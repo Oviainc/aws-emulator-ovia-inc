@@ -51,3 +51,49 @@ Replayed suite: 23 cloudformation-family checks fail with the identical detail '
 2. Minimal repro: CreateChangeSet(ChangeSetType='CREATE') then poll DescribeChangeSet for Status in {CREATE_COMPLETE, FAILED} — the status never reaches either.
 3. Second repro: CreateStack with an AWS::CloudFormation::WaitCondition + WaitConditionHandle and poll DescribeStacks; the stack never leaves its non-terminal status.
 4. Third repro: CreateStack with a custom resource backed by an SNS topic and poll for CREATE_COMPLETE, then GetAtt its response data.
+
+## Resolution (partial: the wait-condition family)
+
+What this report bundles is 23 poll loops under one heading, and they do not share one
+implementation. The part that is now implemented is the WAIT-CONDITION half of the async
+driver: a create or update whose template declares an `AWS::CloudFormation::WaitCondition`
+is no longer completed by the clock — it waits until the wait condition has the distinct
+success signals its `Count` asks for, `SignalResource` delivers them, a failure signal or
+the declared `Timeout` fails the operation, and while it waits the stack reports the
+resources whose work has started (the wait condition itself `*_IN_PROGRESS`, carrying the
+reason that says its work was initiated) and not the ones that depend on it. Repro 3 above
+now converges, `cloudformation.signal-resource-invalid-status-rejected` passes, and
+`cloudformation.ec2mr-cfnres-in-progress-stack-omits-unstarted-resource` and
+`cloudformation__sns__sqs.cfn-independent-branches-provision-concurrently-and-tear-down-in-reverse`
+get past their polls and fail later.
+
+Still open, and NOT resolved by that change — each of these checks blocks on an operation
+of this service that is still a scaffold 501, and each of those operations has its own stub
+issue:
+
+* stack sets and stack-set drift (`detect-stackset-drift-lifecycle`,
+  `list-stack-instance-resource-drifts`, `stack-set-drift-detection-lifecycle`):
+  `CreateStackSet`, `CreateStackInstances`, `DescribeStackSet`,
+  `DescribeStackSetOperation`, `DetectStackSetDrift`, `ListStackInstances`,
+  `DescribeStackInstance`, `ListStackInstanceResourceDrifts`;
+* the extension registry's writers (`type-configuration-set-and-batch-describe`,
+  `concurrent-batch-describe-type-configurations-consistent-snapshot`): `ActivateType`,
+  `SetTypeConfiguration`, `BatchDescribeTypeConfigurations`;
+* continue/cancel rollback (`continue-update-rollback-on-stable-stack-fails`,
+  `stack-continue-update-rollback-lifecycle`, `stack-update-cancel-then-continue-rollback`,
+  `deep-cloudformation-1-cfn-enforce-continue-update-rollback-requires-resource-skip`):
+  `ContinueUpdateRollback`, `CancelUpdateStack`;
+* cross-stack references (`export-deletion-blocked-while-imported-rejected`):
+  `ListExports`, `ListImports` and `Fn::ImportValue`;
+* `GetTemplateSummary`, which `ec2mr-cfnres-in-progress-stack-omits-unstarted-resource`
+  now reaches;
+* the remaining deploy flows, which wait on resources in the services the stack provisions
+  (`cdk-deployed-l2-trio-serves-http-and-persists`,
+  `deploy-iam-role-assumable-by-trusted-service`,
+  `cfn-deploy-iam-role-trust-mismatched-principal-negative`,
+  `s3-replication-role-trust-s3-positive`,
+  `config-delivery-denied-when-bucket-policy-is-removed`) and on change-set and
+  custom-resource behaviour (`execute-changeset-rejects-non-executable-status`,
+  `execute-failed-changeset-rejected`,
+  `deep-cloudformation-3-cfn-flight-update-while-wait-condition-barriered-rejected-then-succeeds`,
+  the two `xsvc-cloudformation-3-sns-custom-resource-*` checks).

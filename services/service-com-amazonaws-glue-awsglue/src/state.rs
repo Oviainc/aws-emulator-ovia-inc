@@ -2942,6 +2942,12 @@ pub mod messages {
     /// [`CRAWLER_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and no disclosure of
     /// the requested name.
     pub const SCHEMA_ALREADY_EXISTS: &str = "Schema already exists.";
+
+    /// `CreateRegistry` for a `RegistryName` this account already holds. NOT recorded
+    /// either: inferred from the recorded `CreateDatabase` duplicate, like
+    /// [`SCHEMA_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and no disclosure of the
+    /// requested name.
+    pub const REGISTRY_ALREADY_EXISTS: &str = "Registry already exists.";
 }
 
 /// Fold a database or table name the way the catalog stores it: ASCII-lowercased.

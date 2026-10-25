@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores the resource-based policy of the Lambda resource the `ResourceArn` names: the
+//! whole document the request carried, at a fresh revision, replacing whatever policy
+//! that resource had. The policy lives on the stored record beside the statements
+//! `AddPermission` adds (`crate::state::PolicyRecord`), so `GetResourcePolicy`,
+//! `DeleteResourcePolicy` and `GetPolicy` all read the one policy of that resource.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +177,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourcePolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutResourcePolicyErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+
+        // "The policy document you want to add to your Lambda resource. This is
+        // formatted as a JSON string": a value that is not a JSON policy document is no
+        // policy, and the model's `^[\s\S]+$` pattern cannot say so, so this is the
+        // parameter violation the operation models an error for.
+        if !crate::state::is_policy_document(&input.policy) {
+            return Err(PutResourcePolicyErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    r#type: None,
+                    message: Some(
+                        "The Policy parameter must be a policy document formatted as a JSON \
+                         object."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        let (record, version) = crate::state::resolve_policy_resource(
+            &mut store,
+            &input.resource_arn,
+            &region,
+            ::std::time::SystemTime::now(),
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => {
+                PutResourcePolicyErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+            crate::state::ResolveFailure::NotFound(message) => {
+                PutResourcePolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+        })?;
+
+        // "The revision ID that the existing policy must match for the replacement to
+        // proceed. If the revision ID doesn't match, the operation fails with a
+        // PreconditionFailedException error." The id to match is the stored policy's
+        // own, so a resource with no policy yet matches no expectation at all.
+        if let Some(expected) = &input.revision_id {
+            let current = record
+                .policies
+                .get(&version)
+                .map(|stored| stored.revision_id.clone());
+            if current.as_deref() != Some(expected.as_str()) {
+                return Err(PutResourcePolicyErrorModeled::PreconditionFailedException(
+                    PreconditionFailedException {
+                        r#type: None,
+                        message: Some(
+                            crate::state::RESOURCE_POLICY_REVISION_MISMATCH_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "This operation replaces any existing policy on the Lambda resource. If you
+        // previously added permissions using the AddPermission operation, the new policy
+        // overwrites those permissions." So the stored policy becomes this document and
+        // nothing else, at the revision this change mints.
+        let stored = crate::state::PolicyRecord::of_document(input.policy.clone());
+        let policy = stored.to_json();
+        let revision_id = stored.revision_id.clone();
+        record.policies.insert(version, stored);
+
+        Ok(PutResourcePolicyOutput {
+            policy: Some(policy),
+            revision_id: Some(revision_id),
+        })
     }
 }

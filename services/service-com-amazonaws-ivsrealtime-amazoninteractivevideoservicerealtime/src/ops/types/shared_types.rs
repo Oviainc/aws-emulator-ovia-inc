@@ -410,15 +410,326 @@ impl ::aws_smithy_schema_server::DeserializableStruct for ParticipantToken {
     }
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ivsrealtime#AutoParticipantRecordingConfiguration")]
+// `AutoParticipantRecordingConfiguration` is the second shape in this module whose
+// schema and serde pair are written out by hand rather than produced by
+// `#[smithy_macros::smithy(shape = ...)]`, and the reason is PRESENCE.
+//
+// Two of its members carry a Smithy `@default` (`smithy_query(query="shape",
+// shape="AutoParticipantRecordingConfiguration")`): `recordingReconnectWindowSeconds`
+// (`@default 0`) and `recordParticipantReplicas` (`@default false`). The vendored
+// codegen refuses `Option<T>` for a `@default` member and materialises the declared
+// default while deserializing, so an absent member and one the caller sent at that same
+// value arrive IDENTICAL at a handler. For `recordingReconnectWindowSeconds` that costs
+// nothing — its doc states the same default the model declares ("The default value is
+// 0") — but `recordParticipantReplicas` documents "Default: `true`" while declaring
+// `@default false`, so with the materialised value there is no way to report the
+// documented default for a request that left the member out WITHOUT also discarding the
+// `false` a caller sends to disable replica participant recording, which is the member's
+// whole documented purpose.
+//
+// Keeping each member `Option` is what makes both reachable: the wire value is `None`
+// exactly when the request did not carry the member, and
+// `crate::state::effective_recording_configuration` applies that member's documented
+// default exactly then, reporting any value the caller did send as it arrived.
+//
+// Everything else mirrors the macro's output for a structure: one `M_<MEMBER>` schema
+// per member (index = position in the model's member list, plus the `member` sub-schema
+// a list member carries), the constraint traits the dispatch-boundary validating walk
+// reads off those schemas, a `SCHEMA` naming the members in order, the `<SHAPE>_SCHEMA`
+// alias, and the serialize/deserialize pair. Unlike `ParticipantToken` below this is an
+// INPUT shape, so its constraint traits are carried here too — the walk enforces them
+// and a dropped trait would accept a request AWS refuses.
+//
+// REMOVE THIS BLOCK when the vendored codegen keeps a `@default` member's presence
+// (an `Option<T>` field plus "materialise the declared default only where the member is
+// absent AND the shape has no other default"): the defect is general — every member of
+// every service whose documented default differs from its declared `@default` has it —
+// so the fix belongs there, and `vendor/` is outside what a fix may change. Once it
+// does, delete the hand-written schema, the two impls and this comment, and put
+// `#[smithy_macros::smithy(shape =
+// "com.amazonaws.ivsrealtime#AutoParticipantRecordingConfiguration")]` back on the
+// struct; `tests/all/documented_member_defaults.rs` pins the behaviour either way.
 #[derive(Debug, Clone, Default)]
 pub struct AutoParticipantRecordingConfiguration {
     pub storage_configuration_arn: String,
     pub media_types: Option<Vec<String>>,
     pub thumbnail_configuration: Option<ParticipantThumbnailConfiguration>,
-    pub recording_reconnect_window_seconds: i32,
+    pub recording_reconnect_window_seconds: Option<i32>,
     pub hls_configuration: Option<ParticipantRecordingHlsConfiguration>,
-    pub record_participant_replicas: bool,
+    pub record_participant_replicas: Option<bool>,
+}
+
+/// `AutoParticipantRecordingStorageConfigurationArn`'s modelled `@pattern`, verbatim
+/// from `smithy_query(query="shape",shape="AutoParticipantRecordingConfiguration")` —
+/// member `storageConfigurationArn`. The alternation's first branch is what admits the
+/// documented empty string.
+const RECORDING_STORAGE_CONFIGURATION_ARN_PATTERN: &str =
+    "^^$|^arn:aws:ivs:[a-z0-9-]+:[0-9]+:storage-configuration/[a-zA-Z0-9-]+$$";
+
+/// `storageConfigurationArn`: the modelled `@length(0..128)` plus
+/// [`RECORDING_STORAGE_CONFIGURATION_ARN_PATTERN`].
+static RECORDING_STORAGE_CONFIGURATION_ARN_TRAITS:
+    ::std::sync::LazyLock<::aws_smithy_schema::TraitMap> = ::std::sync::LazyLock::new(|| {
+    let mut traits = ::aws_smithy_schema::TraitMap::new();
+    traits.insert(::std::boxed::Box::new(
+        ::aws_smithy_schema_server::constraints::LengthTrait::new(Some(0), Some(128)),
+    ));
+    traits.insert(::std::boxed::Box::new(
+        ::aws_smithy_schema_server::constraints::PatternTrait::new(
+            RECORDING_STORAGE_CONFIGURATION_ARN_PATTERN,
+        ),
+    ));
+    traits
+});
+
+/// Every value `ParticipantRecordingMediaType` admits, from
+/// `smithy_query(query="shape",shape="ParticipantRecordingMediaType")`.
+const RECORDING_MEDIA_TYPES: [&str; 3] = ["AUDIO_VIDEO", "AUDIO_ONLY", "NONE"];
+
+/// The `mediaTypes` ELEMENT shape's own constraint: its value set. A list member and its
+/// elements share one schema, so the element's traits travel in this separate map.
+static RECORDING_MEDIA_TYPE_ELEM_TRAITS: ::std::sync::LazyLock<::aws_smithy_schema::TraitMap> =
+    ::std::sync::LazyLock::new(|| {
+        let mut traits = ::aws_smithy_schema::TraitMap::new();
+        traits.insert(::std::boxed::Box::new(
+            ::aws_smithy_schema_server::constraints::EnumTrait::new(&RECORDING_MEDIA_TYPES),
+        ));
+        traits
+    });
+
+/// `mediaTypes`: the list's modelled `@length(0..1)`, plus its elements' value set.
+static RECORDING_MEDIA_TYPES_TRAITS: ::std::sync::LazyLock<::aws_smithy_schema::TraitMap> =
+    ::std::sync::LazyLock::new(|| {
+        let mut traits = ::aws_smithy_schema::TraitMap::new();
+        traits.insert(::std::boxed::Box::new(
+            ::aws_smithy_schema_server::constraints::LengthTrait::new(Some(0), Some(1)),
+        ));
+        traits.insert(::std::boxed::Box::new(
+            ::aws_smithy_schema_server::constraints::ElementConstraintsTrait::new(
+                &RECORDING_MEDIA_TYPE_ELEM_TRAITS,
+            ),
+        ));
+        traits
+    });
+
+/// `recordingReconnectWindowSeconds`: the modelled `@range(0..300)` of
+/// `ParticipantRecordingReconnectWindowSeconds`.
+static RECORDING_RECONNECT_WINDOW_TRAITS: ::std::sync::LazyLock<::aws_smithy_schema::TraitMap> =
+    ::std::sync::LazyLock::new(|| {
+        let mut traits = ::aws_smithy_schema::TraitMap::new();
+        traits.insert(::std::boxed::Box::new(
+            ::aws_smithy_schema_server::constraints::RangeTrait::new(Some(0.0), Some(300.0)),
+        ));
+        traits
+    });
+
+#[allow(non_upper_case_globals)]
+impl AutoParticipantRecordingConfiguration {
+    const SHAPE_ID: &'static str =
+        "com.amazonaws.ivsrealtime#AutoParticipantRecordingConfiguration";
+    const NAMESPACE: &'static str = "com.amazonaws.ivsrealtime";
+
+    pub const M_STORAGE_CONFIGURATION_ARN: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ivsrealtime#AutoParticipantRecordingConfiguration$storageConfigurationArn",
+                Self::NAMESPACE,
+                "storageConfigurationArn",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "storageConfigurationArn",
+            0,
+        )
+        .with_traits(&RECORDING_STORAGE_CONFIGURATION_ARN_TRAITS);
+    const M_MEDIA_TYPES_MEMBER: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ivsrealtime#AutoParticipantRecordingConfiguration$mediaTypes$member",
+                Self::NAMESPACE,
+                "member",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "member",
+            0,
+        );
+    pub const M_MEDIA_TYPES: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ivsrealtime#AutoParticipantRecordingConfiguration$mediaTypes",
+                Self::NAMESPACE,
+                "mediaTypes",
+            ),
+            ::aws_smithy_schema::ShapeType::List,
+            "mediaTypes",
+            1,
+        )
+        .with_list_member(&Self::M_MEDIA_TYPES_MEMBER)
+        .with_traits(&RECORDING_MEDIA_TYPES_TRAITS);
+    pub const M_THUMBNAIL_CONFIGURATION: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ivsrealtime#AutoParticipantRecordingConfiguration$thumbnailConfiguration",
+                Self::NAMESPACE,
+                "thumbnailConfiguration",
+            ),
+            ::aws_smithy_schema::ShapeType::Structure,
+            "thumbnailConfiguration",
+            2,
+        );
+    pub const M_RECORDING_RECONNECT_WINDOW_SECONDS: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ivsrealtime#AutoParticipantRecordingConfiguration$recordingReconnectWindowSeconds",
+                Self::NAMESPACE,
+                "recordingReconnectWindowSeconds",
+            ),
+            ::aws_smithy_schema::ShapeType::Integer,
+            "recordingReconnectWindowSeconds",
+            3,
+        )
+        .with_traits(&RECORDING_RECONNECT_WINDOW_TRAITS);
+    pub const M_HLS_CONFIGURATION: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ivsrealtime#AutoParticipantRecordingConfiguration$hlsConfiguration",
+                Self::NAMESPACE,
+                "hlsConfiguration",
+            ),
+            ::aws_smithy_schema::ShapeType::Structure,
+            "hlsConfiguration",
+            4,
+        );
+    pub const M_RECORD_PARTICIPANT_REPLICAS: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ivsrealtime#AutoParticipantRecordingConfiguration$recordParticipantReplicas",
+                Self::NAMESPACE,
+                "recordParticipantReplicas",
+            ),
+            ::aws_smithy_schema::ShapeType::Boolean,
+            "recordParticipantReplicas",
+            5,
+        );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            Self::SHAPE_ID,
+            Self::NAMESPACE,
+            "AutoParticipantRecordingConfiguration",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_STORAGE_CONFIGURATION_ARN,
+            &Self::M_MEDIA_TYPES,
+            &Self::M_THUMBNAIL_CONFIGURATION,
+            &Self::M_RECORDING_RECONNECT_WINDOW_SECONDS,
+            &Self::M_HLS_CONFIGURATION,
+            &Self::M_RECORD_PARTICIPANT_REPLICAS,
+        ],
+    );
+}
+
+pub static AUTO_PARTICIPANT_RECORDING_CONFIGURATION_SCHEMA: &::aws_smithy_schema::Schema =
+    &AutoParticipantRecordingConfiguration::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for AutoParticipantRecordingConfiguration {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // `storageConfigurationArn` is `@required`, so it is always written — which is
+        // also what puts it in front of the validating walk on every request.
+        s.write_string(
+            &Self::M_STORAGE_CONFIGURATION_ARN,
+            self.storage_configuration_arn.as_str(),
+        )?;
+        if let Some(v) = self.media_types.as_ref() {
+            s.write_list(&Self::M_MEDIA_TYPES, &|__sl| {
+                for __it in v.iter() {
+                    __sl.write_string(&Self::M_MEDIA_TYPES, __it.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(v) = self.thumbnail_configuration.as_ref() {
+            s.write_struct(&Self::M_THUMBNAIL_CONFIGURATION, v)?;
+        }
+        if let Some(v) = self.recording_reconnect_window_seconds.as_ref() {
+            s.write_integer(&Self::M_RECORDING_RECONNECT_WINDOW_SECONDS, *v)?;
+        }
+        if let Some(v) = self.hls_configuration.as_ref() {
+            s.write_struct(&Self::M_HLS_CONFIGURATION, v)?;
+        }
+        if let Some(v) = self.record_participant_replicas.as_ref() {
+            s.write_boolean(&Self::M_RECORD_PARTICIPANT_REPLICAS, *v)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for AutoParticipantRecordingConfiguration {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut storage_configuration_arn: Option<String> = None;
+        let mut media_types: Option<Vec<String>> = None;
+        let mut thumbnail_configuration: Option<ParticipantThumbnailConfiguration> = None;
+        let mut recording_reconnect_window_seconds: Option<i32> = None;
+        let mut hls_configuration: Option<ParticipantRecordingHlsConfiguration> = None;
+        let mut record_participant_replicas: Option<bool> = None;
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => {
+                    storage_configuration_arn =
+                        Some(d.read_string(&Self::M_STORAGE_CONFIGURATION_ARN)?);
+                }
+                Some(1) => {
+                    let mut __out: Vec<String> = Vec::new();
+                    d.read_list(&Self::M_MEDIA_TYPES, &mut |__dl| {
+                        __out.push(__dl.read_string(&Self::M_MEDIA_TYPES)?);
+                        Ok(())
+                    })?;
+                    media_types = Some(__out);
+                }
+                Some(2) => {
+                    // The enclosing member names itself as an error from inside the
+                    // nested shape passes back out, the way the macro's own read does.
+                    let __read = <ParticipantThumbnailConfiguration as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)
+                        .map_err(|__e| {
+                            ::aws_smithy_schema_server::within_member(__e, "thumbnailConfiguration")
+                        })?;
+                    thumbnail_configuration = Some(__read);
+                }
+                Some(3) => {
+                    recording_reconnect_window_seconds =
+                        Some(d.read_integer(&Self::M_RECORDING_RECONNECT_WINDOW_SECONDS)?);
+                }
+                Some(4) => {
+                    let __read = <ParticipantRecordingHlsConfiguration as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)
+                        .map_err(|__e| {
+                            ::aws_smithy_schema_server::within_member(__e, "hlsConfiguration")
+                        })?;
+                    hls_configuration = Some(__read);
+                }
+                Some(5) => {
+                    record_participant_replicas =
+                        Some(d.read_boolean(&Self::M_RECORD_PARTICIPANT_REPLICAS)?);
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            storage_configuration_arn: storage_configuration_arn.ok_or_else(|| {
+                ::aws_smithy_schema_server::missing_member("storageConfigurationArn")
+            })?,
+            media_types,
+            thumbnail_configuration,
+            recording_reconnect_window_seconds,
+            hls_configuration,
+            record_participant_replicas,
+        })
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.ivsrealtime#ParticipantThumbnailConfiguration")]
@@ -490,15 +801,244 @@ pub struct LayoutConfiguration {
     pub pip: Option<PipConfiguration>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ivsrealtime#GridConfiguration")]
+// `GridConfiguration` is hand-written for the SAME reason
+// `AutoParticipantRecordingConfiguration` above is: `gridGap` carries the Smithy
+// `@default 0` while its own doc states "Specifies the spacing between participant tiles
+// in pixels. Default: `2`" (`smithy_query(query="shape",shape="GridConfiguration")`), so
+// with the materialised `0` a handler cannot report the documented spacing for a request
+// that left the member out without also rewriting the `0` a caller asks for. Keeping the
+// member `Option` is what makes both reachable, and
+// `crate::state::effective_layout` applies the documented default exactly where the
+// request carried no value.
+//
+// `PipConfiguration` below is deliberately left to the macro: its `gridGap`, `pipOffset`
+// and `omitStoppedVideo` each document the SAME default the model declares for them
+// ("Default: `0`", "Default: `0`", "Default: `false`"), so the value the framework
+// materialises for an absent member is already the documented one and presence carries no
+// information.
+//
+// REMOVE THIS BLOCK under the same condition as the one above.
 #[derive(Debug, Clone, Default)]
 pub struct GridConfiguration {
     pub featured_participant_attribute: Option<String>,
-    pub omit_stopped_video: bool,
+    pub omit_stopped_video: Option<bool>,
     pub video_aspect_ratio: Option<String>,
     pub video_fill_mode: Option<String>,
-    pub grid_gap: i32,
+    pub grid_gap: Option<i32>,
     pub participant_order_attribute: Option<String>,
+}
+
+/// `AttributeKey`'s modelled `@pattern`, from
+/// `smithy_query(query="shape",shape="GridConfiguration")` — members
+/// `featuredParticipantAttribute` and `participantOrderAttribute`.
+const ATTRIBUTE_KEY_PATTERN: &str = "^[a-zA-Z0-9-_]*$";
+
+/// An `AttributeKey` member: the modelled `@length(0..128)` plus
+/// [`ATTRIBUTE_KEY_PATTERN`]. One map serves both members of this shape that target it.
+static ATTRIBUTE_KEY_TRAITS: ::std::sync::LazyLock<::aws_smithy_schema::TraitMap> =
+    ::std::sync::LazyLock::new(|| {
+        let mut traits = ::aws_smithy_schema::TraitMap::new();
+        traits.insert(::std::boxed::Box::new(
+            ::aws_smithy_schema_server::constraints::LengthTrait::new(Some(0), Some(128)),
+        ));
+        traits.insert(::std::boxed::Box::new(
+            ::aws_smithy_schema_server::constraints::PatternTrait::new(ATTRIBUTE_KEY_PATTERN),
+        ));
+        traits
+    });
+
+/// Every value `VideoAspectRatio` admits, from
+/// `smithy_query(query="shape",shape="VideoAspectRatio")`.
+const VIDEO_ASPECT_RATIOS: [&str; 4] = ["AUTO", "VIDEO", "SQUARE", "PORTRAIT"];
+
+/// Every value `VideoFillMode` admits, from
+/// `smithy_query(query="shape",shape="VideoFillMode")`.
+const VIDEO_FILL_MODES: [&str; 3] = ["FILL", "COVER", "CONTAIN"];
+
+/// `videoAspectRatio`: the value set of the `VideoAspectRatio` enum it targets.
+static VIDEO_ASPECT_RATIO_TRAITS: ::std::sync::LazyLock<::aws_smithy_schema::TraitMap> =
+    ::std::sync::LazyLock::new(|| {
+        let mut traits = ::aws_smithy_schema::TraitMap::new();
+        traits.insert(::std::boxed::Box::new(
+            ::aws_smithy_schema_server::constraints::EnumTrait::new(&VIDEO_ASPECT_RATIOS),
+        ));
+        traits
+    });
+
+/// `videoFillMode`: the value set of the `VideoFillMode` enum it targets.
+static VIDEO_FILL_MODE_TRAITS: ::std::sync::LazyLock<::aws_smithy_schema::TraitMap> =
+    ::std::sync::LazyLock::new(|| {
+        let mut traits = ::aws_smithy_schema::TraitMap::new();
+        traits.insert(::std::boxed::Box::new(
+            ::aws_smithy_schema_server::constraints::EnumTrait::new(&VIDEO_FILL_MODES),
+        ));
+        traits
+    });
+
+/// `gridGap`: the modelled `@range(min 0)` of `GridGap`, which declares no maximum.
+static GRID_GAP_TRAITS: ::std::sync::LazyLock<::aws_smithy_schema::TraitMap> =
+    ::std::sync::LazyLock::new(|| {
+        let mut traits = ::aws_smithy_schema::TraitMap::new();
+        traits.insert(::std::boxed::Box::new(
+            ::aws_smithy_schema_server::constraints::RangeTrait::new(Some(0.0), None),
+        ));
+        traits
+    });
+
+#[allow(non_upper_case_globals)]
+impl GridConfiguration {
+    const SHAPE_ID: &'static str = "com.amazonaws.ivsrealtime#GridConfiguration";
+    const NAMESPACE: &'static str = "com.amazonaws.ivsrealtime";
+
+    pub const M_FEATURED_PARTICIPANT_ATTRIBUTE: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ivsrealtime#GridConfiguration$featuredParticipantAttribute",
+                Self::NAMESPACE,
+                "featuredParticipantAttribute",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "featuredParticipantAttribute",
+            0,
+        )
+        .with_traits(&ATTRIBUTE_KEY_TRAITS);
+    pub const M_OMIT_STOPPED_VIDEO: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ivsrealtime#GridConfiguration$omitStoppedVideo",
+                Self::NAMESPACE,
+                "omitStoppedVideo",
+            ),
+            ::aws_smithy_schema::ShapeType::Boolean,
+            "omitStoppedVideo",
+            1,
+        );
+    pub const M_VIDEO_ASPECT_RATIO: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ivsrealtime#GridConfiguration$videoAspectRatio",
+                Self::NAMESPACE,
+                "videoAspectRatio",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "videoAspectRatio",
+            2,
+        )
+        .with_traits(&VIDEO_ASPECT_RATIO_TRAITS);
+    pub const M_VIDEO_FILL_MODE: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ivsrealtime#GridConfiguration$videoFillMode",
+                Self::NAMESPACE,
+                "videoFillMode",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "videoFillMode",
+            3,
+        )
+        .with_traits(&VIDEO_FILL_MODE_TRAITS);
+    pub const M_GRID_GAP: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.ivsrealtime#GridConfiguration$gridGap",
+            Self::NAMESPACE,
+            "gridGap",
+        ),
+        ::aws_smithy_schema::ShapeType::Integer,
+        "gridGap",
+        4,
+    )
+    .with_traits(&GRID_GAP_TRAITS);
+    pub const M_PARTICIPANT_ORDER_ATTRIBUTE: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ivsrealtime#GridConfiguration$participantOrderAttribute",
+                Self::NAMESPACE,
+                "participantOrderAttribute",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "participantOrderAttribute",
+            5,
+        )
+        .with_traits(&ATTRIBUTE_KEY_TRAITS);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            Self::SHAPE_ID,
+            Self::NAMESPACE,
+            "GridConfiguration",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_FEATURED_PARTICIPANT_ATTRIBUTE,
+            &Self::M_OMIT_STOPPED_VIDEO,
+            &Self::M_VIDEO_ASPECT_RATIO,
+            &Self::M_VIDEO_FILL_MODE,
+            &Self::M_GRID_GAP,
+            &Self::M_PARTICIPANT_ORDER_ATTRIBUTE,
+        ],
+    );
+}
+
+pub static GRID_CONFIGURATION_SCHEMA: &::aws_smithy_schema::Schema = &GridConfiguration::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GridConfiguration {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.featured_participant_attribute.as_ref() {
+            s.write_string(&Self::M_FEATURED_PARTICIPANT_ATTRIBUTE, v.as_str())?;
+        }
+        if let Some(v) = self.omit_stopped_video.as_ref() {
+            s.write_boolean(&Self::M_OMIT_STOPPED_VIDEO, *v)?;
+        }
+        if let Some(v) = self.video_aspect_ratio.as_ref() {
+            s.write_string(&Self::M_VIDEO_ASPECT_RATIO, v.as_str())?;
+        }
+        if let Some(v) = self.video_fill_mode.as_ref() {
+            s.write_string(&Self::M_VIDEO_FILL_MODE, v.as_str())?;
+        }
+        if let Some(v) = self.grid_gap.as_ref() {
+            s.write_integer(&Self::M_GRID_GAP, *v)?;
+        }
+        if let Some(v) = self.participant_order_attribute.as_ref() {
+            s.write_string(&Self::M_PARTICIPANT_ORDER_ATTRIBUTE, v.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for GridConfiguration {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => {
+                    out.featured_participant_attribute =
+                        Some(d.read_string(&Self::M_FEATURED_PARTICIPANT_ATTRIBUTE)?);
+                }
+                Some(1) => {
+                    out.omit_stopped_video = Some(d.read_boolean(&Self::M_OMIT_STOPPED_VIDEO)?);
+                }
+                Some(2) => {
+                    out.video_aspect_ratio = Some(d.read_string(&Self::M_VIDEO_ASPECT_RATIO)?);
+                }
+                Some(3) => {
+                    out.video_fill_mode = Some(d.read_string(&Self::M_VIDEO_FILL_MODE)?);
+                }
+                Some(4) => out.grid_gap = Some(d.read_integer(&Self::M_GRID_GAP)?),
+                Some(5) => {
+                    out.participant_order_attribute =
+                        Some(d.read_string(&Self::M_PARTICIPANT_ORDER_ATTRIBUTE)?);
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.ivsrealtime#PipConfiguration")]

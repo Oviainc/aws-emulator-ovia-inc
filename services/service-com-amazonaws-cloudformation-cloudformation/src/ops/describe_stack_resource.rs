@@ -90,7 +90,10 @@ fn stack_resource_detail(stack: &StoredStack, deployed: &DeployedResource) -> St
         resource_type: deployed.resource.resource_type.clone(),
         last_updated_timestamp: crate::state::timestamp(deployed.status_timestamp),
         resource_status: deployed.status.clone(),
-        resource_status_reason: None,
+        // "Success/failure message associated with the resource": what the record carries,
+        // which is the "work started" message for a resource whose operation is under way
+        // and nothing for one whose status speaks for itself.
+        resource_status_reason: deployed.status_reason.clone(),
         description: None,
         metadata: deployed.resource.metadata.clone(),
         drift_information: crate::state::resource_drift_information(deployed),
@@ -192,11 +195,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Returns a description of the specified resource in the specified stack": one
         // resource, named by the logical id the template declared it under, out of the
-        // resources that stack's last completed deployment materialised. A logical id the
-        // stack has not deployed names no resource, so the request is refused rather than
-        // answered with an empty description.
-        let deployed = stack
-            .resources
+        // resources that stack reports right now — what its last completed deployment
+        // materialised, or, for an operation waiting at a wait condition, what that
+        // operation has created so far (`StoredStack::reported_resources`). A logical id
+        // the stack has not deployed names no resource, so the request is refused rather
+        // than answered with an empty description.
+        let reported = stack.reported_resources();
+        let deployed = reported
             .iter()
             .find(|deployed| deployed.resource.logical_id == input.logical_resource_id)
             .ok_or_else(|| {

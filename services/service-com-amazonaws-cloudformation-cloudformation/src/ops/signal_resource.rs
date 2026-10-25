@@ -5,10 +5,12 @@
 //! signalled logical id and the signal's `UniqueId`, and acts on it where something is
 //! WAITING for it — while the stack's create or update is in flight and the signalled
 //! resource's declaration waits on resource signals, the signal is reported as an event on
-//! that resource and a `FAILURE` signal fails the operation at once (a failed create then
-//! rolls back, as `CreateStack`'s own `OnFailure` default says). Every other signal is
-//! accepted and recorded and changes nothing; only a `StackName` that names no live stack
-//! in the request's Region is refused, with `ValidationError`.
+//! that resource, a wait condition the operation is waiting AT proceeds once it has the
+//! number of signals its `Count` asks for ([`crate::state::wait_conditions`]), and a
+//! `FAILURE` signal fails the operation at once (a failed create then rolls back, as
+//! `CreateStack`'s own `OnFailure` default says). Every other signal is accepted and
+//! recorded and changes nothing; only a `StackName` that names no live stack in the
+//! request's Region is refused, with `ValidationError`.
 //!
 //! ## Shape of an operation
 //!
@@ -199,6 +201,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.status,
                 now,
             );
+            // A wait condition the operation is waiting AT proceeds once the signals it
+            // waits for have arrived: this is what makes the terminal status due, and it is
+            // a no-op while any of the operation's wait conditions is short of its `Count`
+            // (`crate::state::wait_conditions`).
+            stack.release_wait_conditions(now);
 
             // Something only WAITS for a signal while the operation that waits is in
             // flight and the resource's own declaration asks it to

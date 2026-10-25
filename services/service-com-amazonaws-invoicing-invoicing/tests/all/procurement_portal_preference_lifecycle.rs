@@ -25,8 +25,8 @@
 //!   free again — asserted over several portals and identities;
 //! * a start call whose outcome this emulator cannot produce (confirming delivery of a
 //!   test e-invoice to a procurement portal outside it) is refused with the operation's
-//!   modelled error while the ATTEMPT it made is recorded — asserted over preferences
-//!   differing in which portal endpoints they configure;
+//!   modelled error and persists nothing — asserted over preferences differing in which
+//!   portal endpoints they configure;
 //! * repeating an update lands the same configuration, and a delete's `ClientToken`
 //!   replay answers with the ARN it removed.
 
@@ -679,10 +679,9 @@ async fn a_delete_removes_the_preference_from_every_reader() {
 /// RULE: a start call whose success would assert work this emulator cannot perform — here
 /// confirming delivery of a test e-invoice to a procurement portal that lives outside it —
 /// is refused at that call with the operation's own modelled error (`ValidationException`,
-/// HTTP 400) instead of reporting an outcome nothing produced. The ATTEMPT is what the
-/// call did perform, so it is recorded: the preference's `Version` and `LastUpdateDate`
-/// advance with that write, while nothing claims a verified portal connection — no plane's
-/// status moves and no code becomes submittable.
+/// HTTP 400) instead of reporting an outcome nothing produced. The refusal persists
+/// nothing: the preference reports the same `Version` and `LastUpdateDate` a reader saw
+/// before it, no plane's status moves and no code becomes submittable.
 ///
 /// The rows differ along which portal endpoints the preference configures (none, the
 /// portal instance endpoint, the test environment's endpoint, both), because the endpoint
@@ -764,41 +763,16 @@ async fn a_send_that_cannot_confirm_delivery_refuses_and_verifies_nothing() {
             }
         }
 
-        // The attempt was recorded — the version counts the writes of this resource, so
-        // the two attempts above advanced it by two — while nothing claims a verified
-        // portal connection: no plane's status moved, the configuration is untouched and
-        // no submitted code can complete a validation, because none was issued.
+        // The refusal wrote nothing a reader can observe: `Version` is the version
+        // number of the CONFIGURATION, so it stays where the last successful write left
+        // it however many sends were refused, `LastUpdateDate` is untouched, and nothing
+        // claims a verified portal connection — no plane's status moved and no submitted
+        // code can complete a validation, because none was issued.
         let after = get_preference(&router, &arn).await;
-        let expected_version = before
-            .get("Version")
-            .and_then(Value::as_i64)
-            .unwrap_or_default()
-            + 2;
         assert_eq!(
-            after.get("Version").and_then(Value::as_i64),
-            Some(expected_version),
-            "case {label}: expected Version {expected_version} after two attempts, got {:?}",
-            after.get("Version")
+            after, before,
+            "case {label}: two refused sends must leave the preference exactly as it was, got {after}"
         );
-        for member in [
-            "EinvoiceDeliveryPreferenceStatus",
-            "PurchaseOrderRetrievalPreferenceStatus",
-            "EinvoiceDeliveryPreferenceStatusReason",
-            "PurchaseOrderRetrievalPreferenceStatusReason",
-            "EinvoiceDeliveryEnabled",
-            "PurchaseOrderRetrievalEnabled",
-            "Contacts",
-            "ProcurementPortalInstanceEndpoint",
-            "TestEnvPreference",
-            "CreateDate",
-        ] {
-            assert_eq!(
-                after.get(member),
-                before.get(member),
-                "case {label}: an unconfirmed attempt must not move {member}, got {:?}",
-                after.get(member)
-            );
-        }
         for code in ["000000", "123456", "not-a-code"] {
             let (status, body) = call(
                 &router,

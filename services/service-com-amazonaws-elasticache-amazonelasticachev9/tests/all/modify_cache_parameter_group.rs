@@ -659,14 +659,15 @@ async fn a_group_the_account_cannot_modify_is_refused() {
 
     // Every family's own default group is the service's, not the customer's:
     // its values ARE the engine defaults, so none of its parameters may be set,
-    // and a refused request leaves it reporting them all.
+    // and a refused request leaves it reporting them all. The refusal states the
+    // rule rather than the group, which is how the service words it.
     for family in state::PARAMETER_GROUP_FAMILIES {
         let group = format!("default.{family}");
         let reply = modify(&emulator, &group, &[("timeout", "300")]).await;
         let message = refused(&group, &reply, 400, "InvalidParameterValue");
-        assert!(
-            message.contains(&group),
-            "case {group}: the refusal must name the group asked for, got {message}"
+        assert_eq!(
+            message, "Cannot modify a default parameter group.",
+            "case {group}: expected the service's default-group sentence, got {message}"
         );
         let described = describe_ok(&emulator, &group, &[]).await;
         for parameter in reported(&described) {

@@ -37,6 +37,8 @@ mod error_message_rules;
 mod get_order_reporting;
 #[path = "all/get_site_address_reporting.rs"]
 mod get_site_address_reporting;
+#[path = "all/order_cancellation.rs"]
+mod order_cancellation;
 #[path = "all/order_lifecycle.rs"]
 mod order_lifecycle;
 #[path = "all/orderable_instance_types.rs"]

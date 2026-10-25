@@ -24,9 +24,10 @@
 //!    recorded as running on the Outpost go away WITH it and block nothing.
 //!
 //! Where the seeded state comes from: three of the modelled `CapacityTaskStatus`
-//! values and the `ORDER_SUBMITTED` quote status are reached only through operations
-//! that are still scaffold stubs (`CancelCapacityTask`, `CancelOrder`), so a row that
-//! needs one puts the stored record in it through the same store seam
+//! values are reached only through an operation that is still a scaffold stub
+//! (`CancelCapacityTask`), and the `ORDER_SUBMITTED` quote status of a quote whose
+//! submitted order this store has no record of is reached by no call at all, so a row
+//! that needs one puts the stored record in it through the same store seam
 //! [`crate::outpost_decommission`] uses. Every assertion still goes over the wire.
 
 use std::collections::VecDeque;

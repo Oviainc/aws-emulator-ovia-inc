@@ -129,10 +129,9 @@ pub const ORDER_STATUS_PREPARING: &str = "PREPARING";
 pub const ORDER_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 
 /// The `OrderStatus` of a cancelled order — the model's "`CANCELLED` - Order is
-/// cancelled". No call in the implemented slice reaches it (`CancelOrder` is still a
-/// scaffold stub with an issue of its own); it is named here because it is one of the
-/// two statuses in which an order is FINISHED and so no longer outstanding on its
-/// Outpost. See [`ORDER_STATUS_SETTLED`].
+/// cancelled". `CancelOrder` is what moves an order into it ([`OrderRecord::cancel`]),
+/// and it is one of the two statuses in which an order is FINISHED and so no longer
+/// outstanding on its Outpost. See [`ORDER_STATUS_SETTLED`].
 pub const ORDER_STATUS_CANCELLED: &str = "CANCELLED";
 
 /// The `OrderStatus` of an order that ran to its end — the model's "`COMPLETED` -
@@ -161,6 +160,12 @@ pub const LINE_ITEM_STATUS_PREPARING: &str = "PREPARING";
 /// `SHIPPED` is a claim about hardware in transit, which it has no record of (see
 /// [`ORDER_STATUS_IN_PROGRESS`]).
 pub const LINE_ITEM_STATUS_BUILDING: &str = "BUILDING";
+
+/// The `LineItemStatus` of a line item of a cancelled order, the item-level
+/// counterpart of [`ORDER_STATUS_CANCELLED`]: cancelling the order cancels the items
+/// it was to deliver, so nothing is left being prepared or built for it. See
+/// [`OrderRecord::cancel`].
+pub const LINE_ITEM_STATUS_CANCELLED: &str = "CANCELLED";
 
 /// The `OrderType` of an order placed for an Outpost, from the modelled enum
 /// (`OUTPOST | REPLACEMENT`).
@@ -757,6 +762,24 @@ impl OrderRecord {
             .status
             .as_deref()
             .is_none_or(|status| !ORDER_STATUS_SETTLED.contains(&status))
+    }
+
+    /// Cancel this order: what `CancelOrder` leaves behind.
+    ///
+    /// The order settles in [`ORDER_STATUS_CANCELLED`] — one of the two statuses in
+    /// which it is finished ([`ORDER_STATUS_SETTLED`]), so it is outstanding on its
+    /// Outpost no longer — and every line item of it settles in the item-level status
+    /// of the same name: the order's status is "Order is cancelled" and the items are
+    /// what it was to deliver, so none of them is still being prepared or built.
+    /// The transition the clock still owed this order is dropped with it: a cancelled
+    /// order never moves on to being built, so [`Self::in_progress_at`] is cleared
+    /// rather than left to fire against a finished order.
+    pub fn cancel(&mut self) {
+        self.order.status = Some(ORDER_STATUS_CANCELLED.to_string());
+        for item in self.order.line_items.iter_mut().flatten() {
+            item.status = Some(LINE_ITEM_STATUS_CANCELLED.to_string());
+        }
+        self.in_progress_at = None;
     }
 }
 
@@ -1826,6 +1849,11 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         in_region(&self.orders, region, order_id)
     }
 
+    /// The same order, to CHANGE. See [`Self::order`].
+    pub fn order_mut(&mut self, region: &str, order_id: &str) -> Option<&mut OrderRecord> {
+        in_region_mut(&mut self.orders, region, order_id)
+    }
+
     /// How many vCPUs of EC2 capacity this service publishes for the catalog item
     /// `catalog_item_id` names, or `None` for a SKU it publishes no configuration
     /// under — a code of the modelled `SkuCode` form that names nothing in the
@@ -2094,6 +2122,14 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// [`Self::outstanding_order_on_outpost`], which this stands beside; callers
     /// settle first (see [`Self::settle_quotes`]), so the quote statuses read here
     /// are the ones the quotes hold at that instant.
+    ///
+    /// A quote is only the SECOND record of the order: where this store holds the
+    /// order the quote names, that order's own status is what says whether anything is
+    /// still outstanding — an order that has finished
+    /// ([`OrderRecord::is_outstanding`]) is finished on both records, and the quote it
+    /// was submitted from stays `ORDER_SUBMITTED` because an order WAS submitted for
+    /// it. Only a submitted order this store has no record of is answered for by the
+    /// quote alone.
     pub fn quote_ordered_from_on_outpost(
         &self,
         region: &str,
@@ -2105,8 +2141,17 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
                 .outpost_arn
                 .as_deref()
                 .and_then(resolve_outpost_id);
-            quote_outpost.as_deref() == Some(outpost_id)
-                && record.quote.quote_status.as_deref() == Some(QUOTE_STATUS_ORDER_SUBMITTED)
+            if quote_outpost.as_deref() != Some(outpost_id)
+                || record.quote.quote_status.as_deref() != Some(QUOTE_STATUS_ORDER_SUBMITTED)
+            {
+                return false;
+            }
+            record
+                .quote
+                .submitted_order_id
+                .as_deref()
+                .and_then(|order_id| self.orders.get(order_id))
+                .is_none_or(OrderRecord::is_outstanding)
         })
     }
 
@@ -2222,8 +2267,8 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     ///   is outstanding until it is finished ([`OrderRecord::is_outstanding`]), and a
     ///   quote of this Outpost that an order was submitted from — the modelled
     ///   `QuoteStatus` [`QUOTE_STATUS_ORDER_SUBMITTED`], whose `SubmittedOrderId`
-    ///   names it. Nothing in this slice moves an order past being prepared or built,
-    ///   so an order the store knows about is one that can still be cancelled, and a
+    ///   names it. An order is outstanding until it is finished, so an order the store
+    ///   still holds outstanding is one that can still be cancelled, and a
     ///   decommission has to wait for it.
     ///
     /// A second is a resource it CAN hold:
@@ -3280,6 +3325,22 @@ pub fn order_contents_report() -> String {
 /// ordered from.
 pub fn quote_status_conflict(quote_id: &str, status: &str) -> String {
     format!("an order cannot be submitted from quote {quote_id}, which is {status}")
+}
+
+/// How this service states that an order cannot be cancelled, because it has already
+/// finished.
+///
+/// An order is cancelled while the service still has work to carry out on it; once it
+/// is in one of the statuses in which it is FINISHED ([`ORDER_STATUS_SETTLED`]) there
+/// is nothing left to cancel, and reporting a success would say the call changed
+/// something it did not. AWS publishes no wording for the refusal, so the sentence is
+/// the emulator's own, worded by the same rule as [`quote_status_conflict`]: what a
+/// caller branches on is the modelled `ConflictException` code (HTTP 409) and the
+/// `ResourceId` / `ResourceType` naming the order, while the message names the status
+/// the order is in, so the caller can tell an order already cancelled from one that
+/// ran to its end.
+pub fn order_status_conflict(order_id: &str, status: &str) -> String {
+    format!("order {order_id} cannot be cancelled, which is {status}")
 }
 
 /// The report a `ResourceArn` that is not an Outposts resource ARN states for a

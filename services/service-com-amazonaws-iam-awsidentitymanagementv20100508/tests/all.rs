@@ -107,5 +107,7 @@ mod user_attached_policy_listing;
 mod user_lifecycle;
 #[path = "all/user_permissions_boundary.rs"]
 mod user_permissions_boundary;
+#[path = "all/user_tag_listing.rs"]
+mod user_tag_listing;
 #[path = "all/user_tags.rs"]
 mod user_tags;

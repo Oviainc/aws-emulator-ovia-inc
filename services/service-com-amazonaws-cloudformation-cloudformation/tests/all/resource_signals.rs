@@ -396,6 +396,18 @@ async fn a_signal_something_waits_on_is_reported_on_the_resource() {
         // An update's signal needs the create out of the way first; a create's signal has
         // to reach the create itself.
         let started = if row.updating {
+            // A create that waits on a signal does not complete until it gets one (the
+            // `wait_conditions` suite is what pins that wait), so the create's own wait is
+            // released here before the update is started. A declaration that waits on
+            // nothing during a create is signalled all the same, and nothing turns on it.
+            let (status_code, signalled) =
+                signal(&router, row.stack, GATE, "create-signal", "SUCCESS").await;
+            assert_eq!(
+                status_code, 200,
+                "case {:?}: the create's signal must be accepted, got {status_code} \
+                 {signalled}",
+                row.case
+            );
             wait_for_the_transition().await;
             let started = Instant::now();
             let (status_code, updated) = call(

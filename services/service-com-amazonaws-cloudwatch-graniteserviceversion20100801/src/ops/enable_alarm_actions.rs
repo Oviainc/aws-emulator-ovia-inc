@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableAlarmActions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableAlarmActions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableAlarmActions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Turns the actions of the named alarms ON: from its next state change on, each alarm
+//! executes the action ARNs configured for the state it moves to.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +138,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableAlarmActions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableAlarmActionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableAlarmActions"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation_error(
+                "the CloudWatch alarm store is unavailable",
+            )
+        })?;
+
+        let now = crate::state::now_secs();
+        // The store's lock is held for the write only, and released before the alarms are
+        // settled below.
+        let unknown = {
+            let mut store = state.lock();
+            store.set_actions_enabled(&input.alarm_names, true, now)
+        };
+        // This operation models no error at all, so a name no alarm of this Region answers to
+        // is not refused: the alarms that do exist are written and the rest are left alone.
+        if !unknown.is_empty() {
+            ::tracing::debug!(
+                alarms = %unknown.join(", "),
+                "these names name no alarm in this Region, so no actions were enabled for them"
+            );
+        }
+        // Turning the actions on owes nothing for a transition that happened while they were
+        // off: a withheld notification is not queued, so there is none to deliver late. Every
+        // evaluation the clock has already made due is still materialised here, and the
+        // notifications those transitions owe are delivered.
+        crate::state::alarm_actions::settle_alarms(&*self.engine, ctx).await;
+        // From here on the alarms this call turned on execute what their transitions fire,
+        // whichever call or clock materialises those transitions.
+        crate::state::alarm_actions::drive_alarm_clock(&self.engine, ctx);
+
+        Ok(EnableAlarmActionsOutput)
     }
 }

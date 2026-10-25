@@ -2293,6 +2293,10 @@ fn apply_alarms<Eng: Send + Sync + 'static>(
                 // state is set appropriately."
                 evaluation_due_secs: now
                     + cloudwatch::state::alarm_evaluation::EVALUATION_DELAY_SECS,
+                // Everything else about the stored alarm is what a freshly written one
+                // carries: this writer sets the alarm, its tags and when its first
+                // evaluation is owed, and nothing about any state a caller forced.
+                ..cloudwatch::state::StoredAlarm::default()
             },
         );
         minted.push(Alarm {

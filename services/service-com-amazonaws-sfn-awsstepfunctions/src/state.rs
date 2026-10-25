@@ -1068,6 +1068,20 @@ pub struct HistoryEvent {
     pub state_name: Option<String>,
 }
 
+/// What the store already holding an execution under the ARN a `StartExecution`
+/// would mint means for that request
+/// ([`ComAmazonawsSfnAwsstepfunctionsState::started_already`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartedAlready {
+    /// The documented idempotent hit: the first request's response is answered
+    /// again, carrying the execution's own `startDate`, and nothing is run a second
+    /// time.
+    Idempotent { start_date: SystemTime },
+    /// Everything else: the execution name is in use, which this operation's
+    /// modelled `ExecutionAlreadyExists` reports.
+    NameTaken,
+}
+
 /// The terminal result [`asl::run`] already computed for an execution, owed to the
 /// clock: it becomes the execution's reported status at `due_at` and not before.
 #[derive(Debug, Clone)]
@@ -2810,6 +2824,35 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             ));
         }
         None
+    }
+
+    /// What a `StartExecution` whose execution ARN the store ALREADY holds answers,
+    /// or `None` when the ARN is free.
+    ///
+    /// "StartExecution is idempotent for STANDARD workflows. [...] if you call
+    /// StartExecution with the same name and input as a running execution, the call
+    /// succeeds and return the same response as the original request. If the
+    /// execution is closed or if the input is different, it returns a 400
+    /// ExecutionAlreadyExists error." It "isn't idempotent for EXPRESS workflows".
+    ///
+    /// The decision lives HERE because `StartExecution` takes it twice: once before
+    /// the definition is interpreted, so a repeat of an idempotent start does not
+    /// make a `Task` state's service integration calls a second time, and once with
+    /// the admitting lock held, because the name could have been taken while the
+    /// walk ran.
+    pub fn started_already(
+        &self,
+        execution_arn: &str,
+        standard: bool,
+        input: &str,
+    ) -> Option<StartedAlready> {
+        let existing = self.executions.get(execution_arn)?;
+        if standard && !existing.is_terminal() && existing.input == input {
+            return Some(StartedAlready::Idempotent {
+                start_date: existing.start_date,
+            });
+        }
+        Some(StartedAlready::NameTaken)
     }
 
     /// Why the store cannot take one more execution of `bytes` for
@@ -4865,7 +4908,32 @@ fn uuid_v4(high: u64, low: u64) -> String {
 // Running an execution
 // ---------------------------------------------------------------------------
 
-/// Interpret `definition` against `input` and schedule what the clock owes.
+/// One attempt at running an execution: what is interpreted, over what input, and
+/// where the attempt's history continues from.
+///
+/// The members travel together — every caller of [`plan_run`] has all of them and
+/// none of them means anything without the rest — so they are one argument.
+pub struct RunAttempt<'a> {
+    pub definition: &'a str,
+    pub input: &'a str,
+    /// When this attempt started, which every offset the walk reports is measured
+    /// from.
+    pub start: SystemTime,
+    /// What the definition reads through the context object (`$$`): the execution's
+    /// and the state machine's own identity, which the caller's request already
+    /// fixed.
+    pub context: &'a asl::Context,
+    /// The type of the event the attempt opens its history with —
+    /// [`EVENT_EXECUTION_STARTED`] for a `StartExecution`,
+    /// [`EVENT_EXECUTION_REDRIVEN`] for a `RedriveExecution`.
+    pub opening: &'a str,
+    /// The last id the execution's history already holds, so a redrive's events
+    /// CONTINUE the existing numbering instead of restarting it.
+    pub previous_event_id: i64,
+}
+
+/// Interpret `attempt`'s definition against its input and schedule what the clock
+/// owes.
 ///
 /// The run happens HERE, in the call that starts it: [`asl::run`] walks the states
 /// and what it reached is reported as a [`Planned`] — a terminal outcome parked in a
@@ -4873,31 +4941,13 @@ fn uuid_v4(high: u64, low: u64) -> String {
 /// passed>`, or the activity task the walk SUSPENDED on, which the execution waits
 /// at until a worker answers it.
 ///
-/// `opening` is the event the attempt opens its history with — [`EVENT_EXECUTION_STARTED`]
-/// for a `StartExecution`, [`EVENT_EXECUTION_REDRIVEN`] for a `RedriveExecution` — and
-/// `previous_event_id` the last id the execution's history already holds, so a
-/// redrive's events CONTINUE the existing numbering instead of restarting it.
-///
-/// `context` is what the definition reads through the context object (`$$`): the
-/// execution's and the state machine's own identity, which the caller's request
-/// already fixed.
+/// `tasks` is what the `Task` states of the definition make their service
+/// integration calls through ([`integration::interpret`]).
 pub fn plan_run(
-    definition: &str,
-    input: &str,
-    start: SystemTime,
-    context: &asl::Context,
-    opening: &str,
-    previous_event_id: i64,
+    attempt: &RunAttempt<'_>,
+    tasks: &dyn integration::Tasks,
 ) -> Planned {
-    plan_run_settling_after(
-        definition,
-        input,
-        start,
-        context,
-        opening,
-        previous_event_id,
-        EXECUTION_SETTLE_DELAY,
-    )
+    plan_run_settling_after(attempt, EXECUTION_SETTLE_DELAY, tasks)
 }
 
 /// Plan the attempt a `RedriveExecution` begins.
@@ -4913,32 +4963,28 @@ pub fn plan_run(
 /// Either way the attempt opens its history with [`EVENT_EXECUTION_REDRIVEN`] —
 /// "redriven executions append their event history to the existing event history" —
 /// and its outcome is owed to the clock exactly as a start's is.
+///
+/// `tasks` is the seam [`plan_run`] takes: the step the redrive continues from, and
+/// every state after it, makes its service-integration call exactly as the first
+/// attempt's did.
 pub fn plan_redrive(
-    definition: &str,
-    input: &str,
-    start: SystemTime,
-    context: &asl::Context,
+    attempt: &RunAttempt<'_>,
     from: Option<&asl::RedriveStep>,
-    previous_event_id: i64,
+    tasks: &dyn integration::Tasks,
 ) -> Planned {
     let Some(from) = from else {
-        return plan_run(
-            definition,
-            input,
-            start,
-            context,
-            EVENT_EXECUTION_REDRIVEN,
-            previous_event_id,
-        );
+        return plan_run(attempt, tasks);
     };
-    let run = asl::redrive(definition, input, start, context, from);
-    plan_from_run(
-        run,
+    let RunAttempt {
+        definition,
+        input,
         start,
-        EXECUTION_SETTLE_DELAY,
-        Some(EVENT_EXECUTION_REDRIVEN),
+        context,
+        opening,
         previous_event_id,
-    )
+    } = *attempt;
+    let run = asl::redrive(definition, input, start, context, from, tasks);
+    plan_from_run(run, start, EXECUTION_SETTLE_DELAY, Some(opening), previous_event_id)
 }
 
 /// What one planned run of a definition left for the store to record.
@@ -5013,15 +5059,19 @@ pub fn planned_map_run_bytes(planned: &[PlannedMapRun]) -> usize {
 /// already carries `status`, `stopDate` and the output — so it owes the clock
 /// nothing and passes `Duration::ZERO`.
 pub fn plan_run_settling_after(
-    definition: &str,
-    input: &str,
-    start: SystemTime,
-    context: &asl::Context,
-    opening: &str,
-    previous_event_id: i64,
+    attempt: &RunAttempt<'_>,
     settle: Duration,
+    tasks: &dyn integration::Tasks,
 ) -> Planned {
-    let run = asl::run(definition, input, start, context);
+    let RunAttempt {
+        definition,
+        input,
+        start,
+        context,
+        opening,
+        previous_event_id,
+    } = *attempt;
+    let run = asl::run(definition, input, start, context, tasks);
     plan_from_run(run, start, settle, Some(opening), previous_event_id)
 }
 
@@ -5039,8 +5089,12 @@ pub fn plan_run_settling_after(
 /// `Wait` state's `Timestamp` is measured against; `now` is the instant the reply
 /// arrived, which the continuation's own events are stamped from.
 ///
+/// `tasks` is what the `Task` states AFTER the reply make their service integration
+/// calls through, exactly as the start's own states did.
+///
 /// `None` when the definition no longer declares the state the task was scheduled at,
 /// so there is no continuation to record.
+#[allow(clippy::too_many_arguments)]
 pub fn plan_reply(
     definition: &str,
     input: &str,
@@ -5049,11 +5103,12 @@ pub fn plan_reply(
     context: &asl::Context,
     reply: &asl::ActivityReply,
     previous_event_id: i64,
+    tasks: &dyn integration::Tasks,
 ) -> Option<Planned> {
     // What the execution has already spent, which a definition-level `TimeoutSeconds`
     // counts: a task that stayed outstanding was part of this execution's run.
     let elapsed = now.duration_since(start).unwrap_or_default();
-    let run = asl::resume(definition, input, start, context, reply, elapsed)?;
+    let run = asl::resume(definition, input, start, context, reply, elapsed, tasks)?;
     Some(plan_from_run(
         run,
         now,
@@ -5274,6 +5329,7 @@ fn round_up_to(value: i64, increment: i64) -> i64 {
 }
 
 pub mod asl;
+pub mod integration;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

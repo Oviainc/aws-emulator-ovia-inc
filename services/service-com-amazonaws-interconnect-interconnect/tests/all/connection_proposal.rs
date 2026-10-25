@@ -29,9 +29,13 @@ const GATEWAY_ROWS: [(&str, Option<i64>); 2] = [
     ("ic-proposal-b", Some(64_512)),
 ];
 
-/// Every stored connection, as `ListConnections` reports it.
-async fn connections(emulator: &Emulator) -> Vec<Value> {
-    let listed = emulator.ic_ok("ListConnections", json!({})).await;
+/// Every stored connection of `region`, as `ListConnections` reports it there — a
+/// connection belongs to the region its create was signed for, so each region's
+/// endpoint lists only its own.
+async fn connections_in(emulator: &Emulator, region: &str) -> Vec<Value> {
+    let listed = emulator
+        .ic_ok_in(region, "ListConnections", json!({}))
+        .await;
     listed["connections"]
         .as_array()
         .expect("connections is a list")
@@ -237,10 +241,16 @@ async fn describe_connection_proposal_reports_the_proposal_each_activation_key_n
     }
 
     for (activation_key, (case, connection_id)) in &minted {
-        let label = format!("{} / {}", case.environment_id(), case.bandwidth);
+        let label = format!(
+            "{} / {} in {}",
+            case.environment_id(),
+            case.bandwidth,
+            case.region
+        );
 
         let proposal = emulator
-            .ic_ok(
+            .ic_ok_in(
+                case.region,
                 "DescribeConnectionProposal",
                 json!({ "activationKey": activation_key }),
             )
@@ -250,7 +260,11 @@ async fn describe_connection_proposal_reports_the_proposal_each_activation_key_n
         // The proposal and the connection are one record read two ways: the three
         // members both views carry agree.
         let fetched = emulator
-            .ic_ok("GetConnection", json!({ "identifier": connection_id }))
+            .ic_ok_in(
+                case.region,
+                "GetConnection",
+                json!({ "identifier": connection_id }),
+            )
             .await;
         let connection = &fetched["connection"];
         for member in ["bandwidth", "environmentId", "provider", "location"] {
@@ -264,7 +278,8 @@ async fn describe_connection_proposal_reports_the_proposal_each_activation_key_n
         // Describing is a READ: a second call answers identically and the connection
         // it names is untouched.
         let again = emulator
-            .ic_ok(
+            .ic_ok_in(
+                case.region,
                 "DescribeConnectionProposal",
                 json!({ "activationKey": activation_key }),
             )
@@ -274,7 +289,11 @@ async fn describe_connection_proposal_reports_the_proposal_each_activation_key_n
             "case {label:?}: expected a repeated describe to answer identically, got {again:?}"
         );
         let refetched = emulator
-            .ic_ok("GetConnection", json!({ "identifier": connection_id }))
+            .ic_ok_in(
+                case.region,
+                "GetConnection",
+                json!({ "identifier": connection_id }),
+            )
             .await;
         assert_eq!(
             refetched, fetched,
@@ -283,13 +302,20 @@ async fn describe_connection_proposal_reports_the_proposal_each_activation_key_n
     }
 
     // And nothing was created by the reads: the store still holds exactly the
-    // connections the creates made.
-    let stored = connections(&emulator).await;
+    // connections the creates made. Each region's endpoint lists only the
+    // connections created through it, so the whole set is the union over the
+    // regions the rows were created in.
+    let mut regions: Vec<&str> = minted.values().map(|(case, _)| case.region).collect();
+    regions.sort_unstable();
+    regions.dedup();
+    let mut stored = 0usize;
+    for region in &regions {
+        stored += connections_in(&emulator, region).await.len();
+    }
     assert_eq!(
-        stored.len(),
+        stored,
         minted.len(),
-        "expected the describes to have created nothing, got {} connections for {} proposals",
-        stored.len(),
+        "expected the describes to have created nothing, got {stored} connections for {} proposals",
         minted.len()
     );
 }

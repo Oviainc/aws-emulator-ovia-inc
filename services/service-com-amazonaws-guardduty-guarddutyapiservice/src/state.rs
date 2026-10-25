@@ -3511,6 +3511,11 @@ pub const ENTITY_SET_ACTIVATING: &str = "ACTIVATING";
 /// GuardDuty is using the list. See [`ENTITY_SET_INACTIVE`] for the enum.
 pub const ENTITY_SET_ACTIVE: &str = "ACTIVE";
 
+/// The `TrustedEntitySetStatus` a set an update asked to STOP using is in until
+/// the clock owes it [`ENTITY_SET_INACTIVE`]: the mirror of
+/// [`ENTITY_SET_ACTIVATING`]. See [`ENTITY_SET_INACTIVE`] for the enum.
+pub const ENTITY_SET_DEACTIVATING: &str = "DEACTIVATING";
+
 /// The `TrustedEntitySetStatus` a set whose deletion has been accepted is in: the
 /// set is on its way out of use. See [`ENTITY_SET_INACTIVE`] for the enum.
 pub const ENTITY_SET_DELETE_PENDING: &str = "DELETE_PENDING";
@@ -3521,7 +3526,8 @@ pub const ENTITY_SET_DELETE_PENDING: &str = "DELETE_PENDING";
 pub const ENTITY_SET_DELETED: &str = "DELETED";
 
 /// How long a set the caller asked to activate stays [`ENTITY_SET_ACTIVATING`],
-/// or a set whose delete was accepted stays [`ENTITY_SET_DELETE_PENDING`], before
+/// a set an update asked to stop using stays [`ENTITY_SET_DEACTIVATING`], or a
+/// set whose delete was accepted stays [`ENTITY_SET_DELETE_PENDING`], before
 /// the clock owes it the settled status.
 ///
 /// AWS documents no duration for taking an uploaded list into use or for removing
@@ -3782,7 +3788,7 @@ impl EntitySetRecord {
 
     /// Apply the status change the CLOCK already made due, if any.
     ///
-    /// The move out of [`ENTITY_SET_ACTIVATING`] or
+    /// The move out of [`ENTITY_SET_ACTIVATING`], [`ENTITY_SET_DEACTIVATING`] or
     /// [`ENTITY_SET_DELETE_PENDING`] was owed at [`Self::status_due_millis`]
     /// whether or not anybody called, which is why a reporting operation may apply
     /// it. `UpdatedAt` records the instant it was OWED, not the instant somebody
@@ -3798,11 +3804,46 @@ impl EntitySetRecord {
         // own status, so a status this function does not know stays where it is.
         self.status = match self.status.as_str() {
             ENTITY_SET_ACTIVATING => ENTITY_SET_ACTIVE.to_string(),
+            ENTITY_SET_DEACTIVATING => ENTITY_SET_INACTIVE.to_string(),
             ENTITY_SET_DELETE_PENDING => ENTITY_SET_DELETED.to_string(),
             other => other.to_string(),
         };
         self.status_due_millis = None;
         self.updated_at_millis = due;
+    }
+
+    /// Start the transition the `Activate` an UPDATE carries asks for, from
+    /// whatever status this set currently has: [`ENTITY_SET_ACTIVATING`] then
+    /// [`ENTITY_SET_ACTIVE`] when the caller asks GuardDuty to start using the
+    /// set, [`ENTITY_SET_DEACTIVATING`] then [`ENTITY_SET_INACTIVE`] when it asks
+    /// it to stop. It is the entity-set counterpart of
+    /// [`ThreatIntelSetRecord::set_activation`], shared by both entity-set
+    /// updates so the trusted and the threat set cannot drift on what `Activate`
+    /// does.
+    ///
+    /// Asking for the status the set has already settled on, or is already
+    /// transitioning to, owes nothing and answers `false`, so a repeated request
+    /// leaves the status and the instant the clock owes it exactly where they are
+    /// rather than re-opening a transition. Asking for the other one replaces
+    /// whatever was owed, so a request that reverses a transition still running
+    /// turns it around instead of queueing behind it.
+    ///
+    /// The transition is never immediate: the clock owes the settled status
+    /// [`ENTITY_SET_TRANSITION_MILLIS`] later and only [`Self::settle`]
+    /// materialises it, so a caller reading straight afterwards still observes
+    /// the transitional status.
+    pub fn set_activation(&mut self, activate: bool, now: i64) -> bool {
+        let (settled, transitional) = if activate {
+            (ENTITY_SET_ACTIVE, ENTITY_SET_ACTIVATING)
+        } else {
+            (ENTITY_SET_INACTIVE, ENTITY_SET_DEACTIVATING)
+        };
+        if self.status == settled || self.status == transitional {
+            return false;
+        }
+        self.status = transitional.to_string();
+        self.status_due_millis = Some(now.saturating_add(ENTITY_SET_TRANSITION_MILLIS));
+        true
     }
 }
 

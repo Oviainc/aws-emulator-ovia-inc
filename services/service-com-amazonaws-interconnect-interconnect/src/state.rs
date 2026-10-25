@@ -10,7 +10,9 @@
 //!   same records, so a `GetEnvironment` is byte-identical to the entry
 //!   `ListEnvironments` returned for that id.
 //! * **Connections** — caller-created. `CreateConnection` allocates one and every
-//!   other connection operation reads or mutates that stored record.
+//!   other connection operation reads or mutates that stored record. This service's
+//!   endpoints are regional, so each record belongs to the Region its create was
+//!   signed for and is resolved only for requests signed for that Region.
 //!
 //! Attach points are NOT held here: an attach point is a Direct Connect gateway of the
 //! account, so `ListAttachPoints` resolves them against the service that owns them
@@ -150,6 +152,10 @@ pub fn owed_progression(state: &str, entered: Instant) -> Option<PendingTransiti
 pub struct StoredConnection {
     /// The resource exactly as `GetConnection` returns it.
     pub connection: Connection,
+    /// The Region this connection belongs to: the one the `CreateConnection` that
+    /// allocated it was signed for, which its ARN also carries. Only a request
+    /// signed for this Region sees the record ([`visible_in`]).
+    pub region: String,
     /// The remote-account identifier the creator supplied, which the partner
     /// verifies; `DescribeConnectionProposal` reads it.
     pub remote_account: Option<RemoteAccountIdentifier>,
@@ -183,6 +189,17 @@ pub struct IdempotentCreate {
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
 
+/// Whether `stored` is a connection a request signed for `region` can see.
+///
+/// This service's endpoints are regional (`https://interconnect.{Region}.{dnsSuffix}`),
+/// so a connection belongs to the Region it was created in: every read, update and
+/// delete issued against another Region's endpoint sees nothing, exactly as it sees
+/// nothing for an identifier that was never allocated. ONE predicate, so every
+/// resolution path below scopes the store the same way.
+pub fn visible_in(stored: &StoredConnection, region: &str) -> bool {
+    stored.region == region
+}
+
 impl IdempotentCreate {
     /// Whether a repeated request is the SAME request this token created a
     /// connection for.
@@ -207,23 +224,31 @@ impl IdempotentCreate {
 pub struct ComAmazonawsInterconnectInterconnectState {
     /// The seeded Environment catalog, keyed by `environmentId`.
     pub environments: BTreeMap<String, Environment>,
-    /// The live connections, keyed by `id`. A deleted connection is kept in the
+    /// The live connections, keyed by `id`, each record carrying the Region it
+    /// belongs to: an operation reaches them through [`Self::connection_in`] /
+    /// [`Self::connections_in`], so one Region's endpoint never answers for
+    /// another's connections. A deleted connection is kept in the
     /// `deleted` state rather than dropped straight away, so a later
     /// `GetConnection` reports the terminal state instead of a 404 — and is
     /// evicted once [`DELETED_RECORD_RETENTION`] has elapsed. At most
     /// [`MAX_CONNECTIONS`] entries.
     pub connections: BTreeMap<String, StoredConnection>,
-    /// `clientToken` -> what that token created, so a retried `CreateConnection`
-    /// replays the first outcome instead of allocating a second connection, and a
-    /// retry carrying the same token with different parameters is refused. Every
+    /// `(Region, clientToken)` -> what that token created, so a retried
+    /// `CreateConnection` replays the first outcome instead of allocating a second
+    /// connection, and a retry carrying the same token with different parameters is
+    /// refused. Keyed by the Region too ([`idempotency_key`]): a token is scoped to
+    /// the regional endpoint that first carried it, so the same token sent to another
+    /// Region is one that endpoint has never seen. Every
     /// entry names a connection in `connections`, and a dangling one is dropped on
     /// the next operation, so this map is bounded by [`MAX_STORED_RECORDS`] however
     /// many tokens a caller invents.
-    pub idempotency_tokens: BTreeMap<String, IdempotentCreate>,
+    pub idempotency_tokens: BTreeMap<(String, String), IdempotentCreate>,
     /// `activationKey` -> connection id: the reverse index
     /// `DescribeConnectionProposal` / `AcceptConnectionProposal` resolve a
     /// partner-portal key through. One entry per stored connection, dropped with it,
-    /// so it is bounded by [`MAX_STORED_RECORDS`] too.
+    /// so it is bounded by [`MAX_STORED_RECORDS`] too. The connection the entry names
+    /// is still resolved through [`Self::connection_in`], so a key minted in one
+    /// Region resolves to nothing in another.
     pub activation_keys: BTreeMap<String, String>,
 }
 
@@ -322,12 +347,50 @@ impl ComAmazonawsInterconnectInterconnectState {
             .map_or_else(|| stored.connection.state.clone(), |p| p.state.clone())
     }
 
+    /// The stored connection `identifier` names IN `region`, which is the only
+    /// connection a request signed for that Region can reach by identifier.
+    ///
+    /// A connection belongs to the Region it was created in ([`visible_in`]), so an
+    /// identifier allocated through another Region's endpoint resolves to nothing
+    /// here — the same answer an identifier that was never allocated gets.
+    pub fn connection_in(&self, region: &str, identifier: &str) -> Option<&StoredConnection> {
+        self.connections
+            .get(identifier)
+            .filter(|stored| visible_in(stored, region))
+    }
+
+    /// [`Self::connection_in`] for the operations that MUTATE the record they
+    /// resolve, scoping the store by the same predicate.
+    pub fn connection_in_mut(
+        &mut self,
+        region: &str,
+        identifier: &str,
+    ) -> Option<&mut StoredConnection> {
+        self.connections
+            .get_mut(identifier)
+            .filter(|stored| visible_in(stored, region))
+    }
+
+    /// Every connection a request signed for `region` sees, in `ConnectionId` order
+    /// (`connections` is a `BTreeMap`, so iteration already is).
+    pub fn connections_in<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = (&'a String, &'a StoredConnection)> {
+        self.connections
+            .iter()
+            .filter(move |(_, stored)| visible_in(stored, region))
+    }
+
     /// The stored connection an `AmazonResourceName` names, for the tagging
     /// operations that identify a resource by its ARN rather than by its id.
     ///
     /// The ARN identifies the resource in FULL — partition, region and account
     /// included — so an ARN whose fields differ from the stored one names a
-    /// resource this store does not hold, exactly as an unknown id does. A
+    /// resource this store does not hold, exactly as an unknown id does. The
+    /// Region a record belongs to is one of those fields, so matching the stored
+    /// ARN is what scopes these operations to the Region the caller addressed
+    /// (the handlers refuse an ARN from another scope before getting here). A
     /// connection that has reached the terminal `deleted` state is gone too: the
     /// store keeps the record readable so a caller polling a delete sees the
     /// terminal state, but a deleted resource has no tag set to read or change.
@@ -382,6 +445,12 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
     ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
         .map_or_else(|| DEFAULT_REGION.to_string(), |scope| scope.region)
+}
+
+/// The key a `clientToken` is held under in [`ComAmazonawsInterconnectInterconnectState::idempotency_tokens`]:
+/// the Region the request addressed, then the token itself.
+pub fn idempotency_key(region: &str, token: &str) -> (String, String) {
+    (region.to_string(), token.to_string())
 }
 
 /// Two `Provider` values name the same partner on the same side of the union.

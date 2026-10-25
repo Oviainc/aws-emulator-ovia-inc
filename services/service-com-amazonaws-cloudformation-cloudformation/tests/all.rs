@@ -125,3 +125,5 @@ mod unrecognized_resource_types;
 mod validate_template;
 #[path = "all/waf_regional_ip_set_resources.rs"]
 mod waf_regional_ip_set_resources;
+#[path = "all/wait_conditions.rs"]
+mod wait_conditions;

@@ -351,7 +351,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The permission statement that's added to the function policy" is what this
         // call answers with, so it is rendered once and both stored and reported.
         let added = statement.to_json();
-        policy.statements.push(statement);
+        policy.add_statement(statement);
 
         let size = policy.to_json().len();
         if size > crate::state::MAX_POLICY_SIZE_BYTES {

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTrustedEntitySet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateTrustedEntitySet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies the members a request carries to the trusted entity set the
+//! request's detector holds under `TrustedEntitySetId`, leaving every member the
+//! request omits where it was, so `GetTrustedEntitySet` reports the updated set.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateTrustedEntitySet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +145,163 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateTrustedEntitySet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateTrustedEntitySetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateTrustedEntitySet"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateTrustedEntitySetErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        // The two documented value rules the model cannot express hold of the
+        // entity set's members whichever call writes them, so they are checked
+        // here exactly as `CreateTrustedEntitySet` checks them — and BEFORE
+        // anything is written, so a refused update leaves the stored set and this
+        // state's clock untouched. A member the request omits is not checked: it
+        // is not being written.
+        if input
+            .name
+            .as_deref()
+            .is_some_and(|name| !crate::state::is_entity_set_name(name))
+        {
+            return Err(bad_request(crate::state::invalid_parameter_message(
+                crate::state::ENTITY_SET_NAME_MEMBER,
+            )));
+        }
+        // "The format of the Location URL must be a valid Amazon S3 URL format.
+        // Invalid URL formats will result in an error, regardless of whether you
+        // activate the entity set or not"
+        // (`smithy_query(query="doc",shape="CreateTrustedEntitySetRequest",member="Location")`):
+        // the rule is the entity set's own, so an update cannot leave a location
+        // in the store that a create would have refused, and the check does not
+        // depend on `Activate`.
+        if input
+            .location
+            .as_deref()
+            .is_some_and(|location| !crate::state::is_s3_location(location))
+        {
+            return Err(bad_request(crate::state::invalid_parameter_message(
+                crate::state::ENTITY_SET_LOCATION_MEMBER,
+            )));
+        }
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+
+        // Every refusal is classified over an IMMUTABLE borrow, before the clock
+        // moves — the ordering `CreateTrustedEntitySet` and
+        // `DeleteTrustedEntitySet` follow.
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
+            // Classified from the REQUEST, the way every other entity-set
+            // operation classifies a `DetectorId` it cannot resolve.
+            return Err(bad_request(crate::state::detector_id_rejection(
+                &input.detector_id,
+            )));
+        };
+        // A set whose delete has already been accepted is no longer one the
+        // account can act on, so it is refused exactly like an id the detector
+        // never held: an update would otherwise walk a `DELETED` record back into
+        // use.
+        if detector
+            .trusted_entity_sets
+            .get(&input.trusted_entity_set_id)
+            .is_none_or(crate::state::EntitySetRecord::is_deleting)
+        {
+            return Err(bad_request(crate::state::minted_id_rejection(
+                crate::state::TRUSTED_ENTITY_SET_ID_MEMBER,
+                &input.trusted_entity_set_id,
+            )));
+        }
+
+        // Past the refusals this is a MUTATION, so it advances this state's clock:
+        // the instant it hands out is what the set's `UpdatedAt` records and what a
+        // transition `Activate` starts is owed from.
+        let now = state.tick_millis();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            // The detector resolved above under the same lock, so this cannot be
+            // reached; answering the modelled server fault keeps it from panicking.
+            return Err(
+                UpdateTrustedEntitySetErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let Some(set) = detector
+            .trusted_entity_sets
+            .get_mut(&input.trusted_entity_set_id)
+        else {
+            // The id resolved above under the same lock, so this cannot be reached.
+            return Err(
+                UpdateTrustedEntitySetErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        // The status change the clock already owed this set, materialised before
+        // this call looks at the status — the same write `GetTrustedEntitySet`
+        // performs, so this shows no caller a status a read would not have shown
+        // anyway, and `Activate` is compared against the status the set has really
+        // got to.
+        set.settle(now);
+
+        // Every member but the two ids is OPTIONAL, and the update documents each
+        // one as the entity set's own value
+        // (`smithy_query(operation="UpdateTrustedEntitySet")`), so this is a
+        // PARTIAL update: a member the request carries replaces the stored one, a
+        // member it omits leaves the stored one exactly where it was. `Format` is
+        // not among them — the format of an existing set cannot be changed — and
+        // neither is `Tags`, which `TagResource` owns.
+        let mut changed = false;
+        if let Some(name) = input.name {
+            changed |= set.name != name;
+            set.name = name;
+        }
+        if let Some(location) = input.location {
+            changed |= set.location != location;
+            set.location = location;
+        }
+        // `ExpectedBucketOwner` is "the Amazon Web Services account ID that owns
+        // the Amazon S3 bucket specified in the location parameter": an update that
+        // provides it records it, and one that does not leaves whatever the create
+        // or an earlier update recorded.
+        if let Some(owner) = input.expected_bucket_owner {
+            changed |= set.expected_bucket_owner.as_deref() != Some(owner.as_str());
+            set.expected_bucket_owner = Some(owner);
+        }
+
+        // "A boolean value that indicates whether GuardDuty is to start using this
+        // updated trusted entity set"
+        // (`smithy_query(operation="UpdateTrustedEntitySet")`): the same activation
+        // transition `CreateTrustedEntitySet` starts, so it goes through the
+        // record's own `set_activation` — asking for the status the set already has
+        // owes nothing, and asking for the other one opens the transitional status
+        // only the clock settles.
+        if let Some(activate) = input.activate {
+            changed |= set.set_activation(activate, now);
+        }
+
+        // `UpdatedAt` moves only when this call really changed the set, so an
+        // update that writes back the values the set already held reports what it
+        // did: nothing.
+        if changed {
+            set.updated_at_millis = now;
+        }
+
+        // `Unit` output: success is the modelled 200 and an empty body. The
+        // detector's own `UpdatedAt` does not move — the set of sub-resources it
+        // holds is unchanged, and only this entity set's record changed.
+        Ok(UpdateTrustedEntitySetOutput {})
     }
+}
+
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` and its `type`
+/// member — the class `CreateTrustedEntitySet` and `GetTrustedEntitySet` refuse
+/// under.
+fn bad_request(message: impl Into<String>) -> UpdateTrustedEntitySetError {
+    crate::scaffolded::Scaffolded::invalid_input(message)
 }
