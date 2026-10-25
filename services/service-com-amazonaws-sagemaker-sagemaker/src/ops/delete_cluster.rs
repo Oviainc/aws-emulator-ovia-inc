@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: begins the deletion of the HyperPod cluster `ClusterName` names (by name
+//! or by ARN) in `crate::state` and answers its `ClusterArn`. The cluster reports
+//! `Deleting` from this call until the clock completes the teardown
+//! ([`crate::state::CLUSTER_RELEASED_AFTER`]), after which it is gone for every caller; a
+//! cluster the service is already moving is refused with the modelled
+//! `ConflictException`, and an identifier this account holds no cluster under with
+//! `ResourceNotFound`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +140,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCluster"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The deletions the clock already completed are materialised first, so a cluster
+        // whose teardown is done is gone here too and the name and quota slot it held are
+        // free again. Each was due at its stored instant whether or not anybody called,
+        // so this call's observer makes no difference to the result.
+        store.release_deleted_clusters(now);
+
+        // `ClusterName` is a `ClusterNameOrArn`: "the string name or the Amazon Resource
+        // Name (ARN)", so both forms find the one stored record — through the same lookup
+        // every other cluster operation resolves that member with.
+        let key = store.cluster_key(&input.cluster_name);
+        let Some(cluster) = key.and_then(|key| store.clusters.get_mut(&key)) else {
+            return Err(DeleteClusterErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!("Could not find cluster {}.", input.cluster_name)),
+            })
+            .into());
+        };
+
+        // The provisioning the clock already owed is materialised BEFORE the status is
+        // judged, so a cluster whose `InService` had fallen due is deleted rather than
+        // refused for a `Creating` it had already left.
+        cluster.settle_status(now);
+
+        // A cluster the service is already moving cannot take a second change at the same
+        // time: that is the conflict this operation models. A repeat of this call lands
+        // here too, because the first one left the cluster `Deleting`.
+        if !cluster.accepts_deletion() {
+            return Err(DeleteClusterErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Cluster \"{}\" cannot be deleted while it is in {} status.",
+                    cluster.arn, cluster.status
+                )),
+            })
+            .into());
+        }
+
+        // The record is kept until the clock completes the teardown, so the `Deleting`
+        // status a caller reads straight after this call is observable; past that instant
+        // every lookup answers as if the cluster were gone.
+        cluster.begin_deletion(now);
+        let arn = cluster.arn.clone();
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(DeleteClusterOutput { cluster_arn: arn })
     }
 }
