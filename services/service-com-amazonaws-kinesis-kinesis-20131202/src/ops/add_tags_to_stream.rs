@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddTagsToStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddTagsToStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddTagsToStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Assigns the request's `Tags` to the stream it names in `crate::state`'s `streams`
+//! store, and answers the modelled empty body. A key the stream already carries takes the
+//! new value and every other tag it carries stays, so the stored tag set is the union of
+//! what was there and what the request assigned; `ListTagsForStream` reports that stored
+//! set.
+//!
+//! The stream is resolved by `StreamName`, by `StreamARN` or by both, through the one
+//! lookup every operation of this service that addresses a stream shares
+//! ([`crate::state::ComAmazonawsKinesisKinesis20131202State::resolve_stream_mut`]). A
+//! request that would take the stream past the documented ceiling of tags is refused with
+//! the modelled `LimitExceededException` BEFORE the stored map grows, and a stream that is
+//! not `ACTIVE` yet is refused with the modelled `ResourceInUseException`.
 //!
 //! ## Shape of an operation
 //!
@@ -114,7 +118,14 @@ impl ::aws_smithy_schema::serde::SerializableStruct for AddTagsToStreamOutput {
 // here — hence the `AddTagsToStreamError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#AddTagsToStream")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#AddTagsToStream",
+    // `InternalFailureException` is widened in with `extra_errors`: this SERVICE models it
+    // ("The processing of the request failed because of an unknown error, exception, or
+    // failure"), the operation shape does not list it, and it is the only honest answer
+    // for a service mounted on an engine that holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum AddTagsToStreamErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -122,6 +133,7 @@ pub enum AddTagsToStreamErrorModeled {
     LimitExceededException(LimitExceededException),
     ResourceInUseException(ResourceInUseException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -147,6 +159,116 @@ impl From<AddTagsToStreamErrorModeled> for AddTagsToStreamError {
 /// concrete engine where it mounts the service, not here.
 pub struct AddTagsToStream<Eng> {
     engine: ::std::sync::Arc<Eng>,
+}
+
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region the stream lives in, and how the call
+/// ended. No stream name, no ARN and no tag: a log sink needs none of them to attribute the
+/// change, and a tag value is caller data.
+fn audit(akid: &str, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "AddTagsToStream",
+        akid = %akid,
+        region = %region,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
+/// The modelled refusal for a request whose `StreamName` / `StreamARN` pair names no stream
+/// of this account and region, worded exactly as the reads word it: one rule, one phrasing,
+/// for every operation that addresses a stream.
+fn lookup_refusal(
+    failure: crate::state::StreamLookupFailure,
+    input: &AddTagsToStreamInput,
+) -> AddTagsToStreamError {
+    match failure {
+        crate::state::StreamLookupFailure::Unspecified => {
+            AddTagsToStreamErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some(crate::state::STREAM_IDENTIFIER_REQUIRED_MESSAGE.to_string()),
+            })
+        }
+        crate::state::StreamLookupFailure::Mismatch => {
+            AddTagsToStreamErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some(crate::state::STREAM_IDENTIFIER_MISMATCH_MESSAGE.to_string()),
+            })
+        }
+        crate::state::StreamLookupFailure::NotFound => {
+            AddTagsToStreamErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::stream_not_found_message(
+                    stream_identifier(input),
+                )),
+            })
+        }
+    }
+    .into()
+}
+
+/// The identifier the request addressed the stream by, which is what a refusal names.
+fn stream_identifier(input: &AddTagsToStreamInput) -> &str {
+    input
+        .stream_name
+        .as_deref()
+        .or(input.stream_arn.as_deref())
+        .unwrap_or_default()
+}
+
+/// Assign the request's tags to the stream it names, or answer the modelled refusal that
+/// stands in the way. The whole write lives here so the caller holds the store's lock for
+/// exactly this long.
+fn assign_tags(
+    store: &mut crate::state::ComAmazonawsKinesisKinesis20131202State,
+    region: &str,
+    now: ::std::time::SystemTime,
+    input: &AddTagsToStreamInput,
+) -> Result<(), AddTagsToStreamError> {
+    // `StreamId` is documented "Not Implemented. Reserved for future use", so no stream
+    // carries one and a request naming only that member names no stream.
+    let stream = store
+        .resolve_stream_mut(
+            region,
+            input.stream_name.as_deref(),
+            input.stream_arn.as_deref(),
+        )
+        .map_err(|failure| lookup_refusal(failure, input))?;
+
+    // "The resource is not available for this operation. For successful operation, the
+    // resource must be in the ACTIVE state" (`ResourceInUseException`): a stream still
+    // inside the transition its create armed is not available for a write to its tags.
+    let status = stream.status(now);
+    if status != crate::state::STREAM_ACTIVE {
+        return Err(AddTagsToStreamErrorModeled::ResourceInUseException(
+            ResourceInUseException {
+                message: Some(crate::state::stream_not_active_message(
+                    stream_identifier(input),
+                    status,
+                )),
+            },
+        )
+        .into());
+    }
+
+    // "You can assign up to 50 tags to a data stream" — the ceiling is on what the STREAM
+    // carries once the request is served, not on what the request names, and it is checked
+    // BEFORE the stored map grows. An assignment overwrites a key the stream already
+    // carries, so re-tagging a fully tagged stream stays inside the ceiling.
+    let resulting = stream.tag_count_with(&input.tags);
+    if resulting > crate::state::MAX_STREAM_TAGS {
+        return Err(AddTagsToStreamErrorModeled::LimitExceededException(
+            LimitExceededException {
+                message: Some(format!(
+                    "assigning these tags would leave the stream carrying {resulting} tags, \
+                     past the {} tags one stream may carry",
+                    crate::state::MAX_STREAM_TAGS
+                )),
+            },
+        )
+        .into());
+    }
+
+    stream.assign_tags(input.tags.clone());
+    Ok(())
 }
 
 impl<Eng> AddTagsToStream<Eng> {
@@ -175,18 +297,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddTagsToStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddTagsToStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddTagsToStream"))
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region whose streams this request
+        // addresses, since a stream name "is also scoped by Amazon Web Services Region".
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, "unavailable");
+            AddTagsToStreamError::from(AddTagsToStreamErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the stream store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let outcome = assign_tags(&mut store, &region, now, &input);
+        drop(store);
+
+        audit(
+            &akid,
+            &region,
+            if outcome.is_ok() { "tagged" } else { "refused" },
+        );
+        // `AddTagsToStream` models no output members, so a served request answers the
+        // modelled empty body.
+        outcome.map(|()| AddTagsToStreamOutput)
     }
 }
