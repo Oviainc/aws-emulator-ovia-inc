@@ -1397,15 +1397,26 @@ pub fn message_attribute_bytes(attributes: &HashMap<String, MessageAttributeValu
         .sum()
 }
 
-/// One message `Publish` delivered to one subscription.
+/// One message `Publish` FANNED OUT to one subscription.
+///
+/// What a publish handed to the subscription, not what the subscription's endpoint received:
+/// the record is written for every confirmed subscription of the topic, including the
+/// protocols this emulator has no delivery path for and the ones whose endpoint refuses or
+/// never grants the delivery. What an endpoint really holds is observed on the endpoint.
+///
+/// The message body and its attributes are held behind an `Arc`, because one publish is
+/// recorded against EVERY subscription of the topic: sharing them keeps one publish's cost
+/// one body and N pointers rather than N copies of a body that may be up to the topic's
+/// `MaximumMessageSize`, which is what bounds the (subscriptions x body bytes) product of a
+/// single request. The body is immutable once published, so there is nothing to clone it for.
 #[derive(Debug, Clone)]
 pub struct PublishedMessage {
     pub message_id: String,
     pub topic_arn: String,
-    pub message: String,
+    pub message: ::std::sync::Arc<str>,
     pub subject: Option<String>,
     pub message_structure: Option<String>,
-    pub message_attributes: HashMap<String, MessageAttributeValue>,
+    pub message_attributes: ::std::sync::Arc<HashMap<String, MessageAttributeValue>>,
     pub message_group_id: Option<String>,
     pub message_deduplication_id: Option<String>,
     /// Set only for a FIFO topic, which is the only kind SNS sequences.
@@ -1419,6 +1430,10 @@ impl PublishedMessage {
     /// is either caller-supplied or derived from caller input, plus a flat allowance
     /// for the fixed-size parts. A field left out of this sum is a field a caller
     /// could grow without the ceiling noticing.
+    ///
+    /// The shared body is counted in FULL for every record that holds a pointer to it, which
+    /// over-counts what is actually held: the ceiling is a bound, so counting the sharing
+    /// would weaken it, and a bound that errs high evicts sooner rather than later.
     pub fn retained_bytes(&self) -> usize {
         /// The fixed-size parts of the record (the timestamp, the `Option`/`String`
         /// headers, the map's own allocation) that no caller varies.

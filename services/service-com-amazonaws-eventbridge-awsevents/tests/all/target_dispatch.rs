@@ -443,7 +443,7 @@ impl Observe {
                 .values()
                 .flatten()
                 .filter(|published| &published.topic_arn == arn)
-                .map(|published| published.message.clone())
+                .map(|published| published.message.to_string())
                 .collect(),
             Self::StateMachine(arn) => {
                 let (status, listed) = sfn(

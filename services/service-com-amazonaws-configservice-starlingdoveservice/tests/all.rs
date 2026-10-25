@@ -99,3 +99,9 @@ mod aggregate_config_rule_compliance_summary;
 mod external_evaluation;
 #[path = "all/configuration_aggregator_sources_status.rs"]
 mod configuration_aggregator_sources_status;
+#[path = "all/put_evaluations.rs"]
+mod put_evaluations;
+#[path = "all/conformance_pack_rule_names.rs"]
+mod conformance_pack_rule_names;
+#[path = "all/remediation_execution.rs"]
+mod remediation_execution;

@@ -359,6 +359,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // Config hands the evaluation it just invoked a `ResultToken` where the rule is
+        // one whose verdicts are DELIVERED back to Config rather than computed by it,
+        // which is what `PutEvaluations` quotes to say which rule and which invocation
+        // a verdict belongs to. It is minted after the write either branch made, so a
+        // rule pointed at another source stops carrying one.
+        if let Some(rule) = store.config_rules.get_mut(name) {
+            rule.mint_evaluation_result_token(now);
+        }
+
         Ok(PutConfigRuleOutput)
     }
 }
