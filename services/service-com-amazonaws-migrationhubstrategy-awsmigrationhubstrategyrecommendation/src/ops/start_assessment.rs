@@ -276,6 +276,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             completion_due: Some(now + crate::state::COMPLETION_SPAN),
         };
         portfolio.assessments.insert(id.clone(), assessment);
+        // The assessment is observable on the SERVERS as well as on its own record:
+        // `ServerDetail$dataCollectionStatus` is "the status of assessment for the
+        // server", so every server this assessment covers is now collecting.
+        portfolio.begin_server_collection();
         // `GetLatestAssessmentId` answers with the most recently started assessment of
         // the Region it is asked in.
         portfolio.latest_assessment_id = Some(id.clone());
