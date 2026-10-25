@@ -350,6 +350,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // for.
             crate::state::validate_template_body(body)
                 .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+            // The documented per-template quotas, the ceilings `DescribeAccountLimits`
+            // advertises for this account: a body past one is refused before the change
+            // set is created, since it is no plan CloudFormation would execute.
+            crate::state::validate_template_quotas(body)
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
             // A change set is a plan over a template CloudFormation can deploy: a body
             // declaring a resource type it does not recognise is refused before the change
             // set is created (`crate::state::resource_types`).

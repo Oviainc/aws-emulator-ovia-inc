@@ -160,9 +160,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reports on is the POLICY, and an absent resource is the modelled 404 rather
         // than a success carrying nothing.
         let Some(policy) = bucket.policy.clone() else {
-            return Err(refusal(crate::state::LookupError::not_found(format!(
-                "vector bucket policy not found: {bucket_name}"
-            ))));
+            return Err(refusal(crate::state::LookupError::not_found(
+                crate::state::POLICY_NOT_FOUND,
+            )));
         };
         Ok(GetVectorBucketPolicyOutput {
             policy: Some(policy),

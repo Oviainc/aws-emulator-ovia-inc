@@ -936,6 +936,12 @@ async fn a_well_formed_request_keeps_the_answer_it_had() {
             "ListTagsForResource",
             serde_json::json!({"ResourceArn": arn.clone()}),
         ),
+        // A run of a workflow this endpoint does not hold is a lookup miss too: the
+        // stop resolves the run, and a workflow that is absent holds none.
+        (
+            "StopWorkflowRun",
+            serde_json::json!({"WorkflowArn": arn.clone(), "RunId": "run-01"}),
+        ),
     ];
     for (operation, body) in implemented_cases {
         let (status, answered) = harness.call(operation, body).await;
@@ -987,10 +993,6 @@ async fn a_well_formed_request_keeps_the_answer_it_had() {
         (
             "UntagResource",
             serde_json::json!({"ResourceArn": arn.clone(), "TagKeys": ["team"]}),
-        ),
-        (
-            "StopWorkflowRun",
-            serde_json::json!({"WorkflowArn": arn.clone(), "RunId": "run-01"}),
         ),
         (
             "ListTaskInstances",

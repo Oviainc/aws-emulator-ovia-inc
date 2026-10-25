@@ -199,9 +199,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// The response is the record that was written, never a re-echo of the request: `Arn`
     /// is computed from this service's namespace, the request's region and the name,
     /// `CreatedTime`/`LastUpdatedTime` come from the clock, `EvaluationType` follows from
-    /// which of the two mutually exclusive SLI configs was supplied, `Goal` carries the
-    /// defaults the model documents, and `MetricSourceType` is derived from the source the
-    /// SLI config names. A second create under the same name is a `ConflictException`.
+    /// which of the two mutually exclusive SLI configs was supplied — a request that
+    /// supplies neither defines no indicator and is refused, so every stored record carries
+    /// one — `Goal` carries the defaults the model documents, and `MetricSourceType` is
+    /// derived from the source the SLI config names. A second create under the same name is
+    /// a `ConflictException`.
     ///
     /// `CreateRecommendedSlo` needs no branch of its own. Its model doc states exactly one
     /// effect — "When set to true, you don't need to specify the MetricThreshold or
@@ -216,13 +218,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Model doc on both members: "You can't specify both RequestBasedSliConfig and
-        // SliConfig in the same operation." The model cannot express the exclusion, so the
-        // boundary validator let it through and it is refused here.
-        if input.sli_config.is_some() && input.request_based_sli_config.is_some() {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "You can't specify both RequestBasedSliConfig and SliConfig in the same operation.",
-            ));
+        // An SLO is defined by EXACTLY ONE service level indicator: the two configs are
+        // mutually exclusive ("You can't specify both RequestBasedSliConfig and SliConfig in
+        // the same operation") and one of them is what makes the record an SLO at all — it
+        // is where the request "specif[ies] whether it is a period-based SLO or a
+        // request-based SLO", and the only source of `EvaluationType` and
+        // `MetricSourceType`. The model can express neither half of that rule, so the
+        // boundary validator admits both shapes and each is refused here, BEFORE any state
+        // is read or written: a refused create stores nothing.
+        if let Some(message) = crate::state::exclusive_sli_configs_refusal(
+            input.sli_config.as_ref(),
+            input.request_based_sli_config.as_ref(),
+        )
+        .or_else(|| {
+            crate::state::absent_sli_config_refusal(
+                input.sli_config.as_ref(),
+                input.request_based_sli_config.as_ref(),
+            )
+        }) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        // The maximum this resource's own `Tags` doc states — "You can associate as many as
+        // 50 tags with an SLO" — which the modelled `TagList` bound is wider than.
+        if let Some(message) = crate::state::tag_count_refusal(input.tags.as_deref()) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {

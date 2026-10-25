@@ -205,31 +205,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
 
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        store.materialise_due(now);
 
         // One lookup resolves the stream, refuses it if it is not accepting data, and
         // mints one id per record IN INPUT ORDER — so the response entries line up
         // positionally with the records the caller sent, and no id is handed out for a
         // record that was not stored. A record the buffer had no room for comes back as
         // `None` and is reported in its own entry below, which is what
-        // `RequestResponses`/`FailedPutCount` are for.
+        // `RequestResponses`/`FailedPutCount` are for. The guard lives in this block
+        // alone: the delivery below is awaited with no lock of this store held.
         let records: Vec<Vec<u8>> = input
             .records
             .into_iter()
             .map(|record| record.data)
             .collect();
-        let (record_ids, encrypted) =
-            match store.ingest_records(&input.delivery_stream_name, records, now) {
-                Ok(stored) => stored,
-                Err(crate::state::StreamRefusal::NoSuchStream) => return Err(no_such_stream()),
-                Err(crate::state::StreamRefusal::NotActive(status)) => {
-                    return Err(stream_not_active(&input.delivery_stream_name, status))
-                }
-                Err(crate::state::StreamRefusal::SourceNotCloudWatchLogs) => {
-                    return Err(not_from_cloudwatch_logs(&input.delivery_stream_name))
-                }
-            };
+        let ingested = {
+            let mut store = state.lock();
+            store.materialise_due(now);
+            store.ingest_records(&input.delivery_stream_name, records, now)
+        };
+        let (record_ids, encrypted) = match ingested {
+            Ok(stored) => stored,
+            Err(crate::state::StreamRefusal::NoSuchStream) => return Err(no_such_stream()),
+            Err(crate::state::StreamRefusal::NotActive(status)) => {
+                return Err(stream_not_active(&input.delivery_stream_name, status))
+            }
+            Err(crate::state::StreamRefusal::SourceNotCloudWatchLogs) => {
+                return Err(not_from_cloudwatch_logs(&input.delivery_stream_name))
+            }
+        };
 
         // "If the record is successfully added to your Firehose stream, it receives a
         // record ID. If the record fails to be added, the result includes an error code
@@ -253,6 +256,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .filter(|entry| entry.error_code.is_some())
             .count();
+
+        // The buffer these records joined is delivered to the stream's destination once it
+        // is due. This put delivers only what an EARLIER buffer was already owed (nothing
+        // this batch is in can be due yet) and starts the task that waits for the clock,
+        // so the delivery happens without any further Firehose call.
+        crate::state::delivery::deliver_due(
+            &*self.engine,
+            now,
+            crate::state::delivery::Extractions::LeaveToThePump,
+        )
+        .await;
+        crate::state::delivery::drive_delivery_clock(&self.engine);
 
         Ok(PutRecordBatchOutput {
             failed_put_count: i32::try_from(failed_put_count).unwrap_or(i32::MAX),

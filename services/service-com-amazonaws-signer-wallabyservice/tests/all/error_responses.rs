@@ -13,8 +13,12 @@
 //!   that certificate and that supplies no `signingMaterial` is refused 400 and
 //!   stores nothing — while a platform AWS Signer issues the certificate for
 //!   itself takes none;
-//! * a profile's STORED status is what decides which transitions it admits: a
-//!   REVOKED profile cannot be canceled, and the refusal names that status.
+//! * a refusal uses one of the shapes the refusing OPERATION's own model
+//!   declares, so the condition of a stored resource is never answered with a
+//!   shape borrowed from another operation's error set — and where no modelled
+//!   shape covers a stored status, the call is not refused at all: the
+//!   transition applies where its documented source status holds and a terminal
+//!   status is left as it stands.
 //!
 //! The rows differ along what the rules generalise over: which condition was
 //! refused, which operation refused it, the platform, and the profile's status.
@@ -342,15 +346,6 @@ async fn every_refusal_names_its_condition_in_the_modelled_code_member() {
             code: "ProfileRevoked".to_string(),
         },
         RefusalCase {
-            case: "CancelSigningProfile on a revoked profile",
-            method: "DELETE",
-            uri: "/signing-profiles/Revoked_Profile".to_string(),
-            body: None,
-            status: 400,
-            shape: "ValidationException",
-            code: "ProfileRevoked".to_string(),
-        },
-        RefusalCase {
             case: "PutSigningProfile with no signing material",
             method: "PUT",
             uri: "/signing-profiles/No_Material_Profile".to_string(),
@@ -530,20 +525,21 @@ async fn signing_material_is_required_exactly_on_the_platforms_outside_the_catal
     }
 }
 
-/// Which cancels a profile's status admits: an `Active` profile is canceled, a
-/// `Canceled` one stays canceled, and a `Revoked` one is REFUSED — the cancel
-/// moves nothing. A profile that was revoked and then RE-PUT is active again, so
-/// the same cancel is admitted: the refusal follows the stored status, not the
-/// profile's history.
+/// What a cancel does to each status a profile can be in: an `Active` profile
+/// becomes `Canceled`, and a profile already in a terminal, non-signing status
+/// keeps it — the call answers the recorded 204 either way, because this
+/// operation's modelled error set carries no refusal for the stored status. A
+/// profile that was revoked and then RE-PUT is active again, so the cancel moves
+/// it: the transition follows the stored status, not the profile's history.
 #[tokio::test]
-async fn a_cancel_is_admitted_or_refused_by_the_profiles_status() {
+async fn a_cancel_moves_only_a_profile_its_source_status_holds_for() {
     // One row per status a profile can be in when the cancel arrives, plus the
     // row that reaches `Active` again through a re-put. 204 is the recorded
-    // success for this DELETE; 400 is the refusal.
+    // success for this DELETE.
     let rows: [(&str, &str, u16, &str); 4] = [
         ("Active", "Active_Cancel", 204, "Canceled"),
         ("Canceled", "Canceled_Cancel", 204, "Canceled"),
-        ("Revoked", "Revoked_Cancel", 400, "Revoked"),
+        ("Revoked", "Revoked_Cancel", 204, "Revoked"),
         ("Revoked then re-put", "Reput_Cancel", 204, "Canceled"),
     ];
 
@@ -581,23 +577,13 @@ async fn a_cancel_is_admitted_or_refused_by_the_profiles_status() {
             "case {status_before}: expected HTTP {expected_status}, got {} {:?}",
             answer.status, answer.body
         );
-        if expected_status != 204 {
-            assert_eq!(
-                answer.code(),
-                Some("ProfileRevoked"),
-                "case {status_before}: expected the code to name the status that forbids the \
-                 cancel, got {:?}",
-                answer.body
-            );
-            assert_eq!(
-                answer.error_type.as_deref(),
-                Some("ValidationException"),
-                "case {status_before}: expected an x-amzn-errortype header, got {:?}",
-                answer.error_type
-            );
-        }
+        assert!(
+            answer.error_type.is_none(),
+            "case {status_before}: expected no x-amzn-errortype on a success, got {:?}",
+            answer.error_type
+        );
 
-        // The status the cancel left behind — a refusal moved nothing.
+        // The status the cancel left behind.
         let got = get_profile(&router, name).await;
         assert_eq!(
             got.str_member("status"),

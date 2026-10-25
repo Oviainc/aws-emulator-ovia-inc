@@ -59,6 +59,8 @@ mod service_groups;
 mod sli_metric_type;
 #[path = "all/slo_evaluation_kind.rs"]
 mod slo_evaluation_kind;
+#[path = "all/slo_indicator_required.rs"]
+mod slo_indicator_required;
 #[path = "all/slo_lifecycle.rs"]
 mod slo_lifecycle;
 #[path = "all/state_roundtrip.rs"]

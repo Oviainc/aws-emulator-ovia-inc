@@ -315,14 +315,21 @@ async fn an_update_of_the_same_kind_replaces_the_indicator_and_keeps_the_kind() 
     }
 }
 
-/// An SLO stored with NO indicator is of no kind yet, so the first config of either kind is
-/// an initial choice rather than a change and is applied.
+/// An update that names NEITHER SLI config changes no indicator and no kind: the record's
+/// evaluation kind is the one its create fixed, whatever else the update writes.
 ///
-/// Both kinds are asserted, since the rule is about changing a kind the record HAS.
+/// Both kinds are rows, since the rule is about the kind the record HAS. (A create that
+/// names neither config defines no indicator at all and is refused — see
+/// `slo_indicator_required.rs`.)
 #[tokio::test]
-async fn the_first_config_on_a_record_with_no_indicator_is_applied() {
+async fn an_update_naming_no_config_leaves_the_indicator_and_the_kind_alone() {
     let rows = [
-        ("SliConfig", sli_config("checkout", "GET /cart", 100.0), "PeriodBased", "Sli"),
+        (
+            "SliConfig",
+            sli_config("checkout", "GET /cart", 100.0),
+            "PeriodBased",
+            "Sli",
+        ),
         (
             "RequestBasedSliConfig",
             request_based_sli_config("checkout"),
@@ -333,40 +340,36 @@ async fn the_first_config_on_a_record_with_no_indicator_is_applied() {
 
     for (index, (member, config, evaluation_type, indicator)) in rows.into_iter().enumerate() {
         let router = router();
-        let name = format!("kindless-slo-{index:02}");
-        let (status, created) = create(&router, json!({ "Name": name })).await;
-        assert_eq!(
-            status, 200,
-            "case {member:?}: expected the setup create to succeed, got {status} with {created}"
-        );
-        assert!(
-            created["Slo"]["EvaluationType"].is_null(),
-            "case {member:?}: expected an SLO created with no config to carry no EvaluationType, got {:?}",
-            created["Slo"]["EvaluationType"]
-        );
+        let name = format!("configless-update-slo-{index:02}");
+        let before = create_slo(&router, &name, member, config).await;
 
         let (status, updated) = call(
             &router,
             "PATCH",
             &format!("/slo/{name}"),
-            Some(json!({ member: config })),
+            Some(json!({ "Description": "after" })),
         )
         .await;
         assert_eq!(
             status, 200,
-            "case {member:?}: expected HTTP 200 setting the first SLI config, got {status} with {updated}"
+            "case {member:?}: expected HTTP 200 from an update naming no SLI config, got {status} with {updated}"
         );
         assert_eq!(
             updated["Slo"]["EvaluationType"].as_str(),
             Some(evaluation_type),
-            "case {member:?}: expected EvaluationType {evaluation_type:?}, got {:?}",
+            "case {member:?}: expected EvaluationType {evaluation_type:?} to survive, got {:?}",
             updated["Slo"]["EvaluationType"]
+        );
+        assert_eq!(
+            updated["Slo"][indicator], before[indicator],
+            "case {member:?}: expected {indicator} to survive unchanged, got {:?}",
+            updated["Slo"][indicator]
         );
 
         let fetched = get_slo(&router, &name).await;
-        assert!(
-            !fetched[indicator].is_null(),
-            "case {member:?}: expected the stored record to carry {indicator}, got {fetched:?}"
+        assert_eq!(
+            fetched[indicator], before[indicator],
+            "case {member:?}: expected the stored record to keep {indicator}, got {fetched:?}"
         );
     }
 }
