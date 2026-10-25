@@ -33,9 +33,14 @@
 //! written to. No audio is transcribed and no object is ever written at the
 //! reported `Transcript.TranscriptFileUri` / `SubtitlesOutput.SubtitleFileUris`,
 //! so a completed job means "the control plane finished with this record", never
-//! "a transcript is fetchable from that URI". Nothing invents transcript content,
-//! a confidence score (`IdentifiedLanguageScore`) or an identified-language
-//! breakdown (`LanguageCodes`): those stay absent because no engine produced them.
+//! "a transcript is fetchable from that URI". Nothing invents transcript content: no
+//! word, sentiment or summary of a call appears anywhere, because no engine produced
+//! one. A member the service itself DETERMINES is reported where the request states
+//! what it is determined from and withheld where it does not — the transcription
+//! family's per-language breakdown (`LanguageCodes`) stays absent for that reason,
+//! while the Call Analytics family's language, media format and sample rate are
+//! determined from the request and this family's own constants (see
+//! [`CallAnalyticsJobRecord`]).
 //! A custom vocabulary is the same: its terms are held in this state, where a
 //! `StartTranscriptionJob` that names the vocabulary would read them from, while the
 //! `DownloadUri` it reports is a location nothing serves (see
@@ -61,9 +66,15 @@
 //! analysed. A Call Analytics JOB is the job record again
 //! ([`CallAnalyticsJobRecord`]): no call is transcribed, no call characteristic,
 //! sentiment or summary is derived and no category is matched, so the
-//! `Transcript.TranscriptFileUri` a completed one reports names a location nothing
-//! writes to or serves, and the `MediaFormat` and `MediaSampleRateHertz` the real
-//! service DETECTS from the media file stay absent because nothing read one. A custom
+//! `Transcript.TranscriptFileUri` — and, for a job that asked for redaction, the
+//! `RedactedTranscriptFileUri` beside it — a completed one reports names a location
+//! nothing writes to or serves. That family's start request carries no language,
+//! media-format or sample-rate member at all, because the service DETERMINES each of
+//! them, so a finished job of it reports the determination this emulator can make
+//! without audio: the language the request narrowed identification to
+//! ([`identified_language`]), the format the media URI it was given names
+//! ([`media_format_of`]) and this family's own sample rate
+//! ([`CALL_AUDIO_SAMPLE_RATE_HERTZ`]). A custom
 //! language model is the MEDICAL vocabulary's case again: its
 //! training and tuning data can only be read from the Amazon S3 location a create
 //! names ([`LanguageModelRecord`]), so the record is real and the training it cannot
@@ -93,7 +104,8 @@ use crate::ops::types::{
     MedicalTranscriptionJobSummary, MedicalTranscriptionSetting, ModelSettings, RelativeTimeRange,
     Rule, Settings, SubtitlesOutput, Tag,
     ToxicityDetectionSettings, Transcript, TranscriptionJob, TranscriptionJobSummary,
-    VocabularyFilterInfo, VocabularyInfo, MEDICAL_SCRIBE_LANGUAGE_CODE_VALUES,
+    VocabularyFilterInfo, VocabularyInfo, MEDIA_FORMAT_VALUES,
+    MEDICAL_SCRIBE_LANGUAGE_CODE_VALUES, REDACTION_OUTPUT_VALUES,
 };
 
 /// `TranscriptionJobStatus` values, from the model's enum
@@ -2407,6 +2419,168 @@ impl MedicalScribeJobRecord {
     }
 }
 
+/// `RedactionOutput` values, from the model's enum
+/// (`smithy_query(query="shape", shape="RedactionOutput")`).
+pub const REDACTION_OUTPUT_REDACTED: &str = REDACTION_OUTPUT_VALUES[0];
+/// See [`REDACTION_OUTPUT_REDACTED`].
+pub const REDACTION_OUTPUT_REDACTED_AND_UNREDACTED: &str = REDACTION_OUTPUT_VALUES[1];
+
+/// Which of the two transcripts the modelled `Transcript` shape can report a finished
+/// job produced, and so which of its two locations that job reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptOutputs {
+    /// Whether an unredacted transcript was produced (`Transcript$TranscriptFileUri`).
+    pub unredacted: bool,
+    /// Whether a redacted one was (`Transcript$RedactedTranscriptFileUri`).
+    pub redacted: bool,
+}
+
+/// What a job asked the service to produce, read from the two members that ask for
+/// redaction.
+///
+/// `ContentRedaction$RedactionOutput` is a required member wherever
+/// `ContentRedaction` is given, and it decides this: "When you choose `redacted`
+/// Amazon Transcribe creates only a redacted transcript. When you choose
+/// `redacted_and_unredacted` Amazon Transcribe creates a redacted and an unredacted
+/// transcript (as two separate files)"
+/// (`smithy_query(query="doc", shape="ContentRedaction", member="RedactionOutput")`).
+/// `Media$RedactedMediaFileUri` asks for a redacted transcript by another route — it
+/// "produces a redacted audio file in addition to a redacted transcript" — and
+/// documents nothing about dropping the unredacted one, so a job that named it and no
+/// `ContentRedaction` produces both.
+///
+/// A job that asked for neither produces the unredacted transcript alone, which is
+/// why `RedactedTranscriptFileUri` is not reported for every job.
+pub fn transcript_outputs(
+    content_redaction: Option<&ContentRedaction>,
+    redacts_media: bool,
+) -> TranscriptOutputs {
+    match content_redaction.map(|redaction| redaction.redaction_output.as_str()) {
+        Some(REDACTION_OUTPUT_REDACTED) => TranscriptOutputs {
+            unredacted: false,
+            redacted: true,
+        },
+        Some(_) => TranscriptOutputs {
+            unredacted: true,
+            redacted: true,
+        },
+        None => TranscriptOutputs {
+            unredacted: true,
+            redacted: redacts_media,
+        },
+    }
+}
+
+/// What distinguishes the redacted transcript's location from the unredacted one's.
+///
+/// CHOSEN: the model documents the two as "two separate files" at two locations
+/// (`Transcript$TranscriptFileUri` / `Transcript$RedactedTranscriptFileUri`) but names
+/// no key for either, so the redacted one is the unredacted file name under this
+/// prefix — in whatever folder or bucket the request directed the output to.
+pub const REDACTED_OUTPUT_PREFIX: &str = "redacted-";
+
+/// Where the REDACTED transcript of a job that asked for redaction is reported to
+/// live, beside the unredacted one at `transcript_uri`.
+///
+/// Reported, not served, exactly as the unredacted location is (see this module's
+/// header): nothing redacts a transcript nothing produced, so what this answers is
+/// WHERE the redacted output would be — a location distinct from the unredacted one,
+/// as the model's two separate members require.
+pub fn redacted_transcript_uri(transcript_uri: &str) -> String {
+    match transcript_uri.rsplit_once('/') {
+        Some((parent, file)) => format!("{parent}/{REDACTED_OUTPUT_PREFIX}{file}"),
+        None => format!("{REDACTED_OUTPUT_PREFIX}{transcript_uri}"),
+    }
+}
+
+/// The `MediaFormat` of the audio a job was given, as the media URI it was given
+/// evidences it — `None` for a URI that evidences no modelled format.
+///
+/// `MediaFormat` is "The format of the input media file"
+/// (`smithy_query(query="shape", shape="CallAnalyticsJob")`) and no member of
+/// `StartCallAnalyticsJob` carries it, so the service reports what it found in the
+/// file. Nothing here opens that file, and the one thing the request says about it is
+/// the name it is stored under: a URI whose last path segment ends in one of the
+/// modelled `MediaFormat` extensions ([`MEDIA_FORMAT_VALUES`]) is reported as that
+/// format — `Media`'s own documented examples are spelled that way
+/// (`s3://DOC-EXAMPLE-BUCKET/my-media-file.flac`) — and a URI that ends in no such
+/// extension leaves the member absent rather than guessed.
+///
+/// `MediaFileUri` is the input audio; a job that named only `RedactedMediaFileUri`
+/// gave its input audio there instead, so that URI answers for it.
+pub fn media_format_of(media: &Media) -> Option<String> {
+    let uri = [
+        media.media_file_uri.as_deref(),
+        media.redacted_media_file_uri.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|uri| !uri.is_empty())?;
+    // The path, without the query or fragment an http(s) URI may carry.
+    let path = uri.split(['?', '#']).next().unwrap_or(uri);
+    let extension = path.rsplit('/').next()?.rsplit_once('.')?.1.to_ascii_lowercase();
+    MEDIA_FORMAT_VALUES
+        .iter()
+        .find(|format| **format == extension)
+        .map(|format| (*format).to_string())
+}
+
+/// The `MediaSampleRateHertz` a finished Call Analytics job reports: "The sample rate,
+/// in hertz, of the audio track in your input media file".
+///
+/// No member of `StartCallAnalyticsJob` carries it either, and unlike the format the
+/// request says nothing at all about it, so this is a CHOSEN figure: the lowest rate
+/// the member itself models (`@range(min: 8000, max: 48000)`), which is the rate the
+/// telephone call audio this family analyses is sampled at. One value for every job of
+/// the family, fixed when the job finishes, so what a job reports never changes
+/// between reads.
+pub const CALL_AUDIO_SAMPLE_RATE_HERTZ: i32 = 8_000;
+
+/// The language a job reports when the request narrowed identification to nothing.
+///
+/// A CHOSEN value of the modelled `LanguageCode` enum
+/// ([`crate::ops::types::LANGUAGE_CODE_VALUES`]), used only where
+/// [`identified_language`] has no option list to read.
+pub const DEFAULT_IDENTIFIED_LANGUAGE: &str = "en-US";
+
+/// The `IdentifiedLanguageScore` that accompanies an identified language:
+/// "Confidence scores are values between 0 and 1; a larger value indicates a higher
+/// probability" (`smithy_query(query="doc", shape="CallAnalyticsJob", member="IdentifiedLanguageScore")`).
+///
+/// This emulator's identification is not probabilistic — it reads the language off the
+/// request rather than weighing audio (see [`identified_language`]) — so what it
+/// reports is the top of that documented range, the certainty of a determination that
+/// had nothing to weigh, rather than an invented probability.
+pub const IDENTIFIED_LANGUAGE_SCORE: f32 = 1.0;
+
+/// The language a Call Analytics job was transcribed in, narrowed to the options the
+/// request allowed.
+///
+/// `StartCallAnalyticsJob` carries NO language member
+/// (`smithy_query(query="operation", operation="StartCallAnalyticsJob")`): Amazon
+/// Transcribe identifies the language of the call itself, and
+/// `CallAnalyticsJobSettings$LanguageOptions` only narrows what identification may
+/// choose between ("You can specify two or more language codes that represent the
+/// languages you think may be present in your media"). So the language is the
+/// service's own determination, and a job that finished has one — "The language code
+/// used to create your Call Analytics job"
+/// (`smithy_query(query="shape", shape="CallAnalyticsJob")`) — however many options
+/// the request listed, or none.
+///
+/// This emulator analyses no audio, so the determination is made from the request
+/// instead of from the call: the FIRST code `LanguageOptions` lists, since
+/// identification may only answer with one of them, and
+/// [`DEFAULT_IDENTIFIED_LANGUAGE`] where the request narrowed the choice to nothing.
+/// It is a function of the request alone, so every read of a job reports the same
+/// language.
+pub fn identified_language(language_options: Option<&[String]>) -> String {
+    language_options
+        .and_then(<[String]>::first)
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_IDENTIFIED_LANGUAGE.to_string())
+}
+
 /// One stored Call Analytics job: exactly what the request asked for, plus the
 /// lifecycle facts the service itself owns (status, timestamps and the location its
 /// transcript would be written to).
@@ -2452,6 +2626,21 @@ pub struct CallAnalyticsJobRecord {
     pub region: String,
     pub settings: Option<CallAnalyticsJobSettings>,
     pub channel_definitions: Option<Vec<ChannelDefinition>>,
+    /// `LanguageCode`, the language the service identified for this call; `None`
+    /// until the job completes, because identification is part of processing it
+    /// ([`identified_language`]).
+    pub language_code: Option<String>,
+    /// `IdentifiedLanguageScore`, set with [`Self::language_code`]
+    /// ([`IDENTIFIED_LANGUAGE_SCORE`]).
+    pub identified_language_score: Option<f32>,
+    /// `MediaFormat`, the format the service determined the input audio is in; `None`
+    /// until the job completes, and for a media URI that evidences no modelled format
+    /// ([`media_format_of`]).
+    pub media_format: Option<String>,
+    /// `MediaSampleRateHertz`, the rate the service determined the input audio is
+    /// sampled at; `None` until the job completes
+    /// ([`CALL_AUDIO_SAMPLE_RATE_HERTZ`]).
+    pub media_sample_rate_hertz: Option<i32>,
     /// Where the transcript was written; `None` until the job completes.
     pub transcript: Option<Transcript>,
     /// `FailureReason`, set only on a `FAILED` job — which none of this emulator's
@@ -2471,44 +2660,42 @@ impl CallAnalyticsJobRecord {
     /// (`Get`, `List`) runs this before projecting the record, and that is the only
     /// write it performs.
     ///
-    /// Completing a job records WHERE its transcript would be written (see the module
-    /// header); it does not write anything there.
+    /// Completing a job records what the service determined while it processed the
+    /// call — the language it identified, the format and sample rate of the audio it
+    /// was given, and WHERE each transcript it produced would be written (see the
+    /// module header) — and writes nothing at those locations. Every one of those
+    /// values is a function of the stored record, so a job reports the same ones at
+    /// every later read.
     pub fn advance_clock(&mut self, now: SystemTime) {
         if self.status != STATUS_IN_PROGRESS || now < self.completion_due {
             return;
         }
         self.status = STATUS_COMPLETED.to_string();
         self.completion_time = Some(self.completion_due);
+        let settings = self.settings.as_ref();
+        self.language_code = Some(identified_language(
+            settings.and_then(|settings| settings.language_options.as_deref()),
+        ));
+        self.identified_language_score = Some(IDENTIFIED_LANGUAGE_SCORE);
+        self.media_format = media_format_of(&self.media);
+        self.media_sample_rate_hertz = Some(CALL_AUDIO_SAMPLE_RATE_HERTZ);
+        let transcript_uri =
+            call_analytics_output_uri(self.output_location.as_deref(), &self.name, &self.region);
+        // Which transcripts the request asked the service to produce decides which
+        // of the two locations the job reports ([`transcript_outputs`]).
+        let outputs = transcript_outputs(
+            settings.and_then(|settings| settings.content_redaction.as_ref()),
+            self.media
+                .redacted_media_file_uri
+                .as_deref()
+                .is_some_and(|uri| !uri.trim().is_empty()),
+        );
         self.transcript = Some(Transcript {
-            transcript_file_uri: Some(call_analytics_output_uri(
-                self.output_location.as_deref(),
-                &self.name,
-                &self.region,
-            )),
-            // Content redaction is recorded as asked for, but nothing redacts a
-            // transcript nothing produced, so no redacted location is reported —
-            // the same projection the transcription-job family makes.
-            redacted_transcript_file_uri: None,
+            transcript_file_uri: outputs.unredacted.then(|| transcript_uri.clone()),
+            redacted_transcript_file_uri: outputs
+                .redacted
+                .then(|| redacted_transcript_uri(&transcript_uri)),
         });
-    }
-
-    /// The language this job's transcription ran in, when the request left no choice
-    /// of language to make.
-    ///
-    /// `StartCallAnalyticsJob` carries NO language member
-    /// (`smithy_query(query="operation", operation="StartCallAnalyticsJob")`): Amazon
-    /// Transcribe identifies the language of the call itself, optionally narrowed to
-    /// the `Settings.LanguageOptions` the request listed. This emulator analyses no
-    /// audio, so it identifies nothing: a language is reported only where
-    /// `LanguageOptions` names exactly one, leaving identification nothing to choose,
-    /// and is absent otherwise rather than guessed — which is also why
-    /// `IdentifiedLanguageScore` is always absent.
-    fn language_code(&self) -> Option<String> {
-        let options = self.settings.as_ref()?.language_options.as_ref()?;
-        match options.as_slice() {
-            [only] => Some(only.clone()),
-            _ => None,
-        }
     }
 
     /// This record as the modelled `CallAnalyticsJob` shape, which is the whole answer
@@ -2522,15 +2709,15 @@ impl CallAnalyticsJobRecord {
         CallAnalyticsJob {
             call_analytics_job_name: Some(self.name.clone()),
             call_analytics_job_status: Some(self.status.clone()),
-            // No analytics feature was skipped, because none ran: the member stays
-            // absent rather than reporting an empty list of skipped features.
+            // Nothing here skips an analytics feature: the one feature the model
+            // names a skip for is generative summarization, and both reason codes it
+            // models turn on the CONTENT of the call, which nothing evaluates. A job
+            // that skipped nothing reports no details at all, rather than an empty
+            // list of skipped features.
             call_analytics_job_details: None,
-            language_code: self.language_code(),
-            // `MediaFormat` and `MediaSampleRateHertz` are NOT members of
-            // `StartCallAnalyticsJob`: the real service detects them from the media
-            // file. This emulator reads no media file, so both stay absent.
-            media_sample_rate_hertz: None,
-            media_format: None,
+            language_code: self.language_code.clone(),
+            media_sample_rate_hertz: self.media_sample_rate_hertz,
+            media_format: self.media_format.clone(),
             media: Some(self.media.clone()),
             transcript: self.transcript.clone(),
             start_time: self.start_time.map(to_date_time),
@@ -2538,9 +2725,7 @@ impl CallAnalyticsJobRecord {
             completion_time: self.completion_time.map(to_date_time),
             failure_reason: self.failure_reason.clone(),
             data_access_role_arn: self.data_access_role_arn.clone(),
-            // No language identification was performed, so there is no confidence
-            // score to report (see [`Self::language_code`]).
-            identified_language_score: None,
+            identified_language_score: self.identified_language_score,
             settings: self.settings.clone(),
             channel_definitions: self.channel_definitions.clone(),
             tags: (!self.tags.is_empty()).then(|| self.tags.clone()),
@@ -2549,13 +2734,18 @@ impl CallAnalyticsJobRecord {
 
     /// This record as the modelled `CallAnalyticsJobSummary` shape, which is what
     /// `ListCallAnalyticsJobs` reports for each result.
+    ///
+    /// `LanguageCode` is the same determination the job itself reports ("The language
+    /// code used to create your Call Analytics transcription",
+    /// `smithy_query(query="shape", shape="CallAnalyticsJobSummary")`), read off the
+    /// same record rather than recomputed here.
     pub fn to_summary(&self) -> CallAnalyticsJobSummary {
         CallAnalyticsJobSummary {
             call_analytics_job_name: Some(self.name.clone()),
             creation_time: Some(to_date_time(self.creation_time)),
             start_time: self.start_time.map(to_date_time),
             completion_time: self.completion_time.map(to_date_time),
-            language_code: self.language_code(),
+            language_code: self.language_code.clone(),
             call_analytics_job_status: Some(self.status.clone()),
             call_analytics_job_details: None,
             failure_reason: self.failure_reason.clone(),

@@ -17,7 +17,7 @@
 
 use serde_json::{json, Value};
 
-use crate::global_network_lifecycle::{error_code, expected_arn, Emulator, PAST_SETTLE};
+use crate::global_network_lifecycle::{error_code, expected_scoped_arn, Emulator, PAST_SETTLE};
 
 /// The `Description` every seeded site starts with, so a row that supplies no
 /// `Description` has a value to leave alone.
@@ -239,7 +239,7 @@ async fn update_site_writes_only_the_supplied_members_and_round_trips_through_ge
         );
         assert_eq!(
             site["SiteArn"],
-            json!(expected_arn(SITE, site_id)),
+            json!(expected_scoped_arn(SITE, &network, site_id)),
             "case {}: the ARN must not be rewritten, got {site}",
             row.case
         );

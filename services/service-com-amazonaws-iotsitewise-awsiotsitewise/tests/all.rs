@@ -117,6 +117,12 @@ mod access_policy_lifecycle;
 // Same reasoning: declared outside the sorted list, which is the stretch every
 // concurrent iotsitewise change edits. Fold it into the list once the churn
 // settles.
+#[path = "all/access_policies.rs"]
+mod access_policies;
+
+// Same reasoning: declared outside the sorted list, which is the stretch every
+// concurrent iotsitewise change edits. Fold it into the list once the churn
+// settles.
 #[path = "all/pipeline_delete.rs"]
 mod pipeline_delete;
 
@@ -131,6 +137,13 @@ mod create_pipeline_bounds;
 // settles.
 #[path = "all/workspace_queries.rs"]
 mod workspace_queries;
+
+// Same reasoning: this suite's alphabetical place is inside the sorted list, the
+// stretch every concurrent iotsitewise change lands a declaration of its own in,
+// so it is declared up here with the other suites kept out of that stretch. Fold
+// it into the list once the churn settles.
+#[path = "all/asset_composite_model.rs"]
+mod asset_composite_model;
 
 #[path = "all/asset_hierarchies.rs"]
 mod asset_hierarchies;

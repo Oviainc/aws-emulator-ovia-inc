@@ -9,10 +9,14 @@
 //! made due on the task it reads ([`crate::state::settle_task_status`]) — a change
 //! that was owed at that instant whether or not anybody polled.
 //!
-//! A `TaskId` that satisfies the model's pattern but names no stored task is
-//! `SynthesisTaskNotFoundException` (HTTP 400), the error the model declares for
-//! exactly that case; a `TaskId` that does not satisfy the pattern never reaches this
-//! handler, because the framework refuses it at the boundary.
+//! The model declares two distinct refusals for the `TaskId`, and they mean different
+//! things: a value that is not an identifier this service could have minted (the
+//! model's pattern is far wider than the minted form — see
+//! [`crate::state::is_task_id`]) is `InvalidTaskIdException` (HTTP 400), while an
+//! identifier of the minted form that names no stored task is
+//! `SynthesisTaskNotFoundException` (HTTP 400). A `TaskId` that does not satisfy the
+//! model's pattern at all never reaches this handler, because the framework refuses it
+//! at the boundary.
 //!
 //! ## Shape of an operation
 //!
@@ -149,6 +153,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The identifier is judged on its own, before any store lookup: a value that is
+        // not of the form this service mints is no task identifier, whatever the store
+        // happens to hold.
+        if !crate::state::is_task_id(&input.task_id) {
+            return Err(GetSpeechSynthesisTaskErrorModeled::InvalidTaskIdException(
+                crate::service::errors::invalid_task_id(),
+            )
+            .into());
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetSpeechSynthesisTaskErrorModeled::ServiceFailureException(
                 crate::service::errors::service_failure(),
@@ -157,9 +170,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
         let stored = guard.synthesis_tasks.get_mut(&input.task_id).ok_or_else(|| {
-            // The `TaskId` is well-formed (the model's pattern was enforced at the
-            // boundary) and names no task, which is this error rather than
-            // `InvalidTaskIdException`.
+            // The `TaskId` is one this service could have minted and names no task,
+            // which is this error rather than `InvalidTaskIdException`.
             GetSpeechSynthesisTaskErrorModeled::SynthesisTaskNotFoundException(
                 crate::service::errors::synthesis_task_not_found(),
             )

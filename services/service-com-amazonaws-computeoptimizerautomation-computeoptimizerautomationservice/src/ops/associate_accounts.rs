@@ -252,6 +252,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let associated_at = crate::state::now();
                 for account_id in &requested {
                     guard.associate_account(account_id, associated_at);
+                    // An association "automatically enables the Automation
+                    // feature" for a member account that had not enabled it, and
+                    // an enrolled account's resources are analysed — which is
+                    // what gives the management account "recommended actions
+                    // that include associated member accounts"
+                    // (`ListRecommendedActions`) to list, preview and automate.
+                    // Idempotent, so re-associating records nothing again.
+                    if guard.is_enrolled(account_id) {
+                        guard.ensure_recommended_action_inventory(account_id);
+                    }
                 }
                 guard.record_token(client_token, Self::NAME, &request_fingerprint, None);
             }

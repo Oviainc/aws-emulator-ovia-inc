@@ -15,3 +15,5 @@
 mod state_roundtrip;
 #[path = "all/stream_lifecycle.rs"]
 mod stream_lifecycle;
+#[path = "all/stream_tags.rs"]
+mod stream_tags;

@@ -51,9 +51,19 @@ use crate::bridge_members_and_deletion::force_bridge_state;
 use crate::flow_lifecycle::Emulator;
 
 /// Long enough for a transition the clock owes (`mc::TRANSITION_SPAN`) to come due.
-const PAST_THE_TRANSITION: Duration = Duration::from_millis(900);
+///
+/// `pub(crate)` so `tests/all/describe_gateway_instance.rs` waits out the same span rather
+/// than keeping a second copy of it.
+pub(crate) const PAST_THE_TRANSITION: Duration = Duration::from_millis(900);
 
-async fn describe_gateway_instance(emulator: &Emulator, arn: &str) -> (u16, Option<String>, Value) {
+/// `GET /v1/gateway-instances/{GatewayInstanceArn}`.
+///
+/// `pub(crate)` because `tests/all/describe_gateway_instance.rs` drives the same request
+/// through the same front door rather than spelling the binding a second time.
+pub(crate) async fn describe_gateway_instance(
+    emulator: &Emulator,
+    arn: &str,
+) -> (u16, Option<String>, Value) {
     emulator
         .send("GET", &format!("/v1/gateway-instances/{arn}"), None)
         .await
@@ -90,8 +100,9 @@ async fn delete_gateway(emulator: &Emulator, arn: &str) -> (u16, Option<String>,
 /// Create one gateway over the wire and answer its ARN.
 ///
 /// The create is `gateway_lifecycle`'s subject; here it is only the fixture every instance
-/// below is registered with.
-async fn gateway_with(emulator: &Emulator, name: &str) -> String {
+/// below is registered with. `pub(crate)` for the same reason as
+/// [`describe_gateway_instance`].
+pub(crate) async fn gateway_with(emulator: &Emulator, name: &str) -> String {
     let (status, code, created) = emulator
         .send(
             "POST",
@@ -120,7 +131,7 @@ async fn gateway_with(emulator: &Emulator, name: &str) -> String {
 /// This is the registration AWS performs when the gateway software is installed on the
 /// appliance: the model declares no operation for it (see this module's header), so the
 /// fixture goes through the store's own seam rather than over the wire.
-fn register_instance(emulator: &Emulator, gateway_arn: &str) -> String {
+pub(crate) fn register_instance(emulator: &Emulator, gateway_arn: &str) -> String {
     let state = emulator
         .engine
         .state::<mc::ComAmazonawsMediaconnectMediaconnectState>();
@@ -137,7 +148,13 @@ fn register_instance(emulator: &Emulator, gateway_arn: &str) -> String {
 /// registration or deregistration error) or one an operation moves the instance into, so the
 /// tables below force the state the way the reporter of it would rather than leaving most of
 /// the enum unasserted.
-fn instance_in_state(emulator: &Emulator, gateway_arn: &str, instance_state: &str) -> String {
+///
+/// `pub(crate)` because `tests/all/describe_gateway_instance.rs` forces the same seam.
+pub(crate) fn instance_in_state(
+    emulator: &Emulator,
+    gateway_arn: &str,
+    instance_state: &str,
+) -> String {
     let instance_arn = register_instance(emulator, gateway_arn);
     let state = emulator
         .engine

@@ -153,7 +153,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ConstrainedString` (len 0..256, pattern `^[\s\S]*$`) does not express, so they
         // are refused here rather than by the pre-handler constraint walk.
         for (member, value) in [("Type", &input.r#type), ("Provider", &input.provider)] {
-            if let Some(problem) = value.as_deref().and_then(descriptor_problem) {
+            if let Some(problem) = value
+                .as_deref()
+                .and_then(crate::state::link_descriptor_problem)
+            {
                 return Err(CreateLinkErrorModeled::ValidationException(
                     ValidationException {
                         message: format!("{member} {problem}"),
@@ -246,8 +249,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let id = store.next_id(crate::state::LINK_KIND);
         let now = ::std::time::SystemTime::now();
         let record = crate::state::LinkRecord {
-            arn: crate::state::ComAmazonawsNetworkmanagerNetworkmanagerState::resource_arn(
+            // A link exists only inside its global network, so its ARN names that global
+            // network ahead of the link's own id.
+            arn: crate::state::ComAmazonawsNetworkmanagerNetworkmanagerState::scoped_resource_arn(
                 crate::state::LINK_KIND,
+                &input.global_network_id,
                 &id,
             ),
             id: id.clone(),
@@ -259,6 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             provider: input.provider,
             created_at: now,
             available_at: now + crate::state::SETTLE_DELAY,
+            updating_until: None,
             tags: input.tags.unwrap_or_default(),
         };
         let link = record.to_shape(now);
@@ -268,29 +275,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The documented constraints on a link's `Type` and `Provider`, which the model's
-/// `ConstrainedString` does not carry: "Maximum length of 128 characters. Cannot include
-/// the following characters: | \ ^" (`smithy_query query="doc" shape="CreateLinkRequest"
-/// member="Provider"`, the same sentence for `Type`).
-///
-/// Answers `None` when `value` satisfies both, otherwise the member-level reason the
-/// refusal reports.
-fn descriptor_problem(value: &str) -> Option<String> {
-    /// The documented maximum, counted in characters.
-    const MAX_CHARS: usize = 128;
-    /// The characters the documentation forbids.
-    const FORBIDDEN: [char; 3] = ['|', '\\', '^'];
-
-    let length = value.chars().count();
-    if length > MAX_CHARS {
-        return Some(format!(
-            "must be at most {MAX_CHARS} characters, but is {length}"
-        ));
-    }
-    value
-        .chars()
-        .find(|candidate| FORBIDDEN.contains(candidate))
-        .map(|found| {
-            format!("must not include any of the characters | \\ ^, but includes {found:?}")
-        })
-}
+// The documented constraints on a link's `Type` and `Provider` live in
+// `crate::state::link_descriptor_problem`, so `UpdateLink` refuses exactly the values
+// this create refuses.

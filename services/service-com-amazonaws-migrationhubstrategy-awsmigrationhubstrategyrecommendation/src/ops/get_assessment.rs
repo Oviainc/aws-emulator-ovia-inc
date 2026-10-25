@@ -153,7 +153,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetAssessmentErrorModeled::InternalServerException(
                 InternalServerException {
@@ -168,9 +167,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `@readonly`: this reports the stored assessment. The one write it makes is
         // materialising the completion the clock already owed that assessment — owed at
         // this same instant even if nobody had called.
+        //
+        // The assessment is looked up in the Region this request was signed for: an id
+        // minted through another Region's endpoint names nothing here.
         let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        match store.settled_assessment_mut(&input.id, now) {
+        let found = store
+            .region_mut(&region)
+            .and_then(|portfolio| portfolio.settled_assessment_mut(&input.id, now));
+        match found {
             Some(assessment) => Ok(GetAssessmentOutput {
                 id: Some(assessment.id.clone()),
                 data_collection_details: Some(assessment.to_data_collection_details()),

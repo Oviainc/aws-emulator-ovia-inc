@@ -577,8 +577,8 @@ async fn a_tag_request_against_an_unknown_resource_is_refused() {
             code: "NoSuchHostedZone",
         },
         RefusalRow {
-            // No health check can exist: `CreateHealthCheck` is still a
-            // scaffold, so the store holds none.
+            // The store holds no health check with this id: nothing created
+            // one, so the id names none.
             case: "changing tags on a health check",
             method: "POST",
             uri: "/2013-04-01/tags/healthcheck/8f3b7a1e-0c2d-4f5a-9b6c-1d2e3f4a5b6c",

@@ -119,3 +119,7 @@ mod update_flow_source;
 mod update_router_network_interface;
 #[path = "all/update_router_output.rs"]
 mod update_router_output;
+// Declared here rather than in alphabetical order on purpose: this list is appended to by
+// every mediaconnect change at once, and the middle of it is where those insertions land.
+#[path = "all/describe_gateway_instance.rs"]
+mod describe_gateway_instance;

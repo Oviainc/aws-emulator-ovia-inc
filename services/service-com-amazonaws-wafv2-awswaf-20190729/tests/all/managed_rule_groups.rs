@@ -60,6 +60,10 @@ async fn every_catalogued_managed_rule_group_can_be_run_from_a_web_acl_rule() {
             vendor_name,
             name: group_name,
             capacity,
+            product_title: _,
+            product_description: _,
+            is_versioning_supported: _,
+            is_advanced_managed_rule_set: _,
             versions: _,
         } = *group;
         let case = format!("{vendor_name}/{group_name}");
