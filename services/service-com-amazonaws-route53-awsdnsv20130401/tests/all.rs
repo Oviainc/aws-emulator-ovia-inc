@@ -15,6 +15,8 @@
 mod account_limits;
 #[path = "all/checker_ip_ranges.rs"]
 mod checker_ip_ranges;
+#[path = "all/dnssec_status.rs"]
+mod dnssec_status;
 #[path = "all/error_classification.rs"]
 mod error_classification;
 #[path = "all/error_envelope.rs"]

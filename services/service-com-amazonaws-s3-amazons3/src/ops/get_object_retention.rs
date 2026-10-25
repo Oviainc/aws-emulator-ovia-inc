@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetObjectRetention
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetObjectRetention`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetObjectRetention::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Object Lock retention `PutObjectRetention` placed on the addressed object
+//! version — the one `versionId` names, or the key's current object — and answers 200. A
+//! version with no retention associated with it has no `Retention` container to report, so
+//! it answers 404 [`crate::state::NO_SUCH_OBJECT_LOCK_CONFIGURATION_CODE`], the way every
+//! other reader of an absent subresource in this crate answers one.
+//!
+//! READ-ONLY: the stored retention is copied out and nothing is written, so a later caller
+//! sees exactly what this one saw — an expired retention included, which is still the
+//! configuration the version carries even though it no longer restricts a write.
 //!
 //! ## Shape of an operation
 //!
@@ -96,14 +97,24 @@ use super::types::*;
 // `GetObjectRetentionError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `GetObjectRetentionError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#GetObjectRetention")]
+// The operation's MODELED errors, widened with `extra_errors` by the two 404 shapes this
+// SERVICE models for an address that does not exist.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="GetObjectRetention")` reports `errors: []`),
+// yet `Bucket` and `Key` are both @httpLabels, so a request can name a bucket or a key
+// that does not exist — AWS answers `NoSuchBucket` and `NoSuchKey`, each modelled
+// `@httpError(404)`. Widening the set with those two shapes is what lets this reader
+// answer the same two 404s its writer `PutObjectRetention` answers for the same two
+// causes.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#GetObjectRetention",
+    extra_errors = ["NoSuchBucket", "NoSuchKey"]
+)]
 #[derive(Debug)]
 pub enum GetObjectRetentionErrorModeled {
+    NoSuchBucket(NoSuchBucket),
+    NoSuchKey(NoSuchKey),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -158,17 +169,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetObjectRetention` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetObjectRetentionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetObjectRetention"))
+        // request metadata only, and this read needs nothing from it.
+        let _ = ctx;
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // bucket, the request fails with the HTTP status code 403 Forbidden (access
+        // denied)" — `GetObjectRetentionRequest$ExpectedBucketOwner`, judged the way every
+        // other handler here judges it: this emulator serves one account, so the owner of
+        // every bucket it holds is that account.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                ACCESS_DENIED_MESSAGE,
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Without the store there is no retention to report, and no modelled error
+            // says that, so the scaffold's 501 carries what is true: this emulator cannot
+            // serve the request.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetObjectRetention",
+            ));
+        };
+
+        // Read-only: the guard is taken, the retention is copied out, and nothing is
+        // written.
+        let store = state.lock();
+        let version_id = input.version_id.as_deref();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(GetObjectRetentionErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        // A delete marker has no object behind it to carry a retention: 405, the status S3
+        // answers an object-level call on a marker with, as `HeadObject` answers it for the
+        // same cause.
+        if version_id.is_some_and(|named| {
+            bucket
+                .stored_version(&input.key, named)
+                .is_some_and(|held| held.as_delete_marker().is_some())
+        }) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::METHOD_NOT_ALLOWED_CODE,
+                crate::state::METHOD_NOT_ALLOWED_STATUS,
+                crate::state::METHOD_NOT_ALLOWED_MESSAGE,
+            ));
+        }
+        let Some(object) = bucket.addressed_object(&input.key, version_id) else {
+            return Err(match version_id {
+                Some(_) => crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::NO_SUCH_VERSION_CODE,
+                    404,
+                    crate::state::NO_SUCH_VERSION_MESSAGE,
+                ),
+                None => GetObjectRetentionErrorModeled::NoSuchKey(NoSuchKey {}).into(),
+            });
+        };
+
+        // `Retention` is this operation's WHOLE @httpPayload, so there is no way to report
+        // "this version carries none" inside a 200: a version with no retention answers the
+        // subresource-not-there 404 instead.
+        let Some(retention) = object.retention.as_ref() else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NO_SUCH_OBJECT_LOCK_CONFIGURATION_CODE,
+                404,
+                crate::state::NO_SUCH_OBJECT_LOCK_CONFIGURATION_MESSAGE,
+            ));
+        };
+
+        Ok(GetObjectRetentionOutput {
+            retention: Some(ObjectLockRetention {
+                mode: Some(retention.mode.clone()),
+                retain_until_date: Some(::aws_smithy_types::DateTime::from(
+                    retention.retain_until,
+                )),
+                // The event-hold members are a hold that runs from an event rather than to
+                // a date; `PutObjectRetention` refuses a request carrying one, so no stored
+                // retention here has either, and none is reported.
+                event_hold: None,
+                event_hold_duration: None,
+            }),
+        })
     }
 }
+
+/// The wire error code a request this emulator will not serve for the caller is refused
+/// with, and its status and message: "403 Forbidden (access denied)", the way every other
+/// handler in this crate answers an expected-bucket-owner mismatch.
+const ACCESS_DENIED_CODE: &str = "AccessDenied";
+/// See [`ACCESS_DENIED_CODE`].
+const ACCESS_DENIED_STATUS: u16 = 403;
+/// See [`ACCESS_DENIED_CODE`] — the text Amazon S3 "Error responses" publishes for it.
+const ACCESS_DENIED_MESSAGE: &str = "Access Denied";

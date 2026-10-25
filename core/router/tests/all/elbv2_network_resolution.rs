@@ -529,6 +529,16 @@ fn elbv2_resolves_the_account_network_against_ec2() {
                     requested_zone: Some("us-west-2b"),
                     expected: Err("The IP address '203.0.113.4' is not valid"),
                 },
+                IpRow {
+                    // Whether the address is one an `ip` target may carry at all does not
+                    // depend on the zone, so it is judged first: a publicly routable
+                    // address is refused on its own terms rather than asked for a zone
+                    // that would not make it registrable.
+                    case: "a publicly routable address with no zone",
+                    address: "1.1.1.1",
+                    requested_zone: None,
+                    expected: Err("The IP address '1.1.1.1' is not valid"),
+                },
             ];
             let mut accepted: Vec<(String, String)> = Vec::new();
             for row in &rows {

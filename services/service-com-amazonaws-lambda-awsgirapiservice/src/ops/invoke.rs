@@ -469,9 +469,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // passed, and the documented status for it is 204 with no payload. `LogType`
             // "applies to synchronously invoked functions only", so there is no log
             // tail to report either.
+            //
+            // The payload is the EMPTY one rather than no payload at all: `Payload` is
+            // this operation's `@httpPayload`, so it IS the response body, and a `None`
+            // would leave the body to the JSON object the other members would otherwise
+            // make up — a body the 204 status cannot carry, which an SDK reads as a
+            // response shorter than its declared length.
             return Ok(InvokeOutput {
                 status_code: DRY_RUN_STATUS,
                 executed_version: Some(executed_version),
+                payload: Some(Vec::new()),
                 ..InvokeOutput::default()
             });
         }

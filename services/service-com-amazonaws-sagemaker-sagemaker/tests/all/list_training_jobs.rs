@@ -7,10 +7,11 @@
 //! these tests exercise is what a real SDK client gets.
 //!
 //! The training jobs themselves are put into the shared store directly, through the same
-//! `crate::state` records a handler writes: `CreateTrainingJob` is still a scaffold stub
-//! (`issues/things-that-do-not-work/20261022T120642Z-sagemaker-createtrainingjob-stub.md`),
-//! so there is no wire call that creates one yet. Seeding is therefore the fixture, and
-//! only the listing is under test — which is exactly what the shared harness's
+//! `crate::state` records `CreateTrainingJob` writes, so each fixture row's instants,
+//! statuses, warm pool and training plan are exactly what the table declares rather than
+//! whatever a create would mint from the wall clock — which is what the listing's order,
+//! filters and projection are asserted over. Seeding is therefore the fixture, and only
+//! the listing is under test, which is exactly what the shared harness's
 //! `pub(crate) engine` is for, so this suite reuses
 //! [`super::inference_deployment_lifecycle::Emulator`] rather than growing another copy
 //! of the dispatch path.
@@ -25,7 +26,9 @@ use std::time::Duration;
 use std::time::SystemTime;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_sagemaker_sagemaker::ops::types::WarmPoolStatus;
+use service_com_amazonaws_sagemaker_sagemaker::ops::types::{
+    CreateTrainingJobInput, WarmPoolStatus,
+};
 use service_com_amazonaws_sagemaker_sagemaker::state::{
     ComAmazonawsSagemakerSagemakerState, TrainingJob, MAX_PAGE_SIZE,
 };
@@ -47,8 +50,9 @@ const TERMINAL_STATUSES: [&str; 3] = ["Completed", "Failed", "Stopped"];
 
 /// Put a training job in the shared store, under the `TrainingJobName` it is keyed by.
 ///
-/// The store is reached through the harness's `engine`, which is what a suite does when
-/// the operation's writer is still a scaffold stub.
+/// The store is reached through the harness's `engine` so each row's instants, statuses
+/// and optional members are exactly what the table declares, which is what the listing's
+/// order, filters and projection are asserted over.
 fn seed(emulator: &Emulator, job: TrainingJob) {
     emulator
         .engine
@@ -127,6 +131,13 @@ fn job(name: &str, status: &str, created: u64, modified: u64) -> TrainingJob {
             .then(|| at(modified)),
         warm_pool_status: None,
         training_plan_arn: None,
+        failure_reason: None,
+        // The listing reports neither, and a row seeded in a terminal status is already
+        // where the clock would leave it.
+        ends_at: at(modified),
+        tuning_job_arn: None,
+        request: CreateTrainingJobInput::default(),
+        tags: Vec::new(),
     }
 }
 

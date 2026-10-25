@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCustomDetectionRuleAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCustomDetectionRuleAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCustomDetectionRuleAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: moves the custom detection rule association the two URI labels
+//! identify to the `AssociationMode` the body names, so a later
+//! `GetCustomDetectionRuleAssociation` reports the new mode and the same
+//! `AssociationId`, `Arn` and `CreatedAt`. An `(AssociationId, RuleId)` pair this
+//! account holds no association for is refused with the modelled
+//! `ResourceNotFoundException` (an update is never an upsert —
+//! `CreateCustomDetectionRuleAssociation` is what makes an association), and a move
+//! onto a `(RuleId, Mode)` pair this account already associated with the modelled
+//! `ConflictException`.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +144,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCustomDetectionRuleAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCustomDetectionRuleAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCustomDetectionRuleAssociation"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateCustomDetectionRuleAssociationErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+
+        let mut state = state.lock();
+
+        // The association is identified by the two URI labels, `RuleId` and
+        // `AssociationId`, exactly as the read and the delete bound at this same URI
+        // identify it; `Mode` is the value this call SETS — "updates the mode of an
+        // existing custom detection rule association"
+        // (`smithy_query(query="doc",shape="UpdateCustomDetectionRuleAssociation")`).
+        // Both labels carry their own length and pattern constraints, refused at the
+        // request boundary, so reaching here means only the association's EXISTENCE
+        // is open.
+        let Some(current_mode) = state
+            .detection_rule_association_by_id(&region, &input.rule_id, &input.association_id)
+            .map(|record| record.mode.clone())
+        else {
+            // An update is never an upsert:
+            // `CreateCustomDetectionRuleAssociation` is the operation that makes an
+            // association, so a well-formed pair this account holds none for is the
+            // modelled 404 rather than a hollow success.
+            return Err(not_found());
+        };
+
+        // Asking for the mode the association is already in changes nothing, so
+        // neither the store nor `UpdatedAt` moves — which is what `@idempotent` on
+        // this PUT (`smithy_query(operation="UpdateCustomDetectionRuleAssociation")`)
+        // means observably.
+        if current_mode == input.mode {
+            return Ok(UpdateCustomDetectionRuleAssociationOutput {});
+        }
+
+        // An association is the account's enrollment of one published rule in one
+        // mode, so `(RuleId, Mode)` identifies it: moving this one onto a pair the
+        // account already associated would make a second association of that pair,
+        // which is the modelled conflict the create answers for the same reason.
+        if state
+            .detection_rule_association(&region, &input.rule_id, &input.mode)
+            .is_some()
+        {
+            return Err(UpdateCustomDetectionRuleAssociationErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::detection_rule_association_conflict_message()),
+                    // "The error type"
+                    // (`smithy_query(shape="ConflictException")`): the class, the
+                    // same value the body's `__type` carries.
+                    r#type: Some(CONFLICT_EXCEPTION.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A MUTATION, so the instant this hands out is the association's new
+        // `UpdatedAt`; `CreatedAt`, the minted `AssociationId` and the tags the
+        // create recorded are untouched, because the mode is the only value this
+        // operation sets.
+        let now = state.tick_millis();
+        // Taken OUT of the store under the key its current mode gives, so the move
+        // cannot leave a second copy of the association behind. The `else` is
+        // DEFENSIVE and not a refusal path a caller can reach: the lookup above
+        // already resolved the record, and every record is held under the key its
+        // own `(region, rule_id, mode)` fields give.
+        let Some(mut record) = state.custom_detection_rule_associations.remove(&(
+            region.clone(),
+            input.rule_id.clone(),
+            current_mode,
+        )) else {
+            debug_assert!(
+                false,
+                "an association resolved by id must be held under its own (region, rule, mode) key"
+            );
+            return Err(not_found());
+        };
+        record.mode = input.mode.clone();
+        record.updated_at_millis = now;
+        // Put back under the mode the record now carries. No Region PARTITION is
+        // added — the record came out of this same Region — so the store bound
+        // `CreateCustomDetectionRuleAssociation` enforces cannot be crossed here.
+        state
+            .custom_detection_rule_associations
+            .insert((region, record.rule_id.clone(), record.mode.clone()), record);
+
+        // `UpdateCustomDetectionRuleAssociationResponse` declares no members
+        // (`smithy_query(operation="UpdateCustomDetectionRuleAssociation")`): the
+        // association is read back with `GetCustomDetectionRuleAssociation`.
+        Ok(UpdateCustomDetectionRuleAssociationOutput {})
     }
+}
+
+/// The error CLASS an update of an association this account does not hold is named
+/// by on the wire — the modelled 404
+/// (`smithy_query(operation="UpdateCustomDetectionRuleAssociation")`), so it is
+/// answered as the modelled shape rather than under the `BadRequestException`
+/// envelope this service's 400s use.
+const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+
+/// The error CLASS a move onto an already-associated `(RuleId, Mode)` pair is named
+/// by — the modelled 409.
+const CONFLICT_EXCEPTION: &str = "ConflictException";
+
+/// Refuse an `(AssociationId, RuleId)` pair this account holds no association for
+/// with the modelled 404, carrying the message a read of the same absence answers
+/// with: the two name the same missing resource, so they cannot describe it
+/// differently.
+fn not_found() -> UpdateCustomDetectionRuleAssociationError {
+    UpdateCustomDetectionRuleAssociationErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(crate::state::detection_rule_association_not_found_message()),
+            // "The error type" (`smithy_query(shape="ResourceNotFoundException")`):
+            // the class, the same value the body's `__type` carries.
+            r#type: Some(RESOURCE_NOT_FOUND_EXCEPTION.to_string()),
+        },
+    )
+    .into()
 }

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableHostedZoneDNSSEC
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableHostedZoneDNSSEC`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableHostedZoneDNSSEC::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +71,30 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::{no_such_hosted_zone, normalize_zone_id};
+
+/// The modelled `KeySigningKeyWithActiveStatusNotFound` (HTTP 400) for a zone
+/// that holds no key-signing key Route 53 could sign with.
+///
+/// The message is REQUEST-DERIVED, like this service's other not-found wording
+/// (see `crate::state::no_such_hosted_zone`): it names the zone the request
+/// asked about, as the request wrote it, which is what lets a caller driving
+/// several zones tell which one had no usable key.
+fn no_active_key_signing_key(requested_id: &str) -> KeySigningKeyWithActiveStatusNotFound {
+    KeySigningKeyWithActiveStatusNotFound {
+        message: Some(format!(
+            "Hosted zone with ID '{requested_id}' does not have a Key Signing Key in ACTIVE status."
+        )),
+    }
+}
+
+/// The refusal for a zone holding a key-signing key left in
+/// `INTERNAL_FAILURE`, in `InvalidKeySigningKeyStatus`'s own wording: "The
+/// key-signing key (KSK) status isn't valid or another KSK has the status
+/// INTERNAL_FAILURE."
+const INVALID_KEY_SIGNING_KEY_STATUS_MESSAGE: &str =
+    "The key-signing key (KSK) status isn't valid or another KSK has the status INTERNAL_FAILURE.";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -155,20 +170,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableHostedZoneDNSSEC` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableHostedZoneDNSSECErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableHostedZoneDNSSEC"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            EnableHostedZoneDNSSECErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        // The caller may pass the bare id or the `/hostedzone/`-prefixed `Id` a
+        // HostedZone handed it back; both name the same zone.
+        let id = normalize_zone_id(&input.hosted_zone_id);
+        let mut store = state.lock();
+        let zone = store.zones.get_mut(id).ok_or_else(|| {
+            EnableHostedZoneDNSSECErrorModeled::NoSuchHostedZone(no_such_hosted_zone(
+                &input.hosted_zone_id,
+            ))
+        })?;
+
+        // A KSK left in INTERNAL_FAILURE has to be corrected "before you can
+        // continue to work with DNSSEC signing, including actions that involve
+        // this KSK" (`KeySigningKey$Status`), so signing cannot be started over
+        // one.
+        if zone.has_key_signing_key_in_internal_failure() {
+            return Err(
+                EnableHostedZoneDNSSECErrorModeled::InvalidKeySigningKeyStatus(
+                    InvalidKeySigningKeyStatus {
+                        message: Some(INVALID_KEY_SIGNING_KEY_STATUS_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        // Route 53 signs a zone with its key-signing keys, so starting to sign
+        // needs one that is in use for signing: `ACTIVE`.
+        if !zone.has_active_key_signing_key() {
+            return Err(
+                EnableHostedZoneDNSSECErrorModeled::KeySigningKeyWithActiveStatusNotFound(
+                    no_active_key_signing_key(&input.hosted_zone_id),
+                )
+                .into(),
+            );
+        }
+
+        // Enabling signing on a zone that is already signing leaves it signing:
+        // the operation "enables DNSSEC signing in a specific hosted zone", so
+        // what it promises is the end state, not a transition.
+        zone.dnssec_signing_enabled = true;
+        // Signing is a change to the zone's records, so it propagates like any
+        // other: the caller polls the returned change through GetChange.
+        let change = store.submit_change(None);
+
+        Ok(EnableHostedZoneDNSSECOutput {
+            change_info: change.to_change_info(),
+        })
     }
 }

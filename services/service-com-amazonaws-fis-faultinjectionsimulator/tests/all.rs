@@ -27,6 +27,8 @@ mod experiment_lifecycle;
 mod experiment_options_decide_the_run;
 #[path = "all/experiment_run.rs"]
 mod experiment_run;
+#[path = "all/experiment_state_reason_and_report.rs"]
+mod experiment_state_reason_and_report;
 #[path = "all/experiment_target_account_configurations.rs"]
 mod experiment_target_account_configurations;
 #[path = "all/experiment_template_not_found.rs"]

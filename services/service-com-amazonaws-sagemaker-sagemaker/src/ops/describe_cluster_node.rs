@@ -161,9 +161,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+        // Both unknown-identifier cases are the modelled `ResourceNotFound`, worded with
+        // the node lookup's own fixed sentences: the cluster's and the node's differ, so a
+        // caller tells "no such cluster" from "that cluster has no such node" by the text,
+        // and neither leaks an identifier the request did not carry.
         let Some(cluster) = store.cluster_by_name_or_arn_mut(&input.cluster_name) else {
             return Err(DescribeClusterNodeErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!("Cluster {} does not exist.", input.cluster_name)),
+                message: Some(crate::state::CLUSTER_NODE_LOOKUP_CLUSTER_NOT_FOUND.to_string()),
             })
             .into());
         };
@@ -175,13 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let Some(node) = node else {
             return Err(DescribeClusterNodeErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!(
-                    "Cluster {cluster_arn} has no node {}.",
-                    input
-                        .node_id
-                        .or(input.node_logical_id)
-                        .unwrap_or_default()
-                )),
+                message: Some(crate::state::CLUSTER_NODE_NOT_FOUND.to_string()),
             })
             .into());
         };

@@ -17,6 +17,8 @@ mod bounds;
 mod cancel_job;
 #[path = "all/compute_environment_update.rs"]
 mod compute_environment_update;
+#[path = "all/consumable_resource_updates.rs"]
+mod consumable_resource_updates;
 #[path = "all/consumable_resources.rs"]
 mod consumable_resources;
 #[path = "all/job_definition_deregistration.rs"]

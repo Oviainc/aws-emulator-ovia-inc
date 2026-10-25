@@ -13,6 +13,11 @@
 //! `ErrorMessage` that says exactly that (`crate::state::NO_AIRFLOW_ENGINE`). No status is
 //! ever reported for work that ran, and the run holds no task instance.
 //!
+//! A repeated `ClientToken` starts nothing and REPORTS the run it already started, so it
+//! reports it the way every other reader of a run does: the owed status changes are
+//! materialised first (`crate::state::WorkflowRun::settle`), and the replay therefore
+//! answers the same status `GetWorkflowRun` and `ListWorkflowRuns` answer for that record.
+//!
 //! To start a run this operation must resolve the workflow VERSION to run — the one
 //! the request names, else the workflow's latest — so a workflow or a version the
 //! store does not hold is the modelled `ResourceNotFoundException` naming that
@@ -276,9 +281,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(unavailable());
                 };
                 let run = store
-                    .workflow_in(&region, workflow_arn)
-                    .and_then(|workflow| workflow.runs.get(run_id))
+                    .workflow_in_mut(&region, workflow_arn)
+                    .and_then(|workflow| workflow.runs.get_mut(run_id))
                     .ok_or_else(unavailable)?;
+
+                // A replay REPORTS the run this token already started, so it reports
+                // it the way every other reader of a run does: the ONE write a report
+                // may make, every status change the clock already owed
+                // (`crate::state::WorkflowRun::settle`), applied before the answer is
+                // built. Without it this call would answer the status the run held
+                // when it was admitted while `GetWorkflowRun` on the same record
+                // answers the one it has since been owed.
+                run.settle(now);
+
                 return Ok(response_for(run));
             }
         }

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUserImportJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUserImportJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUserImportJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores a user import job in a stored user pool under a freshly minted
+//! `JobId`, and returns the STORED job, so a later `DescribeUserImportJob`
+//! renders the same resource. A new job is `Created`: it imports nothing until
+//! `StartUserImportJob` is called. The job is minted with the locator a client
+//! uploads its CSV to ([`crate::state::user_import_csv_upload_url`]), built from
+//! the endpoint this request arrived at. An unknown `UserPoolId` is refused with
+//! `ResourceNotFoundException`, and a pool already holding
+//! [`crate::state::MAX_USER_IMPORT_JOBS_PER_POOL`] jobs with
+//! `LimitExceededException`.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +176,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUserImportJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUserImportJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUserImportJob"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        let now = ::std::time::SystemTime::now();
+        // The endpoint this request arrived at, which is what the job's CSV
+        // upload locator is built from.
+        let host = request_host(ctx);
+
+        let mut guard = state.lock();
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+        let pool_id = pool.id.clone();
+
+        // This emulator holds a pool's import jobs in memory, so the store is
+        // bounded.
+        if pool.user_import_jobs.len() >= crate::state::MAX_USER_IMPORT_JOBS_PER_POOL {
+            return Err(limit_exceeded(format!(
+                "User pool {} holds at most {} user import jobs.",
+                input.user_pool_id,
+                crate::state::MAX_USER_IMPORT_JOBS_PER_POOL
+            )));
+        }
+
+        // A `JobId` is minted per job, so each create answers a job of its own
+        // rather than overwriting one the pool already holds. The mint is tried
+        // a bounded number of times, so a collision cannot make this request
+        // loop.
+        let Some(job_id) = (0..MINT_ATTEMPTS)
+            .map(|_| crate::state::new_user_import_job_id())
+            .find(|candidate| !pool.user_import_jobs.contains_key(candidate))
+        else {
+            return Err(mint_failed());
+        };
+
+        // The role is kept exactly as submitted: the caller "must specify an IAM
+        // role that has permission to log import-job results to Amazon
+        // CloudWatch Logs" (`CreateUserImportJob.CloudWatchLogsRoleArn`), and
+        // whether that role exists is decided where the import logs, not here,
+        // so a well-formed ARN is accepted.
+        let job = crate::state::UserImportJob::new(
+            job_id.clone(),
+            input.job_name.clone(),
+            pool_id.clone(),
+            input.cloud_watch_logs_role_arn.clone(),
+            input.password_hashing_algorithm.clone(),
+            host.as_deref().and_then(|host| {
+                crate::state::user_import_csv_upload_url(host, &pool_id, &job_id)
+            }),
+            now,
+        );
+
+        // Stored first, then rendered from the stored record, so the response is
+        // exactly what a later read sees.
+        let stored = pool.user_import_jobs.entry(job_id).or_insert(job);
+        Ok(CreateUserImportJobOutput {
+            user_import_job: Some(stored.to_user_import_job_type(now)),
+        })
     }
 }
+
+/// How many `JobId` candidates one create tries before giving up, so a
+/// collision cannot make the mint loop.
+const MINT_ATTEMPTS: usize = 8;
+
+/// The endpoint host this request addressed — its `Host` header, or the
+/// authority of the request URI when it carries one — which is the endpoint a
+/// locator this operation hands out has to name. `None` when the request names
+/// no endpoint of its own.
+fn request_host(ctx: &smithy_server_runtime::OperationContext<'_>) -> Option<String> {
+    ctx.parts()
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            ctx.parts()
+                .uri
+                .authority()
+                .map(::http::uri::Authority::as_str)
+        })
+        .map(ToString::to_string)
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> CreateUserImportJobError {
+    CreateUserImportJobErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `LimitExceededException` for a store at its bound.
+fn limit_exceeded(message: String) -> CreateUserImportJobError {
+    CreateUserImportJobErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> CreateUserImportJobError {
+    CreateUserImportJobErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
+}
+
+/// The modelled server error for a `JobId` the mint could not make unique.
+fn mint_failed() -> CreateUserImportJobError {
+    CreateUserImportJobErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("could not mint a unique JobId; retry the request".to_string()),
+    })
+    .into()
+}
+

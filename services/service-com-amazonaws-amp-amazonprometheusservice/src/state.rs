@@ -231,6 +231,31 @@ pub const QUERY_LOGGING_STATUS_DELETING: &str = "DELETING";
 /// [`WORKSPACE_RESOURCE_TYPE`] is for a workspace.
 pub const QUERY_LOGGING_RESOURCE_TYPE: &str = "AWS::APS::QueryLoggingConfiguration";
 
+/// `ScraperLoggingConfigurationStatusCode` values a SCRAPER's logging configuration
+/// moves through here. Each is an entry of the modelled
+/// `com.amazonaws.amp#ScraperLoggingConfigurationStatusCode` enum
+/// (`crate::ops::types::SCRAPER_LOGGING_CONFIGURATION_STATUS_CODE_VALUES` carries the
+/// full list, including the two failure codes nothing here reaches: this emulator runs
+/// no vended-log delivery that could fail). The lifecycle is the one a query logging
+/// configuration follows — a configuration whose deletion has been accepted reports
+/// `DELETING` until the clock drops the record
+/// ([`ComAmazonawsAmpAmazonprometheusserviceState::materialize_due`]), and any other
+/// pending transition settles to `ACTIVE`.
+pub const SCRAPER_LOGGING_STATUS_ACTIVE: &str = "ACTIVE";
+/// See [`SCRAPER_LOGGING_STATUS_ACTIVE`].
+pub const SCRAPER_LOGGING_STATUS_DELETING: &str = "DELETING";
+
+/// The `resourceType` the modelled `ResourceNotFoundException` / `ConflictException`
+/// report for a scraper's logging configuration — the resource's AWS type name, as
+/// [`QUERY_LOGGING_RESOURCE_TYPE`] is for a workspace's.
+pub const SCRAPER_LOGGING_RESOURCE_TYPE: &str = "AWS::APS::ScraperLoggingConfiguration";
+
+/// The `message` the modelled `ResourceNotFoundException` reports for a scraper that
+/// holds no logging configuration — one CONSTANT sentence naming the kind of resource
+/// that is missing, for the same reason [`QUERY_LOGGING_NOT_FOUND_MESSAGE`] is: the
+/// scraper the request named is reported in `resourceId` instead.
+pub const SCRAPER_LOGGING_NOT_FOUND_MESSAGE: &str = "Scraper logging configuration not found.";
+
 /// The `message` the modelled `ResourceNotFoundException` reports for a workspace this
 /// account does not hold.
 ///
@@ -689,6 +714,38 @@ pub struct QueryLoggingConfiguration {
     pub client_token: Option<String>,
 }
 
+/// One scraper's logging configuration: every member
+/// `DescribeScraperLoggingConfigurationResponse` reports, plus the lifecycle
+/// bookkeeping.
+///
+/// A scraper holds at most one, which is why the store keys them by `scraperId`
+/// (`DescribeScraperLoggingConfiguration` takes nothing else to find one by), exactly as
+/// [`QueryLoggingConfiguration`] is keyed by the workspace that holds it.
+#[derive(Debug, Clone)]
+pub struct ScraperLoggingConfiguration {
+    pub scraper_id: String,
+    /// One entry of the modelled `ScraperLoggingConfigurationStatusCode` enum — see
+    /// [`SCRAPER_LOGGING_STATUS_ACTIVE`].
+    pub status_code: String,
+    /// `ScraperLoggingConfigurationStatus$statusReason` — the reason for a failure, so
+    /// it stays `None` while nothing failed.
+    pub status_reason: Option<String>,
+    /// `loggingDestination` (@required) — the destination the scraper's logs go to.
+    pub logging_destination: crate::ops::types::ScraperLoggingDestination,
+    /// `scraperComponents` is modelled `len 1.., @uniqueItems`, so a stored
+    /// configuration holds at least one component.
+    pub scraper_components: Vec<crate::ops::types::ScraperComponent>,
+    /// `modifiedAt` (@required) — when the record itself last changed.
+    pub modified_at: SystemTime,
+    /// When the clock owes this configuration's next transition, if one is pending:
+    /// `DELETING` is removed, any other transient status becomes `ACTIVE`.
+    pub transition_due: Option<SystemTime>,
+    /// The `clientToken` of the call that last CHANGED this configuration (the start of
+    /// a deletion). Replaying that exact call is the SAME request, so a handler answers
+    /// from the stored record instead of applying the change twice.
+    pub client_token: Option<String>,
+}
+
 /// One stored scraper: every member `ScraperSummary` reports.
 ///
 /// `ListScrapers` reports the scrapers this store HOLDS, so the listing is computed from
@@ -781,6 +838,9 @@ pub struct ComAmazonawsAmpAmazonprometheusserviceState {
     /// Each workspace's query logging configuration, keyed by `workspaceId`. A
     /// workspace holds at most one, and it is dropped with the workspace.
     pub query_logging: HashMap<String, QueryLoggingConfiguration>,
+    /// Each scraper's logging configuration, keyed by `scraperId`. A scraper holds at
+    /// most one, and it is dropped with the scraper.
+    pub scraper_logging: HashMap<String, ScraperLoggingConfiguration>,
     /// `clientToken -> workspaceId`, which is what makes `CreateWorkspace`
     /// idempotent per its `@idempotencyToken`.
     pub client_tokens: HashMap<String, String>,
@@ -911,10 +971,12 @@ impl ComAmazonawsAmpAmazonprometheusserviceState {
         // A scraper is an account-level resource, so its pending transition is owed on
         // its own clock: one being deleted is GONE once its due instant has passed, and
         // one in any other transient status settles to `ACTIVE`.
+        let mut removed_scrapers: Vec<String> = Vec::new();
         self.scrapers.retain(|_, scraper| match scraper.transition_due {
             Some(due) if now >= due => {
                 scraper.transition_due = None;
                 if scraper.status_code == STATUS_DELETING {
+                    removed_scrapers.push(scraper.scraper_id.clone());
                     false
                 } else {
                     scraper.status_code = STATUS_ACTIVE.to_string();
@@ -926,6 +988,32 @@ impl ComAmazonawsAmpAmazonprometheusserviceState {
             }
             _ => true,
         });
+        for scraper_id in removed_scrapers {
+            // A scraper's logging configuration belongs to that scraper, so it goes
+            // when the scraper does.
+            self.scraper_logging.remove(&scraper_id);
+        }
+
+        // A scraper's logging configuration settles on its own clock too, on the same
+        // terms a workspace's query logging configuration does.
+        let mut dropped_scraper_logging: Vec<String> = Vec::new();
+        for configuration in self.scraper_logging.values_mut() {
+            let Some(due) = configuration.transition_due else {
+                continue;
+            };
+            if now < due {
+                continue;
+            }
+            configuration.transition_due = None;
+            if configuration.status_code == SCRAPER_LOGGING_STATUS_DELETING {
+                dropped_scraper_logging.push(configuration.scraper_id.clone());
+            } else {
+                configuration.status_code = SCRAPER_LOGGING_STATUS_ACTIVE.to_string();
+            }
+        }
+        for scraper_id in dropped_scraper_logging {
+            self.scraper_logging.remove(&scraper_id);
+        }
     }
 
     /// The taggable resource the ARN `resource_arn` names, when this store holds one.

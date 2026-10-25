@@ -47,6 +47,17 @@ impl Logs {
 
     /// Call one operation, returning its HTTP status and parsed JSON body.
     pub async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+        self.call_in_region(REGION, operation, body).await
+    }
+
+    /// Call one operation with the SigV4 credential scope naming `region`, for a rule that is
+    /// about which Region a request was made in rather than about its body.
+    pub async fn call_in_region(
+        &self,
+        region: &str,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -55,7 +66,7 @@ impl Logs {
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/logs/aws4_request, \
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/logs/aws4_request, \
                      SignedHeaders=host;x-amz-target, Signature=0123456789abcdef"
                 ),
             )
@@ -75,10 +86,15 @@ impl Logs {
 
     /// Call one operation that must succeed, returning its response body.
     pub async fn ok(&self, operation: &str, body: &Value) -> Value {
-        let (status, parsed) = self.call(operation, body).await;
+        self.ok_in_region(REGION, operation, body).await
+    }
+
+    /// [`Logs::ok`], with the credential scope naming `region`.
+    pub async fn ok_in_region(&self, region: &str, operation: &str, body: &Value) -> Value {
+        let (status, parsed) = self.call_in_region(region, operation, body).await;
         assert_eq!(
             status, 200,
-            "{operation} {body}: expected HTTP 200, got {status} {parsed}"
+            "{operation} {body} in {region}: expected HTTP 200, got {status} {parsed}"
         );
         parsed
     }
@@ -86,10 +102,15 @@ impl Logs {
     /// Call one operation that must be refused as a client error, returning its wire
     /// error code.
     pub async fn err(&self, operation: &str, body: &Value) -> String {
-        let (status, parsed) = self.call(operation, body).await;
+        self.err_in_region(REGION, operation, body).await
+    }
+
+    /// [`Logs::err`], with the credential scope naming `region`.
+    pub async fn err_in_region(&self, region: &str, operation: &str, body: &Value) -> String {
+        let (status, parsed) = self.call_in_region(region, operation, body).await;
         assert_eq!(
             status, 400,
-            "{operation} {body}: expected HTTP 400, got {status} {parsed}"
+            "{operation} {body} in {region}: expected HTTP 400, got {status} {parsed}"
         );
         error_code(&parsed)
     }
@@ -98,10 +119,20 @@ impl Logs {
     /// error code AND the message it reports — for a refusal whose message the service
     /// builds from the request, so the message carries the rule.
     pub async fn refusal(&self, operation: &str, body: &Value) -> (String, String) {
-        let (status, parsed) = self.call(operation, body).await;
+        self.refusal_in_region(REGION, operation, body).await
+    }
+
+    /// [`Logs::refusal`], with the credential scope naming `region`.
+    pub async fn refusal_in_region(
+        &self,
+        region: &str,
+        operation: &str,
+        body: &Value,
+    ) -> (String, String) {
+        let (status, parsed) = self.call_in_region(region, operation, body).await;
         assert_eq!(
             status, 400,
-            "{operation} {body}: expected HTTP 400, got {status} {parsed}"
+            "{operation} {body} in {region}: expected HTTP 400, got {status} {parsed}"
         );
         let message = parsed
             .get("message")

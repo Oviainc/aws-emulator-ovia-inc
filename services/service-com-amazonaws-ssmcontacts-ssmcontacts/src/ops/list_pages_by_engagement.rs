@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPagesByEngagement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPagesByEngagement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPagesByEngagement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the pages of one engagement: the contact channels the engagement engaged by
+//! walking the engaged contact's (or escalation plan's) plan. A read — it writes nothing.
+//!
+//! Only the pages the engagement has already SENT are reported. `StartEngagement` mints a
+//! page per channel the plan targets, stamped with the instant its stage begins — the stages
+//! ahead of it having run out their `DurationInMinutes` — and stopping an engagement stops
+//! the stages it had not reached, so a page whose stage has not come round (or came round
+//! only after the stop) has engaged nobody
+//! ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::sent_pages_of_engagement`]).
+//!
+//! What each page reports is what the store holds: the engagement it belongs to, the contact
+//! whose channel it engaged, the message's sender and incident, the instant it was sent and
+//! the acknowledgement instants `AcceptPage` recorded. The message bodies are `DescribePage`'s
+//! to report, which is why the modelled `Page` does not carry them.
+//!
+//! The order is the scheduling order of the pages, so the opaque `NextToken` carries nothing
+//! but the scheduling sequence the page of results ended on, exactly as
+//! `ListContactChannels` carries a channel's creation sequence.
+//!
+//! Unlike `ListEngagements`, which resolves no resource, this one is addressed BY an
+//! engagement ARN, so it is gated on the account's Incident Manager replication set the way
+//! `DescribeEngagement` is: without an active set the ARN resolves to nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +168,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPagesByEngagement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPagesByEngagementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPagesByEngagement"))
+        use crate::state::{
+            decode_next_token, invalid_next_token_message, page_size, take_page,
+            TOKEN_SCOPE_PAGES_BY_ENGAGEMENT,
+        };
+
+        // The engagement is addressed by ARN; nothing is read off the request envelope.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListPagesByEngagementErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "this service is mounted on an engine that holds no state"
+                        .to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        let state = state.lock();
+
+        // The account gate comes FIRST — before the `NextToken` is read and before
+        // `EngagementId` is resolved — so a non-onboarded account is refused identically
+        // whatever else the request carries, and the refusal names the ARN the request
+        // supplied, which is what cannot be resolved without a replication set.
+        state
+            .require_active_replication_set_for(&input.engagement_id)
+            .map_err(account_precondition_failed)?;
+
+        // The resume point: the scheduling sequence the previous page of results ended on.
+        // Read before the engagement is resolved, as `ListContactChannels` reads its own
+        // token before resolving its contact: a token this service never issued is a
+        // malformed request whatever it is paired with.
+        let after: Option<u64> = match input.next_token.as_deref().filter(|t| !t.is_empty()) {
+            Some(token) => Some(
+                decode_next_token(TOKEN_SCOPE_PAGES_BY_ENGAGEMENT, token)
+                    .and_then(|decoded| decoded.parse::<u64>().ok())
+                    .ok_or_else(|| validation(invalid_next_token_message(token)))?,
+            ),
+            None => None,
+        };
+
+        if !state.engagements.contains_key(&input.engagement_id) {
+            return Err(ListPagesByEngagementErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Engagement {} not found", input.engagement_id),
+                    resource_id: input.engagement_id.clone(),
+                    resource_type: ENGAGEMENT_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // Only the pages the engagement has actually SENT: a stage whose wait has not run
+        // out yet has engaged nobody, so its pages are not part of the engagement yet.
+        let matching: Vec<(u64, Page)> = state
+            .sent_pages_of_engagement(&input.engagement_id, ::std::time::SystemTime::now())
+            .into_iter()
+            .filter(|(sequence, _)| after.is_none_or(|last| *sequence > last))
+            .collect();
+
+        let (results, next_token) = take_page(
+            matching,
+            page_size(input.max_results),
+            TOKEN_SCOPE_PAGES_BY_ENGAGEMENT,
+            |(sequence, _)| sequence.to_string(),
+        );
+
+        Ok(ListPagesByEngagementOutput {
+            next_token,
+            pages: results.into_iter().map(|(_, page)| page).collect(),
+        })
     }
+}
+
+/// The `resourceType` this operation's not-found error names: what the request named is the
+/// engagement whose pages it asks for, spelled as the engagement handlers spell it.
+const ENGAGEMENT_RESOURCE_TYPE: &str = "engagement";
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` because the failure is not a member-level one — the request's
+/// `EngagementId` is well formed; what cannot be resolved is the account's registry — and
+/// `fields` is present but EMPTY for the same reason, as `DescribeEngagement` answers it.
+fn account_precondition_failed(message: String) -> ListPagesByEngagementError {
+    ListPagesByEngagementErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
+}
+
+/// This operation's modelled `ValidationException`, carrying `message`.
+fn validation(message: impl Into<String>) -> ListPagesByEngagementError {
+    ListPagesByEngagementErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: None,
+    })
+    .into()
 }

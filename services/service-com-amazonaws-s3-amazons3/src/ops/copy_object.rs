@@ -690,6 +690,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // bucket's versioning state: this write carries no id of its own.
             version_id: None,
             encryption: encryption.clone(),
+            // The copy's destination carries no Object Lock retention: the object-lock
+            // headers are refused above, and a retention is placed on a stored version
+            // afterwards, by `PutObjectRetention`.
+            retention: None,
             body: source_object.body.clone(),
         };
         if replaces_metadata {

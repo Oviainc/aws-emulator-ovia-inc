@@ -317,8 +317,10 @@ fn merge(
                     .to_string(),
             ));
         }
-        updated.inclusive_start_billing_period = Some(range.inclusive_start_billing_period.clone());
-        updated.exclusive_end_billing_period = range.exclusive_end_billing_period.clone();
+        updated.spans = vec![crate::state::BillingPeriodSpan::new(
+            Some(range.inclusive_start_billing_period.clone()),
+            range.exclusive_end_billing_period.clone(),
+        )];
     }
 
     updated.last_modified_time_millis = crate::state::now_millis();

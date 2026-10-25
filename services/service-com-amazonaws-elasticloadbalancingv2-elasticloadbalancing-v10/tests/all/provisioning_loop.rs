@@ -27,8 +27,11 @@ use std::time::{Duration, SystemTime};
 /// mints belong to it.
 pub(crate) const REGION: &str = "us-west-2";
 
-/// The API version every awsQuery request carries, from the model's service version.
-pub(crate) const VERSION: &str = "2015-12-01";
+/// The API version every awsQuery request carries, read from the model's own statement
+/// of its service version (`src/service/shared_endpoint.rs`) rather than restated beside
+/// it, so one definition serves every suite in this crate.
+pub(crate) const VERSION: &str =
+    service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::service::shared_endpoint::API_VERSION;
 
 /// The canonical account id every emulator ARN carries.
 pub(crate) fn account() -> &'static str {

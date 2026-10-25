@@ -2853,18 +2853,49 @@ impl ComAmazonawsGroundstationGroundstationState {
         validate_config_data(config_data, &self.approved_uplink_bands_mhz)
     }
 
-    /// Whether this account knows a ground station called `name`: its own inventory
-    /// describes one ([`GROUND_STATIONS_ENV`]), or a satellite it is on-boarded to is
-    /// on-boarded to that station — the two places a ground station this account reaches
-    /// is recorded. A name neither records is a ground station this account cannot address.
+    /// Every ground station this account reaches, as the store records it and with
+    /// repeats: its own inventory ([`GROUND_STATIONS_ENV`]) and the stations the
+    /// satellites it is on-boarded to are on-boarded to — the two places a ground station
+    /// this account reaches is recorded. Written once here so "the ground stations of this
+    /// account" is one rule, whether a caller asks whether one exists or asks for all of
+    /// them.
+    fn ground_station_names(&self) -> impl Iterator<Item = &str> + '_ {
+        self.ground_stations.keys().map(String::as_str).chain(
+            self.satellites
+                .values()
+                .flat_map(|satellite| satellite.ground_stations.iter().map(String::as_str)),
+        )
+    }
+
+    /// Whether this account knows a ground station called `name`. A name neither place
+    /// records is a ground station this account cannot address.
     pub fn knows_ground_station(&self, name: &str) -> bool {
-        self.ground_stations.contains_key(name)
-            || self.satellites.values().any(|satellite| {
-                satellite
-                    .ground_stations
-                    .iter()
-                    .any(|station| station == name)
-            })
+        self.ground_station_names().any(|station| station == name)
+    }
+
+    /// The ground stations this account is served by, each a `GroundStationName`, in name
+    /// order and without repeats — so one station recorded in both places, or named twice
+    /// in one, is one ground station, and a page boundary is stable whatever order the
+    /// store holds them in. Empty for an account told about none.
+    pub fn known_ground_stations(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.ground_station_names().map(str::to_string).collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// The ground stations the satellite `satellite_id` is on-boarded to, in the same
+    /// order and with the same de-duplication as [`Self::known_ground_stations`]; empty
+    /// when this account holds no onboarding under that id.
+    pub fn ground_stations_of_satellite(&self, satellite_id: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .satellites
+            .get(satellite_id)
+            .map(|satellite| satellite.ground_stations.clone())
+            .unwrap_or_default();
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// The antennas at the ground station `name`, each an `AntennaName`, in the order the

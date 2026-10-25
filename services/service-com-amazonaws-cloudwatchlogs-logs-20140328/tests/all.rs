@@ -49,6 +49,8 @@ mod import_tasks;
 mod index_policies;
 #[path = "all/index_policy_puts.rs"]
 mod index_policy_puts;
+#[path = "all/index_policy_removal.rs"]
+mod index_policy_removal;
 #[path = "all/ingestion_window.rs"]
 mod ingestion_window;
 #[path = "all/integrations.rs"]

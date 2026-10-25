@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMediaInsightsPipelineConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMediaInsightsPipelineConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints and PERSISTS a media insights pipeline configuration: the caller's name,
+//! access role, processors and sinks (`Elements`), alert rules and tags, plus the
+//! `MediaInsightsPipelineConfigurationId` and ARN this service derives and the
+//! creation timestamps. Every later read, and the delete, resolve the stored record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMediaInsightsPipelineConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A configuration is created READY — the model gives it no status member — so
+//! nothing here is owed to the clock. A name another live configuration already
+//! carries is refused with the modelled 400 `BadRequestException` (the model declares
+//! no `ConflictException` for this operation): the name is one of the two forms of the
+//! `Identifier` every later call resolves.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +169,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMediaInsightsPipelineConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMediaInsightsPipelineConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Modelled constraints — the name's `^[0-9a-zA-Z._-]+$` and 2..64 length, the
+        // role ARN's pattern, the `Tags` list's 1..200 and the alert configuration's
+        // `Rules` 1..3, the `ClientRequestToken` pattern — are refused BEFORE this handler
+        // runs, and `service.rs` words that refusal as this service's 400
+        // `BadRequestException`.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMediaInsightsPipelineConfiguration"))
+        // `Elements` is the exception: its list shape carries NO `@length`
+        // (`smithy_query(query="shape",shape="MediaInsightsPipelineConfigurationElements")`),
+        // so nothing upstream bounds how many a request may send, and the list is moved
+        // into a record this store keeps for the life of the process. It is therefore
+        // refused HERE, before the record is built and before the store lock is taken, as
+        // the same modelled 400 an input-restriction failure earns.
+        if input.elements.len() > crate::state::MAX_INSIGHTS_CONFIGURATION_ELEMENTS {
+            return Err(
+                CreateMediaInsightsPipelineConfigurationErrorModeled::BadRequestException(
+                    crate::state::bad_request(crate::state::too_many_elements_message(
+                        input.elements.len(),
+                    )),
+                )
+                .into(),
+            );
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateMediaInsightsPipelineConfigurationErrorModeled::ServiceFailureException(
+                    crate::state::service_failure("The media pipeline store is unavailable."),
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Idempotent replay: the same `ClientRequestToken` answers with the
+        // configuration the first create minted rather than refusing its name.
+        if let Some(token) = input.client_request_token.as_deref() {
+            if let Some(existing) = store.insights_configuration_for_request_token(token) {
+                return Ok(CreateMediaInsightsPipelineConfigurationOutput {
+                    media_insights_pipeline_configuration: Some(existing.as_modeled()),
+                });
+            }
+        }
+
+        let id = store.mint_media_pipeline_id();
+        let created = crate::state::timestamp(now);
+        let configuration = crate::state::InsightsConfiguration {
+            // Replaced by the store, which owns the creation sequence.
+            seq: 0,
+            arn: crate::state::media_insights_pipeline_configuration_arn(
+                &crate::state::request_region(ctx.parts()),
+                &input.media_insights_pipeline_configuration_name,
+            ),
+            name: input.media_insights_pipeline_configuration_name,
+            id,
+            resource_access_role_arn: input.resource_access_role_arn,
+            real_time_alert_configuration: input.real_time_alert_configuration,
+            elements: input.elements,
+            tags: input.tags.unwrap_or_default(),
+            created_timestamp: created,
+            updated_timestamp: created,
+        };
+
+        let stored = match store.insert_insights_configuration(configuration, input.client_request_token)
+        {
+            Ok(stored) => stored.as_modeled(),
+            // The store is full: the quota the real service enforces, and the modelled
+            // error it declares for it.
+            Err(crate::state::InsightsConfigurationRefused::LimitReached) => {
+                return Err(
+                    CreateMediaInsightsPipelineConfigurationErrorModeled::ResourceLimitExceededException(
+                        crate::state::resource_limit_exceeded(format!(
+                            "The maximum number of media insights pipeline configurations \
+                             ({}) already exists. Delete a configuration before creating \
+                             another.",
+                            crate::state::MAX_INSIGHTS_CONFIGURATIONS
+                        )),
+                    )
+                    .into(),
+                );
+            }
+            Err(crate::state::InsightsConfigurationRefused::NameInUse) => {
+                return Err(
+                    CreateMediaInsightsPipelineConfigurationErrorModeled::BadRequestException(
+                        crate::state::bad_request(
+                            "A media insights pipeline configuration with that name already \
+                             exists.",
+                        ),
+                    )
+                    .into(),
+                );
+            }
+            // The store is the admission gate for the record's own size, and carries the
+            // count it refused; the handler's pre-lock check above refuses the same list
+            // before anything is built, so this arm is that refusal reached through the
+            // store — worded by the one message both share.
+            Err(crate::state::InsightsConfigurationRefused::TooManyElements(sent)) => {
+                return Err(
+                    CreateMediaInsightsPipelineConfigurationErrorModeled::BadRequestException(
+                        crate::state::bad_request(crate::state::too_many_elements_message(sent)),
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        Ok(CreateMediaInsightsPipelineConfigurationOutput {
+            media_insights_pipeline_configuration: Some(stored),
+        })
     }
 }

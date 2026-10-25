@@ -184,6 +184,9 @@ pub const MODEL_CARD_VERSION_QUOTA: usize = 1_000;
 pub const MODEL_CARD_EXPORT_JOB_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`].
 pub const PROCESSING_JOB_QUOTA: usize = 1_000;
+/// See [`MODEL_QUOTA`]. `DeleteTrainingJob` is still a stub, so no call releases a
+/// training-job record yet; the bound is what keeps the store finite in the meantime.
+pub const TRAINING_JOB_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`]. Bounds the lineage-group store as a whole, across Regions: a
 /// group is materialised per Region, so this is the total the store holds rather than a
 /// per-Region count. Declared last in this block, with the lineage-group record and its
@@ -237,17 +240,64 @@ pub const HYPER_PARAMETER_TUNING_JOB_QUOTA: usize = 1_000;
 /// The most training jobs one hyperparameter tuning job may be asked to launch
 /// (`ResourceLimits$MaxNumberOfTrainingJobs`).
 ///
-/// SageMaker publishes this as the adjustable account quota "Maximum number of training
-/// jobs per hyperparameter tuning job" and refuses a larger request with the modelled
-/// `ResourceLimitExceeded`. This emulator models neither Service Quotas nor an account's
-/// adjustments, so every account is held to the published default.
+/// SageMaker publishes this as an adjustable account quota — named by
+/// [`TRAINING_JOBS_PER_TUNING_JOB_QUOTA_NAME`] — and refuses a larger request with the
+/// modelled `ResourceLimitExceeded`. This emulator models neither Service Quotas nor an
+/// account's adjustments, so every account is held to the published default.
 pub const MAX_TRAINING_JOBS_PER_TUNING_JOB: i32 = 750;
 
 /// The most training jobs one hyperparameter tuning job may run at a time
 /// (`ResourceLimits$MaxParallelTrainingJobs`), from the published adjustable quota
-/// "Maximum number of parallel training jobs per hyperparameter tuning job". See
+/// [`PARALLEL_TRAINING_JOBS_PER_TUNING_JOB_QUOTA_NAME`]. See
 /// [`MAX_TRAINING_JOBS_PER_TUNING_JOB`] for why the default is what every account gets.
 pub const MAX_PARALLEL_TRAINING_JOBS_PER_TUNING_JOB: i32 = 10;
+
+/// The published name of the quota [`MAX_TRAINING_JOBS_PER_TUNING_JOB`] is the default
+/// of, as a refusal states it. INFERRED from the sibling
+/// [`PARALLEL_TRAINING_JOBS_PER_TUNING_JOB_QUOTA_NAME`], which is the one of the pair a
+/// recorded refusal spells out: the two dimensions are told apart by name, so this one is
+/// worded in that family's shape. A later recording of the total-jobs refusal is what
+/// would settle it.
+pub const TRAINING_JOBS_PER_TUNING_JOB_QUOTA_NAME: &str =
+    "Maximum number of training jobs each hyper parameter tuning job can run";
+/// The published name of the quota [`MAX_PARALLEL_TRAINING_JOBS_PER_TUNING_JOB`] is the
+/// default of, as a refusal states it.
+pub const PARALLEL_TRAINING_JOBS_PER_TUNING_JOB_QUOTA_NAME: &str =
+    "Maximum number of training jobs each hyper parameter tuning job can run in parallel \
+     at once";
+
+/// The unit [`account_quota_exceeded`] counts a training-job quota in: what the limit,
+/// the utilisation and the delta of such a quota are numbers OF.
+pub const TRAINING_JOBS_UNIT: &str = "TrainingJobs";
+
+/// How SageMaker words a refusal of a request that is past an adjustable account quota
+/// AWS PUBLISHES: the quota by its published name, its limit, what the account is already
+/// using of it and what this request asks for on top — each count followed by the UNIT
+/// the quota is counted in — and then how to ask for more.
+///
+/// The four numbers are the point of the template: a client reads the limit against the
+/// utilisation to decide whether to ask for less or to request an increase, so none of
+/// them is left out and none is replaced by prose about one member of the request.
+/// Stated once here so every operation that evaluates a published account quota words it
+/// the same way.
+///
+/// This is NOT the wording for the emulator's own bound on a store (see [`MODEL_QUOTA`]):
+/// that bound is not a published quota, so a refusal past it states the bound in its own
+/// words rather than claiming Service Quotas can raise it.
+pub fn account_quota_exceeded(
+    quota: &str,
+    unit: &str,
+    limit: i64,
+    in_use: i64,
+    delta: i64,
+) -> String {
+    format!(
+        "The account-level service limit '{quota}' is {limit} {unit}, with current \
+         utilization of {in_use} {unit} and a request delta of {delta} {unit}. Please use \
+         AWS Service Quotas to request an increase for this quota. If AWS Service Quotas \
+         is not available, contact AWS support to request an increase for this quota."
+    )
+}
 
 /// The most hyperparameters one tuning job may search over, across
 /// `ParameterRanges`' integer, continuous and categorical lists together.
@@ -272,6 +322,22 @@ pub const TUNING_JOB_SETTLES_AFTER: Duration = Duration::from_millis(700);
 pub const TUNING_STATUS_IN_PROGRESS: &str = "InProgress";
 /// See [`TUNING_STATUS_IN_PROGRESS`].
 pub const TUNING_STATUS_FAILED: &str = "Failed";
+/// See [`TUNING_STATUS_IN_PROGRESS`]: the transient status
+/// `StopHyperParameterTuningJob` moves a running job into.
+pub const TUNING_STATUS_STOPPING: &str = "Stopping";
+/// See [`TUNING_STATUS_IN_PROGRESS`]: the terminal status the clock owes a job that was
+/// asked to stop, after which "it releases all reserved resources for the tuning job"
+/// (`StopHyperParameterTuningJob`'s own doc).
+pub const TUNING_STATUS_STOPPED: &str = "Stopped";
+
+/// How long after `StopHyperParameterTuningJob` the clock owes the job's `Stopping` ->
+/// `Stopped` transition.
+///
+/// Same contract as [`TUNING_JOB_SETTLES_AFTER`] and chosen on the same terms (AWS
+/// documents no duration for the stop): never zero, so a caller that describes the job
+/// straight after asking it to stop still observes `Stopping`, and one that waits
+/// observes `Stopped`.
+pub const TUNING_JOB_STOPS_AFTER: Duration = Duration::from_millis(300);
 
 /// Why a hyperparameter tuning job this emulator accepted ends in `Failed`.
 ///
@@ -782,9 +848,9 @@ pub const TAGGED_RESOURCE_ENTITY: &str = "Resource";
 /// resources is refused with [`does_not_exist`], which is the refusal for an ARN this
 /// resolution holds no TAG SET for:
 ///
-/// * `training_jobs`, `hub_contents` and `partner_apps` — AWS does tag these, but the
+/// * `hub_contents` and `partner_apps` — AWS does tag these, but the
 ///   only writer that could carry a `Tags` list into the record is still a scaffold stub
-///   here (`create_training_job.rs`, `import_hub_content.rs` /
+///   here (`import_hub_content.rs` /
 ///   `create_hub_content_reference.rs`, `create_partner_app.rs`), so the record carries
 ///   no `tags` field yet. (A test may seed one; the refusal is then approximate for that
 ///   seeded record.) Contrast `hubs`, whose `CreateHub` IS implemented and stores
@@ -873,6 +939,7 @@ tag_accessors!(
     notebook_instances,
     pipelines,
     processing_jobs,
+    training_jobs,
     transform_jobs,
     trial_components,
     trials,
@@ -1015,15 +1082,64 @@ impl Hub {
     }
 }
 
-/// A training job, as `ListTrainingJobs` summarises it.
+/// How long after `CreateTrainingJob` the clock owes the job's move out of `InProgress`
+/// into its terminal status.
 ///
-/// One record per `TrainingJobName` (the name AWS keys a training job by, unique within
-/// an account and Region), holding exactly the members a `TrainingJobSummary` projects
-/// plus the `LastModifiedTime` the listing filters on. The job's full description — its
-/// algorithm, channels, artifacts and secondary-status transitions — is not kept here
-/// yet: `CreateTrainingJob` and `DescribeTrainingJob` are still scaffold stubs, each with
-/// its own issue, and whichever lands first extends THIS record rather than adding a
-/// second store beside it.
+/// Same contract as [`PROCESSING_JOB_ENDS_AFTER`], and chosen on the same terms (AWS
+/// documents no duration for a training run): compressed, never zero, so a caller that
+/// describes the job straight after creating it still observes `InProgress` with the
+/// secondary status of a job whose work has not started, and one that waits (as `aws
+/// sagemaker wait training-job-completed-or-stopped` does) observes a terminal status, so
+/// a waiter terminates.
+pub const TRAINING_JOB_ENDS_AFTER: Duration = Duration::from_millis(400);
+
+/// `TrainingJobStatus`'s members this emulator moves a training job through (the modelled
+/// enum also carries `Completed`, `Stopping`, `Stopped` and `Deleting`, which this slice
+/// does not reach: `StopTrainingJob` and `DeleteTrainingJob` are still stubs). Named once
+/// here so no handler compares a bare string literal.
+pub const TRAINING_STATUS_IN_PROGRESS: &str = "InProgress";
+/// See [`TRAINING_STATUS_IN_PROGRESS`].
+pub const TRAINING_STATUS_FAILED: &str = "Failed";
+
+/// The `SecondaryStatus` an accepted training job carries: the job has been accepted and
+/// no stage of its work has begun. Every other non-terminal member of that enum
+/// (`Downloading`, `Training`, `Uploading`, …) would name work this emulator does not run.
+pub const TRAINING_SECONDARY_STATUS_STARTING: &str = "Starting";
+/// See [`TRAINING_SECONDARY_STATUS_STARTING`]: the member that goes with
+/// [`TRAINING_STATUS_FAILED`] (`SecondaryStatus` spells it exactly as `TrainingJobStatus`
+/// does).
+pub const TRAINING_SECONDARY_STATUS_FAILED: &str = "Failed";
+
+/// `FailureReason` of a training job whose algorithm image could not be run here.
+///
+/// A training job runs a container image (`AlgorithmSpecification$TrainingImage`, or the
+/// image an algorithm's `TrainingSpecification` names). This emulator has no container
+/// runtime, so the run the caller asked for ends in the modelled `Failed` state with this
+/// reason rather than reporting a `Completed` nothing earned, a training duration nothing
+/// spent or final metrics nothing measured. Within the modelled `FailureReason` length
+/// (0..1024). Everything around the run — accepting the job, validating it, minting its
+/// ARN, replaying it, reporting its terminal status — is real.
+pub const NO_TRAINING_CONTAINER_RUNTIME_REASON: &str =
+    "This emulator has no container runtime, so the training job's algorithm image was \
+     never started and no model artifacts were written to the output S3 location";
+
+/// A training job created by `CreateTrainingJob`, as `DescribeTrainingJob` replays it and
+/// `ListTrainingJobs` summarises it.
+///
+/// One record per `TrainingJobName` (the name AWS keys a training job by, unique within an
+/// account and Region). The members a `TrainingJobSummary` projects are fields of their
+/// own, because the listing sorts and filters on them; everything else the describe
+/// reports is the accepted request, kept verbatim.
+///
+/// The store key is the name AS SENT, not folded through [`entity_key`]: `TrainingJobName`
+/// is documented unique "within an Amazon Web Services Region in an Amazon Web Services
+/// account" and nothing in the model makes it case-insensitive, where
+/// `HyperParameterTuningJobName`'s own doc says in so many words that it "is not case
+/// sensitive" — which is why that family folds its key and this one does not.
+///
+/// `ends_at` is the instant the clock owes the job's move out of `InProgress`; it is
+/// stored, never slept on, and materialised by whichever reporting call first runs at or
+/// after it ([`TrainingJob::settle_status`]).
 #[derive(Debug, Clone)]
 pub struct TrainingJob {
     pub name: String,
@@ -1043,6 +1159,60 @@ pub struct TrainingJob {
     pub warm_pool_status: Option<crate::ops::types::WarmPoolStatus>,
     /// The training plan the job reserves capacity from, when it has one.
     pub training_plan_arn: Option<String>,
+    /// Why the job is in a terminal failure status, once it reached one.
+    pub failure_reason: Option<String>,
+    /// When the clock owes this job its move out of `InProgress`.
+    pub ends_at: SystemTime,
+    /// The hyperparameter tuning job that launched this training job, when one did
+    /// (`DescribeTrainingJob$TuningJobArn`). A training job a caller creates has no
+    /// parent, and nothing here launches one on a tuning job's behalf — which is why
+    /// [`ComAmazonawsSagemakerSagemakerState::parallel_training_jobs_in_use`] counts none.
+    pub tuning_job_arn: Option<String>,
+    /// The `CreateTrainingJob` request the job was accepted with, kept verbatim so
+    /// `DescribeTrainingJob` replays what was stored rather than a reconstruction of it.
+    pub request: crate::ops::types::CreateTrainingJobInput,
+    /// The request's `Tags`, projected out of [`Self::request`] so the one tag resolution
+    /// (`tag_accessors!`) reaches this record's tag set through the `tags` field every
+    /// other taggable record exposes.
+    pub tags: Vec<Tag>,
+}
+
+impl TrainingJob {
+    /// Materialise the move out of `InProgress` the clock already owes this job.
+    ///
+    /// This is the one write a reporting operation may make: the transition was due at
+    /// `ends_at` whether or not anybody described the job, so the observer makes no
+    /// difference to the result. The terminal status is [`TRAINING_STATUS_FAILED`] with
+    /// [`NO_TRAINING_CONTAINER_RUNTIME_REASON`], for the reason that constant gives.
+    ///
+    /// Answers whether the transition happened on this call, so the caller can record it.
+    pub fn settle_status(&mut self, now: SystemTime) -> bool {
+        if self.status == TRAINING_STATUS_IN_PROGRESS && now >= self.ends_at {
+            self.status = TRAINING_STATUS_FAILED.to_string();
+            self.secondary_status = Some(TRAINING_SECONDARY_STATUS_FAILED.to_string());
+            self.failure_reason = Some(NO_TRAINING_CONTAINER_RUNTIME_REASON.to_string());
+            self.last_modified_time = self.ends_at;
+            self.training_end_time = Some(self.ends_at);
+            return true;
+        }
+        false
+    }
+
+    /// Where the job's model artifacts are written, from the output location the request
+    /// named and the job's own name.
+    ///
+    /// `ModelArtifacts$S3ModelArtifacts` is "the path of the S3 object that contains the
+    /// model artifacts", and SageMaker writes it under `<S3OutputPath>/<TrainingJobName>`;
+    /// it is DERIVED from the request rather than a report that an object exists, and
+    /// stays the same across reads for as long as the job is held.
+    pub fn model_artifacts_path(&self) -> String {
+        let base = self
+            .request
+            .output_data_config
+            .s3_output_path
+            .trim_end_matches('/');
+        format!("{base}/{}/output/model.tar.gz", self.name)
+    }
 }
 
 /// An endpoint configuration created by `CreateEndpointConfig`, as
@@ -1224,26 +1394,55 @@ pub struct HyperParameterTuningJob {
 }
 
 impl HyperParameterTuningJob {
-    /// Materialise the `InProgress` -> `Failed` transition the clock already owes.
+    /// Materialise the transition the clock already owes: `InProgress` -> `Failed` for a
+    /// job left to run, `Stopping` -> `Stopped` for one that was asked to stop.
     ///
     /// The one write a reporting operation may make: the transition was due at
     /// `settles_at` whether or not anybody described the job, so the observer makes no
     /// difference to the result. The end and last-modified times move to the instant the
     /// transition was due rather than to "now", so they are stable across later reads.
     ///
-    /// The job fails because this emulator launches no training job — see
-    /// [`NO_TRAINING_RUNNER_FAILURE_REASON`].
+    /// A job left to run fails because this emulator launches no training job — see
+    /// [`NO_TRAINING_RUNNER_FAILURE_REASON`]; a job asked to stop carries no failure
+    /// reason, because stopping is what the caller asked for.
     ///
     /// Answers whether the transition happened on this call, so the caller can record it.
     pub fn settle_status(&mut self, now: SystemTime) -> bool {
-        if self.status == TUNING_STATUS_IN_PROGRESS && now >= self.settles_at {
-            self.status = TUNING_STATUS_FAILED.to_string();
-            self.failure_reason = Some(NO_TRAINING_RUNNER_FAILURE_REASON.to_string());
-            self.end_time = Some(self.settles_at);
-            self.last_modified_time = self.settles_at;
-            return true;
+        if now < self.settles_at {
+            return false;
         }
-        false
+        match self.status.as_str() {
+            TUNING_STATUS_IN_PROGRESS => {
+                self.status = TUNING_STATUS_FAILED.to_string();
+                self.failure_reason = Some(NO_TRAINING_RUNNER_FAILURE_REASON.to_string());
+            }
+            TUNING_STATUS_STOPPING => self.status = TUNING_STATUS_STOPPED.to_string(),
+            _ => return false,
+        }
+        self.end_time = Some(self.settles_at);
+        self.last_modified_time = self.settles_at;
+        true
+    }
+
+    /// Whether the job has reached a status from which nothing more happens on its own.
+    ///
+    /// `Deleting` and `DeleteFailed` belong to `DeleteHyperParameterTuningJob`, which this
+    /// slice does not reach, so the terminal statuses are the three a job here can be in.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            TUNING_STATUS_FAILED | TUNING_STATUS_STOPPED | STATUS_COMPLETED
+        )
+    }
+
+    /// Record that the caller asked this job to stop: it moves to `Stopping` now, and the
+    /// clock owes it `Stopped`. The span is never zero, so the transient status is
+    /// observable.
+    pub fn request_stop(&mut self, now: SystemTime) {
+        self.status = TUNING_STATUS_STOPPING.to_string();
+        self.failure_reason = None;
+        self.last_modified_time = now;
+        self.settles_at = now + TUNING_JOB_STOPS_AFTER;
     }
 }
 
@@ -2652,6 +2851,30 @@ impl ComAmazonawsSagemakerSagemakerState {
         self.processing_jobs.len() < PROCESSING_JOB_QUOTA
     }
 
+    /// Whether another training job fits, i.e. the store is below
+    /// [`TRAINING_JOB_QUOTA`].
+    pub fn training_jobs_below_quota(&self) -> bool {
+        self.training_jobs.len() < TRAINING_JOB_QUOTA
+    }
+
+    /// How much of the account's parallel-training-jobs quota its hyperparameter tuning
+    /// jobs are using: the training jobs a tuning job launched that are still running.
+    ///
+    /// The quota is counted in TrainingJobs, so the utilisation is a count of training-job
+    /// records — the ones a tuning job owns ([`TrainingJob::tuning_job_arn`]) and that have
+    /// not yet reached a terminal status. Nothing in this emulator launches a training job
+    /// on a tuning job's behalf, so an account that has only ever created training jobs
+    /// itself is using none of this quota, and that is read off the store rather than
+    /// assumed.
+    pub fn parallel_training_jobs_in_use(&self) -> usize {
+        self.training_jobs
+            .values()
+            .filter(|job| {
+                job.tuning_job_arn.is_some() && job.status == TRAINING_STATUS_IN_PROGRESS
+            })
+            .count()
+    }
+
     /// The model package the call that presented `token` registered under the same
     /// identity (`name` plus `group`), if one is stored.
     ///
@@ -2876,7 +3099,7 @@ fn arn_resource<'v>(arn: &'v str, region: &str) -> Option<&'v str> {
 /// `Could not find <kind> "<identifier as the caller sent it>".` — so they do not come
 /// through here.
 pub fn does_not_exist(entity: &str, arn: &str) -> String {
-    format!("{entity} '{arn}' does not exist.")
+    entity_not_found(entity, arn, ArnQuoting::SingleQuoted)
 }
 
 /// The entity label [`does_not_exist`] names a lineage action by.
@@ -2890,6 +3113,53 @@ pub const PIPELINE_ENTITY: &str = "Pipeline";
 
 /// The entity label [`does_not_exist`] names one execution of a pipeline by.
 pub const PIPELINE_EXECUTION_ENTITY: &str = "Pipeline execution";
+
+/// How the `does not exist.` sentence renders the ARN it names — the ONE thing the two
+/// recorded templates that use it differ in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArnQuoting {
+    /// As the lineage and pipeline family records it: `'<arn>'`.
+    SingleQuoted,
+    /// As the algorithm and model-package-group family records it: `<arn>`.
+    Bare,
+}
+
+/// The one `<Entity> <identifier> does not exist.` sentence, with `quoting` deciding how
+/// the resolved ARN is rendered.
+///
+/// Private, and reached through [`does_not_exist`] / [`entity_does_not_exist`], so a call
+/// site names the recorded family it belongs to rather than passing a bare flag — and so
+/// the sentence itself is written once and the two shapes cannot drift apart.
+fn entity_not_found(entity: &str, arn: &str, quoting: ArnQuoting) -> String {
+    let identifier = match quoting {
+        ArnQuoting::SingleQuoted => format!("'{arn}'"),
+        ArnQuoting::Bare => arn.to_string(),
+    };
+    format!("{entity} {identifier} does not exist.")
+}
+
+/// How SageMaker's algorithm and model-package-group operations state a resource the
+/// account does not hold: the entity label as the service words it, then the identifier
+/// RESOLVED TO ITS ARN — UNQUOTED — then `does not exist.`
+///
+/// Same sentence as [`does_not_exist`] and the same reason for reporting the resolved ARN
+/// (both kinds are addressed by name or by ARN, so the identifier a consumer extracts is
+/// the one a successful call would report); the single quotes that family's recorded
+/// refusals carry are what differs, which is why the quoting is [`ArnQuoting`]'s to decide
+/// and not each caller's.
+///
+/// Stated once here so the readers, the deletes and the creates that reference one of
+/// these resources cannot word the same fact differently.
+pub fn entity_does_not_exist(entity: &str, arn: &str) -> String {
+    entity_not_found(entity, arn, ArnQuoting::Bare)
+}
+
+/// The entity label [`entity_does_not_exist`] names an algorithm by.
+pub const ALGORITHM_ENTITY: &str = "Algorithm";
+
+/// The entity label [`entity_does_not_exist`] names a model package group by — one word,
+/// as the service spells it there, where the group's own conflict refusal spells it out.
+pub const MODEL_PACKAGE_GROUP_ENTITY: &str = "ModelPackageGroup";
 
 /// How SageMaker's hosting operations state a resource the account does not hold: the
 /// resource kind as the service words it, then the identifier AS THE CALLER SENT IT, in
@@ -2915,6 +3185,51 @@ pub const ENDPOINT_CONFIG_KIND_LABEL: &str = "endpoint configuration";
 
 /// The kind label [`could_not_find`] names an endpoint by.
 pub const ENDPOINT_KIND_LABEL: &str = "endpoint";
+
+/// The kind label [`could_not_find`] names a model package by — a versioned package is
+/// addressed by `<group>/<version>`, so the identifier the refusal quotes is whichever
+/// `VersionedArnOrName` form the request carried.
+pub const MODEL_PACKAGE_KIND_LABEL: &str = "model package";
+
+/// How SageMaker's training-job readers state a job this account does not hold.
+///
+/// A FIXED sentence naming no identifier at all — the recorded wording for this resource,
+/// where the hosting operations quote the name the caller sent ([`could_not_find`]) and
+/// the lineage family reports a resolved ARN ([`does_not_exist`]). A reader that answers
+/// it has stored nothing under the name the request carried.
+pub const REQUESTED_RESOURCE_NOT_FOUND: &str = "Requested resource not found.";
+
+/// How SageMaker states a hyperparameter tuning job the account does not hold: the name
+/// AS THE CALLER SENT IT, in the sentence that tells it to send another one.
+///
+/// The recorded wording for this resource — neither the hosting family's quoted
+/// identifier ([`could_not_find`]) nor the lineage family's resolved ARN
+/// ([`does_not_exist`]) — stated once so every operation that resolves a tuning-job
+/// reference words the same fact the same way.
+pub fn tuning_job_not_found(name: &str) -> String {
+    format!("Amazon SageMaker can't find a tuning job called {name}. Type another name.")
+}
+
+/// How SageMaker words a HyperPod cluster this account does not hold.
+///
+/// A FIXED sentence carrying NOTHING from the request: the recorded refusals of the
+/// cluster operations state the condition and no identifier, so no refusal leaks an ARN
+/// the caller never supplied or a name it can only match against its own input. Stated
+/// once here so the cluster-scoped operations cannot word the same fact differently.
+pub const CLUSTER_NOT_FOUND: &str = "Specified cluster not found";
+
+/// [`CLUSTER_NOT_FOUND`] as the HyperPod NODE lookup words it: the same sentence behind
+/// the name of the condition that lookup raises, which is the form recorded for the
+/// operations that address one node of a cluster.
+pub const CLUSTER_NODE_LOOKUP_CLUSTER_NOT_FOUND: &str =
+    "ClusterNotExistsException: Specified cluster not found";
+
+/// How the HyperPod node lookup words a node the named cluster does not own.
+///
+/// Fixed text, and DIFFERENT from [`CLUSTER_NODE_LOOKUP_CLUSTER_NOT_FOUND`]: the two
+/// unknown-identifier cases of one request — the cluster, and the node inside it — are
+/// what a caller tells apart by the refusal text, since both carry the same code.
+pub const CLUSTER_NODE_NOT_FOUND: &str = "Specified cluster node not found";
 
 /// Why SageMaker refuses this pipeline definition, or `None` when it accepts it.
 ///

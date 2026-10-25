@@ -28,9 +28,10 @@ use crate::ops::types::{
     AmazonopensearchserviceDestinationConfiguration, DeliveryStreamEncryptionConfiguration,
     DeliveryStreamEncryptionConfigurationInput, ElasticsearchDestinationConfiguration,
     ExtendedS3DestinationConfiguration, HttpEndpointDestinationConfiguration,
-    IcebergDestinationConfiguration, ProcessingConfiguration, RedshiftDestinationConfiguration,
-    S3DestinationConfiguration, SecretsManagerConfiguration, SnowflakeDestinationConfiguration,
-    SourceDescription, SplunkDestinationConfiguration, VpcConfiguration, KEY_TYPE_VALUES,
+    IcebergDestinationConfiguration, ProcessingConfiguration, ProcessorParameter,
+    RedshiftDestinationConfiguration, S3DestinationConfiguration, SecretsManagerConfiguration,
+    SnowflakeDestinationConfiguration, SourceDescription, SplunkDestinationConfiguration,
+    VpcConfiguration, KEY_TYPE_VALUES,
 };
 
 /// How long after the starting call a clock-owed stream transition
@@ -122,6 +123,45 @@ pub const FIREHOSE_SERVICE_PRINCIPAL: &str = "firehose.amazonaws.com";
 /// CloudWatch Logs are supported when CloudWatch Logs decompression is enabled"
 /// (`InvalidSourceException`).
 pub const CLOUDWATCH_LOGS_PROCESSOR_TYPES: &[&str] = &["CloudWatchLogProcessing", "Decompression"];
+
+/// The `ProcessorParameterName` values in the order the enum DECLARES them
+/// (`smithy_query(query="shape", shape="ProcessorParameterName")`), which is the order a
+/// processor's normalised parameter list is reported in.
+///
+/// The same set as the generated `crate::ops::types::PROCESSOR_PARAMETER_NAME_VALUES`,
+/// which the scaffold sorts alphabetically and so cannot carry the declaration order; the
+/// test suite pins the two against each other so neither can drift.
+pub const PROCESSOR_PARAMETER_NAME_ORDER: &[&str] = &[
+    "LambdaArn",
+    "NumberOfRetries",
+    "MetadataExtractionQuery",
+    "JsonParsingEngine",
+    "RoleArn",
+    "BufferSizeInMBs",
+    "BufferIntervalInSeconds",
+    "SubRecordType",
+    "Delimiter",
+    "CompressionFormat",
+    "DataMessageExtraction",
+];
+
+/// The `ProcessorType` Firehose runs by INVOKING another service — an AWS Lambda
+/// function — so Firehose itself parameterizes that invocation
+/// ([`NUMBER_OF_RETRIES_PARAMETER`], [`ROLE_ARN_PARAMETER`]). Every other modelled
+/// processor transforms the record in Firehose itself and takes only the parameters the
+/// caller gives it.
+pub const LAMBDA_PROCESSOR_TYPE: &str = "Lambda";
+
+/// The `ProcessorParameterName` carrying how often Firehose retries the invocation.
+pub const NUMBER_OF_RETRIES_PARAMETER: &str = "NumberOfRetries";
+
+/// The `ProcessorParameterName` carrying the role the invocation is made under.
+pub const ROLE_ARN_PARAMETER: &str = "RoleArn";
+
+/// `NumberOfRetries` for an invocation the caller gave no retry count: "Currently the
+/// following default values are supported: 3 for NumberOfRetries"
+/// (`ProcessorParameter$ParameterName`).
+pub const DEFAULT_NUMBER_OF_RETRIES: &str = "3";
 
 /// The `DeliveryStreamEncryptionStatus` a started enable is in while it is in flight:
 /// "Firehose first sets the encryption status of the stream to ENABLING".
@@ -224,6 +264,127 @@ impl DestinationConfigKind {
             Self::Iceberg(config) => config.processing_configuration.as_ref(),
         }
     }
+
+    /// The same configuration, to write the parameters Firehose fills in itself into —
+    /// see [`Self::normalise_processors`].
+    fn processing_configuration_mut(&mut self) -> Option<&mut ProcessingConfiguration> {
+        match self {
+            Self::S3(_) => None,
+            Self::ExtendedS3(config) => config.processing_configuration.as_mut(),
+            Self::Redshift(config) => config.processing_configuration.as_mut(),
+            Self::Elasticsearch(config) => config.processing_configuration.as_mut(),
+            Self::AmazonOpenSearchService(config) => config.processing_configuration.as_mut(),
+            Self::Splunk(config) => config.processing_configuration.as_mut(),
+            Self::HttpEndpoint(config) => config.processing_configuration.as_mut(),
+            Self::Snowflake(config) => config.processing_configuration.as_mut(),
+            Self::AmazonOpenSearchServerless(config) => config.processing_configuration.as_mut(),
+            Self::Iceberg(config) => config.processing_configuration.as_mut(),
+        }
+    }
+
+    /// The role Firehose runs this destination's delivery under: the destination's own
+    /// `RoleARN`, or — for a destination whose shape declares none (Splunk) or leaves it
+    /// optional (an HTTP endpoint) — the role of the intermediate Amazon S3 location it
+    /// always carries. This is the role a processor Firehose has to invoke something with
+    /// runs under when the caller named none.
+    pub fn delivery_role_arn(&self) -> Option<&str> {
+        let role_arn = match self {
+            Self::S3(config) => config.role_arn.as_str(),
+            Self::ExtendedS3(config) => config.role_arn.as_str(),
+            Self::Redshift(config) => config.role_arn.as_str(),
+            Self::Elasticsearch(config) => config.role_arn.as_str(),
+            Self::AmazonOpenSearchService(config) => config.role_arn.as_str(),
+            Self::Splunk(config) => config.s3_configuration.role_arn.as_str(),
+            Self::HttpEndpoint(config) => config
+                .role_arn
+                .as_deref()
+                .unwrap_or(config.s3_configuration.role_arn.as_str()),
+            Self::Snowflake(config) => config.role_arn.as_str(),
+            Self::AmazonOpenSearchServerless(config) => config.role_arn.as_str(),
+            Self::Iceberg(config) => config.role_arn.as_str(),
+        };
+        (!role_arn.is_empty()).then_some(role_arn)
+    }
+
+    /// Materialise what a stored data-processing configuration reports: the processor
+    /// list it holds, and the processor parameters Firehose supplies ITSELF, each
+    /// parameter once and in the service's canonical order.
+    ///
+    /// A described processor carries its EFFECTIVE parameters, not the list as it was
+    /// submitted: a processor Firehose runs by invoking another service
+    /// ([`LAMBDA_PROCESSOR_TYPE`]) also runs under a role and with a retry count, and
+    /// Firehose fills both in — the retry count at its documented default
+    /// ([`DEFAULT_NUMBER_OF_RETRIES`]) and the role from the destination's own delivery
+    /// role ([`Self::delivery_role_arn`]) — when the caller named neither. The result is
+    /// ordered by [`PROCESSOR_PARAMETER_NAME_ORDER`], so a client reads the same list
+    /// whatever order it submitted. A configuration that names no processor holds the
+    /// empty list: the processors of a configuration a caller supplied are exactly the
+    /// ones it named, so there is a list to report either way.
+    ///
+    /// Called on the two paths that WRITE a destination configuration
+    /// (`CreateDeliveryStream`, `UpdateDestination`), so what a describe echoes and what
+    /// the delivery path acts on are the one normalised configuration.
+    pub fn normalise_processors(&mut self) {
+        let delivery_role_arn = self.delivery_role_arn().map(str::to_string);
+        let Some(processing) = self.processing_configuration_mut() else {
+            return;
+        };
+        for processor in processing.processors.get_or_insert_default() {
+            // A parameter name names ONE parameter, so a name given twice keeps the
+            // first value given for it rather than appearing twice.
+            let mut parameters: Vec<ProcessorParameter> = Vec::new();
+            for parameter in processor.parameters.iter().flatten() {
+                if !parameters
+                    .iter()
+                    .any(|kept| kept.parameter_name == parameter.parameter_name)
+                {
+                    parameters.push(parameter.clone());
+                }
+            }
+
+            if processor.r#type == LAMBDA_PROCESSOR_TYPE {
+                fill_parameter(
+                    &mut parameters,
+                    NUMBER_OF_RETRIES_PARAMETER,
+                    DEFAULT_NUMBER_OF_RETRIES,
+                );
+                if let Some(role_arn) = delivery_role_arn.as_deref() {
+                    fill_parameter(&mut parameters, ROLE_ARN_PARAMETER, role_arn);
+                }
+            }
+
+            // A name the model does not declare cannot reach here (`ParameterName`
+            // targets the enum, so the boundary refused it), but one would sort after
+            // every declared name rather than being dropped.
+            parameters.sort_by_key(|parameter| {
+                PROCESSOR_PARAMETER_NAME_ORDER
+                    .iter()
+                    .position(|name| *name == parameter.parameter_name)
+                    .unwrap_or(PROCESSOR_PARAMETER_NAME_ORDER.len())
+            });
+            // A processor the caller gave no parameters and Firehose fills none for
+            // ("You don't have to put a processor parameter when you select
+            // `AppendDelimiterToRecord`" — `Processor`) keeps carrying none.
+            if !parameters.is_empty() {
+                processor.parameters = Some(parameters);
+            }
+        }
+    }
+}
+
+/// Add `name` with `value` to `parameters` unless the caller already named it: what
+/// Firehose fills in is what the request left out.
+fn fill_parameter(parameters: &mut Vec<ProcessorParameter>, name: &str, value: &str) {
+    if parameters
+        .iter()
+        .any(|parameter| parameter.parameter_name == name)
+    {
+        return;
+    }
+    parameters.push(ProcessorParameter {
+        parameter_name: name.to_string(),
+        parameter_value: value.to_string(),
+    });
 }
 
 /// Whether `processing` turns on a processor that only a CloudWatch Logs producer can
@@ -539,7 +700,7 @@ impl ComAmazonawsFirehoseFirehose20150804State {
         // "Attempts to send data to a delivery stream that is not in the ACTIVE state
         // cause an exception."
         if stream.status != StreamStatus::Active {
-            return Err(StreamRefusal::NotActive(stream.status.as_wire()));
+            return Err(StreamRefusal::NotActive);
         }
         // A stream configured for the CloudWatch Logs decompression pipeline takes data
         // from CloudWatch Logs only; an API put is by definition not that producer.
@@ -561,8 +722,10 @@ impl ComAmazonawsFirehoseFirehose20150804State {
 pub enum StreamRefusal {
     /// No stream of that name exists.
     NoSuchStream,
-    /// The stream exists but is not `ACTIVE`; carries the status it is in.
-    NotActive(&'static str),
+    /// The stream exists but is not `ACTIVE`, so it takes no data: the refusal states
+    /// that the stream is not active and not which state it is in
+    /// (`crate::service::not_active_message`).
+    NotActive,
     /// The stream only takes data from CloudWatch Logs
     /// ([`DeliveryStream::takes_cloudwatch_logs_only`]), and an API put is not that
     /// producer: the modelled `InvalidSourceException`.

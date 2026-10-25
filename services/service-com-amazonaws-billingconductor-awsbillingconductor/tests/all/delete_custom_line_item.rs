@@ -9,9 +9,12 @@
 //! cover: a request carrying no `BillingPeriodRange` deletes the item itself (no read of
 //! any billing period reports it again, and the associations other custom line items
 //! held to it go with it), and a request carrying one deletes it only from the half-open
-//! span that range covers — narrowing the span the stored item applies in, leaving it
-//! untouched when the span shares no period with it, and removing the record only once
-//! nothing of it is left. It answers the deleted item's full ARN, refuses an `Arn` that
+//! span that range covers, so the item keeps every OTHER period it applied in: the
+//! periods before the range's inclusive start and the periods from its exclusive end on,
+//! both of them when the range falls strictly inside the periods the item applied in. It
+//! leaves the item untouched when the range shares no period with it, and removes the
+//! record only once nothing of it is left. It answers the deleted item's full ARN,
+//! refuses an `Arn` that
 //! names no stored item with 400 `ValidationException`
 //! (`MISSING_CUSTOMLINEITEM`), refuses a range that covers no billing period with
 //! 400 `ValidationException` (`ILLEGAL_BILLING_PERIOD_RANGE`), and — because the
@@ -28,8 +31,10 @@
 //! percentage, with and without associated resources), the span the stored item was
 //! created with (none / open-ended / bounded, before / around / after the window), where
 //! the request's span falls relative to it (disjoint before, disjoint after, abutting,
-//! overlapping the head, overlapping the tail, equal, covering), how the request's span
-//! is bounded (open end / bounded), how far outside the window a refused range starts
+//! overlapping the head, overlapping the tail, strictly inside, equal, covering), how the
+//! request's span
+//! is bounded (open end / bounded), how many bounded deletes the item has taken (one /
+//! several), how far outside the window a refused range starts
 //! (one month, a year, a decade, the epoch month, a far-future month) and how a billing
 //! period is spelled (`2026-7` / `2026-07`).
 
@@ -432,11 +437,32 @@ async fn a_delete_naming_a_billing_period_range_removes_the_item_only_from_those
             vec![period(0), period(1), period(12)],
         ),
         (
-            "a bounded delete of an item with no span ends it where the delete begins",
+            "a bounded delete of an item with no span takes only the periods it named",
             None,
             range(&period(-1), Some(&period(1))),
-            vec![period(-3), period(-2)],
-            vec![period(-1), period(0), period(1)],
+            vec![period(-3), period(-2), period(1), period(2), period(12)],
+            vec![period(-1), period(0)],
+        ),
+        (
+            "a bounded delete strictly inside a bounded span keeps both sides of it",
+            Some(range(&period(-1), Some(&period(6)))),
+            range(&period(0), Some(&period(2))),
+            vec![period(-1), period(2), period(5)],
+            vec![period(-2), period(0), period(1), period(6)],
+        ),
+        (
+            "a bounded delete strictly inside an open-ended span keeps both sides of it",
+            Some(range(&period(-1), None)),
+            range(&period(0), Some(&period(1))),
+            vec![period(-1), period(1), period(12)],
+            vec![period(-2), period(0)],
+        ),
+        (
+            "a bounded delete of the head of an open-ended item",
+            Some(range(&period(-1), None)),
+            range(&period(-1), Some(&period(1))),
+            vec![period(1), period(2), period(12)],
+            vec![period(-2), period(-1), period(0)],
         ),
         (
             "a delete overlapping the head of a bounded span",
@@ -503,6 +529,16 @@ async fn a_delete_naming_a_billing_period_range_removes_the_item_only_from_those
             range(&one_digit_month(&period(0)), None),
             vec![period(-1)],
             vec![period(0), period(2)],
+        ),
+        (
+            "a one-digit month bounds a delete strictly inside the item's span",
+            Some(range(&period(-1), Some(&period(3)))),
+            range(
+                &one_digit_month(&period(0)),
+                Some(&one_digit_month(&period(1))),
+            ),
+            vec![period(-1), period(1), period(2)],
+            vec![period(0), period(3)],
         ),
     ];
 
@@ -1000,5 +1036,109 @@ async fn deleting_an_item_releases_the_associations_other_items_held_to_it() {
         arns,
         vec![sibling],
         "case {case:?}: expected only the resource the delete did not name, got {associated}"
+    );
+}
+
+/// THE RULE under REPEATED bounded deletes: each one takes only the periods ITS range
+/// covers, so the stretches of billing periods the item still applies in accumulate —
+/// every period no delete has named is still reported, however many deletes landed, and
+/// the record is only gone once nothing of it is left.
+#[tokio::test]
+async fn repeated_bounded_deletes_each_take_only_the_periods_they_name() {
+    let emulator = Emulator::new();
+    let group = emulator.billing_group("payer").await;
+    // No span of its own, so the item starts out applying to every billing period and
+    // each delete carves out exactly the periods it names.
+    let item = emulator.custom_line_item(&group, "twice", json!({})).await;
+
+    // (the span the delete names, the periods a read still reports the item for
+    // afterwards, the periods it does not) — the second delete names periods abutting the
+    // first hole, so two bounded deletes leave the periods on either side of both.
+    let steps: Vec<(Value, Vec<String>, Vec<String>)> = vec![
+        (
+            range(&period(0), Some(&period(1))),
+            vec![period(-2), period(-1), period(1), period(12)],
+            vec![period(0)],
+        ),
+        (
+            range(&period(-1), Some(&period(0))),
+            vec![period(-2), period(1), period(12)],
+            vec![period(-1), period(0)],
+        ),
+    ];
+
+    for (index, (deleted_with, reported, unreported)) in steps.into_iter().enumerate() {
+        let case = format!("delete {} of {deleted_with}", index + 1);
+        emulator.delete_ok(&case, &item, &deleted_with).await;
+        for probe in &reported {
+            assert!(
+                emulator.reports(&case, &item, Some(probe)).await,
+                "case {case:?}: expected the read for {probe:?} to still report the item"
+            );
+        }
+        for probe in &unreported {
+            assert!(
+                !emulator.reports(&case, &item, Some(probe)).await,
+                "case {case:?}: expected the read for {probe:?} not to report the item"
+            );
+        }
+    }
+
+    // What is left of the item is still ONE stored item with its own history: a
+    // `CustomLineItemVersionListElement` carries one start and one end billing period,
+    // so the generation is reported by the OUTER bounds of the stretches it still
+    // applies in. Read on an item bisected once, where both bounds are the ones its
+    // create named.
+    let case = "the history of a bisected item";
+    let bounded = emulator
+        .custom_line_item(
+            &group,
+            "bisected",
+            json!({ "BillingPeriodRange": range(&period(-1), Some(&period(6))) }),
+        )
+        .await;
+    emulator
+        .delete_ok(case, &bounded, &range(&period(0), Some(&period(2))))
+        .await;
+    assert!(
+        emulator.reports(case, &bounded, Some(&period(5))).await
+            && !emulator.reports(case, &bounded, Some(&period(1))).await,
+        "case {case:?}: expected the bisected item to be reported for {:?} and not for {:?}",
+        period(5),
+        period(1)
+    );
+    let (status, versions) = emulator
+        .send(
+            "POST",
+            "/list-custom-line-item-versions",
+            &json!({ "Arn": bounded }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200, got {status} with {versions}"
+    );
+    let elements = versions
+        .get("CustomLineItemVersions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        elements.len(),
+        1,
+        "case {case:?}: expected the item's one generation, got {versions}"
+    );
+    let generation = elements.first().cloned().unwrap_or(Value::Null);
+    assert_eq!(
+        generation.get("StartBillingPeriod").and_then(Value::as_str),
+        Some(period(-1).as_str()),
+        "case {case:?}: expected the generation to start at {:?}, got {generation}",
+        period(-1)
+    );
+    assert_eq!(
+        generation.get("EndBillingPeriod").and_then(Value::as_str),
+        Some(period(6).as_str()),
+        "case {case:?}: expected the generation to end at {:?}, got {generation}",
+        period(6)
     );
 }

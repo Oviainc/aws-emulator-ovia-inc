@@ -138,31 +138,27 @@ impl From<GetCommentsForComparedCommitErrorModeled> for GetCommentsForComparedCo
     }
 }
 
-/// A commit id named in the request: absent (empty) is `CommitIdRequiredException`,
-/// and anything that is not a git object name is `InvalidCommitIdException`.
-///
-/// Each message comes from the one place this crate words that code
-/// (`crate::state`), which `crate::service` uses for the same code when the request
-/// boundary refuses the member: one code, one message, and nothing naming the
-/// emulator's own validator.
+/// A commit id named in the request, mapped onto the errors THIS operation models
+/// for it: which ids address a commit is `crate::state`'s rule
+/// ([`crate::state::checked_commit_id`]), so every operation taking one agrees
+/// about it and about the message each refusal carries.
 fn checked_commit_id(commit_id: &str) -> Result<(), GetCommentsForComparedCommitError> {
-    if commit_id.is_empty() {
-        return Err(GetCommentsForComparedCommitErrorModeled::CommitIdRequiredException(
-            CommitIdRequiredException {
-                message: Some(crate::state::COMMIT_ID_REQUIRED_MESSAGE.to_string()),
-            },
-        )
-        .into());
-    }
-    if !crate::state::is_object_id(commit_id) {
-        return Err(GetCommentsForComparedCommitErrorModeled::InvalidCommitIdException(
-            InvalidCommitIdException {
-                message: Some(crate::state::INVALID_COMMIT_ID_MESSAGE.to_string()),
-            },
-        )
-        .into());
-    }
-    Ok(())
+    crate::state::checked_commit_id(commit_id).map_err(|problem| {
+        let message = Some(problem.message().to_string());
+        match problem {
+            crate::state::CommitIdProblem::Missing => {
+                GetCommentsForComparedCommitErrorModeled::CommitIdRequiredException(
+                    CommitIdRequiredException { message },
+                )
+            }
+            crate::state::CommitIdProblem::Invalid => {
+                GetCommentsForComparedCommitErrorModeled::InvalidCommitIdException(
+                    InvalidCommitIdException { message },
+                )
+            }
+        }
+        .into()
+    })
 }
 
 /// Every comment in the repository by the comment it replies to: the reply edges of
@@ -331,13 +327,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The comment threads filed on this comparison: the after side always has
         // to match, and a named before side narrows the comparison further, while
-        // an absent one reports every comment posted on that after commit. A reply
+        // an absent one reports every comment posted on that after commit. A
+        // comment posted on a PULL REQUEST is filed under that pull request rather
+        // than on the comparison alone, so it is not one of these. A reply
         // is reported inside its own thread, not as a thread of its own.
         let mut roots: Vec<&crate::state::CommentRecord> = repository
             .comments
             .values()
             .filter(|comment| {
                 comment.in_reply_to.is_none()
+                    && comment.pull_request_id.is_none()
                     && comment.comparison.after_commit_id == input.after_commit_id
                     && before_commit_id.is_none_or(|before_commit_id| {
                         comment.comparison.before_commit_id.as_deref() == Some(before_commit_id)

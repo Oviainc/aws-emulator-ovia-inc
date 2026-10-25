@@ -19,6 +19,11 @@
 // else appends to.
 #[path = "all/kinesisvideo_signing_name_routing.rs"]
 mod kinesisvideo_signing_name_routing;
+// At the head for the same reason, and moved here out of the `c…` span of the sorted
+// list: that span is where the cloudformation/cloudtrail suites land, so a line beside
+// them lost repeated squash merges to branches that touched it in the same window.
+#[path = "all/chime_signing_name_routing.rs"]
+mod chime_signing_name_routing;
 // Out of order for the same reason, and placed beside it rather than in the sorted span
 // of its own name or in the appended tail, both of which concurrent suites land into.
 #[path = "all/cognito_vended_session_reads_sse_kms_object.rs"]
