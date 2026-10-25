@@ -326,13 +326,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if want_users {
             for (user_key, user) in &store.users {
-                // A user's permissions boundary is the one relation this account can
-                // hold to a policy: `AttachUserPolicy` is a scaffolded 501, so no user
-                // carries an attached managed policy to report.
+                let attached = want_permissions_policy
+                    && store
+                        .user_attached_policies
+                        .get(user_key)
+                        .is_some_and(|attached| attached.contains(&input.policy_arn));
                 let bounded = want_permissions_boundary
                     && crate::state::permissions_boundary_arn(user.permissions_boundary.as_ref())
                         == Some(input.policy_arn.as_str());
-                if !bounded || !user.path.starts_with(&path_prefix) {
+                if !(attached || bounded) || !user.path.starts_with(&path_prefix) {
                     continue;
                 }
                 related.push((

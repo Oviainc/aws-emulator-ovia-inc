@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAssetModelInterfaceRelationship
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAssetModelInterfaceRelationship`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAssetModelInterfaceRelationship::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation reports the stored interface relationship between an
+//! asset model and an interface asset model from the shared engine store
+//! (`crate::state`); this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -161,20 +155,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAssetModelInterfaceRelationship` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAssetModelInterfaceRelationshipErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAssetModelInterfaceRelationship"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeAssetModelInterfaceRelationshipError::Modeled(
+                DescribeAssetModelInterfaceRelationshipErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+
+        let store = state.lock();
+        // Both members are `CustomID` labels: a raw UUID or the `externalId:` form.
+        let asset_model_id = store
+            .resolve_asset_model_id(&input.asset_model_id)
+            .ok_or_else(|| model_not_found(&input.asset_model_id))?;
+        let interface_asset_model_id = store
+            .resolve_asset_model_id(&input.interface_asset_model_id)
+            .ok_or_else(|| model_not_found(&input.interface_asset_model_id))?;
+
+        // Two models that exist are not a relationship: the relationship exists
+        // only where the interface was APPLIED to the model, so a pair nothing
+        // applied is a not-found rather than an empty answer.
+        let record = store
+            .interface_relationship(&asset_model_id, &interface_asset_model_id)
+            .ok_or_else(|| {
+                not_found(format!(
+                    "The asset model {} does not implement the interface asset model {}.",
+                    input.asset_model_id, input.interface_asset_model_id
+                ))
+            })?;
+
+        Ok(DescribeAssetModelInterfaceRelationshipOutput {
+            asset_model_id: record.asset_model_id.clone(),
+            interface_asset_model_id: record.interface_asset_model_id.clone(),
+            property_mappings: record.property_mappings.clone(),
+            hierarchy_mappings: record.hierarchy_mappings.clone(),
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the asset-model label that
+/// resolved to nothing.
+fn model_not_found(label: &str) -> DescribeAssetModelInterfaceRelationshipError {
+    not_found(crate::state::not_found_message(
+        crate::state::RESOURCE_ASSET_MODEL,
+        label,
+    ))
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> DescribeAssetModelInterfaceRelationshipError {
+    DescribeAssetModelInterfaceRelationshipError::Modeled(
+        DescribeAssetModelInterfaceRelationshipErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException { message },
+        ),
+    )
 }

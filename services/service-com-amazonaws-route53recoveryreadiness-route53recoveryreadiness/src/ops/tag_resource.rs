@@ -9,6 +9,11 @@
 //! `ResourceNotFoundException`'s 404 (see
 //! [`crate::scaffolded::NOT_FOUND_EXCEPTION_STATUS`]) — before anything is written.
 //!
+//! The submitted tags themselves go through [`crate::state::validate_added_tags`], the
+//! same rule every create of this service applies: the resulting tag set must stay
+//! within the per-record ceiling and each submitted key and value must satisfy the AWS
+//! tagging contract, so a refused call writes nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

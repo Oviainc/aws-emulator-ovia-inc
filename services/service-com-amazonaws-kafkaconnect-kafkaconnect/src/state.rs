@@ -1116,8 +1116,9 @@ pub struct WorkerConfigurationRecord {
     pub name: String,
     pub description: Option<String>,
     /// The base64 `connect-distributed.properties` body the create request
-    /// carried, stored verbatim: the read operations hand back exactly what was
-    /// stored.
+    /// carried, stored verbatim: the create refuses a value it could not decode
+    /// ([`base64_content_refusal`]), so what is stored is always base64, and the
+    /// read operations hand back exactly the encoding the caller sent.
     pub properties_file_content: String,
     pub state: String,
     pub revision: i64,
@@ -1561,6 +1562,50 @@ pub fn invalid_parameter(member: &str) -> String {
 /// full sentence): `Invalid parameter <member>: <reason>`
 pub fn invalid_parameter_because(member: &str, reason: &str) -> String {
     format!("{INVALID_PARAMETER} {member}: {reason}")
+}
+
+/// The reason a member that must carry base64-encoded content, and does not, is
+/// rejected with.
+pub const NOT_BASE64: &str = "It must be base64 encoded.";
+
+/// How many characters one base64 quantum encodes to.
+const BASE64_QUANTUM: usize = 4;
+
+/// Whether `value` is content the service can base64-decode.
+///
+/// The codec is `aws_smithy_types::base64` — the standard-alphabet decoder the
+/// wire serializer already uses for every Smithy blob, so the alphabet read here
+/// is the one RFC 4648 section 4 names (`+` and `/`, not the URL-safe `-` and
+/// `_`) and no second base64 implementation enters this crate.
+///
+/// That decoder requires a whole number of quanta, while a client may send the
+/// encoding without its trailing `=`, so a value carrying no `=` has the missing
+/// padding supplied before it is decoded rather than being refused. A value that
+/// carries `=` STATES its own padding and is decoded exactly as given, so padding
+/// that is wrong (one `=` short, padding in the middle, a last quantum holding a
+/// single character) is refused rather than repaired.
+fn is_base64(value: &str) -> bool {
+    if value.contains('=') {
+        return ::aws_smithy_types::base64::decode(value).is_ok();
+    }
+    let missing = (BASE64_QUANTUM - value.len() % BASE64_QUANTUM) % BASE64_QUANTUM;
+    let padded = format!("{value}{}", "=".repeat(missing));
+    ::aws_smithy_types::base64::decode(&padded).is_ok()
+}
+
+/// The message a refusal of `member` carries when its documented base64 content
+/// cannot be decoded, or `None` when the service can read `value`.
+///
+/// A member the model documents as base64 is DECODED by the service to read what
+/// it carries, so a value that is not base64 carries nothing it can store: the
+/// request is refused on that member, in the one member-naming form every
+/// kafkaconnect rejection uses ([`invalid_parameter_because`]), and nothing is
+/// persisted. Only the ENCODING is judged — whatever bytes a legal encoding
+/// decodes to are content this service stores — and the message quotes NONE of
+/// the value, which is modelled sensitive. The decoded bytes answer that one
+/// question and are dropped at once, so nothing sized from the request is kept.
+pub fn base64_content_refusal(member: &str, value: &str) -> Option<String> {
+    (!is_base64(value)).then(|| invalid_parameter_because(member, NOT_BASE64))
 }
 
 /// Whether `value` is a well-formed ARN naming `service`.

@@ -15,6 +15,8 @@
 mod alias_viewer_certificate;
 #[path = "all/cache_policy_lifecycle.rs"]
 mod cache_policy_lifecycle;
+#[path = "all/cache_policy_list.rs"]
+mod cache_policy_list;
 #[path = "all/cache_policy_update.rs"]
 mod cache_policy_update;
 #[path = "all/connection_function_lifecycle.rs"]
