@@ -364,9 +364,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn.clone(),
             crate::state::StoredProcurementPortalPreference {
                 preference,
-                // Nothing has requested a portal validation for this preference yet.
+                // Nothing has requested a portal validation for this preference yet, so
+                // no code is outstanding and no submission has been refused.
                 validation: None,
-                unconfirmed_validation_attempts: 0,
                 failed_verification_attempts: 0,
             },
         );

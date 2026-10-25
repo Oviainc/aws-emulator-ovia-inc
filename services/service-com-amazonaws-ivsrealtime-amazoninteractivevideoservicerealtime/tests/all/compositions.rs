@@ -74,11 +74,17 @@ const STATE_ACTIVE: &str = "ACTIVE";
 //   PipConfiguration$videoFillMode      "Default: COVER."
 //   PipConfiguration$pipBehavior        "Default: STATIC."
 //   PipConfiguration$pipPosition        "Default: BOTTOM_RIGHT."
+//   GridConfiguration$gridGap           "Default: 2."
+//   PipConfiguration$gridGap            "Default: 0."
+//   PipConfiguration$pipOffset          "Default: 0."
 const DEFAULT_GRID_ASPECT_RATIO: &str = "VIDEO";
 const DEFAULT_GRID_FILL_MODE: &str = "COVER";
 const DEFAULT_PIP_FILL_MODE: &str = "COVER";
 const DEFAULT_PIP_BEHAVIOR: &str = "STATIC";
 const DEFAULT_PIP_POSITION: &str = "BOTTOM_RIGHT";
+const DEFAULT_GRID_GAP: i64 = 2;
+const DEFAULT_PIP_GRID_GAP: i64 = 0;
+const DEFAULT_PIP_OFFSET: i64 = 0;
 
 /// Long enough that the `STARTING` -> `ACTIVE` transition the emulator owes has fallen
 /// due, whatever scheduling delay the test host adds.
@@ -617,7 +623,7 @@ async fn every_composition_reports_a_layout_with_the_documented_defaults() {
                 "omitStoppedVideo": false,
                 "videoAspectRatio": DEFAULT_GRID_ASPECT_RATIO,
                 "videoFillMode": DEFAULT_GRID_FILL_MODE,
-                "gridGap": 0,
+                "gridGap": DEFAULT_GRID_GAP,
             }}),
         ),
         (
@@ -627,7 +633,7 @@ async fn every_composition_reports_a_layout_with_the_documented_defaults() {
                 "omitStoppedVideo": false,
                 "videoAspectRatio": DEFAULT_GRID_ASPECT_RATIO,
                 "videoFillMode": DEFAULT_GRID_FILL_MODE,
-                "gridGap": 0,
+                "gridGap": DEFAULT_GRID_GAP,
             }}),
         ),
         (
@@ -637,7 +643,7 @@ async fn every_composition_reports_a_layout_with_the_documented_defaults() {
                 "omitStoppedVideo": false,
                 "videoAspectRatio": DEFAULT_GRID_ASPECT_RATIO,
                 "videoFillMode": DEFAULT_GRID_FILL_MODE,
-                "gridGap": 0,
+                "gridGap": DEFAULT_GRID_GAP,
             }}),
         ),
         (
@@ -647,7 +653,7 @@ async fn every_composition_reports_a_layout_with_the_documented_defaults() {
                 "omitStoppedVideo": false,
                 "videoAspectRatio": "PORTRAIT",
                 "videoFillMode": DEFAULT_GRID_FILL_MODE,
-                "gridGap": 0,
+                "gridGap": DEFAULT_GRID_GAP,
             }}),
         ),
         (
@@ -675,9 +681,9 @@ async fn every_composition_reports_a_layout_with_the_documented_defaults() {
             json!({ "pip": {
                 "omitStoppedVideo": false,
                 "videoFillMode": DEFAULT_PIP_FILL_MODE,
-                "gridGap": 0,
+                "gridGap": DEFAULT_PIP_GRID_GAP,
                 "pipBehavior": DEFAULT_PIP_BEHAVIOR,
-                "pipOffset": 0,
+                "pipOffset": DEFAULT_PIP_OFFSET,
                 "pipPosition": DEFAULT_PIP_POSITION,
             }}),
         ),
@@ -687,9 +693,9 @@ async fn every_composition_reports_a_layout_with_the_documented_defaults() {
             json!({ "pip": {
                 "omitStoppedVideo": false,
                 "videoFillMode": DEFAULT_PIP_FILL_MODE,
-                "gridGap": 0,
+                "gridGap": DEFAULT_PIP_GRID_GAP,
                 "pipBehavior": DEFAULT_PIP_BEHAVIOR,
-                "pipOffset": 0,
+                "pipOffset": DEFAULT_PIP_OFFSET,
                 "pipPosition": "TOP_RIGHT",
                 "pipWidth": 240,
             }}),

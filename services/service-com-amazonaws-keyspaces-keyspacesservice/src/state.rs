@@ -2,23 +2,26 @@
 
 //! Engine state for the com-amazonaws-keyspaces-keyspacesservice service.
 //!
-//! Amazon Keyspaces is a two-level namespace: a region holds keyspaces, and a
-//! keyspace holds tables and user-defined types. Both levels live in the one
-//! [`ComAmazonawsKeyspacesKeyspacesserviceState`] below so every operation reads
-//! and writes ONE copy of a resource.
+//! Amazon Keyspaces is a three-level namespace: an Amazon Web Services Region holds
+//! keyspaces, and a keyspace holds tables and user-defined types. All three levels live
+//! in the one [`ComAmazonawsKeyspacesKeyspacesserviceState`] below so every operation
+//! reads and writes ONE copy of a resource, and the Region a request was signed for is
+//! what selects the keyspaces it can see at all
+//! ([`keyspaces`][ComAmazonawsKeyspacesKeyspacesserviceState::keyspaces]).
 //!
-//! Keyed by [`std::collections::BTreeMap`] at both levels, because `ListKeyspaces`
+//! Keyed by [`std::collections::BTreeMap`] at every level, because `ListKeyspaces`
 //! and `ListTables` are `@paginated`: a page boundary is only resumable if the
 //! iteration order is total and stable, which a hash map's is not.
 //!
 //! This module also holds what more than one operation needs — ARN construction,
 //! the request's region, the modelled defaults, the [service-managed
-//! catalog][SERVICE_MANAGED_KEYSPACES] every account already holds (materialised by
-//! [`ensure_service_managed_catalog`][ComAmazonawsKeyspacesKeyspacesserviceState::ensure_service_managed_catalog]),
+//! catalog][SERVICE_MANAGED_KEYSPACES] every Region already holds (derived per request by
+//! [`keyspace`][ComAmazonawsKeyspacesKeyspacesserviceState::keyspace]),
 //! and [`settle`][ComAmazonawsKeyspacesKeyspacesserviceState::settle],
 //! which materialises the status transitions the clock already owes — so the
 //! per-operation files never carry a second copy of any of it.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
@@ -246,9 +249,9 @@ pub const MULTI_REGION_STRATEGY: &str = "MULTI_REGION";
 /// Amazon Keyspaces is Cassandra-compatible, and a Cassandra cluster's schema and node
 /// metadata live in keyspaces the SERVICE owns: a driver resolves a keyspace, a table or
 /// a type by reading them, so they exist in an account that has created nothing. No
-/// `CreateKeyspace` ever makes one, so they are materialised by
-/// [`ComAmazonawsKeyspacesKeyspacesserviceState::ensure_service_managed_catalog`] rather
-/// than by a caller, and [`is_service_managed_keyspace`] is what keeps every operation
+/// `CreateKeyspace` ever makes one, so a Region's are derived from this catalog on read
+/// ([`ComAmazonawsKeyspacesKeyspacesserviceState::keyspace`]) rather than created by a
+/// caller, and [`is_service_managed_keyspace`] is what keeps every operation
 /// that WRITES off them.
 ///
 /// WHICH keyspaces exist is the one part of this the Smithy model does not state at all
@@ -365,8 +368,9 @@ pub fn is_in_flight_status(status: &str) -> bool {
     status == KEYSPACE_STATUS_CREATING || status == KEYSPACE_STATUS_UPDATING
 }
 
-/// The most keyspaces this emulator holds, and — with [`MAX_TABLES_PER_KEYSPACE`] — the
-/// pair of caps that bound caller-driven growth of the store.
+/// The most keyspaces this emulator holds in one Amazon Web Services Region, and — with
+/// [`MAX_TABLES_PER_KEYSPACE`] and [`MAX_REGIONS`] — the caps that bound caller-driven
+/// growth of the store.
 ///
 /// A generated emulator keeps its resources in memory for the life of the process and a
 /// create is the only thing that adds one, so the store needs a maximum entry count:
@@ -378,10 +382,25 @@ pub fn is_in_flight_status(status: &str) -> bool {
 /// [`ComAmazonawsKeyspacesKeyspacesserviceState::settle`] can do while holding the state
 /// lock.
 ///
+/// It counts what a Region HOLDS, which includes the [`SERVICE_MANAGED_KEYSPACES`] every
+/// Region holds before any call.
+///
 /// The numbers are the emulator's own bound, not a contract: Amazon Keyspaces publishes
 /// these quotas as adjustable, so no single value is the published one; these are the
 /// order of magnitude of the defaults and are far above any ordinary workflow.
 pub const MAX_KEYSPACES: usize = 256;
+
+/// How many Amazon Web Services Regions this emulator keeps keyspaces for.
+///
+/// The store is partitioned per Region and the Region comes from the caller's own SigV4
+/// credential scope, so without a ceiling a caller could open a partition per made-up
+/// Region. It is comfortably more than the Regions Amazon Keyspaces is offered in, so no
+/// real multi-Region workflow meets it; with [`MAX_KEYSPACES`] it is what bounds the whole
+/// store. `CreateKeyspace` refuses a create that would be the FIRST keyspace of a further
+/// Region with the `ServiceQuotaExceededException` it models
+/// ([`ComAmazonawsKeyspacesKeyspacesserviceState::region_capacity_reached`]); a read opens
+/// no partition, so only Regions something was created in count against it.
+pub const MAX_REGIONS: usize = 64;
 
 /// The most tables one keyspace holds. See [`MAX_KEYSPACES`].
 pub const MAX_TABLES_PER_KEYSPACE: usize = 256;
@@ -689,20 +708,24 @@ pub fn arn_not_found(resource_arn: &str) -> ResourceNotFoundException {
 /// Per-service state for com-amazonaws-keyspaces-keyspacesservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsKeyspacesKeyspacesserviceState {
-    /// Every keyspace in this account, keyed by `keyspaceName`. Bounded by
-    /// [`MAX_KEYSPACES`], each keyspace's tables by [`MAX_TABLES_PER_KEYSPACE`] and its
-    /// types by [`MAX_TYPES_PER_KEYSPACE`], and each table's schema by
-    /// [`MAX_COLUMNS_PER_TABLE`].
-    pub keyspaces: BTreeMap<String, Keyspace>,
+    /// The keyspaces callers have created, partitioned by the Amazon Web Services Region
+    /// of the request that created each one and keyed inside a Region by `keyspaceName` —
+    /// "keyspace names must be unique within each Region" (`CreateKeyspace`), so a
+    /// keyspace, with the tables and types it holds, is a resource of ONE Region and the
+    /// same name names a different resource in another.
+    ///
+    /// Only a write opens a Region's partition ([`Self::insert_keyspace`]) and
+    /// [`Self::settle`] drops one once it holds nothing, so a read answers for any Region
+    /// without storing a thing. Bounded by [`MAX_REGIONS`] partitions, each by
+    /// [`MAX_KEYSPACES`] keyspaces, each keyspace's tables by
+    /// [`MAX_TABLES_PER_KEYSPACE`] and its types by [`MAX_TYPES_PER_KEYSPACE`], and each
+    /// table's schema by [`MAX_COLUMNS_PER_TABLE`].
+    regions: BTreeMap<String, BTreeMap<String, Keyspace>>,
     /// The earliest instant at which any stored table or type has a status transition
     /// due, or `None` when none has. [`Self::settle`] returns without looking at a single
     /// resource until that instant arrives, so a request pays O(1) for the clock except on
     /// the calls where a transition really is due.
     next_transition_at: Option<SystemTime>,
-    /// Whether the [`SERVICE_MANAGED_KEYSPACES`] have been written into `keyspaces` yet.
-    /// See [`Self::ensure_service_managed_catalog`], which the handlers call before they
-    /// read or write a keyspace.
-    service_managed_catalog_materialised: bool,
 }
 
 /// One keyspace, with the tables it owns.
@@ -1423,87 +1446,165 @@ pub fn referenced_type_names(type_expression: &str) -> Vec<String> {
     referenced
 }
 
-impl ComAmazonawsKeyspacesKeyspacesserviceState {
-    /// Materialise the keyspaces this account ALREADY HELD before any call: the
-    /// [`SERVICE_MANAGED_KEYSPACES`] and the system tables each of them holds. Nothing a
-    /// caller does creates them, so an account that has created nothing still enumerates
-    /// them and still resolves a table inside them.
-    ///
-    /// The engine hands every service an EMPTY store, so the catalog is written on first
-    /// touch rather than by a constructor; the flag makes that a one-off, so the seed is
-    /// never re-applied. `region` is the requesting caller's, exactly as every other
-    /// resource in this store takes the region of the call that brought it into being —
-    /// it is what the ARNs are built from ([`keyspace_arn`], [`table_arn`]).
-    ///
-    /// Every handler calls this before it looks at `keyspaces`, including the reporting
-    /// ones: materialising a resource that existed before the call changes nothing a
-    /// later caller would not have seen anyway, which is the same ground
-    /// [`Self::settle`] stands on.
-    pub fn ensure_service_managed_catalog(&mut self, region: &str) {
-        if self.service_managed_catalog_materialised {
-            return;
-        }
-        self.service_managed_catalog_materialised = true;
-        for (keyspace_name, table_names) in SERVICE_MANAGED_KEYSPACES {
-            let tables = table_names
-                .iter()
-                .map(|table_name| {
-                    (
-                        (*table_name).to_string(),
-                        Table {
-                            keyspace_name: (*keyspace_name).to_string(),
-                            table_name: (*table_name).to_string(),
-                            resource_arn: table_arn(region, keyspace_name, table_name),
-                            // Every member below is one only a `CreateTable` could have
-                            // filled, and no create made this table: the service owns it.
-                            creation_timestamp: None,
-                            // A table the account already had is in service: there is no
-                            // create for the clock to owe a transition to.
-                            status: TABLE_STATUS_ACTIVE.to_string(),
-                            status_due_at: None,
-                            schema_definition: None,
-                            capacity_specification: None,
-                            auto_scaling_specification: None,
-                            last_update_to_pay_per_request: None,
-                            encryption_specification: None,
-                            point_in_time_recovery: None,
-                            ttl: None,
-                            default_time_to_live: None,
-                            comment: None,
-                            client_side_timestamps: None,
-                            replica_specifications: BTreeMap::new(),
-                            warm_throughput_specification: None,
-                            tags: TagSet::new(),
-                            // Only a `cdcSpecification` creates a stream, and no call
-                            // ever carried one for a table the service owns.
-                            cdc_stream_tags: BTreeMap::new(),
-                            superseded: Vec::new(),
-                            restored_from: None,
-                            earliest_known_settings: None,
-                        },
-                    )
-                })
-                .collect();
-            self.keyspaces.insert(
-                (*keyspace_name).to_string(),
-                Keyspace {
-                    name: (*keyspace_name).to_string(),
-                    resource_arn: keyspace_arn(region, keyspace_name),
-                    // A system keyspace is served in the Region it is read in, so it is
-                    // single-Region and reports no `replicationRegions`.
-                    replication_strategy: SINGLE_REGION_STRATEGY.to_string(),
-                    replication_regions: vec![region.to_string()],
-                    tags: TagSet::new(),
-                    // Nothing is being created, so the keyspace is usable now.
-                    status: KEYSPACE_STATUS_ACTIVE.to_string(),
+/// One [service-managed keyspace][SERVICE_MANAGED_KEYSPACES] — `keyspace_name`, holding
+/// the system tables `table_names` — as the Amazon Web Services Region `region` holds it.
+///
+/// DERIVED per request rather than stored: these keyspaces are the SERVICE's, every Region
+/// holds them before any call, no operation changes one, and their ARNs are
+/// Region-qualified ([`keyspace_arn`], [`table_arn`]) — so the Region that is asking is
+/// all it takes to report them, and a read of a Region nothing was ever created in stores
+/// nothing to answer.
+fn service_managed_keyspace(region: &str, keyspace_name: &str, table_names: &[&str]) -> Keyspace {
+    let tables = table_names
+        .iter()
+        .map(|table_name| {
+            (
+                (*table_name).to_string(),
+                Table {
+                    keyspace_name: keyspace_name.to_string(),
+                    table_name: (*table_name).to_string(),
+                    resource_arn: table_arn(region, keyspace_name, table_name),
+                    // Every member below is one only a `CreateTable` could have
+                    // filled, and no create made this table: the service owns it.
+                    creation_timestamp: None,
+                    // A table the Region already held is in service: there is no
+                    // create for the clock to owe a transition to.
+                    status: TABLE_STATUS_ACTIVE.to_string(),
                     status_due_at: None,
-                    tables,
-                    // Amazon Keyspaces publishes no user-defined type in a system
-                    // keyspace, and no `CreateType` can put one there.
-                    types: BTreeMap::new(),
+                    schema_definition: None,
+                    capacity_specification: None,
+                    auto_scaling_specification: None,
+                    last_update_to_pay_per_request: None,
+                    encryption_specification: None,
+                    point_in_time_recovery: None,
+                    ttl: None,
+                    default_time_to_live: None,
+                    comment: None,
+                    client_side_timestamps: None,
+                    replica_specifications: BTreeMap::new(),
+                    warm_throughput_specification: None,
+                    tags: TagSet::new(),
+                    // Only a `cdcSpecification` creates a stream, and no call
+                    // ever carried one for a table the service owns.
+                    cdc_stream_tags: BTreeMap::new(),
+                    superseded: Vec::new(),
+                    restored_from: None,
+                    earliest_known_settings: None,
                 },
-            );
+            )
+        })
+        .collect();
+    Keyspace {
+        name: keyspace_name.to_string(),
+        resource_arn: keyspace_arn(region, keyspace_name),
+        // A system keyspace is served in the Region it is read in, so it is
+        // single-Region and reports no `replicationRegions`.
+        replication_strategy: SINGLE_REGION_STRATEGY.to_string(),
+        replication_regions: vec![region.to_string()],
+        tags: TagSet::new(),
+        // Nothing is being created, so the keyspace is usable now.
+        status: KEYSPACE_STATUS_ACTIVE.to_string(),
+        status_due_at: None,
+        tables,
+        // Amazon Keyspaces publishes no user-defined type in a system
+        // keyspace, and no `CreateType` can put one there.
+        types: BTreeMap::new(),
+    }
+}
+
+impl ComAmazonawsKeyspacesKeyspacesserviceState {
+    /// Every keyspace a request signed for `region` can see, in the one total order a
+    /// listing pages through: the [service-managed catalog][SERVICE_MANAGED_KEYSPACES]
+    /// that Region holds before any call, and the keyspaces created in that Region.
+    ///
+    /// A keyspace created in ANOTHER Region is not among them: a keyspace is a resource of
+    /// the Region it was created in.
+    pub fn keyspaces(&self, region: &str) -> Vec<Cow<'_, Keyspace>> {
+        let mut visible: Vec<Cow<'_, Keyspace>> = SERVICE_MANAGED_KEYSPACES
+            .iter()
+            .map(|(keyspace_name, table_names)| {
+                Cow::Owned(service_managed_keyspace(region, keyspace_name, table_names))
+            })
+            .collect();
+        if let Some(created) = self.regions.get(region) {
+            visible.extend(created.values().map(Cow::Borrowed));
         }
+        // One total order over both sources, which is what makes a page boundary
+        // resumable: a `keyspaceName` names at most one of them, so the order is total.
+        visible.sort_by(|left, right| left.name.cmp(&right.name));
+        visible
+    }
+
+    /// What a request signed for `region` sees of the keyspace `keyspace_name`: the one
+    /// created in that Region, or the service-managed keyspace of that name, which every
+    /// Region holds.
+    ///
+    /// `None` when that Region holds no keyspace of the name — which is what a keyspace
+    /// created only in another Region is to this one.
+    pub fn keyspace(&self, region: &str, keyspace_name: &str) -> Option<Cow<'_, Keyspace>> {
+        if let Some(created) = self
+            .regions
+            .get(region)
+            .and_then(|keyspaces| keyspaces.get(keyspace_name))
+        {
+            return Some(Cow::Borrowed(created));
+        }
+        SERVICE_MANAGED_KEYSPACES
+            .iter()
+            .find(|(managed, _)| *managed == keyspace_name)
+            .map(|(managed, table_names)| {
+                Cow::Owned(service_managed_keyspace(region, managed, table_names))
+            })
+    }
+
+    /// Whether `region` already holds a keyspace named `keyspace_name`, which is what
+    /// makes a create of that name a name already taken — in that Region alone.
+    pub fn holds_keyspace(&self, region: &str, keyspace_name: &str) -> bool {
+        is_service_managed_keyspace(keyspace_name)
+            || self
+                .regions
+                .get(region)
+                .is_some_and(|keyspaces| keyspaces.contains_key(keyspace_name))
+    }
+
+    /// How many keyspaces `region` holds, which [`MAX_KEYSPACES`] bounds: the ones created
+    /// there and the [`SERVICE_MANAGED_KEYSPACES`] every Region holds.
+    pub fn keyspace_count(&self, region: &str) -> usize {
+        SERVICE_MANAGED_KEYSPACES.len()
+            + self
+                .regions
+                .get(region)
+                .map_or(0, std::collections::BTreeMap::len)
+    }
+
+    /// The keyspace `keyspace_name` of `region` as a resource to WRITE: one a caller
+    /// created there, and nothing else.
+    ///
+    /// A service-managed keyspace is never reachable here, because it is the service's
+    /// own and takes no change at all: every operation that writes refuses one before it
+    /// looks ([`is_service_managed_keyspace`]). Opens no Region partition, so a write
+    /// against a Region holding nothing stores nothing.
+    pub fn keyspace_mut(&mut self, region: &str, keyspace_name: &str) -> Option<&mut Keyspace> {
+        self.regions.get_mut(region)?.get_mut(keyspace_name)
+    }
+
+    /// Store the keyspace `CreateKeyspace` has just created in `region`, opening that
+    /// Region's partition when this is the first keyspace created there.
+    ///
+    /// The store's only growth site in the number of Regions, which is why
+    /// [`Self::region_capacity_reached`] is what the create checks before reaching it.
+    pub fn insert_keyspace(&mut self, region: &str, keyspace: Keyspace) {
+        self.regions
+            .entry(region.to_string())
+            .or_default()
+            .insert(keyspace.name.clone(), keyspace);
+    }
+
+    /// Whether a create whose keyspace would be the FIRST one stored in `region` is past
+    /// the [`MAX_REGIONS`] ceiling, so the operation must refuse it rather than open a
+    /// further partition. A Region the store already holds keyspaces for is never past it.
+    pub fn region_capacity_reached(&self, region: &str) -> bool {
+        !self.regions.contains_key(region) && self.regions.len() >= MAX_REGIONS
     }
 
     /// Record that some table or type now has a transition due at `due`, so
@@ -1525,131 +1626,147 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
     /// so materialising it changes nothing a later caller would not have seen anyway.
     ///
     /// Nothing is scanned until the earliest due instant arrives, and the scan that does
-    /// run is bounded by [`MAX_KEYSPACES`] x ([`MAX_TABLES_PER_KEYSPACE`] +
-    /// [`MAX_TYPES_PER_KEYSPACE`]) and runs at most once per transition that becomes due.
+    /// run is bounded by [`MAX_REGIONS`] x [`MAX_KEYSPACES`] x ([`MAX_TABLES_PER_KEYSPACE`]
+    /// + [`MAX_TYPES_PER_KEYSPACE`]) and runs at most once per transition that becomes due.
     pub fn settle(&mut self, now: SystemTime) {
         if self.next_transition_at.is_none_or(|next| now < next) {
             return;
         }
         let mut earliest: Option<SystemTime> = None;
-        self.keyspaces.retain(|_, keyspace| {
-            match keyspace.status_due_at {
-                // Still pending: nothing to materialise, but `settle` has to look at this
-                // keyspace again once its span elapses.
-                Some(due) if now < due => earliest = earlier_of(earliest, due),
-                Some(_) => {
-                    keyspace.status_due_at = None;
-                    // The deletion `DeleteKeyspace` started has completed, so the keyspace
-                    // — and every table and type it held, which live inside this record —
-                    // is no longer a resource of the account at all.
-                    if keyspace.is_deleting() {
-                        return false;
+        for keyspaces in self.regions.values_mut() {
+            keyspaces.retain(|_, keyspace| {
+                match keyspace.status_due_at {
+                    // Still pending: nothing to materialise, but `settle` has to look at
+                    // this keyspace again once its span elapses.
+                    Some(due) if now < due => earliest = earlier_of(earliest, due),
+                    Some(_) => {
+                        keyspace.status_due_at = None;
+                        // The deletion `DeleteKeyspace` started has completed, so the
+                        // keyspace — and every table and type it held, which live inside
+                        // this record — is no longer a resource of its Region at all.
+                        if keyspace.is_deleting() {
+                            return false;
+                        }
+                        // The creation `CreateKeyspace` started, or the replication change
+                        // `UpdateKeyspace` started, has completed, so the keyspace is
+                        // usable again.
+                        if is_in_flight_status(&keyspace.status) {
+                            keyspace.status = KEYSPACE_STATUS_ACTIVE.to_string();
+                        }
                     }
-                    // The creation `CreateKeyspace` started, or the replication change
-                    // `UpdateKeyspace` started, has completed, so the keyspace is usable
-                    // again.
-                    if is_in_flight_status(&keyspace.status) {
-                        keyspace.status = KEYSPACE_STATUS_ACTIVE.to_string();
+                    None => {}
+                }
+                keyspace.tables.retain(|_, table| {
+                    // A warm throughput configuration settles on ITS own instant: it is
+                    // `UPDATING` "when changes are being applied" and `AVAILABLE` once they
+                    // are, which is a different clock from the table's status, since a
+                    // later update of any other setting puts the table back in `UPDATING`
+                    // without changing the warm throughput at all.
+                    if let Some(warm) = table.warm_throughput_specification.as_mut() {
+                        match warm.status_due_at {
+                            Some(due) if now < due => earliest = earlier_of(earliest, due),
+                            Some(_) => warm.status_due_at = None,
+                            None => {}
+                        }
                     }
-                }
-                None => {}
-            }
-            keyspace.tables.retain(|_, table| {
-                // A warm throughput configuration settles on ITS own instant: it is
-                // `UPDATING` "when changes are being applied" and `AVAILABLE` once they
-                // are, which is a different clock from the table's status, since a later
-                // update of any other setting puts the table back in `UPDATING` without
-                // changing the warm throughput at all.
-                if let Some(warm) = table.warm_throughput_specification.as_mut() {
-                    match warm.status_due_at {
-                        Some(due) if now < due => earliest = earlier_of(earliest, due),
-                        Some(_) => warm.status_due_at = None,
-                        None => {}
+                    let Some(due) = table.status_due_at else {
+                        return true;
+                    };
+                    if now < due {
+                        earliest = earlier_of(earliest, due);
+                        return true;
                     }
-                }
-                let Some(due) = table.status_due_at else {
-                    return true;
-                };
-                if now < due {
-                    earliest = earlier_of(earliest, due);
-                    return true;
-                }
-                table.status_due_at = None;
-                match table.status.as_str() {
-                    // The creation, or the setting change, the clock owed has
-                    // completed, so the table is usable again.
-                    TABLE_STATUS_CREATING | TABLE_STATUS_UPDATING => {
-                        table.status = TABLE_STATUS_ACTIVE.to_string();
-                        true
+                    table.status_due_at = None;
+                    match table.status.as_str() {
+                        // The creation, or the setting change, the clock owed has
+                        // completed, so the table is usable again.
+                        TABLE_STATUS_CREATING | TABLE_STATUS_UPDATING => {
+                            table.status = TABLE_STATUS_ACTIVE.to_string();
+                            true
+                        }
+                        // The deletion the clock owed has completed, so the table is
+                        // no longer a resource of this keyspace at all.
+                        TABLE_STATUS_DELETING => false,
+                        _ => true,
                     }
-                    // The deletion the clock owed has completed, so the table is
-                    // no longer a resource of this keyspace at all.
-                    TABLE_STATUS_DELETING => false,
-                    _ => true,
-                }
+                });
+                // A type has the two transitions its operations start: `CREATING` ->
+                // `ACTIVE` from `CreateType`, and `DELETING` -> gone from `DeleteType`.
+                keyspace.types.retain(|_, udt| {
+                    let Some(due) = udt.status_due_at else {
+                        return true;
+                    };
+                    if now < due {
+                        earliest = earlier_of(earliest, due);
+                        return true;
+                    }
+                    udt.status_due_at = None;
+                    match udt.status.as_str() {
+                        // The creation the clock owed has completed, so the type is usable.
+                        TYPE_STATUS_CREATING => {
+                            udt.status = TYPE_STATUS_ACTIVE.to_string();
+                            true
+                        }
+                        // The deletion the clock owed has completed, so the type is no
+                        // longer a resource of this keyspace at all.
+                        TYPE_STATUS_DELETING => false,
+                        _ => true,
+                    }
+                });
+                // Nothing is owed for this keyspace itself, so it stays.
+                true
             });
-            // A type has the two transitions its operations start: `CREATING` ->
-            // `ACTIVE` from `CreateType`, and `DELETING` -> gone from `DeleteType`.
-            keyspace.types.retain(|_, udt| {
-                let Some(due) = udt.status_due_at else {
-                    return true;
-                };
-                if now < due {
-                    earliest = earlier_of(earliest, due);
-                    return true;
-                }
-                udt.status_due_at = None;
-                match udt.status.as_str() {
-                    // The creation the clock owed has completed, so the type is usable.
-                    TYPE_STATUS_CREATING => {
-                        udt.status = TYPE_STATUS_ACTIVE.to_string();
-                        true
-                    }
-                    // The deletion the clock owed has completed, so the type is no
-                    // longer a resource of this keyspace at all.
-                    TYPE_STATUS_DELETING => false,
-                    _ => true,
-                }
-            });
-            // Nothing is owed for this keyspace itself, so it stays.
-            true
-        });
+        }
+        // A Region whose last created keyspace is gone holds nothing a caller created, and
+        // the catalog it still reports is derived — so its partition is dropped rather than
+        // kept for the life of the process.
+        self.regions.retain(|_, keyspaces| !keyspaces.is_empty());
         self.next_transition_at = earliest;
     }
 
-    /// The tags of the resource `resource_arn` names, or `None` when it names no
-    /// resource this store holds.
+    /// The tags of the resource `resource_arn` names to a request signed for `region`, or
+    /// `None` when it names no resource that Region holds.
     ///
-    /// The ARN is the key, not the name it embeds: a stored resource answers only to the
-    /// ARN it was minted with ([`keyspace_arn`], [`table_arn`]), so an ARN for another
-    /// partition or another Region reaches nothing here even when a resource of that
-    /// name exists.
-    pub fn resource_tags(&self, resource_arn: &str) -> Option<&TagSet> {
+    /// The ARN is the key, not the name it embeds: a resource answers only to the ARN it
+    /// was minted with ([`keyspace_arn`], [`table_arn`]), which is Region-qualified — so
+    /// an ARN for another partition or another Region reaches nothing here even when a
+    /// resource of that name exists there.
+    pub fn resource_tags(&self, region: &str, resource_arn: &str) -> Option<Cow<'_, TagSet>> {
+        let keyspace = self.keyspace(region, &arn_keyspace_name(resource_arn)?)?;
         match parse_resource_arn(resource_arn)? {
-            ResourceRef::Keyspace { keyspace_name } => {
-                let keyspace = self.keyspaces.get(&keyspace_name)?;
-                (keyspace.resource_arn == resource_arn).then_some(&keyspace.tags)
+            ResourceRef::Keyspace { .. } => {
+                if keyspace.resource_arn != resource_arn {
+                    return None;
+                }
+                Some(match keyspace {
+                    Cow::Borrowed(created) => Cow::Borrowed(&created.tags),
+                    Cow::Owned(managed) => Cow::Owned(managed.tags),
+                })
             }
-            ResourceRef::Table {
-                keyspace_name,
-                table_name,
-            } => {
-                let table = self.keyspaces.get(&keyspace_name)?.tables.get(&table_name)?;
-                (table.resource_arn == resource_arn).then_some(&table.tags)
-            }
+            ResourceRef::Table { table_name, .. } => match keyspace {
+                Cow::Borrowed(created) => {
+                    let table = created.tables.get(&table_name)?;
+                    (table.resource_arn == resource_arn).then_some(Cow::Borrowed(&table.tags))
+                }
+                Cow::Owned(managed) => {
+                    let table = managed.tables.get(&table_name)?;
+                    (table.resource_arn == resource_arn)
+                        .then(|| Cow::Owned(table.tags.clone()))
+                }
+            },
             // A stream answers for the tags its own ARN was registered with, so a label
-            // that names none of the table's streams reaches nothing here.
-            ResourceRef::Stream {
-                keyspace_name,
-                table_name,
-                ..
-            } => self
-                .keyspaces
-                .get(&keyspace_name)?
-                .tables
-                .get(&table_name)?
-                .cdc_stream_tags
-                .get(resource_arn),
+            // that names none of the table's streams reaches nothing here — and a system
+            // table has no stream at all, because no `cdcSpecification` ever enabled one
+            // on a table the service owns.
+            ResourceRef::Stream { table_name, .. } => match keyspace {
+                Cow::Borrowed(created) => created
+                    .tables
+                    .get(&table_name)?
+                    .cdc_stream_tags
+                    .get(resource_arn)
+                    .map(Cow::Borrowed),
+                Cow::Owned(_) => None,
+            },
         }
     }
 
@@ -1659,9 +1776,13 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
     /// is creating is still `CREATING` — which [`Self::settle`] materialises out of that
     /// status when the clock owes it, so a finished restore stops counting without anybody
     /// having to clear a flag.
+    ///
+    /// The quota the sentence states is the ACCOUNT's, so every Region's tables count
+    /// towards it.
     pub fn restores_in_progress(&self) -> usize {
-        self.keyspaces
+        self.regions
             .values()
+            .flat_map(|keyspaces| keyspaces.values())
             .flat_map(|keyspace| keyspace.tables.values())
             .filter(|table| {
                 table.restored_from.is_some() && table.status == TABLE_STATUS_CREATING
@@ -1670,18 +1791,26 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
     }
 
     /// The same lookup, for a tagging operation that writes.
-    pub fn resource_tags_mut(&mut self, resource_arn: &str) -> Option<&mut TagSet> {
+    ///
+    /// Only a resource a caller CREATED in `region` is reachable: the service's own
+    /// resources take no change, and every tagging operation refuses one before it looks
+    /// ([`is_service_managed_keyspace`]).
+    pub fn resource_tags_mut(
+        &mut self,
+        region: &str,
+        resource_arn: &str,
+    ) -> Option<&mut TagSet> {
+        let keyspaces = self.regions.get_mut(region)?;
         match parse_resource_arn(resource_arn)? {
             ResourceRef::Keyspace { keyspace_name } => {
-                let keyspace = self.keyspaces.get_mut(&keyspace_name)?;
+                let keyspace = keyspaces.get_mut(&keyspace_name)?;
                 (keyspace.resource_arn == resource_arn).then_some(&mut keyspace.tags)
             }
             ResourceRef::Table {
                 keyspace_name,
                 table_name,
             } => {
-                let table = self
-                    .keyspaces
+                let table = keyspaces
                     .get_mut(&keyspace_name)?
                     .tables
                     .get_mut(&table_name)?;
@@ -1691,8 +1820,7 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
                 keyspace_name,
                 table_name,
                 ..
-            } => self
-                .keyspaces
+            } => keyspaces
                 .get_mut(&keyspace_name)?
                 .tables
                 .get_mut(&table_name)?

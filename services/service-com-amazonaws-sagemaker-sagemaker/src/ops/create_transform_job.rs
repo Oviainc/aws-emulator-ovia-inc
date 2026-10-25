@@ -295,6 +295,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 experiment_config: input.experiment_config,
                 tags: input.tags.unwrap_or_default(),
                 creation_time: now,
+                last_modified_time: now,
                 transform_end_time: None,
                 ends_at: now + crate::state::TRANSFORM_JOB_SETTLES_AFTER,
             },
