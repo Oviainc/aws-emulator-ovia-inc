@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutManagedInsightRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutManagedInsightRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutManagedInsightRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enables managed Contributor Insights rules for Amazon Web Services resources, one rule
+//! per `ManagedRule` the request carries. Implemented here, and the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -86,9 +80,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatch-graniteservi
 // here — hence the `PutManagedInsightRulesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#PutManagedInsightRules")]
+//
+// `InternalServiceFault` — "Request processing has failed due to some unknown error,
+// exception, or failure." — is widened in through `extra_errors`: this SERVICE models the
+// shape (and other operations declare it), but this operation's own `errors` list omits it,
+// and an unreachable shared store has to be reportable as the server failure it is rather
+// than as a parameter fault the caller could act on.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#PutManagedInsightRules",
+    extra_errors = ["InternalServiceFault"]
+)]
 #[derive(Debug)]
 pub enum PutManagedInsightRulesErrorModeled {
+    InternalServiceFault(InternalServiceFault),
     InvalidParameterValueException(InvalidParameterValueException),
     MissingRequiredParameterException(MissingRequiredParameterException),
 }
@@ -144,18 +148,162 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutManagedInsightRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutManagedInsightRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutManagedInsightRules"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutManagedInsightRulesErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some(
+                    "the CloudWatch Contributor Insights rule store is unavailable".into(),
+                ),
+            })
+        })?;
+
+        // "A list of ManagedRules to enable." (`PutManagedInsightRulesInput$ManagedRules`,
+        // required) — a request carrying the member with no entry names no rule to enable, so
+        // the value the operation was given is not one it can act on.
+        if input.managed_rules.is_empty() {
+            return Err(invalid_parameter_value(EMPTY_MANAGED_RULES.to_string()));
+        }
+
+        // Every entry is read BEFORE anything is stored, so a request carrying one unusable
+        // entry enables none of them. What is read here is prose the model carries no
+        // constraint for; the modelled constraints — `TemplateName`'s 1..128 length and
+        // pattern, `ResourceARN`'s 1..1024 length — were enforced before this handler ran and
+        // are not re-checked.
+        for rule in &input.managed_rules {
+            if let Some(message) = crate::state::resource_arn_error(&rule.resource_arn) {
+                return Err(invalid_parameter_value(message));
+            }
+            if let Some(message) =
+                crate::state::tag_count_error("Contributor Insights rule", rule.tags.as_deref())
+            {
+                return Err(invalid_parameter_value(message));
+            }
+        }
+
+        let mut store = state.lock();
+        // "This array is empty if the API operation was successful for all the rules specified
+        // in the request." (`PartialFailure`) — an empty array, not an absent one, so a caller
+        // iterating the failures never has to tell the two apart.
+        let mut failures: Vec<PartialFailure> = Vec::new();
+        for rule in &input.managed_rules {
+            let origin = crate::state::ManagedRuleOrigin {
+                template_name: rule.template_name.clone(),
+                resource_arn: rule.resource_arn.clone(),
+            };
+            let rule_name = crate::state::managed_insight_rule_name(
+                &origin.template_name,
+                &origin.resource_arn,
+            );
+            let occupant = store
+                .insight_rules
+                .get(&rule_name)
+                .map(|stored| stored.managed.clone());
+            match occupant {
+                // The same template is already enabled for the same resource: "If a previously
+                // created managed rule is currently disabled, a subsequent call to this API
+                // will re-enable it." (`PutManagedInsightRules`). Its tags are left alone —
+                // "If you are using this operation to update an existing Contributor Insights
+                // rule, any tags that you specify in this parameter are ignored."
+                // (`ManagedRule$Tags`)
+                Some(ref managed) if managed.as_ref() == Some(&origin) => {
+                    if let Some(stored) = store.insight_rules.get_mut(&rule_name) {
+                        stored.rule.state = crate::state::INSIGHT_RULE_ENABLED.to_string();
+                    }
+                }
+                // A different rule already holds the name this managed rule would take, so
+                // enabling it would overwrite a rule the request never named. The rest of the
+                // request is still enabled and this one is reported back among the rules that
+                // could not be enabled.
+                Some(_) => failures.push(PartialFailure {
+                    failure_resource: Some(origin.template_name.clone()),
+                    exception_type: Some("InvalidParameterValueException".into()),
+                    failure_code: Some("InvalidParameterValue".into()),
+                    failure_description: Some(format!(
+                        "a Contributor Insights rule named {rule_name} already exists and is not \
+                         the managed rule of template {} for {}",
+                        origin.template_name, origin.resource_arn
+                    )),
+                }),
+                None => {
+                    if store.insight_rules.len() >= crate::state::MAX_INSIGHT_RULES {
+                        failures.push(PartialFailure {
+                            failure_resource: Some(origin.template_name.clone()),
+                            exception_type: Some("LimitExceededException".into()),
+                            failure_code: Some("LimitExceeded".into()),
+                            failure_description: Some(format!(
+                                "this emulator holds at most {} Contributor Insights rules",
+                                crate::state::MAX_INSIGHT_RULES
+                            )),
+                        });
+                        continue;
+                    }
+                    store.insight_rules.insert(
+                        rule_name.clone(),
+                        crate::state::StoredInsightRule {
+                            // Stored as the shape `DescribeInsightRules` reports, so a managed
+                            // rule is one of this store's Contributor Insights rules rather
+                            // than a second record beside them: the rule the state operations
+                            // enable, disable and delete is this one.
+                            rule: InsightRule {
+                                name: rule_name,
+                                // "When you enable a managed rule, you create a Contributor
+                                // Insights rule that collects data from Amazon Web Services
+                                // services." (`PutManagedInsightRules`)
+                                state: crate::state::INSIGHT_RULE_ENABLED.to_string(),
+                                // "For managed rules, this is `{"Name": "ServiceLogRule",
+                                // "Version": 1}`" (`InsightRule$Schema`).
+                                schema: crate::state::MANAGED_INSIGHT_RULE_SCHEMA.to_string(),
+                                definition: managed_definition(&origin),
+                                // "An optional built-in rule that Amazon Web Services
+                                // manages." (`InsightRule$ManagedRule`)
+                                managed_rule: Some(true),
+                                apply_on_transformed_logs: Some(false),
+                            },
+                            tags: rule.tags.clone().unwrap_or_default(),
+                            managed: Some(origin),
+                        },
+                    );
+                }
+            }
+        }
+
+        Ok(PutManagedInsightRulesOutput {
+            failures: Some(failures),
+        })
     }
+}
+
+/// Refuse the request with this operation's modelled `InvalidParameterValueException`
+/// (HTTP 400): "The value of an input parameter is bad or out-of-range."
+fn invalid_parameter_value(message: String) -> PutManagedInsightRulesError {
+    PutManagedInsightRulesErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// How CloudWatch states that `ManagedRules` carries no entry.
+const EMPTY_MANAGED_RULES: &str = "EMPTY_MANAGED_RULES: ManagedRules cannot be an empty array.";
+
+/// The `Definition` a managed rule carries: the managed-rule schema, and the template and
+/// resource the rule was enabled from.
+///
+/// `InsightRule$Definition` is required on the shape `DescribeInsightRules` reports, and a
+/// managed rule is not written by a caller — "You cannot edit these rules with PutInsightRule"
+/// (`PutManagedInsightRules`) — so what it reports is the request this rule came from, under
+/// the schema the model names for a managed rule.
+fn managed_definition(origin: &crate::state::ManagedRuleOrigin) -> String {
+    // The schema is the one constant `crate::state` keeps for a managed rule, parsed so the
+    // definition and the rule's own `Schema` member cannot drift apart.
+    let schema: ::serde_json::Value =
+        ::serde_json::from_str(crate::state::MANAGED_INSIGHT_RULE_SCHEMA)
+            .unwrap_or(::serde_json::Value::Null);
+    ::serde_json::json!({
+        "Schema": schema,
+        "TemplateName": origin.template_name,
+        "ResourceARN": origin.resource_arn,
+    })
+    .to_string()
 }
