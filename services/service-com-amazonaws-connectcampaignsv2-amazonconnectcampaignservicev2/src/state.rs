@@ -352,6 +352,15 @@ fn instant_parts(at: ::aws_smithy_types::DateTime) -> (i64, u32) {
     (at.secs(), at.subsec_nanos())
 }
 
+/// Whether the instant `deadline` has passed at `now` — compared exactly, through
+/// [`instant_parts`], so the comparison is not rounded to whole seconds.
+///
+/// The one place a deadline a caller sent is weighed against the clock, so every
+/// reader of a stored deadline draws the line at the same instant.
+fn deadline_passed(deadline: ::aws_smithy_types::DateTime, now: SystemTime) -> bool {
+    instant_parts(::aws_smithy_types::DateTime::from(now)) >= instant_parts(deadline)
+}
+
 /// The lifecycle state of a stored campaign.
 ///
 /// The variants are exactly the `CampaignState` enum the Smithy model declares —
@@ -478,11 +487,16 @@ pub struct StoredCampaign {
     /// When this campaign was created. Part of the record, not of any response:
     /// no modelled member in this slice carries it.
     pub created_at: std::time::SystemTime,
-    /// The outbound requests this campaign has taken, keyed by the `clientToken`
+    /// The outbound requests this campaign has pending, keyed by the `clientToken`
     /// each was submitted under — the idempotency token `PutOutboundRequestBatch`
     /// ("This API is idempotent", per the model's own documentation) resolves a
     /// repeated submission through, so the same token is answered with the dial
     /// request id it was first given rather than a second one.
+    ///
+    /// A request leaves this buffer once its `expirationTime` has passed, which is
+    /// owed to the clock alone ([`Self::expire_outbound_requests`]): an expired
+    /// request is no longer dialable, so it neither occupies a buffer slot nor keeps
+    /// answering for its token.
     pub outbound_requests: BTreeMap<String, StoredOutboundRequest>,
 }
 
@@ -495,8 +509,18 @@ pub struct StoredOutboundRequest {
     pub id: String,
     /// The `ChannelSubtype` the request was submitted for.
     pub channel_subtype: String,
-    /// The `expirationTime` the caller sent, as epoch seconds.
-    pub expires_at_epoch_seconds: i64,
+    /// The `expirationTime` the caller sent: the instant after which this request is
+    /// no longer dialable, which is why `OutboundRequest$expirationTime` is required.
+    /// A record past it is no longer pending (see [`Self::is_expired_at`]).
+    pub expires_at: ::aws_smithy_types::DateTime,
+}
+
+impl StoredOutboundRequest {
+    /// Whether this request's `expirationTime` has passed at `now`, so it is no
+    /// longer dialable and no longer one of the campaign's pending requests.
+    pub fn is_expired_at(&self, now: SystemTime) -> bool {
+        deadline_passed(self.expires_at, now)
+    }
 }
 
 /// What a campaign's store did with one outbound request of a batch, as
@@ -509,8 +533,11 @@ pub enum OutboundRequestOutcome {
     /// was given, in which case this repeat stored nothing new.
     Taken(String),
     /// The campaign's buffer already holds [`MAX_OUTBOUND_REQUESTS_PER_CAMPAIGN`]
-    /// requests, so nothing was stored.
+    /// pending requests, so nothing was stored.
     BufferFull,
+    /// The request's `expirationTime` has already passed, so there is no dial left to
+    /// place for it: nothing was stored and no id was minted.
+    Expired,
 }
 
 impl StoredCampaign {
@@ -561,6 +588,31 @@ impl StoredCampaign {
             }
             stored => stored,
         }
+    }
+
+    /// Drop every request this campaign's buffer holds whose `expirationTime` has
+    /// passed at `now`, and report how many went.
+    ///
+    /// The buffer is a buffer of PENDING requests: a request past its expiration is
+    /// no longer dialable, so it is no longer pending — it holds neither one of the
+    /// [`MAX_OUTBOUND_REQUESTS_PER_CAMPAIGN`] slots nor its own `clientToken`. The
+    /// removal is owed to the CLOCK, not to the call that materialises it: it was due
+    /// at the expiration instant whether or not anyone called afterwards.
+    pub fn expire_outbound_requests(&mut self, now: SystemTime) -> usize {
+        let before = self.outbound_requests.len();
+        self.outbound_requests
+            .retain(|_, request| !request.is_expired_at(now));
+        before - self.outbound_requests.len()
+    }
+
+    /// The requests this campaign still has pending at `now` — everything in its
+    /// buffer that has not passed its `expirationTime`. A pure read, so a reader
+    /// counting the buffer writes nothing.
+    pub fn pending_outbound_requests(&self, now: SystemTime) -> usize {
+        self.outbound_requests
+            .values()
+            .filter(|request| !request.is_expired_at(now))
+            .count()
     }
 
     /// The channel subtypes this campaign is configured for, as the model's
@@ -864,9 +916,12 @@ pub const MAX_CAMPAIGNS: usize = 1_000;
 /// `FailureCode` `BufferLimitExceeded` — the code the model declares for a campaign
 /// that cannot take another request right now.
 ///
-/// A campaign's buffer grows one record per accepted request and never shrinks, so
-/// without a ceiling a caller could submit batches until the process runs out of
-/// memory. The figure is the emulator's own, set far above any plausible workload.
+/// A campaign's buffer grows one record per accepted request and shrinks only as
+/// requests pass their `expirationTime`, so without a ceiling a caller could submit
+/// batches of long-lived requests until the process runs out of memory. The figure is
+/// the emulator's own, set far above any plausible workload. It counts the PENDING
+/// requests: an expired one is not in the buffer any more (see
+/// [`StoredCampaign::expire_outbound_requests`]).
 pub const MAX_OUTBOUND_REQUESTS_PER_CAMPAIGN: usize = 10_000;
 
 /// The most Connect instances this emulator's store holds onboarding records for,
@@ -1225,15 +1280,27 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     ///
     /// A `client_token` the campaign has already taken stores nothing and reports
     /// the id it was given then, which is what makes a repeated batch idempotent.
+    ///
+    /// `expires_at` is weighed against `now` first: a request whose expiration has
+    /// already passed can never be dialled, so it is not taken at all, mints no id
+    /// and occupies no slot. The expiries the clock already owes the campaign's
+    /// buffer are materialised at the same instant
+    /// ([`StoredCampaign::expire_outbound_requests`]), so a slot and a `clientToken`
+    /// are both held only while their request is still pending.
     pub fn take_outbound_request(
         &mut self,
         campaign_id: &str,
         client_token: &str,
         channel_subtype: &str,
-        expires_at_epoch_seconds: i64,
+        expires_at: ::aws_smithy_types::DateTime,
+        now: SystemTime,
     ) -> Option<OutboundRequestOutcome> {
         {
-            let campaign = self.campaigns.get(campaign_id)?;
+            let campaign = self.campaigns.get_mut(campaign_id)?;
+            campaign.expire_outbound_requests(now);
+            if deadline_passed(expires_at, now) {
+                return Some(OutboundRequestOutcome::Expired);
+            }
             if let Some(taken) = campaign.outbound_requests.get(client_token) {
                 return Some(OutboundRequestOutcome::Taken(taken.id.clone()));
             }
@@ -1241,7 +1308,7 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
                 return Some(OutboundRequestOutcome::BufferFull);
             }
         }
-        // Only now, past both refusals, is an id minted — so a refused request
+        // Only now, past every refusal, is an id minted — so a refused request
         // consumes no id and leaves no gap in the sequence.
         let id = self.next_dial_request_id();
         let campaign = self.campaigns.get_mut(campaign_id)?;
@@ -1250,7 +1317,7 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
             StoredOutboundRequest {
                 id: id.clone(),
                 channel_subtype: channel_subtype.to_string(),
-                expires_at_epoch_seconds,
+                expires_at,
             },
         );
         Some(OutboundRequestOutcome::Taken(id))

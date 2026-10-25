@@ -4,12 +4,13 @@
 //! IMPLEMENTED: records a table under its keyspace in [`crate::state`] and answers with
 //! the ARN it minted for it. This is the ONLY file to touch for `CreateTable`.
 //!
-//! ONE input member is NOT served here and is refused with a 501 that says so rather than
-//! stored and forgotten: `cdcSpecification`, which no report in this slice can answer for.
-//! Every other member IS served, including `autoScalingSpecification` and
-//! `replicaSpecifications` (reported back by `GetTable` and
-//! `GetTableAutoScalingSettings`) and `warmThroughputSpecification` (reported back by
-//! `GetTable`).
+//! EVERY input member is served here: `autoScalingSpecification` and
+//! `replicaSpecifications` are stored on the table and reported back by `GetTable` and
+//! `GetTableAutoScalingSettings`, `warmThroughputSpecification` by `GetTable`, and
+//! `cdcSpecification` enables the table's change data capture stream in the CDC stream
+//! store shared with KeyspacesStreams ([`crate::state::cdc_stream_state`]) — the stream
+//! `GetTable` reports as `cdcSpecification`/`latestStreamArn` and KeyspacesStreams serves
+//! the records of. Nothing in this operation's surface answers the scaffold's 501.
 //!
 //! The paragraphs below are the scaffold's own notes on how an operation is shaped and
 //! how it reaches state; they still describe this file.
@@ -242,23 +243,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             })
         })?;
-        let region = crate::state::request_region(ctx);
-
-        // The ONE member this slice cannot serve faithfully yet: a CDC stream has no
-        // summary any report here carries, so accepting it would mean storing a request and
-        // never answering for it. Answer the honest 501 instead, worded so it is not counted
-        // as "CreateTable is a stub": the operation IS implemented, this part of its surface
-        // is not.
-        if input.cdc_specification.is_some() {
-            return Err(crate::scaffolded::Scaffolded::NotImplemented(
-                crate::scaffolded::NotImplemented {
-                    message: "CreateTable is implemented in this emulator, but not its \
-                              cdcSpecification member: omit it, or the table would be stored \
-                              with a CDC stream setting no operation here can report."
+        // The CDC stream store, shared with KeyspacesStreams: resolved here, before
+        // either store is locked, and locked AFTER this service's own, which is the one
+        // lock order every handler of this crate takes.
+        let streams = crate::state::cdc_stream_state(&*self.engine).ok_or_else(|| {
+            CreateTableErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "Amazon Keyspaces could not reach the CDC stream store for this request."
                         .to_string(),
-                },
-            ));
-        }
+                ),
+            })
+        })?;
+        let region = crate::state::request_region(ctx);
 
         let invalid = |message: String| -> CreateTableError {
             CreateTableErrorModeled::ValidationException(ValidationException {
@@ -279,10 +275,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let point_in_time_recovery = input.point_in_time_recovery.unwrap_or(PointInTimeRecovery {
             status: crate::state::DEFAULT_POINT_IN_TIME_RECOVERY_STATUS.to_string(),
         });
+        // "The CDC stream settings of the table": whether this table captures its changes
+        // to a stream, and which images that stream publishes (the modelled default when
+        // the request names none). A specification that asks for no stream asks for the
+        // state a table with no `cdcSpecification` is already in, so it stores nothing.
+        let cdc = crate::state::resolve_cdc(input.cdc_specification.as_ref());
         // The per-resource tag rules hold wherever a caller supplies tags, so a create
         // applies the same ones `TagResource` does: at most
         // `MAX_TAGS_PER_RESOURCE` tags on the resource, no reserved key, one tag per key.
-        let tags = crate::state::new_tag_set(input.tags.as_deref()).map_err(|rejection| {
+        let to_tag_failure = |rejection: crate::state::TagRejection| {
             let message = Some(rejection.message());
             match rejection.is_quota() {
                 true => CreateTableErrorModeled::ServiceQuotaExceededException(
@@ -292,7 +293,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     CreateTableErrorModeled::ValidationException(ValidationException { message })
                 }
             }
-        })?;
+        };
+        let tags = crate::state::new_tag_set(input.tags.as_deref()).map_err(to_tag_failure)?;
+        // The stream is a resource of its own, so the tags the CDC specification applies
+        // to it are a tag set of its own — the table's own tags on top when the
+        // specification asks the stream to inherit them — under the same per-resource
+        // rules, checked before anything is stored. Checked whatever the status asks
+        // for: a reserved key or an oversized list is the same bad input whether or not
+        // the request also asks for the stream that would carry it.
+        let stream_tags = match cdc.as_ref() {
+            Some(cdc) => {
+                let tags = crate::state::new_stream_tag_set(cdc, &tags).map_err(to_tag_failure)?;
+                // Stored only for a stream that exists: a specification asking for no
+                // stream leaves no resource for a tag to belong to.
+                cdc.enabled.then_some(tags)
+            }
+            None => None,
+        };
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
@@ -319,6 +336,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A keyspace whose own deletion is already in progress takes no new table: it and
+        // everything in it are on their way out, so storing one would create a table that
+        // vanishes with the keyspace. That is the modelled conflict — "you try to perform
+        // an action and the same or a different action is already in progress".
+        if keyspace.is_deleting() {
+            return Err(CreateTableErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::keyspace_deleting_rejection(&input.keyspace_name)),
+            })
+            .into());
+        }
 
         // A column's type may name "other user-defined types that are contained in the
         // same keyspace" (`FieldDefinition$type`, the same rule for a column), so a name
@@ -409,6 +437,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             None => None,
         };
+
+        // Amazon Keyspaces creates the table's CDC stream as part of a create that asks
+        // for one, in the stream store shared with KeyspacesStreams: the stream this
+        // writes IS the stream that service reports and serves the records of. It is
+        // minted HERE, as the LAST step before the table is inserted, because every step
+        // that can still refuse this request has run by now — a refused create must leave
+        // no stream behind, and a minted stream must leave no table-less stream behind.
+        // No fallible step may be added between this block and the insert below.
+        //
+        // The store refuses only a view type outside the model's `StreamViewType` set,
+        // which the boundary validator has already refused, so that refusal is this
+        // service's own server error rather than a silently CDC-less table.
+        let mut cdc_stream_tags: ::std::collections::BTreeMap<String, crate::state::TagSet> =
+            ::std::collections::BTreeMap::new();
+        if let (Some(cdc), Some(stream_tags)) = (cdc.as_ref().filter(|cdc| cdc.enabled), stream_tags)
+        {
+            let enabled = streams.lock().enable_stream(
+                &region,
+                &input.keyspace_name,
+                &input.table_name,
+                &cdc.view_type,
+            );
+            let Some(stream_arn) = enabled else {
+                return Err(CreateTableErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(format!(
+                            "Amazon Keyspaces could not enable a CDC stream publishing \
+                             viewType '{}' for table '{}.{}'.",
+                            cdc.view_type, input.keyspace_name, input.table_name
+                        )),
+                    },
+                )
+                .into());
+            };
+            cdc_stream_tags.insert(stream_arn, stream_tags);
+        }
+
         keyspace.tables.insert(
             input.table_name.clone(),
             crate::state::Table {
@@ -437,6 +502,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 replica_specifications,
                 warm_throughput_specification,
                 tags,
+                // The tags of the stream enabled just above, under the stream's own ARN
+                // (empty for a table whose create asked for no CDC stream).
+                cdc_stream_tags,
                 // A table whose schema and TTL settings have never changed has one
                 // revision of them — the current one — so nothing is superseded yet.
                 superseded: Vec::new(),

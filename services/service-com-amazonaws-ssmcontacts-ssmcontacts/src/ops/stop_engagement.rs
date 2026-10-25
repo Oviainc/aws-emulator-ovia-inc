@@ -6,6 +6,19 @@
 //! the `Reason` the call carried are recorded on the engagement, so `DescribeEngagement`
 //! reports a `StopTime` from then on and the engagement engages no further contacts.
 //!
+//! "Further contacts aren't engaged" is what the stop has to MAKE TRUE, so it is not only
+//! a stamp on the engagement record. An engagement enters each stage of its plan at that
+//! stage's own offset into the engagement, and `StartEngagement` persists one page per
+//! targeted channel stamped with the instant its stage is due
+//! ([`crate::state::PageRecord::sent_time`]). A stage still ahead of the stop instant is
+//! never entered, so the pages it would have sent engaged no contact channel at all: they
+//! are dropped
+//! ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::cancel_unsent_pages_of`]), and
+//! from then on `DescribePage`, `AcceptPage`, `ListPageReceipts` and `ListPageResolutions`
+//! answer for them exactly as they do for a page nothing ever sent. The pages the
+//! engagement had already sent are untouched — the contacts they reached were engaged, and
+//! stopping the engagement cannot unsend a page or discard an acknowledgement of one.
+//!
 //! Two refusals come before that, in this order:
 //!
 //! 1. the account-level Incident Manager precondition
@@ -194,10 +207,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An engagement that is already stopped keeps the stop it recorded: its `StopTime`
         // has been readable since that call, and a second stop must not move what a reader
         // already saw. "Further contacts aren't engaged" holds either way.
-        if engagement.stop_time.is_none() {
-            engagement.stop_time = Some(::std::time::SystemTime::now());
-            engagement.stop_reason = input.reason.clone();
-        }
+        let stopped_at = match engagement.stop_time {
+            Some(already) => already,
+            None => {
+                let at = ::std::time::SystemTime::now();
+                engagement.stop_time = Some(at);
+                engagement.stop_reason = input.reason.clone();
+                at
+            }
+        };
+
+        // "Further contacts aren't engaged": the engagement ends here, so the plan stages
+        // whose send instant had not arrived are never entered and page nobody. Their pages
+        // engaged no contact channel, so they are dropped rather than left reportable and
+        // acknowledgeable. The instant used is the one the engagement RECORDED, so a repeated
+        // stop cancels exactly what the first one did.
+        state.cancel_unsent_pages_of(&input.engagement_id, stopped_at);
 
         Ok(StopEngagementOutput {})
     }

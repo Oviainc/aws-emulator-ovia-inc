@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteKeyspace
-//! IMPLEMENTED: removes a keyspace and the tables it owns from [`crate::state`]. This is
-//! the ONLY file to touch for `DeleteKeyspace`.
+//! IMPLEMENTED: puts a keyspace, and the tables and types it owns, in `DELETING` in
+//! [`crate::state`], which `crate::state::settle` later removes. This is the ONLY file to
+//! touch for `DeleteKeyspace`.
+//!
+//! A repeat of this call while the keyspace is already `DELETING` is the modelled
+//! `ConflictException`, NOT the no-error repeat `DeleteTable` documents for a table: the
+//! service documents no keyspace-level behaviour here, and an action already in progress
+//! is what this model's `ConflictException` names — the same answer `UpdateKeyspace` and
+//! `DeleteType` already give for a resource of theirs that is mid-change.
 //!
 //! The paragraphs below are the scaffold's own notes on how an operation is shaped and
 //! how it reaches state; they still describe this file.
@@ -154,12 +161,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             })
         })?;
+        // The CDC stream store, shared with KeyspacesStreams: a stream follows one
+        // table's changes, and no table outlives its keyspace. Resolved before either
+        // store is locked, and locked AFTER this service's own — one lock order
+        // everywhere.
+        let streams = crate::state::cdc_stream_state(&*self.engine).ok_or_else(|| {
+            DeleteKeyspaceErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "Amazon Keyspaces could not reach the CDC stream store for this request."
+                        .to_string(),
+                ),
+            })
+        })?;
         let region = crate::state::request_region(ctx);
 
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // The service-managed keyspaces are part of the account before any call.
         store.ensure_service_managed_catalog(&region);
-        store.settle(::std::time::SystemTime::now());
+        store.settle(now);
 
         // A service-managed keyspace is not a resource a client owns: Cassandra refuses
         // DDL against one as an invalid query ("system keyspace is not user-modifiable"),
@@ -173,16 +193,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // "The DeleteKeyspace operation deletes a keyspace and all of its tables." The
-        // tables are held INSIDE the keyspace record, so removing it removes them with
-        // it and no table can outlive its keyspace in state.
-        let Some(removed) = store.keyspaces.remove(&input.keyspace_name) else {
+        let Some(keyspace) = store.keyspaces.get_mut(&input.keyspace_name) else {
             return Err(DeleteKeyspaceErrorModeled::ResourceNotFoundException(
                 crate::state::keyspace_not_found(&region, &input.keyspace_name),
             )
             .into());
         };
-        let deleted_tables: Vec<String> = removed.tables.keys().cloned().collect();
+
+        // A keyspace is deletable only from `ACTIVE`. While a change of its own is still
+        // settling — the creation `CreateKeyspace` started, the replication change
+        // `UpdateKeyspace` started, or a deletion a previous call to this operation
+        // started — this is the modelled conflict: "Amazon Keyspaces couldn't complete the
+        // requested action. This error may occur if you try to perform an action and the
+        // same or a different action is already in progress." The caller's recourse is to
+        // wait for that action, so the status it is waiting on is in the message.
+        if keyspace.status != crate::state::KEYSPACE_STATUS_ACTIVE {
+            let message = if keyspace.is_deleting() {
+                crate::state::keyspace_deleting_rejection(&input.keyspace_name)
+            } else {
+                format!(
+                    "Keyspace '{}' is in status {} and cannot be deleted until it is {}.",
+                    input.keyspace_name,
+                    keyspace.status,
+                    crate::state::KEYSPACE_STATUS_ACTIVE
+                )
+            };
+            return Err(DeleteKeyspaceErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
+            })
+            .into());
+        }
+
+        // "The DeleteKeyspace operation deletes a keyspace and all of its tables" — so a
+        // table or type of it that has a change of its own in flight is dropped by this
+        // call, which is precisely what `DeleteTable` refuses for such a table ("If a
+        // table is either in the CREATING or UPDATING states, then Amazon Keyspaces
+        // returns a ResourceInUseException"). A keyspace holding one is therefore not
+        // deletable yet either, and that is the same modelled conflict as above — the one
+        // `UpdateKeyspace` already answers for a table of its keyspace that is mid-change.
+        if let Some((kind, name, status)) = keyspace.resource_in_flight() {
+            let message = format!(
+                "{kind} '{}.{name}' is in status {status} and the keyspace cannot be \
+                 deleted until every table and type in it has settled.",
+                input.keyspace_name
+            );
+            return Err(DeleteKeyspaceErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
+            })
+            .into());
+        }
+
+        // Accepted. `KeyspaceStatus` models `DELETING` and `GetKeyspace` reports a
+        // keyspace's status, so the deletion is observable rather than instantaneous: the
+        // keyspace enters `DELETING` now, and so does every table and type it holds, since
+        // they go with it. The clock owes their removal one span from here; `settle`
+        // materialises it, and nothing sleeps for it.
+        let settles_at = now + crate::state::TRANSIENT_STATUS_SPAN;
+        keyspace.status = crate::state::KEYSPACE_STATUS_DELETING.to_string();
+        keyspace.status_due_at = Some(settles_at);
+        for table in keyspace.tables.values_mut() {
+            table.status = crate::state::TABLE_STATUS_DELETING.to_string();
+            table.status_due_at = Some(settles_at);
+        }
+        for udt in keyspace.types.values_mut() {
+            udt.status = crate::state::TYPE_STATUS_DELETING.to_string();
+            udt.status_due_at = Some(settles_at);
+        }
+        let deleted_tables: Vec<String> = keyspace.tables.keys().cloned().collect();
+        // Tell the store the earliest instant at which `settle` has to look at the
+        // keyspaces again.
+        store.note_transition_due(settles_at);
         drop(store);
 
         // Every table deleted with the keyspace takes its capacities with it, so the
@@ -197,6 +277,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 table_name,
             );
         }
+        // The tables are gone, so the CDC streams that followed them are: a stream
+        // captures the changes of one table, and that table no longer exists.
+        streams
+            .lock()
+            .forget_streams_in_keyspace(&region, &input.keyspace_name);
 
         Ok(DeleteKeyspaceOutput {})
     }

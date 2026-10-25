@@ -228,8 +228,8 @@ async fn get_gov_cloud_account_information(router: &MultiServiceRouter, body: Va
 /// The standalone call — the one that names no account, which the model
 /// documents as defaulting to the account of the calling identity — is the
 /// modelled 404 until a GovCloud account is linked to that account, and reports
-/// the link once one is recorded; naming that same account explicitly answers
-/// identically either way.
+/// the link once one is recorded; naming that same account explicitly is the
+/// authorization refusal instead, whether a link is recorded or not.
 ///
 /// Nothing in this emulator comes up GovCloud-linked: the link is recorded
 /// through the same minting constructor whatever creates a GovCloud account
@@ -246,10 +246,7 @@ async fn the_standalone_call_reports_the_callers_own_linked_account() {
     );
     for (case, request) in [
         ("the standalone call, unlinked", json!({})),
-        (
-            "the caller's own account named explicitly, unlinked",
-            json!({"StandardAccountId": own}),
-        ),
+        ("the standalone call, unlinked, repeated", json!({})),
     ] {
         let answer = get_gov_cloud_account_information(&router, request).await;
         assert_eq!(
@@ -261,15 +258,24 @@ async fn the_standalone_call_reports_the_callers_own_linked_account() {
         );
     }
 
+    // Naming the caller's own account in `StandardAccountId` is refused: the
+    // member names a member account of the organization.
+    let named = get_gov_cloud_account_information(&router, json!({"StandardAccountId": own})).await;
+    assert_eq!(
+        (named.status, named.error_code()),
+        (403, "AccessDeniedException"),
+        "case \"the caller's own account named explicitly, unlinked\": expected the 403 \
+         refusal, got {} with {:?}",
+        named.status,
+        named.body
+    );
+
     // The link arrives the way a creator of a GovCloud account records one.
     let (stored_id, stored_state) = record_minted_link(&engine, &own);
 
     for (case, request) in [
         ("the standalone call", json!({})),
-        (
-            "the caller's own account named explicitly",
-            json!({"StandardAccountId": own}),
-        ),
+        ("the standalone call, repeated", json!({})),
     ] {
         let answer = get_gov_cloud_account_information(&router, request).await;
         assert_eq!(
@@ -305,6 +311,18 @@ async fn the_standalone_call_reports_the_callers_own_linked_account() {
             answer.member("AccountState")
         );
     }
+
+    // The recorded link does not make the self-naming request answerable either:
+    // the refusal is about which account the member may name, not about the link.
+    let named = get_gov_cloud_account_information(&router, json!({"StandardAccountId": own})).await;
+    assert_eq!(
+        (named.status, named.error_code()),
+        (403, "AccessDeniedException"),
+        "case \"the caller's own account named explicitly, linked\": expected the 403 \
+         refusal, got {} with {:?}",
+        named.status,
+        named.body
+    );
 }
 
 /// A link the store holds is reported exactly as stored — the linked account's

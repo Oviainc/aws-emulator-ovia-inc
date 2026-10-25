@@ -6,12 +6,14 @@
 //! one when a table is created or altered with a CDC specification, and this service
 //! only reports it and serves its records. The write side therefore lives HERE —
 //! [`ComAmazonawsKeyspacesstreamsKeyspacesstreamsState::enable_stream`],
+//! [`ComAmazonawsKeyspacesstreamsKeyspacesstreamsState::disable_stream`],
 //! [`ComAmazonawsKeyspacesstreamsKeyspacesstreamsState::append_change_record`] and
-//! [`ComAmazonawsKeyspacesstreamsKeyspacesstreamsState::split_shard`] — so the
-//! Keyspaces control plane (`service-com-amazonaws-keyspaces-keyspacesservice`, whose
-//! `CreateTable`/`UpdateTable` are still scaffolded) and this crate's tests populate
-//! exactly the records `src/ops/` reads back. No handler in this crate writes a stream,
-//! a shard or a record.
+//! [`ComAmazonawsKeyspacesstreamsKeyspacesstreamsState::split_shard`] — and it is ONE
+//! store in the shared engine, so the stream the Keyspaces control plane
+//! (`service-com-amazonaws-keyspaces-keyspacesservice`, whose `CreateTable` and
+//! `UpdateTable` drive it from their `cdcSpecification`) enables is exactly the stream
+//! `src/ops/` reports. No handler in THIS crate writes a stream, a shard or a record:
+//! the control plane and this crate's tests are what populate them.
 
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap};
@@ -35,6 +37,25 @@ pub const SHARD_ITERATOR_LIFETIME: Duration = Duration::from_secs(15 * 60);
 /// after it is enabled still observes `ENABLING`.
 pub const STATUS_TRANSITION_DELAY: Duration = Duration::from_millis(400);
 
+/// `StreamStatus` = `ENABLING`: the status a stream is created in, while Amazon
+/// Keyspaces is bringing change data capture up for its table.
+///
+/// The four constants below are the whole of the model's `StreamStatus` value set
+/// (`crate::ops::types::STREAM_STATUS_VALUES`), which is also the whole of the
+/// Keyspaces control plane's `CdcStatus` value set: a table's CDC status IS the status
+/// of the stream this store holds for it, which is why neither side keeps a second copy.
+pub const STREAM_STATUS_ENABLING: &str = "ENABLING";
+/// `StreamStatus` = `ENABLED`: the status an enabling stream settles into, in which it
+/// captures the changes made to its table.
+pub const STREAM_STATUS_ENABLED: &str = "ENABLED";
+/// `StreamStatus` = `DISABLING`: the status a stream enters when CDC is turned off for
+/// its table. It captures nothing more from that instant on.
+pub const STREAM_STATUS_DISABLING: &str = "DISABLING";
+/// `StreamStatus` = `DISABLED`: the status a disabling stream settles into. The records
+/// it already captured stay readable — a consumer can drain them — but no shard of it
+/// accepts another.
+pub const STREAM_STATUS_DISABLED: &str = "DISABLED";
+
 /// The `eventVersion` stamped on every record this emulator captures: the version of
 /// the record FORMAT, so it is a property of the emulator and not of one record.
 pub const RECORD_FORMAT_VERSION: &str = "1.0";
@@ -54,6 +75,16 @@ pub const MAX_TRACKED_ITERATORS: usize = 4096;
 /// The most pagination cursors this service keeps, bounded for the same reason and in
 /// the same way: a caller mints one per page it asks for.
 pub const MAX_TRACKED_PAGE_TOKENS: usize = 4096;
+
+/// The most streams this service keeps for ONE table: its live stream, plus the
+/// disabled ones it had before.
+///
+/// An EMULATOR ceiling, not an AWS quota: turning CDC off and on again mints a new
+/// stream and keeps the disabled one (its records stay readable), so a caller looping on
+/// `UpdateTable` would otherwise grow this store without end. Past the cap the table's
+/// OLDEST disabled stream is dropped — never a live one, and never a newer one — so the
+/// stream a running consumer is draining is still there.
+pub const MAX_STREAMS_PER_TABLE: usize = 8;
 
 /// A status change the clock owes a stream, with no further call: AWS reports a
 /// freshly enabled stream as `ENABLING` and moves it to `ENABLED` itself.
@@ -198,6 +229,19 @@ impl StreamEntry {
     /// The shard `shard_id` names, if this stream holds it.
     pub fn shard(&self, shard_id: &str) -> Option<&ShardEntry> {
         self.shards.iter().find(|shard| shard.shard_id == shard_id)
+    }
+
+    /// Whether this stream is still following its table: a `StreamStatus` of
+    /// [`STREAM_STATUS_ENABLING`] or [`STREAM_STATUS_ENABLED`].
+    ///
+    /// A [`STREAM_STATUS_DISABLING`] or [`STREAM_STATUS_DISABLED`] stream has stopped
+    /// capturing changes for good — CDC was turned off for its table — so it is not the
+    /// stream a later enable re-asserts, and it accepts no further record.
+    pub fn is_live(&self) -> bool {
+        matches!(
+            self.stream_status.as_str(),
+            STREAM_STATUS_ENABLING | STREAM_STATUS_ENABLED
+        )
     }
 }
 
@@ -371,12 +415,15 @@ impl ComAmazonawsKeyspacesstreamsKeyspacesstreamsState {
     /// creates when a table is created or altered with a CDC specification, with one
     /// open shard and no records yet, and return its ARN.
     ///
-    /// Idempotent per region/keyspace/table, the way re-asserting a table's CDC
-    /// specification is: an already-enabled table keeps its stream and its label.
-    /// `stream_view_type` decides which images the stream's records carry, and must be
-    /// one of the model's `StreamViewType` values — `None` for any other value, the
-    /// way Keyspaces refuses a CDC specification it cannot honour, rather than storing
-    /// a view type that would silently publish no image.
+    /// Idempotent per region/keyspace/table while the table's stream is LIVE
+    /// ([`StreamEntry::is_live`]), the way re-asserting a table's CDC specification is:
+    /// the table keeps that stream and its label. A table whose stream was DISABLED
+    /// gets a NEW one — `GetTable` reports the `latestStreamArn` of a table, so a
+    /// re-enabled table has a later stream, and the disabled one keeps the records it
+    /// captured. `stream_view_type` decides which images the stream's records carry, and
+    /// must be one of the model's `StreamViewType` values — `None` for any other value,
+    /// the way Keyspaces refuses a CDC specification it cannot honour, rather than
+    /// storing a view type that would silently publish no image.
     pub fn enable_stream(
         &mut self,
         region: &str,
@@ -384,24 +431,38 @@ impl ComAmazonawsKeyspacesstreamsKeyspacesstreamsState {
         table_name: &str,
         stream_view_type: &str,
     ) -> Option<String> {
-        // Idempotence first: an already-enabled table keeps its stream whatever the
-        // re-asserted view type says, so a repeat call cannot be refused by a value
+        // Idempotence first: a table whose stream is still live keeps it whatever the
+        // re-asserted view type says ("After you create the stream, you can't make
+        // changes to this selection"), so a repeat call cannot be refused by a value
         // that only matters when a stream is created.
-        if let Some(existing) = self.stream_for_table(region, keyspace_name, table_name) {
+        if let Some(existing) = self.live_stream_for_table(region, keyspace_name, table_name) {
             return Some(existing.stream_arn.clone());
         }
         if !crate::ops::types::STREAM_VIEW_TYPE_VALUES.contains(&stream_view_type) {
             return None;
         }
-        let created = SystemTime::now();
-        let stream_label = stream_label_for(created);
-        // The resource path Amazon Keyspaces gives a table's stream:
-        // `/keyspace/<keyspace>/table/<table>/stream/<label>`.
-        let stream_arn = ::engine::emulator_arn(
-            "cassandra",
-            region,
-            &format!("/keyspace/{keyspace_name}/table/{table_name}/stream/{stream_label}"),
-        );
+        // A stream's label is the instant it was created, and it has to IDENTIFY the
+        // stream inside its ARN, which is this map's key. Two streams of one table minted
+        // inside the label's resolution would therefore collide — a table whose CDC is
+        // turned off and straight back on is exactly that case — so the later one is
+        // labelled at the next free instant: the label stays the creation time (to the
+        // millisecond), every stream of a table has its own ARN, and no stream can
+        // overwrite another's records or be answered in place of it.
+        let mut created = SystemTime::now();
+        let (stream_label, stream_arn) = loop {
+            let stream_label = stream_label_for(created);
+            // The resource path Amazon Keyspaces gives a table's stream:
+            // `/keyspace/<keyspace>/table/<table>/stream/<label>`.
+            let stream_arn = ::engine::emulator_arn(
+                "cassandra",
+                region,
+                &format!("/keyspace/{keyspace_name}/table/{table_name}/stream/{stream_label}"),
+            );
+            if !self.streams.contains_key(&stream_arn) {
+                break (stream_label, stream_arn);
+            }
+            created += Duration::from_millis(1);
+        };
         let shard = self.new_shard(created, Vec::new());
         self.streams.insert(
             stream_arn.clone(),
@@ -414,17 +475,165 @@ impl ComAmazonawsKeyspacesstreamsKeyspacesstreamsState {
                 // AWS returns a stream it has just created in a non-terminal status
                 // and moves it on itself; `materialise_due_transitions` is what
                 // completes it.
-                stream_status: "ENABLING".to_string(),
+                stream_status: STREAM_STATUS_ENABLING.to_string(),
                 stream_view_type: stream_view_type.to_string(),
                 creation_request_date_time: created,
                 pending_status: Some(PendingStatus {
                     due: created + STATUS_TRANSITION_DELAY,
-                    status: "ENABLED".to_string(),
+                    status: STREAM_STATUS_ENABLED.to_string(),
                 }),
                 shards: vec![shard],
             },
         );
+        // This table now holds one more stream than before, and one call adds at most
+        // one, so the cap is applied here with a single eviction: the table's OLDEST
+        // stream goes, never the live one just minted and never a newer one. Oldest is
+        // decided by the creation instant the entry carries (ties broken by ARN, as
+        // [`Self::stream_for_table`] breaks them), so the choice does not depend on how a
+        // label happens to render.
+        let held: Vec<(SystemTime, String)> = self
+            .streams
+            .values()
+            .filter(|stream| {
+                stream.region == region
+                    && stream.keyspace_name == keyspace_name
+                    && stream.table_name == table_name
+            })
+            .map(|stream| (stream.creation_request_date_time, stream.stream_arn.clone()))
+            .collect();
+        if held.len() > MAX_STREAMS_PER_TABLE {
+            let oldest = held
+                .iter()
+                .min_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)))
+                .map(|(_, stream_arn)| stream_arn.clone());
+            if let Some(oldest) = oldest {
+                self.forget_stream(&oldest);
+            }
+        }
         Some(stream_arn)
+    }
+
+    /// Disable change data capture for a table: the stream Amazon Keyspaces created for
+    /// it stops capturing changes, and the ARN of that stream is returned.
+    ///
+    /// The stream enters [`STREAM_STATUS_DISABLING`] and the clock owes it
+    /// [`STREAM_STATUS_DISABLED`] one [`STATUS_TRANSITION_DELAY`] later, exactly as
+    /// enabling is a two-step the clock finishes. It is NOT removed: `StreamStatus`
+    /// models `DISABLED`, which only a stream a caller can still read could ever
+    /// report, so a consumer keeps draining the records captured before the disable —
+    /// and every shard's range ends here, so nothing more can be appended.
+    ///
+    /// `None` when the table has no live stream: disabling CDC on a table that has none
+    /// changes nothing.
+    pub fn disable_stream(
+        &mut self,
+        region: &str,
+        keyspace_name: &str,
+        table_name: &str,
+    ) -> Option<String> {
+        let stream_arn = self
+            .live_stream_for_table(region, keyspace_name, table_name)?
+            .stream_arn
+            .clone();
+        let now = SystemTime::now();
+        let stream = self.streams.get_mut(&stream_arn)?;
+        stream.stream_status = STREAM_STATUS_DISABLING.to_string();
+        stream.pending_status = Some(PendingStatus {
+            due: now + STATUS_TRANSITION_DELAY,
+            status: STREAM_STATUS_DISABLED.to_string(),
+        });
+        // A stream that captures nothing more has no open-ended range left: a shard's
+        // end is its last record, or its own start when it never held one.
+        for shard in stream.shards.iter_mut().filter(|shard| shard.is_open()) {
+            shard.ending_sequence_number = Some(
+                shard
+                    .records
+                    .last()
+                    .map_or(shard.starting_sequence_number.clone(), |record| {
+                        record.sequence_number.clone()
+                    }),
+            );
+        }
+        Some(stream_arn)
+    }
+
+    /// Forget every stream of one table, and answer with the ARNs forgotten.
+    ///
+    /// A stream follows one table's changes, so it cannot outlive that table: the
+    /// Keyspaces control plane calls this when the table is deleted (and, per keyspace,
+    /// when the keyspace that holds it is).
+    pub fn forget_streams_for_table(
+        &mut self,
+        region: &str,
+        keyspace_name: &str,
+        table_name: &str,
+    ) -> Vec<String> {
+        self.forget_streams(|stream| {
+            stream.region == region
+                && stream.keyspace_name == keyspace_name
+                && stream.table_name == table_name
+        })
+    }
+
+    /// Forget every stream of every table of one keyspace, and answer with the ARNs
+    /// forgotten: "The `DeleteKeyspace` operation deletes a keyspace and all of its
+    /// tables", and a table's stream goes with the table.
+    pub fn forget_streams_in_keyspace(
+        &mut self,
+        region: &str,
+        keyspace_name: &str,
+    ) -> Vec<String> {
+        self.forget_streams(|stream| {
+            stream.region == region && stream.keyspace_name == keyspace_name
+        })
+    }
+
+    /// The ARNs of every stream this store holds for one table, in no particular order:
+    /// this is a membership set, not a listing.
+    ///
+    /// A table's streams are capped here ([`MAX_STREAMS_PER_TABLE`]), and the Keyspaces
+    /// control plane holds each stream's TAGS, so it prunes those against this list:
+    /// that is what keeps a tag set from outliving the stream it belongs to.
+    pub fn stream_arns_for_table(
+        &self,
+        region: &str,
+        keyspace_name: &str,
+        table_name: &str,
+    ) -> Vec<String> {
+        self.streams
+            .values()
+            .filter(|stream| {
+                stream.region == region
+                    && stream.keyspace_name == keyspace_name
+                    && stream.table_name == table_name
+            })
+            .map(|stream| stream.stream_arn.clone())
+            .collect()
+    }
+
+    /// Remove every stream `matches` selects, with the iterators bookmarking them, and
+    /// answer with the ARNs removed.
+    fn forget_streams(&mut self, matches: impl Fn(&StreamEntry) -> bool) -> Vec<String> {
+        let forgotten: Vec<String> = self
+            .streams
+            .values()
+            .filter(|stream| matches(stream))
+            .map(|stream| stream.stream_arn.clone())
+            .collect();
+        for stream_arn in &forgotten {
+            self.forget_stream(stream_arn);
+        }
+        forgotten
+    }
+
+    /// Remove one stream and the iterators bookmarking it.
+    ///
+    /// An iterator is a bookmark INTO a stream, so one into a stream that is gone can
+    /// never be served again; dropping it here keeps the registry from holding them.
+    fn forget_stream(&mut self, stream_arn: &str) {
+        self.streams.remove(stream_arn);
+        self.iterators
+            .retain(|_, entry| entry.stream_arn != stream_arn);
     }
 
     /// Capture one change to a row of the table `stream_arn`'s stream follows, as a
@@ -559,18 +768,48 @@ impl ComAmazonawsKeyspacesstreamsKeyspacesstreamsState {
         self.streams.get(stream_arn)
     }
 
-    /// The stream following one table in one region, if that table has CDC enabled.
+    /// The LATEST stream following one table in one region, if that table ever had CDC
+    /// enabled.
+    ///
+    /// A table can have had more than one stream over its life — CDC turned off and on
+    /// again mints a new one — and the one that speaks for the table now is the most
+    /// recently created, which is what Keyspaces reports as a table's `latestStreamArn`.
+    /// Ties (two streams created inside the clock's resolution) are broken by ARN, so
+    /// the answer is total and stable rather than dependent on map order.
     pub fn stream_for_table(
         &self,
         region: &str,
         keyspace_name: &str,
         table_name: &str,
     ) -> Option<&StreamEntry> {
-        self.streams.values().find(|stream| {
-            stream.region == region
-                && stream.keyspace_name == keyspace_name
-                && stream.table_name == table_name
-        })
+        self.streams
+            .values()
+            .filter(|stream| {
+                stream.region == region
+                    && stream.keyspace_name == keyspace_name
+                    && stream.table_name == table_name
+            })
+            .max_by(|left, right| {
+                left.creation_request_date_time
+                    .cmp(&right.creation_request_date_time)
+                    .then_with(|| left.stream_arn.cmp(&right.stream_arn))
+            })
+    }
+
+    /// The stream that is still capturing one table's changes, if CDC is on for it: the
+    /// table's latest stream, when that stream [is live][StreamEntry::is_live].
+    ///
+    /// A disabled stream is not re-enabled by a later CDC specification — that mints a
+    /// new stream — so the enable/disable write side asks for this one, not for
+    /// [`Self::stream_for_table`].
+    pub fn live_stream_for_table(
+        &self,
+        region: &str,
+        keyspace_name: &str,
+        table_name: &str,
+    ) -> Option<&StreamEntry> {
+        self.stream_for_table(region, keyspace_name, table_name)
+            .filter(|stream| stream.is_live())
     }
 
     /// Whether a stream with this ARN exists and still accepts records.
@@ -743,10 +982,23 @@ fn project_images(
 /// A stream's label: "A timestamp that serves as a unique identifier for this stream
 /// … The stream label represents the point in time when the stream was created."
 /// (`GetStream`'s `streamLabel` doc.)
+///
+/// Rendered to the MILLISECOND (`2026-10-23T10:07:58.123`), whatever sub-second digits
+/// the timestamp formatter happens to emit: the label has to identify the stream, and a
+/// label at second resolution could not tell two streams of one table apart. Uniqueness
+/// is settled by the caller ([`ComAmazonawsKeyspacesstreamsKeyspacesstreamsState::enable_stream`]),
+/// which labels a colliding stream at the next free instant.
 fn stream_label_for(created: SystemTime) -> String {
+    let subsecond_millis = epoch_millis(created) % 1_000;
     ::aws_smithy_types::DateTime::from(created)
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .map(|rendered| rendered.trim_end_matches('Z').to_string())
+        .map(|rendered| {
+            let whole_seconds = rendered.trim_end_matches('Z');
+            let whole_seconds = whole_seconds
+                .split_once('.')
+                .map_or(whole_seconds, |(seconds, _)| seconds);
+            format!("{whole_seconds}.{subsecond_millis:03}")
+        })
         .unwrap_or_else(|_| epoch_millis(created).to_string())
 }
 

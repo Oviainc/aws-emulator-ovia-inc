@@ -21,6 +21,8 @@ mod budget_action_execution;
 mod budget_action_history;
 #[path = "all/budget_action_lifecycle.rs"]
 mod budget_action_lifecycle;
+#[path = "all/budget_action_lock.rs"]
+mod budget_action_lock;
 #[path = "all/budget_action_read_purity.rs"]
 mod budget_action_read_purity;
 #[path = "all/budget_action_settle_history.rs"]
@@ -31,6 +33,8 @@ mod budget_action_subscriber_limits;
 mod budget_actions_for_budget;
 #[path = "all/budget_creation_limits.rs"]
 mod budget_creation_limits;
+#[path = "all/budget_end_date_expiry.rs"]
+mod budget_end_date_expiry;
 #[path = "all/budget_lifecycle.rs"]
 mod budget_lifecycle;
 #[path = "all/budget_read_projection.rs"]

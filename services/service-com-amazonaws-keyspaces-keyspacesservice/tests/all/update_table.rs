@@ -18,10 +18,10 @@
 //! 4. A request that breaks a rule the model cannot state is refused with the error the
 //!    model declares for it, and the refusal leaves the table untouched — including the
 //!    documented "you can only update one specific table setting per update operation".
-//! 5. The ONE setting no report here can answer for — `cdcSpecification` — is refused with
-//!    the scaffold's 501 rather than stored and forgotten; every other modelled setting is
-//!    applied (see `tests/all/update_table_scaling_settings.rs` for auto scaling, the
-//!    per-Region settings and warm throughput).
+//! 5. Every modelled setting is APPLIED, and none is refused with the scaffold's 501 —
+//!    `cdcSpecification` included (see `tests/all/cdc_streams.rs`), and see
+//!    `tests/all/update_table_scaling_settings.rs` for auto scaling, the per-Region
+//!    settings and warm throughput.
 //! 6. A stored schema only grows, so growing one past the emulator's column cap is
 //!    refused with the quota error the model declares — in one call or across several.
 
@@ -32,8 +32,7 @@ use service_com_amazonaws_keyspaces_keyspacesservice::ops::types::TABLE_STATUS_V
 use service_com_amazonaws_keyspaces_keyspacesservice::state as keyspaces;
 
 use super::keyspace_table_lifecycle::{
-    assert_failure, assert_ok, epoch_seconds, error_code, minimal_schema, settle_wait, table_arn,
-    Emulator,
+    assert_failure, assert_ok, epoch_seconds, minimal_schema, settle_wait, table_arn, Emulator,
 };
 
 /// A KMS key ARN for the `CUSTOMER_MANAGED_KMS_KEY` rows — the form
@@ -45,17 +44,6 @@ const KMS_KEY_ARN: &str = "arn:aws:kms:us-west-2:000000000000:key/aaaaaaaa-bbbb-
 /// not carry it.
 fn at(body: &Value, path: &str) -> Value {
     body.pointer(path).cloned().unwrap_or(Value::Null)
-}
-
-/// Assert a call was refused with the scaffold's 501 `NotImplemented`, which
-/// [`assert_failure`] deliberately refuses to accept for a modelled failure.
-fn assert_not_implemented(case: &str, got: (u16, Value)) {
-    let (status, body) = got;
-    assert_eq!(
-        (status, error_code(&body).as_str()),
-        (501, "NotImplemented"),
-        "case {case:?}: expected the honest 501 NotImplemented, got {status} {body}"
-    );
 }
 
 /// Create `table` in `keyspace` from `request` (the names and a default schema are
@@ -892,39 +880,3 @@ async fn growing_a_schema_past_the_column_cap_is_the_modelled_quota_error() {
     );
 }
 
-/// RULE 5: the one setting no operation in this slice can report is refused with the honest
-/// 501, never stored, and never answered as a success.
-#[tokio::test]
-async fn a_setting_this_slice_cannot_report_is_refused_with_the_scaffold_501() {
-    let emulator = Emulator::start();
-    let keyspace = "unimplemented_ks";
-    let table = "unimplemented_tbl";
-    assert_ok(
-        "create the keyspace",
-        emulator
-            .call("CreateKeyspace", json!({"keyspaceName": keyspace}))
-            .await,
-    );
-    create_table(&emulator, keyspace, table, json!({})).await;
-    tokio::time::sleep(settle_wait()).await;
-    let untouched = get_table(&emulator, keyspace, table).await;
-
-    // `cdcSpecification` alone: `GetTable` has no CDC summary to report, so storing it
-    // would mean answering for a setting nothing here can read back.
-    let unimplemented: Vec<(&str, Value)> = vec![(
-        "cdcSpecification",
-        json!({"cdcSpecification": {"status": "ENABLED"}}),
-    )];
-
-    for (case, members) in unimplemented {
-        let mut request = members;
-        request["keyspaceName"] = json!(keyspace);
-        request["tableName"] = json!(table);
-        assert_not_implemented(case, emulator.call("UpdateTable", request).await);
-        assert_eq!(
-            get_table(&emulator, keyspace, table).await,
-            untouched,
-            "case {case:?}: a 501 must leave the table exactly as it was"
-        );
-    }
-}

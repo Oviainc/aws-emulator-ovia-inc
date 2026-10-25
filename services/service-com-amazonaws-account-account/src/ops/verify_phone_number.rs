@@ -181,9 +181,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `Otp`'s `^[a-zA-Z0-9]{6}$` and `AccountId`'s `^\d{12}$` were refused at
         // the boundary already, so what reaches here is a well-formed passcode;
-        // WHICH passcode is the right one is this service's own rule. `AccountId`
-        // is optional, so an absent one lands on the caller's own account.
-        let account_id = crate::state::resolve_account_id(input.account_id.as_deref());
+        // WHICH passcode is the right one is this service's own rule.
+        //
+        // The account this call acts on. An absent `AccountId` is the standalone
+        // call on the caller's own account; a PRESENT one names a member account
+        // of the caller's organization, which the caller's own account is not —
+        // so naming it is the modelled authorization refusal, decided before the
+        // passcode is looked at.
+        let account_id = match crate::state::target_account_id(input.account_id.as_deref()) {
+            Ok(account_id) => account_id,
+            Err(denied) => {
+                return Err(VerifyPhoneNumberErrorModeled::AccessDeniedException(denied).into())
+            }
+        };
         let mut store = state.lock();
         // Verifying acts on the primary contact of an account that already
         // exists, so this call never creates a record: an id this emulator holds

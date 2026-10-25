@@ -10,6 +10,39 @@ Issue-Commit: 8bb3e31d2bc3a99611966740f58be573e66087fa
 
 > _Note: this issue was identified against the code base at commit `8bb3e31d2bc3a99611966740f58be573e66087fa`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution (what landed here, and what this record does NOT own)
+
+**The operation is implemented, and so is the store it reads.** `DescribeRules` carries no
+scaffold header and answers 200 from the service's own state: a listener's rules are its
+default rule plus the rules `CreateRule` persisted on it, reported in evaluation order
+(ascending priority, default rule last), selectable by `RuleArns` and paged by
+`Marker`/`PageSize`. `CreateRule` — the only writer of a listener's non-default rules, and
+until now a scaffold stub whose 501 meant this read could never report more than one rule —
+is implemented with it: priority unique per listener (`PriorityInUse`), a forward resolved
+against the target group store (`TargetGroupNotFound`), the condition-field and
+condition-value rules the model states in prose, and the published
+`rules-per-application-load-balancer` bound (`TooManyRules`). A target group a RULE forwards
+to is now in use for `DeleteTargetGroup` and reports its load balancer, through one helper on
+the listener record. Pinned end to end over the wire by
+`services/service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10/tests/all/listener_rules.rs`.
+
+**The one recorded unit is NOT claimed as passing, and its remaining blocker is another
+service's.** `elbv2.deploy-elbv2-1-rule-update-tg-replace-deletion-protection` deploys a
+CloudFormation stack and then calls `DescribeRules` with the listener ARN read out of that
+stack's `Outputs`. CloudFormation in this emulator does not provision ELBv2 resources through
+the ELBv2 service: it synthesizes each declared resource's identifier from the template
+(`services/service-com-amazonaws-cloudformation-cloudformation/src/state/template.rs`, and
+`src/state/provisioner.rs` has no ELBv2 arm), so the ARN that reaches this read names a
+listener no `CreateListener` ever minted and `ListenerNotFound`/400 is the correct answer for
+it. Serving it from the ELBv2 side would mean inventing a listener the store never created.
+That work is owned by the open records
+`20261022T235108Z-cloudformation-stack-outputs-carry-no-outputvalue-failing-resources.md` and
+`20261023T025808Z-cloudformation-elbv2-a-cloudformation-stack-whose-elbv2-listener-rules-collide.md`
+(whose own stated fix is the ELBv2 `CreateRule` priority-uniqueness refusal — which landed
+here — plus CloudFormation's resource-failure/rollback state machine), exactly as the resolved
+record `20261023T025808Z-elbv2-awsquery-action-table-at-api-version-2015.md` already
+reassigned this trace id.
+
 ## Operation
 DescribeRules
 

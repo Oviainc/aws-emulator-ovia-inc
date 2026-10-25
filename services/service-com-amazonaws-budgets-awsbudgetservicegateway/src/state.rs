@@ -13,6 +13,11 @@
 //! (`Action$BudgetName`) and every action operation names that budget beside the
 //! `ActionId`, so an action cannot outlive the budget it acts on.
 //!
+//! That same sentence also bounds a budget's LIFE: a budget's `TimePeriod$End` is the
+//! instant after which AWS holds it no longer, so the store is reached through
+//! [`store_at`], which materialises every deletion the clock has already made due
+//! ([`expire_due_budgets`]) before any operation sees it.
+//!
 //! The helpers below (ARN rendering, the opaque pagination token, the cross-member
 //! rules `CreateBudget`/`UpdateBudget` document) are shared by several operation
 //! handlers, so they live here rather than being copied into each `src/ops` file —
@@ -228,8 +233,9 @@ pub struct ActionExecution {
 /// already started and has not settled yet.
 ///
 /// An action in one of them is the locked resource `ResourceLockedException` ("the
-/// server rejected that particular method for the requested resource") names: a second
-/// execution cannot be started over work that is still running.
+/// server rejected that particular method for the requested resource") names: while the
+/// work runs, none of the methods that mutate the action — a second execution, an update
+/// of its members, its deletion — is accepted.
 pub fn action_is_in_progress(status: &str) -> bool {
     matches!(
         status,
@@ -1080,6 +1086,62 @@ pub fn page<T: Clone>(
     let end = start.saturating_add(page_size).min(items.len());
     let next = (end < items.len()).then(|| encode_next_token(end));
     Some((items[start..end].to_vec(), next))
+}
+
+/// Whether the clock has already made `stored`'s deletion due.
+///
+/// A budget's `TimePeriod$End` is the end of its life: "After the end date, Amazon Web
+/// Services deletes the budget and all the associated notifications and subscribers"
+/// (`Budget$TimePeriod`). The deletion falls due at that instant, so a budget whose end
+/// date is in the PAST is no longer part of the account's state at all.
+///
+/// A budget that names no `End` names no such instant, so nothing is due for it. Every
+/// write path stamps the documented default end ([`stamp_service_owned`]), so only a
+/// budget placed in the store directly can be in that shape.
+fn budget_deletion_due(stored: &StoredBudget, now: SystemTime) -> bool {
+    let now = ::aws_smithy_types::DateTime::from(now);
+    stored
+        .budget
+        .time_period
+        .as_ref()
+        .and_then(|period| period.end.as_ref())
+        .is_some_and(|end| instant(end) < instant(&now))
+}
+
+/// Drop every budget whose deletion the clock has already made due
+/// ([`budget_deletion_due`]), with the notifications, subscribers, actions and tags held
+/// inside it — the deletion AWS performs after a budget's end date, materialised at the
+/// moment a call observes the store.
+///
+/// This is the clock's own deletion, not a change any caller made: the same budgets would
+/// be gone at this instant even if nobody had called, and the budget a read drops here
+/// never comes back, so no later caller sees a budget this one did not.
+///
+/// Every operation that reaches this store runs it first ([`store_at`]), so a budget past
+/// its end date is absent from every listing, resolves to the `NotFoundException` a budget
+/// that does not exist resolves to, and stops counting against the account's budget quota
+/// ([`budget_count_for_account`]).
+fn expire_due_budgets(
+    state: &mut ComAmazonawsBudgetsAwsbudgetservicegatewayState,
+    now: SystemTime,
+) {
+    state
+        .budgets
+        .retain(|_, stored| !budget_deletion_due(stored, now));
+}
+
+/// Lock this service's store for a call that observes it at `now`, with every deletion the
+/// clock owes already materialised ([`expire_due_budgets`]).
+///
+/// The one door into the store: a handler calls this instead of `state.lock()`, so no
+/// operation can read or write a budget whose end date has passed.
+pub fn store_at(
+    state: &::engine::ServiceState<ComAmazonawsBudgetsAwsbudgetservicegatewayState>,
+    now: SystemTime,
+) -> ::std::sync::MutexGuard<'_, ComAmazonawsBudgetsAwsbudgetservicegatewayState> {
+    let mut store = state.lock();
+    expire_due_budgets(&mut store, now);
+    store
 }
 
 /// The refusal message a request whose `AccountId` is not the caller's own account

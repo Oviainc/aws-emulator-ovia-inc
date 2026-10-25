@@ -55,7 +55,7 @@ const CUSTOM_PROVIDER_ARN: &str = "arn:aws:sso::aws:applicationProvider/custom";
 /// `authorization_code | refresh_token | urn:ietf:params:oauth:grant-type:jwt-bearer |
 /// urn:ietf:params:oauth:grant-type:token-exchange`, and the union carries
 /// `AuthorizationCode | RefreshToken | JwtBearer | TokenExchange`.
-const GRANT_TYPES: &[(&str, &str)] = &[
+pub(crate) const GRANT_TYPES: &[(&str, &str)] = &[
     ("authorization_code", "AuthorizationCode"),
     ("refresh_token", "RefreshToken"),
     ("urn:ietf:params:oauth:grant-type:jwt-bearer", "JwtBearer"),
@@ -72,10 +72,10 @@ const TRUSTED_TOKEN_ISSUER_ARN: &str = "arn:aws:sso::123456789012:trustedTokenIs
 
 /// One row of the grant table: a `GrantType` and the `Grant` union body it selects.
 #[derive(Debug, Clone)]
-struct GrantCase {
-    label: &'static str,
-    grant_type: &'static str,
-    grant: Value,
+pub(crate) struct GrantCase {
+    pub(crate) label: &'static str,
+    pub(crate) grant_type: &'static str,
+    pub(crate) grant: Value,
 }
 
 /// The `n`th trusted-token-issuer ARN, so a row can carry a list of DISTINCT issuers up
@@ -95,7 +95,7 @@ fn issuer_arn(index: usize) -> String {
 /// its own optional members present and absent. The list bounds come from
 /// `smithy_query(query="shape",shape="RedirectUris,AuthorizedTokenIssuers")`:
 /// `length 1..10` on both.
-fn grant_cases() -> Vec<GrantCase> {
+pub(crate) fn grant_cases() -> Vec<GrantCase> {
     vec![
         GrantCase {
             label: "authorization_code with a single redirect URI",
@@ -168,7 +168,7 @@ fn grant_cases() -> Vec<GrantCase> {
 
 /// One grant of each `GrantType`, so a test can put the whole set on one application and
 /// watch a delete touch exactly one of them.
-fn one_grant_per_type() -> Vec<GrantCase> {
+pub(crate) fn one_grant_per_type() -> Vec<GrantCase> {
     let mut rows: Vec<GrantCase> = Vec::new();
     for (grant_type, _) in GRANT_TYPES {
         let row = grant_cases()
@@ -181,7 +181,7 @@ fn one_grant_per_type() -> Vec<GrantCase> {
 }
 
 /// Create one application and return its `ApplicationArn`.
-async fn create_application(
+pub(crate) async fn create_application(
     router: &MultiServiceRouter,
     instance_arn: &str,
     name: &str,
@@ -206,7 +206,7 @@ async fn create_application(
         .to_string()
 }
 
-async fn put_grant(
+pub(crate) async fn put_grant(
     router: &MultiServiceRouter,
     application_arn: &str,
     grant_type: &str,
@@ -224,7 +224,7 @@ async fn put_grant(
     .await
 }
 
-async fn get_grant(
+pub(crate) async fn get_grant(
     router: &MultiServiceRouter,
     application_arn: &str,
     grant_type: &str,
@@ -237,7 +237,7 @@ async fn get_grant(
     .await
 }
 
-async fn delete_grant(
+pub(crate) async fn delete_grant(
     router: &MultiServiceRouter,
     application_arn: &str,
     grant_type: &str,

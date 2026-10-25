@@ -9,6 +9,10 @@
 //! action was created with, and a replacement `Subscribers` set is held to the same
 //! per-type split as a create's ([`crate::state::subscriber_limit_violation`]); either
 //! is refused with `InvalidParameterException`, the client-error this operation models.
+//! An action whose work this service started and has not settled yet
+//! ([`crate::state::action_is_in_progress`]) is the locked resource
+//! `ResourceLockedException` names, so an update of it is refused and the stored action
+//! is left as the in-flight work found it.
 //!
 //! ## Shape of an operation
 //!
@@ -206,7 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
+        let mut store = crate::state::store_at(&state, now);
         let held = store
             .budgets
             .get_mut(&(input.account_id.clone(), input.budget_name.clone()))
@@ -219,6 +223,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )),
                 })
             })?;
+
+        // Work this service started and has not settled yet: the resource is locked
+        // against this method until it does, which is what `ResourceLockedException`
+        // reports ("the server rejected that particular method for the requested
+        // resource"). Refused before anything is written, so the in-flight work keeps
+        // the members it was started with.
+        if crate::state::action_is_in_progress(&held.action.status) {
+            return Err(UpdateBudgetActionErrorModeled::ResourceLockedException(
+                ResourceLockedException {
+                    message: Some(format!(
+                        "Unable to update budget action: {} - the action is {} and cannot \
+                         be updated until that completes.",
+                        input.action_id, held.action.status
+                    )),
+                },
+            )
+            .into());
+        }
 
         let old_action = held.action.clone();
         // `ActionType` is not an input of this operation, so the action keeps the type it

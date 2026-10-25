@@ -1072,7 +1072,7 @@ fn imported_method_responses(operation: &Node) -> BTreeMap<String, GetMethodResp
         .and_then(Node::entries)
         .unwrap_or_default()
     {
-        if !is_status_code(code) {
+        if !crate::state::is_status_code(code) {
             continue;
         }
         let headers: ::std::collections::HashMap<String, bool> = response
@@ -1094,14 +1094,6 @@ fn imported_method_responses(operation: &Node) -> BTreeMap<String, GetMethodResp
         );
     }
     responses
-}
-
-/// Whether `code` is an HTTP status code, as a `MethodResponse`'s `statusCode` is
-/// constrained to be (`^[1-5]\d\d$`).
-fn is_status_code(code: &str) -> bool {
-    code.len() == 3
-        && code.starts_with(['1', '2', '3', '4', '5'])
-        && code.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// The `Integration` an operation's [`INTEGRATION_EXTENSION`] becomes, with every pseudo

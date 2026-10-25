@@ -176,7 +176,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         state.materialize_due(now);
 
-        let Some(team) = state.team(&input.arn) else {
+        // The team record is taken as a snapshot, so the session this handler mints —
+        // which borrows the store mutably for the next session id — does not overlap the
+        // borrow of the team it is minted for.
+        let Some(team) = state.team(&input.arn).cloned() else {
             // The one message this service answers every resource lookup that resolves
             // to nothing with (`crate::state::resource_not_found`).
             return Err(
@@ -255,18 +258,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        // A session is minted FOR the team, so it takes the region off the team's own ARN
-        // rather than off this request; a team whose ARN carries no region segment this
-        // grammar accepts falls back to the region the request was signed for.
-        let team_arn = team.arn.clone();
-        let team_name = team.name.clone();
-        let approval_strategy = team.approval_strategy;
-        let requester_region = crate::state::request_region(ctx.parts());
-        let region = crate::state::arn_region(&team_arn)
-            .map_or_else(|| requester_region.clone(), ToString::to_string);
-
         // The store is bounded, so a caller looping on this operation cannot grow this
-        // process's memory without end (`crate::state::MAX_SESSIONS`).
+        // process's memory without end (`crate::state::MAX_SESSIONS`). This operation
+        // declares no quota error, so the ceiling is reported with the
+        // `ValidationException` (400) it does declare.
         if state.sessions.len() >= crate::state::MAX_SESSIONS {
             return Err(StartApprovalTeamBaselineErrorModeled::ValidationException(
                 ValidationException {
@@ -280,8 +275,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let seq = state.next_session_seq();
-        let arn = crate::state::session_arn(&region, &team_name, seq);
-        let Some(expiration_time) = now.checked_add(crate::state::SESSION_EXPIRATION) else {
+        // The one constructor every session of this service is built by
+        // (`crate::state::Session::for_team`), so the baseline session and the update
+        // session `UpdateApprovalTeam` starts differ only in their kind and their
+        // approvers.
+        let Some(session) = crate::state::Session::for_team(
+            crate::state::SessionKind::Baseline,
+            &team,
+            approvers,
+            crate::state::request_region(ctx.parts()),
+            now,
+            seq,
+        ) else {
             return Err(
                 StartApprovalTeamBaselineErrorModeled::InternalServerException(
                     InternalServerException {
@@ -292,45 +297,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let session = crate::state::Session {
-            arn: arn.clone(),
-            kind: crate::state::SessionKind::Baseline,
-            approval_team_arn: team_arn.clone(),
-            approval_team_name: team_name,
-            approval_strategy,
-            approvers,
-            // The resource the approved action acts on is the approval team itself.
-            protected_resource_arn: team_arn,
-            // A session is reported `CREATING` until its activation comes due, the
-            // non-terminal status `SessionStatus` declares for one.
-            status: crate::state::SessionStatus::Creating,
-            status_code: None,
-            status_message: None,
-            // This emulator executes no protected operation, so nothing has run and
-            // nothing has failed: the execution is `PENDING` for as long as the session
-            // exists.
-            execution_status: crate::state::SessionExecutionStatus::Pending,
-            // The only strategy `ActionCompletionStrategy` declares.
-            action_completion_strategy:
-                crate::state::ActionCompletionStrategy::AutoCompletionUponApproval,
-            // Nothing in this request names an additional security requirement, so the
-            // session applies none.
-            additional_security_requirements: Vec::new(),
-            requester_service_principal: crate::state::SERVICE_PRINCIPAL.to_string(),
-            requester_principal_arn: crate::state::caller_identity_arn(),
-            requester_account_id: crate::state::caller_account_id().to_string(),
-            requester_region,
-            // `RequesterComment` and `Description` are what a requester supplies, and
-            // this operation's input carries neither.
-            requester_comment: None,
-            description: None,
-            metadata: ::std::collections::BTreeMap::new(),
-            initiation_time: now,
-            expiration_time,
-            completion_time: None,
-            activation_due: now.checked_add(crate::state::SESSION_ACTIVATION_DELAY),
-            seq,
-        };
+        let arn = session.arn.clone();
         state.insert_session(session);
 
         // Read the answer back out of the store, so the response can only ever name a

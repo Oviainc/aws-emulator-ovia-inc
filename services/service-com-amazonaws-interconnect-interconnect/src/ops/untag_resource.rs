@@ -67,14 +67,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-interconnect-interconne
 #[smithy_macros::operation_error(
     "com.amazonaws.interconnect#UntagResource",
     extra_errors = [
-        "ResourceNotFoundException",
+        "InterconnectClientException",
         "InterconnectValidationException",
         "InterconnectServerException",
     ]
 )]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
-    ResourceNotFoundException(ResourceNotFoundException),
+    InterconnectClientException(InterconnectClientException),
     InterconnectValidationException(InterconnectValidationException),
     InterconnectServerException(InterconnectServerException),
 }
@@ -131,8 +131,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// request lists and keeps every other key with its value. A key the resource
     /// does not carry is removed from nothing, so the call is idempotent: repeating
     /// it, or naming a key that was never applied, succeeds and changes nothing.
-    /// An `arn` that names no resource of this service is a 404 — untagging never
-    /// brings a resource into existence. A key in the namespace AWS reserves for its
+    /// An `arn` that names no resource of this service is refused — untagging never
+    /// brings a resource into existence — and the two ways it can name none are
+    /// refused with DIFFERENT codes: an ARN outside the scope the request addresses
+    /// is a fault in the request, while an in-scope ARN that names nothing is this
+    /// service's own client fault. A key in the namespace AWS reserves for its
     /// own system tags is not the caller's to remove, so a request naming one is
     /// refused on the input and the tag set is left exactly as it was.
     async fn handle(
@@ -140,7 +143,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UntagResourceErrorModeled::InterconnectServerException(
                 InterconnectServerException {
@@ -156,11 +158,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // allows: the ARN carries the `ConnectionId` of the connection whose tags
         // these are. An ARN the boundary validator let through that still does not
         // parse as one is refused as invalid INPUT, never with a 501.
-        if crate::state::connection_id_from_arn(&input.arn).is_none() {
+        let Some(parsed) = crate::state::parse_connection_arn(&input.arn) else {
             return Err(UntagResourceErrorModeled::InterconnectValidationException(
                 InterconnectValidationException {
                     message: crate::state::not_a_connection_arn_message(&input.arn),
                 },
+            )
+            .into());
+        };
+
+        // An ARN identifies its resource in FULL, so one whose partition, Region or
+        // account is not the one this request addresses names a resource outside the
+        // scope the caller is talking to — a fault in the REQUEST, refused as
+        // invalid input, and a DIFFERENT code from an in-scope ARN that merely names
+        // nothing (below), which is what lets a caller tell "wrong account" from "no
+        // such resource".
+        if let Some(message) =
+            crate::state::arn_scope_violation(&parsed, &crate::state::request_region(ctx))
+        {
+            return Err(UntagResourceErrorModeled::InterconnectValidationException(
+                InterconnectValidationException { message },
             )
             .into());
         }
@@ -187,11 +204,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.materialise_due_transitions(::std::time::Instant::now());
 
         // The same ARN resolution every tagging operation uses: full-ARN match, and
-        // a connection in the terminal deleted state no longer has a tag set.
+        // a connection in the terminal deleted state no longer has a tag set. In
+        // scope and well-formed but naming no connection this account holds is this
+        // service's own CLIENT fault, the modelled 400, not a 404.
         let Some(stored) = guard.connection_by_arn_mut(&input.arn) else {
-            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::connection_not_retrievable_message(&input.arn)),
+            return Err(UntagResourceErrorModeled::InterconnectClientException(
+                InterconnectClientException {
+                    message: crate::state::connection_not_retrievable_message(&input.arn),
                 },
             )
             .into());

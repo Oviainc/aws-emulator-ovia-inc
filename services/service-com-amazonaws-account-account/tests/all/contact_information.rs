@@ -444,8 +444,8 @@ async fn a_stored_contact_information_round_trips_member_for_member() {
 }
 
 /// The stored contact is keyed by the RESOLVED account: a request that names no
-/// `AccountId` and one that names the caller's own id land on the same record,
-/// and another 12-digit id is a record of its own.
+/// `AccountId` lands on the caller's own record, another 12-digit id is a record
+/// of its own, and naming the caller's own id is refused rather than resolved.
 #[tokio::test]
 async fn the_stored_contact_is_keyed_by_the_resolved_account() {
     let own = default_account_id().to_string();
@@ -483,14 +483,10 @@ async fn the_stored_contact_is_keyed_by_the_resolved_account() {
         put.status, put.body
     );
 
-    // Each account reports its own contact, by either way of naming it.
+    // Each account reports its own contact, reached the one way that account can
+    // be named.
     for (case, request, expected) in [
         ("the caller's own account, unnamed", json!({}), &implicit),
-        (
-            "the caller's own account, named explicitly",
-            json!({"AccountId": own}),
-            &implicit,
-        ),
         (
             "another account in the organization",
             json!({"AccountId": other}),
@@ -501,23 +497,37 @@ async fn the_stored_contact_is_keyed_by_the_resolved_account() {
         assert_contact_information_matches(case, expected, &answer);
     }
 
-    // Writing through the explicit id lands on the SAME record as the implicit
-    // one: one account, one primary contact.
+    // Naming the caller's own id is refused on both the read and the write, and
+    // the refused write left the record it could not target untouched.
     let rewritten = contact_for("Rewritten");
-    let put = put_contact_information(
-        &router,
-        json!({"AccountId": own, "ContactInformation": rewritten}),
-    )
-    .await;
-    assert_eq!(
-        put.status, 200,
-        "case \"explicit own AccountId\": PutContactInformation must answer 200, got {} \
-         with {:?}",
-        put.status, put.body
-    );
+    for (case, uri, request) in [
+        (
+            "GetContactInformation naming the caller's own id",
+            "/getContactInformation",
+            json!({"AccountId": own}),
+        ),
+        (
+            "PutContactInformation naming the caller's own id",
+            "/putContactInformation",
+            json!({"AccountId": own, "ContactInformation": rewritten}),
+        ),
+    ] {
+        let answer = call(&router, uri, request).await;
+        assert_eq!(
+            (answer.status, answer.error_code()),
+            (403, "AccessDeniedException"),
+            "case {case:?}: expected the 403 refusal, got {} with {:?}",
+            answer.status,
+            answer.body
+        );
+    }
     let answer = get_contact_information(&router, json!({})).await;
-    assert_contact_information_matches("a rewrite through the explicit own id", &rewritten, &answer);
-    // And it left the other account's record alone.
+    assert_contact_information_matches(
+        "the caller's own account after the refused rewrite",
+        &implicit,
+        &answer,
+    );
+    // And the other account's record is untouched too.
     let answer = get_contact_information(&router, json!({"AccountId": other})).await;
     assert_contact_information_matches("the untouched other account", &named, &answer);
 }
@@ -562,18 +572,11 @@ async fn a_read_of_an_account_with_no_record_is_refused() {
 /// often it is repeated.
 #[tokio::test]
 async fn an_account_reports_a_primary_contact_before_any_put() {
-    let own = default_account_id().to_string();
-
     // (case, the call that brings the record into existence — none for the
     // caller's own account, which the store comes up holding — the read)
     type Row = (&'static str, Option<(&'static str, Value)>, Value);
     let cases: Vec<Row> = vec![
         ("the caller's own account, unnamed", None, json!({})),
-        (
-            "the caller's own account, named explicitly",
-            None,
-            json!({"AccountId": own}),
-        ),
         (
             "an account created by PutAccountName",
             Some((

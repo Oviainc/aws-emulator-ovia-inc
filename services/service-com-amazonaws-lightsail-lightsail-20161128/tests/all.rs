@@ -33,6 +33,8 @@ mod bundle_catalog;
 mod contact_method_notifications;
 #[path = "all/container_image_registry.rs"]
 mod container_image_registry;
+#[path = "all/container_image_registry_login.rs"]
+mod container_image_registry_login;
 #[path = "all/container_service_lifecycle.rs"]
 mod container_service_lifecycle;
 #[path = "all/container_service_metric_data.rs"]
@@ -91,6 +93,8 @@ mod instance_reboot;
 mod instance_restore_from_snapshot;
 #[path = "all/instance_snapshot_listing.rs"]
 mod instance_snapshot_listing;
+#[path = "all/instance_snapshot_read.rs"]
+mod instance_snapshot_read;
 #[path = "all/load_balancer_delete.rs"]
 mod load_balancer_delete;
 #[path = "all/load_balancer_instance_attachment.rs"]
