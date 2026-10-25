@@ -21,6 +21,8 @@ mod error_classification;
 mod error_envelope;
 #[path = "all/hosted_zone_config.rs"]
 mod hosted_zone_config;
+#[path = "all/hosted_zone_count.rs"]
+mod hosted_zone_count;
 #[path = "all/hosted_zone_records.rs"]
 mod hosted_zone_records;
 #[path = "all/hosted_zones_by_vpc.rs"]

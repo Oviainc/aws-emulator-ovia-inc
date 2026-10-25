@@ -2602,9 +2602,9 @@ pub const ROUTER_OUTPUT_TYPE_MEDIALIVE_INPUT: &str = "MEDIALIVE_INPUT";
 
 /// The `RouterNetworkInterfaceState` enum the model declares for a router network
 /// interface (`smithy_query(query="shape",shape="RouterNetworkInterfaceState")`: CREATING |
-/// ACTIVE | UPDATING | DELETING | ERROR | RECOVERING). Only the three a network interface's
-/// creation and update reach are named here; the rest belong to operations that are still
-/// scaffolded.
+/// ACTIVE | UPDATING | DELETING | ERROR | RECOVERING). Only the four a network interface's
+/// creation, update and deletion reach are named here; the rest belong to operations that
+/// are still scaffolded.
 pub const ROUTER_NETWORK_INTERFACE_STATE_CREATING: &str = "CREATING";
 /// See [`ROUTER_NETWORK_INTERFACE_STATE_CREATING`]. A network interface that finished being
 /// created is usable: unlike a router input or output there is no start call for one, so
@@ -2616,6 +2616,12 @@ pub const ROUTER_NETWORK_INTERFACE_STATE_ACTIVE: &str = "ACTIVE";
 /// operation="UpdateRouterNetworkInterface")`); the clock settles it back into
 /// [`ROUTER_NETWORK_INTERFACE_STATE_ACTIVE`] one [`TRANSITION_SPAN`] later.
 pub const ROUTER_NETWORK_INTERFACE_STATE_UPDATING: &str = "UPDATING";
+/// See [`ROUTER_NETWORK_INTERFACE_STATE_CREATING`]. The non-terminal state an interface is
+/// answered in while an accepted DeleteRouterNetworkInterface is being carried out; the
+/// enum carries no terminal deleted value, so the clock completes the deletion by taking
+/// the record out of the store (see
+/// [`StoredRouterNetworkInterface::removal_due_at`]).
+pub const ROUTER_NETWORK_INTERFACE_STATE_DELETING: &str = "DELETING";
 
 /// The `RouterNetworkInterfaceType` enum the model declares
 /// (`smithy_query(query="shape",shape="RouterNetworkInterfaceType")`: PUBLIC | VPC). Like a
@@ -3753,6 +3759,17 @@ pub struct StoredRouterNetworkInterface {
     /// When this record was last changed. An accepted UpdateRouterNetworkInterface that
     /// changes a member moves it; a read never moves it.
     pub updated_at: SystemTime,
+    /// When the record stops existing, or `None` while the interface is not being deleted.
+    ///
+    /// A router network interface delete is a HARD delete, for the same reason a router
+    /// input's and a router output's are: `RouterNetworkInterfaceState` declares no terminal
+    /// deleted value (see [`ROUTER_NETWORK_INTERFACE_STATE_DELETING`]). So this is the
+    /// instant the deletion the call accepted becomes complete: until then the interface is
+    /// readable in `DELETING` and a repeated delete answers the same thing, and from then on
+    /// the store no longer holds it. The removal is owed at this instant whether or not
+    /// anybody calls, which is why a reporting operation may materialise it
+    /// ([`ComAmazonawsMediaconnectMediaconnectState::settle_due_transitions`]).
+    pub removal_due_at: Option<SystemTime>,
 }
 
 impl StoredRouterNetworkInterface {
@@ -3786,9 +3803,37 @@ impl StoredRouterNetworkInterface {
     /// Whether a state change is in flight for this interface: the clock still owes it one,
     /// so the interface is between two states rather than settled in one — the same reading
     /// as [`StoredRouterInput::is_transitioning`], which is what an operation that MOVES the
-    /// state (UpdateRouterNetworkInterface) refuses on.
+    /// state (UpdateRouterNetworkInterface) refuses on. It includes the deletion the clock
+    /// owes once DeleteRouterNetworkInterface has accepted one, because an interface on its
+    /// way out is not an interface a later call can still act on.
     pub fn is_transitioning(&self) -> bool {
-        self.pending.is_some()
+        self.pending.is_some() || self.is_deleting()
+    }
+
+    /// Whether this interface is already on its way out: DeleteRouterNetworkInterface
+    /// accepted a delete for it, so a repeat of that `@idempotent` call answers the same
+    /// response rather than restarting the deletion. See [`Self::removal_due_at`].
+    pub fn is_deleting(&self) -> bool {
+        self.removal_due_at.is_some()
+    }
+
+    /// Whether the clock has made this interface's removal due at `now` — the same spelling
+    /// [`StoredRouterInput::is_removal_due`] and [`StoredRouterOutput::is_removal_due`] use,
+    /// so every record type is settled by one rule in
+    /// [`ComAmazonawsMediaconnectMediaconnectState::settle_due_transitions`].
+    pub fn is_removal_due(&self, now: SystemTime) -> bool {
+        self.removal_due_at.is_some_and(|due_at| now >= due_at)
+    }
+
+    /// Enter `DELETING` now and owe the record's removal once [`TRANSITION_SPAN`] has
+    /// passed — the deletion counterpart of [`Self::begin_transition`], which owes a STATE
+    /// instead. The delete supersedes whatever state change was owed before it: an interface
+    /// on its way out does not settle into `ACTIVE` on the way.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        self.state = ROUTER_NETWORK_INTERFACE_STATE_DELETING.to_string();
+        self.pending = None;
+        self.removal_due_at = Some(now + TRANSITION_SPAN);
+        self.updated_at = now;
     }
 
     /// `RouterNetworkInterface$NetworkInterfaceType`, the variant of the interface's
@@ -4120,9 +4165,10 @@ impl ComAmazonawsMediaconnectMediaconnectState {
             .collect()
     }
 
-    /// Settle every flow, gateway, bridge, router input and router output whose status
-    /// change the clock already made due, and materialise the removal of every router input
-    /// and router output whose deletion has come due.
+    /// Settle every flow, gateway, bridge, router input, router output and router network
+    /// interface whose status change the clock already made due, and materialise the removal
+    /// of every router input, router output and router network interface whose deletion has
+    /// come due.
     pub fn settle_due_transitions(&mut self, now: SystemTime) {
         for flow in self.flows.values_mut() {
             flow.settle(now);
@@ -4148,15 +4194,19 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         for reservation in self.reservations.values_mut() {
             reservation.settle(now);
         }
-        // A router input or router output whose removal the clock has made due stops
-        // existing: the deletion was owed at that instant whether or not anybody called,
-        // and neither `RouterInputState` nor `RouterOutputState` declares a terminal state
-        // the record could be reported in afterwards (see
-        // [`StoredRouterInput::removal_due_at`] and [`StoredRouterOutput::removal_due_at`]).
+        // A router input, router output or router network interface whose removal the clock
+        // has made due stops existing: the deletion was owed at that instant whether or not
+        // anybody called, and none of `RouterInputState`, `RouterOutputState` and
+        // `RouterNetworkInterfaceState` declares a terminal state the record could be
+        // reported in afterwards (see [`StoredRouterInput::removal_due_at`],
+        // [`StoredRouterOutput::removal_due_at`] and
+        // [`StoredRouterNetworkInterface::removal_due_at`]).
         self.router_inputs
             .retain(|_, router_input| !router_input.is_removal_due(now));
         self.router_outputs
             .retain(|_, router_output| !router_output.is_removal_due(now));
+        self.router_network_interfaces
+            .retain(|_, interface| !interface.is_removal_due(now));
     }
 
     /// The router input `arn` addresses, with everything the clock already made due

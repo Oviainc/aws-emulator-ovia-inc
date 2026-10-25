@@ -291,7 +291,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::TokenOutcome::Replay(_) => {
                 return match guard.rules.get(&input.rule_arn) {
                     Some(rule) => Ok(output_for(rule)),
-                    None => Err(not_found()),
+                    None => Err(not_found(&input.rule_arn)),
                 };
             }
             crate::state::TokenOutcome::ParameterMismatch => {
@@ -317,7 +317,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let Some(rule) = guard.rules.get(&input.rule_arn) else {
-            return Err(not_found());
+            return Err(not_found(&input.rule_arn));
         };
         // `ruleRevision` is the rule's optimistic-concurrency token: an update
         // carrying a revision other than the stored one is refused rather than
@@ -346,7 +346,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let updated_at = crate::state::now();
         let Some(rule) = guard.rules.get_mut(&input.rule_arn) else {
-            return Err(not_found());
+            return Err(not_found(&input.rule_arn));
         };
         // Only the members the request carries are applied; an absent member
         // leaves the stored value alone.
@@ -392,7 +392,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reader sees.
         match guard.rules.get(&input.rule_arn) {
             Some(rule) => Ok(output_for(rule)),
-            None => Err(not_found()),
+            None => Err(not_found(&input.rule_arn)),
         }
     }
 }
@@ -418,11 +418,13 @@ fn output_for(rule: &crate::state::StoredRule) -> UpdateAutomationRuleOutput {
     }
 }
 
-/// The 404 for an ARN no rule has. The message is the service's fixed
-/// not-found wording, which names no resource.
-fn not_found() -> UpdateAutomationRuleError {
+/// The 404 for an ARN no rule has. An update is a MUTATION of the rule the
+/// request names, so the message NAMES that ARN
+/// ([`crate::state::rule_not_found_message`]); the fixed sentence that names no
+/// resource is the wording a read answers with.
+fn not_found(rule_arn: &str) -> UpdateAutomationRuleError {
     UpdateAutomationRuleErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+        message: Some(crate::state::rule_not_found_message(rule_arn)),
     })
     .into()
 }

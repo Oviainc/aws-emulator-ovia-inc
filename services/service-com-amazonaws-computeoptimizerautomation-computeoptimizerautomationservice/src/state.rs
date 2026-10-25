@@ -439,12 +439,28 @@ pub fn fingerprint<T: std::fmt::Debug>(value: &T) -> String {
 //   failed, the current revision, the values that are settable).
 // ---------------------------------------------------------------------------
 
-/// The message every `ResourceNotFoundException` of this service carries.
+/// The message a REPORTING operation's `ResourceNotFoundException` carries.
 ///
-/// FIXED and resource-independent: the error reports that the resource the
-/// request named is not there, and names neither the ARN nor the id, so a
-/// not-found body never echoes a resource identifier back to its caller.
+/// FIXED and resource-independent: a read reports that the resource the request
+/// named is not there, and names neither the ARN nor the id, so the body of a
+/// read's not-found echoes no resource identifier back to its caller. The
+/// service words a MUTATION's not-found the other way round — see
+/// [`rule_not_found_message`].
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The specified resource could not be found";
+
+/// The `ResourceNotFoundException` message for a MUTATION whose target rule the
+/// store does not hold.
+///
+/// A mutation of an automation rule names the `RuleArn` it was sent, because
+/// that is the one fact a caller retrying or batching mutations needs to tell
+/// WHICH of its targets is gone; a read of the same rule answers the fixed
+/// sentence ([`RESOURCE_NOT_FOUND_MESSAGE`]) instead. Every operation that
+/// changes a rule through its ARN — the rule's update and delete, and the tag
+/// addition and removal that target the same ARN — words its 404 here, so the
+/// mutation side of that split is worded in ONE place.
+pub fn rule_not_found_message(rule_arn: &str) -> String {
+    format!("Rule with ARN {rule_arn} does not exist")
+}
 
 /// The message every `OptInRequiredException` of this service carries.
 ///

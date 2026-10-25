@@ -14,7 +14,7 @@
 //! [`ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE`], which every operation of that surface asks
 //! before looking anything up.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use ::aws_smithy_types::DateTime;
@@ -517,6 +517,112 @@ pub fn region_ceiling_message(instance_arn: &str) -> String {
          created: this emulator holds at most {MAX_REGIONS_PER_INSTANCE} Regions per \
          instance, and {instance_arn} already holds that many"
     )
+}
+
+/// The maximum number of TAGS this emulator keeps on any ONE taggable resource (an
+/// instance, a permission set, an application or a trusted token issuer).
+///
+/// Taken from the model rather than chosen: `TagList` — the shape of both
+/// `TagResource$Tags` and `ListTagsForResource$Tags` — is declared `length(min: 0,
+/// max: 75)`, so a resource that held more tags than this could not be reported by the
+/// read at all. It doubles as the per-resource memory ceiling: a stored tag lives until
+/// a caller removes it, and a write that would push a resource past it is refused with
+/// the modelled `ServiceQuotaExceededException`.
+pub const MAX_TAGS_PER_RESOURCE: usize = 75;
+
+/// The message a tagging write refuses with once a resource would carry more than
+/// [`MAX_TAGS_PER_RESOURCE`] distinct keys; built from the request, which names the
+/// resource the ceiling was reached on, and worded as the modelled
+/// `ServiceQuotaExceededException` describes itself ("the principal has crossed the
+/// permitted number of resources that can be created").
+pub fn tag_ceiling_message(resource_arn: &str) -> String {
+    format!(
+        "The principal has crossed the permitted number of resources that can be \
+         created: a resource carries at most {MAX_TAGS_PER_RESOURCE} tags, and \
+         {resource_arn} cannot carry the requested ones as well"
+    )
+}
+
+/// The refusal a `ResourceArn` this account holds no TAGGABLE resource for earns, as the
+/// message of the modelled `ResourceNotFoundException`.
+///
+/// Built from the request, like [`application_not_found_message`]: it names the ARN that
+/// resolved to nothing. An ARN held under a different instance than the `InstanceArn`
+/// the request carried resolves to nothing too — see
+/// [`ComAmazonawsSsoadminSwbexternalserviceState::taggable_resource_tags`].
+pub fn taggable_resource_not_found_message(resource_arn: &str) -> String {
+    format!("Could not find a taggable resource with arn {resource_arn}.")
+}
+
+/// Merge `requested` into the tag set `stored`, which is what a tagging write composes
+/// with what a resource already carries: a key the resource already holds takes the
+/// requested value in place, a key it does not hold is added, and every other key is
+/// left untouched.
+///
+/// A tag set is keyed by `Tag$Key`, and the model declares no `@uniqueItems` on
+/// `TagList`, so one request may name a key twice — and a create that stored its `Tags`
+/// as the caller sent them may hold a key twice already. The value a key ends up with is
+/// the one written LAST, and a key this merge writes is left holding ONE entry, so the
+/// value stored here is the value [`tags_in_key_order`] reports.
+pub fn merge_tags(stored: &mut Vec<Tag>, requested: &[Tag]) {
+    for tag in requested {
+        let mut written = false;
+        stored.retain_mut(|held| {
+            if held.key != tag.key {
+                return true;
+            }
+            if written {
+                // A second entry for the same key: the set holds one value per key, so
+                // the entry this write just valued is the one that stays.
+                return false;
+            }
+            held.value = tag.value.clone();
+            written = true;
+            true
+        });
+        if !written {
+            stored.push(tag.clone());
+        }
+    }
+}
+
+/// How many DISTINCT keys `stored` would hold once `requested` had been merged into it
+/// ([`merge_tags`]).
+///
+/// What [`MAX_TAGS_PER_RESOURCE`] is judged against, so overwriting the value of a key a
+/// resource already carries never crosses the ceiling: it adds no tag.
+pub fn merged_tag_count(stored: &[Tag], requested: &[Tag]) -> usize {
+    let keys: BTreeSet<&str> = stored
+        .iter()
+        .chain(requested)
+        .map(|tag| tag.key.as_str())
+        .collect();
+    keys.len()
+}
+
+/// The tag set `tags` as the `(page key, item)` pairs [`page`] enumerates: one entry per
+/// distinct `Tag$Key`, in key order.
+///
+/// The KEY is both the page key and the identity of a tag, so the enumeration order is
+/// stable across calls however the tags were written, and a pagination cursor resumes
+/// after a key rather than after a position a later write would shift.
+pub fn tags_in_key_order(tags: &[Tag]) -> Vec<(String, Tag)> {
+    let ordered: BTreeMap<&str, &str> = tags
+        .iter()
+        .map(|tag| (tag.key.as_str(), tag.value.as_str()))
+        .collect();
+    ordered
+        .into_iter()
+        .map(|(key, value)| {
+            (
+                key.to_string(),
+                Tag {
+                    key: key.to_string(),
+                    value: value.to_string(),
+                },
+            )
+        })
+        .collect()
 }
 
 /// The `AuthenticationMethodType` an [`AuthenticationMethod`] union value carries.
@@ -2020,6 +2126,70 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         })
     }
 
+    /// The TAGGABLE resource `resource_arn` names: the ARN of the instance it belongs to
+    /// (itself, for an instance) and the tag set it carries.
+    ///
+    /// The model's `TaggableResourceArn` admits four kinds of resource — an instance, a
+    /// permission set, an application and a trusted token issuer — and each is stored
+    /// under its own ARN, so the ARN alone says which record carries the tags. `None` for
+    /// an ARN this account holds no resource under, including one whose instance has
+    /// since gone (an instance holds its resources, see [`Self::remove_instance`]).
+    fn taggable_resource(&self, resource_arn: &str) -> Option<(&str, &Vec<Tag>)> {
+        if let Some(instance) = self.instances.get(resource_arn) {
+            return Some((instance.instance_arn.as_str(), &instance.tags));
+        }
+        if let Some(record) = self.permission_sets.get(resource_arn) {
+            return Some((record.instance_arn.as_str(), &record.tags));
+        }
+        if let Some(record) = self.applications.get(resource_arn) {
+            return Some((record.instance_arn.as_str(), &record.tags));
+        }
+        self.trusted_token_issuers
+            .get(resource_arn)
+            .map(|record| (record.instance_arn.as_str(), &record.tags))
+    }
+
+    /// The tags the taggable resource `resource_arn` names carries, for an operation that
+    /// REPORTS them.
+    ///
+    /// `instance_arn` is the request's optional `InstanceArn`: when a caller sends one, a
+    /// resource held under a DIFFERENT instance is as absent here as one that was never
+    /// created — the same rule [`Self::permission_set`] resolves a permission set by — so
+    /// the read and the write below never disagree about which resource an ARN names.
+    pub fn taggable_resource_tags(
+        &self,
+        instance_arn: Option<&str>,
+        resource_arn: &str,
+    ) -> Option<&Vec<Tag>> {
+        let (owner, tags) = self.taggable_resource(resource_arn)?;
+        instance_arn.is_none_or(|arn| arn == owner).then_some(tags)
+    }
+
+    /// The same tag set, for an operation that CHANGES it. Resolves exactly as
+    /// [`Self::taggable_resource_tags`].
+    pub fn taggable_resource_tags_mut(
+        &mut self,
+        instance_arn: Option<&str>,
+        resource_arn: &str,
+    ) -> Option<&mut Vec<Tag>> {
+        let owner = self.taggable_resource(resource_arn)?.0.to_string();
+        if instance_arn.is_some_and(|arn| arn != owner) {
+            return None;
+        }
+        if let Some(instance) = self.instances.get_mut(resource_arn) {
+            return Some(&mut instance.tags);
+        }
+        if let Some(record) = self.permission_sets.get_mut(resource_arn) {
+            return Some(&mut record.tags);
+        }
+        if let Some(record) = self.applications.get_mut(resource_arn) {
+            return Some(&mut record.tags);
+        }
+        self.trusted_token_issuers
+            .get_mut(resource_arn)
+            .map(|record| &mut record.tags)
+    }
+
     /// Store the status of one assignment deletion, evicting the OLDEST records while
     /// the history is over [`MAX_RECORDS_PER_STORE`].
     ///
@@ -2855,6 +3025,12 @@ pub fn cursor_permission_sets(instance_arn: &str) -> String {
 /// instance that permission set belongs to (the same pair the read resolves against).
 pub fn cursor_managed_policies(instance_arn: &str, permission_set_arn: &str) -> String {
     format!("managedPolicies|{instance_arn}|{permission_set_arn}")
+}
+
+/// Cursor scope of a `ListTagsForResource` enumeration: the operation and the resource
+/// whose tags it walks, which is the whole filter that selected the rows.
+pub fn cursor_tags(resource_arn: &str) -> String {
+    format!("tags|{resource_arn}")
 }
 
 /// Cursor scope of a `ListAccountAssignments` enumeration: the operation and the whole

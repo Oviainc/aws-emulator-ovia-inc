@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateNodeState
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateNodeState`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateNodeState::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Update the state of a node: the node this request names is put into the
+//! state the request asks for — `ACTIVE` to commission it ("Set to ACTIVE
+//! (COMMISSIONED) to indicate that the Node is deployable") or `DRAINING` to
+//! isolate it ("Set to DRAINING to isolate the Node so that MediaLive Anywhere
+//! won't use it") — and reported back out of the store.
+//!
+//! `State` is OPTIONAL and the model documents no default for it
+//! (`smithy_query(query="operation", operation="UpdateNodeState")`), so a
+//! request that names none changes nothing and still answers with the stored
+//! node. Both values the member accepts are `NodeState` values a node STAYS in
+//! until something asks for another, so the node is in the asked-for state as of
+//! this call and the clock owes nothing after it.
+//!
+//! The lookup, the write and the projection all live in the node slice
+//! ([`crate::state::ComAmazonawsMedialiveMedialiveState::apply_node_state`]), so
+//! this handler only turns a [`crate::state::NodeStateRefusal`] into one of this
+//! operation's modelled errors and reports the node the slice read back.
 //!
 //! ## Shape of an operation
 //!
@@ -115,7 +124,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-medialive-medialive.jso
 // here — hence the `UpdateNodeStateError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.medialive#UpdateNodeState")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.medialive#UpdateNodeState",
+    // `NotFoundException` is a shape the SERVICE models, and one `DescribeNode`
+    // and `DeleteNode` declare for this very resource, which this operation's
+    // error list omits: a cluster/node pair that names no node names nothing to
+    // update, so this operation needs that error to say what the reader and the
+    // delete of the same node say.
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum UpdateNodeStateErrorModeled {
     BadGatewayException(BadGatewayException),
@@ -124,6 +141,7 @@ pub enum UpdateNodeStateErrorModeled {
     ForbiddenException(ForbiddenException),
     GatewayTimeoutException(GatewayTimeoutException),
     InternalServerErrorException(InternalServerErrorException),
+    NotFoundException(NotFoundException),
     TooManyRequestsException(TooManyRequestsException),
     UnprocessableEntityException(UnprocessableEntityException),
 }
@@ -172,6 +190,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UpdateNodeState";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UPDATE_NODE_STATE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UPDATE_NODE_STATE_OUTPUT_SCHEMA;
+    // The model's own `@http` code, kept (`smithy_query(query="operation",
+    // operation="UpdateNodeState")`: code 201), which is what every other node
+    // operation that answers synchronously in this service uses.
     const SUCCESS_STATUS: u16 = 201u16;
 
     async fn handle(
@@ -179,18 +200,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateNodeState` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateNodeStateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        // Clock-owed work first, as every operation of this service does: it
+        // materialises only what the clock had already made due, so a node whose
+        // deregistration has come due is already in its terminal state when the
+        // write below resolves it.
+        state.settle(now);
+
+        // The node slice owns the "both ids have to match" rule (`Id` is "Unique
+        // in the Cluster"), the refusal for a node whose delete has been
+        // accepted, and the read-back, so the response reports the state that
+        // was STORED rather than the one this request asked for.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateNodeState"))
+        // A value `State` carries is one of `UpdateNodeStateShape`'s: the member
+        // targets an `enum` shape, whose membership the request boundary
+        // enforces before this handler runs, so reaching here means the value is
+        // one the node can be in.
+        let node = state
+            .apply_node_state(&input.cluster_id, &input.node_id, input.state.as_deref())
+            .map_err(|refusal| refused(refusal, &input.node_id))?;
+
+        Ok(crate::state::node_description_output!(
+            UpdateNodeStateOutput,
+            node
+        ))
     }
+}
+
+/// One [`crate::state::NodeStateRefusal`] as this operation's own modelled
+/// error.
+///
+/// A cluster/node pair that names no node — and a node whose deregistration has
+/// already been accepted, which names no node a caller may still change — leaves
+/// nothing to update: `NotFoundException` (404), the error `DescribeNode` and
+/// `DeleteNode` answer for the same node, with the wording this service uses for
+/// an id that is not there and the one it uses for an id whose delete it took.
+fn refused(refusal: crate::state::NodeStateRefusal, node_id: &str) -> UpdateNodeStateError {
+    match refusal {
+        crate::state::NodeStateRefusal::NoSuchNode => {
+            UpdateNodeStateErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message("Node", node_id)),
+            })
+        }
+        crate::state::NodeStateRefusal::DeleteAccepted => {
+            UpdateNodeStateErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::already_deleted_message(&format!(
+                    "Node {node_id}"
+                ))),
+            })
+        }
+    }
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no node store to update. A modelled server error, never a fresh
+/// engine (which would drop the write when this request returns).
+fn unavailable() -> UpdateNodeStateError {
+    UpdateNodeStateErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

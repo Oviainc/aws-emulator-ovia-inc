@@ -218,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::TokenOutcome::Replay(_) => {
                 return match guard.rules.get(&input.resource_arn) {
                     Some(_) => Ok(TagResourceOutput {}),
-                    None => Err(not_found()),
+                    None => Err(not_found(&input.resource_arn)),
                 };
             }
             crate::state::TokenOutcome::ParameterMismatch => {
@@ -244,7 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let Some(rule) = guard.rules.get(&input.resource_arn) else {
-            return Err(not_found());
+            return Err(not_found(&input.resource_arn));
         };
         // "This ensures you're tagging the correct version of the rule": the
         // revision is the rule's optimistic-concurrency token, so a request
@@ -265,7 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let Some(rule) = guard.rules.get_mut(&input.resource_arn) else {
-            return Err(not_found());
+            return Err(not_found(&input.resource_arn));
         };
         // The addition does not advance `ruleRevision`: a repeat of the same
         // request would then fail the revision check above, and the operation is
@@ -300,11 +300,13 @@ fn merge_tags(stored: &[Tag], added: &[Tag]) -> Vec<Tag> {
     merged
 }
 
-/// The modelled 404 (`ResourceNotFoundException`, HTTP 404), worded with this
-/// service's fixed not-found text, which names no resource.
-fn not_found() -> TagResourceError {
+/// The modelled 404 (`ResourceNotFoundException`, HTTP 404). A tag addition is a
+/// MUTATION of the rule the `resourceArn` names, so the message NAMES that ARN
+/// ([`crate::state::rule_not_found_message`]); the fixed sentence that names no
+/// resource is the wording the tag READ answers with.
+fn not_found(resource_arn: &str) -> TagResourceError {
     TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.into()),
+        message: Some(crate::state::rule_not_found_message(resource_arn)),
     })
     .into()
 }

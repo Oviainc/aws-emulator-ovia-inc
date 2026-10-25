@@ -18,7 +18,8 @@
 //!   reviews an increase, so AWS opens none and the request ends `NOT_APPROVED`: no
 //!   `CaseId`, and the quota keeps the value it had.
 //!
-//! `CaseId` stays absent either way: this emulator opens no support case.
+//! `CaseId` stays absent while nothing has opened a case: `CreateSupportCase` is what
+//! opens one for a request that is still awaiting a decision.
 //!
 //! A `ContextId` names the resource the increase is asked for, on a quota AWS
 //! publishes as adjustable per resource: the request is recorded at the `RESOURCE`
@@ -37,7 +38,7 @@
 //!   `IllegalArgumentException` (400);
 //! * a second open request for the same quota AND the same context ->
 //!   `ResourceAlreadyExistsException` (400): one quota plane has at most one request
-//!   awaiting a decision;
+//!   awaiting a decision, whether it is `PENDING` or has a support case processing it;
 //! * a region already holding [`crate::state::MAX_REQUESTS_PER_REGION`] stored
 //!   requests -> `QuotaExceededException` (409): the request store is append-only, so
 //!   it has a ceiling.
@@ -243,8 +244,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .requests_for_quota(&region, &input.service_code, &input.quota_code)
             .into_iter()
             .find(|request| {
-                request.status == crate::state::STATUS_PENDING
-                    // One PLANE of a quota has at most one open request: a pending
+                crate::state::is_open_request_status(&request.status)
+                    // One PLANE of a quota has at most one open request: an open
                     // increase for one resource does not block another resource's.
                     && request.context_id.as_deref() == input.context_id.as_deref()
             });

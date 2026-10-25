@@ -312,6 +312,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: tags.into_iter().collect(),
             messages: ::std::collections::VecDeque::new(),
             handles: ::std::collections::HashMap::new(),
+            deduplication: ::std::collections::BTreeMap::new(),
+            // Nothing has been sequenced yet, so the first message this queue
+            // sequences gets the first sequence number.
+            sequenced: 0,
             created_at: now,
             // Nothing has changed the queue yet, so it was last modified when it was
             // created.

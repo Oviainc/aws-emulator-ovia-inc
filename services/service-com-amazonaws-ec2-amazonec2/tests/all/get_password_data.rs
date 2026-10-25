@@ -37,7 +37,7 @@ use ec2::state::{
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{call, error_code};
+use super::ec2_query::{call, error_code, member};
 
 /// The Region every call here is signed for; it only selects the ec2Query envelope,
 /// since password data carries no Region member.
@@ -102,19 +102,6 @@ fn emulator() -> (MultiServiceRouter, Images) {
     (router, images)
 }
 
-/// The text of the response's immediate `name` child: `None` when the element is absent,
-/// `Some("")` when it is present and empty — the two cases the `timestamp` and
-/// `passwordData` assertions below have to tell apart.
-fn member(body: &str, name: &str) -> Option<String> {
-    let document = roxmltree::Document::parse(body)
-        .unwrap_or_else(|error| panic!("the response body must be XML ({error}): {body}"));
-    document
-        .root_element()
-        .children()
-        .find(|node| node.is_element() && node.tag_name().name() == name)
-        .map(|node| node.text().unwrap_or_default().to_string())
-}
-
 /// Launch one instance from `image_id`, optionally naming a key pair, and answer its id.
 async fn launch(router: &MultiServiceRouter, image_id: &str, key_name: Option<&str>) -> String {
     let mut params = vec![
@@ -131,32 +118,10 @@ async fn launch(router: &MultiServiceRouter, image_id: &str, key_name: Option<&s
         .unwrap_or_else(|| panic!("RunInstances must report the instance it minted: {body}"))
 }
 
-/// The `instanceId`/`instanceState` pair `DescribeInstances` reports for one instance,
-/// as a string the "nothing moved" assertions compare.
+/// The `instanceState` `DescribeInstances` reports for one instance, as the "nothing
+/// moved" assertions compare it — the shared harness's reader, for this suite's Region.
 async fn described_state(router: &MultiServiceRouter, instance_id: &str) -> String {
-    let (status, body) = api(
-        router,
-        "DescribeInstances",
-        &[p("InstanceId.1", instance_id)],
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "DescribeInstances for {instance_id} must succeed, got {status}: {body}"
-    );
-    let document = roxmltree::Document::parse(&body)
-        .unwrap_or_else(|error| panic!("the response body must be XML ({error}): {body}"));
-    document
-        .descendants()
-        .find(|node| node.is_element() && node.tag_name().name() == "instanceState")
-        .and_then(|state| {
-            state
-                .children()
-                .find(|node| node.is_element() && node.tag_name().name() == "name")
-        })
-        .and_then(|name| name.text())
-        .unwrap_or_default()
-        .to_string()
+    super::ec2_query::described_instance_state(router, REGION, instance_id).await
 }
 
 /// Park one instance in `state`, reached only through the public API, and answer its id.

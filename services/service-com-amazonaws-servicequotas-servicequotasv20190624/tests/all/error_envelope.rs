@@ -483,8 +483,8 @@ fn the_wire_status_reports_the_fault_for_every_modelled_http_error() {
 }
 
 /// A request the model ACCEPTS is still served by its operation: the refusal path in
-/// front of every operation refuses nothing the model allows, and does not swallow a
-/// stub's 501.
+/// front of every operation refuses nothing the model allows, and leaves the judgement
+/// about the request to the handler.
 #[tokio::test]
 async fn a_request_the_model_accepts_still_reaches_its_operation() {
     let client = client("us-east-1");
@@ -518,13 +518,21 @@ async fn a_request_the_model_accepts_still_reaches_its_operation() {
         );
     }
 
-    // A stub still answers the scaffold's 501 for a request the model accepts — the
-    // stub census is not a 400.
+    // No operation of this service is a scaffold any more, so a request the model
+    // accepts is judged by the handler: a lookup naming no stored request answers the
+    // modelled refusal, never the scaffold's 501.
     let (status, parsed) = client
         .call("CreateSupportCase", json!({"RequestId": "abc123"}))
         .await;
     assert_eq!(
-        status, 501,
-        "case a stub with a valid request: expected HTTP 501, got {status} with {parsed}"
+        status, 400,
+        "case an implemented operation with a valid request: expected the modelled \
+         refusal on HTTP 400, got {status} with {parsed}"
+    );
+    assert_eq!(
+        parsed["__type"].as_str(),
+        Some("NoSuchResourceException"),
+        "case an implemented operation with a valid request: expected the modelled \
+         refusal, got {parsed}"
     );
 }

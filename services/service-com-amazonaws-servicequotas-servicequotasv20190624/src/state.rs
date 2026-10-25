@@ -16,7 +16,7 @@
 //!   resource, so one quota holds an account-wide value and a value per resource at
 //!   once;
 //! * the **quota increase requests** (`RequestServiceQuotaIncrease`,
-//!   `GetRequestedServiceQuotaChange`,
+//!   `GetRequestedServiceQuotaChange`, `CreateSupportCase`,
 //!   `ListRequestedServiceQuotaChangeHistoryByQuota`) — append-only, with an
 //!   insertion-ordered index so a history listing is newest-first and a pagination
 //!   token keeps meaning the same position;
@@ -144,6 +144,13 @@ pub const OPT_IN_STATUS_DISABLED: &str = "DISABLED";
 
 /// `RequestStatus` member `PENDING`: the status a newly minted request carries.
 pub const STATUS_PENDING: &str = "PENDING";
+/// `RequestStatus` member `CASE_OPENED`: the status a request carries while a support
+/// case is processing it.
+///
+/// Source: the member's own documentation (`smithy_query(query="shape",
+/// shape="RequestedServiceQuotaChange")`, member `Status`) — "`CASE_OPENED`: Service
+/// Quotas opened a support case to process the quota increase request."
+pub const STATUS_CASE_OPENED: &str = "CASE_OPENED";
 /// `RequestStatus` member `APPROVED`: the status a decided request carries once the
 /// increase has been applied to the quota.
 pub const STATUS_APPROVED: &str = "APPROVED";
@@ -159,6 +166,18 @@ pub const STATUS_NOT_APPROVED: &str = "NOT_APPROVED";
 /// What `SupportCaseAllowed` means when a request does not carry it: the model's own
 /// default, "By default, this flag is set to True".
 pub const SUPPORT_CASE_ALLOWED_BY_DEFAULT: bool = true;
+
+/// Whether a quota increase request in `status` is still OPEN — awaiting a decision —
+/// rather than terminal.
+///
+/// The two open statuses of the model's `RequestStatus` are [`STATUS_PENDING`] ("under
+/// review by Amazon Web Services") and [`STATUS_CASE_OPENED`] ("Service Quotas opened a
+/// support case to process the quota increase request"); every other member reports an
+/// outcome. One predicate, so the decision the clock owes and the one-open-request-per-
+/// quota rule agree on what open means.
+pub fn is_open_request_status(status: &str) -> bool {
+    status == STATUS_PENDING || status == STATUS_CASE_OPENED
+}
 
 /// The one Region the quota request TEMPLATE plane is served from.
 ///
@@ -501,12 +520,14 @@ pub struct QuotaRequest {
     pub decided_at: SystemTime,
     /// `Requester` — the identity that made the request.
     pub requester: String,
-    /// `CaseId`: `None` unless a support case was opened for the request.
+    /// `CaseId`: `None` until a support case is opened for the request, which is what
+    /// `CreateSupportCase` does.
     pub case_id: Option<String>,
     /// `SupportCaseAllowed`, as the request carried it (or
     /// [`SUPPORT_CASE_ALLOWED_BY_DEFAULT`] when it carried nothing). `false` is the
-    /// submitter opting out of the support case that reviews an increase, which is what
-    /// decides the request's terminal status.
+    /// submitter opting out of the support case that reviews an increase, so no case is
+    /// opened for it unless one is asked for explicitly — and whether a case reviews
+    /// the request is what decides its terminal status.
     pub support_case_allowed: bool,
     /// `QuotaRequestedAtLevel` — an `AppliedLevelEnum` member: [`LEVEL_RESOURCE`] when
     /// the request named a resource context, [`LEVEL_ACCOUNT`] otherwise.
@@ -563,6 +584,29 @@ pub enum ResourceArnError {
 pub struct TagCeilingExceeded {
     /// The number of tags the request would have left on the resource.
     pub would_hold: usize,
+}
+
+/// Why no support case was opened for a quota increase request.
+///
+/// The three cases are three different refusals in the model, and the handler maps
+/// each to the error shape that states it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SupportCaseRefusal {
+    /// This region holds no quota increase request with that `RequestId`:
+    /// `NoSuchResourceException`.
+    NoSuchRequest,
+    /// The request already has a support case, carrying this `CaseId`:
+    /// `ResourceAlreadyExistsException`.
+    CaseAlreadyOpen {
+        /// The `CaseId` of the case the request already carries.
+        case_id: String,
+    },
+    /// The request is no longer awaiting a decision, so there is nothing for a support
+    /// case to process: `InvalidResourceStateException`.
+    NotPending {
+        /// The `RequestStatus` the request carries instead.
+        status: String,
+    },
 }
 
 /// The mutable, per-region half of this service's state.
@@ -884,15 +928,16 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
 
     /// Materialise every decision the clock has already made due in `region`.
     ///
-    /// A `PENDING` request whose `decided_at` has passed is decided by what its
-    /// submitter asked for:
+    /// An OPEN request ([`is_open_request_status`]) whose `decided_at` has passed is
+    /// decided by whether a support case reviews it:
     ///
-    /// * `SupportCaseAllowed` (the default) — the increase is `APPROVED` and its
-    ///   desired value becomes the quota's applied value;
-    /// * `SupportCaseAllowed = false` — the submitter opted out of the support case
-    ///   that reviews an increase, so AWS opens none and the request ends
-    ///   `NOT_APPROVED`: no `CaseId`, and NOTHING is put in force, so the quota keeps
-    ///   the value it had.
+    /// * a case reviews it — because `SupportCaseAllowed` let Service Quotas open one
+    ///   (the model's default), or because `CreateSupportCase` opened one for it — so
+    ///   the increase is `APPROVED` and its desired value becomes the quota's applied
+    ///   value;
+    /// * no case reviews it — `SupportCaseAllowed = false` and nothing opened one
+    ///   since — so the request ends `NOT_APPROVED`: no `CaseId`, and NOTHING is put in
+    ///   force, so the quota keeps the value it had.
     ///
     /// This is the ONLY writer of the applied overlay, and the decision is owed at
     /// `decided_at` whether or not anybody calls — so a reporting operation may settle
@@ -911,7 +956,9 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
                 state
                     .quota_requests
                     .get(*id)
-                    .is_some_and(|request| request.status == STATUS_PENDING && request.decided_at <= now)
+                    .is_some_and(|request| {
+                        is_open_request_status(&request.status) && request.decided_at <= now
+                    })
             })
             .cloned()
             .collect();
@@ -920,7 +967,7 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         }
 
         // The decision: flip the stored requests, and note the overlay each APPROVED
-        // one puts in force. A request that opted out of its support case settles to
+        // one puts in force. A request no support case ever reviewed settles to
         // NOT_APPROVED and contributes no overlay.
         let mut decided: Vec<(AppliedKey, AppliedQuota)> = Vec::new();
         if let Some(state) = self.regions.get_mut(region) {
@@ -930,7 +977,7 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
                 };
                 // The decision happened when it came due, not when somebody looked.
                 request.last_updated = request.decided_at;
-                if !request.support_case_allowed {
+                if request.case_id.is_none() && !request.support_case_allowed {
                     request.status = STATUS_NOT_APPROVED.to_string();
                     continue;
                 }
@@ -963,6 +1010,50 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
     /// One stored request by `Id`, within the caller's region.
     pub fn request(&self, region: &str, id: &str) -> Option<&QuotaRequest> {
         self.regions.get(region)?.quota_requests.get(id)
+    }
+
+    /// Open a support case for the stored quota increase request `id` and return the
+    /// record as it now stands — or why no case was opened.
+    ///
+    /// Opening a case is what `CreateSupportCase` does: the request keeps its `Id`,
+    /// `DesiredValue` and `Created`, and gains a `CaseId` and the
+    /// [`STATUS_CASE_OPENED`] status its `Status` member documents. The case is the
+    /// review the decision waits on, so the decision becomes due
+    /// [`REQUEST_DECISION_DELAY`] after the case was opened — never at that same
+    /// instant, so a caller reading straight afterwards sees the request under its new
+    /// status.
+    ///
+    /// The caller must have settled the decisions the clock already owes
+    /// ([`Self::settle_due_requests`]) first, so a request whose decision was already
+    /// due is seen in the status it had earned rather than as still open.
+    pub fn open_support_case(
+        &mut self,
+        region: &str,
+        id: &str,
+        now: SystemTime,
+    ) -> Result<QuotaRequest, SupportCaseRefusal> {
+        let Some(request) = self
+            .regions
+            .get_mut(region)
+            .and_then(|state| state.quota_requests.get_mut(id))
+        else {
+            return Err(SupportCaseRefusal::NoSuchRequest);
+        };
+        // A decided request has nothing left for a case to process, whether or not a
+        // case was ever opened for it — so the decision is checked before the case.
+        if !is_open_request_status(&request.status) {
+            return Err(SupportCaseRefusal::NotPending {
+                status: request.status.clone(),
+            });
+        }
+        if let Some(case_id) = request.case_id.clone() {
+            return Err(SupportCaseRefusal::CaseAlreadyOpen { case_id });
+        }
+        request.case_id = Some(support_case_id(&request.id, now));
+        request.status = STATUS_CASE_OPENED.to_string();
+        request.last_updated = now;
+        request.decided_at = now + REQUEST_DECISION_DELAY;
+        Ok(request.clone())
     }
 
     /// Every stored request for one quota, NEWEST FIRST.
@@ -1543,6 +1634,23 @@ fn request_id(
 /// `^[0-9a-zA-Z][a-zA-Z0-9-]{1,128}$` and its 1..128 length.
 fn report_id(region: &str, sequence: u64, now: SystemTime) -> String {
     derive_id(&format!("report:{region}:{sequence}"), now)
+}
+
+/// Derive the `CaseId` of the support case opened for one quota increase request.
+///
+/// A support case id is an opaque string — the model's `CustomerServiceEngagementId`
+/// carries no length or pattern — and the ids AWS Support mints are written
+/// `case-<account id>-…`, so the account the case belongs to is the one part of the
+/// form a client can read anything from. The rest is derived from the request's own
+/// (already unique) id plus the clock, the way every other id of this service is
+/// ([`derive_id`]), so no two cases share an id and a client only ever sees an id that
+/// is in state.
+fn support_case_id(request_id: &str, now: SystemTime) -> String {
+    format!(
+        "case-{}-{}",
+        ::engine::emulator_account_id(),
+        derive_id(&format!("case:{request_id}"), now)
+    )
 }
 
 /// 32 lowercase hex characters derived from `seed` and the clock.
