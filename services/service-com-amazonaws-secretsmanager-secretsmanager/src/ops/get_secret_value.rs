@@ -230,13 +230,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(GetSecretValueErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(match (input.version_id.as_deref(), stage) {
-                        (Some(version_id), _) => format!(
-                            "Secrets Manager can't find the specified secret version: {version_id}"
-                        ),
-                        (None, stage) => format!(
-                            "Secrets Manager can't find the specified secret value for staging \
-                             label: {}",
-                            stage.unwrap_or(crate::state::STAGE_CURRENT)
+                        (Some(version_id), _) => {
+                            crate::state::version_not_found_message(version_id)
+                        }
+                        (None, stage) => crate::state::stage_not_found_message(
+                            stage.unwrap_or(crate::state::STAGE_CURRENT),
                         ),
                     }),
                 },

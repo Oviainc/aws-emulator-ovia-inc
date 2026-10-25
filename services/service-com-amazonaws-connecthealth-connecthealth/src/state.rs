@@ -21,7 +21,7 @@ use crate::ops::types::{
     InputDataConfig, InsightsContext, InsightsOutput, MedicalScribeChannelDefinition,
     MedicalScribeListeningSessionDetails, MedicalScribePostStreamActionSettingsResponse,
     MedicalScribePostStreamActionsResult, OutputDataConfig, PatientInsightsEncounterContext,
-    PatientInsightsPatientContext, SubscriptionDescription, UserContext,
+    PatientInsightsPatientContext, SubscriptionDescription, UserContext, WebAppConfiguration,
 };
 
 /// The region an emulated ARN carries when the request names none.
@@ -29,6 +29,10 @@ const DEFAULT_REGION: &str = "us-east-1";
 
 /// This service's ARN namespace / SigV4 signing name (`OPERATIONS.md`, "Wire protocol").
 const ARN_NAMESPACE: &str = "health-agent";
+
+/// The ARN namespace of IAM Identity Center, where the application a domain's web app
+/// runs as lives — another service's namespace, not this one's.
+const IDC_ARN_NAMESPACE: &str = "sso";
 
 /// How long a `Domain` stays in `DELETING` before the deletion the clock owes is
 /// materialised — the record is purged, and `GetDomain` then answers
@@ -258,15 +262,43 @@ impl EncryptionType {
     }
 }
 
-/// The stored web-application configuration of a `Domain` — the OUTPUT form
-/// (`WebAppConfiguration`), derived once from the `CreateWebAppConfiguration` the
-/// caller supplied: the Identity Center *instance* id it names is exchanged for the
-/// Identity Center *application* id this service creates in that instance.
+/// The stored web-application configuration of a `Domain`, derived once from the
+/// `CreateWebAppConfiguration` the caller supplied: the Identity Center *instance* the
+/// caller named, and the Identity Center *application* this service created in it.
 #[derive(Debug, Clone)]
 pub struct WebAppConfigurationRecord {
     pub ehr_role: String,
-    pub idc_application_id: String,
+    /// The Identity Center INSTANCE this domain's web application was created in — the
+    /// one the create named. An application is identified within its instance, so the
+    /// instance is part of the application's identity and is kept on the record rather
+    /// than discarded once the application has been created.
+    pub idc_instance_id: String,
+    /// The application this service created for the domain, as its own id within
+    /// [`Self::idc_instance_id`] (`apl-` plus 16 hex). The identifier the responses
+    /// report is this id in that instance — see [`Self::projected`].
+    pub idc_application_suffix: String,
     pub idc_region: String,
+}
+
+impl WebAppConfigurationRecord {
+    /// The record as the modelled `WebAppConfiguration` every Domain response reports
+    /// (`smithy_query(query="shape", shape="WebAppConfiguration")`: `ehrRole`,
+    /// `idcApplicationId`, `idcRegion`, all required).
+    ///
+    /// The reported `idcApplicationId` is the stored application IN the stored instance:
+    /// an Identity Center application is identified within its instance, so the
+    /// identifier is built here, in the one place every response reads it from, rather
+    /// than in each handler.
+    pub fn projected(&self) -> WebAppConfiguration {
+        WebAppConfiguration {
+            ehr_role: self.ehr_role.clone(),
+            idc_application_id: idc_application_id(
+                &self.idc_instance_id,
+                &self.idc_application_suffix,
+            ),
+            idc_region: self.idc_region.clone(),
+        }
+    }
 }
 
 /// A persisted `Domain`.
@@ -730,10 +762,16 @@ impl ComAmazonawsConnecthealthConnecthealthState {
         }
     }
 
-    /// Mint the Identity Center application id this service creates for a web app.
-    pub fn mint_idc_application_id(&mut self) -> String {
+    /// Mint the id of the Identity Center application this service creates for a
+    /// domain's web app, WITHIN the Identity Center instance the create named: `apl-`
+    /// plus 16 hex, as Identity Center names an application.
+    ///
+    /// Every domain owns its own application, so a fresh id is minted per call; the
+    /// instance is folded into the digest, so the id is unique to the
+    /// instance-and-application pair rather than to this store's sequence alone.
+    pub fn mint_idc_application_suffix(&mut self, idc_instance_id: &str) -> String {
         let seq = self.next_seq();
-        mint_id("apl-", 16, seq)
+        mint_scoped_id("apl-", 16, seq, idc_instance_id)
     }
 
     /// Materialise every deletion the CLOCK has already made due: a `Domain` whose
@@ -970,16 +1008,67 @@ impl ComAmazonawsConnecthealthConnecthealthState {
 /// pattern this service declares, and folding in both the sequence and the clock keeps
 /// ids unique within a process and across processes.
 fn mint_id(prefix: &str, body_len: usize, seq: u64) -> String {
+    mint_scoped_id(prefix, body_len, seq, "")
+}
+
+/// [`mint_id`], with `scope` folded into the digest: the id of the resource the minted
+/// one is allocated WITHIN, so the result is unique to the pair rather than to the
+/// sequence and the clock alone.
+fn mint_scoped_id(prefix: &str, body_len: usize, seq: u64, scope: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |since| since.as_nanos());
     let mut hasher = Sha256::new();
     hasher.update(prefix.as_bytes());
+    hasher.update(scope.as_bytes());
     hasher.update(seq.to_be_bytes());
     hasher.update(nanos.to_be_bytes());
     hasher.update(std::process::id().to_be_bytes());
     let body = hex::encode(hasher.finalize());
     format!("{prefix}{}", &body[..body_len])
+}
+
+/// The most characters of the Identity Center instance id a create named that this
+/// service carries into the application identifier it reports.
+///
+/// `WebAppConfiguration$idcApplicationId` is bounded at 256 characters, while
+/// `CreateWebAppConfiguration$idcInstanceId` is bounded at 256 on its own and declares
+/// no pattern (`smithy_query(query="shape",
+/// shape="WebAppConfiguration,CreateWebAppConfiguration")`), so a value the model
+/// accepts can be longer than the identifier that has to carry it wrapped in an ARN.
+/// This is what keeps the reported identifier inside its own modelled bound.
+///
+/// Carried as far as it fits rather than refused: every value up to the modelled 256 is
+/// one the model declares this operation accepts, so refusing one would be a refusal the
+/// model does not state. An Identity Center instance id (`ssoins-` plus 16 hex) is an
+/// order of magnitude shorter than this bound, and the application id minted for the
+/// instance folds in the WHOLE value, so two instances that share a prefix still get
+/// different application identifiers.
+pub const MAX_IDC_INSTANCE_SEGMENT: usize = 160;
+
+/// The identifier of the Identity Center application `suffix` inside the Identity Center
+/// instance `idc_instance_id`:
+/// `arn:aws:sso::<account>:application/<instanceId>/apl-<suffix>`.
+///
+/// An Identity Center application is identified WITHIN its instance, so the identifier
+/// names both: a web app created against one instance is distinguishable from one
+/// created against another, and the instance a domain's web application lives in is
+/// observable in every response that reports the configuration. Identity Center is a
+/// global namespace, so the ARN carries no region segment.
+///
+/// The instance is carried as the create NAMED it — the model documents the member as
+/// the instance id and constrains nothing else about it, so this service neither
+/// reformats the value nor judges its form — bounded by [`MAX_IDC_INSTANCE_SEGMENT`].
+pub fn idc_application_id(idc_instance_id: &str, suffix: &str) -> String {
+    let instance: String = idc_instance_id
+        .chars()
+        .take(MAX_IDC_INSTANCE_SEGMENT)
+        .collect();
+    ::engine::emulator_arn(
+        IDC_ARN_NAMESPACE,
+        "",
+        &format!("application/{instance}/{suffix}"),
+    )
 }
 
 /// The ARN of a `Domain`:

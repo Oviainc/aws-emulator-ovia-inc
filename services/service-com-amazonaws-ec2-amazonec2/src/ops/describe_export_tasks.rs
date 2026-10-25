@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeExportTasks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeExportTasks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeExportTasks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the instance export tasks [`crate::state`] holds, narrowed by
+//! `ExportTaskIds` and by `Filters`, each task carrying the state the clock has reached for
+//! it. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -130,18 +124,225 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeExportTasks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeExportTasksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
+            MAX_FILTERS, MAX_RESOURCE_IDS, MatchBudget, matches_every_filter,
+            require_service_state,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — an export
+        // task's modelled shape names no Region. The store is reached through the engine
+        // held on `self`.
+        let _ = ctx;
+
+        // Read in place rather than copied: the ids only go into the lookup set below, and
+        // the cap is asked before anything proportional to them is done.
+        let requested_ids: &[String] = input.export_task_ids.as_deref().unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "ExportTaskIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+
+        // Matching cost is filters x values x held values x stored tasks, and the model
+        // bounds none of those, so the request-controlled factors are capped here, before
+        // any work proportional to them is done — and their PRODUCT is charged to ONE
+        // [`MatchBudget`] below, which is the bound the per-factor caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name this operation does not answer is refused whether or not any export
+        // task would have matched it, so an unsupported filter can never read as "no
+        // results".
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let canonical = canonical_filter_name(name).ok_or_else(|| {
+                Scaffolded::invalid_parameter_value(format!("The filter '{name}' is invalid"))
+            })?;
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(canonical.to_string(), values.to_vec()));
+        }
+
+        // "The export task IDs" (`DescribeExportTasksRequest$ExportTaskIds`) NARROW the
+        // report: an id the account holds no export task for selects no row rather than
+        // failing the call. The recorded behaviour of the real service settles it — the
+        // corpus unit `ec2.op-contract-describeExportTasks` names the export task id
+        // `export-i-0123456789abcdef0`, which no account holds, and AWS answers a RESULT, not
+        // `InvalidExportTaskID.NotFound`. That code is for an operation that ACTS on one
+        // named task (`CancelExportTask`), where there is nothing to act on; a describe
+        // reports the set it was asked about, which is then empty.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeExportTasks"))
+        // The ids go into a SET, so narrowing one stored task is a logarithmic lookup rather
+        // than a scan of up to `MAX_RESOURCE_IDS` ids per task under the state lock.
+        let named_ids: ::std::collections::BTreeSet<&str> =
+            requested_ids.iter().map(String::as_str).collect();
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // Every comparison is charged to ONE budget — one step per task as well, so even an
+        // unfiltered scan is counted — so the PRODUCT of stored tasks, filters, values, held
+        // values and value length is bounded however the caller combines them, which is also
+        // what bounds how long this holds the state lock.
+        //
+        // This loop only READS: the `cancelling` -> `cancelled` move a cancel started is
+        // DERIVED from the stored due instant by [`crate::state::ExportTaskRecord::view_at`],
+        // so reporting it stores nothing and cannot change what a later caller sees.
+        let now = ::std::time::Instant::now();
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<ExportTask> = Vec::new();
+        // Whether the scan stopped before it had looked at every task. A budget spent while
+        // the LAST task was being compared leaves a COMPLETE answer, so incompleteness is
+        // recorded where it happens rather than inferred from the spent budget afterwards.
+        let mut stopped_early = false;
+        for (export_task_id, record) in &store.export_tasks {
+            if budget.exhausted() {
+                stopped_early = true;
+                break;
+            }
+            // The id narrowing is read off the stored key, so a task the request did not
+            // name costs no projection and no comparison at all.
+            if !named_ids.is_empty() && !named_ids.contains(export_task_id.as_str()) {
+                continue;
+            }
+            let task = record.view_at(now);
+            // The AND/OR rule EC2 defines for every `Filters` member is evaluated by the one
+            // shared evaluator; only the per-operation lookup is local.
+            if matches_every_filter(&selectors, &mut budget, &|name| filter_values(&task, name)) {
+                selected.push(task);
+            }
+        }
+        // A scan that stopped before the end answers an INCOMPLETE set, and so does one whose
+        // budget was spent WHILE the last task was being compared — the shared evaluator
+        // reports an aborted comparison as a non-match, which must not read as a genuine one.
+        // Neither is something to report as a result: the request asked for more filtering
+        // than one call will do, and is told so rather than given a silently truncated set.
+        // Refusing a complete answer whose cost landed exactly on the ceiling is the safe
+        // side of that boundary, and it is the shape every sibling describe of this crate
+        // takes. This operation models no page size to narrow with, so the refusal names the
+        // filters.
+        if stopped_early || budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or name the export tasks to describe"
+            )));
+        }
+
+        // Reported in `ExportTaskId` order: the store is an ordered map, so its iteration
+        // order already satisfies this, and two calls therefore report one set the same way.
+        Ok(DescribeExportTasksOutput {
+            export_tasks: Some(selected),
+        })
+    }
+}
+
+/// The filter names this operation answers.
+///
+/// The model documents no list of its own — "the filters for the export tasks"
+/// (`DescribeExportTasksRequest$Filters`) — and `Filter` itself says a filter matches
+/// resources "by specific criteria, such as tags, attributes, or IDs". So the names here are
+/// EC2's spelling (hyphenated, lower case) of the reported shape's own scalar members —
+/// `smithy_query(query="shape",shape="ExportTask")` — plus `tag-key`, the resource-wide tag
+/// filter EC2 documents for every taggable resource ("List and filter using the CLI and
+/// API", linked from `Filter`), which an export task is: it carries `ExportTask$Tags`.
+/// Every entry must be answered by [`filter_values`].
+///
+/// `tag:<key>` is the one name with a variable part, so it is matched by prefix rather than
+/// listed here.
+const EXPORT_TASK_FILTERS: [&str; 5] = [
+    "description",
+    "export-task-id",
+    "state",
+    "status-message",
+    "tag-key",
+];
+
+/// The name [`filter_values`] answers for the filter the request called `name`, or `None`
+/// when this operation answers no such filter.
+///
+/// The `tag:<key>` prefix comes from the crate's one definition of it,
+/// [`crate::state::TAG_FILTER_PREFIX`], so that spelling cannot drift between the describes
+/// that answer the tag filter. EC2 filter names are case-sensitive, so every comparison is
+/// exact — and a `tag:` prefix with no key names no tag, so it is as undocumented as any
+/// other misspelling. The `tag:<key>` family keeps its whole name, the key being part of
+/// what it selects on.
+fn canonical_filter_name(name: &str) -> Option<&str> {
+    if name
+        .strip_prefix(crate::state::TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+    {
+        return Some(name);
+    }
+    EXPORT_TASK_FILTERS.contains(&name).then_some(name)
+}
+
+/// The values the EC2 filter `name` compares against this export task.
+///
+/// A filter naming an attribute this task does not carry compares against NO values, so it
+/// selects nothing — which is the answer for `status-message` on a task that carries none.
+/// `name` is a name [`canonical_filter_name`] resolved. This is the one per-operation half
+/// of the shared AND/OR evaluator ([`crate::state::matches_every_filter`]).
+fn filter_values<'a>(task: &'a ExportTask, name: &str) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    if let Some(key) = name.strip_prefix(crate::state::TAG_FILTER_PREFIX) {
+        return task
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "description" => text(task.description.as_deref()),
+        "export-task-id" => text(task.export_task_id.as_deref()),
+        "state" => text(task.state.as_deref()),
+        "status-message" => text(task.status_message.as_deref()),
+        // "tag-key - The key of a tag assigned to the resource. Use this filter to find all
+        // resources that have a tag with a specific key, regardless of the tag value": the
+        // KEYS the task carries, whatever each one's value is.
+        "tag-key" => task
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        // An attribute an export task does not have holds no value for a filter to match,
+        // so a filter naming one selects nothing.
+        _ => Vec::new(),
     }
 }

@@ -308,11 +308,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // writes collided.
             return Err(PutSecretValueErrorModeled::ResourceExistsException(
                 ResourceExistsException {
-                    message: Some(format!(
-                        "You can't use ClientRequestToken {version_id} because that value is \
-                         already in use for a version of secret {}.",
-                        secret.arn
-                    )),
+                    message: Some(crate::state::token_in_use_message(&version_id, &secret.arn)),
                 },
             )
             .into());
@@ -325,11 +321,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !secret.has_room_for_version(&stages) {
             return Err(PutSecretValueErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "The request failed because it would exceed the maximum of {} versions \
-                         this emulator stores for one secret.",
-                        crate::state::VERSIONS_PER_SECRET
-                    )),
+                    message: Some(crate::state::version_quota_message()),
                 },
             )
             .into());

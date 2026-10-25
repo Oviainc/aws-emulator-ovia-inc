@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use crate::ops::types::{
-    ExternalSecretRotationMetadataItem, ReplicationStatusType, RotationRulesType, Tag,
+    ExternalSecretRotationMetadataItem, Filter, ReplicationStatusType, RotationRulesType, Tag,
 };
 
 /// The staging label on the current value of a secret.
@@ -40,6 +40,13 @@ pub const STAGE_PREVIOUS: &str = "AWSPREVIOUS";
 /// finishes" (`DescribeSecretResponse$VersionIdsToStages`, this service's
 /// Smithy model).
 pub const STAGE_PENDING: &str = "AWSPENDING";
+
+/// Whether `stage` is one of the staging labels the service itself moves —
+/// [`STAGE_CURRENT`], [`STAGE_PREVIOUS`] and [`STAGE_PENDING`], the three the
+/// model documents — rather than one a caller named.
+pub fn is_reserved_stage(stage: &str) -> bool {
+    matches!(stage, STAGE_CURRENT | STAGE_PREVIOUS | STAGE_PENDING)
+}
 
 /// Secrets Manager appends "a hyphen and six random characters after the secret
 /// name at the end of the ARN" (`CreateSecretRequest$Name`, this service's
@@ -113,6 +120,62 @@ pub fn recovery_window_out_of_range_message() -> String {
     format!(
         "The RecoveryWindowInDays value must be between {MIN_RECOVERY_WINDOW_DAYS} and \
          {MAX_RECOVERY_WINDOW_DAYS} days (inclusive)."
+    )
+}
+
+/// The message `LimitExceededException` carries for an attachment that would
+/// take a version past the staging-label cap (see [`STAGES_PER_VERSION`]).
+///
+/// `LimitExceededException` is documented as "The request failed because it
+/// would exceed one of the Secrets Manager quotas." (this service's Smithy
+/// model); the wire message is this one constant sentence, which states the
+/// quota rather than echoing the label or the version the request named.
+pub const STAGE_LIMIT_MESSAGE: &str =
+    "You exceeded the maximum number of staging labels allowed on a secret.";
+
+/// The `ResourceNotFoundException` message for a `VersionId` the named secret
+/// holds no version under.
+///
+/// The secret itself was found, so the missing thing is the version the request
+/// named — and the caller cannot tell which of the ids it sent was wrong unless
+/// the message names it. Every operation that resolves a `VersionId` answers
+/// with THIS sentence.
+pub fn version_not_found_message(version_id: &str) -> String {
+    format!("Secrets Manager can't find the specified secret version: {version_id}")
+}
+
+/// The `ResourceNotFoundException` message for a staging label no version of the
+/// named secret carries.
+///
+/// The secret was found and the label was not, so the message names the label
+/// the request asked for. Every operation that resolves a value BY STAGE — the
+/// single read and the batched one — answers with THIS sentence.
+pub fn stage_not_found_message(stage: &str) -> String {
+    format!("Secrets Manager can't find the specified secret value for staging label: {stage}")
+}
+
+/// The `ResourceExistsException` message for a `ClientRequestToken` that already
+/// names a version of this secret holding a DIFFERENT value.
+///
+/// The token is the new version's id and an `@idempotencyToken`, so the same
+/// token with the same value is the same request; the same token with another
+/// value would modify an existing version, which no operation of this service
+/// does. The message is built from the request's own token and the secret's ARN,
+/// which is what identifies which of a batch of idempotent writes collided.
+pub fn token_in_use_message(token: &str, arn: &str) -> String {
+    format!(
+        "You can't use ClientRequestToken {token} because that value is already in use for a \
+         version of secret {arn}."
+    )
+}
+
+/// The `LimitExceededException` message for a write that would leave a secret
+/// holding more versions than this store keeps for one secret (see
+/// [`VERSIONS_PER_SECRET`]).
+pub fn version_quota_message() -> String {
+    format!(
+        "The request failed because it would exceed the maximum of {VERSIONS_PER_SECRET} versions \
+         this emulator stores for one secret."
     )
 }
 
@@ -281,6 +344,28 @@ pub const SECRET_QUOTA: usize = 1_000;
 /// against one secret from growing the store without end.
 pub const VERSIONS_PER_SECRET: usize = 100;
 
+/// How many staging labels of its OWN a caller attaches to one version of a
+/// secret before a further attachment is refused.
+///
+/// `SecretVersionStagesType` — the list of "all of the staging labels currently
+/// attached to this version of the secret" — is modelled with a maximum length
+/// of 20 (this service's Smithy model), so twenty is what one version carries.
+/// The labels the service itself moves (`AWSCURRENT`, `AWSPREVIOUS`,
+/// `AWSPENDING`) are not counted against it: they are attached by rotation and
+/// by every write of a value, so counting them would refuse a caller's
+/// twentieth label on a version that is simply current.
+pub const STAGES_PER_VERSION: usize = 20;
+
+/// How many secrets one batched read resolves, and the page size it falls back
+/// to when the caller names none.
+///
+/// `BatchGetSecretValue` "retrieves the contents of the encrypted fields
+/// SecretString or SecretBinary for up to 20 secrets", `SecretIdListType` is
+/// modelled with a maximum length of 20 and `MaxResultsBatchType` with a range
+/// of 1..20 (this service's Smithy model), so twenty secrets is one batch
+/// whichever way the caller selects them.
+pub const SECRETS_PER_BATCH: usize = 20;
+
 /// The region a resource is placed in when the request carries no SigV4
 /// credential scope to read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -351,6 +436,93 @@ pub fn is_valid_secret_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || SECRET_NAME_EXTRA_CHARS.contains(c))
+}
+
+/// Whether a secret satisfies one `Filter`.
+///
+/// A filter's `Values` are alternatives (any one matching is enough) and each
+/// value may be negated with a leading `!`; separate filters all have to hold.
+/// Every operation that selects secrets by filter — the listing and the batched
+/// read, which share one `Filter` shape — selects with THIS function, so the two
+/// cannot disagree about what a filter means.
+pub fn matches_filter(secret: &Secret, filter: &Filter) -> bool {
+    let Some(key) = filter.key.as_deref() else {
+        return true;
+    };
+    let values = filter.values.as_deref().unwrap_or(&[]);
+    if values.is_empty() {
+        return true;
+    }
+    values.iter().any(|value| match value.strip_prefix('!') {
+        Some(negated) => !matches_filter_value(secret, key, negated),
+        None => matches_filter_value(secret, key, value),
+    })
+}
+
+/// Whether a secret matches one filter value.
+///
+/// The per-key rules come from `Filter$Key` in this service's model: `name`,
+/// `tag-key`, `tag-value`, `primary-region` and `owning-service` are
+/// case-sensitive prefix matches, `description` is a prefix match that is not
+/// case-sensitive, and `all` "breaks the filter value string into words and then
+/// searches all attributes for matches", not case-sensitive.
+fn matches_filter_value(secret: &Secret, key: &str, value: &str) -> bool {
+    match key {
+        "name" => secret.name.starts_with(value),
+        "description" => secret
+            .description
+            .as_deref()
+            .is_some_and(|description| starts_with_ignoring_case(description, value)),
+        "tag-key" => secret
+            .tags
+            .iter()
+            .filter_map(|tag| tag.key.as_deref())
+            .any(|tag_key| tag_key.starts_with(value)),
+        "tag-value" => secret
+            .tags
+            .iter()
+            .filter_map(|tag| tag.value.as_deref())
+            .any(|tag_value| tag_value.starts_with(value)),
+        "primary-region" => secret.region.starts_with(value),
+        "owning-service" => secret
+            .owning_service
+            .as_deref()
+            .is_some_and(|owner| owner.starts_with(value)),
+        "all" => {
+            let attributes = searchable_attributes(secret);
+            value.split_whitespace().all(|word| {
+                attributes
+                    .iter()
+                    .any(|attribute| starts_with_ignoring_case(attribute, word))
+            })
+        }
+        // A key the model does not name matches nothing.
+        _ => false,
+    }
+}
+
+/// The attributes the `all` filter key searches.
+fn searchable_attributes(secret: &Secret) -> Vec<&str> {
+    let mut attributes = vec![secret.name.as_str(), secret.region.as_str()];
+    attributes.extend(secret.description.as_deref());
+    attributes.extend(secret.owning_service.as_deref());
+    for tag in &secret.tags {
+        attributes.extend(tag.key.as_deref());
+        attributes.extend(tag.value.as_deref());
+    }
+    attributes
+}
+
+/// A prefix match that ignores ASCII case.
+///
+/// Compares BYTES rather than slicing the haystack at `prefix.len()`: both
+/// operands are request-derived, so a byte-indexed slice would panic whenever
+/// that offset fell inside a multi-byte character of the haystack. Case folding
+/// is ASCII-only, as `eq_ignore_ascii_case` makes it: a non-ASCII byte has to
+/// match exactly, which is the most the model's "not case-sensitive" pins down.
+fn starts_with_ignoring_case(haystack: &str, prefix: &str) -> bool {
+    let (haystack, prefix) = (haystack.as_bytes(), prefix.as_bytes());
+    haystack.len() >= prefix.len() && haystack[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
 /// The wildcard a policy statement names when it grants access to every
@@ -840,6 +1012,16 @@ impl SecretVersion {
     /// (`SecretVersionStagesType` is modelled with a minimum length of 1).
     pub fn stages_out(&self) -> Option<Vec<String>> {
         (!self.version_stages.is_empty()).then(|| self.version_stages.clone())
+    }
+
+    /// How many of the staging labels on this version a CALLER named: the ones
+    /// the service moves itself are left out, as [`is_reserved_stage`] decides.
+    /// This is the count [`STAGES_PER_VERSION`] bounds.
+    pub fn custom_stage_count(&self) -> usize {
+        self.version_stages
+            .iter()
+            .filter(|stage| !is_reserved_stage(stage))
+            .count()
     }
 }
 
@@ -1364,6 +1546,97 @@ impl Secret {
                 None => break,
             }
         }
+    }
+
+    /// The version id `stage` currently names: the version carrying the label,
+    /// and for `AWSPENDING` the id a started rotation reserved for the version
+    /// its rotation function has not created yet — the reservation IS the label's
+    /// current holder until that version arrives.
+    pub fn stage_holder(&self, stage: &str) -> Option<&str> {
+        if stage == STAGE_PENDING {
+            return self.pending_version_id();
+        }
+        self.version_with_stage(stage)
+            .map(|version| version.version_id.as_str())
+    }
+
+    /// Attach `stage` to the version `move_to` already holds.
+    ///
+    /// "Each staging label can be attached to only one version at a time. To add
+    /// a staging label to a version when it is already attached to another
+    /// version, Secrets Manager first removes it from the other version first
+    /// and then attaches it to this one", and "Whenever you move AWSCURRENT,
+    /// Secrets Manager automatically moves the label AWSPREVIOUS to the version
+    /// that AWSCURRENT was removed from" (`UpdateSecretVersionStage`, this
+    /// service's Smithy model) — so the label ends up on exactly one version,
+    /// and a move of the current label leaves the previous one behind it.
+    ///
+    /// A move of `AWSPENDING` onto a version that exists also drops a rotation's
+    /// reservation of that label, for the reason [`put_version`] drops it: the
+    /// reservation stands only while the label names a version the store does
+    /// not hold.
+    ///
+    /// [`put_version`]: Secret::put_version
+    pub fn attach_stage(&mut self, stage: &str, move_to: &str, at: SystemTime) {
+        let demoted = if stage == STAGE_CURRENT {
+            self.version_with_stage(STAGE_CURRENT)
+                .map(|current| current.version_id.clone())
+                .filter(|current| current != move_to)
+        } else {
+            None
+        };
+        for existing in &mut self.versions {
+            existing.version_stages.retain(|held| held != stage);
+        }
+        if let Some(demoted) = demoted {
+            for existing in &mut self.versions {
+                existing.version_stages.retain(|held| held != STAGE_PREVIOUS);
+            }
+            if let Some(existing) = self
+                .versions
+                .iter_mut()
+                .find(|version| version.version_id == demoted)
+            {
+                existing.version_stages.push(STAGE_PREVIOUS.to_string());
+            }
+        }
+        if let Some(existing) = self
+            .versions
+            .iter_mut()
+            .find(|version| version.version_id == move_to)
+        {
+            existing.version_stages.push(stage.to_string());
+        }
+        if stage == STAGE_PENDING {
+            self.pending_rotation_version_id = None;
+        }
+        self.last_changed_date = at;
+    }
+
+    /// Take `stage` off the version `remove_from`.
+    ///
+    /// "If this action results in the last label being removed from a version,
+    /// then the version is considered to be 'deprecated' and can be deleted by
+    /// Secrets Manager" (`UpdateSecretVersionStage`, this service's Smithy
+    /// model), so the version stays stored and simply carries no label.
+    ///
+    /// Removing `AWSPENDING` from the id a cancelled rotation reserved releases
+    /// that reservation, which is the clean-up the model sends a caller to this
+    /// operation for.
+    pub fn detach_stage(&mut self, stage: &str, remove_from: &str, at: SystemTime) {
+        if let Some(existing) = self
+            .versions
+            .iter_mut()
+            .find(|version| version.version_id == remove_from)
+        {
+            existing.version_stages.retain(|held| held != stage);
+        }
+        if stage == STAGE_PENDING
+            && self.pending_rotation_version_id.as_deref() == Some(remove_from)
+        {
+            self.pending_rotation_version_id = None;
+        }
+        self.last_changed_date = at;
     }
 
     /// Apply the rotation configuration a `RotateSecret` call carries.

@@ -27,6 +27,8 @@ mod budget_action_lifecycle;
 mod budget_action_lock;
 #[path = "all/budget_action_read_purity.rs"]
 mod budget_action_read_purity;
+#[path = "all/budget_action_role_account_scope.rs"]
+mod budget_action_role_account_scope;
 #[path = "all/budget_action_settle_history.rs"]
 mod budget_action_settle_history;
 #[path = "all/budget_action_subscriber_limits.rs"]

@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op MergePullRequestByThreeWay
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `MergePullRequestByThreeWay`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`MergePullRequestByThreeWay::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: merges the pull request's source reference into its destination
+//! reference three-way — against the tree of the two tips' merge base, the one
+//! reading of a CodeCommit merge this crate has ([`crate::state::merge`]), so
+//! `conflictDetailLevel`, `conflictResolutionStrategy` and `conflictResolution`
+//! settle a path both sides changed exactly as they do for every other merge API —
+//! writes the result as ONE commit that records BOTH tips as its parents (the
+//! destination, the side being merged into, first), leaves the destination branch at
+//! that commit, and closes the pull request: "If the merge is successful, it closes
+//! the pull request."
+//!
+//! The merge is between the tips the two references hold NOW rather than the tips
+//! the pull request was opened at — `sourceCommitId` is the value to pass "if you
+//! want an exception thrown if the current commit ID of the tip of the source branch
+//! does not match this commit ID", so the current tip is what is merged — and the
+//! stored target then records what was merged, who merged it, the merge commit and
+//! the strategy, so a later `GetPullRequest` reports the merge rather than a
+//! prediction of it.
+//!
+//! A merge no strategy and no resolution settles is refused with the modelled
+//! `ManualMergeRequiredException`, and nothing is written; so is a pull request that
+//! is no longer open, and one whose destination branch the repository no longer
+//! holds.
+//!
+//! The merge runs under one per-request budget and off the async worker, exactly as
+//! `CreateUnreferencedMergeCommit`'s does, because it holds the store guard it reads
+//! the snapshots and the object bytes through for its whole span.
 //!
 //! ## Shape of an operation
 //!
@@ -180,6 +198,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeMap;
+
+use crate::state::merge;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -249,6 +271,117 @@ impl From<MergePullRequestByThreeWayErrorModeled> for MergePullRequestByThreeWay
     }
 }
 
+/// One `conflictResolution` problem as the errors THIS operation models for it,
+/// each with that shape's own sentence. The reading of what is wrong with a
+/// resolution is shared ([`merge::CheckedResolution`]); which modelled failure
+/// answers the caller is the operation's.
+///
+/// This operation models no `FileModeRequiredException`, so an entry that asks for
+/// a file mode and names none is refused as the mode it named not being valid,
+/// which is the only file-mode failure it models.
+fn refused_resolution(problem: merge::ResolutionProblem) -> MergePullRequestByThreeWayError {
+    use merge::ResolutionProblem as Problem;
+    let modeled = match problem {
+        Problem::PathRequired => {
+            MergePullRequestByThreeWayErrorModeled::PathRequiredException(PathRequiredException {
+                message: Some(
+                    "a file path is required for every conflict resolution entry".to_string(),
+                ),
+            })
+        }
+        Problem::InvalidPath(raw) => {
+            MergePullRequestByThreeWayErrorModeled::InvalidPathException(InvalidPathException {
+                message: Some(format!("the path {raw} is not valid")),
+            })
+        }
+        Problem::FileModeRequired => {
+            MergePullRequestByThreeWayErrorModeled::InvalidFileModeException(
+                InvalidFileModeException {
+                    message: Some(
+                        "a file mode is required to update mode permissions for a file".to_string(),
+                    ),
+                },
+            )
+        }
+        Problem::InvalidFileMode(mode) => {
+            MergePullRequestByThreeWayErrorModeled::InvalidFileModeException(
+                InvalidFileModeException {
+                    message: Some(format!("the file mode {mode} is not valid")),
+                },
+            )
+        }
+        Problem::TooManyEntries(entries) => {
+            MergePullRequestByThreeWayErrorModeled::MaximumConflictResolutionEntriesExceededException(
+                MaximumConflictResolutionEntriesExceededException {
+                    message: Some(format!(
+                        "the merge carries {entries} conflict resolution entries, more than the \
+                         {} this emulator accepts",
+                        merge::MAX_CONFLICT_RESOLUTION_ENTRIES
+                    )),
+                },
+            )
+        }
+        Problem::MultipleEntries(path) => {
+            MergePullRequestByThreeWayErrorModeled::MultipleConflictResolutionEntriesException(
+                MultipleConflictResolutionEntriesException {
+                    message: Some(format!(
+                        "more than one conflict resolution entry was provided for {path}"
+                    )),
+                },
+            )
+        }
+        Problem::ReplacementTypeRequired(path) => {
+            MergePullRequestByThreeWayErrorModeled::ReplacementTypeRequiredException(
+                ReplacementTypeRequiredException {
+                    message: Some(format!(
+                        "a replacement type is required for the conflict resolution entry \
+                         for {path}"
+                    )),
+                },
+            )
+        }
+        Problem::InvalidReplacementType(replacement_type) => {
+            MergePullRequestByThreeWayErrorModeled::InvalidReplacementTypeException(
+                InvalidReplacementTypeException {
+                    message: Some(format!(
+                        "the replacement type {replacement_type} is not valid"
+                    )),
+                },
+            )
+        }
+        Problem::ReplacementContentRequired(path) => {
+            MergePullRequestByThreeWayErrorModeled::ReplacementContentRequiredException(
+                ReplacementContentRequiredException {
+                    message: Some(format!(
+                        "{} was specified for {path} but no replacement content was provided",
+                        merge::REPLACEMENT_USE_NEW_CONTENT
+                    )),
+                },
+            )
+        }
+        Problem::InvalidReplacementContent {
+            path,
+            replacement_type,
+        } => MergePullRequestByThreeWayErrorModeled::InvalidReplacementContentException(
+            InvalidReplacementContentException {
+                message: Some(format!(
+                    "replacement content was provided for {path} with the replacement \
+                     type {replacement_type}, which keeps a stored version"
+                )),
+            },
+        ),
+        Problem::PathNotInResult(path) => {
+            MergePullRequestByThreeWayErrorModeled::InvalidPathException(InvalidPathException {
+                message: Some(format!(
+                    "the merge result does not hold the path {path}, so its \
+                     file mode cannot be set"
+                )),
+            })
+        }
+    };
+    modeled.into()
+}
+
 /// The `MergePullRequestByThreeWay` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -285,18 +418,553 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `MergePullRequestByThreeWay` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(MergePullRequestByThreeWayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Which ids address a pull request is `crate::state`'s rule, so every
+        // operation taking a `pullRequestId` agrees about it; this only maps each
+        // outcome onto the error THIS operation models for it.
+        let pull_request_id = crate::state::normalize_pull_request_id(&input.pull_request_id)
+            .map_err(|problem| match problem {
+                crate::state::PullRequestIdProblem::Missing => {
+                    MergePullRequestByThreeWayErrorModeled::PullRequestIdRequiredException(
+                        PullRequestIdRequiredException {
+                            message: Some(
+                                crate::state::PULL_REQUEST_ID_REQUIRED_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+                crate::state::PullRequestIdProblem::Invalid => {
+                    MergePullRequestByThreeWayErrorModeled::InvalidPullRequestIdException(
+                        InvalidPullRequestIdException {
+                            message: Some(
+                                crate::state::INVALID_PULL_REQUEST_ID_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+            })?;
+
+        // `sourceCommitId` is "the full commit ID of the original or updated commit
+        // in the pull request source branch", so a value that is not a commit id at
+        // all addresses no commit — and the only commit-id failure this operation
+        // models is the invalid one.
+        let requested_source_tip = input.source_commit_id.as_deref();
+        if requested_source_tip
+            .is_some_and(|commit_id| crate::state::checked_commit_id(commit_id).is_err())
+        {
+            return Err(
+                MergePullRequestByThreeWayErrorModeled::InvalidCommitIdException(
+                    InvalidCommitIdException {
+                        message: Some(crate::state::INVALID_COMMIT_ID_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "If unspecified, the default FILE_LEVEL is used" and the default
+        // strategy "is NONE, which requires any conflicts to be resolved manually".
+        let detail_level = input
+            .conflict_detail_level
+            .as_deref()
+            .unwrap_or(merge::CONFLICT_DETAIL_FILE_LEVEL);
+        if !merge::CONFLICT_DETAIL_LEVELS.contains(&detail_level) {
+            return Err(
+                MergePullRequestByThreeWayErrorModeled::InvalidConflictDetailLevelException(
+                    InvalidConflictDetailLevelException {
+                        message: Some(format!(
+                            "the conflict detail level {detail_level} is not valid"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let strategy = input
+            .conflict_resolution_strategy
+            .as_deref()
+            .unwrap_or(merge::CONFLICT_RESOLUTION_NONE);
+        if !merge::CONFLICT_RESOLUTION_STRATEGIES.contains(&strategy) {
+            return Err(
+                MergePullRequestByThreeWayErrorModeled::InvalidConflictResolutionStrategyException(
+                    InvalidConflictResolutionStrategyException {
+                        message: Some(format!(
+                            "the conflict resolution strategy {strategy} is not valid"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `conflictResolution` is "if AUTOMERGE is the conflict resolution
+        // strategy, a list of inputs to use when resolving conflicts during a
+        // merge": under any other strategy the branch to take is already decided,
+        // so a resolution list cannot be honoured and the request is refused
+        // rather than silently ignored. Checked BEFORE the entries themselves,
+        // because a list that cannot be honoured at all is the primary reason the
+        // request fails, whatever one of its entries says.
+        if merge::resolution_supplied(input.conflict_resolution.as_ref())
+            && strategy != merge::CONFLICT_RESOLUTION_AUTOMERGE
+        {
+            return Err(
+                MergePullRequestByThreeWayErrorModeled::InvalidConflictResolutionException(
+                    InvalidConflictResolutionException {
+                        message: Some(format!(
+                            "a conflict resolution list is used only with the \
+                             {} conflict resolution strategy",
+                            merge::CONFLICT_RESOLUTION_AUTOMERGE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let resolution = merge::CheckedResolution::check(input.conflict_resolution.as_ref())
+            .map_err(refused_resolution)?;
+
+        let now = std::time::SystemTime::now();
+        // "The Amazon Resource Name (ARN) of the user who merged the branches": the
+        // caller this request was signed by, read the one way this crate reads a
+        // caller's identity.
+        let merged_by = crate::state::caller_identity_arn(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+        // Whether the id names a pull request AT ALL is a question about the whole
+        // store, because a pull request id is unique per account; it is answered
+        // before one repository is borrowed to write, so the two refusals below can
+        // be told apart.
+        let pull_request_exists = store.pull_request(pull_request_id).is_some();
+        let repository = store
+            .repositories
+            .get_mut(&input.repository_name)
+            .ok_or_else(|| {
+                MergePullRequestByThreeWayErrorModeled::RepositoryDoesNotExistException(
+                    RepositoryDoesNotExistException {
+                        message: Some(crate::state::repository_does_not_exist_message(
+                            &input.repository_name,
+                        )),
+                    },
+                )
+            })?;
+
+        // Everything the merge reads out of the stored pull request, resolved
+        // before anything is written: the two branches its target names, the tips
+        // they hold NOW, and the merge base of those tips.
+        let (source_tip, destination_branch, destination_tip) = {
+            let Some(pull_request) = repository.pull_requests.get(&pull_request_id) else {
+                // A pull request this repository does not hold: one that exists
+                // elsewhere is refused as not associated with this repository, and
+                // one no repository holds as not existing at all.
+                return Err(if pull_request_exists {
+                    MergePullRequestByThreeWayErrorModeled::RepositoryNotAssociatedWithPullRequestException(
+                        RepositoryNotAssociatedWithPullRequestException {
+                            message: Some(
+                                crate::state::REPOSITORY_NOT_ASSOCIATED_WITH_PULL_REQUEST_MESSAGE
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into()
+                } else {
+                    MergePullRequestByThreeWayErrorModeled::PullRequestDoesNotExistException(
+                        PullRequestDoesNotExistException {
+                            message: Some(crate::state::pull_request_does_not_exist_message(
+                                &pull_request_id.to_string(),
+                            )),
+                        },
+                    )
+                    .into()
+                });
+            };
+            // A merge closes the pull request, and "pull request status can only
+            // change from OPEN to CLOSED": one that is already closed cannot be
+            // merged again, and nothing is written for it.
+            if pull_request.status != crate::state::PULL_REQUEST_STATUS_OPEN {
+                return Err(
+                    MergePullRequestByThreeWayErrorModeled::PullRequestAlreadyClosedException(
+                        PullRequestAlreadyClosedException {
+                            message: Some(
+                                crate::state::PULL_REQUEST_ALREADY_CLOSED_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            let Some(target) = pull_request.targets.first() else {
+                // Every stored pull request carries its target, so this is an
+                // internal inconsistency rather than a modelled CodeCommit failure.
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "the pull request holds no target to merge",
+                ));
+            };
+            let source_reference = target.source_reference.clone();
+            let destination_reference = target.destination_reference.clone();
+
+            // The source side: "the full commit ID of the tip of the source branch
+            // used to create the pull request. If the pull request branch is
+            // updated by a push while the pull request is open, the commit ID
+            // changes to reflect the new tip of the branch" — so what is merged is
+            // the tip the reference holds now. A reference the repository no longer
+            // holds as a branch holds no tip to merge, which is the same refusal as
+            // a tip that is not the one the request names.
+            let different_tip = || {
+                MergePullRequestByThreeWayErrorModeled::TipOfSourceReferenceIsDifferentException(
+                    TipOfSourceReferenceIsDifferentException {
+                        message: Some(
+                            crate::state::TIP_OF_SOURCE_REFERENCE_IS_DIFFERENT_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+            };
+            let source_tip = repository
+                .resolve_branch(&source_reference)
+                .and_then(|branch| repository.branches.get(branch))
+                .map(|branch| branch.commit_id.clone())
+                .ok_or_else(different_tip)?;
+            // "Pass this value if you want an exception thrown if the current
+            // commit ID of the tip of the source branch does not match this commit
+            // ID."
+            if requested_source_tip.is_some_and(|requested| requested != source_tip) {
+                return Err(different_tip().into());
+            }
+
+            // The destination side: the branch the merge is applied to. One the
+            // repository no longer holds is a target branch that has been modified
+            // since, and a merge cannot be written on a reference that is gone.
+            let Some(destination_branch) = repository
+                .resolve_branch(&destination_reference)
+                .map(str::to_string)
+            else {
+                return Err(
+                    MergePullRequestByThreeWayErrorModeled::ConcurrentReferenceUpdateException(
+                        ConcurrentReferenceUpdateException {
+                            message: Some(
+                                crate::state::CONCURRENT_REFERENCE_UPDATE_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            let destination_tip = repository
+                .branches
+                .get(&destination_branch)
+                .map(|branch| branch.commit_id.clone())
+                .ok_or_else(|| {
+                    MergePullRequestByThreeWayErrorModeled::ConcurrentReferenceUpdateException(
+                        ConcurrentReferenceUpdateException {
+                            message: Some(
+                                crate::state::CONCURRENT_REFERENCE_UPDATE_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                })?;
+            (source_tip, destination_branch, destination_tip)
+        };
+
+        // The two snapshots the merge is between, read out of the commit
+        // projection the whole crate reads a commit's tree through.
+        let unreadable_tip = |commit_id: &str| {
+            // A branch tip the commit projection does not hold is an internal
+            // inconsistency, refused like an unreachable store rather than as a
+            // modelled CodeCommit failure.
+            crate::scaffolded::Scaffolded::validation(format!(
+                "the repository store holds no commit {commit_id} the pull request's references \
+                 point at"
+            ))
+        };
+        let source_files = repository
+            .commits
+            .get(&source_tip)
+            .map(|commit| commit.files.clone())
+            .ok_or_else(|| unreadable_tip(&source_tip))?;
+        let destination_files = repository
+            .commits
+            .get(&destination_tip)
+            .map(|commit| commit.files.clone())
+            .ok_or_else(|| unreadable_tip(&destination_tip))?;
+
+        // The three-way merge: the tree of the merge base against the two tips.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("MergePullRequestByThreeWay"))
+        // This is caller-driven CPU work — history walks and, for a file both
+        // sides changed, a diff3 of three whole blobs — and it runs under this
+        // service's store lock, so it is held to a wall-clock deadline
+        // (`MergeBudget`, checked per path and per history walk) and moved off the
+        // async worker, exactly as this crate's other caller-driven CPU work is.
+        let mut budget = merge::MergeBudget::for_one_request();
+        // What a merge ran out of, as the errors this operation models for it —
+        // the same reading of the same allowance `GetMergeOptions` answers with,
+        // so one pair of commits is refused the same way whether the merge is
+        // reported or written.
+        let out_of_allowance = |problem: merge::MergeProblem| -> MergePullRequestByThreeWayError {
+            match problem {
+                // No merge base at all: the two tips share no commit, so there is
+                // no common ancestor to merge either side's changes against.
+                merge::MergeProblem::NoMergeBase => {
+                    MergePullRequestByThreeWayErrorModeled::TipsDivergenceExceededException(
+                        TipsDivergenceExceededException {
+                            message: Some(format!(
+                                "the divergence between {source_tip} and {destination_tip} is too \
+                                 great to determine whether there might be any merge conflicts"
+                            )),
+                        },
+                    )
+                    .into()
+                }
+                merge::MergeProblem::ItemsToCompare => {
+                    MergePullRequestByThreeWayErrorModeled::MaximumItemsToCompareExceededException(
+                        MaximumItemsToCompareExceededException {
+                            message: Some(format!(
+                                "merging {source_tip} into {destination_tip} exceeds the {} items \
+                                 this emulator compares against the merge base at once",
+                                merge::MAX_ITEMS_TO_COMPARE_PER_REQUEST
+                            )),
+                        },
+                    )
+                    .into()
+                }
+                merge::MergeProblem::Deadline => {
+                    MergePullRequestByThreeWayErrorModeled::MaximumItemsToCompareExceededException(
+                        MaximumItemsToCompareExceededException {
+                            message: Some(format!(
+                                "merging {source_tip} into {destination_tip} took longer than the \
+                                 {} seconds this emulator spends merging two commits",
+                                merge::MAX_MERGE_SECONDS
+                            )),
+                        },
+                    )
+                    .into()
+                }
+                merge::MergeProblem::ContentToLoad => {
+                    MergePullRequestByThreeWayErrorModeled::MaximumFileContentToLoadExceededException(
+                        MaximumFileContentToLoadExceededException {
+                            message: Some(format!(
+                                "merging {source_tip} into {destination_tip} line by line exceeds \
+                                 the {} bytes of file content this emulator loads at once",
+                                merge::MAX_CONTENT_BYTES_PER_REQUEST
+                            )),
+                        },
+                    )
+                    .into()
+                }
+            }
+        };
+        let (base_commit_id, base_files, mut merged) = crate::service::off_the_async_worker(|| {
+            // The base is resolved as its own step, because the merge base is also
+            // what the stored target reports as "the commit ID of the most recent
+            // commit that the source branch and the destination branch have in
+            // common".
+            let base_commit_id =
+                merge::merge_base(repository, &source_tip, &destination_tip, &mut budget)?;
+            let base_files = repository
+                .commits
+                .get(&base_commit_id)
+                .map(|commit| commit.files.clone())
+                .unwrap_or_default();
+            let merged = merge::merge_snapshots(
+                repository,
+                &base_files,
+                &source_files,
+                &destination_files,
+                detail_level,
+                strategy,
+                &mut budget,
+            )?;
+            Ok::<_, merge::MergeProblem>((base_commit_id, base_files, merged))
+        })
+        .map_err(out_of_allowance)?;
+
+        // Then the caller's own resolutions, which AUTOMERGE is what carries.
+        if strategy == merge::CONFLICT_RESOLUTION_AUTOMERGE {
+            resolution
+                .apply(&mut merged, &base_files, &source_files, &destination_files)
+                .map_err(refused_resolution)?;
+            // A resolution can write a file at a path the merged tree holds as a
+            // folder, and can equally settle a collision the merge itself found,
+            // so the file-against-folder verdict is recomputed over the resolved
+            // result.
+            merged
+                .detect_object_type_conflicts(&budget)
+                .map_err(out_of_allowance)?;
+        }
+
+        // Anything still conflicting is a merge no strategy and no resolution
+        // settled, which is exactly what the modelled refusal says.
+        if !merged.unresolved().is_empty() {
+            return Err(
+                MergePullRequestByThreeWayErrorModeled::ManualMergeRequiredException(
+                    ManualMergeRequiredException {
+                        message: Some(
+                            "The pull request cannot be merged automatically into the destination \
+                             branch. You must manually merge the branches and resolve any \
+                             conflicts."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The snapshot the merge commit carries, and the bytes the merge produced
+        // that the object store does not hold yet.
+        let mut files: BTreeMap<String, crate::state::FileEntry> = BTreeMap::new();
+        let mut new_blobs: Vec<Vec<u8>> = Vec::new();
+        for (path, file) in std::mem::take(&mut merged.files) {
+            if let Some(content) = file.content {
+                new_blobs.push(content);
+            }
+            files.insert(path, file.entry);
+        }
+
+        // The folders the merge emptied are kept only when the caller asked for
+        // it, with the placeholder `crate::state::keep_empty_folders` writes — the
+        // one reading of that rule this crate has.
+        if input.keep_empty_folders {
+            let emptied: Vec<&str> = source_files
+                .keys()
+                .chain(destination_files.keys())
+                .filter(|path| !files.contains_key(path.as_str()))
+                .map(String::as_str)
+                .collect();
+            for _ in crate::state::keep_empty_folders(&mut files, emptied) {
+                // The placeholder entry names the EMPTY blob, which the store must
+                // hold for the tree to encode.
+                new_blobs.push(Vec::new());
+            }
+        }
+
+        // The emulator's own bound on the snapshot each commit stores, checked
+        // FIRST so the folder walk below never runs over a tree this emulator would
+        // not store anyway.
+        if files.len() > crate::state::MAX_FILES_PER_TREE {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "this emulator holds at most {} files per repository tree",
+                crate::state::MAX_FILES_PER_TREE
+            )));
+        }
+
+        // Then CodeCommit's documented 6 MB folder limit, the other bound a written
+        // tree is held to, charged from the crate's one reading of that rule.
+        if let Some((folder, _)) = merge::oversized_changed_folder(&files, &destination_files) {
+            return Err(
+                MergePullRequestByThreeWayErrorModeled::FolderContentSizeLimitExceededException(
+                    FolderContentSizeLimitExceededException {
+                        message: Some(format!(
+                            "the commit cannot be created because the folder {folder} \
+                             would exceed the limit of {} bytes",
+                            crate::state::MAX_FOLDER_CONTENT_BYTES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // And the bound on the STORE this commit's objects grow, charged before
+        // the write exactly as `CreateCommit` charges it.
+        let added_bytes = new_blobs
+            .iter()
+            .map(Vec::len)
+            .fold(0usize, usize::saturating_add);
+        if repository.objects.len().saturating_add(new_blobs.len())
+            > crate::state::MAX_OBJECTS_PER_REPOSITORY
+            || repository.object_bytes().saturating_add(added_bytes)
+                > crate::state::MAX_OBJECT_BYTES_PER_REPOSITORY
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "the commit would take this repository past the {} objects and {} object bytes this emulator holds",
+                crate::state::MAX_OBJECTS_PER_REPOSITORY,
+                crate::state::MAX_OBJECT_BYTES_PER_REPOSITORY
+            )));
+        }
+
+        // "The name of the author who created the commit. This information is used
+        // as both the author and committer for the commit."
+        let user = UserInfo {
+            name: input.author_name.clone(),
+            email: input.email.clone(),
+            date: Some(crate::state::git_date(now)),
+        };
+        for content in new_blobs {
+            repository.insert_blob(content);
+        }
+        // A THREE-WAY merge keeps both histories: the written commit records both
+        // tips as its parents, with the destination — the side being merged into —
+        // first, which is what makes the merge commit a merge rather than a commit
+        // on one side.
+        let (merge_commit_id, _tree_id) = repository
+            .commit_snapshot(
+                files,
+                vec![destination_tip.clone(), source_tip.clone()],
+                user.clone(),
+                user,
+                input.commit_message.as_deref(),
+            )
+            .ok_or_else(|| {
+                // Every entry names a blob this store holds, so the tree always
+                // encodes; a snapshot that did not is an internal inconsistency,
+                // refused like an unreachable store.
+                crate::scaffolded::Scaffolded::validation(
+                    "the repository store holds a file whose blob id is not an object name",
+                )
+            })?;
+        // The destination branch is left at the merge commit, which is what makes
+        // the merged content readable there by a later caller.
+        repository.branches.insert(
+            destination_branch.clone(),
+            crate::state::Branch {
+                name: destination_branch,
+                commit_id: merge_commit_id.clone(),
+            },
+        );
+        // Writing a commit and moving a reference modifies the repository, so
+        // `lastModifiedDate` moves with it, exactly as it does for `PutFile` or
+        // `CreateCommit`.
+        repository.last_modified_date = now;
+        // Keep the history bounded: the oldest commits no ref reaches are dropped
+        // here, together with every git object no remaining ref reaches.
+        repository.prune_history();
+
+        // "If the merge is successful, it closes the pull request": the stored
+        // pull request records the merge — what was merged, who merged it, the
+        // commit it produced and the strategy — and is CLOSED, so every later read
+        // of it reports the merge rather than a prediction of one.
+        let pull_request = repository
+            .pull_requests
+            .get_mut(&pull_request_id)
+            .ok_or_else(|| {
+                // Read above under this same guard, so it is still there;
+                // answering rather than panicking keeps the handler total.
+                MergePullRequestByThreeWayErrorModeled::PullRequestDoesNotExistException(
+                    PullRequestDoesNotExistException {
+                        message: Some(crate::state::pull_request_does_not_exist_message(
+                            &pull_request_id.to_string(),
+                        )),
+                    },
+                )
+            })?;
+        pull_request.status = crate::state::PULL_REQUEST_STATUS_CLOSED.to_string();
+        // "The day and time of the last user or system activity on the pull
+        // request": merging it is such activity.
+        pull_request.last_activity_date = now;
+        if let Some(target) = pull_request.targets.first_mut() {
+            target.source_commit = source_tip;
+            target.destination_commit = destination_tip;
+            target.merge_base = Some(base_commit_id);
+            target.merged = true;
+            target.merged_by = Some(merged_by);
+            target.merge_commit_id = Some(merge_commit_id);
+            target.merge_option = Some(merge::MERGE_OPTION_THREE_WAY.to_string());
+        }
+
+        Ok(MergePullRequestByThreeWayOutput {
+            pull_request: Some(pull_request.to_modeled()),
+        })
     }
 }

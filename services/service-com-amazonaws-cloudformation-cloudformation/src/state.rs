@@ -52,8 +52,9 @@
 //! change sets per stack and [`MAX_CHANGE_SETS`] across the store (past either
 //! `CreateChangeSet` answers the modelled `LimitExceededException`), [`PAGE_SIZE`]
 //! items per paginated response and [`MAX_DESCRIBED_STACK_RESOURCES`] resources per
-//! `DescribeStackResources` response (the documented cap on that unpaginated read), and
-//! [`hook_results::MAX_HOOK_RESULTS`] recorded Hook invocation results.
+//! `DescribeStackResources` response (the documented cap on that unpaginated read),
+//! [`hook_results::MAX_HOOK_RESULTS`] recorded Hook invocation results and
+//! [`change_set_hooks::MAX_CHANGE_SET_HOOKS`] Hook invocations planned for one change set.
 //!
 //! Reading a stack's template body and evaluating what it declares is bounded by the
 //! [`template`] module's own caps (nodes, depth, the documented per-template quotas and
@@ -180,6 +181,10 @@ pub mod resource_schema;
 /// The Hook invocation results this account and Region holds, which `ListHookResults`
 /// reports summaries of.
 pub mod hook_results;
+
+/// The Hook invocations planned for one change set, which `DescribeChangeSetHooks`
+/// reports.
+pub mod change_set_hooks;
 
 /// The generated templates this account and Region holds: what `CreateGeneratedTemplate`
 /// starts and `DescribeGeneratedTemplate` reads the progress of.
@@ -2016,9 +2021,45 @@ pub struct StoredChangeSet {
     pub stack_drift_status: String,
     pub pending: Option<PendingChangeSetStatus>,
     pub changes: Vec<StoredResourceChange>,
+    /// The Hook invocations planned for this change set, in the order they were planned,
+    /// so `DescribeChangeSetHooks` pages over them deterministically (see
+    /// [`change_set_hooks`]). Bounded at [`change_set_hooks::MAX_CHANGE_SET_HOOKS`],
+    /// oldest reclaimed first.
+    pub hooks: Vec<change_set_hooks::StoredChangeSetHook>,
 }
 
 impl StoredChangeSet {
+    /// Record one planned Hook invocation on this change set. The oldest record is
+    /// reclaimed past [`change_set_hooks::MAX_CHANGE_SET_HOOKS`], so the store cannot grow
+    /// without limit.
+    ///
+    /// This is the ONLY way a record enters a change set's plan, and
+    /// [`change_set_hooks`] is where what can and cannot plan one is written down.
+    pub fn plan_hook(&mut self, hook: change_set_hooks::StoredChangeSetHook) {
+        let over_the_bound = (self.hooks.len() + 1)
+            .saturating_sub(change_set_hooks::MAX_CHANGE_SET_HOOKS);
+        if over_the_bound > 0 {
+            // One shift for however many records the bound reclaims, rather than one per
+            // record.
+            self.hooks.drain(..over_the_bound);
+        }
+        self.hooks.push(hook);
+    }
+
+    /// The `ChangeSetHooksStatus` this change set's Hook plan is in
+    /// ([`change_set_hooks::hooks_status`]).
+    ///
+    /// The plan is computed as part of creating the change set, so its status follows that
+    /// creation: `PLANNING` while the creation is still in flight, `PLANNED` once it has
+    /// completed and the plan it computed is what a read reports, and `UNAVAILABLE` for a
+    /// change set whose creation did not complete, which has no computed plan to report.
+    pub fn hooks_status(&self) -> &'static str {
+        match self.status.as_str() {
+            change_set_status::CREATE_PENDING => change_set_hooks::hooks_status::PLANNING,
+            change_set_status::CREATE_COMPLETE => change_set_hooks::hooks_status::PLANNED,
+            _ => change_set_hooks::hooks_status::UNAVAILABLE,
+        }
+    }
     /// Materialise the change-set transition the clock has already made due, if any.
     ///
     /// Like [`StoredStack::settle`], it only ever applies a transition whose due instant
@@ -3185,6 +3226,8 @@ pub enum PageOf {
     ChangeSetSummaries,
     /// `ListHookResults`'s `HookResults`.
     HookResults,
+    /// `DescribeChangeSetHooks`'s `Hooks`.
+    ChangeSetHooks,
     /// `ListExports`'s `Exports`.
     Exports,
     /// `DescribeAccountLimits`'s `AccountLimits`.
@@ -3204,6 +3247,7 @@ impl PageOf {
             Self::Changes => "changes",
             Self::ChangeSetSummaries => "change-set-summaries",
             Self::HookResults => "hookresults",
+            Self::ChangeSetHooks => "change-set-hooks",
             Self::Exports => "exports",
             Self::AccountLimits => "account-limits",
             Self::TypeSummaries => "type-summaries",

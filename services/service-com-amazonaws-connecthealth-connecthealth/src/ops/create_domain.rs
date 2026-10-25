@@ -302,13 +302,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A web app is set up only when asked for. The caller names an Identity Center
-        // INSTANCE; the service creates an application in it and reports that
-        // application's id, so the stored (output) shape is not the input shape.
+        // INSTANCE; the service creates an application IN that instance and reports that
+        // application's identifier, so the stored shape is not the input shape: the
+        // instance the caller named is persisted, and the application minted in it is
+        // identified within it (`crate::state::idc_application_id`).
         let web_app_configuration = input.web_app_setup_configuration.as_ref().map(|setup| {
-            let idc_application_id = store.mint_idc_application_id();
+            let idc_application_suffix = store.mint_idc_application_suffix(&setup.idc_instance_id);
             crate::state::WebAppConfigurationRecord {
                 ehr_role: setup.ehr_role.clone(),
-                idc_application_id,
+                idc_instance_id: setup.idc_instance_id.clone(),
+                idc_application_suffix,
                 idc_region: setup.idc_region.clone(),
             }
         });
@@ -368,13 +371,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }),
                 status: stored.status.as_wire().to_string(),
                 web_app_url: stored.web_app_url.clone(),
-                web_app_configuration: stored.web_app_configuration.as_ref().map(|config| {
-                    WebAppConfiguration {
-                        ehr_role: config.ehr_role.clone(),
-                        idc_application_id: config.idc_application_id.clone(),
-                        idc_region: config.idc_region.clone(),
-                    }
-                }),
+                web_app_configuration: stored
+                    .web_app_configuration
+                    .as_ref()
+                    .map(crate::state::WebAppConfigurationRecord::projected),
                 created_at: crate::state::to_timestamp(stored.created_at),
             },
             members: vec![

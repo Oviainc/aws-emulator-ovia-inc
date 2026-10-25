@@ -453,7 +453,7 @@ async fn a_region_nothing_was_created_in_reads_as_an_empty_account() {
             let latest = call_in(&router, region, "GET", "/get-latest-assessment-id", None).await;
             assert_eq!(
                 (latest.status, latest.error_code()),
-                (400, "ValidationException"),
+                (404, "ResourceNotFoundException"),
                 "case {case:?}: no assessment was started in this Region, got {:?}",
                 latest.body
             );

@@ -21,6 +21,8 @@ mod asset_listing;
 mod configure_logs;
 #[path = "all/describe_packaging_configuration.rs"]
 mod describe_packaging_configuration;
+#[path = "all/egress_access_log_group_names.rs"]
+mod egress_access_log_group_names;
 #[path = "all/empty_response_framing.rs"]
 mod empty_response_framing;
 #[path = "all/error_responses.rs"]

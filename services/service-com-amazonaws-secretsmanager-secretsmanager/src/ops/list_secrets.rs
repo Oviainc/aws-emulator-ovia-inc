@@ -186,7 +186,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .secrets
             .values()
             .filter(|secret| include_deleted || !secret.scheduled_for_deletion())
-            .filter(|secret| filters.iter().all(|filter| matches_filter(secret, filter)))
+            .filter(|secret| {
+                filters
+                    .iter()
+                    .all(|filter| crate::state::matches_filter(secret, filter))
+            })
             .collect();
         sort_secrets(&mut matching, input.sort_by.as_deref(), input.sort_order.as_deref());
 
@@ -288,90 +292,6 @@ fn sort_secrets(
     if sort_order == Some("desc") {
         secrets.reverse();
     }
-}
-
-/// Whether a secret satisfies one filter.
-///
-/// A filter's `Values` are alternatives (any one matching is enough) and each
-/// value may be negated with a leading `!`; separate filters all have to hold.
-fn matches_filter(secret: &crate::state::Secret, filter: &Filter) -> bool {
-    let Some(key) = filter.key.as_deref() else {
-        return true;
-    };
-    let values = filter.values.as_deref().unwrap_or(&[]);
-    if values.is_empty() {
-        return true;
-    }
-    values.iter().any(|value| match value.strip_prefix('!') {
-        Some(negated) => !matches_value(secret, key, negated),
-        None => matches_value(secret, key, value),
-    })
-}
-
-/// Whether a secret matches one filter value.
-///
-/// The per-key rules come from `Filter$Key` in this service's model: `name`,
-/// `tag-key`, `tag-value`, `primary-region` and `owning-service` are
-/// case-sensitive prefix matches, `description` is a prefix match that is not
-/// case-sensitive, and `all` "breaks the filter value string into words and then
-/// searches all attributes for matches", not case-sensitive.
-fn matches_value(secret: &crate::state::Secret, key: &str, value: &str) -> bool {
-    match key {
-        "name" => secret.name.starts_with(value),
-        "description" => secret
-            .description
-            .as_deref()
-            .is_some_and(|description| starts_with_ignoring_case(description, value)),
-        "tag-key" => secret
-            .tags
-            .iter()
-            .filter_map(|tag| tag.key.as_deref())
-            .any(|tag_key| tag_key.starts_with(value)),
-        "tag-value" => secret
-            .tags
-            .iter()
-            .filter_map(|tag| tag.value.as_deref())
-            .any(|tag_value| tag_value.starts_with(value)),
-        "primary-region" => secret.region.starts_with(value),
-        "owning-service" => secret
-            .owning_service
-            .as_deref()
-            .is_some_and(|owner| owner.starts_with(value)),
-        "all" => {
-            let attributes = searchable_attributes(secret);
-            value.split_whitespace().all(|word| {
-                attributes
-                    .iter()
-                    .any(|attribute| starts_with_ignoring_case(attribute, word))
-            })
-        }
-        // A key the model does not name matches nothing.
-        _ => false,
-    }
-}
-
-/// The attributes the `all` filter key searches.
-fn searchable_attributes(secret: &crate::state::Secret) -> Vec<&str> {
-    let mut attributes = vec![secret.name.as_str(), secret.region.as_str()];
-    attributes.extend(secret.description.as_deref());
-    attributes.extend(secret.owning_service.as_deref());
-    for tag in &secret.tags {
-        attributes.extend(tag.key.as_deref());
-        attributes.extend(tag.value.as_deref());
-    }
-    attributes
-}
-
-/// A prefix match that ignores ASCII case.
-///
-/// Compares BYTES rather than slicing the haystack at `prefix.len()`: both
-/// operands are request-derived, so a byte-indexed slice would panic whenever
-/// that offset fell inside a multi-byte character of the haystack. Case folding
-/// is ASCII-only, as `eq_ignore_ascii_case` makes it: a non-ASCII byte has to
-/// match exactly, which is the most the model's "not case-sensitive" pins down.
-fn starts_with_ignoring_case(haystack: &str, prefix: &str) -> bool {
-    let (haystack, prefix) = (haystack.as_bytes(), prefix.as_bytes());
-    haystack.len() >= prefix.len() && haystack[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
 /// The modelled server error for a request that cannot reach this service's

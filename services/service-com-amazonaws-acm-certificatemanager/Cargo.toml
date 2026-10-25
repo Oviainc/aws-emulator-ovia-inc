@@ -29,6 +29,18 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 # Certificate ids: ACM certificate ARNs end in a v4 UUID.
 uuid = { version = "1", features = ["v4"] }
+# Reads the X.509 certificates `ImportCertificate` accepts: their names, validity,
+# serial, algorithms and key-usage extensions.
+x509-cert = "0.2"
+# Reads the PEM framing and the PKCS#8 structure of the private key an import carries,
+# so an encrypted or mismatched key is refused.
+pkcs8 = { version = "0.10", features = ["pem", "std"] }
+# The PKCS#1 RSA key structures, for the RSA key size an imported certificate's
+# `KeyAlgorithm` is read from and for matching its private key.
+pkcs1 = "0.7"
+# The SEC1 elliptic-curve private key structure, for matching an EC private key with
+# the certificate it was imported with.
+sec1 = "0.7"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -36,6 +48,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Generates the real certificates and key pairs the import tests feed the service,
+# independently of the DER this crate reads.
+rcgen = "0.13"
 
 [lints]
 workspace = true

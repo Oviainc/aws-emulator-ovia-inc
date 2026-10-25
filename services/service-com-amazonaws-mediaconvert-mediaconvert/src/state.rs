@@ -441,6 +441,15 @@ pub const JOB_ENGINE_VERSION_LIFETIME: Duration = Duration::from_secs(365 * 24 *
 /// one value, `ONE_YEAR`.
 pub const RESERVATION_TERM: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
+/// The fewest reserved transcode slots a reservation plan can state.
+///
+/// `ReservationPlanSettings$ReservedSlots` is "the number of reserved transcode slots
+/// (RTS) for this queue. The number of RTS determines how many jobs the queue can process
+/// in parallel; each RTS can process one job at a time" — a count of slots, and a queue
+/// that reserved none of them could run no job in parallel, so the smallest plan reserves
+/// one. The member is a bare `__integer`, so nothing before a handler refuses less.
+pub const MIN_RESERVED_SLOTS: i32 = 1;
+
 /// The `arn:` service/resource namespace for this service's ARNs
 /// (`awsService.arnNamespace` is `mediaconvert`).
 const ARN_NAMESPACE: &str = "mediaconvert";
@@ -657,6 +666,114 @@ pub fn reservation_plan_required_message() -> String {
     format!(
         "ReservationPlanSettings is required when PricingPlan is {}.",
         PRICING_PLAN_RESERVED
+    )
+}
+
+/// How this service refuses a reservation plan that reserves fewer slots than a count of
+/// slots can be ([`MIN_RESERVED_SLOTS`]).
+///
+/// As with every member-naming refusal here, the sentence is built from the request: the
+/// value the caller entered and the floor it has to clear.
+pub fn reserved_slots_below_minimum_message(requested: i32) -> String {
+    format!(
+        "You specified {requested} for ReservedSlots. ReservedSlots must be at least \
+         {MIN_RESERVED_SLOTS}."
+    )
+}
+
+/// How this service refuses an update that would lower a reserved queue's slot count.
+///
+/// `ReservationPlanSettings$ReservedSlots` states the rule as a one-way one: "You can't
+/// decrease the number of RTS in your reserved queue. You can increase the number of RTS
+/// by extending your existing commitment with a new 12-month commitment for the larger
+/// number." That documented sentence is the fixed text; the two counts come from the
+/// stored plan and from the request.
+pub fn reserved_slots_decrease_message(stored: i32, requested: i32) -> String {
+    format!(
+        "You can't decrease the number of RTS in your reserved queue. Your queue has \
+         {stored} RTS and you specified {requested} for ReservedSlots."
+    )
+}
+
+/// Why a concurrency a request entered cannot be stored (see [`check_concurrent_jobs`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConcurrencyRefusal {
+    /// The request entered a negative number of jobs: a problem in the request, which a
+    /// handler answers with its modelled `BadRequestException`.
+    Negative(i32),
+    /// The request entered more concurrent jobs than this Region's pool has left for the
+    /// queue: a quota the account has run out of, which a handler answers with its
+    /// modelled `ServiceQuotaExceededException`.
+    Unavailable {
+        /// What the request entered.
+        requested: i32,
+        /// What the pool has left for this queue, from
+        /// [`ComAmazonawsMediaconvertMediaconvertState::concurrency_available_to`].
+        available: i32,
+    },
+}
+
+impl ConcurrencyRefusal {
+    /// The sentence the refusal states, so the two operations that enforce the constraint
+    /// cannot word it differently.
+    pub fn message(self) -> String {
+        match self {
+            Self::Negative(requested) => negative_concurrent_jobs_message(requested),
+            Self::Unavailable {
+                requested,
+                available,
+            } => concurrent_jobs_unavailable_message(requested, available),
+        }
+    }
+}
+
+/// Whether a concurrency a request entered for a queue can be stored.
+///
+/// `ConcurrentJobs` is "the maximum number of jobs your queue can process concurrently",
+/// and "for on-demand queues, the value you enter is constrained by your service quotas
+/// for Maximum concurrent jobs, per on-demand queue and Maximum concurrent jobs, per
+/// account" — so an on-demand queue's concurrency is an ALLOCATION out of the Region's
+/// pool ([`TOTAL_CONCURRENT_JOBS`], what `ListQueues$TotalConcurrentJobs` reports) and a
+/// value past what the pool has left for that queue cannot be allocated. A negative count
+/// is not a number of jobs at all, whatever the pricing plan. A `RESERVED` queue's
+/// capacity is bought by its reservation plan rather than drawn from the on-demand pool
+/// (`ListQueues$UnallocatedConcurrentJobs` is "across all of your on-demand queues"), so
+/// only the negative test applies to one.
+///
+/// `available` is [`ComAmazonawsMediaconvertMediaconvertState::concurrency_available_to`]
+/// for the queue being created or updated, read before the record is borrowed for writing.
+pub fn check_concurrent_jobs(
+    pricing_plan: &str,
+    requested: i32,
+    available: i32,
+) -> Result<(), ConcurrencyRefusal> {
+    if requested < 0 {
+        return Err(ConcurrencyRefusal::Negative(requested));
+    }
+    if pricing_plan == PRICING_PLAN_ON_DEMAND && requested > available {
+        return Err(ConcurrencyRefusal::Unavailable {
+            requested,
+            available,
+        });
+    }
+    Ok(())
+}
+
+/// How this service refuses a concurrency that is not a number of jobs.
+fn negative_concurrent_jobs_message(requested: i32) -> String {
+    format!("You specified {requested} for ConcurrentJobs. ConcurrentJobs must not be negative.")
+}
+
+/// How this service refuses a concurrency the Region's pool cannot allocate to one queue.
+///
+/// The pool the refusal quotes is the one `ListQueues` reports, so what a caller is told
+/// it may allocate is what that listing says is unallocated.
+fn concurrent_jobs_unavailable_message(requested: i32, available: i32) -> String {
+    format!(
+        "You specified {requested} for ConcurrentJobs, but only {available} of this \
+         Region's {TOTAL_CONCURRENT_JOBS} concurrent jobs are available to allocate to \
+         this queue. Allocate at most {available} concurrent jobs to it, or free capacity \
+         on your other on-demand queues."
     )
 }
 
@@ -1268,6 +1385,14 @@ impl QueueRecord {
     /// This queue's [`encode_cursor`] token.
     pub fn cursor(&self) -> String {
         encode_cursor(self.created_at, &self.name)
+    }
+
+    /// The number of RTS this queue's stored reservation plan reserves, or `None` for a
+    /// queue that has no plan — which is what an on-demand queue is.
+    pub fn reserved_slots(&self) -> Option<i32> {
+        self.reservation_plan
+            .as_ref()
+            .and_then(|plan| plan.reserved_slots)
     }
 }
 
@@ -4294,18 +4419,37 @@ impl ComAmazonawsMediaconvertMediaconvertState {
     /// in `i64` and clamped into the ceiling, so an account whose queues have allocated
     /// more than the pool reports nothing left to allocate rather than a negative count.
     pub fn concurrency_allocation(&self) -> (i32, i32) {
+        // No stored queue is named by the empty string — `CreateQueue` refuses a `Name`
+        // that carries no characters — so excluding that name excludes nothing, and this
+        // reports the pool left over when every stored queue holds its allocation.
+        (TOTAL_CONCURRENT_JOBS, self.concurrency_available_to(""))
+    }
+
+    /// How much of the Region's on-demand concurrency pool is available to allocate to
+    /// the queue named `queue_name`.
+    ///
+    /// The same quantity [`Self::concurrency_allocation`] reports as
+    /// `UnallocatedConcurrentJobs`, except that the named queue's OWN allocation is left
+    /// out of what is already taken: a queue re-stating its concurrency is measured
+    /// against the pool once, not against the capacity it already holds as well. A queue
+    /// the store does not hold yet (one being created) takes nothing, so the exclusion is
+    /// a no-op for it.
+    ///
+    /// Summed in `i64` and clamped into the ceiling, so an account whose queues have
+    /// allocated more than the pool reports nothing left rather than a negative count. The
+    /// walk is over at most [`MAX_QUEUES`] records and clones nothing, as every other walk
+    /// over the queue set here is.
+    pub fn concurrency_available_to(&self, queue_name: &str) -> i32 {
         let allocated: i64 = self
             .queues
             .values()
-            .filter(|queue| queue.pricing_plan == PRICING_PLAN_ON_DEMAND)
+            .filter(|queue| {
+                queue.pricing_plan == PRICING_PLAN_ON_DEMAND && queue.name != queue_name
+            })
             .map(|queue| i64::from(queue.concurrent_jobs))
             .sum();
         let ceiling = i64::from(TOTAL_CONCURRENT_JOBS);
-        let unallocated = (ceiling - allocated).clamp(0, ceiling);
-        (
-            TOTAL_CONCURRENT_JOBS,
-            i32::try_from(unallocated).unwrap_or(0),
-        )
+        i32::try_from((ceiling - allocated).clamp(0, ceiling)).unwrap_or(0)
     }
 }
 
