@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPrivateGraphEndpoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPrivateGraphEndpoints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPrivateGraphEndpoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the stored private graph endpoints of one graph, a page at a
+//! time. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +148,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPrivateGraphEndpoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPrivateGraphEndpointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPrivateGraphEndpoints"))
+        // A read (`@readonly`): it reports the stored endpoints of the GRAPH the request
+        // names, which lives in exactly one Region.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListPrivateGraphEndpointsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the neptune-graph store is not mounted on this engine"
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A token this service did not issue names no page, so it is refused rather
+        // than treated as the start of the listing. This operation models
+        // `ValidationException`, so the refusal is that modelled 400.
+        let start_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
+                ListPrivateGraphEndpointsErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "nextToken '{token}' is not a pagination token this service issued"
+                    ),
+                    reason: Some("ILLEGAL_ARGUMENT".to_string()),
+                })
+            })?),
+            None => None,
+        };
+        // The modelled `maxResults` range 1..100 is refused by the boundary validator
+        // before this handler runs, so reaching here with a value outside it is not
+        // possible; the clamp keeps the invariant the paging below relies on LOCAL — a
+        // page of at least one entry — so a page can never come back empty while
+        // endpoints remain.
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(DEFAULT_PAGE_SIZE)
+            .clamp(1, DEFAULT_PAGE_SIZE);
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+
+        // An endpoint is addressed as an endpoint of one graph, so the identifier has to
+        // name a graph of THIS Region: a listing of the endpoints of a graph that does
+        // not exist is a failed lookup rather than an empty page.
+        let Some(graph) = store.settled_graph(&input.graph_identifier, &region, now) else {
+            return Err(
+                ListPrivateGraphEndpointsErrorModeled::ResourceNotFoundException(
+                    crate::state::graph_not_found(&input.graph_identifier),
+                )
+                .into(),
+            );
+        };
+        let graph_id = graph.id.clone();
+
+        // Reporting only: the sole write is materialising what the clock already made
+        // due — each endpoint whose provisioning has come due, and each accepted
+        // deletion whose span has passed — so this listing reports the endpoints as they
+        // stood at `now` and never reports one that is gone.
+        store.materialise_private_endpoints(now);
+
+        // The endpoints of a graph are keyed by the VPC id they are addressed by, so one
+        // stable total order underlies every page and a token can name a position in it.
+        let mut remaining = store.private_endpoints_of(&graph_id, start_after.as_deref());
+        let page: Vec<&crate::state::PrivateGraphEndpoint> =
+            remaining.by_ref().take(page_size).collect();
+        // A token only when endpoints remain, and it resumes after the last one
+        // reported, so a resumed page returns the remainder without repeats.
+        let next_token = if remaining.next().is_some() {
+            page.last()
+                .map(|endpoint| encode_page_token(&endpoint.vpc_id))
+        } else {
+            None
+        };
+        let private_graph_endpoints: Vec<PrivateGraphEndpointSummary> = page
+            .into_iter()
+            .map(PrivateGraphEndpointSummary::from)
+            .collect();
+
+        Ok(Self::Output {
+            private_graph_endpoints,
+            next_token,
+        })
+    }
+}
+
+/// The page size when `maxResults` is absent: the largest the member allows
+/// (`smithy_query(query="operation",operation="ListPrivateGraphEndpoints")` ->
+/// `maxResults` range 1..100), so an unpaginated caller sees as much as one page can
+/// carry.
+const DEFAULT_PAGE_SIZE: usize = 100;
+
+/// A pagination token naming the VPC id of the last endpoint of the page just returned.
+/// Hex keeps the token opaque to a client and within `PaginationToken`'s 1..8192
+/// length, the same encoding the other listings of this service page their own id
+/// spaces with.
+fn encode_page_token(last_returned_vpc_id: &str) -> String {
+    hex::encode(last_returned_vpc_id)
+}
+
+/// The VPC id a token resumes after, or `None` when the token is not one
+/// [`encode_page_token`] produced.
+///
+/// A decoded value that does not name a position in the VPC-id space (the modelled
+/// `VpcId` pattern) is rejected rather than treated as the start of the list.
+/// Membership in the store is deliberately NOT required: an endpoint deleted between
+/// two pages must still leave its successors reachable, which is what resuming from a
+/// position, rather than from a row, gives.
+fn decode_page_token(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    crate::state::is_vpc_id(&decoded).then_some(decoded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_page_token, encode_page_token};
+
+    /// A token round-trips to the VPC id it was minted from, and a token this service
+    /// never issued is rejected rather than silently treated as the first page.
+    #[test]
+    fn page_tokens_round_trip_and_reject_foreign_tokens() {
+        for vpc_id in ["vpc-0", "vpc-abc", "vpc-0a1b2c3d4e5f67890"] {
+            let token = encode_page_token(vpc_id);
+            let decoded = decode_page_token(&token);
+            assert_eq!(
+                decoded.as_deref(),
+                Some(vpc_id),
+                "case {vpc_id:?}: token {token:?} did not round-trip, got {decoded:?}"
+            );
+        }
+        for foreign in [
+            "not-a-token",
+            "zz",
+            "abc",
+            // Decodes cleanly, but names no position in the VPC-id space.
+            &hex::encode("not-a-vpc-id"),
+            &hex::encode("vpc-"),
+            &hex::encode("VPC-ABC"),
+            // A graph id is a position in another id space.
+            &hex::encode("g-0123456789"),
+        ] {
+            let decoded = decode_page_token(foreign);
+            assert!(
+                decoded.is_none(),
+                "case {foreign:?}: expected rejection, got {decoded:?}"
+            );
+        }
     }
 }

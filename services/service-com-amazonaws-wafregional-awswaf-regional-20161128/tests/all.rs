@@ -55,6 +55,8 @@ mod sql_injection_match_set;
 mod sql_injection_match_set_updates;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/web_acl_association.rs"]
+mod web_acl_association;
 #[path = "all/web_acl_default_action.rs"]
 mod web_acl_default_action;
 #[path = "all/web_acl_end_of_support.rs"]

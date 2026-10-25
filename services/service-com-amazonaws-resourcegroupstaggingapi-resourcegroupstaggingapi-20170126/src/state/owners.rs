@@ -44,6 +44,7 @@ use std::time::SystemTime;
 // workspace resolves them at stays in one place.
 use service_com_amazonaws_ecs_amazonec2containerservicev20141113 as owner_ecs;
 use service_com_amazonaws_eventbridge_awsevents as owner_events;
+use service_com_amazonaws_glue_awsglue as owner_glue;
 use service_com_amazonaws_kms_trentservice as owner_kms;
 use service_com_amazonaws_secretsmanager_secretsmanager as owner_secretsmanager;
 use service_com_amazonaws_sfn_awsstepfunctions as owner_sfn;
@@ -201,6 +202,7 @@ pub fn visit<Eng: Send + Sync + 'static>(
         "sqs" => sqs(engine, arn, change),
         "ecs" => ecs(engine, arn, change),
         "events" => events(engine, arn, change),
+        "glue" => glue(engine, arn, change),
         "kms" => kms(engine, arn, change),
         "secretsmanager" => secretsmanager(engine, arn, change),
         "states" => states(engine, arn, change),
@@ -262,6 +264,15 @@ pub fn tagged_resources<Eng: Send + Sync + 'static>(
             for rule in bus.rules.values() {
                 record(rule.arn.clone(), plain_tag_pairs(&rule.tags));
             }
+        }
+    }
+    if let Some(state) = owner_glue::state::service_state(engine) {
+        // Glue holds the tag set of every resource whose create carries a `Tags` map, so
+        // the tags a create recorded are already this projection's rows: that service's
+        // own records, with the ARN minted for the serving Region (a Glue record carries
+        // no Region of its own, like an EventBridge event bus).
+        for (arn, tags) in state.lock().tagged_resources(region) {
+            record(arn, tags.into_iter().collect());
         }
     }
     if let Some(state) = owner_kms::state::service_state(engine) {
@@ -434,6 +445,68 @@ fn events<Eng: Send + Sync + 'static>(
             }
             Change::Remove(keys) => {
                 stored.retain(|held| !keys.iter().any(|removed| removed == &held.key))
+            }
+        }
+    }
+    Resolution::Present { tags: Some(pairs) }
+}
+
+/// AWS Glue: the Data Catalog databases and connections, crawlers and job definitions
+/// whose create carries a `Tags` map, each of which that service holds the tag set of —
+/// so that set is the one this API reads and writes.
+///
+/// The ARN is resolved against those records by the Glue crate's OWN resolver
+/// ([`owner_glue::state::parse_tagged_resource`] plus `resource_tags_mut`), so the kinds
+/// this API can tag, the record each ARN resolves to and the refusal a missing one gets
+/// are that service's own, with no second copy here to drift from it.
+fn glue<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    arn: &ParsedArn,
+    change: Option<&Change<'_>>,
+) -> Resolution {
+    let Some(state) = owner_glue::state::service_state(engine) else {
+        return Resolution::Unowned;
+    };
+    // A `glue` ARN that resolver does not recognise as a taggable resource of that
+    // service is NOT a missing resource: it is a request Glue refuses, so the
+    // per-resource failure carries that refusal — its own parameter wording under the
+    // code Glue's `TagResource` models for a bad input.
+    let Some(resource) = owner_glue::state::parse_tagged_resource(&arn.arn) else {
+        return absent(
+            "InvalidInputException",
+            owner_glue::state::invalid_resource_arn_message(&arn.arn),
+        );
+    };
+    let mut state = state.lock();
+    // A tag write never brings a resource into being, so an ARN that service holds no
+    // record for is a per-resource failure carrying ITS not-found wording, composed by
+    // that service.
+    let Some(stored) = state.resource_tags_mut(&resource) else {
+        return absent(
+            "EntityNotFoundException",
+            owner_glue::state::tagged_resource_not_found_message(&resource, &arn.arn),
+        );
+    };
+    let mut pairs: Tags = stored
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if let Some(change) = change {
+        if let Err(would_hold) = change.apply(&mut pairs) {
+            return Resolution::TooManyTags(would_hold);
+        }
+        // In place, for the reason `option_tag_list!` gives: a key the change does not
+        // name keeps the exact value Glue stored for it.
+        match change {
+            Change::Upsert { tags: upserts, .. } => {
+                for (key, value) in upserts.iter() {
+                    stored.insert(key.clone(), value.clone());
+                }
+            }
+            Change::Remove(keys) => {
+                for key in keys.iter() {
+                    stored.remove(key);
+                }
             }
         }
     }
