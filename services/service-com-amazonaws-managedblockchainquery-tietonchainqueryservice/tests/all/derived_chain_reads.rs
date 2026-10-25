@@ -33,6 +33,7 @@ use service_com_amazonaws_managedblockchainquery_tietonchainqueryservice::state:
 };
 
 use crate::chain_query_slice::{balance_or_none, drain, hashes, item_identity, Emulator};
+use crate::native_token_denomination::{amount_decimals, amount_units};
 
 /// Every network the model declares, from the model's own `QueryNetwork` enum.
 fn networks() -> Vec<String> {
@@ -100,13 +101,17 @@ fn instant(value: &Value, case: &str) -> i64 {
         as i64
 }
 
-/// A response member that has to be a base-10 integer, as `TokenBalance$balance` is.
-fn integer(value: &Value, case: &str) -> i128 {
-    value
+/// A balance response member, in the token's SMALLEST unit: the model types
+/// `TokenBalance$balance` as a String and the service quotes it in the unit of the token
+/// `token` names (`native_token_denomination.rs`).
+fn amount_of(value: &Value, token: &Value, case: &str) -> i128 {
+    let text = value
         .as_str()
-        .unwrap_or_else(|| panic!("case {case}: expected a string, got {value:?}"))
-        .parse()
-        .unwrap_or_else(|error| panic!("case {case}: expected a base-10 integer: {error}"))
+        .unwrap_or_else(|| panic!("case {case}: expected a string, got {value:?}"));
+    let decimals = amount_decimals(token["contractAddress"].as_str(), token["tokenId"].as_str());
+    amount_units(text, decimals).unwrap_or_else(|| {
+        panic!("case {case}: expected an amount of at most {decimals} decimal places, got {text}")
+    })
 }
 
 /// Every transaction summary the service lists for `address`.
@@ -153,9 +158,8 @@ async fn every_published_account_of_a_mainnet_has_balances_and_a_history() {
                 let reply = emulator.ok("/get-token-balance", &body).await;
 
                 // `balance` and `atBlockchainInstant` are the required output members,
-                // and a balance is a whole number of the token's smallest unit, so it is
-                // never negative.
-                let balance = integer(&reply["balance"], &case);
+                // and a balance is an amount of the token held, so it is never negative.
+                let balance = amount_of(&reply["balance"], &token, &case);
                 assert!(
                     balance >= 0,
                     "case {case}: a balance is not negative, got {balance}"

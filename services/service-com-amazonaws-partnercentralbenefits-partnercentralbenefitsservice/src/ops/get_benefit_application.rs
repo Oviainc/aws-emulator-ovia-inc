@@ -231,7 +231,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             benefit_application_details: application.benefit_application_details.clone(),
             programs: crate::state::BenefitApplication::optional_list(&application.programs),
             status: Some(application.status.clone()),
-            stage: application.stage.clone(),
+            // `Stage` is the workflow position the current status puts the application at
+            // (see `crate::state::stage_for_status`), so it is computed off the stored
+            // status rather than held as a second field that could disagree with it.
+            stage: application.stage(),
             status_reason: application.status_reason.clone(),
             // `StatusReasonCode` is `@deprecated` ("This field is no longer used"), so the
             // list is the only one reported; nothing in this slice sets either.

@@ -195,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let review_templates = page
             .iter()
             .filter_map(|template_arn| store.review_templates.get(template_arn))
-            .map(crate::state::ReviewTemplateRecord::to_summary)
+            .map(|record| record.to_summary(store.review_template_update_status(record)))
             .collect();
 
         Ok(ListReviewTemplatesOutput {

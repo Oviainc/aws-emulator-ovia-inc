@@ -496,6 +496,28 @@ impl ComAmazonawsWafv2Awswaf20190729State {
         Some(entry)
     }
 
+    /// Drop a regex pattern set and every index entry that pointed at it.
+    ///
+    /// `RegexPatternSet$Name` and `$ARN` are modelled as optional, so an entry
+    /// whose stored shape carries neither leaves no index key behind to remove.
+    pub fn remove_regex_pattern_set(
+        &mut self,
+        scope: &str,
+        id: &str,
+    ) -> Option<RegexPatternSetEntry> {
+        let entry = self
+            .regex_pattern_sets
+            .remove(&(scope.to_string(), id.to_string()))?;
+        if let Some(name) = entry.regex_pattern_set.name.clone() {
+            self.regex_pattern_set_names
+                .remove(&(entry.scope.clone(), name));
+        }
+        if let Some(arn) = entry.regex_pattern_set.arn.as_deref() {
+            self.arn_index.remove(arn);
+        }
+        Some(entry)
+    }
+
     /// How many web ACLs this scope already holds. See [`MAX_WEB_ACLS_PER_SCOPE`].
     pub fn web_acls_in_scope(&self, scope: &str) -> usize {
         self.web_acls
@@ -523,6 +545,19 @@ impl ComAmazonawsWafv2Awswaf20190729State {
         let entry = self
             .regex_pattern_sets
             .get(&(scope.to_string(), id.to_string()))?;
+        (entry.regex_pattern_set.name.as_deref() == Some(name)).then_some(entry)
+    }
+
+    /// [`Self::regex_pattern_set`], mutably.
+    pub fn regex_pattern_set_mut(
+        &mut self,
+        scope: &str,
+        name: &str,
+        id: &str,
+    ) -> Option<&mut RegexPatternSetEntry> {
+        let entry = self
+            .regex_pattern_sets
+            .get_mut(&(scope.to_string(), id.to_string()))?;
         (entry.regex_pattern_set.name.as_deref() == Some(name)).then_some(entry)
     }
 
@@ -577,7 +612,7 @@ impl ComAmazonawsWafv2Awswaf20190729State {
     /// `WAFNonexistentItemException` ("WAF couldn’t perform the operation because
     /// your resource doesn't exist") rather than stored for a later `Get` to hand
     /// back as though the reference were live. This is the ingress counterpart of
-    /// [`Self::web_acl_referencing_ip_set`]: the same reference keeps an entity from
+    /// [`Self::web_acl_referencing`]: the same reference keeps an entity from
     /// being deleted and keeps a rule that names a missing one from being stored.
     ///
     /// Each of the model's four reference-bearing statements is resolved against
@@ -686,13 +721,15 @@ impl ComAmazonawsWafv2Awswaf20190729State {
             && matches!(self.arn_index.get(arn), Some(ResourceRef::RuleGroup { .. }))
     }
 
-    /// The live web ACL whose rule tree references `ip_set_arn`, if any.
+    /// The live web ACL whose rule tree references `arn`, if any.
     ///
-    /// An IP set that a web ACL still references cannot be deleted, so this is
-    /// what `DeleteIPSet` consults. It walks the whole tree, because an
-    /// `IPSetReferenceStatement` can sit inside `AndStatement`, `OrStatement`,
+    /// A resource that a web ACL still references cannot be deleted, so this is
+    /// what a delete consults, whatever KIND of resource is being deleted: an ARN
+    /// identifies one resource of one kind, so the walk asks only whether any
+    /// reference statement names this ARN. It walks the whole tree, because a
+    /// reference statement can sit inside `AndStatement`, `OrStatement`,
     /// `NotStatement` or a rate-based/managed-rule-group scope-down statement.
-    pub fn web_acl_referencing_ip_set(&self, ip_set_arn: &str) -> Option<&WebAclEntry> {
+    pub fn web_acl_referencing(&self, arn: &str) -> Option<&WebAclEntry> {
         self.web_acls.values().find(|entry| {
             entry
                 .web_acl
@@ -701,11 +738,7 @@ impl ComAmazonawsWafv2Awswaf20190729State {
                 .unwrap_or_default()
                 .iter()
                 .any(|rule| {
-                    statement_references_ip_set(
-                        &rule.statement,
-                        ip_set_arn,
-                        MAX_STATEMENT_NESTING_DEPTH,
-                    )
+                    statement_references_arn(&rule.statement, arn, MAX_STATEMENT_NESTING_DEPTH)
                 })
         })
     }
@@ -1200,26 +1233,40 @@ pub fn misplaced_rule_group_statement(
     None
 }
 
-/// `true` when `statement`, or anything nested inside it, is an
-/// `IPSetReferenceStatement` for `arn`.
+/// `true` when `statement`, or anything nested inside it, is a reference statement
+/// naming `arn`.
+///
+/// The three reference-bearing statements of this model that name a resource of
+/// this account — `IPSetReferenceStatement`, `RuleGroupReferenceStatement` and
+/// `RegexPatternSetReferenceStatement` — are all checked, because an ARN names one
+/// resource of one kind: whichever kind `arn` belongs to, the statement that could
+/// carry it is the one for that kind, and no other statement can name it.
 ///
 /// `depth_budget` is the number of levels left to descend, so this cannot recurse
 /// further than [`MAX_STATEMENT_NESTING_DEPTH`] even if a tree somehow reached the
 /// store without passing [`validate_statement_nesting`].
-fn statement_references_ip_set(statement: &Statement, arn: &str, depth_budget: u32) -> bool {
+fn statement_references_arn(statement: &Statement, arn: &str, depth_budget: u32) -> bool {
     if depth_budget == 0 {
         return false;
     }
-    if statement
+    let names_arn = statement
         .ip_set_reference_statement
         .as_ref()
         .is_some_and(|reference| reference.arn == arn)
-    {
+        || statement
+            .rule_group_reference_statement
+            .as_ref()
+            .is_some_and(|reference| reference.arn == arn)
+        || statement
+            .regex_pattern_set_reference_statement
+            .as_ref()
+            .is_some_and(|reference| reference.arn == arn);
+    if names_arn {
         return true;
     }
     nested_statements(statement)
         .into_iter()
-        .any(|nested| statement_references_ip_set(nested, arn, depth_budget - 1))
+        .any(|nested| statement_references_arn(nested, arn, depth_budget - 1))
 }
 
 /// A modelled timestamp as milliseconds since the Unix epoch, so a `TimeWindow`
@@ -1533,7 +1580,7 @@ pub const RATE_BASED_CUSTOM_KEYS_WCU: i64 = 30;
 /// The WCU cost of one statement. See [`web_acl_capacity`].
 ///
 /// `depth_budget` bounds the descent exactly as in
-/// [`statement_references_ip_set`]: a caller-supplied tree deeper than
+/// [`statement_references_arn`]: a caller-supplied tree deeper than
 /// [`MAX_STATEMENT_NESTING_DEPTH`] is refused on ingress, and this budget is the
 /// second line of defence so no request can drive the recursion past it.
 fn statement_capacity(

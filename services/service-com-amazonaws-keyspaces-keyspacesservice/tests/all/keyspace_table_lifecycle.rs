@@ -1313,45 +1313,14 @@ async fn requests_that_break_an_unmodelled_rule_are_refused_and_the_rest_accepte
         "ResourceNotFoundException",
     );
 
-    // The ONE member this slice does not serve is refused honestly, with the 501 that says
-    // the feature is not written yet — never accepted and silently dropped. (The other
-    // optional specifications ARE served: `autoScalingSpecification` and
-    // `replicaSpecifications` are reported by `GetTable` /
-    // `GetTableAutoScalingSettings` and `warmThroughputSpecification` by `GetTable` — see
+    // Every optional specification `CreateTable` models is now SERVED — none is refused
+    // with the scaffold's 501: `autoScalingSpecification` and `replicaSpecifications` are
+    // reported by `GetTable` / `GetTableAutoScalingSettings` and
+    // `warmThroughputSpecification` by `GetTable` (see
     // `tests/all/column_types_and_auto_scaling.rs` and
-    // `tests/all/update_table_scaling_settings.rs`.)
-    let unserved: [(&str, Value); 1] = [("cdcSpecification", json!({"status": "ENABLED"}))];
-    for (member, value) in unserved {
-        let mut request = json!({
-            "keyspaceName": keyspace,
-            "tableName": "unserved_member_tbl",
-            "schemaDefinition": minimal_schema("pk"),
-        });
-        request[member] = value;
-        let (status, body) = emulator.call("CreateTable", request).await;
-        assert_eq!(
-            (status, error_code(&body).as_str()),
-            (501, "NotImplemented"),
-            "case {member:?}: an unserved member must be refused as not implemented, \
-             got {status} {body}"
-        );
-        assert!(
-            body["message"].as_str().unwrap_or_default().contains(member),
-            "case {member:?}: the refusal must name the member the caller has to drop: {body}"
-        );
-        // And nothing was stored for it.
-        assert_failure(
-            member,
-            emulator
-                .call(
-                    "GetTable",
-                    json!({"keyspaceName": keyspace, "tableName": "unserved_member_tbl"}),
-                )
-                .await,
-            404,
-            "ResourceNotFoundException",
-        );
-    }
+    // `tests/all/update_table_scaling_settings.rs`), and `cdcSpecification` enables the
+    // table's CDC stream, reported by `GetTable` and served by KeyspacesStreams (see
+    // `tests/all/cdc_streams.rs`).
 
     // The replication rules of CreateKeyspace: "if the replicationStrategy is
     // MULTI_REGION, the regionList requires the current Region and at least one

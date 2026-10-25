@@ -39,6 +39,7 @@ use service_com_amazonaws_managedblockchainquery_tietonchainqueryservice::state:
 use service_com_amazonaws_managedblockchainquery_tietonchainqueryservice::state::is_bitcoin;
 
 use crate::chain_query_slice::{hashes, Emulator, NetworkFixture};
+use crate::native_token_denomination::{amount_decimals, amount_units};
 
 /// Identifiers the fixture ledger does not hold. They satisfy `ChainAddress`'s
 /// `^[-A-Za-z0-9]{13,74}$` and differ in form, length, case and alphabet:
@@ -84,6 +85,12 @@ fn native_token(network: &str) -> &'static str {
     }
 }
 
+/// The decimal places an amount of `network`'s own currency is quoted with; see
+/// [`amount_decimals`].
+fn native_decimals(network: &str) -> u32 {
+    amount_decimals(None, Some(native_token(network)))
+}
+
 /// The items of a list response, under the member `@paginated(items=...)` names.
 fn items(reply: &Value, member: &str) -> Vec<Value> {
     reply[member].as_array().cloned().unwrap_or_default()
@@ -103,14 +110,24 @@ fn instant(value: &Value) -> Option<i64> {
     value["time"].as_f64().map(|secs| secs as i64)
 }
 
-/// The `balance` of a balance response, which the model types as a String and the
-/// service reports as a base-10 integer.
-fn balance(case: &str, reply: &Value) -> i128 {
+/// The `balance` of a balance response, in the token's SMALLEST unit: the model types it
+/// as a String and the service quotes it in the token's own unit, `decimals` places down
+/// (the rule `native_token_denomination.rs` owns).
+fn balance(case: &str, reply: &Value, decimals: u32) -> i128 {
     let raw = reply["balance"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case}: balance is required, got {reply:?}"));
-    raw.parse::<i128>()
-        .unwrap_or_else(|_| panic!("case {case}: expected a base-10 integer balance, got {raw}"))
+    amount_units(raw, decimals).unwrap_or_else(|| {
+        panic!("case {case}: expected an amount of at most {decimals} decimal places, got {raw}")
+    })
+}
+
+/// The amount a balance row reports, in the token's smallest unit, with the decimal places
+/// taken from the token the row's own `tokenIdentifier` names.
+fn row_units(case: &str, row: &Value) -> i128 {
+    let token = &row["tokenIdentifier"];
+    let decimals = amount_decimals(token["contractAddress"].as_str(), token["tokenId"].as_str());
+    balance(case, row, decimals)
 }
 
 /// The instants the ledger's own transactions run between.
@@ -535,7 +552,7 @@ async fn a_native_balance_resolves_now_and_at_instants_across_the_ledgers_life()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("the test clock is after the Unix epoch")
             .as_secs() as i64;
-        let held = balance(&case, &reply);
+        let held = balance(&case, &reply, native_decimals(&network.network));
         assert!(
             held > 0,
             "case {case}: the busiest wallet received more than it sent, so its balance is \
@@ -572,7 +589,7 @@ async fn a_native_balance_resolves_now_and_at_instants_across_the_ledgers_life()
             let mut historical = body.clone();
             historical["atBlockchainInstant"] = json!({"time": at});
             let past = emulator.ok("/get-token-balance", &historical).await;
-            let then = balance(&case, &past);
+            let then = balance(&case, &past, native_decimals(&network.network));
             assert!(
                 then > 0,
                 "case {case}: the wallet held the network's currency at that instant, got \
@@ -629,8 +646,10 @@ async fn a_native_balance_resolves_now_and_at_instants_across_the_ledgers_life()
             "case {case}: one holding matches that filter, got {rows:?}"
         );
         assert_eq!(
-            rows[0]["balance"].as_str(),
-            Some(held.to_string().as_str()),
+            rows[0]["balance"]
+                .as_str()
+                .and_then(|raw| amount_units(raw, native_decimals(&network.network))),
+            Some(held),
             "case {case}: ListTokenBalances must agree with GetTokenBalance ({held}), got \
              {rows:?}"
         );
@@ -684,11 +703,10 @@ async fn an_owner_scoped_listing_returns_the_native_row_and_every_token_row() {
                     Some(network.network.as_str()),
                     "case {case}: every row is on the filtered network, got {row:?}"
                 );
-                let raw = row["balance"].as_str().unwrap_or_default();
+                let units = row_units(&case, row);
                 assert!(
-                    raw.parse::<i128>().is_ok_and(|balance| balance >= 0),
-                    "case {case}: a balance is a base-10 integer and no chain holds a \
-                     negative one, got {raw}"
+                    units >= 0,
+                    "case {case}: no chain holds a negative balance, got {units}"
                 );
             }
             let got: Vec<String> = rows
@@ -774,11 +792,10 @@ async fn a_contract_scoped_listing_returns_the_holders_of_that_contract() {
                     Some(contract.as_str()),
                     "case {case}: every row is a balance of the filtered contract, got {row:?}"
                 );
-                let raw = row["balance"].as_str().unwrap_or_default();
+                let units = row_units(&case, row);
                 assert!(
-                    raw.parse::<i128>().is_ok_and(|balance| balance >= 0),
-                    "case {case}: a balance is a base-10 integer and no chain holds a \
-                     negative one, got {raw}"
+                    units >= 0,
+                    "case {case}: no chain holds a negative balance, got {units}"
                 );
                 let owner = row["ownerIdentifier"]["address"]
                     .as_str()
@@ -805,10 +822,7 @@ async fn a_contract_scoped_listing_returns_the_holders_of_that_contract() {
             // A holder row is a real balance: at least one of them is positive, or the
             // contract has no tokens at all.
             assert!(
-                rows.iter().any(|row| row["balance"]
-                    .as_str()
-                    .and_then(|raw| raw.parse::<i128>().ok())
-                    .is_some_and(|balance| balance > 0)),
+                rows.iter().any(|row| row_units(&case, row) > 0),
                 "case {case}: a contract with holders has a positive balance among them, got \
                  {rows:?}"
             );

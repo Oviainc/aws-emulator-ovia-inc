@@ -1276,6 +1276,85 @@ async fn cdc_is_enabled_only_for_a_modelled_view_type() {
     );
 }
 
+/// RULE: a table's streams are distinct resources, so turning CDC off and straight back
+/// on — with no wait at all, inside one tick of the stream label's resolution — gives
+/// the table a NEW, live stream of its own, and leaves the disabled one exactly as it
+/// was, records and all.
+///
+/// No sleep anywhere: the point is that two streams minted in the same instant cannot
+/// collide, so an enable can never be answered with the stream that was just disabled.
+#[tokio::test]
+async fn disabling_and_immediately_re_enabling_mints_a_distinct_live_stream() {
+    let (engine, _router) = emulator();
+    let state = service_state(&*engine).expect("state");
+    let mut guard = state.lock();
+
+    let mut minted: Vec<String> = Vec::new();
+    // Several cycles back to back, so the case the clock's resolution makes likely —
+    // two of them inside one millisecond — is actually exercised.
+    for cycle in 0..4_u32 {
+        let view_type = STREAM_VIEW_TYPE_VALUES[cycle as usize % STREAM_VIEW_TYPE_VALUES.len()];
+        let case = format!("cycle {cycle} ({view_type})");
+        let stream_arn = guard
+            .enable_stream("us-east-1", "shop", "orders", view_type)
+            .unwrap_or_else(|| panic!("case {case}: a modelled view type must be accepted"));
+        assert!(
+            !minted.contains(&stream_arn),
+            "case {case}: a re-enabled table must get a stream of its own, got \
+             {stream_arn} again"
+        );
+        let live = guard
+            .live_stream_for_table("us-east-1", "shop", "orders")
+            .expect("the stream just enabled is live");
+        assert_eq!(
+            (live.stream_arn.as_str(), live.stream_view_type.as_str()),
+            (stream_arn.as_str(), view_type),
+            "case {case}: the live stream is the one just enabled, publishing its own view"
+        );
+        // One captured change, so a stream that was overwritten rather than kept would
+        // lose a record and be caught below.
+        assert!(
+            guard
+                .append_change_record(&stream_arn, change(&format!("c{cycle}")))
+                .is_some(),
+            "case {case}: a live stream must capture a change"
+        );
+
+        let disabled = guard.disable_stream("us-east-1", "shop", "orders");
+        assert_eq!(
+            disabled.as_deref(),
+            Some(stream_arn.as_str()),
+            "case {case}: disabling must answer with the stream it stopped"
+        );
+        assert!(
+            guard
+                .live_stream_for_table("us-east-1", "shop", "orders")
+                .is_none(),
+            "case {case}: a disabled table has no live stream left"
+        );
+        minted.push(stream_arn);
+    }
+
+    // Every stream of the cycle is still there, each with the one record it captured.
+    for (cycle, stream_arn) in minted.iter().enumerate() {
+        let case = format!("cycle {cycle}");
+        let stream = guard
+            .stream(stream_arn)
+            .unwrap_or_else(|| panic!("case {case}: the stream must still be held"));
+        assert_eq!(
+            stream.shards.iter().map(|shard| shard.records.len()).sum::<usize>(),
+            1,
+            "case {case}: a stream keeps the records it captured, got {:?}",
+            stream.shards
+        );
+        assert!(
+            !stream.is_live(),
+            "case {case}: a disabled stream must not be live, got {}",
+            stream.stream_status
+        );
+    }
+}
+
 /// RULE: a token this service issues stops being usable once it is older than the
 /// lifetime the service documents for it, and each refusal carries the
 /// `ValidationExceptionType` that names which lifetime ran out.
