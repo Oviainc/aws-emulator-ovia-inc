@@ -2217,6 +2217,27 @@ pub struct Bucket {
     /// Private, like `tags` and `encryption`, so the accessor pair below is the only way in
     /// or out.
     replication: Option<crate::ops::types::ReplicationConfiguration>,
+    /// The S3 Intelligent-Tiering configurations the bucket carries, by the id each one is
+    /// identified by — empty while the bucket carries none, which is the state it is
+    /// created in.
+    ///
+    /// A bucket carries MANY of them, not one: "Puts a S3 Intelligent-Tiering
+    /// configuration to the specified bucket. You can have up to 1,000 S3
+    /// Intelligent-Tiering configurations per bucket"
+    /// (`PutBucketIntelligentTieringConfiguration`'s own documentation), and every other
+    /// operation on one names it by "the ID used to identify the S3 Intelligent-Tiering
+    /// configuration" (that request's `Id`) — so the id is the key and a put under an id
+    /// already present replaces that configuration alone.
+    ///
+    /// The MODELLED container is stored whole, for the reason [`Self::replication`] is:
+    /// it is exactly what the put carries and what a read reports back, so a reader
+    /// answers with the configuration the bucket actually carries rather than a re-derived
+    /// copy. A `BTreeMap`, so iterating it IS ascending id order and a listing needs no
+    /// sort step, and a page's resume point is simply the next id in it.
+    ///
+    /// Private, like `tags` and `replication`, so the accessors below are the only way in
+    /// or out.
+    intelligent_tiering: BTreeMap<String, crate::ops::types::IntelligentTieringConfiguration>,
     /// The bucket's website configuration, as `PutBucketWebsite` last set it, or `None`
     /// while no website configuration is associated with the bucket.
     ///
@@ -2484,6 +2505,46 @@ impl Bucket {
         configuration: crate::ops::types::ReplicationConfiguration,
     ) {
         self.replication = Some(configuration);
+    }
+
+    /// Every S3 Intelligent-Tiering configuration the bucket carries, in ascending id
+    /// order — empty for a bucket that carries none.
+    ///
+    /// The order is the store's own (a `BTreeMap` of ids), so two listings of an unchanged
+    /// bucket report the same sequence and a page can resume at the next id.
+    pub fn intelligent_tiering_configurations(
+        &self,
+    ) -> impl Iterator<Item = (&str, &crate::ops::types::IntelligentTieringConfiguration)> + '_
+    {
+        self.intelligent_tiering
+            .iter()
+            .map(|(id, configuration)| (id.as_str(), configuration))
+    }
+
+    /// Associate `configuration` with the bucket under `id`, reporting what that did.
+    ///
+    /// Per-ID, not whole-bucket: `PutBucketIntelligentTieringConfiguration` "puts a S3
+    /// Intelligent-Tiering configuration to the specified bucket" under the `Id` the
+    /// request names, so a put under an id the bucket already carries replaces THAT
+    /// configuration and leaves every other one in place.
+    ///
+    /// A put that would add a NEW id past
+    /// [`MAX_INTELLIGENT_TIERING_CONFIGURATIONS_PER_BUCKET`] writes nothing and reports
+    /// [`IntelligentTieringWrite::ConfigurationCountReached`], which is the published
+    /// ceiling rather than this emulator's own; replacing an id already present is never
+    /// refused by it, since it adds no configuration.
+    pub fn put_intelligent_tiering_configuration(
+        &mut self,
+        id: String,
+        configuration: crate::ops::types::IntelligentTieringConfiguration,
+    ) -> IntelligentTieringWrite {
+        if !self.intelligent_tiering.contains_key(&id)
+            && self.intelligent_tiering.len() >= MAX_INTELLIGENT_TIERING_CONFIGURATIONS_PER_BUCKET
+        {
+            return IntelligentTieringWrite::ConfigurationCountReached;
+        }
+        self.intelligent_tiering.insert(id, configuration);
+        IntelligentTieringWrite::Stored
     }
 
     /// The default encryption rules IN FORCE on the bucket: the ones a
@@ -4088,6 +4149,39 @@ pub const MAX_SERVER_SIDE_ENCRYPTION_RULES: usize = 10;
 /// (`PutBucketReplication`'s own documentation). The lower end is the same sentence: a
 /// configuration naming no rule is not one S3 records.
 pub const MAX_REPLICATION_RULES: usize = 1_000;
+
+/// How many S3 Intelligent-Tiering configurations one bucket may carry.
+///
+/// AWS publishes the bound on the operation that records them: "You can have up to 1,000
+/// S3 Intelligent-Tiering configurations per bucket"
+/// (`PutBucketIntelligentTieringConfiguration`'s own documentation), which the same
+/// documentation's `TooManyConfigurations` error names again as "the 1,000-configuration
+/// limit". A put that would add a configuration past it is refused rather than recorded,
+/// so what one bucket's map holds is bounded whatever a caller does.
+pub const MAX_INTELLIGENT_TIERING_CONFIGURATIONS_PER_BUCKET: usize = 1_000;
+
+/// What [`Bucket::put_intelligent_tiering_configuration`] did, so the handler answers each
+/// outcome without re-deriving it — and cannot reach the stored case without having gone
+/// through the configuration-count check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntelligentTieringWrite {
+    /// The configuration is now the one the bucket carries under that id.
+    Stored,
+    /// The bucket already carries [`MAX_INTELLIGENT_TIERING_CONFIGURATIONS_PER_BUCKET`]
+    /// configurations and this put named a new id; nothing was written.
+    ConfigurationCountReached,
+}
+
+/// The code S3 answers a put that would take a bucket past the configuration limit with:
+/// "TooManyConfigurations … You are attempting to create a new configuration but have
+/// already reached the 1,000-configuration limit"
+/// (`PutBucketIntelligentTieringConfiguration`'s own special errors), under "HTTP 400 Bad
+/// Request Error".
+pub const TOO_MANY_CONFIGURATIONS_CODE: &str = "TooManyConfigurations";
+
+/// The HTTP status [`TOO_MANY_CONFIGURATIONS_CODE`] is rendered with: 400, from that same
+/// special-errors list.
+pub const TOO_MANY_CONFIGURATIONS_STATUS: u16 = 400;
 
 /// The code S3 answers a `GetBucketReplication` for a bucket that has no replication
 /// configuration with: "ReplicationConfigurationNotFoundError - There is no replication

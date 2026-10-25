@@ -19,6 +19,8 @@ mod bucket_cors;
 mod bucket_deletion_emptiness;
 #[path = "all/bucket_encryption.rs"]
 mod bucket_encryption;
+#[path = "all/bucket_intelligent_tiering.rs"]
+mod bucket_intelligent_tiering;
 #[path = "all/bucket_lifecycle.rs"]
 mod bucket_lifecycle;
 #[path = "all/bucket_location.rs"]
