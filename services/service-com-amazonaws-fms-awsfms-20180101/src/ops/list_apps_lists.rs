@@ -142,12 +142,6 @@ impl From<ListAppsListsErrorModeled> for ListAppsListsError {
     }
 }
 
-/// The largest page `ListAppsLists` serves, which is the maximum the model's
-/// `com.amazonaws.fms#PaginationMaxResults` declares for `MaxResults` (range
-/// 1..100). It bounds the response for every caller, and is the same bound
-/// `ListProtocolsLists` applies.
-const MAX_PAGE_SIZE: usize = 100;
-
 /// The `ListAppsLists` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -225,13 +219,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .range(lower..)
             .filter(|(_, record)| record.default_list == input.default_lists);
 
-        // The page is bounded by the modelled `PaginationMaxResults` range
-        // (1..100), clamped rather than only capped so a page can never be
-        // empty-with-a-token (which a client would follow forever) if that
-        // validation ever changes.
-        let page_size = usize::try_from(input.max_results)
-            .unwrap_or(0)
-            .clamp(1, MAX_PAGE_SIZE);
+        // The page is bounded by the one page-size rule every paginated
+        // operation of this service shares ([`crate::state::page_size`]), which
+        // this operation's REQUIRED `MaxResults` resolves through just as an
+        // optional one does.
+        let page_size = crate::state::page_size(Some(input.max_results));
         let apps_lists: Vec<AppsListDataSummary> = remaining
             .by_ref()
             .take(page_size)

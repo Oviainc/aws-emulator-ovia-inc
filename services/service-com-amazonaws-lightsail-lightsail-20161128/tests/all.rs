@@ -115,6 +115,8 @@ mod instance_restore_from_snapshot;
 mod instance_snapshot_listing;
 #[path = "all/instance_snapshot_read.rs"]
 mod instance_snapshot_read;
+#[path = "all/instance_start_addresses.rs"]
+mod instance_start_addresses;
 #[path = "all/load_balancer_delete.rs"]
 mod load_balancer_delete;
 #[path = "all/load_balancer_instance_attachment.rs"]

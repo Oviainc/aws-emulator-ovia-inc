@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTaskInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTaskInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTaskInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -95,6 +86,20 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::ops::Bound;
+use std::time::SystemTime;
+
+/// The list this operation's pagination cursors belong to, so a cursor issued for
+/// another paginated list of this service is refused here.
+const PAGE_KIND: &str = "TaskInstances";
+
+/// The smallest page size the modelled `MaxResults` range allows
+/// (`@range(min: 1, max: 100)`).
+const MIN_PAGE_SIZE: usize = 1;
+
+/// The largest page size that same range allows.
+const MAX_PAGE_SIZE: usize = 100;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -106,6 +111,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mwaaserverless-amazonmw
 // here — hence the `ListTaskInstancesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
+//
+// This set is EXACTLY what the model declares for this operation
+// (`smithy_query(query="operation", operation="ListTaskInstances")`): no
+// `ResourceNotFoundException`, unlike every single-resource operation that resolves the
+// same `WorkflowArn` or `RunId` (`GetWorkflow`, `GetWorkflowRun`, `GetTaskInstance`),
+// which all declare it. A child-resource listing therefore cannot answer a parent it
+// does not hold with that shape — an SDK client has no modelled type to map it onto —
+// so an absent workflow or run is an empty page instead, exactly as in this service's
+// other two child listings.
 #[smithy_macros::operation_error("com.amazonaws.mwaaserverless#ListTaskInstances")]
 #[derive(Debug)]
 pub enum ListTaskInstancesErrorModeled {
@@ -167,32 +181,152 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (ctx, &self.engine);
+        // The endpoint this request was signed for: a regional endpoint resolves only
+        // the workflows created through it.
+        let region = crate::state::request_region(ctx.parts());
 
         // A member value that fails the constraint its model declares is refused
         // first, with the modelled `ValidationException` — `Message`,
         // `Reason: fieldValidationFailed` and a `FieldList` entry naming each
-        // offending member. A well-formed request still reaches the 501 below:
-        // the operation itself is not implemented yet.
+        // offending member.
         validate_input(&input).map_err(|refusal| {
             ListTaskInstancesError::from(ListTaskInstancesErrorModeled::ValidationException(
                 refusal,
             ))
         })?;
 
-        // Implement `ListTaskInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTaskInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". The members listed in `skip_validation` on
-        // `ListTaskInstancesInput` are checked by `validate_input` below; every other
-        // modeled constraint is refused BEFORE this handler runs.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTaskInstances"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTaskInstancesErrorModeled::InternalServerException(InternalServerException {
+                message: "the com.amazonaws.mwaaserverless workflow store is unavailable"
+                    .to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+
+        // The ONE write a read may make: finish every workflow teardown the clock has
+        // already made due, so the task instances of a run under a workflow past its
+        // `DELETING` span are gone with it — the same step every handler that touches
+        // `workflows` takes.
+        store.reap_deleted_workflows(now);
+
+        // The cursor is the IDENTIFIER of the last instance on the previous page, which
+        // is also its position in the order this listing walks, scoped to the RUN whose
+        // instances the walk is over: a cursor minted while walking another run's (or
+        // another workflow's) instances is not a position in this walk, so honouring it
+        // would silently truncate or restart the listing — it is refused, exactly like a
+        // cursor issued for another of this service's lists or one this service never
+        // issued. Decoded BEFORE the lookup so a cursor that is not this walk's is one
+        // refusal whatever the request's references resolve to.
+        let after: Option<String> = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::parse_task_instance_page_token(
+                    PAGE_KIND,
+                    token,
+                    &input.workflow_arn,
+                    &input.run_id,
+                )
+                .ok_or_else(|| {
+                    ListTaskInstancesErrorModeled::ValidationException(
+                        crate::state::invalid_page_token("ListTaskInstances"),
+                    )
+                })?,
+            ),
+        };
+
+        // `MaxResults` carries `@default: 20` and `@range(1..100)`, both applied before
+        // this handler runs, so the value is already a usable page size; it is held to
+        // those published bounds anyway, because a page size of zero would report "this
+        // run has no task instances" for a run that has them — a wrong answer dressed as
+        // success — and the walk must always make progress.
+        let page_size = usize::try_from(input.max_results)
+            .unwrap_or(0)
+            .clamp(MIN_PAGE_SIZE, MAX_PAGE_SIZE);
+
+        // The entity this listing walks is the RUN its `@httpLabel`s name. A workflow
+        // this endpoint does not hold (including one of ANOTHER region) and a workflow
+        // holding no such run both contribute no task instance, so the walk is over an
+        // empty set, which this listing reports as the empty page its output models —
+        // the only failures it may answer are the ones its own error set declares, and a
+        // not-found error is not among them.
+        let run = store
+            .workflow_in(&region, &input.workflow_arn)
+            .and_then(|workflow| workflow.runs.get(&input.run_id));
+        let Some(run) = run else {
+            return Ok(ListTaskInstancesOutput {
+                task_instances: Some(Vec::new()),
+                next_token: None,
+            });
+        };
+
+        // A run holds its instances keyed by `TaskInstanceId`, so the walk is that key's
+        // order — the same set and order `GetWorkflowRun` reports as
+        // `RunDetail.TaskInstances` — resumed immediately after the cursor's identifier.
+        // One item PAST the page is read so a token is issued only when a further
+        // instance really exists, and a client stops without an extra empty round trip.
+        let lower = match after.as_deref() {
+            Some(last) => Bound::Excluded(last),
+            None => Bound::Unbounded,
+        };
+        let mut page: Vec<&crate::state::TaskInstance> = run
+            .task_instances
+            .range::<str, _>((lower, Bound::Unbounded))
+            .map(|(_, task)| task)
+            .take(page_size + 1)
+            .collect();
+        let more = page.len() > page_size;
+        page.truncate(page_size);
+
+        let next_token = match page.last() {
+            Some(last) if more => Some(crate::state::encode_page_token(
+                PAGE_KIND,
+                &crate::state::format_task_instance_listing_key(
+                    &run.workflow_arn,
+                    &run.run_id,
+                    &last.task_instance_id,
+                ),
+            )),
+            _ => None,
+        };
+
+        let task_instances: Vec<TaskInstanceSummary> = page
+            .iter()
+            .copied()
+            .map(|task| summarize(run, task))
+            .collect();
+
+        Ok(ListTaskInstancesOutput {
+            // The page itself — the `@paginated` `items` member — so "no task instances
+            // on this page" is the empty list rather than an absent member.
+            task_instances: Some(task_instances),
+            next_token,
+        })
+    }
+}
+
+/// One stored task instance as the `TaskInstanceSummary` this listing reports.
+///
+/// Every member comes from the stored record, with the three the OWNING RUN decides
+/// (`WorkflowArn`, `RunId`, `WorkflowVersion`) read from that run rather than echoed
+/// from the request, and `DurationInSeconds` derived from the instance's own
+/// `StartedAt`/`EndedAt` — "null if the task is not complete"
+/// (`smithy_query(query="shape", shape="TaskInstanceSummary")`, `DurationInSeconds`) —
+/// so the summary agrees member for member with what `GetTaskInstance` serves from the
+/// same record.
+fn summarize(
+    run: &crate::state::WorkflowRun,
+    task: &crate::state::TaskInstance,
+) -> TaskInstanceSummary {
+    TaskInstanceSummary {
+        workflow_arn: Some(run.workflow_arn.clone()),
+        workflow_version: Some(run.workflow_version.clone()),
+        run_id: Some(run.run_id.clone()),
+        task_instance_id: Some(task.task_instance_id.clone()),
+        status: Some(task.status.clone()),
+        duration_in_seconds: task.duration_in_seconds(),
+        operator_name: task.operator_name.clone(),
     }
 }
 

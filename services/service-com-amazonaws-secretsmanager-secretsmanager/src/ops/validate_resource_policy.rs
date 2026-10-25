@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ValidateResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ValidateResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ValidateResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Validates a resource policy document and reports the outcome: a document that is
+//! not a policy document is refused with `MalformedPolicyDocumentException`, and one
+//! that fails a reported check comes back with `PolicyValidationPassed` false and an
+//! entry naming each failed check. Nothing is persisted.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -165,20 +163,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ValidateResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ValidateResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ValidateResourcePolicy"))
+        // The syntax check of the three this operation documents: a document that
+        // is not a policy document "has syntax errors" and is refused with
+        // `MalformedPolicyDocumentException` rather than reported as a validation
+        // error. A property of the request alone, so it runs before any state is
+        // reached. The grammar is the one every resource policy of this service
+        // has to satisfy; the wording is this operation's own, which reports a
+        // failed check rather than the grammar a document has to meet.
+        let policy = crate::state::parse_resource_policy(&input.resource_policy).map_err(|_| {
+            ValidateResourcePolicyErrorModeled::MalformedPolicyDocumentException(
+                MalformedPolicyDocumentException {
+                    message: Some(crate::state::VALIDATE_SYNTAX_ERROR_MESSAGE.to_string()),
+                },
+            )
+        })?;
+
+        // A resource policy statement names the identities it applies to, and
+        // each of them has to be one that exists; a document whose statements do
+        // not is refused, never reported on.
+        if crate::state::names_unsupported_policy_principal(&policy) {
+            return Err(
+                ValidateResourcePolicyErrorModeled::MalformedPolicyDocumentException(
+                    MalformedPolicyDocumentException {
+                        message: Some(
+                            crate::state::VALIDATE_UNSUPPORTED_PRINCIPAL_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The ARN or name of the secret with the resource-based policy you want
+        // to validate" (`ValidateResourcePolicyRequest$SecretId`) is optional: a
+        // request naming one has it resolved, a request naming none validates the
+        // document on its own.
+        if let Some(secret_id) = input.secret_id.as_deref() {
+            let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+            let mut store = state.lock();
+            // This operation reports on a document and persists nothing. The only
+            // write is one the clock had already made due whether or not anybody
+            // called: dropping secrets whose recovery window has elapsed.
+            let now = ::std::time::SystemTime::now();
+            store.expire_due(now);
+
+            let Some(secret) = store.get(secret_id) else {
+                return Err(ValidateResourcePolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            };
+
+            // "A parameter value is not valid for the current state of the
+            // resource. Possible causes: The secret is scheduled for deletion."
+            if secret.scheduled_for_deletion() {
+                return Err(ValidateResourcePolicyErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::MARKED_FOR_DELETION_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The other two checks the operation documents — broad access to the
+        // secret, and locking a caller out — are REPORTED, not refused: a document
+        // failing either is answered with `PolicyValidationPassed` false and one
+        // entry per failed check, and one failing neither passes with no entries.
+        let validation_errors: Vec<ValidationErrorsEntry> =
+            crate::state::resource_policy_check_failures(&policy)
+                .into_iter()
+                .map(|(check_name, error_message)| ValidationErrorsEntry {
+                    check_name: Some(check_name.to_string()),
+                    error_message: Some(error_message.to_string()),
+                })
+                .collect();
+
+        Ok(ValidateResourcePolicyOutput {
+            policy_validation_passed: validation_errors.is_empty(),
+            validation_errors: Some(validation_errors),
+        })
     }
 }
+
+/// The modelled server error for a request that cannot reach this service's
+/// store. `service_state` answers `None` only when the engine is not the shared
+/// in-memory one, which is a server-side fault, never a bad request.
+fn state_unavailable() -> ValidateResourcePolicyError {
+    ValidateResourcePolicyErrorModeled::InternalServiceError(InternalServiceError {
+        message: Some("the Secrets Manager emulator's state store is unavailable".to_string()),
+    })
+    .into()
+}
+

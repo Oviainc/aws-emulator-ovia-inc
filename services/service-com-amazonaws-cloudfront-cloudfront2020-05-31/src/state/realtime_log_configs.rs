@@ -433,23 +433,10 @@ pub const REALTIME_LOG_CONFIG_IN_USE_MESSAGE: &str =
 /// rule the parent module's `references_cache_policy` states for the other resource a cache
 /// behaviour attaches.
 pub fn references_realtime_log_config(config: &DistributionConfig, arn: &str) -> bool {
-    behavior_realtime_log_config_arns(config).any(|attached| attached == arn)
-}
-
-/// The real-time log configuration ARN every cache behaviour of `config` names — the
-/// default behaviour first, then each ordered one — skipping the behaviours that name none.
-fn behavior_realtime_log_config_arns(
-    config: &DistributionConfig,
-) -> impl Iterator<Item = &str> + '_ {
-    std::iter::once(config.default_cache_behavior.realtime_log_config_arn.as_deref())
-        .chain(
-            config
-                .cache_behaviors
-                .as_ref()
-                .and_then(|behaviors| behaviors.items.as_deref())
-                .unwrap_or_default()
-                .iter()
-                .map(|behavior| behavior.realtime_log_config_arn.as_deref()),
-        )
-        .flatten()
+    super::behavior_attachments(
+        config,
+        |behavior| behavior.realtime_log_config_arn.as_deref(),
+        |behavior| behavior.realtime_log_config_arn.as_deref(),
+    )
+    .any(|attached| attached == arn)
 }

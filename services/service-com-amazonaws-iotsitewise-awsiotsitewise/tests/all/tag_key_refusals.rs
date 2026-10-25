@@ -89,9 +89,10 @@ fn member(body: &Value, name: &str) -> String {
 /// `TagResource` tags, and the one whose tag set a refusal must leave untouched.
 ///
 /// The list is the `tags`-bearing inputs this crate implements (the remaining
-/// `tags`-bearing operations — `CreateProject`, `CreateDashboard`,
-/// `CreateApplication`, `CreateComputationModel` — are still scaffolded 501 stubs
-/// and are left to their own stub issues).
+/// `tags`-bearing operations — `CreateProject` and `CreateDashboard` — are still
+/// scaffolded 501 stubs and are left to their own stub issues;
+/// `CreateApplication` and `CreateComputationModel` are implemented and carry
+/// this same tag-key cover in their own suites).
 async fn targets(router: &MultiServiceRouter) -> (String, Vec<Target>) {
     // A stored asset model: the operation that creates an asset needs one to
     // point at, and the operation that tags an existing resource needs a real

@@ -53,6 +53,8 @@ mod onboarding_job_deletion;
 mod outbound_request_expiration;
 #[path = "all/profile_outbound_requests.rs"]
 mod profile_outbound_requests;
+#[path = "all/region_scoping.rs"]
+mod region_scoping;
 #[path = "all/signing_name_path_claim.rs"]
 mod signing_name_path_claim;
 #[path = "all/state_roundtrip.rs"]

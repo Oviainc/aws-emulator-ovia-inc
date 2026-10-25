@@ -28,11 +28,11 @@
 //! `deliverable_address`, `string`) and the cluster helpers (`base_cluster`,
 //! `cluster_metadata`, `job_metadata`, `listed_job_ids`) are the ones `job_lifecycle`,
 //! `cluster_updates` and `cluster_creation` already drive the service with, so every call
-//! here goes through the same front door a client uses. `ListClusters` is still a scaffold
-//! in this crate, so the clusters the emulator holds are counted in the service's own
-//! store — the store the handler writes, reached the way the service reaches it, exactly
-//! as `cluster_creation` records a long-term pricing there. Everything the rule is about
-//! still travels over the wire.
+//! here goes through the same front door a client uses. The clusters the emulator holds
+//! are counted in the service's own store — the store the handler writes, reached the way
+//! the service reaches it, exactly as `cluster_creation` records a long-term pricing
+//! there — so a refusal that stored a cluster the caller was never given an id for shows
+//! up here. Everything the rule is about still travels over the wire.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -65,9 +65,10 @@ const INITIAL_CLUSTER_SIZE_MAX: i64 = 16;
 
 /// Every cluster id this emulator holds.
 ///
-/// `ListClusters` is still a scaffold in this crate, so the only way to see a cluster the
-/// caller was never given an id for is the service's own store — the store `CreateCluster`
-/// writes, reached the way the service reaches it.
+/// Read from the service's own store — the store `CreateCluster` writes, reached the way
+/// the service reaches it — so a cluster the caller was never given an id for is counted
+/// too. The listing `ListClusters` reports off this same store is what `cluster_listing`
+/// asserts.
 pub(crate) fn stored_cluster_ids(engine: &Arc<engine::InMemoryEngine>) -> BTreeSet<String> {
     let state = service_state(&**engine).expect("the service's store is on this engine");
     let store = state.lock();
