@@ -213,6 +213,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // An identity-provider configuration authenticates users to an Amazon EKS
+        // control plane's API server, and a cluster `RegisterCluster` connected has no
+        // such control plane: the operation does not apply to it, which the
+        // connected-cluster gate reports permanently. It is answered as soon as the
+        // cluster is resolved, before anything in the body is judged against it.
+        if cluster.is_connected() {
+            return Err(
+                AssociateIdentityProviderConfigErrorModeled::ClientException(
+                    crate::state::connected_cluster_refusal(&input.cluster_name),
+                )
+                .into(),
+            );
+        }
+
         // `clientRequestToken` is `@idempotencyToken`: an SDK generates it once per
         // call and RESENDS the same value when it retries, so a retry of the call that
         // started this association is answered with THAT update rather than starting a
