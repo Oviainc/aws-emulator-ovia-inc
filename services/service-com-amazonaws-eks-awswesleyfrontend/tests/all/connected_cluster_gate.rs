@@ -307,6 +307,12 @@ fn probes(cluster: &str) -> Vec<Probe> {
             String::new(),
         ),
         probe(
+            "ActivateCertificateAuthority",
+            "POST",
+            format!("/clusters/{label}/certificate-authorities/probe-ca/activate"),
+            "{}".to_string(),
+        ),
+        probe(
             "StartInsightsRefresh",
             "POST",
             format!("/clusters/{label}/insights-refresh"),

@@ -85,6 +85,10 @@ mod coip_pools;
 mod confirm_product_instance;
 #[path = "all/copy_volumes.rs"]
 mod copy_volumes;
+// What `CreateDhcpOptions` stores: the options a request names, the ones it refuses, and
+// the set a caller created being one `AssociateDhcpOptions` resolves.
+#[path = "all/create_dhcp_options.rs"]
+mod create_dhcp_options;
 #[path = "all/create_security_group.rs"]
 mod create_security_group;
 #[path = "all/dedicated_hosts.rs"]

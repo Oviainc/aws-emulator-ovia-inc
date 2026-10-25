@@ -544,7 +544,8 @@ pub fn normalized_tag_key(key: &str) -> String {
 /// `TagValue` 0..256, the whole store is bounded. A write that would take a plan past
 /// it is refused whole with the modelled `ValidationException` (the only
 /// constraint-refusal error the tagging operations declare — they model no
-/// `ServiceQuotaExceededException`).
+/// `ServiceQuotaExceededException`), worded by [`constraint_report`] like every other
+/// constraint this service states in a handler.
 pub const MAX_TAGS_PER_PLAN: usize = 200;
 
 /// The number of rescore execution plans this emulator holds.

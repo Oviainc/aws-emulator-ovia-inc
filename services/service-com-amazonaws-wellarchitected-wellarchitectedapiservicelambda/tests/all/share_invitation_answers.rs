@@ -42,7 +42,11 @@ use super::workload_harness::Client;
 /// (`smithy_query(query="shape", shape="ShareInvitationAction")`) and both target statuses
 /// are published members of `ShareStatus` (`smithy_query(query="shape",
 /// shape="ShareStatus")`).
-const ANSWERS: [(&str, &str); 2] = [("ACCEPT", "ACCEPTED"), ("REJECT", "REJECTED")];
+///
+/// `pub(crate)` because `super::lens_share_invitation_answers` — the suite for the same
+/// operation on an invitation of the OTHER resource kind this service shares — answers
+/// over the same table and must not keep a second copy of it.
+pub(crate) const ANSWERS: [(&str, &str); 2] = [("ACCEPT", "ACCEPTED"), ("REJECT", "REJECTED")];
 
 /// The `ShareStatus` a share carries while it is still waiting on its invitation.
 const PENDING: &str = "PENDING";
@@ -75,7 +79,12 @@ async fn share_summary(client: &Client, workload_id: &str, share_id: &str, case:
 }
 
 /// The `Status` of one share of one workload.
-async fn share_status(client: &Client, workload_id: &str, share_id: &str, case: &str) -> String {
+pub(crate) async fn share_status(
+    client: &Client,
+    workload_id: &str,
+    share_id: &str,
+    case: &str,
+) -> String {
     member(&share_summary(client, workload_id, share_id, case).await, "Status").to_string()
 }
 
@@ -86,7 +95,11 @@ async fn outstanding(client: &Client, case: &str) -> Vec<String> {
 }
 
 /// Answer one invitation.
-async fn answer(client: &Client, share_invitation_id: &str, action: &str) -> super::workload_harness::Answer {
+pub(crate) async fn answer(
+    client: &Client,
+    share_invitation_id: &str,
+    action: &str,
+) -> super::workload_harness::Answer {
     client
         .update_share_invitation(
             share_invitation_id,

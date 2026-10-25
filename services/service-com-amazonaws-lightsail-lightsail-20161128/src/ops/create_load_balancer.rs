@@ -231,14 +231,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The alternative names are "the optional alternative domains and
         // subdomains to use with your SSL/TLS certificate", so with no
         // certificate there is nothing for them to be used with.
-        let alternative_names = input.certificate_alternative_names.clone().unwrap_or_default();
-        if certificate.is_none() && !alternative_names.is_empty() {
+        let requested_alternatives = input.certificate_alternative_names.clone().unwrap_or_default();
+        if certificate.is_none() && !requested_alternatives.is_empty() {
             return Err(invalid(
                 "certificateAlternativeNames requires certificateName and \
                  certificateDomainName: the alternative names belong to a certificate"
                     .to_string(),
             ));
         }
+        // How many entries the list may carry is bounded before any of them is
+        // read, because the de-duping below examines every one of them.
+        if requested_alternatives.len() > crate::state::MAX_DOMAIN_NAME_LIST_ENTRIES {
+            return Err(invalid(format!(
+                "certificateAlternativeNames carries {} entries, more than the {} this service \
+                 reads for one certificate",
+                requested_alternatives.len(),
+                crate::state::MAX_DOMAIN_NAME_LIST_ENTRIES
+            )));
+        }
+        // "Lightsail will de-dupe the names for you" — reduced through the one
+        // owner of that rule, so the certificate this call stores carries the
+        // same shape as one `CreateLoadBalancerTlsCertificate` stores.
+        let alternative_names = certificate
+            .as_ref()
+            .map(|(_, domain_name)| {
+                crate::state::alternative_domain_names(domain_name, requested_alternatives)
+            })
+            .unwrap_or_default();
         // `LoadBalancer$healthCheckPath` is a `NonEmptyString` (pattern `\S`),
         // so a blank path is not one this load balancer could ever report; an
         // ABSENT one gets the documented root path instead.
@@ -317,14 +336,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // `AttachLoadBalancerTlsCertificate` is what attaches it — which
                 // is why a load balancer created with a certificate still serves
                 // plain `HTTP`.
-                certificate: certificate.map(|(certificate_name, domain_name)| {
-                    crate::state::StoredLoadBalancerCertificate {
-                        name: certificate_name,
-                        domain_name,
-                        alternative_names,
-                        is_attached: false,
-                    }
-                }),
+                // A load balancer may hold
+                // `MAX_CERTIFICATES_PER_LOAD_BALANCER` certificates, and this
+                // call describes at most one of them;
+                // `CreateLoadBalancerTlsCertificate` is what adds another.
+                certificates: certificate
+                    .map(|(certificate_name, domain_name)| {
+                        crate::state::StoredLoadBalancerCertificate {
+                            name: certificate_name,
+                            domain_name,
+                            alternative_names,
+                            is_attached: false,
+                            // `CreateLoadBalancer`'s `tags` are the LOAD
+                            // BALANCER's ("The tag keys and optional values to
+                            // add to the resource during create" — the resource
+                            // this call creates), and it exposes no tags for the
+                            // certificate it was asked for.
+                            tags: Vec::new(),
+                        }
+                    })
+                    .into_iter()
+                    .collect(),
                 // Nothing is registered with a load balancer this call just
                 // created: `AttachInstancesToLoadBalancer` is what registers an
                 // instance with it.

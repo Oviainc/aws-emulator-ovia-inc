@@ -33,6 +33,8 @@ mod query_error_envelope;
 mod resource_tags;
 #[path = "all/rule_deletion_and_condition_value_spellings.rs"]
 mod rule_deletion_and_condition_value_spellings;
+#[path = "all/rule_priorities.rs"]
+mod rule_priorities;
 #[path = "all/shared_endpoint_routing.rs"]
 mod shared_endpoint_routing;
 #[path = "all/ssl_policies.rs"]
