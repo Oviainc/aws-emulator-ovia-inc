@@ -1,0 +1,283 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The inheritance drift an `EnabledBaseline` reports, end to end over HTTP.
+//!
+//! Driven through the same [`MultiServiceRouter`] the production emulator dispatches with,
+//! so what these tests exercise is the wire behaviour a client sees — status codes and JSON
+//! bodies — not the handlers' Rust signatures.
+//!
+//! The rule under test, asserted over a TABLE spanning every baseline the service
+//! publishes rather than one case: a DEPLOYED enablement reports
+//! `driftStatusSummary.types.inheritance.status` exactly when its baseline is one AWS
+//! Control Tower assesses inheritance drift on, and that status is `IN_SYNC` while no
+//! account under the target organizational unit has diverged from the configuration the
+//! enablement applies to it; an enablement whose deployment the clock has not made due
+//! yet, and one of a baseline no inheritance drift is assessed for, carry no
+//! `driftStatusSummary` member at all.
+//!
+//! The table is `state::BASELINE_CATALOG` itself — the catalog `ListBaselines`/`GetBaseline`
+//! publish — so every baseline is covered, including the ones whose drift AWS does not
+//! assess, and a retune of the catalog retunes these cases. Which baselines are assessed
+//! comes from the model: `EnabledBaselineDriftTypes`
+//! (`smithy_query(query="shape", shape="EnabledBaselineDriftTypes")`) documents that
+//! Control Tower detects inheritance drift on the enabled baselines that target OUs and
+//! not on the ones that apply to the landing zone, which is the catalog's
+//! `detects_inheritance_drift` flag the service reads through
+//! `state::assesses_inheritance_drift`. The status value set (`IN_SYNC` | `DRIFTED`) comes
+//! from `smithy_query(query="shape", shape="EnabledBaselineDriftStatus")`.
+
+use smithy_server_runtime::MultiServiceRouter;
+
+use service_com_amazonaws_controltower_awscontroltowerapis::state::{
+    assesses_inheritance_drift, CatalogBaseline, BASELINE_CATALOG,
+};
+
+use crate::baseline_catalog::served_arn;
+use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, Answer};
+
+/// The ARN the service serves `baseline` under, in the region these tests sign for. The
+/// sibling `baseline_catalog` suite owns that form, so the two cannot disagree about it.
+fn baseline_identifier(baseline: &CatalogBaseline) -> String {
+    served_arn(baseline)
+}
+
+/// POST `/enable-baseline` for one catalog baseline on its own organizational unit, at the
+/// NEWEST version that baseline offers.
+async fn enable(router: &MultiServiceRouter, baseline: &CatalogBaseline, index: usize) -> Answer {
+    let version = baseline
+        .versions
+        .last()
+        .expect("every catalog baseline offers at least one version");
+    call(
+        router,
+        "/enable-baseline",
+        serde_json::json!({
+            "baselineIdentifier": baseline_identifier(baseline),
+            "baselineVersion": version,
+            "targetIdentifier":
+                format!("arn:aws:organizations::123456789012:ou/o-exampleorg/ou-dr11-{index:04}"),
+        }),
+    )
+    .await
+}
+
+/// `GetEnabledBaseline`'s `enabledBaselineDetails` for `identifier`, asserting it resolved.
+async fn details(router: &MultiServiceRouter, case: &str, identifier: &str) -> serde_json::Value {
+    let got = call(
+        router,
+        "/get-enabled-baseline",
+        serde_json::json!({ "enabledBaselineIdentifier": identifier }),
+    )
+    .await;
+    assert_eq!(
+        got.status, 200,
+        "case {case:?}: get-enabled-baseline expected 200, got {} body {:?}",
+        got.status, got.body
+    );
+    got.get("enabledBaselineDetails").clone()
+}
+
+/// The `driftStatusSummary` member of a reported record, absent as `None`.
+fn drift_summary(record: &serde_json::Value) -> Option<serde_json::Value> {
+    record.get("driftStatusSummary").cloned()
+}
+
+/// The drift summary a deployed enablement of `baseline` must report: the whole member as
+/// the model nests it (`driftStatusSummary.types.inheritance.status`) for a baseline whose
+/// inheritance drift AWS assesses, and nothing at all for one it does not.
+fn expected_summary(baseline: &CatalogBaseline) -> Option<serde_json::Value> {
+    assesses_inheritance_drift(&baseline_identifier(baseline)).then(|| {
+        serde_json::json!({ "types": { "inheritance": { "status": "IN_SYNC" } } })
+    })
+}
+
+/// RULE: a deployed enablement reports an inheritance drift status exactly when its
+/// baseline is one AWS Control Tower assesses inheritance drift on, and that status is
+/// `IN_SYNC` for an enablement nothing has diverged from; an enablement still being
+/// deployed reports no drift summary, because drift is a property of a deployed
+/// configuration.
+#[tokio::test]
+async fn a_deployed_enablement_reports_the_inheritance_drift_of_its_baseline() {
+    let router = emulator();
+
+    // Every baseline the catalog publishes, each on its own target so the rows do not
+    // interact.
+    let mut rows: Vec<(&CatalogBaseline, String)> = Vec::new();
+    for (index, baseline) in BASELINE_CATALOG.iter().enumerate() {
+        let enabled = enable(&router, baseline, index).await;
+        assert_eq!(
+            enabled.status, 200,
+            "case {:?}: enable-baseline expected 200, got {} body {:?}",
+            baseline.name, enabled.status, enabled.body
+        );
+        rows.push((baseline, enabled.string("arn")));
+    }
+    assert!(
+        rows.len() >= 2,
+        "the catalog must publish at least two baselines for this table to span the rule, \
+         got {}",
+        rows.len()
+    );
+
+    // While the enablement's operation is in flight nothing is deployed yet, so no drift
+    // is assessed for any baseline — not even one AWS assesses drift on.
+    for (baseline, arn) in &rows {
+        let detail = details(&router, baseline.name, arn).await;
+        assert_eq!(
+            drift_summary(&detail),
+            None,
+            "case {:?}: expected no driftStatusSummary while the enablement is in flight, \
+             got {detail:?}",
+            baseline.name
+        );
+    }
+
+    // The clock makes every enablement due; nothing sleeps server-side, the wait is the
+    // test's.
+    tokio::time::sleep(past_the_settle_span()).await;
+
+    for (baseline, arn) in &rows {
+        let expected = expected_summary(baseline);
+        let detail = details(&router, baseline.name, arn).await;
+        assert_eq!(
+            detail
+                .get("statusSummary")
+                .and_then(|summary| summary.get("status"))
+                .and_then(serde_json::Value::as_str),
+            Some("SUCCEEDED"),
+            "case {:?}: expected the enablement to be deployed before its drift is read, \
+             got {detail:?}",
+            baseline.name
+        );
+        assert_eq!(
+            drift_summary(&detail),
+            expected,
+            "case {:?}: expected driftStatusSummary {expected:?} for a deployed \
+             enablement, got {detail:?}",
+            baseline.name
+        );
+
+        // A report does not disturb what a later caller sees: the drift summary is the
+        // same on a second read.
+        let again = details(&router, baseline.name, arn).await;
+        assert_eq!(
+            drift_summary(&again),
+            expected,
+            "case {:?}: expected the drift summary to be stable across reads, got \
+             {again:?}",
+            baseline.name
+        );
+
+        // `parentIdentifier` stays absent whatever the drift is: every enablement here is
+        // applied to an organizational unit, so none is the child of another one.
+        assert!(
+            detail.get("parentIdentifier").is_none(),
+            "case {:?}: an OU-level enablement inherits from nothing, so it carries no \
+             parentIdentifier, got {detail:?}",
+            baseline.name
+        );
+    }
+}
+
+/// RULE (the same one, through the other reporting operation): `ListEnabledBaselines`
+/// reports the drift summary of the record it lists, so the listing and
+/// `GetEnabledBaseline` agree member for member — before and after an update, which
+/// changes the version and parameters applied but not which baseline is enabled and so not
+/// whether its drift is assessed.
+#[tokio::test]
+async fn the_listing_and_an_update_report_the_same_drift_summary() {
+    let router = emulator();
+
+    // The rows that can be UPDATED are the ones whose baseline offers a second version, so
+    // the update asks for a version the baseline really offers; the rest are enabled too,
+    // so the listing still spans the whole catalog.
+    let mut rows: Vec<(&CatalogBaseline, String)> = Vec::new();
+    for (index, baseline) in BASELINE_CATALOG.iter().enumerate() {
+        let enabled = enable(&router, baseline, index).await;
+        assert_eq!(
+            enabled.status, 200,
+            "case {:?}: enable-baseline expected 200, got {} body {:?}",
+            baseline.name, enabled.status, enabled.body
+        );
+        rows.push((baseline, enabled.string("arn")));
+    }
+
+    tokio::time::sleep(past_the_settle_span()).await;
+
+    let listed = call(&router, "/list-enabled-baselines", serde_json::json!({})).await;
+    assert_eq!(
+        listed.status, 200,
+        "list-enabled-baselines expected 200, got {} body {:?}",
+        listed.status, listed.body
+    );
+    let summaries = crate::enabled_control_lifecycle::entries(listed.get("enabledBaselines"));
+
+    for (baseline, arn) in &rows {
+        let expected = expected_summary(baseline);
+        let summary = summaries
+            .iter()
+            .find(|entry| entry.get("arn").and_then(serde_json::Value::as_str) == Some(arn))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        assert_eq!(
+            drift_summary(&summary),
+            expected,
+            "case {:?}: expected the listing to report driftStatusSummary {expected:?}, \
+             got {summary:?}",
+            baseline.name
+        );
+
+        // An update re-applies the baseline at another version it offers: the enablement
+        // goes back to UNDER_CHANGE, and the drift already assessed stays reported rather
+        // than being withdrawn or re-derived as a status the model does not declare.
+        let newest = baseline
+            .versions
+            .last()
+            .copied()
+            .expect("every catalog baseline offers at least one version");
+        let Some(other_version) = baseline
+            .versions
+            .iter()
+            .copied()
+            .find(|version| *version != newest)
+        else {
+            continue;
+        };
+        let updated = call(
+            &router,
+            "/update-enabled-baseline",
+            serde_json::json!({
+                "enabledBaselineIdentifier": arn,
+                "baselineVersion": other_version,
+            }),
+        )
+        .await;
+        assert_eq!(
+            updated.status, 200,
+            "case {:?}: update-enabled-baseline expected 200, got {} body {:?}",
+            baseline.name, updated.status, updated.body
+        );
+        let in_flight = details(&router, baseline.name, arn).await;
+        assert_eq!(
+            drift_summary(&in_flight),
+            expected,
+            "case {:?}: expected the assessed drift summary {expected:?} to survive an \
+             update in flight, got {in_flight:?}",
+            baseline.name
+        );
+    }
+
+    tokio::time::sleep(past_the_settle_span()).await;
+
+    for (baseline, arn) in &rows {
+        let expected = expected_summary(baseline);
+        let detail = details(&router, baseline.name, arn).await;
+        assert_eq!(
+            drift_summary(&detail),
+            expected,
+            "case {:?}: expected driftStatusSummary {expected:?} once the update is due, \
+             got {detail:?}",
+            baseline.name
+        );
+    }
+}
