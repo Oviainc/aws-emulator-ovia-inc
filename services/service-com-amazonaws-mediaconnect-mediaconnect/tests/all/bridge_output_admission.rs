@@ -27,9 +27,23 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
-use crate::bridge_lifecycle::{create_bridge, describe_bridge, minted_gateway_arn};
+use crate::bridge_lifecycle::{create_bridge, describe_bridge, minted_flow_arn, minted_gateway_arn};
 use crate::bridge_members_and_deletion::{add_outputs, network_output, network_source};
 use crate::flow_lifecycle::Emulator;
+
+/// The one source every create below carries, of the kind the bridge's own direction
+/// admits: a cloud-to-ground (egress) bridge's content "comes from an existing MediaConnect
+/// flow", a ground-to-cloud (ingress) bridge's "originates at your premises".
+fn admitted_source(bridge_type: &Value) -> Value {
+    if bridge_type.get("egressGatewayBridge").is_some() {
+        json!({ "flowSource": {
+            "flowArn": minted_flow_arn(1, "flow-output-admission"),
+            "name": "src",
+        }})
+    } else {
+        network_source("src", 5_000, "rtp")
+    }
+}
 
 /// `created` outputs for a create request and `added` ones for a later add request, named
 /// apart so no name is ever in use twice on one bridge.
@@ -179,7 +193,7 @@ async fn only_a_cloud_to_ground_bridge_takes_the_outputs_a_request_configures() 
         let mut body = json!({
             "name": format!("bridge-admission-{index}"),
             "placementArn": placement,
-            "sources": [network_source("src", 5_000, "rtp")],
+            "sources": [admitted_source(&bridge_type)],
         });
         for (member, settings) in bridge_type.as_object().expect("a bridge-type member") {
             body[member] = settings.clone();

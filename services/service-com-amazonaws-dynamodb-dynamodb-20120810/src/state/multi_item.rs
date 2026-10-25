@@ -89,6 +89,53 @@ pub const CANCELLATION_CODE_CONDITION_FAILED: &str = "ConditionalCheckFailed";
 /// refused.
 pub const CANCELLATION_CODE_VALIDATION_ERROR: &str = "ValidationError";
 
+/// The clause every refusal of a parameter value in this service opens with, which the
+/// documented `ValidationError` cancellation reason also states ("Message: One or more
+/// parameter values were invalid").
+pub const INVALID_PARAMETER_CLAUSE: &str = "One or more parameter values were invalid";
+
+/// What a transaction reports when IT refused ONE of its elements while preparing that
+/// element against its table: the `TransactionCanceledException` message and the
+/// `CancellationReasons`, which name the element at `at` with
+/// [`CANCELLATION_CODE_VALIDATION_ERROR`] and `detail`, and every other element of
+/// `elements` with [`CANCELLATION_CODE_NONE`] and no message, since nothing was wrong
+/// with those ("Cancellation reason codes and possible error messages").
+///
+/// `detail` is stated behind [`INVALID_PARAMETER_CLAUSE`], the clause the documented
+/// reason opens with, the way every other validation refusal of a parameter value in
+/// this service words it. Every transactional operation that prepares elements against a
+/// table reaches this, so the documented reason shape has one implementation.
+pub fn cancelled_by_element_reasons(
+    at: usize,
+    elements: usize,
+    detail: &str,
+) -> (String, Vec<CancellationReason>) {
+    let detail = if detail.starts_with(INVALID_PARAMETER_CLAUSE) {
+        detail.to_string()
+    } else {
+        format!("{INVALID_PARAMETER_CLAUSE}: {detail}")
+    };
+    let codes: Vec<&str> = (0..elements)
+        .map(|element| {
+            if element == at {
+                CANCELLATION_CODE_VALIDATION_ERROR
+            } else {
+                CANCELLATION_CODE_NONE
+            }
+        })
+        .collect();
+    let reasons: Vec<CancellationReason> = codes
+        .iter()
+        .enumerate()
+        .map(|(element, code)| CancellationReason {
+            code: Some((*code).to_string()),
+            message: (element == at).then(|| detail.clone()),
+            item: None,
+        })
+        .collect();
+    (transaction_cancelled_message(&codes), reasons)
+}
+
 /// What a transactional read or write costs relative to the same single-item one:
 /// "Transactional write requests require two write capacity units" and "Transactional
 /// read requests require two read capacity units to perform one read per second for
@@ -100,6 +147,18 @@ pub const TRANSACTIONAL_CAPACITY_FACTOR: f64 = 2.0;
 /// completed. After 10 minutes, any request with the same client token is treated as a
 /// new request" (`TransactWriteItems$ClientRequestToken`).
 pub const TRANSACTION_IDEMPOTENCY_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// How a repeat of a `ClientRequestToken` carrying different actions is refused.
+///
+/// The modelled error says what happened — "DynamoDB rejected the request because you
+/// retried a request with a different payload but with an idempotent token that was
+/// already used" (`IdempotentParameterMismatchException`) — and the service states it in
+/// the one fixed sentence below, which names the token's window and nothing of the
+/// request that was sent. Shared by every operation a token makes idempotent, because it
+/// is one refusal.
+pub const IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE: &str =
+    "Specified idempotent token was used with different request parameters within the idempotency \
+     window";
 
 /// How many `ClientRequestToken`s this emulator remembers at once.
 ///

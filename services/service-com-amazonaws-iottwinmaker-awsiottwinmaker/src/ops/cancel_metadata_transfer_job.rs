@@ -163,7 +163,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             metadata_transfer_job_id = %input.metadata_transfer_job_id,
             "serving a request"
         );
-        let _ = ctx;
+        // The Region this request is signed for picks the store it acts on: a
+        // job created through another Region's endpoint is not in it, so this
+        // call cannot cancel it.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CancelMetadataTransferJobErrorModeled::InternalServerException(
                 InternalServerException {
@@ -172,6 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let mut state = state.lock();
+        let state = state.region_mut(&region);
 
         let Some(job) = state
             .metadata_transfer_jobs

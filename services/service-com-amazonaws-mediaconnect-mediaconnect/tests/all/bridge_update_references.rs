@@ -85,10 +85,13 @@ fn unheld_flow_arn() -> String {
 /// The bridge every case addresses, its placement gateway and the flows it may name.
 struct Fixture {
     /// An INGRESS bridge on the placement gateway, carrying one network source (`net-src`,
-    /// on `net-1`) and one flow source (`flow-src`, on [`Self::held_flow`]).
+    /// on `net-1`): a ground-to-cloud bridge's content originates at your premises, so a
+    /// network source is the kind it ingests.
     ingress_arn: String,
-    /// An EGRESS bridge on the same gateway, carrying one network output (`net-out`, on
-    /// `net-1`): the only bridge kind a request configures a network output on.
+    /// An EGRESS bridge on the same gateway, carrying one flow source (`flow-src`, on
+    /// [`Self::held_flow`]) and one network output (`net-out`, on `net-1`): a
+    /// cloud-to-ground bridge is the kind that takes its content from a cloud flow and the
+    /// only kind a request configures a network output on.
     egress_arn: String,
     /// The flow the ingress bridge's flow source starts on, and a second one an update may
     /// point it at.
@@ -131,7 +134,6 @@ async fn fixture(emulator: &Emulator) -> Fixture {
                     "port": 5000,
                     "protocol": "rtp",
                 }},
-                { "flowSource": { "flowArn": held_flow, "name": "flow-src" }},
             ],
         }),
     )
@@ -364,7 +366,7 @@ async fn a_flow_source_can_only_be_pointed_at_a_flow_the_account_holds() {
     for flow_arn in [&fixture.other_held_flow, &fixture.held_flow] {
         let (status, code, answered) = update_source(
             &emulator,
-            &fixture.ingress_arn,
+            &fixture.egress_arn,
             "flow-src",
             json!({ "flowSource": { "flowArn": flow_arn } }),
         )
@@ -375,7 +377,7 @@ async fn a_flow_source_can_only_be_pointed_at_a_flow_the_account_holds() {
             "case {flow_arn:?}: a flow the account holds is accepted, got {status} {code:?}: \
              {answered}"
         );
-        let stored = described_source(&emulator, &fixture.ingress_arn, "flow-src").await;
+        let stored = described_source(&emulator, &fixture.egress_arn, "flow-src").await;
         assert_eq!(
             stored["flowSource"]["flowArn"].as_str(),
             Some(flow_arn.as_str()),
@@ -384,7 +386,7 @@ async fn a_flow_source_can_only_be_pointed_at_a_flow_the_account_holds() {
         );
     }
 
-    let before = described_source(&emulator, &fixture.ingress_arn, "flow-src").await;
+    let before = described_source(&emulator, &fixture.egress_arn, "flow-src").await;
     let cases: Vec<(&str, String)> = vec![
         ("an ARN this account never minted", unheld_flow_arn()),
         (
@@ -400,7 +402,7 @@ async fn a_flow_source_can_only_be_pointed_at_a_flow_the_account_holds() {
     for (case, flow_arn) in cases {
         let (status, code, parsed) = update_source(
             &emulator,
-            &fixture.ingress_arn,
+            &fixture.egress_arn,
             "flow-src",
             json!({ "flowSource": {
                 "flowArn": flow_arn,
@@ -409,7 +411,7 @@ async fn a_flow_source_can_only_be_pointed_at_a_flow_the_account_holds() {
         )
         .await;
         assert_refused(case, status, code.as_deref(), &parsed);
-        let after = described_source(&emulator, &fixture.ingress_arn, "flow-src").await;
+        let after = described_source(&emulator, &fixture.egress_arn, "flow-src").await;
         assert_eq!(
             after, before,
             "case {case:?}: a refused update writes nothing, not even the VPC interface \

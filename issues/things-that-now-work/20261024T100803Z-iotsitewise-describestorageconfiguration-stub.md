@@ -23,3 +23,15 @@ The handler carries the scaffold marker `//! SCAFFOLDED, NOT IMPLEMENTED:` at th
 
 1. Boot the iotsitewise emulator
 2. Call DescribeStorageConfiguration and observe HTTP 501 with no state persisted
+
+## Resolution
+
+Implemented alongside `PutStorageConfiguration`, which it proves the round trip
+for (see
+`issues/things-that-now-work/20261024T100803Z-iotsitewise-putstorageconfiguration-stub.md`).
+The storage configuration is one account-wide record in `src/state.rs`; this
+operation only READS it — an account no put has configured is reported from the
+documented defaults without being materialised, so a describe cannot change what
+a later caller sees — and `lastUpdateDate` is reported only once a put has
+recorded one. `tests/all/storage_configuration.rs` covers both operations end to
+end.

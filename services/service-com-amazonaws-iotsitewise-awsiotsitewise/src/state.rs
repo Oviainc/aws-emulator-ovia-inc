@@ -81,15 +81,18 @@ use crate::ops::types::{
     AssetPropertyValue, AssetStatus, AssetSummary, ComputationModelConfiguration,
     ComputationModelDataBindingValue, ComputationModelStatus, ComputeNode,
     ComputeNodeExecutionDetails,
-    ComputeNodeExecutionStatus, ConfigurationStatus, DatasetConfig, DatasetSource, DatasetStatus,
+    ComputeNodeExecutionStatus, ConfigurationStatus, CustomerManagedS3Storage, DatasetConfig,
+    DatasetSource, DatasetStatus,
     ExecutionEnvironmentVariables, ExecutionStatus, ExecutionSummary, ExportErrorReportLocation,
     ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform, HierarchyMapping, Identity,
-    ImageLocation, LoggingOptions, Mount, MountOverrides, PipelineExecutionStatus, PortalStatus,
+    ImageLocation, LoggingOptions, Mount, MountOverrides, MultiLayerStorage,
+    PipelineExecutionStatus, PortalStatus,
     PortalTypeEntry, ProcessingInput, PropertyMapping, PropertyType, QueryStatistics, QuerySummary,
-    ResolveTo, Resource, ResourceStatus, SearchFilters, TargetResource, TaskConfiguration,
-    TimeInNanos, TrimSettings, Variant, WorkspaceEncryptionConfiguration,
-    WorkspaceEncryptionConfigurationInfo, WorkspaceStatus, ENCRYPTION_TYPE_VALUES,
-    VIDEO_DATA_TYPE_VALUES,
+    ResolveTo, Resource, ResourceStatus, RetentionPeriod, SearchFilters, TargetResource,
+    TaskConfiguration, TimeInNanos, TrimSettings, Variant, WarmTierRetentionPeriod,
+    WorkspaceEncryptionConfiguration, WorkspaceEncryptionConfigurationInfo, WorkspaceStatus,
+    DISASSOCIATED_DATA_STORAGE_STATE_VALUES, ENCRYPTION_TYPE_VALUES, STORAGE_TYPE_VALUES,
+    VIDEO_DATA_TYPE_VALUES, WARM_TIER_STATE_VALUES,
 };
 
 /// The `iotsitewise` ARN service namespace, as `OPERATIONS.md` reports it.
@@ -3249,6 +3252,11 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// has configured, which reports [`ENCRYPTION_TYPE_SITEWISE_DEFAULT`] without storing
     /// anything — see [`Self::default_encryption_configuration`].
     pub default_encryption: Option<DefaultEncryptionRecord>,
+    /// The account's storage configuration, as the last
+    /// `PutStorageConfiguration` left it. `None` is an account nothing has
+    /// configured, which reports the hot-tier default WITHOUT storing anything —
+    /// see [`Self::storage_configuration`].
+    pub storage: Option<StorageConfigurationRecord>,
     /// Dataset export jobs by [`dataset_export_job_key`] — the workspace they
     /// were created in and their own id — because every operation on a job
     /// addresses it within a workspace.
@@ -5792,14 +5800,24 @@ pub struct DefaultEncryptionRecord {
     pub active_at: SystemTime,
 }
 
+/// The `ConfigurationState` a configuration whose transition falls due at
+/// `active_at` reports at `now`: in force from that instant, and being applied
+/// until it.
+///
+/// Every account-wide setting this service keeps settles the same way, so the
+/// one rule is read from here rather than restated per setting.
+pub fn configuration_state(active_at: SystemTime, now: SystemTime) -> &'static str {
+    if now >= active_at {
+        CONFIGURATION_STATE_ACTIVE
+    } else {
+        CONFIGURATION_STATE_UPDATE_IN_PROGRESS
+    }
+}
+
 impl DefaultEncryptionRecord {
     /// The `ConfigurationState` this configuration reports at `now`.
     pub fn state(&self, now: SystemTime) -> &'static str {
-        if now >= self.active_at {
-            CONFIGURATION_STATE_ACTIVE
-        } else {
-            CONFIGURATION_STATE_UPDATE_IN_PROGRESS
-        }
+        configuration_state(self.active_at, now)
     }
 }
 
@@ -6169,6 +6187,337 @@ fn check_binding_value(
         check_binding_value(variable, element, depth + 1)?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The account's storage configuration
+//
+// `PutStorageConfiguration` "configures storage settings for IoT SiteWise" and
+// `DescribeStorageConfiguration` "retrieves information about the storage
+// configuration": ONE account-wide setting rather than a resource, so the
+// record it is kept in, the rules a selection is read against, and what the two
+// operations report all live here once, the way the default encryption
+// configuration above does.
+// ---------------------------------------------------------------------------
+
+/// The `StorageType` that keeps data in the service-managed hot tier.
+///
+/// Source: `smithy_query(query="shape", shape="StorageType")` — the enum holds
+/// exactly this value and [`STORAGE_TYPE_MULTI_LAYER`]. It is also the tier an
+/// account nothing has configured stores into, which is what the `storageType`
+/// documentation states of it ("IoT SiteWise saves your data into the hot tier").
+pub const STORAGE_TYPE_SITEWISE_DEFAULT: &str = "SITEWISE_DEFAULT_STORAGE";
+
+/// The `StorageType` that keeps data in the hot tier AND in a customer managed
+/// Amazon S3 bucket (the cold tier); see [`STORAGE_TYPE_SITEWISE_DEFAULT`].
+pub const STORAGE_TYPE_MULTI_LAYER: &str = "MULTI_LAYER_STORAGE";
+
+/// The `DisassociatedDataStorageState` / `WarmTierState` value that turns one of
+/// those features on. Both enums hold exactly this value and
+/// [`STORAGE_STATE_DISABLED`]
+/// (`smithy_query(query="shape", shape="DisassociatedDataStorageState,WarmTierState")`).
+pub const STORAGE_STATE_ENABLED: &str = "ENABLED";
+
+/// The value that turns one of them off; see [`STORAGE_STATE_ENABLED`].
+pub const STORAGE_STATE_DISABLED: &str = "DISABLED";
+
+/// Whether NULL and NaN ingestion is disallowed for an account whose
+/// configuration does not name it, as `disallowIngestNullNaN`'s own
+/// documentation states it: "By default the feature is allowed. The feature is
+/// disallowed if the value is true."
+pub const DEFAULT_DISALLOW_INGEST_NULL_NAN: bool = false;
+
+/// What a caller selects a storage configuration with: the members
+/// `PutStorageConfiguration` carries, as ONE value, so the rules over them and
+/// the store that keeps them name a single thing rather than seven.
+#[derive(Debug, Clone, Default)]
+pub struct StorageConfigurationSelection {
+    /// The modelled `storageType`, required on the wire.
+    pub storage_type: String,
+    /// The modelled `multiLayerStorage` — the cold-tier destination, which only
+    /// [`STORAGE_TYPE_MULTI_LAYER`] has one.
+    pub multi_layer_storage: Option<MultiLayerStorage>,
+    /// The modelled `disassociatedDataStorage`.
+    pub disassociated_data_storage: Option<String>,
+    /// The modelled `retentionPeriod` — how long the hot tier keeps data.
+    pub retention_period: Option<RetentionPeriod>,
+    /// The modelled `warmTier`.
+    pub warm_tier: Option<String>,
+    /// The modelled `warmTierRetentionPeriod`.
+    pub warm_tier_retention_period: Option<WarmTierRetentionPeriod>,
+    /// The modelled `disallowIngestNullNaN`.
+    pub disallow_ingest_null_na_n: Option<bool>,
+}
+
+/// Refuse a storage configuration this service cannot accept, in the wording the
+/// refusal carries; `Ok` for one it can.
+///
+/// The rules the shapes state, over the selection as a whole:
+///
+/// * `storageType` is a `StorageType`, `disassociatedDataStorage` a
+///   `DisassociatedDataStorageState` and `warmTier` a `WarmTierState`, each read
+///   against the generated, model-synced value table the way
+///   `PutLoggingOptions` reads its own enum's;
+/// * "If you specified MULTI_LAYER_STORAGE for the storage type, you must
+///   specify a MultiLayerStorage object", whose two members carry an ARN each;
+/// * a retention period names either a number of days or that it is unlimited —
+///   "If you specified a value for this parameter, the `unlimited` parameter
+///   must be `false`" and "If configured to `true`, you must not specify a value
+///   for the `numberOfDays` parameter";
+/// * a `warmTierRetentionPeriod` is set "only if cold tier is enabled", as the
+///   member's own documentation states — the cold tier being the customer
+///   managed bucket [`STORAGE_TYPE_MULTI_LAYER`] keeps a copy in.
+///
+/// Refusing a `multiLayerStorage` beside the hot-tier-only type is this
+/// emulator's own choice rather than a documented rule, and the same one the
+/// default encryption configuration makes over `kmsKeyId`: storing the
+/// destination would leave the service either reporting a cold-tier destination
+/// for a configuration that keeps no cold copy, or silently dropping a member
+/// the caller set.
+pub fn check_storage_selection(selection: &StorageConfigurationSelection) -> Result<(), String> {
+    let storage_type = selection.storage_type.as_str();
+    if !STORAGE_TYPE_VALUES.contains(&storage_type) {
+        return Err(format!(
+            "The storageType {storage_type} is not supported; it must be one of {}.",
+            STORAGE_TYPE_VALUES.join(" | ")
+        ));
+    }
+    match (
+        storage_type == STORAGE_TYPE_MULTI_LAYER,
+        selection.multi_layer_storage.as_ref(),
+    ) {
+        (true, None) => {
+            return Err(format!(
+                "A multiLayerStorage is required when storageType is {STORAGE_TYPE_MULTI_LAYER}."
+            ))
+        }
+        (false, Some(_)) => {
+            return Err(format!(
+                "A multiLayerStorage must be omitted when storageType is \
+                 {STORAGE_TYPE_SITEWISE_DEFAULT}."
+            ))
+        }
+        (true, Some(storage)) => check_customer_managed_s3(&storage.customer_managed_s3_storage)?,
+        (false, None) => {}
+    }
+    check_storage_state(
+        "disassociatedDataStorage",
+        selection.disassociated_data_storage.as_deref(),
+        DISASSOCIATED_DATA_STORAGE_STATE_VALUES,
+    )?;
+    check_storage_state(
+        "warmTier",
+        selection.warm_tier.as_deref(),
+        WARM_TIER_STATE_VALUES,
+    )?;
+    if let Some(period) = selection.retention_period.as_ref() {
+        check_retention_period("retentionPeriod", period.number_of_days, period.unlimited)?;
+    }
+    if let Some(period) = selection.warm_tier_retention_period.as_ref() {
+        if storage_type != STORAGE_TYPE_MULTI_LAYER {
+            return Err(format!(
+                "A warmTierRetentionPeriod can be set only when storageType is \
+                 {STORAGE_TYPE_MULTI_LAYER}."
+            ));
+        }
+        check_retention_period(
+            "warmTierRetentionPeriod",
+            period.number_of_days,
+            period.unlimited,
+        )?;
+    }
+    Ok(())
+}
+
+/// Refuse a value outside the enum `member` is modelled as, by that enum's
+/// generated value table. An absent member selects nothing and is left to the
+/// documented default.
+fn check_storage_state(member: &str, value: Option<&str>, values: &[&str]) -> Result<(), String> {
+    match value {
+        Some(value) if !values.contains(&value) => Err(format!(
+            "The {member} {value} is not supported; it must be one of {}.",
+            values.join(" | ")
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Refuse a retention period that names no period, or names two.
+///
+/// Both retention-period shapes carry the same pair of members with the same
+/// rules, so they are read here rather than once per member: a number of days
+/// goes with `unlimited` false, `unlimited` true goes with no number of days,
+/// and a period that names neither selects no retention at all.
+///
+/// A count of days below one is no period either, whatever the member it is
+/// given in: the modelled `NumberOfDays` is a plain integer with no range
+/// (`smithy_query(query="shape", shape="NumberOfDays")`), so nothing in the
+/// model or the member documentation states a minimum, and the only bound read
+/// here is that a span of days is a positive number of them. This emulator's
+/// own floor, not a published AWS one — a larger minimum is left to the
+/// modelled constraint walk, which is where a documented one would land.
+fn check_retention_period(
+    member: &str,
+    number_of_days: Option<i32>,
+    unlimited: Option<bool>,
+) -> Result<(), String> {
+    match (number_of_days, unlimited.unwrap_or(false)) {
+        (Some(_), true) => Err(format!(
+            "A {member} must not specify numberOfDays when unlimited is true."
+        )),
+        (None, false) => Err(format!(
+            "A {member} must specify either numberOfDays or unlimited true."
+        )),
+        (Some(days), false) if days < 1 => Err(format!(
+            "The {member} numberOfDays {days} is not a number of days; it must be at least 1."
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Refuse a cold-tier destination whose members do not carry what they are
+/// modelled as: `s3ResourceArn` and `roleArn` are both a modelled `ARN`, so a
+/// value outside that type is one this service could not report back.
+fn check_customer_managed_s3(storage: &CustomerManagedS3Storage) -> Result<(), String> {
+    for (member, value) in [
+        ("s3ResourceArn", &storage.s3_resource_arn),
+        ("roleArn", &storage.role_arn),
+    ] {
+        if !is_modelled_arn(value) || value.chars().count() > ARN_MAX_LENGTH {
+            return Err(format!("The {member} {value} is not an ARN this service can store."));
+        }
+    }
+    Ok(())
+}
+
+/// The storage configuration a put stored: the selection it named, when it
+/// named it, and when the configuration it accepted falls due to be in force.
+#[derive(Debug, Clone)]
+pub struct StorageConfigurationRecord {
+    /// What the put selected. Replaced whole by the next put.
+    pub selection: StorageConfigurationSelection,
+    /// The instant of the put, which `DescribeStorageConfiguration` reports as
+    /// `lastUpdateDate` ("The date the storage configuration was last updated").
+    pub updated_at: SystemTime,
+    /// When [`CONFIGURATION_STATE_UPDATE_IN_PROGRESS`] ->
+    /// [`CONFIGURATION_STATE_ACTIVE`] falls due: the instant of the put plus
+    /// [`ACTIVATION_DELAY`]. Stored rather than slept for, so nothing blocks and
+    /// a caller reading straight after the put still observes the state the
+    /// service reports while it applies the change.
+    pub active_at: SystemTime,
+}
+
+impl StorageConfigurationRecord {
+    /// The `ConfigurationState` this configuration reports at `now`.
+    pub fn state(&self, now: SystemTime) -> &'static str {
+        configuration_state(self.active_at, now)
+    }
+}
+
+/// What the two storage-configuration operations report: the same members, so
+/// they read them from one place.
+#[derive(Debug, Clone)]
+pub struct StorageConfiguration {
+    /// The configuration in force, with the documented default filled in for
+    /// each member it does not name — see [`documented_defaults`].
+    pub selection: StorageConfigurationSelection,
+    /// The modelled `configurationStatus`.
+    pub status: ConfigurationStatus,
+    /// The modelled `lastUpdateDate`, absent while no put has configured the
+    /// account: nothing has updated the configuration then.
+    pub last_update_date: Option<SystemTime>,
+}
+
+/// `selection` with the documented default filled in for each member it leaves
+/// unnamed: hot-tier data is "kept indefinitely" when no `retentionPeriod` names
+/// a span, and NULL/NaN ingestion is allowed when no `disallowIngestNullNaN`
+/// disallows it. The members whose documentation states no default
+/// (`multiLayerStorage`, `disassociatedDataStorage`, `warmTier`, and the warm
+/// tier's own retention period) are reported only when the configuration names
+/// them.
+fn documented_defaults(selection: &StorageConfigurationSelection) -> StorageConfigurationSelection {
+    StorageConfigurationSelection {
+        retention_period: selection.retention_period.clone().or(Some(RetentionPeriod {
+            number_of_days: None,
+            unlimited: Some(true),
+        })),
+        disallow_ingest_null_na_n: selection
+            .disallow_ingest_null_na_n
+            .or(Some(DEFAULT_DISALLOW_INGEST_NULL_NAN)),
+        ..selection.clone()
+    }
+}
+
+impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
+    /// The storage configuration the account reports at `now`: the one the last
+    /// put stored, or the hot-tier default while nothing has stored any.
+    ///
+    /// A pure READ: an unconfigured account is not materialised, and a
+    /// configuration still settling is reported from the instant its put already
+    /// recorded, so reading cannot change what a later caller sees.
+    pub fn storage_configuration(&self, now: SystemTime) -> StorageConfiguration {
+        let status = |state: &str| ConfigurationStatus {
+            state: state.to_string(),
+            // No error: nothing in this emulator fails to apply a
+            // configuration, so the modelled `error` details have nothing to
+            // report.
+            error: None,
+        };
+        match &self.storage {
+            Some(record) => StorageConfiguration {
+                selection: documented_defaults(&record.selection),
+                status: status(record.state(now)),
+                last_update_date: Some(record.updated_at),
+            },
+            None => StorageConfiguration {
+                selection: documented_defaults(&StorageConfigurationSelection {
+                    storage_type: STORAGE_TYPE_SITEWISE_DEFAULT.to_string(),
+                    ..Default::default()
+                }),
+                status: status(CONFIGURATION_STATE_ACTIVE),
+                last_update_date: None,
+            },
+        }
+    }
+
+    /// Make `selection` the account's storage configuration, and report what
+    /// that call answers with; `Err` with the refusal's wording for a selection
+    /// the configuration in force does not admit.
+    ///
+    /// The whole setting is replaced: a put is the last word on the account's
+    /// storage, so one naming the hot tier alone drops the cold-tier destination
+    /// an earlier put selected. The one member that does not go back is
+    /// `disassociatedDataStorage` — "After the disassociatedDataStorage is
+    /// enabled, you can't disable it" — so a selection that would leave it
+    /// anything but enabled is refused here, under the same lock the write
+    /// takes, rather than in the handler where two puts could race past it. The
+    /// configuration the put accepts falls due at [`ACTIVATION_DELAY`], the span
+    /// this service settles every transition the clock owes at.
+    ///
+    /// Read `selection` against [`check_storage_selection`] first: this stores
+    /// what it is given.
+    pub fn set_storage_configuration(
+        &mut self,
+        selection: StorageConfigurationSelection,
+        now: SystemTime,
+    ) -> Result<StorageConfiguration, String> {
+        let in_force = self.storage_configuration(now);
+        let enabled = |state: &StorageConfigurationSelection| {
+            state.disassociated_data_storage.as_deref() == Some(STORAGE_STATE_ENABLED)
+        };
+        if enabled(&in_force.selection) && !enabled(&selection) {
+            return Err(format!(
+                "The disassociatedDataStorage is {STORAGE_STATE_ENABLED} and cannot be disabled; \
+                 a put must keep naming {STORAGE_STATE_ENABLED}."
+            ));
+        }
+        self.storage = Some(StorageConfigurationRecord {
+            selection,
+            updated_at: now,
+            active_at: now + ACTIVATION_DELAY,
+        });
+        Ok(self.storage_configuration(now))
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

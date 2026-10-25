@@ -194,8 +194,7 @@ impl<Eng: Send + Sync + 'static> InvokeModelWithResponseStream<Eng> {
         // drift; here the turn is delivered as the model family's own streaming
         // events rather than as the unary response body.
         let turn = crate::state::invoke_turn(&model, family, body);
-        let first_byte_latency_ms =
-            i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+        let first_byte_latency_ms = crate::state::latency_ms(started.elapsed());
 
         state
             .lock()
@@ -216,8 +215,7 @@ impl<Eng: Send + Sync + 'static> InvokeModelWithResponseStream<Eng> {
             crate::state::InvocationMetrics {
                 input_tokens: turn.input_tokens,
                 output_tokens: turn.output_tokens,
-                invocation_latency_ms: i64::try_from(started.elapsed().as_millis())
-                    .unwrap_or(i64::MAX),
+                invocation_latency_ms: crate::state::latency_ms(started.elapsed()),
                 first_byte_latency_ms,
             },
         );

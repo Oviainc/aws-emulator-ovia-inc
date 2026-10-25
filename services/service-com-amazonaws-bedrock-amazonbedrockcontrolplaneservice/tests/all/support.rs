@@ -133,6 +133,24 @@ impl Emulator {
         path: &str,
         body: Option<Value>,
     ) -> Reply {
+        self.call_with_headers(region, method, path, body, &[])
+            .await
+    }
+
+    /// One request signed for `region`, carrying `headers` beside the ones every request
+    /// here carries.
+    ///
+    /// The form a suite drives for an input member bound to a HEADER rather than to the
+    /// body — an `@idempotencyToken` the model binds to `x-amz-client-token`, say — so
+    /// such a member travels where the wire puts it.
+    pub async fn call_with_headers(
+        &self,
+        region: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        headers: &[(&str, &str)],
+    ) -> Reply {
         let payload = body.map_or_else(Vec::new, |value| {
             serde_json::to_vec(&value).expect("a serializable request body")
         });
@@ -146,7 +164,12 @@ impl Emulator {
                      aws4_request, SignedHeaders=host, Signature=00"
                 ),
             )
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        let request = headers
+            .iter()
+            .fold(request, |request, (name, value)| {
+                request.header(*name, *value)
+            })
             .body(bytes::Bytes::from(payload))
             .expect("a well-formed request");
 

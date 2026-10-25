@@ -163,7 +163,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListVocabulariesErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -196,10 +195,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::DEFAULT_VOCABULARY_LIST_MAX_RESULTS,
         );
 
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // Reporting only: the sole write is each vocabulary's clock-owed transition.
-        let records = store.vocabularies_newest_first(now);
+        // A regional endpoint lists only the vocabularies created through it.
+        let records = store.vocabularies_newest_first(&region, now);
 
         // The paging rule itself is `state::list_page`: skip what an earlier page
         // held, keep what the filters select, and hand out a cursor only when a

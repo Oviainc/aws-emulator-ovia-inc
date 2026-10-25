@@ -693,6 +693,9 @@ struct RoutingCase {
     /// A type the conflicting record set IS free to take at that name, because
     /// the constraint is per name AND type.
     free_type: &'static str,
+    /// A record data value that suits `free_type`, since a value is parsed
+    /// against the syntax of the type it is submitted for.
+    free_value: &'static str,
 }
 
 /// The rows span the rule's axes: which routing was there first, the record
@@ -708,6 +711,7 @@ const ROUTING_CASES: &[RoutingCase] = &[
         seeded: None,
         conflicting: Some(("blue", 10)),
         free_type: "AAAA",
+        free_value: "2001:db8::30",
     },
     RoutingCase {
         label: "a simple record set joining a weighted group",
@@ -718,6 +722,7 @@ const ROUTING_CASES: &[RoutingCase] = &[
         seeded: Some(("blue", 10)),
         conflicting: None,
         free_type: "TXT",
+        free_value: "\"group-first\"",
     },
     RoutingCase {
         label: "a simple TXT record joining a weighted TXT group",
@@ -728,6 +733,7 @@ const ROUTING_CASES: &[RoutingCase] = &[
         seeded: Some(("green", 20)),
         conflicting: None,
         free_type: "MX",
+        free_value: "10 mail.example.net.",
     },
     RoutingCase {
         label: "a weighted sibling joining a simple AAAA record set",
@@ -738,6 +744,7 @@ const ROUTING_CASES: &[RoutingCase] = &[
         seeded: None,
         conflicting: Some(("canary", 30)),
         free_type: "A",
+        free_value: "192.0.2.33",
     },
 ];
 
@@ -820,7 +827,7 @@ async fn one_name_and_type_hold_either_a_simple_record_set_or_a_routing_group() 
                 case.free_type,
                 case.conflicting,
                 300,
-                &[case.value],
+                &[case.free_value],
             ),
         )
         .await;

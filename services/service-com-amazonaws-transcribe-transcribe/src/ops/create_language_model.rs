@@ -200,7 +200,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateLanguageModelErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -213,17 +212,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The Region this request is served in: Amazon Transcribe is regional, so the
+        // model is created in — and only in — the Region the caller signed for.
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
         // "must be unique within an Amazon Web Services account. If you try to create
         // a new custom language model with the same name as an existing custom
         // language model, you get a ConflictException error" (model doc for
-        // `CreateLanguageModelRequest$ModelName`). Checked and inserted under one
-        // lock, so N concurrent creates of one name have exactly one winner. The name
-        // is unique within THIS family: a language model and a custom vocabulary are
-        // two resource types, each with its own ARN.
-        if store.language_models.contains_key(&input.model_name) {
+        // `CreateLanguageModelRequest$ModelName`) — within one Region of it, since a
+        // regional endpoint serves only its own Region's models. Checked and inserted
+        // under one lock, so N concurrent creates of one name have exactly one winner.
+        // The name is unique within THIS family: a language model and a custom
+        // vocabulary are two resource types, each with its own ARN.
+        if store.language_models.contains(&region, &input.model_name) {
             return Err(CreateLanguageModelErrorModeled::ConflictException(
                 ConflictException {
                     // As the other creates here: the kind, not the caller's name.
@@ -235,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if store.language_models.len() >= crate::state::MAX_LANGUAGE_MODELS {
+        if store.language_models.len_in(&region) >= crate::state::MAX_LANGUAGE_MODELS {
             return Err(CreateLanguageModelErrorModeled::LimitExceededException(
                 LimitExceededException {
                     message: Some(format!(
@@ -243,6 +246,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                          this account. Delete a custom language model you no longer \
                          need and try your request again.",
                         crate::state::MAX_LANGUAGE_MODELS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The Region comes from the request's own (unauthenticated) credential scope,
+        // so the per-Region quota above bounds the store only together with a cap on how
+        // many Regions it keeps models for (see [`crate::state::MAX_REGIONS`]).
+        if store.language_models.region_bucket_exhausted(&region) {
+            return Err(CreateLanguageModelErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(crate::state::region_capacity_message(
+                        crate::state::FAMILY_LANGUAGE_MODELS,
+                        &region,
                     )),
                 },
             )
@@ -275,7 +293,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status = %record.status,
             "custom language model recorded; its training data is not read"
         );
-        store.language_models.insert(record.name.clone(), record);
+        let name = record.name.clone();
+        store.language_models.insert(&region, &name, record);
 
         Ok(output)
     }

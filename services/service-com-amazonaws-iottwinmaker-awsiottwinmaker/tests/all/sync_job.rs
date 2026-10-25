@@ -27,7 +27,7 @@ use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
     SYNC_JOB_STATE_ERROR, SYNC_SOURCE_SITEWISE,
 };
 
-use crate::harness::{sync_job_arn, Emulator, Resp};
+use crate::harness::{sync_job_arn, Emulator, Resp, REGION};
 
 /// Block until the outcome an accepted job owes has fallen due.
 ///
@@ -512,6 +512,7 @@ async fn reading_a_sync_job_changes_nothing_a_later_caller_sees() {
             emulator
                 .state()
                 .lock()
+                .region(REGION)
                 .workspaces
                 .values()
                 .map(|workspace| workspace.sync_jobs.len())

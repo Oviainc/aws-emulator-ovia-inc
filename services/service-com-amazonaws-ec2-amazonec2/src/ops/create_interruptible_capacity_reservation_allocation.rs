@@ -398,6 +398,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 end_date: None,
                 instance_match_criteria,
                 created_at: now,
+                // Capacity carved out of a source reservation for use now, not a
+                // future-dated request: it has no requested delivery date, nothing it
+                // committed to and no delivery method.
+                start_date: None,
+                commitment: None,
+                delivery_preference: None,
                 state: state::CAPACITY_RESERVATION_STATE_PENDING,
                 tags,
                 interruption_info: Some(InterruptionInfo {

@@ -54,7 +54,9 @@ async fn delete_bridge(emulator: &Emulator, arn: &str) -> (u16, Option<String>, 
         .await
 }
 
-/// One network source, so every create below carries the one source CreateBridge requires.
+/// One network source, the kind a ground-to-cloud bridge ingests ("the content originates
+/// at your premises"), so an ingress create below carries the one source CreateBridge
+/// requires.
 fn network_source(name: &str, port: i64) -> Value {
     json!({ "networkSource": {
         "multicastIp": "224.0.0.1",
@@ -62,6 +64,16 @@ fn network_source(name: &str, port: i64) -> Value {
         "networkName": "net-1",
         "port": port,
         "protocol": "rtp",
+    }})
+}
+
+/// One flow source, the kind a cloud-to-ground bridge ingests ("the content comes from an
+/// existing MediaConnect flow"), so an egress create below carries the one source
+/// CreateBridge requires.
+fn flow_source(name: &str, suffix: u64) -> Value {
+    json!({ "flowSource": {
+        "flowArn": crate::bridge_lifecycle::minted_flow_arn(suffix, "flow-bridge-state"),
+        "name": name,
     }})
 }
 
@@ -94,10 +106,15 @@ fn bridge_type_member(egress: bool) -> (&'static str, Value) {
 /// created bridge settles into.
 async fn settled_bridge(emulator: &Emulator, name: &str, egress: bool, port: i64) -> String {
     let (member, settings) = bridge_type_member(egress);
+    let source = if egress {
+        flow_source("src", port as u64)
+    } else {
+        network_source("src", port)
+    };
     let mut body = json!({
         "name": name,
         "placementArn": minted_gateway_arn(1, "gw-bridge-state"),
-        "sources": [network_source("src", port)],
+        "sources": [source],
     });
     body[member] = settings;
 

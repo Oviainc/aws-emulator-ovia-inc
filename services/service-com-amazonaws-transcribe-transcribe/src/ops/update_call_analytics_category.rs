@@ -160,9 +160,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A category carries no region-dependent value, so the request's credential
-        // scope reaches nothing this operation stores or reports.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 UpdateCallAnalyticsCategoryErrorModeled::InternalFailureException(
@@ -190,11 +187,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(bad_request(&message));
         }
 
+        // The Region this request is served in: only the categories created through
+        // this Region's endpoint are this call's to update.
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         let Some(record) = store
             .call_analytics_categories
-            .get_mut(&input.category_name)
+            .get_mut(&region, &input.category_name)
         else {
             return Err(not_found());
         };

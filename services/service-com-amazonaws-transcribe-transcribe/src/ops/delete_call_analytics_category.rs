@@ -144,7 +144,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteCallAnalyticsCategoryErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -157,6 +156,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The Region this request is served in: only the categories created through
+        // this Region's endpoint are this call's to delete.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // A category has no status in the model
         // (`smithy_query(query="shape", shape="CategoryProperties")`), so there is no
@@ -164,11 +166,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this record: presence is the whole question.
         if store
             .call_analytics_categories
-            .remove(&input.category_name)
+            .remove(&region, &input.category_name)
             .is_none()
         {
             // "This can occur when the entity you're trying to delete doesn't exist"
-            // (`BadRequestException`'s own documentation) — so a name this account holds
+            // (`BadRequestException`'s own documentation) — so a name this Region holds
             // no category under is REFUSED, not answered as an already-satisfied
             // delete. That is also the shape and wording this service's recorded
             // absent-category responses carry (`crate::state::not_found_message`), and
