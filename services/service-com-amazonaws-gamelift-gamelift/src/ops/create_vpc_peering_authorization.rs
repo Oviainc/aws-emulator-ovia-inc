@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVpcPeeringAuthorization
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVpcPeeringAuthorization`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVpcPeeringAuthorization::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Issues the authorization the request asks for and persists it, so this response and
+//! every later read of the authorizations (`DescribeVpcPeeringAuthorizations`) are served
+//! from the one stored record. The authorization is issued for the pair the request names
+//! — the account that manages the fleets, and the VPC to be peered with them — and it is
+//! that pair which identifies it, so re-issuing for a pair that already holds one
+//! replaces it rather than storing a second authorization for the same peering.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +177,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVpcPeeringAuthorization` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVpcPeeringAuthorizationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVpcPeeringAuthorization"))
+        // `ctx` carries the request metadata; this operation's response names no region,
+        // so nothing here is derived from it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateVpcPeeringAuthorizationErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the GameLift emulator state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.tick(now);
+
+        // "To request authorization to create a connection, call this operation from the
+        // Amazon Web Services account with the VPC that you want to peer to your Amazon
+        // GameLift Servers fleet" — so the authorization's peer-VPC account is the account
+        // the call was made FROM, which this emulator serves every request as, and never a
+        // value read out of the request.
+        let record = crate::state::VpcPeeringAuthorizationRecord {
+            game_lift_aws_account_id: input.game_lift_aws_account_id.clone(),
+            peer_vpc_aws_account_id: ::engine::emulator_account_id().to_string(),
+            peer_vpc_id: input.peer_vpc_id.clone(),
+            creation_time: now,
+            expiration_time: now + crate::state::VPC_PEERING_AUTHORIZATION_VALIDITY,
+        };
+        // An authorization is held for the pair it authorizes, so issuing one for a pair
+        // that already holds an authorization REPLACES it: the authorization that "must
+        // exist and be valid for the peering connection to be established" is the one just
+        // issued, and it is valid from now, not from whenever the earlier call ran.
+        let key = (
+            input.game_lift_aws_account_id.clone(),
+            input.peer_vpc_id.clone(),
+        );
+        state.vpc_peering_authorizations.insert(key.clone(), record);
+
+        // Report the STORED record, so this response and every later read of the same
+        // authorization can only agree.
+        let Some(stored) = state.vpc_peering_authorizations.get(&key) else {
+            return Err(
+                CreateVpcPeeringAuthorizationErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some(
+                            "the new VPC peering authorization could not be read back".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        Ok(CreateVpcPeeringAuthorizationOutput {
+            vpc_peering_authorization: Some(stored.to_modelled()),
+        })
     }
 }

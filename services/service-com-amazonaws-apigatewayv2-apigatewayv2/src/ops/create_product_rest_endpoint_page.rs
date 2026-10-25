@@ -233,6 +233,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &page_id,
             ),
             product_rest_endpoint_page_id: page_id.clone(),
+            // The Region this page belongs to, so a later write re-resolving its display
+            // content derives the identified endpoint's invoke URL here rather than in
+            // the Region that writer signed for.
+            region,
             rest_endpoint_identifier: input.rest_endpoint_identifier,
             display_content,
             last_modified: ::std::time::SystemTime::now(),

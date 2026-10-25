@@ -217,11 +217,13 @@ fn summary(source: &crate::state::IdentitySource) -> IdentitySourceForList {
         crate::state::IdentitySourceType::IamIdentityCenter => {
             IdentitySourceParametersForList::IamIdentityCenter(IamIdentityCenterForList {
                 instance_arn: Some(source.instance_arn.clone()),
-                // `ApprovalPortalUrl` is the address of the approval portal AWS hosts for
-                // the instance. This emulator serves no portal and the model fixes no
-                // form for the URL, so the member is omitted rather than reporting an
-                // address nothing answers.
-                approval_portal_url: None,
+                // The approval portal is the one recorded on the source when its
+                // association with the IAM Identity Center instance was established
+                // ([`crate::state::IdentitySource::activate`]), so it is reported for
+                // every source that association is live for and absent only while the
+                // source is still `CREATING` — never recomputed here, so two reads of
+                // one source cannot report two portals.
+                approval_portal_url: source.approval_portal_url.clone(),
                 region: Some(source.instance_region.clone()),
             })
         }

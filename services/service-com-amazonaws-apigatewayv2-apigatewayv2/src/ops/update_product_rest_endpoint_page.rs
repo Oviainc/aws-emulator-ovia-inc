@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateProductRestEndpointPage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateProductRestEndpointPage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateProductRestEndpointPage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: patches the stored [`crate::state::ProductRestEndpointPage`] the URI
+//! names — a member the request carries replaces the stored one, a member it omits leaves
+//! the stored value alone — and answers 200 with the stored page. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +155,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateProductRestEndpointPage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateProductRestEndpointPageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The page's own Region is on its record, so nothing reported here is derived
+        // from the Region this request was signed for.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateProductRestEndpointPage",
+            ));
+        };
+
+        let mut store = state.lock();
+
+        // A page is addressed UNDER its product
+        // (`/v2/portalproducts/{PortalProductId}/productrestendpointpages/{Id}`), so an
+        // unknown product and an unknown page under a known one both name no page: 404
+        // `NotFoundException` ("The resource specified in the request was not found"), the
+        // wording `GetProductRestEndpointPage` refuses an unknown page with.
+        let stored = store
+            .portal_products
+            .get_mut(&input.portal_product_id)
+            .and_then(|product| {
+                product
+                    .product_rest_endpoint_pages
+                    .get_mut(&input.product_rest_endpoint_page_id)
+            });
+        let Some(page) = stored else {
+            return Err(UpdateProductRestEndpointPageErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "Invalid ProductRestEndpointPage identifier specified {}:{}:{}",
+                        ::engine::emulator_account_id(),
+                        input.portal_product_id,
+                        input.product_rest_endpoint_page_id
+                    )),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+
+        // The update is a PATCH (`PATCH
+        // /v2/portalproducts/{PortalProductId}/productrestendpointpages/{Id}`): a member
+        // the request carries replaces the stored one, and a member it omits leaves the
+        // stored value exactly as it was. The page's id, its ARN, its Region and the REST
+        // endpoint it documents are not inputs of this operation, so the patched record
+        // carries them over untouched.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateProductRestEndpointPage"))
+        // Patched on a CLONE, so a request this refuses leaves the stored page exactly as
+        // it was rather than half-written.
+        let mut updated = page.clone();
+        let mut modified = false;
+
+        if let Some(requested) = input.display_content.as_ref() {
+            // `DisplayContent` is the page's content as a whole, so one the request
+            // carries replaces the stored content wholesale: each member it overrides
+            // takes the overriding value, and each member it does not override returns to
+            // the default API Gateway derives from the REST endpoint this page documents —
+            // the same resolution the create performs, against the page's OWN Region.
+            let parts =
+                crate::state::rest_endpoint_identifier_parts(&updated.rest_endpoint_identifier)
+                    .map_err(bad_request)?;
+            updated.display_content =
+                crate::state::resolve_endpoint_display_content(&updated.region, parts, Some(requested))
+                    .map_err(bad_request)?;
+            modified = true;
+        }
+
+        // `TryItState` is a modelled enum, so the boundary validator refuses a value
+        // outside its catalog before this handler runs.
+        if let Some(try_it_state) = input.try_it_state {
+            updated.try_it_state = try_it_state;
+            modified = true;
+        }
+
+        // "The timestamp when the product REST endpoint page was last modified" — it
+        // advances only when this request carried a member to apply, so a patch that
+        // configures nothing is not recorded as a modification of the record.
+        if modified {
+            updated.last_modified = ::std::time::SystemTime::now();
+        }
+
+        // Write the patched record back where it was, then report what the STORE now
+        // holds, so what this caller is told is what a later GetProductRestEndpointPage
+        // reports.
+        *page = updated;
+        let reported = page.to_wire();
+        Ok(UpdateProductRestEndpointPageOutput {
+            display_content: reported.display_content,
+            last_modified: reported.last_modified,
+            product_rest_endpoint_page_arn: reported.product_rest_endpoint_page_arn,
+            product_rest_endpoint_page_id: reported.product_rest_endpoint_page_id,
+            rest_endpoint_identifier: reported.rest_endpoint_identifier,
+            status: reported.status,
+            status_exception: reported.status_exception,
+            try_it_state: reported.try_it_state,
+        })
     }
+}
+
+/// This operation's refusal of a request it models no more specific error for: the
+/// modelled `BadRequestException` ("The request is not valid, for example, the input is
+/// incomplete or incorrect"), whose message names the member and the constraint. Takes the
+/// `String` the `crate::state` validators carry their message in, the way the sibling
+/// helper in `create_product_rest_endpoint_page` does.
+fn bad_request(message: String) -> UpdateProductRestEndpointPageError {
+    UpdateProductRestEndpointPageErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
 }

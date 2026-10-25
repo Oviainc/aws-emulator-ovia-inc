@@ -36,7 +36,11 @@
 //!   `ListApprovalTeams` omits it.
 //! * The activation of a new identity source ([`IDENTITY_SOURCE_ACTIVATION_DELAY`]). A
 //!   source is `CREATING` until it comes due and `ACTIVE` afterwards, which is what
-//!   `IdentitySourceStatus`' non-terminal `CREATING` token stands for.
+//!   `IdentitySourceStatus`' non-terminal `CREATING` token stands for. The approval
+//!   portal of the IAM Identity Center instance the source is associated with is
+//!   recorded when that activation is materialised ([`IdentitySource::activate`],
+//!   [`approval_portal_url`]), so a source reports a portal exactly once its
+//!   association is live.
 //! * The removal of an identity source whose deletion `DeleteIdentitySource` started
 //!   ([`IDENTITY_SOURCE_DELETION_DELAY`]). The source is reported `DELETING` — the
 //!   model's other non-terminal `IdentitySourceStatus` token — until the removal comes
@@ -939,6 +943,15 @@ pub struct IdentitySource {
     /// named it. It is the INSTANCE's region, which need not be the region the identity
     /// source's own ARN carries.
     pub instance_region: String,
+    /// `IamIdentityCenter$ApprovalPortalUrl`: the address of the approval portal that
+    /// belongs to this source's IAM Identity Center instance ([`approval_portal_url`]).
+    ///
+    /// The portal exists once the association with the instance does, so it is recorded
+    /// when this source's activation comes due ([`IdentitySource::activate`]) and is
+    /// `None` for as long as the source is still `CREATING`. Reading it off the record
+    /// rather than recomputing it per request is what makes every read of one source
+    /// report the same URL.
+    pub approval_portal_url: Option<String>,
     pub status: IdentitySourceStatus,
     pub creation_time: SystemTime,
     /// Instant at which this source's activation (`CREATING` -> `ACTIVE`) becomes due.
@@ -971,6 +984,10 @@ impl IdentitySource {
             source_type,
             instance_arn,
             instance_region,
+            // The association with the instance is not established yet, so neither is
+            // its approval portal: `activate` records the portal's address when the
+            // activation this create owes comes due.
+            approval_portal_url: None,
             status: IdentitySourceStatus::Creating,
             creation_time: now,
             activation_due: Some(now + IDENTITY_SOURCE_ACTIVATION_DELAY),
@@ -978,6 +995,17 @@ impl IdentitySource {
             tags,
             seq,
         }
+    }
+
+    /// Materialise the activation the clock owes this source: it becomes `ACTIVE`, and
+    /// the approval portal of the IAM Identity Center instance it is associated with is
+    /// recorded on the record ([`approval_portal_url`]), so every later read reports the
+    /// same portal for this source.
+    pub fn activate(&mut self) {
+        self.status = IdentitySourceStatus::Active;
+        self.activation_due = None;
+        self.approval_portal_url =
+            Some(approval_portal_url(&self.instance_arn, &self.instance_region));
     }
 
     /// Put this source into `DELETING` and record the instant its removal comes due
@@ -1431,6 +1459,66 @@ pub fn identity_source_arn(region: &str, seq: u64) -> String {
         "mpa",
         region,
         &format!("{IDENTITY_SOURCE_RESOURCE}/ids-{seq:012}"),
+    )
+}
+
+/// The id of the IAM Identity Center instance an `IdcInstanceArn` names: the segment
+/// after `instance/`, the only resource segment the modelled pattern
+/// `^arn:.+:sso:::instance/(?:sso)?ins-[a-zA-Z0-9-.]{16}$` allows.
+fn idc_instance_id(instance_arn: &str) -> &str {
+    instance_arn
+        .rsplit_once('/')
+        .map_or(instance_arn, |(_, id)| id)
+}
+
+/// The DNS suffix hostnames take in the partition an ARN names: `amazonaws.com`, except
+/// in the China partition, where every AWS hostname ends in `amazonaws.com.cn`.
+fn partition_dns_suffix(arn: &str) -> &'static str {
+    match arn.split(':').nth(1) {
+        Some("aws-cn") => "amazonaws.com.cn",
+        _ => "amazonaws.com",
+    }
+}
+
+/// The id of an IAM Identity Center instance as ONE hostname label: lowercased, with the
+/// dots its id may carry turned into hyphens — a hostname label carries only letters,
+/// digits and hyphens — and with no trailing hyphen.
+fn instance_host_label(instance_arn: &str) -> String {
+    let mut label = idc_instance_id(instance_arn)
+        .to_ascii_lowercase()
+        .replace('.', "-");
+    let keep = label.trim_end_matches('-').len();
+    if keep > 0 {
+        label.truncate(keep);
+    }
+    label
+}
+
+/// URL of the approval portal associated with an IAM Identity Center instance, as
+/// `ApprovalPortalUrl` reports it for an identity source.
+///
+/// The portal belongs to the INSTANCE, so its address is derived from the instance's own
+/// id and from the region that instance is in — never from the request that reads it —
+/// and is recorded on the identity-source record
+/// ([`IdentitySource::approval_portal_url`]) so that every read of one source reports
+/// one portal. The host is that instance's id under this service's own regional
+/// hostname (`mpa.<region>.<partition dns suffix>`, the host this service's endpoint
+/// rules resolve to), which keeps one portal per instance per region and stays inside
+/// the DNS namespace this service owns.
+#[must_use]
+pub fn approval_portal_url(instance_arn: &str, instance_region: &str) -> String {
+    // `IamIdentityCenter$Region` carries no modelled pattern, so a region segment is
+    // only placed in the host when the stored instance names one: an empty one would
+    // otherwise leave an empty label in the hostname.
+    let region = if instance_region.is_empty() {
+        String::new()
+    } else {
+        format!("{instance_region}.")
+    };
+    format!(
+        "https://{}.mpa.{region}{}",
+        instance_host_label(instance_arn),
+        partition_dns_suffix(instance_arn)
     )
 }
 
@@ -1932,8 +2020,7 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
             if due > now {
                 continue;
             }
-            source.status = IdentitySourceStatus::Active;
-            source.activation_due = None;
+            source.activate();
         }
 
         // An identity source whose deletion `DeleteIdentitySource` started is gone once

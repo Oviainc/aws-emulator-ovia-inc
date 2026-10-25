@@ -280,8 +280,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // The token names a profile that is no longer stored, so there is no original
             // result to return: forget the token and let this request create afresh, which
-            // is what the caller asked for. (Unreachable while `DeleteProfile` is a stub;
-            // handled here so the create stays well defined once it lands.)
+            // is what the caller asked for.
             store
                 .create_profile_tokens
                 .forget(&input.client_request_token);

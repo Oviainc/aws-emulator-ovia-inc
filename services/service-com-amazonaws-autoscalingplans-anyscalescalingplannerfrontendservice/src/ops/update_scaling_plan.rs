@@ -4,6 +4,16 @@
 //! Mutates the stored plan in place: the members the request carries replace what is
 //! stored, the ones it omits are left intact.
 //!
+//! An `ApplicationSource` the request carries is held to the same rule a create is:
+//! "You can create one scaling plan per application source", so a source another
+//! stored plan already claims is refused with `ValidationException` and the stored
+//! plan is left untouched. That refusal ranks BELOW the two that resolve the plan this
+//! request names (`ObjectNotFoundException`, then `ConcurrentUpdateException`): a
+//! request is answered about the plan it addresses before it is answered about another
+//! plan's claim. Only the SHAPE of the supplied source — a stack or a tag set, never
+//! neither and never both — is judged before the lookup, as every operation that
+//! carries an `ApplicationSource` judges it.
+//!
 //! "You cannot update a scaling plan if it is in the process of being created,
 //! updated, or deleted" — such a call is refused with `ConcurrentUpdateException`.
 //! A successful update leaves the plan in `UpdateInProgress`, with the move back to
@@ -152,16 +162,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle_due(now);
 
         // An application source the request carries must still name exactly one
-        // application: a stack or a tag set, never neither and never both.
-        if let Some(source) = input.application_source.as_ref() {
-            crate::state::validate_application_source(source).map_err(validation)?;
-        }
+        // application: a stack or a tag set, never neither and never both. Its identity
+        // key is what the single-plan-per-source rule below is decided on.
+        let source_key = input
+            .application_source
+            .as_ref()
+            .map(crate::state::validate_application_source)
+            .transpose()
+            .map_err(validation)?;
         // Instructions the request carries are held to the same semantics
         // `CreateScalingPlan` holds them to: an update cannot leave a plan in a shape
         // a create could never have produced.
         if let Some(instructions) = input.scaling_instructions.as_deref() {
             crate::state::validate_scaling_instructions(instructions).map_err(validation)?;
         }
+
+        // "You can create one scaling plan per application source": an update may not
+        // claim a source another stored plan already covers, any more than a create
+        // may. The plan being updated is excluded, so re-sending its own source is a
+        // no-op rather than a conflict with itself. Only the claimant's NAME is kept, so
+        // the store is free for the one mutable lookup below; the refusal itself waits
+        // until the plan this request names has been resolved.
+        let covered_by = source_key.as_deref().and_then(|key| {
+            state
+                .plan_covering_source(key, Some(input.scaling_plan_name.as_str()))
+                .map(|existing| existing.name.clone())
+        });
 
         let plan = state
             .plan_mut(&input.scaling_plan_name, input.scaling_plan_version)
@@ -177,6 +203,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "The scaling plan '{}' is in status {} and cannot be updated",
                 input.scaling_plan_name, plan.status_code
             )));
+        }
+        if let Some(existing) = covered_by {
+            return Err(validation(
+                crate::state::application_source_covered_message(&existing),
+            ));
         }
 
         // Replace only what the request carries; everything else stays as stored.

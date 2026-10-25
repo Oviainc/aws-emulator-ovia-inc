@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteLoginProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteLoginProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteLoginProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +167,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteLoginProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteLoginProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteLoginProfileErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // A mutation: the operation "deletes the password for the specified IAM user",
+        // so the lock is held for write across the existence checks and the removal.
+        let mut store = state.lock();
+
+        // The access key id the request was signed with: the caller's identity when
+        // the request names no user, and the acting principal the audit record below
+        // is attributed to.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+
+        // With no `UserName` the password deleted is that of the IAM user the request
+        // was signed by, resolved from the signing access key id exactly as
+        // `CreateLoginProfile`, `GetLoginProfile` and `DeleteAccessKey` resolve a
+        // nameless caller. A caller whose credentials belong to no IAM user is refused
+        // rather than having an identity invented for it: IAM serves the nameless form
+        // from an AssumeRoot session, which this emulator has no principal for.
+        let user_key = match &input.user_name {
+            Some(user_name) => crate::state::name_key(user_name),
+            None => match store.access_keys.get(&caller_akid) {
+                Some(record) => record.user_key.clone(),
+                None => {
+                    ::tracing::info!(
+                        audit = true,
+                        operation = "DeleteLoginProfile",
+                        outcome = "refused_no_caller_identity",
+                        caller_akid = %caller_akid,
+                        "no login profile was deleted"
+                    );
+                    // Neither modelled client error fits: the request named no entity
+                    // to be missing and no quota was reached, so the refusal goes
+                    // through the crate's generic client-input channel (HTTP 400, code
+                    // `ValidationException`), exactly as the other login-profile
+                    // operations refuse the same request.
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "Must specify userName when calling with non-User credentials",
+                    ));
+                }
+            },
+        };
+
+        // A login profile exists only as the password of a user the account holds, so a
+        // delete naming an absent user is not found and removes nothing — the same
+        // refusal the create, the read and the update answer with. IAM entity names
+        // "are not distinguished by case", so the lookup is on the case-folded key.
+        if !store.users.contains_key(&user_key) {
+            ::tracing::info!(
+                audit = true,
+                operation = "DeleteLoginProfile",
+                outcome = "refused_no_such_user",
+                caller_akid = %caller_akid,
+                user_key = %user_key,
+                "no login profile was deleted"
+            );
+            return Err(DeleteLoginProfileErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The user with name {} cannot be found.",
+                        input.user_name.as_deref().unwrap_or(&user_key)
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // This operation DELETES a password, so there has to be one to delete: a user
+        // the account holds without a login profile ("a login profile is created when
+        // you create a password for the user", `GetLoginProfile`) is not found, so the
+        // delete is NOT idempotent — a second delete of the same password is refused,
+        // just as `UpdateLoginProfile` refuses an update of a password that is not
+        // there.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteLoginProfile"))
+        // `EntityTemporarilyUnmodifiableException` is DECLINED for the reason it cannot
+        // arise: it reports "a user name that was deleted and then recreated", and
+        // every delete and create in this emulator takes effect at once, so no entity
+        // is ever temporarily unmodifiable. `LimitExceededException` is declined too: a
+        // delete creates no entity, so it reaches no account quota.
+        if store.login_profiles.remove(&user_key).is_none() {
+            ::tracing::info!(
+                audit = true,
+                operation = "DeleteLoginProfile",
+                outcome = "refused_no_login_profile",
+                caller_akid = %caller_akid,
+                user_key = %user_key,
+                "no login profile was deleted"
+            );
+            return Err(DeleteLoginProfileErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        // The same refusal `GetLoginProfile` and `UpdateLoginProfile`
+                        // answer with, naming the entity type and then the user the
+                        // request named.
+                        "Login Profile for User {} cannot be found.",
+                        input.user_name.as_deref().unwrap_or(&user_key)
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Audit record for a credential-revoking call: the acting principal and whose
+        // password went away, never any secret material — no password is held at all
+        // (`CreateLoginProfile` drops the value it is handed), so there is none to log.
+        ::tracing::info!(
+            audit = true,
+            operation = "DeleteLoginProfile",
+            outcome = "deleted",
+            caller_akid = %caller_akid,
+            user_key = %user_key,
+            "login profile deleted"
+        );
+
+        // "Deleting a user's password does not prevent a user from accessing Amazon Web
+        // Services through the command line interface or the API", so the user's access
+        // keys are deliberately left in place: withdrawing those is `UpdateAccessKey`'s
+        // and `DeleteAccessKey`'s job, not this operation's.
+        //
+        // The output shape is `Unit`: the operation reports nothing, and the password's
+        // absence is read back through `GetLoginProfile`.
+        Ok(DeleteLoginProfileOutput)
     }
 }

@@ -183,10 +183,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(revision) = revision else {
             return Err(DeregisterTaskDefinitionErrorModeled::ClientException(
                 ClientException {
-                    message: Some(format!(
-                        "taskDefinition must name a revision (family:revision or a \
-                         task-definition ARN); got {:?}",
-                        input.task_definition
+                    message: Some(crate::state::task_definition_revision_required_message(
+                        &input.task_definition,
                     )),
                 },
             )

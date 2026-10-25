@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDaemonTaskDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDaemonTaskDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDaemonTaskDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the ONE stored daemon task-definition revision a `family:revision` or ARN
+//! reference names: the delete puts an `ACTIVE` revision into `DELETE_IN_PROGRESS` with
+//! the instant it was requested, and the clock carries it from there to `DELETED`, which
+//! `DescribeDaemonTaskDefinition` reads back. A revision whose delete was already asked
+//! for is reported as it stands, so repeating the call changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +147,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDaemonTaskDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDaemonTaskDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDaemonTaskDefinition"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteDaemonTaskDefinitionErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+        let _ = ctx;
+
+        let Some((family, revision)) =
+            crate::state::parse_daemon_task_definition_reference(&input.daemon_task_definition)
+        else {
+            return Err(DeleteDaemonTaskDefinitionErrorModeled::ClientException(
+                ClientException {
+                    message: Some(crate::state::daemon_task_definition_reference_message(
+                        &input.daemon_task_definition,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "The family and revision (family:revision) or full Amazon Resource Name (ARN)
+        // of the daemon task definition to delete": unlike the member the reading
+        // operations take, this one does not offer the family on its own — a family (or
+        // `family:*`) names every revision registered under it, not the ONE revision this
+        // call deletes, so it is refused for the revision it does not carry rather than
+        // resolved to the latest one.
+        let Some(revision) = revision else {
+            return Err(DeleteDaemonTaskDefinitionErrorModeled::ClientException(
+                ClientException {
+                    message: Some(
+                        crate::state::daemon_task_definition_revision_required_message(
+                            &input.daemon_task_definition,
+                        ),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        // A delete an earlier call asked for finishes on the clock, so what this call sees
+        // is the status the revision stands in at THIS instant: one whose delete has come
+        // due is `DELETED` here, not still `DELETE_IN_PROGRESS`.
+        guard.advance_clock(now);
+
+        let Some(record) = guard.daemon_task_definitions.get_mut(&(family, revision)) else {
+            return Err(DeleteDaemonTaskDefinitionErrorModeled::ClientException(
+                ClientException {
+                    message: Some(
+                        crate::state::DAEMON_TASK_DEFINITION_NOT_FOUND_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // "Deletes the specified daemon task definition. ... A daemon task definition must
+        // be in an ACTIVE state to be deleted." The ACTIVE status is what a deletion
+        // APPLIES to: a revision whose delete was already asked for is already on its way
+        // out of the account, so the call has nothing left to start. It reports the same
+        // revision as the call that started the deletion and changes NOTHING — the
+        // instant the first delete was requested stands, the status is not moved back,
+        // and the completion the clock already owes is neither re-dated nor restarted —
+        // so repeating a delete can neither resurrect a revision nor extend its deletion.
+        if record.status == crate::state::DAEMON_TASK_DEFINITION_ACTIVE {
+            record.request_delete(now);
+        }
+
+        Ok(DeleteDaemonTaskDefinitionOutput {
+            // "The full Amazon Resource Name (ARN) of the deleted daemon task
+            // definition", read off the stored revision — never rebuilt from the
+            // reference the request carried.
+            daemon_task_definition_arn: Some(record.arn.clone()),
+        })
     }
 }

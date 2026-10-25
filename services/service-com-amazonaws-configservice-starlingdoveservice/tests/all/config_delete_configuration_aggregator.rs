@@ -134,6 +134,7 @@ fn seed_resource(emulator: &Emulator, resource_type: &str, resource_id: &str) {
             tags: Default::default(),
             first_recorded_at: Some(captured_at),
             last_recorded_at: Some(captured_at),
+            ..DiscoveredResourceEntry::default()
         },
     );
 }

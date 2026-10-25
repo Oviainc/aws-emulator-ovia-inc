@@ -776,3 +776,108 @@ async fn describe_channel_flow_answers_the_modelled_forbidden_exception() {
         );
     }
 }
+
+/// RULE: what the claim rule resolves is the HANDLER and its store — so the request the
+/// whole family used to refuse as `AmbiguousService`, Chime SDK Identity's
+/// `CreateAppInstance` (restJson1 `POST /app-instances`, modelled code 201), is SERVED by
+/// that one service: it answers 201 with the ARN it minted, and that ARN reads back
+/// through the same router.
+///
+/// Appended here rather than in a second suite of its own: this file already mounts the
+/// family and owns `router_with_the_family` / `call`, and a claim table cannot show that
+/// the resolved claimant then answers from state.
+///
+/// The rows span how the request names the service — a bare emulator host, where only
+/// this model's path space names the claimant, and this service's own endpoint host —
+/// and both readers the created instance is visible through: the collection
+/// (`GET /app-instances`) and the resource (`GET /app-instances/{AppInstanceArn}`).
+#[tokio::test]
+async fn create_app_instance_is_served_by_chime_sdk_identity_and_reads_back() {
+    let router = router_with_the_family(false);
+
+    for (case, host) in [
+        ("on a bare emulator host", "localhost:9297"),
+        (
+            "addressed at the identity endpoint",
+            "identity-chime.us-east-1.amazonaws.com",
+        ),
+    ] {
+        let (status, code, content_type, parsed) = call(
+            &router,
+            "POST",
+            host,
+            "/app-instances",
+            json!({
+                "Name": format!("family-router-{}", host.split('.').next().unwrap_or(host)),
+                "ClientRequestToken": format!("token-{}", host.len()),
+            }),
+        )
+        .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (201, ""),
+            "case {case:?}: CreateAppInstance must be served by Chime SDK Identity with its \
+             modelled 201, got {status} {code:?} ({parsed})"
+        );
+        assert_eq!(
+            content_type, "application/json",
+            "case {case:?}: a restJson1 response is framed as application/json, got \
+             {content_type:?}"
+        );
+        let arn = parsed
+            .get("AppInstanceArn")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            arn.starts_with("arn:aws:chime:"),
+            "case {case:?}: the created app instance reports the ARN it minted, got {parsed}"
+        );
+
+        // The collection reader, through the same router: a routing failure carries no
+        // `AppInstances`, and no sibling binds this route.
+        let (status, code, _content_type, listed) =
+            call(&router, "GET", host, "/app-instances", Value::Null).await;
+        let arns: Vec<&str> = listed
+            .get("AppInstances")
+            .and_then(Value::as_array)
+            .map(|instances| {
+                instances
+                    .iter()
+                    .filter_map(|instance| {
+                        instance.get("AppInstanceArn").and_then(Value::as_str)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            (status, code.as_str()),
+            (200, ""),
+            "case {case:?}: ListAppInstances must be served by Chime SDK Identity, got \
+             {status} {code:?} ({listed})"
+        );
+        assert!(
+            arns.contains(&arn.as_str()),
+            "case {case:?}: the created app instance must read back through the router, \
+             {arn} not in {arns:?}"
+        );
+
+        // And the resource reader, whose URI carries the ARN as one percent-encoded label.
+        let (status, code, _content_type, described) =
+            call(&router, "GET", host, &format!("/app-instances/{}", label(&arn)), Value::Null)
+                .await;
+        assert_eq!(
+            (
+                status,
+                code.as_str(),
+                described
+                    .pointer("/AppInstance/AppInstanceArn")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<no AppInstanceArn>")
+            ),
+            (200, "", arn.as_str()),
+            "case {case:?}: DescribeAppInstance must report the instance just created, got \
+             {status} {code:?} ({described})"
+        );
+    }
+}
