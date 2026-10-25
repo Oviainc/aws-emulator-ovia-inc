@@ -843,9 +843,9 @@ pub const EVALUATION_VIOLATOR_LIMIT: i64 = 100;
 /// policy, in one member account of the organisation — what the compliance
 /// summary (`ListComplianceStatus`) counts per account.
 ///
-/// Like [`ComAmazonawsFmsAwsfms20180101State::discovered_resources`] and
-/// [`ComAmazonawsFmsAwsfms20180101State::shield_attacks`], the map these records
-/// live in is an INVENTORY, not a cache: Firewall Manager learns a violation by
+/// Like [`ComAmazonawsFmsAwsfms20180101State::shield_attacks`], the map these
+/// records live in is an INVENTORY, not a cache: Firewall Manager learns a
+/// violation by
 /// evaluating the member accounts' resources against the policy, this emulator
 /// stands in for no such evaluator, and so the inventory holds exactly what
 /// something put in it. An account with nothing recorded against it is reported
@@ -977,33 +977,28 @@ pub struct ComAmazonawsFmsAwsfms20180101State {
     /// policies are a contiguous range in id order that a
     /// `ListThirdPartyFirewallFirewallPolicies` page can resume from.
     ///
-    /// Like [`Self::discovered_resources`] this is an INVENTORY, not a cache: a
+    /// Like [`Self::shield_attacks`] this is an INVENTORY, not a cache: a
     /// third-party firewall policy is created in the VENDOR's own console or
     /// API — no Firewall Manager operation creates one — so the inventory is
     /// empty unless something put a policy in it.
     /// `ListThirdPartyFirewallFirewallPolicies` reports what is here for the
     /// vendor the request names, and never a policy it made up.
-    pub third_party_firewall_policies: BTreeMap<String, ThirdPartyFirewallPolicyRecord>,
-    /// The organisation's resources that are available to be associated with a
-    /// resource set, keyed by the resource URI (its ARN) so the total order
-    /// makes a `ListDiscoveredResources` page resumable from a key.
     ///
-    /// This is an INVENTORY, not a cache: Firewall Manager discovers it from the
-    /// member accounts of the organisation, and the emulator has no member
-    /// accounts to discover from, so it is empty unless something put a resource
-    /// in it. `ListDiscoveredResources` reports what is here, filtered by the
-    /// request's member accounts and resource type — never a resource it made up.
-    pub discovered_resources: BTreeMap<String, DiscoveredResource>,
+    /// The organisation's DISCOVERABLE RESOURCES are deliberately not a field
+    /// beside this one: Firewall Manager discovers them from the services that
+    /// own them, so [`discovered_resources`] reads those services' stores
+    /// through the shared engine rather than a copy kept here.
+    pub third_party_firewall_policies: BTreeMap<String, ThirdPartyFirewallPolicyRecord>,
     /// The DDoS attacks Shield Advanced recorded against the resources the
     /// stored Shield Advanced policies protect, keyed by
     /// [`shield_attack_key`] so one policy's attacks are a contiguous,
     /// chronologically ordered range a `GetProtectionStatus` page can resume
     /// from.
     ///
-    /// Like [`Self::discovered_resources`] this is an INVENTORY, not a cache:
-    /// Shield Advanced detects attacks and Firewall Manager reports what it
-    /// detected, and this emulator stands in for no attack detector, so the
-    /// inventory is empty unless something put an attack in it —
+    /// This is an INVENTORY, not a cache: Shield Advanced detects attacks and
+    /// Firewall Manager reports what it detected, and this emulator stands in
+    /// for no attack detector, so the inventory is empty unless something put an
+    /// attack in it —
     /// `GetProtectionStatus` reports what is here, filtered by the request's
     /// policy, member account and time period, and never an attack it made up.
     ///
@@ -1018,7 +1013,7 @@ pub struct ComAmazonawsFmsAwsfms20180101State {
     /// violations — and, within them, one member account's — are a contiguous
     /// range a compliance page can resume from.
     ///
-    /// Like [`Self::discovered_resources`] and [`Self::shield_attacks`] this is
+    /// Like [`Self::shield_attacks`] this is
     /// an INVENTORY, not a cache: see [`PolicyViolationRecord`]. An entry
     /// outlives a deletion of its policy that asked for no cleanup of the
     /// policy's resources and is then unreachable, because a `PolicyId` is
@@ -2171,17 +2166,20 @@ pub fn resource_set_item_failure_reason(
 /// The accounts of this organization a resource may belong to: the ones
 /// [`ComAmazonawsFmsAwsfms20180101State::member_accounts`] reports — the SAME
 /// definition `ListMemberAccounts` answers with, so two operations cannot
-/// disagree about who is in the organization — together with the accounts the
-/// discovered-resource inventory carries, which are by construction accounts
-/// Firewall Manager discovered resources in.
-pub fn organization_accounts(store: &ComAmazonawsFmsAwsfms20180101State) -> BTreeSet<String> {
+/// disagree about who is in the organization — together with `discoverable`, the
+/// accounts the discovered-resource inventory reports resources in, which are by
+/// construction accounts Firewall Manager discovered resources in.
+///
+/// `discoverable` is [`discoverable_accounts`], which its caller reads BEFORE
+/// taking this store's guard (that read takes the owning services' locks), so a
+/// resource `ListDiscoveredResources` reports as discoverable is one the batch
+/// operations accept from its account.
+pub fn organization_accounts(
+    store: &ComAmazonawsFmsAwsfms20180101State,
+    discoverable: BTreeSet<String>,
+) -> BTreeSet<String> {
     let mut accounts = store.member_accounts();
-    accounts.extend(
-        store
-            .discovered_resources
-            .values()
-            .filter_map(|resource| resource.account_id.clone()),
-    );
+    accounts.extend(discoverable);
     accounts
 }
 
@@ -2350,6 +2348,498 @@ pub fn mint_identifier() -> String {
 /// subset of base62, so a hex string satisfies the base62 pattern.
 pub fn mint_base62_id() -> String {
     mint_hex(22)
+}
+
+// ---------------------------------------------------------------------------
+// The organisation's discoverable resource inventory
+// ---------------------------------------------------------------------------
+//
+// Firewall Manager does not keep a registry of the organisation's resources: it
+// DISCOVERS them from the accounts of the organisation, where the service that
+// owns each kind of resource holds it. This emulator stands in for those
+// services, so the inventory is read from THEIR stores through the one shared
+// engine (the same cross-service read `ListS3Buckets` does for S3's buckets) —
+// never from a second copy kept here, which nothing would write and which would
+// disagree with the owning service the moment a resource was created or deleted.
+
+/// A resource type Firewall Manager works with, "in the format shown in the
+/// Amazon Web Services Resource Types Reference" (`Policy$ResourceType`).
+/// [`DISCOVERABLE_RESOURCE_TYPES`] lists the ones this emulator can discover and
+/// says where each catalogue entry comes from.
+pub const RESOURCE_TYPE_APIGATEWAY_STAGE: &str = "AWS::ApiGateway::Stage";
+/// See [`RESOURCE_TYPE_APIGATEWAY_STAGE`].
+pub const RESOURCE_TYPE_CLOUDFRONT_DISTRIBUTION: &str = "AWS::CloudFront::Distribution";
+/// See [`RESOURCE_TYPE_APIGATEWAY_STAGE`].
+pub const RESOURCE_TYPE_EC2_EIP: &str = "AWS::EC2::EIP";
+/// See [`RESOURCE_TYPE_APIGATEWAY_STAGE`].
+pub const RESOURCE_TYPE_EC2_INSTANCE: &str = "AWS::EC2::Instance";
+/// See [`RESOURCE_TYPE_APIGATEWAY_STAGE`].
+pub const RESOURCE_TYPE_EC2_NETWORK_INTERFACE: &str = "AWS::EC2::NetworkInterface";
+/// See [`RESOURCE_TYPE_APIGATEWAY_STAGE`].
+pub const RESOURCE_TYPE_EC2_SECURITY_GROUP: &str = "AWS::EC2::SecurityGroup";
+/// See [`RESOURCE_TYPE_APIGATEWAY_STAGE`].
+pub const RESOURCE_TYPE_EC2_SUBNET: &str = "AWS::EC2::Subnet";
+/// See [`RESOURCE_TYPE_APIGATEWAY_STAGE`].
+pub const RESOURCE_TYPE_EC2_VPC: &str = "AWS::EC2::VPC";
+/// See [`RESOURCE_TYPE_APIGATEWAY_STAGE`].
+pub const RESOURCE_TYPE_ELB_LOAD_BALANCER: &str = "AWS::ElasticLoadBalancing::LoadBalancer";
+/// See [`RESOURCE_TYPE_APIGATEWAY_STAGE`].
+pub const RESOURCE_TYPE_ELBV2_LOAD_BALANCER: &str = "AWS::ElasticLoadBalancingV2::LoadBalancer";
+/// See [`RESOURCE_TYPE_APIGATEWAY_STAGE`].
+pub const RESOURCE_TYPE_NETWORK_FIREWALL_FIREWALL: &str = "AWS::NetworkFirewall::Firewall";
+
+/// Every resource type this emulator can discover resources of, in ascending
+/// order so the catalogue reads as a set.
+///
+/// SOURCE of the catalogue: the resource types `Policy$ResourceType` documents
+/// as valid for a Firewall Manager policy type
+/// (`smithy_query(query="doc",shape="Policy",member="ResourceType")`:
+/// `AWS::ApiGateway::Stage`, `AWS::CloudFront::Distribution`,
+/// `AWS::ElasticLoadBalancingV2::LoadBalancer`,
+/// `AWS::ElasticLoadBalancing::LoadBalancer`, `AWS::EC2::EIP`,
+/// `AWS::EC2::Subnet`, `AWS::EC2::SecurityGroup`, `AWS::EC2::NetworkInterface`,
+/// `AWS::EC2::Instance` and `AWS::EC2::VPC`), together with
+/// `AWS::NetworkFirewall::Firewall`, the Network Firewall resource a Firewall
+/// Manager RESOURCE SET holds — the very thing `ListDiscoveredResources`
+/// reports resources "available to be associated with" and the type
+/// `BatchAssociateResource` already spells out.
+///
+/// A type NOT in this catalogue is one no service this emulator stands in for
+/// holds resources of: it is reported as an EMPTY inventory, never refused and
+/// never answered with an invented resource. Adding the service that owns such a
+/// type is what adds its entry here.
+pub const DISCOVERABLE_RESOURCE_TYPES: &[&str] = &[
+    RESOURCE_TYPE_APIGATEWAY_STAGE,
+    RESOURCE_TYPE_CLOUDFRONT_DISTRIBUTION,
+    RESOURCE_TYPE_EC2_EIP,
+    RESOURCE_TYPE_EC2_INSTANCE,
+    RESOURCE_TYPE_EC2_NETWORK_INTERFACE,
+    RESOURCE_TYPE_EC2_SECURITY_GROUP,
+    RESOURCE_TYPE_EC2_SUBNET,
+    RESOURCE_TYPE_EC2_VPC,
+    RESOURCE_TYPE_ELB_LOAD_BALANCER,
+    RESOURCE_TYPE_ELBV2_LOAD_BALANCER,
+    RESOURCE_TYPE_NETWORK_FIREWALL_FIREWALL,
+];
+
+/// One resource an emulated service holds, as the inventory reads it out of that
+/// service's own store: the URI it would be associated by (its ARN), the name it
+/// carries, and the account that owns it.
+#[derive(Debug, Clone)]
+struct HeldResource {
+    uri: String,
+    name: String,
+    account: String,
+}
+
+/// The account a resource belongs to when its own store records no owner: the
+/// ONE account this emulator presents ([`::engine::emulator_account_id`]), which
+/// is also the account segment of every ARN [`::engine::emulator_arn`] builds.
+fn emulator_owner() -> String {
+    ::engine::emulator_account_id().to_string()
+}
+
+/// The ARN of a resource of `service` in `region` that `account` OWNS, for a
+/// record whose own store keeps no ARN.
+///
+/// [`::engine::emulator_arn`] stamps this emulator's own account into the ARN,
+/// which is right for a resource this emulator owns and wrong for one whose
+/// record reports another `OwnerId`: the reported `AccountId` and the account
+/// segment of the reported `URI` must name the SAME account, or a resource set
+/// would be offered a URI its account check refuses.
+fn owned_arn(service: &str, region: &str, account: &str, resource: &str) -> String {
+    format!(
+        "arn:{}:{service}:{region}:{account}:{resource}",
+        emulator_partition()
+    )
+}
+
+/// Whether `uri` names a resource of `region`: an ARN whose Region field is
+/// `region`, or one that carries no Region at all (a global service's ARN, such
+/// as CloudFront's).
+///
+/// A value that is not an ARN names no resource that could be associated, so it
+/// is not in any Region's inventory. The check is what keeps the inventory and
+/// `BatchAssociateResource` in agreement: a resource set holds the resources of
+/// the administrator's Region, so a resource reported as discoverable in a
+/// Region is one that Region's resource sets can actually take.
+fn in_region(uri: &str, region: &str) -> bool {
+    parse_arn(uri).is_some_and(|arn| arn.region.is_empty() || arn.region == region)
+}
+
+/// Whether `value` can be carried by the model's `ResourceName`
+/// (`com.amazonaws.fms#ResourceName`: length 1..128, pattern
+/// `^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`) — so a resource whose owning service lets
+/// it carry a longer or otherwise unrepresentable name is reported WITHOUT a
+/// `Name` rather than with one the model cannot hold.
+///
+/// The character classes are `char`'s own, which APPROXIMATE the pattern's
+/// Unicode classes: `is_alphabetic` is a superset of `\p{L}` (it also admits
+/// Other_Alphabetic marks), `is_numeric` of `\p{N}`, and
+/// `is_whitespace() && !is_control()` of `\p{Z}`. The approximation is on the
+/// permissive side and decides only whether `Name` is reported or omitted, never
+/// whether a resource is discovered.
+fn is_resource_name(value: &str) -> bool {
+    (1..=128).contains(&value.chars().count())
+        && value.chars().all(|c| {
+            c.is_alphabetic()
+                || c.is_numeric()
+                // `\p{Z}` is the SEPARATOR category: a control character such as
+                // a tab or a newline is whitespace but not a separator, and the
+                // pattern does not admit it.
+                || (c.is_whitespace() && !c.is_control())
+                || matches!(c, '_' | '.' | ':' | '/' | '=' | '+' | '-' | '@')
+        })
+}
+
+/// The resources Amazon EC2 holds of `resource_type`, read from the EC2
+/// service's own store through the shared engine.
+///
+/// An EC2 resource's ARN is `arn:aws:ec2:<region>:<account>:<kind>/<id>`, which
+/// is the URI a resource set associates it by; the stored ARN is preferred where
+/// the record carries one (a subnet's `SubnetArn`, a security group's
+/// `SecurityGroupArn`), so the Region a resource is discoverable in is the one
+/// the service that created it recorded.
+///
+/// LOCK ORDER: this takes the EC2 store's lock, holds no other while it does,
+/// and hands back owned values rather than a guard — so it is called with NO
+/// Firewall Manager store guard held. Keeping the cross-service read
+/// one-directional and guard-free is what makes a lock cycle unreachable.
+fn ec2_resources<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    resource_type: &str,
+) -> Vec<HeldResource> {
+    let Some(state) = ::service_com_amazonaws_ec2_amazonec2::state::service_state(engine) else {
+        return Vec::new();
+    };
+    let store = state.lock();
+    // The ARN of a resource whose own record keeps none. EC2's VPC, instance,
+    // network interface and address stores are NOT Region-keyed and those
+    // records carry no ARN, so such a resource is reported in whichever Region
+    // asks — exactly as EC2's own Region-agnostic describes report it, and so
+    // [`in_region`] does no filtering for those four types. The Region filter
+    // bites for the types whose record DOES keep an ARN (`SubnetArn`,
+    // `SecurityGroupArn`).
+    //
+    // The ARN's ACCOUNT field is the account the record itself reports as the
+    // owner, not this emulator's: a resource whose `OwnerId` is another account
+    // is reported with an `AccountId` and a `URI` that name the SAME account, so
+    // the pair cannot disagree and the URI is one `BatchAssociateResource`
+    // accepts from that account.
+    let arn = |account: &str, resource: &str| owned_arn("ec2", region, account, resource);
+    match resource_type {
+        RESOURCE_TYPE_EC2_VPC => store
+            .vpcs
+            .values()
+            .filter_map(|vpc| {
+                let id = vpc.vpc_id.clone()?;
+                let account = vpc.owner_id.clone().unwrap_or_else(emulator_owner);
+                Some(HeldResource {
+                    uri: arn(&account, &format!("vpc/{id}")),
+                    name: id,
+                    account,
+                })
+            })
+            .collect(),
+        RESOURCE_TYPE_EC2_SUBNET => store
+            .subnets
+            .values()
+            .filter_map(|subnet| {
+                let id = subnet.subnet_id.clone()?;
+                let account = subnet.owner_id.clone().unwrap_or_else(emulator_owner);
+                Some(HeldResource {
+                    uri: subnet
+                        .subnet_arn
+                        .clone()
+                        .unwrap_or_else(|| arn(&account, &format!("subnet/{id}"))),
+                    name: id,
+                    account,
+                })
+            })
+            .collect(),
+        RESOURCE_TYPE_EC2_SECURITY_GROUP => store
+            .security_groups
+            .values()
+            .filter_map(|group| {
+                let id = group.group_id.clone()?;
+                let account = group.owner_id.clone().unwrap_or_else(emulator_owner);
+                Some(HeldResource {
+                    uri: group
+                        .security_group_arn
+                        .clone()
+                        .unwrap_or_else(|| arn(&account, &format!("security-group/{id}"))),
+                    // A security group is addressed by its `GroupName` where it
+                    // has one, which is the name AWS shows for it.
+                    name: group.group_name.clone().unwrap_or(id),
+                    account,
+                })
+            })
+            .collect(),
+        RESOURCE_TYPE_EC2_NETWORK_INTERFACE => store
+            .network_interfaces
+            .values()
+            .filter_map(|interface| {
+                let id = interface.network_interface_id.clone()?;
+                let account = interface.owner_id.clone().unwrap_or_else(emulator_owner);
+                Some(HeldResource {
+                    uri: arn(&account, &format!("network-interface/{id}")),
+                    name: id,
+                    account,
+                })
+            })
+            .collect(),
+        RESOURCE_TYPE_EC2_INSTANCE => store
+            .instances
+            .values()
+            .map(|instance| {
+                let account = emulator_owner();
+                HeldResource {
+                    uri: arn(&account, &format!("instance/{}", instance.instance_id)),
+                    name: instance.instance_id.clone(),
+                    account,
+                }
+            })
+            .collect(),
+        // An Elastic IP address is associated by the ARN of its ALLOCATION; an
+        // address held without an allocation id (an EC2-Classic address) names
+        // no resource an ARN can address, so it is not discoverable.
+        RESOURCE_TYPE_EC2_EIP => store
+            .addresses
+            .values()
+            .filter_map(|address| {
+                let id = address.allocation_id.clone()?;
+                let account = emulator_owner();
+                Some(HeldResource {
+                    uri: arn(&account, &format!("elastic-ip/{id}")),
+                    name: id,
+                    account,
+                })
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The Application/Network/Gateway Load Balancers Elastic Load Balancing v2
+/// holds, read from that service's own store. Each record keeps the ARN its
+/// create minted, which carries the Region it was created in.
+///
+/// LOCK ORDER: as [`ec2_resources`].
+fn load_balancers_v2<Eng: Send + Sync + 'static>(engine: &Eng) -> Vec<HeldResource> {
+    let Some(state) =
+        ::service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state::service_state(
+            engine,
+        )
+    else {
+        return Vec::new();
+    };
+    let store = state.lock();
+    store
+        .load_balancers
+        .values()
+        .map(|record| HeldResource {
+            uri: record.arn.clone(),
+            name: record.name.clone(),
+            account: emulator_owner(),
+        })
+        .collect()
+}
+
+/// The Classic Load Balancers Elastic Load Balancing holds IN `region` — that
+/// store is keyed by Region first, a load balancer being a regional resource —
+/// read from that service's own store.
+///
+/// LOCK ORDER: as [`ec2_resources`].
+fn load_balancers_classic<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+) -> Vec<HeldResource> {
+    let Some(state) =
+        ::service_com_amazonaws_elasticloadbalancing_elasticloadbalancing_v7::state::service_state(
+            engine,
+        )
+    else {
+        return Vec::new();
+    };
+    let store = state.lock();
+    store
+        .load_balancers_in(region)
+        .map(|held| {
+            held.keys()
+                .map(|name| HeldResource {
+                    uri: ::engine::emulator_arn(
+                        "elasticloadbalancing",
+                        region,
+                        &format!("loadbalancer/{name}"),
+                    ),
+                    name: name.clone(),
+                    account: emulator_owner(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The CloudFront distributions that service holds, read from its own store.
+/// CloudFront is global, so a distribution's stored ARN carries no Region and it
+/// is discoverable from every Region.
+///
+/// LOCK ORDER: as [`ec2_resources`].
+fn distributions<Eng: Send + Sync + 'static>(engine: &Eng) -> Vec<HeldResource> {
+    let Some(state) =
+        ::service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::service_state(engine)
+    else {
+        return Vec::new();
+    };
+    let store = state.lock();
+    store
+        .distributions
+        .values()
+        .map(|record| HeldResource {
+            uri: record.arn.clone(),
+            // A distribution has no name of its own; its `Id` is what names it.
+            name: record.id.clone(),
+            account: emulator_owner(),
+        })
+        .collect()
+}
+
+/// The API Gateway stages that service holds, read from its own store: one entry
+/// per stage of every REST API, named by the stage.
+///
+/// An API Gateway ARN carries an EMPTY account field
+/// (`arn:aws:apigateway:<region>::/restapis/<id>/stages/<name>`, built by that
+/// service's own `state::service_arn`), so the owning account is this
+/// emulator's rather than the URI's.
+///
+/// LOCK ORDER: as [`ec2_resources`].
+fn api_gateway_stages<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+) -> Vec<HeldResource> {
+    use ::service_com_amazonaws_apigateway_backplanecontrolservice::state as apigateway;
+
+    let Some(state) = apigateway::service_state(engine) else {
+        return Vec::new();
+    };
+    let store = state.lock();
+    store
+        .rest_apis
+        .iter()
+        .flat_map(|(api_id, api)| {
+            api.stages.keys().map(move |stage| HeldResource {
+                uri: apigateway::service_arn(
+                    region,
+                    &format!("/restapis/{api_id}/stages/{stage}"),
+                ),
+                name: stage.clone(),
+                account: emulator_owner(),
+            })
+        })
+        .collect()
+}
+
+/// The Network Firewall firewalls that service holds, read from its own store.
+/// Each record keeps the `FirewallArn` its create minted.
+///
+/// LOCK ORDER: as [`ec2_resources`].
+fn firewalls<Eng: Send + Sync + 'static>(engine: &Eng) -> Vec<HeldResource> {
+    let Some(state) =
+        ::service_com_amazonaws_networkfirewall_networkfirewall_20201112::state::service_state(
+            engine,
+        )
+    else {
+        return Vec::new();
+    };
+    let store = state.lock();
+    store
+        .firewalls
+        .values()
+        .map(|record| HeldResource {
+            uri: record.firewall_arn.clone(),
+            name: record.firewall_name.clone(),
+            account: emulator_owner(),
+        })
+        .collect()
+}
+
+/// Every resource this emulator holds of `resource_type`, from whichever service
+/// owns that type — the catalogue [`DISCOVERABLE_RESOURCE_TYPES`] names. A type
+/// no emulated service owns holds nothing.
+fn held_resources<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    resource_type: &str,
+) -> Vec<HeldResource> {
+    match resource_type {
+        RESOURCE_TYPE_EC2_VPC
+        | RESOURCE_TYPE_EC2_SUBNET
+        | RESOURCE_TYPE_EC2_SECURITY_GROUP
+        | RESOURCE_TYPE_EC2_NETWORK_INTERFACE
+        | RESOURCE_TYPE_EC2_INSTANCE
+        | RESOURCE_TYPE_EC2_EIP => ec2_resources(engine, region, resource_type),
+        RESOURCE_TYPE_ELBV2_LOAD_BALANCER => load_balancers_v2(engine),
+        RESOURCE_TYPE_ELB_LOAD_BALANCER => load_balancers_classic(engine, region),
+        RESOURCE_TYPE_CLOUDFRONT_DISTRIBUTION => distributions(engine),
+        RESOURCE_TYPE_APIGATEWAY_STAGE => api_gateway_stages(engine, region),
+        RESOURCE_TYPE_NETWORK_FIREWALL_FIREWALL => firewalls(engine),
+        _ => Vec::new(),
+    }
+}
+
+/// The organisation's resources of `resource_type` that `account` owns in
+/// `region` and that are available to be associated with a resource set, keyed
+/// by URI — the total order that makes a `ListDiscoveredResources` page
+/// resumable from a key.
+///
+/// This is a pure READ of the stores of the services that own the resources: a
+/// resource created through one of those services is discoverable with no
+/// propagation step, and one deleted there stops being discovered, because
+/// nothing is copied here. An account that owns none, and a type no emulated
+/// service holds, both answer an EMPTY inventory — never an invented resource.
+pub fn discovered_resources<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    account: &str,
+    resource_type: &str,
+) -> BTreeMap<String, DiscoveredResource> {
+    let mut inventory = BTreeMap::new();
+    for held in held_resources(engine, region, resource_type) {
+        if held.account != account || !in_region(&held.uri, region) {
+            continue;
+        }
+        let name = is_resource_name(&held.name).then(|| held.name.clone());
+        inventory.insert(
+            held.uri.clone(),
+            DiscoveredResource {
+                uri: Some(held.uri),
+                account_id: Some(held.account),
+                r#type: Some(resource_type.to_string()),
+                name,
+            },
+        );
+    }
+    inventory
+}
+
+/// The accounts the discoverable inventory reports resources in, in `region`:
+/// by construction, the accounts Firewall Manager discovered resources in, and
+/// so accounts of the organisation whose resources a resource set may hold.
+///
+/// Derived from the SAME reads as [`discovered_resources`], so an account a
+/// resource is discoverable in is one `BatchAssociateResource` accepts that
+/// resource from, and the two cannot disagree.
+pub fn discoverable_accounts<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+) -> BTreeSet<String> {
+    DISCOVERABLE_RESOURCE_TYPES
+        .iter()
+        .flat_map(|resource_type| held_resources(engine, region, resource_type))
+        .filter(|held| in_region(&held.uri, region))
+        .map(|held| held.account)
+        .collect()
 }
 
 /// The mint behind [`mint_identifier`] and [`mint_base62_id`]: `len` lowercase

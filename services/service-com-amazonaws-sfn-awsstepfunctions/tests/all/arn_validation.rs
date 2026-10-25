@@ -120,7 +120,7 @@ async fn expect_invalid_arn(
 // An ARN of another region
 // ---------------------------------------------------------------------------
 
-/// Every ARN member of every implemented operation (13 pairs) refuses an ARN whose region is
+/// Every ARN member of every implemented operation (15 pairs) refuses an ARN whose region is
 /// not the endpoint's, with `InvalidArn` and the region-mismatch message — not with
 /// the resource-absent error, and not with a 404.
 #[tokio::test]
@@ -128,7 +128,7 @@ async fn every_arn_member_refuses_an_arn_from_another_region() {
     let emulator = Emulator::new();
     let machine = create_machine(&emulator, "arn-rule", HELLO_DEFINITION).await;
     let execution = start(&emulator, &machine, "run-1").await;
-    // Neither a map run nor an activity can exist in this emulator, so these two are
+    // No map run of THIS state machine and no activity exists here, so these two are
     // built from the ARN forms the model documents; the region check does not depend
     // on the resource being there.
     let map_run = format!(
@@ -152,7 +152,9 @@ async fn every_arn_member_refuses_an_arn_from_another_region() {
         ("DescribeExecution", "executionArn", &execution),
         ("StopExecution", "executionArn", &execution),
         ("RedriveExecution", "executionArn", &execution),
+        ("ListMapRuns", "executionArn", &execution),
         ("ListExecutions", "mapRunArn", &map_run),
+        ("DescribeMapRun", "mapRunArn", &map_run),
     ];
 
     for foreign in FOREIGN_REGIONS {
@@ -309,7 +311,9 @@ async fn a_malformed_arn_reports_the_component_that_failed() {
         ("DescribeExecution", "executionArn"),
         ("StopExecution", "executionArn"),
         ("RedriveExecution", "executionArn"),
+        ("ListMapRuns", "executionArn"),
         ("ListExecutions", "mapRunArn"),
+        ("DescribeMapRun", "mapRunArn"),
     ];
 
     for (case, value, diagnosis) in &shared {

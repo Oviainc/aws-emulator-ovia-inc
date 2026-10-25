@@ -245,6 +245,7 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::CE::AnomalySubscription",
     // AWS Certificate Manager
     "AWS::CertificateManager::Account",
+    "AWS::CertificateManager::AcmeEndpoint",
     "AWS::CertificateManager::Certificate",
     // AWS CloudFormation's own types, including the generic custom resource and the
     // registry's own records.

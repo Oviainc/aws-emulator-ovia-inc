@@ -21,6 +21,8 @@ mod dashboard_lifecycle;
 mod dashboard_name_uniqueness;
 #[path = "all/delete_dashboard_idempotency.rs"]
 mod delete_dashboard_idempotency;
+#[path = "all/listing_pagination.rs"]
+mod listing_pagination;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 #[path = "all/resource_not_found.rs"]

@@ -124,16 +124,26 @@ fn hls_manifest_defaults() -> Vec<(&'static str, Value)> {
         .collect()
 }
 
-/// The `dashPackage` members MediaPackage server-fills, with the default each takes.
+/// The `dashPackage` members MediaPackage server-fills, with the default each takes. The
+/// live-manifest half of this block (`manifestLayout`, `utcTiming`, `manifestWindowSeconds`,
+/// `minUpdatePeriodSeconds`, `suggestedPresentationDelaySeconds`, `segmentDurationSeconds`)
+/// is driven over its own set of inputs, and across the update write path, by
+/// `dash_live_manifest_defaults.rs`.
 fn dash_package_defaults() -> Vec<(&'static str, Value)> {
     vec![
         ("adTriggers", default_ad_triggers()),
         ("adsOnDeliveryRestrictions", json!("RESTRICTED")),
         ("includeIframeOnlyStream", json!(false)),
+        ("manifestLayout", json!("FULL")),
+        ("manifestWindowSeconds", json!(60)),
         ("minBufferTimeSeconds", json!(30)),
+        ("minUpdatePeriodSeconds", json!(15)),
         ("periodTriggers", json!([])),
         ("profile", json!("NONE")),
+        ("segmentDurationSeconds", json!(2)),
         ("segmentTemplateFormat", json!("NUMBER_WITH_TIMELINE")),
+        ("suggestedPresentationDelaySeconds", json!(25)),
+        ("utcTiming", json!("NONE")),
     ]
 }
 
@@ -235,7 +245,10 @@ fn cases() -> Vec<(&'static str, Value)> {
                 "dashPackage": {
                     "profile": "HBBTV_1_5",
                     "periodTriggers": ["ADS"],
-                    "minBufferTimeSeconds": 4
+                    "minBufferTimeSeconds": 4,
+                    "manifestLayout": "COMPACT",
+                    "utcTiming": "HTTP-HEAD",
+                    "segmentDurationSeconds": 4
                 }
             }),
         ),
@@ -397,7 +410,7 @@ async fn every_server_filled_enum_default_is_a_value_the_model_accepts() {
     // The default values this service fills in are not free text: each one must be a
     // member of the enum the model declares for that member. Sources: the `*_VALUES`
     // tables generated from the Smithy model
-    // (`smithy_query(query="shape",shape="AdMarkers,AdsOnDeliveryRestrictions,PlaylistType,Origination,Profile,SegmentTemplateFormat,__AdTriggersElement,__PeriodTriggersElement",model_path="services/service-com-amazonaws-mediapackage-mediapackage/smithy-model/com-amazonaws-mediapackage-mediapackage.json")`).
+    // (`smithy_query(query="shape",shape="AdMarkers,AdsOnDeliveryRestrictions,PlaylistType,Origination,Profile,SegmentTemplateFormat,ManifestLayout,UtcTiming,__AdTriggersElement,__PeriodTriggersElement",model_path="services/service-com-amazonaws-mediapackage-mediapackage/smithy-model/com-amazonaws-mediapackage-mediapackage.json")`).
     let singles: Vec<(&str, &str, &[&str])> = vec![
         ("Origination", state::DEFAULT_ORIGINATION, types::ORIGINATION_VALUES),
         ("AdMarkers", state::DEFAULT_AD_MARKERS, types::AD_MARKERS_VALUES),
@@ -408,6 +421,16 @@ async fn every_server_filled_enum_default_is_a_value_the_model_accepts() {
         ),
         ("PlaylistType", state::DEFAULT_PLAYLIST_TYPE, types::PLAYLIST_TYPE_VALUES),
         ("Profile", state::DEFAULT_DASH_PROFILE, types::PROFILE_VALUES),
+        (
+            "ManifestLayout",
+            state::DEFAULT_DASH_MANIFEST_LAYOUT,
+            types::MANIFEST_LAYOUT_VALUES,
+        ),
+        (
+            "UtcTiming",
+            state::DEFAULT_DASH_UTC_TIMING,
+            types::UTC_TIMING_VALUES,
+        ),
         (
             "SegmentTemplateFormat",
             state::DEFAULT_DASH_SEGMENT_TEMPLATE_FORMAT,
