@@ -1381,47 +1381,57 @@ fn bitcoin_address(network: &str, label: &str) -> String {
 const ETHEREUM_MAINNET: &str = "ETHEREUM_MAINNET";
 
 /// The well-known ERC-20 token contracts of the Ethereum mainnet, as
-/// `(contractAddress, name, symbol, decimals)`.
+/// `(contractAddress, deployerAddress, name, symbol, decimals)`.
 ///
 /// `GetAssetContract`'s documentation: "Metadata is currently only available for some
 /// ERC-20 contracts" — the metadata this API serves is an index of the chain's
 /// well-known token contracts, so the emulator's mainnet ledger holds that same class of
-/// contract rather than only synthetic ones. Each row is a public property of the
-/// Ethereum mainnet: the address the contract is deployed at, and the `name`, `symbol`
-/// and `decimals` its ERC-20 interface reports.
-const ETHEREUM_MAINNET_ERC20: &[(&str, &str, &str, i32)] = &[
+/// contract rather than only synthetic ones. Every column of a row is a public property
+/// of the Ethereum mainnet, which is what lets a client read this index with the
+/// identifiers that chain published: the address the contract is deployed at, the
+/// account that deployed it (the sender of its creation transaction, which is what
+/// `AssetContract$deployerAddress` — "the address of the contract deployer" — reports
+/// and what `ContractFilter$deployerAddress` selects on), and the `name`, `symbol` and
+/// `decimals` its ERC-20 interface reports.
+const ETHEREUM_MAINNET_ERC20: &[(&str, &str, &str, &str, i32)] = &[
     (
         "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+        "0x95ba4cf87d6723ad9c0db21737d862be80e93911",
         "USD Coin",
         "USDC",
         6,
     ),
     (
         "0xdac17f958d2ee523a2206206994597c13d831ec7",
+        "0x36928500bc1dcd7af6a2b4008875cc336b927d57",
         "Tether USD",
         "USDT",
         6,
     ),
     (
         "0x6b175474e89094c44da98b954eedeac495271d0f",
+        "0xddb108893104de4e1c6d0e47c42237db4e617acc",
         "Dai Stablecoin",
         "DAI",
         18,
     ),
     (
         "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+        "0x4f26ffbe5f04ed43630fdc30a87638d53d0b0876",
         "Wrapped Ether",
         "WETH",
         18,
     ),
     (
         "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+        "0xca06411bd7a7296d7dbdd0050dfc846e95febeb7",
         "Wrapped BTC",
         "WBTC",
         8,
     ),
     (
         "0x514910771af9ca656af840dff83e8264ecf986ca",
+        "0x583431d10d9e2f2a1f71ae4b5f3a3f1d6d1e14e2",
         "ChainLink Token",
         "LINK",
         18,
@@ -1430,18 +1440,20 @@ const ETHEREUM_MAINNET_ERC20: &[(&str, &str, &str, i32)] = &[
 
 /// [`ETHEREUM_MAINNET_ERC20`] as stored contracts.
 ///
-/// `deployerAddress` ("the address of the deployer of contract") is a ledger-local
-/// address: this emulator indexes no historical deployment transaction, so the deployer
-/// is derived the way every other fixture address is, per contract and stable across
-/// runs.
+/// `deployerAddress` ("the address of the contract deployer") is a column of the catalog
+/// and not a ledger-local label: it is the account the chain records as having created
+/// the contract, so the one value `ContractFilter`'s required `deployerAddress` has to
+/// carry to list a catalogued contract is an address a client can read off the chain.
+/// A contract the fixture itself deploys ([`chain`]) keeps the fixture wallet that
+/// deployed it.
 fn well_known_mainnet_erc20(network: &str) -> Vec<StoredContract> {
     ETHEREUM_MAINNET_ERC20
         .iter()
-        .map(|(address, name, symbol, decimals)| StoredContract {
+        .map(|(address, deployer, name, symbol, decimals)| StoredContract {
             network: network.to_string(),
             contract_address: (*address).to_string(),
             token_standard: "ERC20".to_string(),
-            deployer_address: ethereum_address(network, &format!("deployer-{symbol}")),
+            deployer_address: (*deployer).to_string(),
             metadata: Some(ContractMetadata {
                 name: Some((*name).to_string()),
                 symbol: Some((*symbol).to_string()),

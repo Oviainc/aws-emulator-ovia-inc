@@ -19,6 +19,8 @@ mod asset_contracts;
 mod batch_token_balance;
 #[path = "all/chain_query_slice.rs"]
 mod chain_query_slice;
+#[path = "all/contract_deployer.rs"]
+mod contract_deployer;
 #[path = "all/contract_token_denomination.rs"]
 mod contract_token_denomination;
 #[path = "all/cross_chain_address.rs"]

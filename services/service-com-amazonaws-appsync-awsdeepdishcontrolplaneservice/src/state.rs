@@ -829,6 +829,38 @@ impl SourceApiAssociationRecord {
         Ok(self.status.clone())
     }
 
+    /// Apply the configuration choices an update asks this association for, or report
+    /// the refusal the call meets.
+    ///
+    /// The two settable members are each "the new value" of a configuration choice, so
+    /// the update REPLACES what was stored rather than merging into it: a member the
+    /// request omits is gone from the association, and an omitted `mergeType` leaves
+    /// the association on the modelled default ([`DEFAULT_MERGE_TYPE`]) — the same
+    /// projection the create takes, so an update cannot leave an association in a state
+    /// no create could produce.
+    ///
+    /// Only the configuration changes: the merge the association scheduled is neither
+    /// performed nor re-scheduled here, so the status, the status detail and the merge
+    /// date stay what the clock left behind.
+    ///
+    /// An association whose DELETION the clock still owes is being destroyed, and that
+    /// deletion is a modification already in progress, so the call is refused rather
+    /// than writing over the status the deletion left behind.
+    pub fn apply_update(
+        &mut self,
+        description: Option<String>,
+        merge_type: Option<String>,
+    ) -> Result<(), AssociationRefusal> {
+        if self.deletion_pending() {
+            return Err(AssociationRefusal::ConcurrentModification(
+                CONCURRENT_MODIFICATION_MESSAGE.to_string(),
+            ));
+        }
+        self.description = description;
+        self.merge_type = merge_type.unwrap_or_else(|| DEFAULT_MERGE_TYPE.to_string());
+        Ok(())
+    }
+
     /// This record as the modelled `SourceApiAssociation` shape.
     ///
     /// The single projection every operation that reports an association answers
@@ -899,16 +931,25 @@ pub enum AssociationRefusal {
 ///
 /// Stated independently of the operation, so the read and the merge refuse the same
 /// pair the same way; each handler lifts a variant into its own modelled error. Only
-/// the two refusals the LOOKUP itself can meet are here — what an operation then does
+/// the refusals the LOOKUP itself can meet are here — what an operation then does
 /// with the association it found is its own business.
+///
+/// Which SIDE of the pair resolved to nothing is kept apart, because the operations do
+/// not all answer the two the same way: an absent Merged API is a not-found to every
+/// one of them, while an `associationId` that names no association of it is a not-found
+/// to the read and the merge and a BAD REQUEST to `UpdateSourceApiAssociation`.
 #[derive(Debug, Clone)]
 pub enum AssociationLookupRefusal {
     /// The request names an identifier that cannot name an API at all:
     /// `BadRequestException` (HTTP 400), carrying this text.
     BadRequest(String),
-    /// The Merged API or the association under it is not one this account holds:
+    /// The Merged API the request addresses is not one this account holds:
     /// `NotFoundException` (HTTP 404), carrying this text.
     NotFound(String),
+    /// The Merged API exists, but holds no association with the `associationId` the
+    /// request names — which is carried here, so an operation whose refusal names the
+    /// rejected id can build it.
+    AssociationNotFound(String),
 }
 
 /// A lookup refusal is one of the refusals an association operation can give, so an
@@ -919,6 +960,9 @@ impl From<AssociationLookupRefusal> for AssociationRefusal {
         match refusal {
             AssociationLookupRefusal::BadRequest(message) => Self::BadRequest(message),
             AssociationLookupRefusal::NotFound(message) => Self::NotFound(message),
+            AssociationLookupRefusal::AssociationNotFound(_) => {
+                Self::NotFound(ASSOCIATION_NOT_FOUND_MESSAGE.to_string())
+            }
         }
     }
 }
@@ -1216,7 +1260,9 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
     /// * the Merged API is resolved in either identifier form, and one that resolves to
     ///   nothing is a not-found;
     /// * an `associationId` names an association OF the Merged API addressed, so one
-    ///   that belongs to another Merged API — or to none — is not found under this one.
+    ///   that belongs to another Merged API — or to none — resolves to nothing under
+    ///   this one, which each operation answers in its own way
+    ///   ([`AssociationLookupRefusal`]).
     pub fn resolve_association(
         &self,
         merged_api_identifier: &str,
@@ -1236,7 +1282,7 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
             .get(association_id)
             .filter(|association| association.merged_api_id == merged.api_id)
             .ok_or_else(|| {
-                AssociationLookupRefusal::NotFound(ASSOCIATION_NOT_FOUND_MESSAGE.to_string())
+                AssociationLookupRefusal::AssociationNotFound(association_id.to_string())
             })
     }
 
@@ -1536,6 +1582,17 @@ pub const INVALID_PAGINATION_TOKEN_MESSAGE: &str = "Invalid pagination token giv
 /// variable part to fill. Shared with `GetSourceApiAssociation`, which resolves the same
 /// pair by the same rule.
 pub const ASSOCIATION_NOT_FOUND_MESSAGE: &str = "No source API association was found";
+
+/// AppSync's refusal text for an `associationId` that resolves to no association of the
+/// Merged API addressed, where the operation treats that as a MALFORMED request rather
+/// than an absent resource ([`AssociationLookupRefusal::AssociationNotFound`]).
+///
+/// Built from the request: the rejected `associationId` is named, so the caller can see
+/// which value was refused, exactly as [`invalid_api_id_message`] names a rejected API
+/// id.
+pub fn invalid_association_id_message(association_id: &str) -> String {
+    format!("Invalid SourceApi Association ID {association_id}")
+}
 
 /// The text `ConcurrentModificationException` (HTTP 409) carries, which the MODEL
 /// states for the shape itself: "Another modification is in progress at this time and

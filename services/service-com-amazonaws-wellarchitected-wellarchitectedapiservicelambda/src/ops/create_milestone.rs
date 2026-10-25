@@ -200,75 +200,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // "Create a milestone for an existing workload": the path id is resolved by
-        // this lookup, so an id no workload carries is the lookup's 404 whatever its
-        // syntax. The record itself is only copied once the request is accepted, below.
-        if !store.workloads.contains_key(&input.workload_id) {
-            return Err(CreateMilestoneErrorModeled::ResourceNotFoundException(
-                crate::state::workload_not_found(&input.workload_id),
+        // "Create a milestone for an existing workload": the workload the milestone is OF,
+        // the uniqueness of its name within that workload and the workload's milestone
+        // ceiling are all resolved by the one place a milestone is recorded
+        // (`crate::state::record_milestone`), so this operation and the upgrades that keep
+        // a review as it stood cannot disagree about any of them. Nothing is written for a
+        // refused request, so it consumes no milestone number.
+        let milestone_number = store
+            .record_milestone(
+                &input.workload_id,
+                input.milestone_name,
+                std::time::SystemTime::now(),
             )
-            .into());
-        }
-
-        // "Milestone names must be unique within a workload"
-        // (`smithy_query(query="shape", shape="MilestoneName")`), compared the way this
-        // service compares a name it meters for uniqueness: capitalization and
-        // whitespace are ignored (`crate::state::normalize_unique_name`), so a spelling
-        // that differs only in either collides with the stored milestone and consumes no
-        // milestone number.
-        if let Some(existing) = store.milestone_holding_name(&input.workload_id, &input.milestone_name)
-        {
-            return Err(CreateMilestoneErrorModeled::ConflictException(
-                crate::state::milestone_name_conflict(
-                    &existing.milestone_name,
-                    &input.workload_id,
-                    existing.milestone_number,
-                ),
-            )
-            .into());
-        }
-
-        let milestone_number = store.next_milestone_number(&input.workload_id);
-        if milestone_number > crate::state::MAX_MILESTONES_PER_WORKLOAD {
-            return Err(CreateMilestoneErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: format!(
-                        "The workload with ID {} already holds the maximum of {} milestones",
-                        input.workload_id,
-                        crate::state::MAX_MILESTONES_PER_WORKLOAD
-                    ),
-                    resource_id: Some(input.workload_id.clone()),
-                    resource_type: Some(crate::state::WORKLOAD_RESOURCE_TYPE.to_string()),
-                    // The model publishes no numeric Service Quotas code for this
-                    // quota, so it is named by what it meters; the service code is this
-                    // service's own signing name.
-                    quota_code: "MilestonesPerWorkload".to_string(),
-                    service_code: crate::state::ARN_NAMESPACE.to_string(),
-                },
-            )
-            .into());
-        }
-
-        // A milestone records the workload as it stands NOW, by value: a later
-        // `UpdateWorkload` must not change what this milestone reports. This is the
-        // first copy of the record, taken only now that the request is accepted.
-        let Some(workload) = store.workloads.get(&input.workload_id).cloned() else {
-            return Err(CreateMilestoneErrorModeled::ResourceNotFoundException(
-                crate::state::workload_not_found(&input.workload_id),
-            )
-            .into());
-        };
-        let record = crate::state::MilestoneRecord {
-            milestone_number,
-            milestone_name: input.milestone_name,
-            recorded_at: std::time::SystemTime::now(),
-            workload,
-        };
-        store
-            .milestones
-            .entry(input.workload_id.clone())
-            .or_default()
-            .insert(milestone_number, record);
+            .map_err(|refusal| match refusal {
+                crate::state::MilestoneRefusal::NotFound(exception) => {
+                    CreateMilestoneErrorModeled::ResourceNotFoundException(exception)
+                }
+                crate::state::MilestoneRefusal::NameTaken(exception) => {
+                    CreateMilestoneErrorModeled::ConflictException(exception)
+                }
+                crate::state::MilestoneRefusal::QuotaExceeded(exception) => {
+                    CreateMilestoneErrorModeled::ServiceQuotaExceededException(exception)
+                }
+            })?;
         // Written through the ledger's bounded `remember`, which holds the remembered
         // tokens at `MAX_REMEMBERED_REQUEST_TOKENS` by forgetting the oldest: the token is
         // caller-chosen, so the ledger cannot be allowed to grow with the stream of them.

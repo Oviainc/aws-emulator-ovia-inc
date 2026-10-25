@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RevokeSecurityGroupIngress
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RevokeSecurityGroupIngress`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the stored inbound rules a request names from a security group,
+//! by rule id or by rule properties, and reports what it removed.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RevokeSecurityGroupIngress::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation. The translation between a stored
+//! security group rule and the properties a request names it by lives in [`crate::state`],
+//! so the egress half and `DescribeSecurityGroupRules` read one stored rule the same way.
 //!
 //! ## Shape of an operation
 //!
@@ -105,6 +102,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The direction this operation revokes in: the INBOUND rules — "removes the specified
+/// inbound (ingress) rules from a security group" (`RevokeSecurityGroupIngress`). A group's
+/// inbound and outbound rules are two lists on one stored group, told apart by this flag,
+/// which is also the `IsEgress` a revoked rule is reported with.
+const IS_EGRESS: bool = false;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -172,18 +175,287 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RevokeSecurityGroupIngress` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RevokeSecurityGroupIngressErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries the Region this request was signed for, which is what says which
+        // default VPC a group NAME is resolved in and which VPC is the forgiving one. The
+        // store is reached through the engine held on `self`.
+        use crate::state;
+
+        let region = state::request_region(ctx.parts());
+
+        let rule_ids: &[String] = input.security_group_rule_ids.as_deref().unwrap_or_default();
+        let permissions: &[IpPermission] = input.ip_permissions.as_deref().unwrap_or_default();
+        // Everything that can be decided from the REQUEST ALONE is decided here, before the
+        // store is reached at all: a request that names no servable revoke costs no lookup,
+        // no allocation and no lock.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RevokeSecurityGroupIngress"))
+        // Both lists are CALLER-SIZED and the model declares no `@length` for either, so
+        // they are capped the way every other EC2 operation of this crate caps a
+        // caller-sized list (`describe_security_groups.rs` caps `GroupIds` the same way at
+        // the same [`state::MAX_RESOURCE_IDS`]): the work and the allocation one request
+        // can ask for have to be bounded before any of it is done.
+        if rule_ids.len() > state::MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "SecurityGroupRuleIds carries {} ids, above the maximum of {max}",
+                rule_ids.len(),
+                max = state::MAX_RESOURCE_IDS,
+            )));
+        }
+        if permissions.len() > state::MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "IpPermissions carries {} entries, above the maximum of {max}",
+                permissions.len(),
+                max = state::MAX_RESOURCE_IDS,
+            )));
+        }
+        // One permission names one rule per SOURCE, so the sources are caller-chosen as
+        // well and carry the same cap — counted before any of them is built, so nothing is
+        // allocated for a batch that is refused.
+        let named_rules: usize = permissions
+            .iter()
+            .map(state::ip_permission_grant_count)
+            .sum();
+        if named_rules > state::MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "IpPermissions names {named_rules} rules, above the maximum of {max}",
+                max = state::MAX_RESOURCE_IDS,
+            )));
+        }
+        // The flat members (`$IpProtocol`, `$FromPort`, `$ToPort`, `$CidrIp`,
+        // `$SourceSecurityGroupName`, `$SourceSecurityGroupOwnerId`) are the OLDER spelling
+        // of ONE permission, so a request carries its rule properties in exactly one of the
+        // two spellings.
+        let names_flat_rule = input.ip_protocol.is_some()
+            || input.cidr_ip.is_some()
+            || input.source_security_group_name.is_some()
+            || input.source_security_group_owner_id.is_some()
+            || input.from_port.is_some()
+            || input.to_port.is_some();
+        // "You can specify rules using either rule IDs or security group rule properties"
+        // (`RevokeSecurityGroupIngress`) — either, not both: the two name rules in two
+        // ways, and a request carrying both has not said which of them it means.
+        if !rule_ids.is_empty() && (!permissions.is_empty() || names_flat_rule) {
+            return Err(state::invalid_parameter_combination(
+                "A revoke names its rules either by SecurityGroupRuleIds or by rule \
+                 properties, not by both",
+            ));
+        }
+        // The two spellings of rule properties name DIFFERENT rules, and a revoke removes
+        // the rules the request names — so a request carrying both is refused rather than
+        // served by one of them: dropping the flat members would answer 200 to a request
+        // whose other rule was never looked at.
+        if !permissions.is_empty() && names_flat_rule {
+            return Err(state::invalid_parameter_combination(
+                "A revoke names its rule properties either by IpPermissions or by the flat \
+                 IpProtocol, FromPort, ToPort, CidrIp, SourceSecurityGroupName and \
+                 SourceSecurityGroupOwnerId members, not by both",
+            ));
+        }
+        // "You can't specify this parameter when specifying a source security group"
+        // (`$CidrIp`): one rule has ONE source.
+        if input.cidr_ip.is_some() && input.source_security_group_name.is_some() {
+            return Err(state::invalid_parameter_combination(
+                "A rule names either a CIDR IP address range or a source security group, \
+                 not both",
+            ));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // "You can specify either the security group name or the security group ID", and a
+        // name only names a group of the DEFAULT VPC: the shared resolver is the one place
+        // that rule lives, so the delete and the revoke path cannot read it two ways.
+        let group_id = state::resolve_security_group_id(
+            &mut store,
+            &region,
+            input.group_id.as_deref(),
+            input.group_name.as_deref(),
+        )?;
+        let Some(group) = store.security_groups.get(&group_id) else {
+            // A group this account does not hold is a refusal, not an empty revoke: a
+            // caller has to be able to tell "no such group" from "no such rule".
+            return Err(state::invalid_group_not_found(&group_id));
+        };
+        // Every group this crate stores is created INTO a VPC, so a record carrying no
+        // `VpcId` is one no writer here can produce; it is read as "no VPC of this
+        // account", which is the conservative answer on both counts below — such a group
+        // is not in the DEFAULT VPC, so a rule it does not hold is refused rather than
+        // forgiven, and a source group named by name is looked for in no VPC.
+        let vpc_id = group.vpc_id.clone().unwrap_or_default();
+        // "For a default VPC, if the values you specify do not match the existing rule's
+        // values, no error is returned … For a non-default VPC … an
+        // InvalidPermission.NotFound client error is returned, and no rules are revoked"
+        // (`RevokeSecurityGroupIngress`), so which VPC holds the group decides what a rule
+        // the group does not hold means. The Region's ambient default network is
+        // materialised before the comparison — the same call the name path makes — so which
+        // VPC is the default one does not depend on whether an earlier request in this
+        // Region happened to ask by name.
+        store.ensure_default_network(&region);
+        let in_default_vpc = !vpc_id.is_empty()
+            && store.default_vpc_id(&region).as_deref() == Some(vpc_id.as_str());
+
+        // The rules the request names, as the ids the group holds them under, beside the
+        // rules it named that the group holds none of.
+        let (revoked_ids, unknown) = if !rule_ids.is_empty() {
+            // "Not an id of this kind" is asked BEFORE "no such rule", for the whole list:
+            // the order `state::require_well_formed_id` documents, so a malformed id is
+            // never reported as a rule the group does not hold just because a well-formed
+            // unknown one came earlier in the list.
+            for rule_id in rule_ids {
+                state::require_well_formed_id(
+                    state::SECURITY_GROUP_RULE_ID_PREFIX,
+                    rule_id,
+                    state::INVALID_SECURITY_GROUP_RULE_ID_MALFORMED,
+                )?;
+            }
+            let mut found: Vec<String> = Vec::with_capacity(rule_ids.len());
+            for rule_id in rule_ids {
+                // A rule id names ONE rule, so an id naming no inbound rule OF THIS GROUP
+                // is refused whichever VPC the group is in: the default VPC's forgiveness
+                // is documented for values that "do not match the existing rule's values",
+                // which is a statement about rule PROPERTIES. A request naming one id twice
+                // revokes the rule once.
+                let names_a_rule = store
+                    .security_group_rules
+                    .get(rule_id.as_str())
+                    .is_some_and(|record| {
+                        record.rule.group_id.as_deref() == Some(group_id.as_str())
+                            && record.rule.is_egress.unwrap_or(false) == IS_EGRESS
+                    });
+                if !names_a_rule {
+                    return Err(state::invalid_security_group_rule_id_not_found(rule_id));
+                }
+                if !found.iter().any(|held| held == rule_id) {
+                    found.push(rule_id.clone());
+                }
+            }
+            (found, Vec::new())
+        } else {
+            // "The sets of IP permissions" (`$IpPermissions`), or the single rule the flat
+            // members spell out — the older form of the same request, which is why it is
+            // read into one `IpPermission` rather than matched on its own path.
+            let mut asked: Vec<IpPermission> = permissions.to_vec();
+            if asked.is_empty() {
+                let Some(ip_protocol) = input.ip_protocol.as_deref() else {
+                    return Err(state::missing_parameter(
+                        "The request must contain either IpPermissions, SecurityGroupRuleIds \
+                         or IpProtocol",
+                    ));
+                };
+                asked.push(IpPermission {
+                    ip_protocol: Some(ip_protocol.to_string()),
+                    from_port: input.from_port,
+                    to_port: input.to_port,
+                    user_id_group_pairs: input.source_security_group_name.as_deref().map(|name| {
+                        vec![UserIdGroupPair {
+                            group_name: Some(name.to_string()),
+                            // "Not supported" (`$SourceSecurityGroupOwnerId`): carried into
+                            // the pair as the request wrote it, but an owner is not part of
+                            // a rule's identity, so it narrows nothing.
+                            user_id: input.source_security_group_owner_id.clone(),
+                            ..UserIdGroupPair::default()
+                        }]
+                    }),
+                    ip_ranges: input.cidr_ip.as_deref().map(|cidr_ip| {
+                        vec![IpRange {
+                            description: None,
+                            cidr_ip: Some(cidr_ip.to_string()),
+                        }]
+                    }),
+                    ipv6_ranges: None,
+                    prefix_list_ids: None,
+                });
+            }
+            // "The IP protocol name (tcp, udp, icmp, icmpv6) or number"
+            // (`IpPermission$IpProtocol`) identifies a rule as much as its ports and its
+            // source do, so a permission that names no protocol names no rule — and
+            // reading an absent one as all-protocols would let such a request revoke the
+            // group's `-1` rule. Both spellings of the request are refused the same way,
+            // and the message names the member the CALLER sent: the flat `IpProtocol`
+            // where the request used the flat form, the indexed one otherwise.
+            let flat_form = permissions.is_empty();
+            if let Some(index) = asked.iter().position(|permission| {
+                permission
+                    .ip_protocol
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+            }) {
+                let member = if flat_form {
+                    "IpProtocol".to_string()
+                } else {
+                    format!("IpPermissions.{}.IpProtocol", index + 1)
+                };
+                return Err(state::missing_parameter(format!(
+                    "The request must contain the parameter {member}"
+                )));
+            }
+            let mut named: Vec<state::SecurityGroupRuleAtom> = asked
+                .iter()
+                .flat_map(state::security_group_rule_atoms)
+                .collect();
+            if named.is_empty() {
+                return Err(state::missing_parameter(
+                    "Every rule must name a source: a CIDR IP address range, a prefix list \
+                     or a source security group",
+                ));
+            }
+            // A source group named by NAME is the default-VPC spelling of the group a
+            // stored rule names by id (`UserIdGroupPair$GroupName`), so it is resolved
+            // within the group's own VPC before it is matched. A name no group of that VPC
+            // answers to is left as it stands: it matches no stored rule, which is the
+            // answer such a request has earned.
+            for rule in &mut named {
+                let state::SecurityGroupRuleSource::ReferencedGroup(source_group) = &rule.source
+                else {
+                    continue;
+                };
+                if state::security_group_id_is_well_formed(source_group) {
+                    continue;
+                }
+                if let Some(resolved) = store.security_group_id_for_name(&vpc_id, source_group) {
+                    rule.source = state::SecurityGroupRuleSource::ReferencedGroup(resolved);
+                }
+            }
+            // Decided before anything is written, because a non-default VPC revokes NOTHING
+            // when any rule the request names is one the group does not hold.
+            let plan = store.plan_security_group_revoke(&group_id, IS_EGRESS, &named);
+            (plan.revoked, plan.unknown)
+        };
+
+        if !unknown.is_empty() && !in_default_vpc {
+            return Err(state::invalid_permission_not_found());
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "if you
+        // have the required permissions, the error response is DryRunOperation"
+        // (`$DryRun`). Nothing has been removed yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The rules are the resources: removing the records is what revokes them, and the
+        // store recomputes the group's aggregate `IpPermissions` from the rules that are
+        // left, so `DescribeSecurityGroups` and `DescribeSecurityGroupRules` cannot come to
+        // disagree about this group.
+        let removed = store.remove_security_group_rules(&revoked_ids);
+
+        // "Returns true if the request succeeds; otherwise, returns an error" (`$Return`),
+        // beside "details about the revoked security group rules"
+        // (`$RevokedSecurityGroupRules`) and "the inbound rules that were unknown to the
+        // service" (`$UnknownIpPermissions`) — each reported only when there is one, so a
+        // revoke that found every rule reports no unknown set at all.
+        let revoked: Vec<RevokedSecurityGroupRule> = removed
+            .iter()
+            .map(state::revoked_security_group_rule)
+            .collect();
+        let unknown: Vec<IpPermission> = unknown.iter().map(state::ip_permission_for_rule).collect();
+        Ok(RevokeSecurityGroupIngressOutput {
+            r#return: Some(true),
+            unknown_ip_permissions: (!unknown.is_empty()).then_some(unknown),
+            revoked_security_group_rules: (!revoked.is_empty()).then_some(revoked),
+        })
     }
 }
+

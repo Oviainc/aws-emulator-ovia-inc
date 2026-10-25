@@ -78,6 +78,8 @@ mod chime_family_signing_name_routing;
 // suite appends to.
 #[path = "all/cloudformation_provisions_acm_acme_endpoints.rs"]
 mod cloudformation_provisions_acm_acme_endpoints;
+#[path = "all/cloudformation_provisions_codedeploy_resources.rs"]
+mod cloudformation_provisions_codedeploy_resources;
 #[path = "all/cloudformation_provisions_cognito_user_pool_groups.rs"]
 mod cloudformation_provisions_cognito_user_pool_groups;
 // Declared in this same quiet span of the sorted list, for the reason the note above gives:

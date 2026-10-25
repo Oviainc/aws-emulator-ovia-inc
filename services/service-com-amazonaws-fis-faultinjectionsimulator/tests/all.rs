@@ -61,5 +61,7 @@ mod target_account_configurations;
 mod target_account_role_ownership;
 #[path = "all/template_admissibility_sequence.rs"]
 mod template_admissibility_sequence;
+#[path = "all/template_target_and_action_rules.rs"]
+mod template_target_and_action_rules;
 #[path = "all/update_experiment_template.rs"]
 mod update_experiment_template;

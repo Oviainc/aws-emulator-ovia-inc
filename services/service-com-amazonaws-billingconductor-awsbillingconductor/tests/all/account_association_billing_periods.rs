@@ -117,13 +117,17 @@ impl Emulator {
     }
 
     /// Create a billing group holding `linked`, and answer the ARN the service minted.
+    ///
+    /// It designates no primary account: a primary account would have to be one of
+    /// `linked` (an account designated the group's main account is an account of that
+    /// group), and which account that is makes no difference to the per-period
+    /// memberships these rows read.
     async fn create_group(&self, name: &str, plan: &str, linked: &[&str]) -> String {
         let (status, body) = self
             .post(
                 "/create-billing-group",
                 &json!({
                     "Name": name,
-                    "PrimaryAccountId": "999988887777",
                     "AccountGrouping": {"LinkedAccountIds": linked},
                     "ComputationPreference": {"PricingPlanArn": plan},
                 }),

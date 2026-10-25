@@ -53,10 +53,17 @@ const CREATE_GROUP_PATH: &str = "/create-billing-group";
 const UPDATE_GROUP_PATH: &str = "/update-billing-group";
 const CREATE_PLAN_PATH: &str = "/create-pricing-plan";
 
-/// The account that serves as the billing owner of every group here: a group needs one to
-/// hold an operational `Status` at all (the model's `ResponsibilityTransferArn` is "When
-/// specified, the PrimaryAccountId is no longer required").
-const PRIMARY_ACCOUNT_ID: &str = "999988887777";
+/// The account that serves as the billing owner of the `index`-th group here: a group
+/// needs one to hold an operational `Status` at all (the model's
+/// `ResponsibilityTransferArn` is "When specified, the PrimaryAccountId is no longer
+/// required").
+///
+/// One per group, because a group's primary account is one of its OWN linked accounts and
+/// an account belongs to at most one billing group — so no two groups of one family can
+/// name the same primary account.
+fn primary_account_id(index: usize) -> String {
+    format!("{:012}", 999900000000_u64 + index as u64)
+}
 
 /// The billing period the service calls current, read from the same clock it answers
 /// from so an expectation holds whatever month the suite runs in.
@@ -131,17 +138,29 @@ impl Emulator {
             .to_string()
     }
 
-    /// Create a billing group computing with `plan`, with the members `extra` names laid
-    /// over the defaults, and answer the ARN the service minted.
-    async fn create_group(&self, name: &str, plan: &str, extra: &Value) -> String {
+    /// Create a billing group computing with `plan` whose primary account is `primary`,
+    /// with the members `extra` names laid over the defaults, and answer the ARN the
+    /// service minted.
+    ///
+    /// The primary account is also the group's one linked account, since the account that
+    /// serves as a group's main account is an account of that group. The members of
+    /// `extra`'s own `AccountGrouping` are laid over the default grouping one by one, so a
+    /// row naming `AutoAssociate` keeps that membership.
+    async fn create_group(&self, name: &str, plan: &str, primary: &str, extra: &Value) -> String {
         let mut body = json!({
             "Name": name,
-            "PrimaryAccountId": PRIMARY_ACCOUNT_ID,
-            "AccountGrouping": {"LinkedAccountIds": []},
+            "PrimaryAccountId": primary,
+            "AccountGrouping": {"LinkedAccountIds": [primary]},
             "ComputationPreference": {"PricingPlanArn": plan},
         });
         for (member, value) in extra.as_object().into_iter().flatten() {
-            body[member] = value.clone();
+            if member == "AccountGrouping" {
+                for (inner, inner_value) in value.as_object().into_iter().flatten() {
+                    body["AccountGrouping"][inner] = inner_value.clone();
+                }
+            } else {
+                body[member] = value.clone();
+            }
         }
         let (status, answer) = self.post(CREATE_GROUP_PATH, &body).await;
         assert_eq!(
@@ -296,7 +315,12 @@ async fn a_group_is_reported_only_for_the_periods_from_the_one_it_was_created_in
     for (index, creation) in CREATION_PERIODS.iter().enumerate() {
         let case = format!("created in {creation:?}");
         let group = em
-            .create_group(&format!("Created-{index}"), &plan, &json!({}))
+            .create_group(
+                &format!("Created-{index}"),
+                &plan,
+                &primary_account_id(index),
+                &json!({}),
+            )
             .await;
         em.created_in(&group, creation);
 
@@ -396,7 +420,7 @@ fn value_rows(first_plan: &str, second_plan: &str) -> Vec<ValueRow> {
         },
         ValueRow {
             label: "AccountGrouping.AutoAssociate",
-            create: json!({"AccountGrouping": {"LinkedAccountIds": [], "AutoAssociate": false}}),
+            create: json!({"AccountGrouping": {"AutoAssociate": false}}),
             update: json!({"AccountGrouping": {"AutoAssociate": true}}),
             before: json!({"AccountGrouping": {"AutoAssociate": false}}),
             after: json!({"AccountGrouping": {"AutoAssociate": true}}),
@@ -417,7 +441,10 @@ async fn a_write_shows_up_from_the_period_it_was_made_in_and_in_no_earlier_one()
     for (index, row) in value_rows(&first_plan, &second_plan).iter().enumerate() {
         let case = format!("{} rewritten", row.label);
         let name = format!("Valued-{index}");
-        let group = em.create_group(&name, &first_plan, &row.create).await;
+        let primary = primary_account_id(index);
+        let group = em
+            .create_group(&name, &first_plan, &primary, &row.create)
+            .await;
         em.created_in(&group, &creation);
         em.update_group(&case, &group, &row.update).await;
 
@@ -441,7 +468,7 @@ async fn a_write_shows_up_from_the_period_it_was_made_in_and_in_no_earlier_one()
             assert_members(
                 &case,
                 &element,
-                &json!({"Arn": group, "PrimaryAccountId": PRIMARY_ACCOUNT_ID,
+                &json!({"Arn": group, "PrimaryAccountId": primary,
                         "BillingGroupType": "STANDARD"}),
             );
         }
@@ -490,6 +517,7 @@ async fn each_period_reports_the_generation_that_was_in_force_in_it() {
         .create_group(
             "Generations",
             &first_plan,
+            &primary_account_id(0),
             &json!({"Description": "first"}),
         )
         .await;
@@ -599,7 +627,8 @@ async fn a_filter_selects_on_the_values_the_period_reports() {
         .create_group(
             "Filtered-Before",
             &first_plan,
-            &json!({"AccountGrouping": {"LinkedAccountIds": [], "AutoAssociate": false}}),
+            &primary_account_id(0),
+            &json!({"AccountGrouping": {"AutoAssociate": false}}),
         )
         .await;
     em.created_in(&group, &creation);
@@ -698,7 +727,12 @@ async fn a_page_walks_only_the_groups_the_period_holds() {
     let mut groups: Vec<String> = Vec::new();
     for (index, period) in periods.iter().enumerate() {
         let group = em
-            .create_group(&format!("Paged-{index}"), &plan, &json!({}))
+            .create_group(
+                &format!("Paged-{index}"),
+                &plan,
+                &primary_account_id(index),
+                &json!({}),
+            )
             .await;
         em.created_in(&group, period);
         groups.push(group);

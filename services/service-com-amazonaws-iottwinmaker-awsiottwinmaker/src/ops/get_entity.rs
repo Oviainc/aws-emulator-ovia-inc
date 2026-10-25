@@ -388,7 +388,9 @@ fn composite_component_summary(
 /// The definition is projected by [`crate::state::property_definition_response`],
 /// the one conversion every reader of a stored definition shares, so an entity's
 /// properties and a component type's property definitions report a definition
-/// the same way.
+/// the same way; `areAllPropertyValuesReturned` is decided by
+/// [`crate::state::all_property_values_returned`], the one rule every reader of
+/// a property's value answers that flag with.
 fn property_response(property: &crate::state::PropertyRecord) -> PropertyResponse {
     PropertyResponse {
         definition: property
@@ -396,7 +398,9 @@ fn property_response(property: &crate::state::PropertyRecord) -> PropertyRespons
             .as_ref()
             .and_then(crate::state::property_definition_response),
         value: property.value.clone(),
-        are_all_property_values_returned: Some(true),
+        are_all_property_values_returned: Some(crate::state::all_property_values_returned(
+            property.value.as_ref(),
+        )),
     }
 }
 

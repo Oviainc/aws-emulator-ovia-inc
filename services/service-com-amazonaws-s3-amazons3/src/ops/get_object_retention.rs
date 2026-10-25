@@ -8,6 +8,11 @@
 //! it answers 404 [`crate::state::NO_SUCH_OBJECT_LOCK_CONFIGURATION_CODE`], the way every
 //! other reader of an absent subresource in this crate answers one.
 //!
+//! A retention is part of S3 Object Lock, so a call addressed to a bucket with no Object
+//! Lock configuration is refused 400 [`crate::state::INVALID_REQUEST_CODE`] with
+//! [`crate::state::OBJECT_LOCK_CONFIGURATION_MISSING_MESSAGE`], exactly as the write half
+//! refuses it.
+//!
 //! READ-ONLY: the stored retention is copied out and nothing is written, so a later caller
 //! sees exactly what this one saw — an expired retention included, which is still the
 //! configuration the version carries even though it no longer restricts a write.
@@ -205,6 +210,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(bucket) = store.bucket(&input.bucket) else {
             return Err(GetObjectRetentionErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
         };
+        // A bucket with no Object Lock configuration locks nothing, so no object in it has
+        // a retention to report: the same request S3 cannot carry out that the write half
+        // `PutObjectRetention` refuses.
+        if !bucket.object_lock_enabled() {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_REQUEST_CODE,
+                crate::state::INVALID_REQUEST_STATUS,
+                crate::state::OBJECT_LOCK_CONFIGURATION_MISSING_MESSAGE,
+            ));
+        }
         // A delete marker has no object behind it to carry a retention: 405, the status S3
         // answers an object-level call on a marker with, as `HeadObject` answers it for the
         // same cause.

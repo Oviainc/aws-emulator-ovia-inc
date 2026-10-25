@@ -45,6 +45,8 @@ mod volume_attachment;
 mod volume_configuration_validation;
 #[path = "all/volume_lifecycle.rs"]
 mod volume_lifecycle;
+#[path = "all/volume_modification.rs"]
+mod volume_modification;
 #[path = "all/volume_zone_affinity.rs"]
 mod volume_zone_affinity;
 #[path = "all/wire_error_responses.rs"]

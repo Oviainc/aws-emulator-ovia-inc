@@ -63,6 +63,8 @@ mod put_feed_policy_scope;
 mod refusals_from_state;
 #[path = "all/region_isolation.rs"]
 mod region_isolation;
+#[path = "all/reserved_tag_namespace.rs"]
+mod reserved_tag_namespace;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/resource_untagging.rs"]

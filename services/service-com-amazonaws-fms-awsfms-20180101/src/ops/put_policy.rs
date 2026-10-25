@@ -41,6 +41,10 @@
 //! * `IncludeMap` and `ExcludeMap` cannot both scope the policy →
 //!   `InvalidInputException`.
 //!
+//! The request's `TagList` is checked on the same path, before the `PolicyId` is
+//! resolved: a tag key it names more than once has no single outcome, so it is
+//! refused with `InvalidInputException` rather than stored twice over.
+//!
 //! Every one of them is decided before anything is written, so a refused call
 //! leaves the store exactly as it was.
 //!
@@ -516,6 +520,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The rule that needs the store, decided before either branch writes.
         validate_resource_set_ids(&policy, &store)?;
+
+        // The tag set this write would store: a `TagList` naming one key twice
+        // cannot be held by the resource, so the write is refused before the
+        // `PolicyId` is resolved and before anything is persisted — the same
+        // refusal, from the same shared check, that a tagging operation answers.
+        if let Some(message) =
+            crate::state::duplicate_tag_key_message(input.tag_list.as_deref().unwrap_or_default())
+        {
+            return Err(PutPolicyErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         let record = match requested_id {
             // UPDATE: the id names an existing policy version, and the token must

@@ -715,6 +715,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // headers are refused above, and a retention is placed on a stored version
             // afterwards, by `PutObjectRetention`.
             retention: None,
+            // Nor a legal hold, for the same reason: `PutObjectLegalHold` is what applies
+            // one to a stored version.
+            legal_hold: None,
             // And no restore: the copy is stored in a non-archived storage class (the source
             // had to be out of one for this copy to be served at all), so there is nothing
             // to restore; `RestoreObject` is what asks for one.

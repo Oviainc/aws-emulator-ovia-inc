@@ -280,6 +280,19 @@ impl Emulator {
         .await
     }
 
+    /// `ListProperties`: POST /workspaces/{workspaceId}/properties-list, with
+    /// the workspace as the only `@httpLabel` and `entityId`, the component
+    /// address (`componentName` or `componentPath`) and the page members
+    /// (`maxResults`, `nextToken`) carried in the body.
+    pub(crate) async fn list_properties(&self, workspace_id: &str, body: Value) -> Resp {
+        self.call(
+            "POST",
+            &format!("/workspaces/{workspace_id}/properties-list"),
+            Some(body),
+        )
+        .await
+    }
+
     pub(crate) async fn list_entities(&self, workspace_id: &str, body: Value) -> Resp {
         self.call(
             "POST",

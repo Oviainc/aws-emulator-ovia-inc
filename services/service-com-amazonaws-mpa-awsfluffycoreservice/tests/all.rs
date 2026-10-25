@@ -27,6 +27,8 @@ mod baseline_session_minting;
 mod identity_source_approval_portal;
 #[path = "all/identity_source_deletion.rs"]
 mod identity_source_deletion;
+#[path = "all/identity_source_detail.rs"]
+mod identity_source_detail;
 #[path = "all/identity_sources.rs"]
 mod identity_sources;
 #[path = "all/inactive_team_version_deletion.rs"]

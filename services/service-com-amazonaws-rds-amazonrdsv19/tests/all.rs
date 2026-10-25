@@ -91,6 +91,8 @@ mod orderable_db_instance_options;
 mod query_catalog_reads;
 #[path = "all/query_error_envelope.rs"]
 mod query_error_envelope;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/valid_db_instance_modifications.rs"]

@@ -220,6 +220,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         list.last_update_time = None;
         list.previous_protocols_list = None;
 
+        // The tag set this write would store: a `TagList` naming one key twice
+        // cannot be held by the resource, so the write is refused before the
+        // `ListId` is resolved and before anything is persisted — the same
+        // refusal, from the same shared check, that a tagging operation answers.
+        if let Some(message) =
+            crate::state::duplicate_tag_key_message(input.tag_list.as_deref().unwrap_or_default())
+        {
+            return Err(PutProtocolsListErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let record = match requested_id {
             // UPDATE: the id names an existing customer list, and the token must
             // match the version that is stored.

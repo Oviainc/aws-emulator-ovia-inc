@@ -166,3 +166,9 @@ mod user_authentication_mode_conflict;
 // both writers of a rule list through the `ModifyUser` suite's reader.
 #[path = "all/access_string_refusal_wording.rs"]
 mod access_string_refusal_wording;
+
+// Appended for the same reason: the suite that continues where the wording suite stops —
+// the stored-length bound a rule list is refused at, what the refusal message does NOT
+// say, and what the user takes after one.
+#[path = "all/access_string_refusal_message.rs"]
+mod access_string_refusal_message;

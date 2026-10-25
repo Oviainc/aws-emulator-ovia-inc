@@ -689,7 +689,14 @@ async fn associate_accounts_refuses_an_unknown_group_and_a_taken_account() {
         &["111122223333", "222233334444"],
     )
     .await;
-    let other = create_group(&em, "OtherGroup", &plan, Some("999988887777"), &[]).await;
+    let other = create_group(
+        &em,
+        "OtherGroup",
+        &plan,
+        Some("999988887777"),
+        &["999988887777"],
+    )
+    .await;
 
     // Rows differ along which form of ARN names the absent group: the full ARN and
     // the bare id the pattern also accepts.
@@ -780,7 +787,14 @@ async fn associate_accounts_refuses_an_unknown_group_and_a_taken_account() {
 async fn an_account_listed_twice_in_one_request_is_refused() {
     let em = Emulator::new();
     let plan = create_plan(&em, "DuplicatePlan").await;
-    let group = create_group(&em, "DuplicateGroup", &plan, Some("111122223333"), &[]).await;
+    let group = create_group(
+        &em,
+        "DuplicateGroup",
+        &plan,
+        Some("111122223333"),
+        &["111122223333"],
+    )
+    .await;
 
     let cases: Vec<(&str, &str, Value)> = vec![
         (
@@ -1059,12 +1073,24 @@ async fn list_account_associations_honours_each_filter() {
         "AssociationGroup",
         &plan,
         Some("111122223333"),
-        &["111122223333", "222233334444"],
+        &["111122223333", "222233334444", "999988887777"],
     )
     .await;
-    // A primary account that is not a member: known to the payer account, but not
-    // associated with any billing group.
-    let loose = create_group(&em, "LooseGroup", &plan, Some("999988887777"), &[]).await;
+    // An account the payer account knows that no billing group holds: a member taken back
+    // out of the group it was in is in no billing group at all, which is what
+    // `UNMONITORED` reports.
+    let (status, body) = em
+        .post(
+            "/disassociate-accounts",
+            &json!({"Arn": group, "AccountIds": ["999988887777"]}),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "setup DisassociateAccounts: expected 200, got {status} with {body:?}"
+    );
+    // A billing group holding no account at all, for the filter that must report none.
+    let loose = create_group(&em, "LooseGroup", &plan, None, &[]).await;
 
     let cases: Vec<(&str, Value, Vec<&str>)> = vec![
         (
