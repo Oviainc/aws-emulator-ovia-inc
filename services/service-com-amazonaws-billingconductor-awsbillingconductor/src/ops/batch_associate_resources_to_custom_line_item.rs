@@ -247,6 +247,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             ));
         }
+        // The billing group the target applies to: the scope the resources it can be a
+        // percentage of belong to.
+        let target_billing_group = target.billing_group_arn.clone();
 
         // The range the association applies in: the start is inclusive and the end
         // exclusive, so an end at or before the start would cover no billing period.
@@ -291,7 +294,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "ILLEGAL_CUSTOMLINEITEM",
                         "a custom line item cannot be associated to itself".to_string(),
                     )),
-                    Some(arn) => Ok(arn),
+                    // The resources a percentage item's charge is computed over are
+                    // the ones its own billing group carries: that group, and the
+                    // custom line items of that same group. `ILLEGAL_CUSTOMLINEITEM`
+                    // is the `AssociateResourceErrorReason` this falls under — the
+                    // resource cannot be a resource of THIS item
+                    // (`smithy_query(query="shape",shape="AssociateResourceErrorReason")`).
+                    Some(arn) => match state
+                        .out_of_scope_association(&target_billing_group, &arn)
+                    {
+                        Some(fault) => Err((
+                            "ILLEGAL_CUSTOMLINEITEM",
+                            fault.message(&target_billing_group, &arn),
+                        )),
+                        None => Ok(arn),
+                    },
                 };
                 (requested, outcome)
             })

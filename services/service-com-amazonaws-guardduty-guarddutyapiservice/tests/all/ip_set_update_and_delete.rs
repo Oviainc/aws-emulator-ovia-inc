@@ -204,8 +204,10 @@ fn base_create(case_tag: &str, with_owner: bool) -> Value {
 ///
 /// The rows differ along what the rule generalises over: WHICH optional members the
 /// request carries (each alone, several together, none at all), the SIZE of the value
-/// (both ends of `Name`/`Location`'s modelled `len 1..300`), its ALPHABET (ASCII and
-/// non-ASCII) and whether the member already had a stored value.
+/// (both ends of `Name`/`Location`'s modelled `len 1..300`), its ALPHABET (the
+/// documented name punctuation, a non-ASCII location) and whether the member already
+/// had a stored value. The alphabet `Name` itself is held to is the
+/// `ip_set_name_alphabet` suite's rule.
 struct UpdateRow {
     case: &'static str,
     with_owner: bool,
@@ -256,9 +258,9 @@ fn partial_update_rows() -> Vec<UpdateRow> {
             update: json!({"name": "a", "location": "s"}),
         },
         UpdateRow {
-            case: "a non-ASCII name round-trips byte for byte",
+            case: "a non-ASCII location round-trips byte for byte",
             with_owner: false,
-            update: json!({"name": "リスト – 更新", "location": "https://example.com/更新.xml"}),
+            update: json!({"name": "renamed list 2", "location": "https://example.com/更新.xml"}),
         },
         UpdateRow {
             case: "an update that carries no updatable member at all",

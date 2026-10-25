@@ -40,7 +40,10 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::enabled_control_lifecycle::{control, details, enable, entries, ou};
+use crate::enabled_control_lifecycle::{
+    configuration, configured, control, control_operation, details, drift, enable_with, entries,
+    last_operation, member, ou, status_summary_status as status,
+};
 use crate::landing_zone_lifecycle::{
     call, emulator, is_operation_identifier, past_the_settle_span, Answer,
 };
@@ -61,101 +64,6 @@ async fn update(
         }),
     )
     .await
-}
-
-/// The control operation log, as `ListControlOperations` reports it. `GetControlOperation`
-/// is still a scaffold stub (its own issue), so the log is read through the listing that
-/// resolves the same records.
-async fn operation_log(router: &MultiServiceRouter) -> Vec<serde_json::Value> {
-    let listed = call(
-        router,
-        "/list-control-operations",
-        serde_json::json!({ "maxResults": 100 }),
-    )
-    .await;
-    assert_eq!(
-        listed.status, 200,
-        "list-control-operations: expected 200, got {} body {:?}",
-        listed.status, listed.body
-    );
-    entries(listed.get("controlOperations"))
-}
-
-/// The one logged record carrying `operation_identifier`, or `Value::Null`.
-async fn control_operation(
-    router: &MultiServiceRouter,
-    operation_identifier: &str,
-) -> serde_json::Value {
-    operation_log(router)
-        .await
-        .into_iter()
-        .find(|record| member(record, "operationIdentifier") == Some(operation_identifier))
-        .unwrap_or(serde_json::Value::Null)
-}
-
-/// A member of a JSON object, as a `&str`.
-fn member<'a>(value: &'a serde_json::Value, name: &str) -> Option<&'a str> {
-    value.get(name).and_then(serde_json::Value::as_str)
-}
-
-/// `statusSummary.status` of an `EnabledControlDetails`.
-fn status(details: &serde_json::Value) -> Option<&str> {
-    details
-        .get("statusSummary")
-        .and_then(|summary| member(summary, "status"))
-}
-
-/// `statusSummary.lastOperationIdentifier` of an `EnabledControlDetails`.
-fn last_operation(details: &serde_json::Value) -> Option<&str> {
-    details
-        .get("statusSummary")
-        .and_then(|summary| member(summary, "lastOperationIdentifier"))
-}
-
-/// `driftStatusSummary.driftStatus` of an `EnabledControlDetails`.
-fn drift(details: &serde_json::Value) -> Option<&str> {
-    details
-        .get("driftStatusSummary")
-        .and_then(|summary| member(summary, "driftStatus"))
-}
-
-/// The configuration a control carries, as the key/value mapping a `parameters` list
-/// denotes: the entries sorted by key, so a case compares configurations rather than the
-/// order a list happened to be sent in. An absent member reads as the empty
-/// configuration.
-fn configuration(parameters: &serde_json::Value) -> Vec<serde_json::Value> {
-    let mut entries = entries(parameters);
-    entries.sort_by_key(|entry| {
-        entry
-            .get("key")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    });
-    entries
-}
-
-/// The configuration `GetEnabledControl` reports for `identifier`.
-async fn configured(router: &MultiServiceRouter, identifier: &str) -> Vec<serde_json::Value> {
-    configuration(details(router, identifier).await.get("parameters").unwrap_or(&serde_json::Value::Null))
-}
-
-/// `EnableControl` with `parameters` (omitted when `None`), handing back the minted ARN
-/// and the enabling operation's identifier.
-async fn enable_with(
-    router: &MultiServiceRouter,
-    control_identifier: &str,
-    target_identifier: &str,
-    parameters: Option<serde_json::Value>,
-) -> (String, String) {
-    let mut body = serde_json::json!({
-        "controlIdentifier": control_identifier,
-        "targetIdentifier": target_identifier,
-    });
-    if let Some(parameters) = parameters {
-        body["parameters"] = parameters;
-    }
-    enable(router, body).await
 }
 
 /// One row of the update table.

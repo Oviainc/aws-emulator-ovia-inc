@@ -159,17 +159,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
-        let identity = crate::state::resolve_caller(
+        // "Returns details about the IAM user or role whose credentials are used to call
+        // the operation": a key that names no session here is an IAM user's own
+        // long-term key, resolved against the IAM store (read before the session lock is
+        // taken, so the two are never held at once).
+        let long_term = {
+            let iam = crate::state::iam_state(&*self.engine);
+            match iam.as_ref() {
+                Some(iam) => crate::state::long_term_identity(Some(&iam.lock()), &access_key_id),
+                None => crate::state::long_term_identity(None, &access_key_id),
+            }
+        };
+        let identity = crate::state::resolve_request_caller(
             &mut state.lock(),
             &access_key_id,
             ::std::time::SystemTime::now(),
             ctx.credential_store(),
+            long_term,
         )
         .map_err(|expired| {
             GetCallerIdentityErrorModeled::ExpiredTokenException(ExpiredTokenException {
                 message: Some(expired.message()),
             })
-        })?;
+        })?
+        .identity;
 
         Ok(GetCallerIdentityOutput {
             user_id: Some(identity.user_id),

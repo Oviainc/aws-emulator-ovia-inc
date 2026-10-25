@@ -1368,7 +1368,6 @@ async fn the_virtual_cluster_store_is_capped_and_reclaims_retired_clusters() {
 async fn operations_outside_this_slice_still_answer_501() {
     let emr = Emr::new();
     let cases = [
-        ("ListVirtualClusters", "GET", "/virtualclusters".to_string(), None),
         (
             "DeleteManagedEndpoint",
             "DELETE",

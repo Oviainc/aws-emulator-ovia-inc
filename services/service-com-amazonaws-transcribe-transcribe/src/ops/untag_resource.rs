@@ -154,7 +154,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UntagResourceErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -182,11 +181,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The Region this request is served in: with the emulator's partition and
+        // account, what the ARN's own qualifiers have to name for it to name a resource
+        // this call may write to.
+        let region = crate::state::request_region(ctx.parts());
+
         let mut store = state.lock();
-        let Some(tags) = store.tags_mut(&resource) else {
-            // As on the read path: an ARN naming no stored resource is this service's
-            // `BadRequestException`, named by the resource KIND the ARN's type segment
-            // denotes.
+        let Some(tags) = store.tags_mut(&resource, &region) else {
+            // As on the read path: an ARN naming no stored resource of this Region and
+            // account — including a well-formed one qualified for another partition,
+            // Region or account — is this service's `BadRequestException`, named by the
+            // resource KIND the ARN's type segment denotes.
             return Err(UntagResourceErrorModeled::BadRequestException(BadRequestException {
                 message: Some(crate::state::not_found_message(crate::state::resource_kind(
                     &resource.resource_type,
