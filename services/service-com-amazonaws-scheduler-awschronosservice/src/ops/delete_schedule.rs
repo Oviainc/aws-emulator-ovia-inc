@@ -167,10 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(DeleteScheduleErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Schedule {} does not exist in schedule group {group_name}.",
-                        input.name
-                    ),
+                    message: crate::state::schedule_does_not_exist(&input.name),
                 },
             )
             .into());

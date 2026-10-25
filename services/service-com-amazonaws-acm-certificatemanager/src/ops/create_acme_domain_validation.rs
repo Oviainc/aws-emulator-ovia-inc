@@ -5,7 +5,9 @@
 //! names, persists the validation record (status `VALIDATING`) with the prevalidation
 //! scope and hosted zone the request configured, the resource tags it carries and the
 //! server-managed DNS record the caller publishes to prove ownership, and returns the
-//! ARN. An endpoint ARN with no record behind it is `ResourceNotFoundException`; a
+//! ARN. An endpoint ARN that names ANOTHER account is `ValidationException` — a verdict
+//! on the request, reached before the store is read; an endpoint ARN of this account
+//! with no record behind it is `ResourceNotFoundException`; a
 //! second validation of a domain the endpoint already validates is a conflict; an
 //! `IdempotencyToken` re-sent (against the same endpoint) with the same parameters
 //! resolves to the validation it already created, and re-sent with different parameters
@@ -188,6 +190,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // The endpoint ARN is INPUT this operation validates, and its account segment is
+        // part of what it validates: a validation's own ARN is minted as a path under the
+        // endpoint's, so an endpoint ARN carrying another account's id could only ever
+        // mint an ARN in that account, which this caller cannot address. That is a
+        // verdict on the request, so it is reached before the store is consulted at all —
+        // never reported as a resource this account happens not to hold.
+        if !crate::state::arn_is_in_caller_account(&input.acme_endpoint_arn) {
+            return Err(validation_exception(
+                crate::service::cross_account_arn_refusal(
+                    crate::state::ACME_ENDPOINT_RESOURCE_TYPE,
+                ),
+            ));
+        }
 
         let tags = crate::state::tag_map(input.tags.as_deref().unwrap_or_default())
             .map_err(validation_exception)?;

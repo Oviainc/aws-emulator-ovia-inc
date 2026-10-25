@@ -620,16 +620,19 @@ async fn an_idempotency_token_names_one_create() {
     );
 }
 
-/// RULE: a validation can only be created under an endpoint this account holds, and can
-/// only be described while its own record exists — both refusals are modelled
-/// (`ResourceNotFoundException`, HTTP 400), never a 501 or a 200.
+/// RULE: a validation can only be created under an endpoint of the caller's OWN account —
+/// an endpoint ARN naming another account is refused as invalid input
+/// (`ValidationException`, HTTP 400) before the store is read — and under an endpoint of
+/// this account it can only be created while that endpoint's record exists, and only
+/// described while its own record does; both of those are `ResourceNotFoundException`
+/// (HTTP 400), and none of the three is a 501 or a 200.
 #[tokio::test]
 async fn unknown_parents_and_unknown_validations_are_refused() {
     let (router, engine) = router_with_engine();
     let endpoint_arn = create_endpoint(&router, "known host", &endpoint_body()).await;
 
-    // Endpoint ARNs no record answers to: one in this account's Region, one in another
-    // Region, and one in another account.
+    // Endpoint ARNs no record of THIS account answers to: one in this account's Region,
+    // and one in another Region.
     let unknown_endpoints = [
         (
             "an endpoint id this account never created",
@@ -638,11 +641,6 @@ async fn unknown_parents_and_unknown_validations_are_refused() {
         (
             "an endpoint in another Region",
             format!("arn:aws:acm:eu-central-1:{ACCOUNT}:acme-endpoint/11111111-1111-4111-8111-111111111111"),
-        ),
-        (
-            "an endpoint in another account",
-            "arn:aws:acm:us-west-2:210987654321:acme-endpoint/22222222-2222-4222-8222-222222222222"
-                .to_string(),
         ),
     ];
     for (case, arn) in unknown_endpoints {
@@ -670,6 +668,35 @@ async fn unknown_parents_and_unknown_validations_are_refused() {
             "case {case:?}: expected the refusal to name {arn}, got {refusal}"
         );
     }
+
+    // An endpoint ARN of ANOTHER account is a verdict on the request: the ARN is not
+    // addressable by this caller, whatever the store holds, so it is refused as invalid
+    // input rather than reported as a resource that is missing.
+    let case = "an endpoint in another account";
+    let foreign = "arn:aws:acm:us-west-2:210987654321:acme-endpoint/22222222-2222-4222-8222-222222222222";
+    let (status, refusal) = call(
+        &router,
+        "CreateAcmeDomainValidation",
+        &json!({
+            "AcmeEndpointArn": foreign,
+            "DomainName": "example.com",
+            "PrevalidationOptions": { "DnsPrevalidation": {} },
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: creating under {foreign} must be refused, got {status} {refusal}"
+    );
+    assert_eq!(
+        error_code(&refusal),
+        "ValidationException",
+        "case {case:?}: expected ValidationException for {foreign}, got {refusal}"
+    );
+    assert!(
+        !error_message(&refusal).contains(foreign),
+        "case {case:?}: a cross-account refusal must withhold the submitted ARN, got {refusal}"
+    );
 
     // A validation ARN of the right shape under a real endpoint, but no record behind
     // it, and one under an endpoint that does not exist either.

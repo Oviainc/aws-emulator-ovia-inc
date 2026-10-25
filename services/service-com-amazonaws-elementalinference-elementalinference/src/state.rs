@@ -541,7 +541,13 @@ impl Dictionary {
 }
 
 /// One output of a feed: an Elemental Inference feature plus where its results go.
-#[derive(Debug, Clone)]
+///
+/// Two outputs are EQUAL when every member of the stored record matches, which is what
+/// tells an output a request would really add from one the feed already holds exactly as
+/// asked (`Feed::outputs_to_append`): the comparison is made on the stored form of both,
+/// so a request that leaves an optional member to the service's default
+/// ([`output_config_with_defaults`]) still matches the output that default produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output {
     pub name: String,
     pub output_config: OutputConfig,
@@ -752,6 +758,36 @@ impl Feed {
         for output in &mut self.outputs {
             output.status = OUTPUT_STATUS_DISABLED.to_string();
         }
+    }
+
+    /// Which of `requested` — the outputs a request asks this feed to hold, already in
+    /// their STORED form ([`Output::new`]) — an append would really add.
+    ///
+    /// An output the feed ALREADY holds exactly as `requested` describes it is in place
+    /// already, so it is neither appended a second time nor refused: `AssociateFeed` is
+    /// `@idempotent` and its `associatedResourceName` is the operation's
+    /// `@idempotencyToken`, so the request an SDK repeats when it never saw the first
+    /// response is that one request once more, and its effect has to be applied ONCE. A
+    /// repeat whose outputs are all in place therefore adds nothing, and one that also
+    /// carries an output the feed does not hold yet adds exactly that one.
+    ///
+    /// An output whose NAME the feed holds under a DIFFERENT definition is not in place
+    /// and is not appendable either: appending it would MODIFY the stored output, which
+    /// this operation cannot do ("You can't modify an existing output (for example to
+    /// change its name). Instead, use UpdateFeed"). That one is refused, and the `Err`
+    /// carries its name for the refusal to report.
+    pub fn outputs_to_append(&self, requested: Vec<Output>) -> Result<Vec<Output>, String> {
+        let mut to_append = Vec::with_capacity(requested.len());
+        for candidate in requested {
+            match self.outputs.iter().find(|held| held.name == candidate.name) {
+                // Already in place, exactly as this request describes it.
+                Some(held) if *held == candidate => {}
+                // The same name carrying something else: a modification.
+                Some(_) => return Err(candidate.name),
+                None => to_append.push(candidate),
+            }
+        }
+        Ok(to_append)
     }
 
     /// The name of the resource currently associated with this feed, if any.

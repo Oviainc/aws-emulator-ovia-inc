@@ -17,15 +17,17 @@
 //! of a call that succeeded answers the same way.
 //!
 //! `BillingPeriodRange` is "the billing period range in which the custom line item
-//! request will be applied", and an association is stored over the half-open range
+//! request will be applied", and an association is in effect over the half-open range
 //! `[InclusiveStartBillingPeriod, ExclusiveEndBillingPeriod)`. So a request that names
 //! no range disassociates the resource in every billing period and the association is
-//! dropped, while one that names a range takes effect FROM its inclusive start: the
-//! association keeps the earlier periods it applied in and ENDS there, which is the
-//! `EndBillingPeriod` a later read reports. An association left covering no period at
-//! all is dropped. Nothing re-associates a resource but
-//! `BatchAssociateResourcesToCustomLineItem`, so the range's exclusive end does not
-//! restore the association after it — it is checked for order and bounds nothing else.
+//! dropped, while one that names a range disassociates it ONLY in the periods that
+//! range covers: the association keeps the earlier periods it applied in and resumes at
+//! the range's exclusive end, so a read of a period at or after that end still reports
+//! the resource. A read of a period inside the range does not, and an association left
+//! covering no period at all is dropped. A request that would leave one association in
+//! effect over more separate stretches of billing periods than the store holds for one
+//! fails THAT resource with the modelled `SERVICE_LIMIT_EXCEEDED` reason and writes
+//! nothing for it.
 //!
 //! ## Shape of an operation
 //!
@@ -176,51 +178,31 @@ fn failed(arn: &str, reason: &str, message: String) -> DisassociateResourceRespo
     }
 }
 
-/// Apply a disassociation that takes effect from `effective_from` to the stored
-/// association at `index`, and report whether the stored state CHANGED.
+/// Apply a disassociation of the billing periods `removed` names to the stored
+/// association at `index`, and report what it did.
 ///
-/// `None` disassociates the resource in every billing period, so the association is
-/// dropped. A billing period ends the association there: the periods before it are
-/// ones the association applied in, and the ones from it on are the ones the request
-/// disassociates. An association that would then cover no period at all — one that
-/// starts at or after the disassociation, or already ends at or before it — is
-/// dropped, and one that already ends there is left exactly as it is, so a retry of
-/// the same request changes nothing.
+/// The range is half-open, so the association keeps every period outside it: a range
+/// bounded on both sides takes only the periods between its bounds and the association
+/// RESUMES at the exclusive end, while an open-ended range (and the fully open span a
+/// request naming no range disassociates over) takes every period from its start on.
+/// An association left in effect in no period at all is dropped, and one the range
+/// shares no period with is left exactly as it is, so a retry of the same request
+/// changes nothing. A removal the store's bound on an association's separate stretches
+/// of billing periods refuses writes nothing
+/// ([`crate::state::ResourceAssociationRecord::remove_periods`]).
 fn apply_disassociation(
     associations: &mut Vec<crate::state::ResourceAssociationRecord>,
     index: usize,
-    effective_from: Option<&str>,
-) -> bool {
-    let Some(from) = effective_from.and_then(|from| {
-        crate::state::billing_period_key(from).map(|key| (from.to_string(), key))
-    }) else {
-        // No range, or a range whose start is no billing period at all (which the
-        // modelled `BillingPeriod` pattern already refuses before this handler runs):
-        // the disassociation is not bounded to any period.
-        associations.remove(index);
-        return true;
+    removed: &crate::state::BillingPeriodSpan,
+) -> crate::state::PeriodsRemoval {
+    let Some(association) = associations.get_mut(index) else {
+        return crate::state::PeriodsRemoval::Unchanged;
     };
-    let (from_period, from_key) = from;
-    let association = &mut associations[index];
-    let starts_at_or_after = association
-        .inclusive_start_billing_period
-        .as_deref()
-        .and_then(crate::state::billing_period_key)
-        .is_some_and(|start| start >= from_key);
-    if starts_at_or_after {
+    let outcome = association.remove_periods(removed);
+    if association.is_empty() {
         associations.remove(index);
-        return true;
     }
-    let already_ended = association
-        .exclusive_end_billing_period
-        .as_deref()
-        .and_then(crate::state::billing_period_key)
-        .is_some_and(|end| end <= from_key);
-    if already_ended {
-        return false;
-    }
-    association.exclusive_end_billing_period = Some(from_period);
-    true
+    outcome
 }
 
 /// The `BatchDisassociateResourcesFromCustomLineItem` operation.
@@ -300,8 +282,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // The range the disassociation applies in: the start is inclusive and the end
-        // exclusive, so an end at or before the start would cover no billing period.
+        // The billing periods the disassociation applies to: the start is inclusive and
+        // the end exclusive, so an end at or before the start would cover no billing
+        // period. A request that names no range disassociates the resource in every
+        // billing period, which is the fully open span.
         if let Some(range) = &input.billing_period_range {
             if !crate::state::billing_period_range_is_ordered(range) {
                 return Err(validation(
@@ -313,10 +297,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
         }
-        let effective_from = input
+        let removed = input
             .billing_period_range
             .as_ref()
-            .map(|range| range.inclusive_start_billing_period.clone());
+            .map(|range| {
+                crate::state::BillingPeriodSpan::new(
+                    Some(range.inclusive_start_billing_period.clone()),
+                    range.exclusive_end_billing_period.clone(),
+                )
+            })
+            .unwrap_or_default();
 
         // EVERY requested resource is resolved against the store FIRST, so the
         // outcomes are decided on one consistent view and the stored item is borrowed
@@ -381,12 +371,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .position(|association| association.arn == resource_arn)
             {
-                if apply_disassociation(
-                    &mut target.associated_resources,
-                    index,
-                    effective_from.as_deref(),
-                ) {
-                    target.last_modified_time_millis = now;
+                match apply_disassociation(&mut target.associated_resources, index, &removed) {
+                    crate::state::PeriodsRemoval::Changed => {
+                        target.last_modified_time_millis = now;
+                    }
+                    crate::state::PeriodsRemoval::Unchanged => {}
+                    // One stretch of billing periods more than a stored association
+                    // may be in effect over is a limit this resource's element cannot
+                    // get around, and nothing of it was written.
+                    crate::state::PeriodsRemoval::AtSpanLimit => {
+                        failures.push(failed(
+                            requested,
+                            "SERVICE_LIMIT_EXCEEDED",
+                            format!(
+                                "the association of {resource_arn} is in effect over at most {} \
+                                 separate ranges of billing periods",
+                                crate::state::MAX_BILLING_PERIOD_SPANS_PER_ASSOCIATION
+                            ),
+                        ));
+                        continue;
+                    }
                 }
             }
             disassociated.push(DisassociateResourceResponseElement {

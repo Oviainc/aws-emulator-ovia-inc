@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartSearch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartSearch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts a search over a workspace's data: the request is persisted as a search
+//! record in `crate::state` and the call answers immediately with the minted
+//! `searchId` and the initial `QUEUED` status, the way the operation documents it.
+//! The lifecycle the call owes (`QUEUED` -> `RUNNING` -> `SUCCEEDED`) is recorded as
+//! DUE INSTANTS, never slept on, so a poll derives the status it reports from the
+//! clock instead of writing one.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartSearch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Idempotent on `clientToken`: a repeat of a call that carried one answers from the
+//! search that token already started rather than starting a second. A workspace the
+//! store does not hold is the modelled not-found refusal.
 //!
 //! ## Shape of an operation
 //!
@@ -180,20 +181,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartSearch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartSearchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartSearch"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartSearchError::Modeled(StartSearchErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // A `timeIntervals` entry bounds the data the search reads, so an interval
+        // whose end precedes its start names no data at all — refused the way every
+        // other range this service takes is (cf. `BatchGetAssetPropertyAggregates`),
+        // and before anything is written so a refused call starts no search.
+        check_search_filters(input.search_filters.as_ref()).map_err(invalid_request)?;
+
+        let mut store = state.lock();
+
+        // A search runs against the data of ONE workspace, so a request naming a
+        // workspace this account does not hold addresses nothing: the modelled
+        // not-found refusal, in the wording every other operation scoped to a
+        // workspace uses (cf. `DescribeTimeSeries`), and before any state is
+        // written.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            )));
+        }
+
+        // "The request is idempotent on clientToken: repeating a call with the same
+        // token returns the original search instead of starting a new one" — the
+        // repeat writes nothing and reports the original search, at whatever status
+        // that search has reached by now.
+        if let Some(client_token) = input.client_token.as_deref() {
+            if let Some(existing) =
+                store.search_for_client_token(&input.workspace_name, client_token)
+            {
+                return Ok(started(existing, now));
+            }
+        }
+
+        // The store is bounded: a start is the only thing that adds a search and
+        // nothing evicts one, so past either cap this is the modelled quota refusal.
+        if store.searches.len() >= crate::state::MAX_SEARCHES {
+            return Err(limit_exceeded(format!(
+                "This emulator holds at most {} searches.",
+                crate::state::MAX_SEARCHES
+            )));
+        }
+        if store.searches_in_workspace(&input.workspace_name)
+            >= crate::state::MAX_SEARCHES_PER_WORKSPACE
+        {
+            return Err(limit_exceeded(format!(
+                "This emulator holds at most {} searches per workspace.",
+                crate::state::MAX_SEARCHES_PER_WORKSPACE
+            )));
+        }
+
+        let search_id = crate::state::new_id();
+        let running_at = now + crate::state::SEARCH_QUEUED_FOR;
+        let record = crate::state::SearchRecord {
+            workspace_name: input.workspace_name.clone(),
+            search_id: search_id.clone(),
+            query_statement: input.query_statement.clone(),
+            // "The search strategy to use. Defaults to QUICK when omitted."
+            search_type: input
+                .search_type
+                .clone()
+                .unwrap_or_else(|| crate::state::DEFAULT_SEARCH_TYPE.to_string()),
+            search_filters: input.search_filters.clone(),
+            group_id: input.group_id.clone(),
+            client_token: input.client_token.clone(),
+            started_at: now,
+            // "The search runs in the background": the instants its transitions fall
+            // due are STORED, never slept on, so this call returns immediately and a
+            // poll taken straight afterwards still observes QUEUED.
+            running_at,
+            succeeded_at: running_at + crate::state::SEARCH_RUNS_FOR,
+        };
+
+        let output = started(&record, now);
+        store.searches.insert(
+            crate::state::search_key(&input.workspace_name, &search_id),
+            record,
+        );
+
+        Ok(output)
     }
+}
+
+/// What this operation answers for a stored search, as of `now` — every member
+/// read off the record rather than off the request.
+fn started(record: &crate::state::SearchRecord, now: ::std::time::SystemTime) -> StartSearchOutput {
+    StartSearchOutput {
+        search_id: record.search_id.clone(),
+        workspace_name: record.workspace_name.clone(),
+        status: record.status(now).to_string(),
+        group_id: record.group_id.clone(),
+    }
+}
+
+/// Refuse a `searchFilters` whose `timeIntervals` carry an interval that spans no
+/// time at all, in the wording the refusal carries; `Ok` for one that does not.
+fn check_search_filters(filters: Option<&SearchFilters>) -> Result<(), String> {
+    let intervals = filters.and_then(|filters| filters.time_intervals.as_deref());
+    for interval in intervals.unwrap_or_default() {
+        if crate::state::timestamp_key(&interval.start_time)
+            > crate::state::timestamp_key(&interval.end_time)
+        {
+            return Err("A timeIntervals startTime must not be after its endTime.".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> StartSearchError {
+    StartSearchError::Modeled(StartSearchErrorModeled::InvalidRequestException(
+        InvalidRequestException { message },
+    ))
+}
+
+/// HTTP 410 `LimitExceededException` carrying `message`.
+fn limit_exceeded(message: String) -> StartSearchError {
+    StartSearchError::Modeled(StartSearchErrorModeled::LimitExceededException(
+        LimitExceededException { message },
+    ))
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> StartSearchError {
+    StartSearchError::Modeled(StartSearchErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException { message },
+    ))
 }

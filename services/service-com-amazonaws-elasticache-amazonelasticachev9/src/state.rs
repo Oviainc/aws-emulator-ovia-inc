@@ -76,9 +76,13 @@
 //! record is what lets the writer write the copy the reader already reads
 //! instead of a second one beside it.
 //!
-//! Beside the cache resources sits the RBAC user: `CreateUser` mints one and
-//! `DescribeUsers` reports it, over the one [`UserRecord`] map below, which also
-//! holds the built-in `default` user every account already has.
+//! Beside the cache resources sits the RBAC user: `CreateUser` mints one,
+//! `ModifyUser` changes its permissions and the way it authenticates,
+//! `DescribeUsers` reports it and `DeleteUser` takes it away, over the one
+//! [`UserRecord`] map below, which also holds the built-in `default` user every
+//! account already has. A modified user does not settle at the call: it answers
+//! `modifying` and the clock owes it `active` ([`UserRecord::pending_status`])
+//! the same way a deleted one is owed its removal.
 //!
 //! The update action is this service's one resource nothing creates: it exists
 //! for every (published service update, cluster-or-replication-group) pair the
@@ -6928,6 +6932,17 @@ pub fn update_action_view(
     }
 }
 
+/// How long an access string the store keeps, in characters.
+///
+/// The model constrains `AccessString` with `@pattern "\S"` alone and
+/// `ModifyUser$AppendAccessString` "adds additional user permissions to the
+/// access string" a user already has, so the stored rule list grows from call to
+/// call and nothing in the model bounds it. This is therefore the emulator's OWN
+/// bound on the store, for the reason [`CLUSTER_QUOTA`] gives: it sits far above
+/// any rule list an emulator serves, and it is what stops one user's permissions
+/// growing without end.
+pub const MAX_ACCESS_STRING_LEN: usize = 8192;
+
 /// Why `access_string` is not an access string, or `None` when it is one.
 ///
 /// The model constrains `AccessString` only with `@pattern "\S"` — any string
@@ -6942,6 +6957,15 @@ pub fn update_action_view(
 /// inner rules are checked by the same per-rule test. A group that is never
 /// closed is refused.
 pub fn access_string_rejection(member: &str, access_string: &str) -> Option<String> {
+    // Checked before the list is walked: the length is the one thing about a
+    // rule list a caller can grow without end (see [`MAX_ACCESS_STRING_LEN`]),
+    // and it bounds the work the walk below does.
+    if access_string.chars().count() > MAX_ACCESS_STRING_LEN {
+        return Some(format!(
+            "Invalid value for {member}: an access string is at most \
+             {MAX_ACCESS_STRING_LEN} characters."
+        ));
+    }
     let refuse = |token: &str| {
         Some(format!(
             "Invalid value {token} for {member}: it is not a Valkey or Redis OSS ACL rule."
@@ -7291,6 +7315,13 @@ pub struct UserRecord {
     /// [`USER_STATUS_DELETING`], and `None` for a user nothing has deleted.
     /// Materialised by [`ComAmazonawsElasticacheAmazonelasticachev9State::settle_users`].
     pub pending_removal: Option<SystemTime>,
+    /// The status change the clock owes this user: [`USER_STATUS_ACTIVE`] a span
+    /// after the `ModifyUser` that moved it to [`STATUS_MODIFYING`], and `None`
+    /// for a user with nothing outstanding. The CHANGE itself is applied at the
+    /// call — the `User` shape carries no pending-value member to report it
+    /// through — so only the status is owed. Materialised by
+    /// [`ComAmazonawsElasticacheAmazonelasticachev9State::settle_users`].
+    pub pending_status: Option<PendingTransition>,
 }
 
 impl UserRecord {
@@ -7374,6 +7405,8 @@ pub fn built_in_users() -> BTreeMap<String, UserRecord> {
             // No call creates the built-in user and none deletes it, so the
             // clock never owes its removal.
             pending_removal: None,
+            // Nothing has modified it either, so no status change is owed.
+            pending_status: None,
         },
     );
     users
@@ -8032,6 +8065,12 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
     pub fn settle_users(&mut self, now: SystemTime) {
         self.users
             .retain(|_, user| user.pending_removal.is_none_or(|due| now < due));
+        // The other change a user's clock owes: the `modifying` status a
+        // `ModifyUser` left behind settles back to `active` once its span has
+        // passed, which is what frees the user to take the next change.
+        for user in self.users.values_mut() {
+            settle_status(&mut user.status, &mut user.pending_status, now);
+        }
     }
 
     /// Withdraw `user_id` from every user group that lists it.
@@ -9081,6 +9120,28 @@ fn transition_to(status: &str, now: SystemTime) -> Option<PendingTransition> {
 /// [`USER_STATUS_ACTIVE`], which is what `UserGroup$Status` settles at.
 pub fn user_group_transition(now: SystemTime) -> Option<PendingTransition> {
     transition_to(USER_STATUS_ACTIVE, now)
+}
+
+/// The transition the clock owes a just-modified user: [`USER_STATUS_ACTIVE`],
+/// which is what `User$Status` ("Can be \"active\", \"modifying\" or
+/// \"deleting\"") settles at once the change has been carried through.
+pub fn user_transition(now: SystemTime) -> Option<PendingTransition> {
+    transition_to(USER_STATUS_ACTIVE, now)
+}
+
+/// Why the user cannot take a change at this instant, or `None` when it can.
+///
+/// `InvalidUserStateFault` is "The user is not in active state", so a user still
+/// carrying a change the clock has not settled, or one on its way out, takes no
+/// further change. Stated once, over the settled status, so every operation that
+/// changes a user agrees about which statuses it accepts.
+pub fn user_state_refusal(user: &UserRecord) -> Option<String> {
+    (user.status != USER_STATUS_ACTIVE).then(|| {
+        format!(
+            "User {} is in {} state, not active.",
+            user.user_id, user.status
+        )
+    })
 }
 
 /// Why a user group cannot take a change at this instant, or `None` when it

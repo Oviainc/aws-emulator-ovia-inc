@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSMSSandboxPhoneNumbers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSMSSandboxPhoneNumbers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSMSSandboxPhoneNumbers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +77,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -154,23 +146,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_SMS_SANDBOX_PHONE_NUMBERS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// One page of the destination phone numbers this account's SMS sandbox holds.
+    ///
+    /// A pure REPORT of persisted state: every number comes from a record
+    /// `CreateSMSSandboxPhoneNumber` wrote, carrying the verification status that
+    /// record holds, and nothing here writes.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSMSSandboxPhoneNumbers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSMSSandboxPhoneNumbersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSMSSandboxPhoneNumbers"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(ListSMSSandboxPhoneNumbersErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the SNS store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = store.lock();
+
+        let all: Vec<SMSSandboxPhoneNumber> = store
+            .sandbox_phone_numbers_in_order()
+            .into_iter()
+            .map(|number| SMSSandboxPhoneNumber {
+                phone_number: Some(number.phone_number.clone()),
+                status: Some(number.status.clone()),
+            })
+            .collect();
+
+        // `MaxResults` is this request's page size; the model bounds it at 1..100 and
+        // the boundary validator has already refused anything outside that, so an
+        // absent value is the only case left to answer — with the page of "up to 100"
+        // every paginated SNS list reports.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(state::PAGE_SIZE);
+
+        let Some((page, next_token)) =
+            state::paginate(all, input.next_token.as_deref(), page_size)
+        else {
+            return Err(ListSMSSandboxPhoneNumbersErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some("Invalid parameter: NextToken".to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(ListSMSSandboxPhoneNumbersOutput {
+            phone_numbers: page,
+            next_token,
+        })
     }
 }
