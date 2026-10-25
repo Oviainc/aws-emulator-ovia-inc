@@ -22,8 +22,8 @@
 //! shown to be computed from what is stored rather than always answered.
 //!
 //! `ListTaskInstances` is the third child-resource listing and declares no not-found
-//! error either, but it is still a scaffolded 501 stub, so it has no answer to assert
-//! yet; implementing it belongs to its own stub issue.
+//! error either; the suite `task_instance_listing` carries the rule onto it, over the
+//! absent workflow, the absent run and the run another region's endpoint holds.
 
 use std::time::Duration;
 
