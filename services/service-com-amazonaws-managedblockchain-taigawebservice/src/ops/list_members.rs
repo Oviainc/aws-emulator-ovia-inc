@@ -2,7 +2,9 @@
 
 //! @op ListMembers
 //! Implemented: pages `MemberSummary` entries out of the members stored on one network in
-//! [`crate::state`], honouring the `name`, `status` and `isOwned` filters.
+//! [`crate::state`], honouring the `name`, `status` and `isOwned` filters; a `NetworkId`
+//! that resolves to no stored network is refused with this operation's own
+//! `InvalidRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -96,23 +98,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-managedblockchain-taiga
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
 //
-// `ResourceNotFoundException` is widened in with `extra_errors`: `NetworkId` is an
-// `@httpLabel` naming a resource that may not exist, and the alternative to the 404 this
-// SERVICE models for a missing resource would be reporting an absent network as an EMPTY
-// SUCCESS — a listing a client cannot tell apart from a network that holds no members.
-// The shape is this service's own, with `httpError` 404, and `ListProposals` — the other
-// listing scoped by this same `/networks/{NetworkId}` label — declares it; only this
-// operation's error list omits it.
-#[smithy_macros::operation_error(
-    "com.amazonaws.managedblockchain#ListMembers",
-    extra_errors = ["ResourceNotFoundException"]
-)]
+// Nothing is widened in: this list is exactly what the model declares for this
+// operation, which is what a generated client's error union for it holds.
+#[smithy_macros::operation_error("com.amazonaws.managedblockchain#ListMembers")]
 #[derive(Debug)]
 pub enum ListMembersErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServiceErrorException(InternalServiceErrorException),
     InvalidRequestException(InvalidRequestException),
-    ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
 }
 
@@ -129,6 +122,22 @@ impl From<ListMembersErrorModeled> for ListMembersError {
     fn from(modeled: ListMembersErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// This operation models NO `ResourceNotFoundException` (its client errors are
+/// `AccessDeniedException`, `InvalidRequestException` and `ThrottlingException`), so a
+/// network scope it cannot resolve is an invalid REQUEST — never a 404 the model does not
+/// declare, which no generated client could catch, and never an empty page, which would
+/// claim the network exists and holds no members. `ListNodes` and `ListProposalVotes`
+/// answer an unresolvable scope the same way; the prose is the service's one not-found
+/// sentence, so only the shape carrying it differs from `ListProposals`, which does
+/// declare the 404.
+fn network_not_found(network_id: &str) -> ListMembersError {
+    ListMembersErrorModeled::InvalidRequestException(crate::state::not_found_invalid_request(
+        crate::state::RESOURCE_NETWORK,
+        network_id,
+    ))
+    .into()
 }
 
 /// The `ListMembers` operation.
@@ -200,15 +209,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.settle(::std::time::SystemTime::now());
 
-        // A `NetworkId` that names no network of this Region is the resource-not-found
-        // case, not an empty page: an empty page would claim the network exists and holds
-        // no members. The network is the resource this listing was asked for, and the
-        // shared constructor states it the way every other failure of this service does.
+        // A `NetworkId` that names no network of this Region is refused naming that
+        // network, rather than answered with an empty page that would claim the network
+        // exists and holds no members — in the shape this operation's own error list
+        // declares for it.
         let Some(network) = guard.network(&region, &input.network_id) else {
-            return Err(ListMembersErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(crate::state::RESOURCE_NETWORK, &input.network_id),
-            )
-            .into());
+            return Err(network_not_found(&input.network_id));
         };
 
         // Each filter selects on the STORED value of the member it names: `Name` is "The
