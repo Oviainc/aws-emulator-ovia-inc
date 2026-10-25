@@ -21,6 +21,8 @@ mod plan_capacity_quota;
 mod plan_capacity_units;
 #[path = "all/plan_update.rs"]
 mod plan_update;
+#[path = "all/regional_isolation.rs"]
+mod regional_isolation;
 #[path = "all/rescore_execution_plan_lifecycle.rs"]
 mod rescore_execution_plan_lifecycle;
 #[path = "all/resource_tags.rs"]

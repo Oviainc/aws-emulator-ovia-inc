@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeComputationModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeComputationModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeComputationModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the handler below answers from the computation model this
+//! service's store holds under the requested id, reporting the configuration,
+//! data binding, dates, version and actions the create (or the last accepted
+//! write) left on it, and refusing an id — or a version of that id — the store
+//! does not hold with the modelled 404.
 //!
 //! ## Shape of an operation
 //!
@@ -173,20 +170,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeComputationModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeComputationModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeComputationModel"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeComputationModelError::Modeled(
+                DescribeComputationModelErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        let store = state.lock();
+        let record = store
+            .computation_models
+            .get(&input.computation_model_id)
+            .ok_or_else(|| not_found(&input.computation_model_id))?;
+
+        // A read scoped to a version — `LATEST`, `ACTIVE` or an explicit number — is
+        // answered only by a version the store holds for this model; one it does not
+        // hold is the modelled 404 rather than the latest version under another
+        // version's name. The rule itself lives on the record, so every operation that
+        // carries this filter resolves it identically.
+        if !record.serves_version(input.computation_model_version.as_deref(), now) {
+            return Err(not_found(&input.computation_model_id));
+        }
+
+        Ok(DescribeComputationModelOutput {
+            computation_model_id: record.id.clone(),
+            computation_model_arn: record.arn.clone(),
+            computation_model_name: record.name.clone(),
+            computation_model_description: record.description.clone(),
+            computation_model_configuration: record.configuration.clone(),
+            computation_model_data_binding: record.data_binding.clone(),
+            computation_model_creation_date: crate::state::to_date_time(record.creation_date),
+            computation_model_last_update_date: crate::state::to_date_time(
+                record.last_update_date,
+            ),
+            computation_model_status: record.status(now),
+            computation_model_version: record.version_label(),
+            // The actions this model exposes, as its create materialised them from the
+            // computation type its configuration names.
+            action_definitions: record.action_definitions.clone(),
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the computation model the request
+/// asked for.
+fn not_found(requested: &str) -> DescribeComputationModelError {
+    DescribeComputationModelError::Modeled(
+        DescribeComputationModelErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException {
+                message: crate::state::not_found_message(
+                    crate::state::RESOURCE_COMPUTATION_MODEL,
+                    requested,
+                ),
+            },
+        ),
+    )
 }

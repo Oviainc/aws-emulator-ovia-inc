@@ -6,8 +6,9 @@
 //! clusters, the snapshots taken of them, the cluster parameter groups and
 //! cluster subnet groups they are configured from, the HSM configurations that
 //! tell a cluster where to store its database encryption keys, the usage limits
-//! set on their features, and the Query Editor (QEV2) IAM Identity Center
-//! applications the account registered. Every collection keeps
+//! set on their features, the snapshot copy grants that let Redshift encrypt
+//! copied snapshots in another region, and the Query Editor (QEV2) IAM Identity
+//! Center applications the account registered. Every collection keeps
 //! INSERTION ORDER, so the `Marker`
 //! cursor the paginated `Describe*` operations hand out is a stable, resumable
 //! offset into the same sequence a later page walks.
@@ -32,7 +33,8 @@ use crate::ops::types::{
     ClusterNode, ClusterParameterGroup, ClusterParameterGroupStatus, ClusterParameterStatus,
     ClusterSubnetGroup, ClusterVersion, CreateUsageLimitOutput, HsmConfiguration, MaintenanceTrack,
     NetworkInterface, Parameter, PendingModifiedValues, Qev2IdcApplication, RecurringCharge,
-    ReservedNodeOffering, Snapshot, Subnet, SupportedOperation, SupportedPlatform, UpdateTarget,
+    ReservedNodeOffering, Snapshot, SnapshotCopyGrant, Subnet, SupportedOperation,
+    SupportedPlatform, UpdateTarget,
     VpcEndpoint, VpcSecurityGroupMembership,
 };
 use sha2::{Digest, Sha256};
@@ -1496,6 +1498,20 @@ pub const QEV2_IDC_APPLICATION_QUOTA: usize = 10_000;
 /// released by `DeleteHsmConfiguration`.
 pub const HSM_CONFIGURATION_QUOTA: usize = 10_000;
 
+/// How many snapshot copy grants the store holds before
+/// `CreateSnapshotCopyGrant` refuses with the modelled
+/// `SnapshotCopyGrantQuotaExceededFault`.
+///
+/// The same reasoning as [`HSM_CONFIGURATION_QUOTA`]: the emulator's own bound
+/// on
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::snapshot_copy_grants`],
+/// not a claim about an account's published limit. A grant's identity is the
+/// name its create gives it, and names are unlimited in number, so this bound is
+/// what stops the collection growing without end; it is set far above any
+/// workflow an emulator serves, and every record it holds is released by
+/// `DeleteSnapshotCopyGrant`.
+pub const SNAPSHOT_COPY_GRANT_QUOTA: usize = 10_000;
+
 /// How many tags one resource may carry before a create that would exceed it
 /// refuses with the modelled `TagLimitExceededFault`.
 ///
@@ -1835,6 +1851,15 @@ pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// Every HSM configuration, keyed by `HsmConfigurationIdentifier`, in
     /// creation order.
     pub hsm_configurations: Vec<StoredHsmConfiguration>,
+    /// Every snapshot copy grant, keyed by `SnapshotCopyGrantName`, in creation
+    /// order.
+    ///
+    /// The modelled `SnapshotCopyGrant` shape IS the whole record — a grant
+    /// carries no status the clock moves and nothing the shape has no member
+    /// for — so, like
+    /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::usage_limits`],
+    /// this collection needs no `Stored*` wrapper.
+    pub snapshot_copy_grants: Vec<SnapshotCopyGrant>,
     /// Every Query Editor (QEV2) IAM Identity Center application the account
     /// registered, keyed by `Qev2IdcApplicationArn`, in creation order.
     ///
@@ -1904,6 +1929,7 @@ impl Default for ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             parameter_groups: default_parameter_groups(),
             usage_limits: Vec::new(),
             hsm_configurations: Vec::new(),
+            snapshot_copy_grants: Vec::new(),
             qev2_idc_applications: Vec::new(),
             cluster_versions: published_cluster_versions(),
             maintenance_tracks: published_maintenance_tracks(),
@@ -2068,6 +2094,17 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         self.hsm_configurations.iter().find(|stored| {
             stored.configuration.hsm_configuration_identifier.as_deref() == Some(identifier)
         })
+    }
+
+    /// The stored snapshot copy grant with this `SnapshotCopyGrantName`, if any.
+    ///
+    /// The name is compared exactly as the create that minted the grant spelled
+    /// it: the documented syntax ([`SNAPSHOT_COPY_GRANT_NAME_RULE`]) admits only
+    /// lowercase letters, digits and hyphens, so there is no folding to do.
+    pub fn snapshot_copy_grant(&self, name: &str) -> Option<&SnapshotCopyGrant> {
+        self.snapshot_copy_grants
+            .iter()
+            .find(|grant| grant.snapshot_copy_grant_name.as_deref() == Some(name))
     }
 
     /// The position of the registered QEV2 IAM Identity Center application with
@@ -2809,6 +2846,19 @@ pub const SNAPSHOT_IDENTIFIER_RULE: IdentifierRule = IdentifierRule {
     lowercase_only: false,
 };
 
+/// The rule for a snapshot copy grant name (`SnapshotCopyGrantName`).
+///
+/// Source: `smithy_query(query="doc", shape="CreateSnapshotCopyGrantMessage",
+/// member="SnapshotCopyGrantName")` — "Must contain from 1 to 63 alphanumeric
+/// characters or hyphens. Alphabetic characters must be lowercase. First
+/// character must be a letter. Cannot end with a hyphen or contain two
+/// consecutive hyphens."
+pub const SNAPSHOT_COPY_GRANT_NAME_RULE: IdentifierRule = IdentifierRule {
+    member: "SnapshotCopyGrantName",
+    max_len: 63,
+    lowercase_only: true,
+};
+
 /// Check `value` against `rule`, naming the member and the constraint it broke.
 ///
 /// `member` overrides the rule's own member name, so `NewClusterIdentifier` and
@@ -3305,6 +3355,16 @@ pub fn default_vpc_security_group_id(vpc_id: &str) -> String {
 /// named no `KmsKeyId` is encrypted under the service-owned key, which Redshift
 /// reports by this id rather than by an ARN.
 pub const AWS_OWNED_KMS_KEY: &str = "AWS_OWNED_KMS_KEY";
+
+/// The `KmsKeyId` a snapshot copy grant carries when its create named none.
+///
+/// Source: `smithy_query(query="doc", shape="CreateSnapshotCopyGrantMessage",
+/// member="KmsKeyId")` — "If no key is specified, the default key is used." The
+/// default key of a Redshift account is the Amazon Web Services managed key for
+/// this service, which callers name by its alias, so that alias is the key such
+/// a grant permits Redshift to use. Resolved once at CREATE time and stored on
+/// the grant, so every later read of it reports the same key.
+pub const DEFAULT_SNAPSHOT_COPY_GRANT_KMS_KEY: &str = "alias/aws/redshift";
 
 /// What a `PendingModifiedValues$MasterUserPassword` carries while an admin
 /// password change is still being applied: the member is `@sensitive`, so the

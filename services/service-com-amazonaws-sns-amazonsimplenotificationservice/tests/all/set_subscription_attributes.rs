@@ -412,6 +412,149 @@ async fn setting_a_subscription_attribute_sns_does_not_accept_is_refused() {
     }
 }
 
+/// An attribute refused because the SUBSCRIPTION's delivery protocol is not one SNS
+/// documents it for is refused with SNS's own whole sentence — `Invalid parameter:
+/// Delivery protocol [<protocol>] does not support <feature>.` — and not with the
+/// `<member> Reason: ` frame this crate states a bad member VALUE in: the attribute's
+/// value broke no constraint of its own, the subscription it was set on is what refused
+/// it. The same sentence answers whichever call wrote the attribute.
+///
+/// The rows differ in the protocol refused, the attribute and so the feature, and the
+/// writing operation, which is what the rule generalises over; the recorded
+/// `RawMessageDelivery` write on a `lambda` subscription is one row of it. The feature
+/// phrase per attribute comes from the doc's scoping sentences quoted on the crate's
+/// `RAW_MESSAGE_DELIVERY_PROTOCOLS`, `DELIVERY_POLICY_PROTOCOLS` and
+/// `SUBSCRIPTION_ROLE_ARN_PROTOCOLS`.
+#[tokio::test]
+async fn a_protocol_scoped_attribute_is_refused_with_the_whole_sentence() {
+    let sns = Sns::new();
+    // case, protocol, attribute, value, the feature the sentence names.
+    let cases: &[(&str, &str, &str, &str, &str)] = &[
+        (
+            "raw delivery on a lambda subscription",
+            "lambda",
+            "RawMessageDelivery",
+            "true",
+            "raw message delivery",
+        ),
+        (
+            "raw delivery on an email subscription",
+            "email",
+            "RawMessageDelivery",
+            "true",
+            "raw message delivery",
+        ),
+        (
+            "raw delivery on an email-json subscription",
+            "email-json",
+            "RawMessageDelivery",
+            "true",
+            "raw message delivery",
+        ),
+        (
+            "raw delivery on an sms subscription",
+            "sms",
+            "RawMessageDelivery",
+            "true",
+            "raw message delivery",
+        ),
+        (
+            "raw delivery on a firehose subscription",
+            "firehose",
+            "RawMessageDelivery",
+            "true",
+            "raw message delivery",
+        ),
+        (
+            "raw delivery on an application subscription",
+            "application",
+            "RawMessageDelivery",
+            "true",
+            "raw message delivery",
+        ),
+        (
+            "a delivery policy on an sqs subscription",
+            "sqs",
+            "DeliveryPolicy",
+            DELIVERY_POLICY,
+            "a delivery policy",
+        ),
+        (
+            "a delivery policy on an application subscription",
+            "application",
+            "DeliveryPolicy",
+            DELIVERY_POLICY,
+            "a delivery policy",
+        ),
+        (
+            "a subscription role on an https subscription",
+            "https",
+            "SubscriptionRoleArn",
+            "arn:aws:iam::000000000000:role/sns-firehose",
+            "a subscription role",
+        ),
+        (
+            "a subscription role on a lambda subscription",
+            "lambda",
+            "SubscriptionRoleArn",
+            "arn:aws:iam::000000000000:role/sns-firehose",
+            "a subscription role",
+        ),
+    ];
+
+    for (index, (case, protocol, name, value, feature)) in cases.iter().enumerate() {
+        let want =
+            format!("Invalid parameter: Delivery protocol [{protocol}] does not support {feature}.");
+        let topic = sns.topic(&format!("protocol-scope-{index:02}")).await;
+
+        // The write path the recorded check drove: SetSubscriptionAttributes.
+        let arn = subscribe(&sns, case, &topic, protocol, endpoint_for(protocol), &[]).await;
+        let answer = set(&sns, &arn, name, Some(value)).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: expected 400, got {} / {}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.code(),
+            "InvalidParameter",
+            "case {case:?}: expected the InvalidParameter code, got {}",
+            answer.body
+        );
+        let message = answer.element("Message").unwrap_or_default();
+        assert_eq!(
+            message, want,
+            "case {case:?}: expected the message {want:?}, got {message:?}"
+        );
+
+        // And the SAME sentence when Subscribe carries the attribute instead.
+        let on_subscribe = sns
+            .call(
+                "Subscribe",
+                &[
+                    ("TopicArn", &topic),
+                    ("Protocol", protocol),
+                    ("Endpoint", endpoint_for(protocol)),
+                    ("ReturnSubscriptionArn", "true"),
+                    ("Attributes.entry.1.key", name),
+                    ("Attributes.entry.1.value", value),
+                ],
+            )
+            .await;
+        assert_eq!(
+            on_subscribe.status, 400,
+            "case {case:?}: Subscribe expected 400, got {} / {}",
+            on_subscribe.status, on_subscribe.body
+        );
+        let subscribe_message = on_subscribe.element("Message").unwrap_or_default();
+        assert_eq!(
+            subscribe_message, want,
+            "case {case:?}: Subscribe expected the message {want:?}, got \
+             {subscribe_message:?}"
+        );
+    }
+}
+
 /// `SetSubscriptionAttributes` answers 404 / `NotFound` for a well-formed subscription
 /// ARN that names no subscription this emulator holds, and 400 / `InvalidParameter` for
 /// a value that is not a subscription ARN at all — including the sentinels SNS publishes

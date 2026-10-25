@@ -500,7 +500,10 @@ pub const MAX_TAGS_PER_PLAN: usize = 200;
 /// growing without bound in a long-lived emulator, since each plan's size is bounded
 /// in turn — by the modelled `@length` constraints on the members a single call
 /// writes, and by [`MAX_TAGS_PER_PLAN`] for the tag set, which `TagResource` grows
-/// across calls.
+/// across calls. It is measured over the WHOLE store
+/// ([`plan_count`](ComAmazonawsKendrarankingAwskendrarerankingfrontendserviceState::plan_count)),
+/// not over one region, so the number of regions a caller signs for cannot multiply
+/// what this emulator holds.
 pub const MAX_RESCORE_EXECUTION_PLANS: usize = 100;
 
 /// The number of extra capacity units one rescore execution plan may be provisioned
@@ -547,10 +550,14 @@ pub fn capacity_units_over_quota(
 /// before any scoring runs.
 pub const MAX_DOCUMENTS_PER_RESCORE: usize = 100;
 
-/// Per-service state for com-amazonaws-kendraranking-awskendrarerankingfrontendservice. A handler reaches it through [`service_state`].
+/// The rescore execution plans of ONE region, with the indexes that resolve them.
+///
+/// One of these per region the store holds plans for: a rescore execution plan belongs
+/// to the region its create was signed for, so this is the only scope in which its id,
+/// its ARN and the `ClientToken` that minted it resolve.
 #[derive(Debug, Default)]
-pub struct ComAmazonawsKendrarankingAwskendrarerankingfrontendserviceState {
-    /// Every live plan, keyed by its 36-character id. A `BTreeMap` so
+pub struct RegionalPlans {
+    /// This region's live plans, keyed by their 36-character id. A `BTreeMap` so
     /// `ListRescoreExecutionPlans` has one stable total order to page through.
     pub plans: BTreeMap<String, RescoreExecutionPlan>,
     /// Plan ARN -> plan id, so an ARN-addressed call (the tagging operations)
@@ -558,25 +565,123 @@ pub struct ComAmazonawsKendrarankingAwskendrarerankingfrontendserviceState {
     pub arn_index: HashMap<String, String>,
     /// `ClientToken` -> plan id: backs `CreateRescoreExecutionPlan` idempotency. One
     /// entry per plan the token created, dropped with that plan, so this map is bounded
-    /// by [`MAX_RESCORE_EXECUTION_PLANS`] like `plans` and `arn_index`.
+    /// like `plans` and `arn_index`.
     pub client_tokens: HashMap<String, String>,
-    /// How many identifiers this store has minted; see [`next_id`](Self::next_id).
+}
+
+/// Per-service state for com-amazonaws-kendraranking-awskendrarerankingfrontendservice. A handler reaches it through [`service_state`].
+///
+/// Plans are keyed by REGION first, because a rescore execution plan is a regional
+/// resource: this service has a per-region endpoint and mints an ARN that names the
+/// region the creating request was signed for, so a plan is visible, addressable and
+/// deletable only through that region. The account is not part of the key — this
+/// emulator serves the single account [`::engine::emulator_arn`] mints every ARN for —
+/// so every request's plans already belong to it.
+#[derive(Debug, Default)]
+pub struct ComAmazonawsKendrarankingAwskendrarerankingfrontendserviceState {
+    /// Every live plan, keyed by the region it was created in and then by its id — the
+    /// single source of truth. A region holding no plans keeps no entry.
+    pub regions: BTreeMap<String, RegionalPlans>,
+    /// How many identifiers this store has minted; see [`next_id`](Self::next_id). It
+    /// spans every region, so no two plans this store holds ever share an id — the
+    /// per-region uniqueness a plan id has in the real service, and no weaker.
     pub ids_minted: u64,
 }
 
 impl ComAmazonawsKendrarankingAwskendrarerankingfrontendserviceState {
-    /// The plan an ARN-addressed call names, or `None` when this store holds no plan
-    /// under that ARN. Resolved through [`arn_index`](Self::arn_index), so no caller
-    /// scans `plans`.
-    pub fn plan_by_arn(&self, resource_arn: &str) -> Option<&RescoreExecutionPlan> {
-        let id = self.arn_index.get(resource_arn)?;
-        self.plans.get(id)
+    /// The plans of one region, or `None` when this store holds none there — which is
+    /// what a listing in a region nothing was ever created in reports as an empty page.
+    ///
+    /// A READER: it never creates the region's bucket, so no read changes what a later
+    /// caller sees.
+    pub fn plans_in(&self, region: &str) -> Option<&RegionalPlans> {
+        self.regions.get(region)
+    }
+
+    /// The plan that id names in `region`, whatever its status.
+    pub fn plan(&self, region: &str, id: &str) -> Option<&RescoreExecutionPlan> {
+        self.plans_in(region)?.plans.get(id)
+    }
+
+    /// [`plan`](Self::plan), for a call that writes the plan it resolves.
+    pub fn plan_mut(&mut self, region: &str, id: &str) -> Option<&mut RescoreExecutionPlan> {
+        self.regions.get_mut(region)?.plans.get_mut(id)
+    }
+
+    /// The plan an ARN-addressed call names in `region`, or `None` when that region
+    /// holds no plan under that ARN. Resolved through the region's `arn_index`, so no
+    /// caller scans `plans`; an ARN naming another region resolves to nothing here,
+    /// because the plan it names does not live in this region.
+    pub fn plan_by_arn(&self, region: &str, resource_arn: &str) -> Option<&RescoreExecutionPlan> {
+        let regional = self.plans_in(region)?;
+        let id = regional.arn_index.get(resource_arn)?;
+        regional.plans.get(id)
     }
 
     /// [`plan_by_arn`](Self::plan_by_arn), for a call that writes the plan it resolves.
-    pub fn plan_by_arn_mut(&mut self, resource_arn: &str) -> Option<&mut RescoreExecutionPlan> {
-        let id = self.arn_index.get(resource_arn)?.clone();
-        self.plans.get_mut(&id)
+    pub fn plan_by_arn_mut(
+        &mut self,
+        region: &str,
+        resource_arn: &str,
+    ) -> Option<&mut RescoreExecutionPlan> {
+        let regional = self.regions.get_mut(region)?;
+        let id = regional.arn_index.get(resource_arn)?.clone();
+        regional.plans.get_mut(&id)
+    }
+
+    /// The plan a repeated `ClientToken` already created in `region`, if any: a token is
+    /// scoped to the region it was used in, so the same token in another region mints
+    /// that region's own plan.
+    pub fn plan_for_client_token(
+        &self,
+        region: &str,
+        client_token: &str,
+    ) -> Option<&RescoreExecutionPlan> {
+        let regional = self.plans_in(region)?;
+        let id = regional.client_tokens.get(client_token)?;
+        regional.plans.get(id)
+    }
+
+    /// Store a freshly minted plan in the region it was created in, under the
+    /// `client_token` that minted it when the request carried one.
+    pub fn insert_plan(
+        &mut self,
+        region: &str,
+        plan: RescoreExecutionPlan,
+        client_token: Option<String>,
+    ) {
+        let regional = self.regions.entry(region.to_string()).or_default();
+        regional.arn_index.insert(plan.arn.clone(), plan.id.clone());
+        if let Some(token) = client_token {
+            regional.client_tokens.insert(token, plan.id.clone());
+        }
+        regional.plans.insert(plan.id.clone(), plan);
+    }
+
+    /// Drop the plan that id names in `region`, answering it when there was one.
+    ///
+    /// Its ARN index entry and the idempotency tokens that created it go with it — or a
+    /// repeated create would answer with the id of a plan that no longer exists — and a
+    /// region left holding no plans keeps no bucket.
+    pub fn remove_plan(&mut self, region: &str, id: &str) -> Option<RescoreExecutionPlan> {
+        let regional = self.regions.get_mut(region)?;
+        let removed = regional.plans.remove(id)?;
+        regional.arn_index.remove(&removed.arn);
+        regional.client_tokens.retain(|_, plan_id| plan_id != id);
+        if regional.plans.is_empty() {
+            self.regions.remove(region);
+        }
+        Some(removed)
+    }
+
+    /// How many plans this store holds across every region — what
+    /// [`MAX_RESCORE_EXECUTION_PLANS`] is measured against, so the whole store stays
+    /// bounded however many regions a caller signs for.
+    pub fn plan_count(&self) -> usize {
+        self.regions
+            .values()
+            .map(|regional| regional.plans.len())
+            .sum()
     }
 
     /// The next identifier this service hands out, in the 36-character `8-4-4-4-12`

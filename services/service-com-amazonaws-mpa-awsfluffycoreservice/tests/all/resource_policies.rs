@@ -418,20 +418,15 @@ async fn a_triple_that_names_no_attachment_is_not_found() {
     let harness = Harness::new();
     let team_arn = team_with_every_policy(&harness, "policy-reader").await;
     // A second team attaching only the seeded policy, so a row can ask it for a policy
-    // that exists in the catalog but is attached to the other team. Its second
-    // reference names a policy the catalog does NOT hold, which is reportable by
-    // nothing.
-    let uncatalogued = "arn:aws:mpa:::aws:policy/IdentityCenter/NotInTheCatalog/$DEFAULT";
+    // that exists in the catalog but is attached to the other team, and for one the
+    // catalog does not hold at all — which is reportable by nothing.
     let (status, created) = harness
         .create(&create_body(
             "other-team",
-            &[
-                format!(
-                    "{}/$DEFAULT",
-                    state::policy_arn(SEEDED_POLICY.0, SEEDED_POLICY.1)
-                ),
-                uncatalogued.to_string(),
-            ],
+            &[format!(
+                "{}/$DEFAULT",
+                state::policy_arn(SEEDED_POLICY.0, SEEDED_POLICY.1)
+            )],
         ))
         .await;
     assert_eq!(status, 200, "create returned {created:?}");
@@ -476,7 +471,7 @@ async fn a_triple_that_names_no_attachment_is_not_found() {
             "AWS_MANAGED",
         ),
         (
-            "an attachment the catalog does not hold",
+            "a policy name the catalog does not hold",
             other_arn.clone(),
             "NotInTheCatalog".to_string(),
             "AWS_MANAGED",

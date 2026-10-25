@@ -11,12 +11,12 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    AdditionalAuthenticationProvider, Api, ApiCache, ApiKey, AuthMode, DataSource,
+    AdditionalAuthenticationProvider, Api, ApiCache, ApiKey, AppSyncRuntime, AuthMode, DataSource,
     DynamodbDataSourceConfig, ElasticsearchDataSourceConfig, EnhancedMetricsConfig, EventConfig,
-    EventBridgeDataSourceConfig, GraphqlApi, HttpDataSourceConfig, LambdaAuthorizerConfig,
-    LambdaDataSourceConfig, LogConfig, OpenIDConnectConfig, OpenSearchServiceDataSourceConfig,
-    RelationalDatabaseDataSourceConfig, SourceApiAssociation, SourceApiAssociationConfig,
-    UserPoolConfig,
+    EventBridgeDataSourceConfig, FunctionConfiguration, GraphqlApi, HttpDataSourceConfig,
+    LambdaAuthorizerConfig, LambdaDataSourceConfig, LogConfig, OpenIDConnectConfig,
+    OpenSearchServiceDataSourceConfig, RelationalDatabaseDataSourceConfig, SourceApiAssociation,
+    SourceApiAssociationConfig, SyncConfig, UserPoolConfig,
 };
 
 /// One stored `GraphqlApi`, plus the API keys created under it.
@@ -70,6 +70,13 @@ pub struct GraphqlApiRecord {
     /// Bounded: `CreateDataSource` refuses a create once the API holds the AppSync
     /// per-API quota of data sources, so this map cannot grow without limit.
     pub data_sources: BTreeMap<String, DataSourceRecord>,
+    /// The functions created under this API, keyed by the opaque `functionId` the
+    /// create minted for each — a function name "does not have to be unique"
+    /// (`CreateFunctionRequest$name`), so the id is what identifies one within its
+    /// API and the name cannot be the key.
+    /// Bounded: `CreateFunction` refuses a create once the API holds the AppSync
+    /// per-API quota of functions, so this map cannot grow without limit.
+    pub functions: BTreeMap<String, FunctionRecord>,
 }
 
 impl GraphqlApiRecord {
@@ -338,6 +345,103 @@ pub fn missing_data_source_config_message(member: &str) -> String {
         other => other,
     };
     format!("Missing {subject} data source config")
+}
+
+/// One stored function of a `GraphqlApiRecord`: "A function is a reusable entity. You
+/// can use multiple functions to compose the resolver logic."
+///
+/// Every member of the modelled `FunctionConfiguration` shape a create call can set is
+/// kept, so a reader projects exactly what was written rather than a subset.
+#[derive(Debug, Clone)]
+pub struct FunctionRecord {
+    /// Creation order, used to keep a listing (and its `nextToken` cursor) stable
+    /// across calls: the minted `functionId` is opaque, so it cannot carry order.
+    pub seq: u64,
+    pub function_id: String,
+    pub arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub data_source_name: String,
+    pub request_mapping_template: Option<String>,
+    pub response_mapping_template: Option<String>,
+    pub function_version: Option<String>,
+    pub sync_config: Option<SyncConfig>,
+    pub max_batch_size: i32,
+    pub runtime: Option<AppSyncRuntime>,
+    pub code: Option<String>,
+}
+
+impl FunctionRecord {
+    /// This record as the modelled `FunctionConfiguration` shape.
+    ///
+    /// The single projection every operation that reports a function answers with, so
+    /// the create and the reads cannot disagree about one function.
+    pub fn to_function_configuration(&self) -> FunctionConfiguration {
+        FunctionConfiguration {
+            function_id: Some(self.function_id.clone()),
+            function_arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            description: self.description.clone(),
+            data_source_name: Some(self.data_source_name.clone()),
+            request_mapping_template: self.request_mapping_template.clone(),
+            response_mapping_template: self.response_mapping_template.clone(),
+            function_version: self.function_version.clone(),
+            sync_config: self.sync_config.clone(),
+            max_batch_size: self.max_batch_size,
+            runtime: self.runtime.clone(),
+            code: self.code.clone(),
+        }
+    }
+}
+
+/// The resource portion of a function's ARN: a function is a child of its API, so it
+/// is named under the API's own `apis/{apiId}` path, as `GetFunction`'s URI
+/// (`/v1/apis/{apiId}/functions/{functionId}`) addresses it.
+pub fn function_resource(api_id: &str, function_id: &str) -> String {
+    format!("apis/{api_id}/functions/{function_id}")
+}
+
+/// The text a `NotFoundException` (HTTP 404) carries for a function the named API does
+/// not hold: the absent function's id, which is what the caller has to act on.
+///
+/// The requirement the refusal answers is the status and the error shape; the wording
+/// is a fixed template over the requested id, as the data-source not-found text
+/// ([`data_source_not_found_message`]) is over the requested name, rather than
+/// anything of the request's own values.
+pub fn function_not_found_message(function_id: &str) -> String {
+    format!("Function {function_id} not found")
+}
+
+/// The refusal text for a function definition AppSync could not run, or `None` when
+/// the request describes one it could.
+///
+/// Three documented requirements, each over the members that carry the definition
+/// rather than over one request's values:
+///
+/// * `code` "When code is used, the runtime is required";
+/// * `runtime` "if a runtime is specified, code must also be specified";
+/// * `functionVersion` "when using VTL and mapping templates, the functionVersion is
+///   required" — a function that carries no `code` is defined in VTL, so it is the
+///   one that needs the template version.
+///
+/// Shared by every operation that takes this member set (`CreateFunction` and
+/// `UpdateFunction`), so the two cannot disagree about which definitions are runnable.
+pub fn function_definition_refusal(
+    code: Option<&str>,
+    runtime: Option<&AppSyncRuntime>,
+    function_version: Option<&str>,
+) -> Option<String> {
+    match (code, runtime) {
+        (Some(_), None) => Some("Invalid runtime given. A runtime is required when code is specified.".to_string()),
+        (None, Some(_)) => Some("Invalid code given. Code is required when a runtime is specified.".to_string()),
+        (Some(_), Some(_)) => None,
+        (None, None) if function_version.is_none_or(str::is_empty) => Some(
+            "Invalid functionVersion given. A functionVersion is required when using mapping \
+             templates."
+                .to_string(),
+        ),
+        (None, None) => None,
+    }
 }
 
 /// One stored `Api`: an AppSync API created with an Event API configuration
@@ -655,6 +759,27 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
         let mut id = base32_13(self.id_seed);
         id.push_str(&base32_13(low));
         id
+    }
+
+    /// Mint a fresh opaque id that can also be addressed as a `ResourceName`: a
+    /// [`mint_id`] id whose first character is a letter.
+    ///
+    /// Every operation that addresses a function (`GetFunction`, `UpdateFunction`,
+    /// `DeleteFunction`) takes the `functionId` as a `ResourceName`, whose pattern
+    /// `^[_A-Za-z][_0-9A-Za-z]*$` rules out an id starting with a digit, so an id of
+    /// that shape would name a function no caller could read back.
+    ///
+    /// [`mint_id`]: Self::mint_id
+    pub fn mint_resource_id(&mut self) -> String {
+        // Each turn draws a FRESH id (the counter advances through a bijection), and
+        // 26 of the 32 first characters qualify, so the loop ends after a couple of
+        // turns rather than retrying one rejected value for ever.
+        loop {
+            let id = self.mint_id();
+            if id.starts_with(|first: char| first.is_ascii_alphabetic()) {
+                return id;
+            }
+        }
     }
 
     /// The next creation-order number.

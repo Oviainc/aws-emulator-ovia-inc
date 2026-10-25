@@ -47,6 +47,8 @@ mod branch_listing_writes;
 mod client_error_messages;
 #[path = "all/comment_content_deletion.rs"]
 mod comment_content_deletion;
+#[path = "all/comment_deleted_refusal_templates.rs"]
+mod comment_deleted_refusal_templates;
 #[path = "all/comment_deleted_refusals.rs"]
 mod comment_deleted_refusals;
 #[path = "all/comment_lifecycle.rs"]

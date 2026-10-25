@@ -31,7 +31,8 @@
 //! WHAT THIS EMULATES, AND WHAT IT DOES NOT: the job RECORD — its name, its
 //! settings, its status, its timestamps and the location its output would be
 //! written to. No audio is transcribed and no object is ever written at the
-//! reported `Transcript.TranscriptFileUri` / `SubtitlesOutput.SubtitleFileUris`,
+//! reported `Transcript.TranscriptFileUri` / `Transcript.RedactedTranscriptFileUri`
+//! / `SubtitlesOutput.SubtitleFileUris`,
 //! so a completed job means "the control plane finished with this record", never
 //! "a transcript is fetchable from that URI". Nothing invents transcript content: no
 //! word, sentiment or summary of a call appears anywhere, because no engine produced
@@ -2064,8 +2065,8 @@ impl TranscriptionJobRecord {
     /// operation (`Get`, `List`) runs this before projecting the record, and that
     /// is the only write it performs.
     ///
-    /// Completing a job records WHERE its output would be written (see the module
-    /// header); it does not write anything there.
+    /// Completing a job records WHERE each output it asked for would be written (see
+    /// the module header); it does not write anything there.
     pub fn advance_clock(&mut self, now: SystemTime) {
         if self.status == STATUS_QUEUED {
             match self.queued_until {
@@ -2079,9 +2080,19 @@ impl TranscriptionJobRecord {
         if self.status == STATUS_IN_PROGRESS && now >= self.completion_due {
             self.status = STATUS_COMPLETED.to_string();
             self.completion_time = Some(self.completion_due);
+            let transcript_uri = self.output_uri("json");
+            // Which transcripts the request asked the service to produce decides
+            // which of the two locations the job reports ([`transcript_outputs`]).
+            // `Media$RedactedMediaFileUri` cannot ask this family for a redacted
+            // output: it "is only supported for Call Analytics
+            // (StartCallAnalyticsJob) transcription requests" (model doc for
+            // `Media$RedactedMediaFileUri`), so `ContentRedaction` decides alone.
+            let outputs = transcript_outputs(self.content_redaction.as_ref(), false);
             self.transcript = Some(Transcript {
-                transcript_file_uri: Some(self.output_uri("json")),
-                redacted_transcript_file_uri: None,
+                transcript_file_uri: outputs.unredacted.then(|| transcript_uri.clone()),
+                redacted_transcript_file_uri: outputs
+                    .redacted
+                    .then(|| redacted_transcript_uri(&transcript_uri)),
             });
             // The subtitle files a completed job produced sit beside the
             // transcript, one per requested format.

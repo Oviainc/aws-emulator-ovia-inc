@@ -19,6 +19,8 @@ mod amend_terminal_refusal;
 mod application_status_gates;
 #[path = "all/application_workflow_stage.rs"]
 mod application_workflow_stage;
+#[path = "all/associate_benefit_application_resource.rs"]
+mod associate_benefit_application_resource;
 #[path = "all/benefit_allocations.rs"]
 mod benefit_allocations;
 #[path = "all/benefit_application_lifecycle.rs"]

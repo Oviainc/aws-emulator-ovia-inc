@@ -941,8 +941,8 @@ async fn invalid_resource_arn_message_is_a_constant() {
 // ---------------------------------------------------------------------------
 
 /// The message's sentences are separated by TWO spaces, which is part of the
-/// recorded constant: the read/update path carries the two sentences, and the
-/// repeated delete leads them with a third.
+/// recorded constant: the read paths carry the two sentences, and the calls that
+/// ask to edit or delete the dead comment lead them with a third.
 ///
 /// `comment_deleted_refusals.rs` spans the comments, operations and principals this
 /// refusal generalises over; what is asserted here is the whitespace itself, which a
@@ -980,7 +980,7 @@ async fn comment_deleted_message_separates_its_sentences_with_two_spaces() {
         (
             "UpdateComment",
             json!({"commentId": comment_id, "content": "an edit"}),
-            vec![already_deleted, verify],
+            vec!["You cannot delete this comment.", already_deleted, verify],
         ),
         (
             "PutCommentReaction",

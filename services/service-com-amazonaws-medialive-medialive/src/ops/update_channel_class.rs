@@ -1,15 +1,44 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateChannelClass
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateChannelClass`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateChannelClass::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores the class a request names on one channel and answers that channel read
+//! back out of state.
+//!
+//! A channel's class is what fixes how many encoding pipelines it has (the
+//! `ChannelClass` doc: "A standard channel has two encoding pipelines and a
+//! single pipeline channel only has one"), so storing the new class re-provisions
+//! the channel: every later read of the channel — the pipelines it runs, how many
+//! of them are healthy, which pipeline a request may name — derives from the
+//! stored class through `ChannelRecord::pipelines`, and this operation writes
+//! nothing else about them.
+//!
+//! `Destinations` is "A list of output destinations for this channel", and it
+//! travels with the class because the two classes need different destinations
+//! (`OutputDestination$Settings`: "one destination for each redundant encoder").
+//! It is optional, so a request that names it REPLACES the channel's stored
+//! destinations and one that omits it leaves them alone — the same member rule
+//! `UpdateChannel` applies — under the same ceiling `CreateChannel` and
+//! `UpdateChannel` enforce where a caller's destinations are stored
+//! (`state::MAX_CHANNEL_DESTINATIONS`), refused with this operation's modelled
+//! `BadRequestException` (400) before anything is written.
+//!
+//! Re-provisioning a channel's pipelines changes the channel's configuration, so
+//! it is accepted only once the channel has STOPPED (`ChannelRecord::has_stopped`,
+//! the notion `UpdateChannel` and `DeleteChannel` share) and is otherwise refused
+//! with the modelled `ConflictException` (409). An accepted change puts the
+//! channel into the modelled `UPDATING` state and owes the `IDLE` it started
+//! from, so a caller polling straight afterwards sees that transient state.
+//!
+//! The id is resolved through the LIVE channel lookup
+//! (`state::live_channel_mut`), so a channel whose delete this service has
+//! accepted — readable in `DELETING` and then in the terminal `DELETED` — names
+//! nothing a caller may still change; this operation models `NotFoundException`
+//! (404), which is what both a dead id and one no channel ever had are answered
+//! with, the message telling the two apart.
+//!
+//! The response is projected from the record this call just wrote by
+//! `channel_description`, never from the request in flight.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +188,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateChannelClass` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateChannelClassErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // The destinations this request would STORE carry the ceiling every
+        // handler that stores a channel's destinations applies, because the
+        // per-request work every later read spends walking them is bounded by
+        // that ceiling and not by one caller's request body. Checked before
+        // anything is written, so a refused request leaves the channel exactly
+        // as it was.
+        let destination_count = input.destinations.as_ref().map_or(0, Vec::len);
+        if destination_count > crate::state::MAX_CHANNEL_DESTINATIONS {
+            return Err(bad_request(&crate::state::too_many_channel_entries_message(
+                "destinations",
+                destination_count,
+                crate::state::MAX_CHANNEL_DESTINATIONS,
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // The channel transitions the clock had already made due decide whether
+        // this channel has stopped, so materialise them first: each was owed at
+        // that instant whether or not this request ran.
+        state.settle(now);
+
+        // Absent and already deleted are ONE refusal class: a delete this
+        // service has accepted leaves the record readable in `DELETING` and then
+        // in the terminal `DELETED`, but the id names nothing a caller may still
+        // change. This operation models `NotFoundException`, so that is the
+        // answer to both; the message tells them apart, the status and the code
+        // do not.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateChannelClass"))
+        // Whether the store holds a record under this id at all is read BEFORE
+        // the live lookup borrows it, so the id is resolved exactly once.
+        let recorded = state.channels.contains_key(&input.channel_id);
+        let Some(channel) = state.live_channel_mut(&input.channel_id) else {
+            let message = if recorded {
+                crate::state::already_deleted_message(&format!("Channel {}", input.channel_id))
+            } else {
+                crate::state::not_found_message("Channel", &input.channel_id)
+            };
+            return Err(not_found(&message));
+        };
+
+        // A channel that has not stopped is encoding through exactly the
+        // pipelines this call would re-provision, so the change waits until it
+        // has stopped — the same notion `UpdateChannel` applies to the
+        // configuration it replaces.
+        if !channel.has_stopped() {
+            return Err(UpdateChannelClassErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Channel {} is in state {} and must have stopped before its class can be updated",
+                    channel.id, channel.state
+                )),
+            })
+            .into());
+        }
+
+        // The class is what this operation exists to write; the destinations are
+        // replaced only when the request names them.
+        channel.channel_class = input.channel_class;
+        if let Some(destinations) = input.destinations {
+            channel.destinations = destinations;
+        }
+
+        // The new class has been applied, which is what `UPDATING` reports; the
+        // channel is still stopped, so the clock owes it the `IDLE` the change
+        // started from.
+        crate::state::begin_update(channel, now);
+
+        // Read back out of the store, so the response reports the channel that
+        // was written rather than one this handler assembled from the request.
+        let channel = state
+            .channel_description(&input.channel_id)
+            .ok_or_else(unavailable)?;
+        Ok(UpdateChannelClassOutput {
+            channel: Some(channel),
+        })
     }
+}
+
+/// A channel this operation cannot resolve to one a caller may still change, as
+/// its modelled `NotFoundException` (404) — the answer both to an id no channel
+/// ever had and to one whose delete this service has already accepted.
+fn not_found(message: &str) -> UpdateChannelClassError {
+    UpdateChannelClassErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// A request this operation cannot serve, as its modelled `BadRequestException`
+/// (400) — the refusal for a request carrying more destinations than this
+/// emulator stores on one channel.
+fn bad_request(message: &str) -> UpdateChannelClassError {
+    UpdateChannelClassErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no channel store to update. A modelled server error, never a fresh
+/// engine (which would drop the write when this request returns).
+fn unavailable() -> UpdateChannelClassError {
+    UpdateChannelClassErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

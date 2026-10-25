@@ -41,7 +41,7 @@ use crate::harness::{params, Emulator, Reply, PAST_TRANSITION};
 /// `ParameterNameValueList`'s member carries the `xmlName` `ParameterNameValue`
 /// (`smithy_query(query="shape", shape="ParameterNameValueList")`), which is
 /// what an `awsQuery` client indexes the pairs under.
-async fn modify(emulator: &Emulator, group: &str, pairs: &[(&str, &str)]) -> Reply {
+pub(crate) async fn modify(emulator: &Emulator, group: &str, pairs: &[(&str, &str)]) -> Reply {
     let mut form = params(&[("CacheParameterGroupName", group)]);
     for (index, (name, value)) in pairs.iter().enumerate() {
         let member = index + 1;
@@ -59,7 +59,7 @@ async fn modify(emulator: &Emulator, group: &str, pairs: &[(&str, &str)]) -> Rep
 
 /// [`modify`], asserting the change was accepted and answered with the name the
 /// group is STORED under (`CacheParameterGroupNameMessage` carries that alone).
-async fn modify_ok(emulator: &Emulator, case: &str, group: &str, pairs: &[(&str, &str)]) {
+pub(crate) async fn modify_ok(emulator: &Emulator, case: &str, group: &str, pairs: &[(&str, &str)]) {
     let reply = modify(emulator, group, pairs).await;
     assert_eq!(
         reply.status, 200,
@@ -76,7 +76,13 @@ async fn modify_ok(emulator: &Emulator, case: &str, group: &str, pairs: &[(&str,
 }
 
 /// Assert `reply` is the refusal `status` / `code`, and hand back its message.
-fn refused<'a>(case: &str, reply: &'a Reply, status: u16, code: &str) -> &'a str {
+///
+/// `pub(crate)` for the reason the scanners in
+/// [`crate::describe_cache_parameters`] are: the suite covering
+/// `ResetCacheParameterGroup` drives the same group through the same writer and
+/// reads a refusal and a parameter's effective value exactly the same way, and a
+/// second copy of these drivers would be a second thing to keep correct.
+pub(crate) fn refused<'a>(case: &str, reply: &'a Reply, status: u16, code: &str) -> &'a str {
     assert_eq!(
         reply.status, status,
         "case {case}: expected {status}, got {} {}",
@@ -93,7 +99,7 @@ fn refused<'a>(case: &str, reply: &'a Reply, status: u16, code: &str) -> &'a str
 
 /// What `DescribeCacheParameters` reports for `parameter` of `group`: the value
 /// in effect and the source it is reported under.
-async fn effective(
+pub(crate) async fn effective(
     emulator: &Emulator,
     case: &str,
     group: &str,
@@ -144,7 +150,7 @@ fn first_allowed(allowed: &str) -> Option<String> {
 /// published row takes ([`first_allowed`]) — the request bodies the pair-count
 /// window is exercised with, taken from the catalog this service publishes
 /// rather than written out by hand.
-fn settable(family: &str, count: usize) -> Vec<(String, String)> {
+pub(crate) fn settable(family: &str, count: usize) -> Vec<(String, String)> {
     let parameters = state::family_default_parameters(family)
         .unwrap_or_else(|| panic!("case {family}: a published family has a catalog"));
     let chosen: Vec<(String, String)> = parameters
@@ -166,7 +172,7 @@ fn settable(family: &str, count: usize) -> Vec<(String, String)> {
 }
 
 /// `pairs` as the borrowed rows [`modify`] takes.
-fn borrowed(pairs: &[(String, String)]) -> Vec<(&str, &str)> {
+pub(crate) fn borrowed(pairs: &[(String, String)]) -> Vec<(&str, &str)> {
     pairs
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
