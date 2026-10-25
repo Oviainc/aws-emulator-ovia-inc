@@ -172,6 +172,9 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::AppConfig::Deployment",
     "AWS::AppConfig::DeploymentStrategy",
     "AWS::AppConfig::Environment",
+    "AWS::AppConfig::ExperimentDefinition",
+    "AWS::AppConfig::Extension",
+    "AWS::AppConfig::ExtensionAssociation",
     "AWS::AppConfig::HostedConfigurationVersion",
     // AWS App Mesh
     "AWS::AppMesh::GatewayRoute",

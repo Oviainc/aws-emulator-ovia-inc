@@ -473,7 +473,10 @@ async fn an_unknown_catalog_is_404_and_a_malformed_one_is_400() {
 ///
 /// The rows differ along what the rule generalises over: which optional members are
 /// present, how many fulfillment types, and the SHAPE of the `BenefitApplicationDetails`
-/// document (object, nested object, array, scalar, absent).
+/// document (object, nested object, absent). A document the requested benefit's
+/// `BenefitRequestSchema` does not accept — one of another JSON type, or a declared field
+/// of another type — is refused rather than stored, which
+/// `tests/all/benefit_catalog_record.rs` pins over every seeded benefit.
 #[tokio::test]
 async fn create_then_get_round_trips_every_supplied_member() {
     let harness = Harness::new();
@@ -506,14 +509,6 @@ async fn create_then_get_round_trips_every_supplied_member() {
                     "Campaign": { "Name": "spring", "Regions": ["us-west-2", "eu-west-1"] },
                 },
             }),
-        ),
-        (
-            "an array details document",
-            json!({ "Name": "array-details", "BenefitApplicationDetails": [1, 2, 3] }),
-        ),
-        (
-            "a scalar details document",
-            json!({ "Name": "scalar-details", "BenefitApplicationDetails": "free form" }),
         ),
         (
             "contacts, resources, files and tags",

@@ -143,14 +143,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let mut state = store.lock();
         // Reporting, but it materialises what the clock already owed: the PENDING ->
         // RUNNING (or CANCEL_PENDING -> CANCELLED) step was due at that instant whether
         // or not anybody described the run.
         state.settle();
 
-        let Some(record) = state.job_run(&input.virtual_cluster_id, &input.id) else {
+        // Resolved in the region this request is signed for: a run started at another
+        // region's endpoint does not exist here.
+        let Some(record) = state.job_run(&region, &input.virtual_cluster_id, &input.id) else {
             return Err(DescribeJobRunErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!(

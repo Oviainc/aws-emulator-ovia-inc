@@ -6,14 +6,17 @@
 //! account already ordered with remote management enabled: the API models NO
 //! device-creation operation, so a device enters the inventory only through
 //! [`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::activate_devices`],
-//! never through a request. An account/region that has activated no device
-//! therefore holds an EMPTY inventory, and that is answered from state like any
-//! other: a list operation reports an empty page and an id-addressed one reports
-//! [`not_found`], because an empty inventory says nothing about what the caller is
-//! permitted to do. Everything else in here is minted by a caller: `CreateTask`
-//! persists a [`Task`] plus one [`Execution`] per target, `CancelTask` moves them
-//! to `CANCELED`, and the reporting operations compute their answers from these
-//! records.
+//! never through a request. Having at least one such device in the signed Region is
+//! the PRECONDITION the whole device/task surface is served behind: a Region this
+//! account has activated none in has no device for a call to act on or be authorized
+//! against, so every operation the model declares `AccessDeniedException` on refuses
+//! there — [`no_devices_in_region`], checked through
+//! [`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::has_devices_in`]
+//! before an id is resolved and before a field is validated. The tagging operations,
+//! which the model declares no `AccessDeniedException` on, are served regardless.
+//! Everything else in here is minted by a caller: `CreateTask` persists a [`Task`]
+//! plus one [`Execution`] per target, `CancelTask` moves them to `CANCELED`, and the
+//! reporting operations compute their answers from these records.
 //!
 //! The inventory and the tasks are REGIONAL, the way the service is: Snow Device
 //! Management reports "all devices on your Amazon Web Services account that have
@@ -25,10 +28,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Capacity, CpuOptions, DeviceSummary, EbsInstanceBlockDevice, ExecutionSummary, Instance,
-    InstanceBlockDeviceMapping, InstanceState, InstanceSummary, PhysicalNetworkInterface,
-    ResourceNotFoundException, ResourceSummary, SecurityGroupIdentifier, SoftwareInformation,
-    TaskSummary,
+    AccessDeniedException, Capacity, CpuOptions, DeviceSummary, EbsInstanceBlockDevice,
+    ExecutionSummary, Instance, InstanceBlockDeviceMapping, InstanceState, InstanceSummary,
+    PhysicalNetworkInterface, ResourceNotFoundException, ResourceSummary, SecurityGroupIdentifier,
+    SoftwareInformation, TaskSummary,
 };
 
 /// The region an ARN is built for when the request carries no SigV4 credential
@@ -451,6 +454,21 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
             .map(|(_, execution)| execution)
     }
 
+    /// Whether this account has Snow Device Management activated on at least one
+    /// device in `region`.
+    ///
+    /// This is the account/region precondition the device and task surface is served
+    /// behind: Snow Device Management acts on devices, and a Region holding none has
+    /// nothing for a call to act on or be authorized against, so every operation the
+    /// model declares `AccessDeniedException` on refuses with
+    /// [`no_devices_in_region`] there — ahead of resolving any id and ahead of
+    /// validating any field, so a caller learns nothing about what a Region it has no
+    /// device in holds. The tagging operations, which the model declares no
+    /// `AccessDeniedException` on, do not consult this.
+    pub fn has_devices_in(&self, region: &str) -> bool {
+        self.devices.values().any(|device| device.region == region)
+    }
+
     /// The device `managed_device_id` names in `region`, or `None` when this
     /// account manages no such device there.
     pub fn device_in(&self, region: &str, managed_device_id: &str) -> Option<&Device> {
@@ -484,8 +502,8 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
     /// device-creation operation, because a device becomes manageable by being
     /// ORDERED — a Snow Family job created with remote management enabled — which
     /// is another service's API. Until something activates a device here, this
-    /// account's inventory in `region` is empty, so a list operation answers an
-    /// empty page and an id-addressed one answers [`not_found`].
+    /// account's inventory in `region` is empty, and the device/task surface is
+    /// refused there ([`Self::has_devices_in`]).
     ///
     /// Ids, ARNs and job ids are the store's own: an id is minted from the
     /// monotonic device counter (so it is unique across Regions), and two
@@ -935,6 +953,28 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 pub fn not_found(resource_type: &str, id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: format!("{resource_type} {id} not found"),
+    }
+}
+
+/// How this service words the account/region device precondition it refuses a
+/// device or task call with.
+///
+/// ONE sentence for the whole class: it states that the signed Region holds no
+/// Snow-Device-Management-activated device, echoes nothing a caller sent, and names
+/// no principal and no permission — the refusal is about device availability in the
+/// Region, not about the caller's authorization, which is why it is kept apart from
+/// [`access_denied_message`].
+pub const NO_DEVICES_IN_REGION_MESSAGE: &str = "No devices found in this region.";
+
+/// The `AccessDeniedException` payload every gated operation refuses a Region this
+/// account has activated no device in with.
+///
+/// Built once here so all ten of them answer the identical code and message,
+/// whatever the request named: the refusal is decided before an id is resolved and
+/// before a field is validated, so nothing about the request can reach it.
+pub fn no_devices_in_region() -> AccessDeniedException {
+    AccessDeniedException {
+        message: NO_DEVICES_IN_REGION_MESSAGE.to_string(),
     }
 }
 

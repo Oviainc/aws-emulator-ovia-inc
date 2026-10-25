@@ -174,11 +174,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
-        // The addressed id decides the answer: one that names no device this
-        // account manages in the signed Region is the modelled
-        // `ResourceNotFoundException`. An account that manages no device at all is
-        // not a permission problem — `AccessDeniedException` is what a caller the
-        // action is not permitted for is answered with.
+        // The account/region device precondition, FIRST: a Region this account has
+        // activated no device in is refused before the addressed id is resolved, so
+        // a caller there never learns whether a particular device exists.
+        if !store.has_devices_in(&region) {
+            return Err(DescribeDeviceErrorModeled::AccessDeniedException(
+                crate::state::no_devices_in_region(),
+            )
+            .into());
+        }
+
+        // The addressed id decides the answer once the Region is served at all: one
+        // that names no device this account manages here is the modelled
+        // `ResourceNotFoundException`.
         let Some(device) = store.device_in(&region, &input.managed_device_id) else {
             return Err(DescribeDeviceErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(

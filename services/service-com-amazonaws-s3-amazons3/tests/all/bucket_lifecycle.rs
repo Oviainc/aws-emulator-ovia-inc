@@ -92,7 +92,11 @@ impl Answer {
 
     /// The text of the first `<name>` element of the body, with the XML escaping the
     /// serializer applies undone, when it carries one.
-    fn element(&self, name: &str) -> Option<String> {
+    ///
+    /// `pub(crate)`: the copy suite ([`super::object_copy`]) reads the `CopyObjectResult`
+    /// container's members out of a SUCCESS body through this one reader rather than
+    /// slicing the body a second way.
+    pub(crate) fn element(&self, name: &str) -> Option<String> {
         let body = String::from_utf8_lossy(&self.body).to_string();
         body.split_once(&format!("<{name}>"))
             .and_then(|(_, rest)| rest.split_once(&format!("</{name}>")))

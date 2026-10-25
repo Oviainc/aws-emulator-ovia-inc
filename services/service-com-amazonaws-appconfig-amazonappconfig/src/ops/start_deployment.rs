@@ -298,6 +298,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // "The extensions that were previously associated to the configuration profile,
+        // environment, or the application when StartDeployment was called": read now, so
+        // the deployment records what was associated at the instant it was asked for and a
+        // later association does not change what this one applied.
+        let applied_extensions = store.applied_extensions_for(
+            &input.application_id,
+            &input.environment_id,
+            &input.configuration_profile_id,
+        );
+
         let Some(environment) = store
             .applications
             .get_mut(&input.application_id)
@@ -357,6 +367,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 description: input.description,
                 kms_key_identifier: input.kms_key_identifier,
                 version_label,
+                applied_extensions,
                 tags: input.tags.unwrap_or_default(),
             },
             &strategy,

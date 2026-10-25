@@ -1069,3 +1069,78 @@ async fn an_account_with_no_outpost_reports_an_empty_set_and_describing_writes_n
         "describing associations must not write to the store"
     );
 }
+
+/// `LocalGatewayRouteTableVpcAssociationIds` narrows the report to the ids named — in store
+/// order whatever order they were asked for, and with an id the account holds no association
+/// for contributing no row rather than widening the answer — and a describe that only asks
+/// about permission reports that outcome instead of describing anything.
+#[tokio::test]
+async fn the_id_list_narrows_the_report_and_a_dry_run_describes_nothing() {
+    let (router, engine) = super::ec2_query::emulator();
+    let rows = route_table_rows();
+    let route_tables: Vec<String> = rows
+        .iter()
+        .map(|row| seed_route_table(&engine, row))
+        .collect();
+    let (ids, _vpcs) = seeded_store(&router, &engine, &route_tables, &rows).await;
+
+    let ids_at = |indices: &[usize]| -> Vec<String> {
+        indices.iter().map(|index| ids[*index].clone()).collect()
+    };
+    let all: Vec<usize> = (0..ids.len()).collect();
+
+    // An id nothing in this account holds: the prefix every association id carries
+    // ([`LOCAL_GATEWAY_ROUTE_TABLE_VPC_ASSOCIATION_ID_PREFIX`]) and 17 hexadecimal digits the
+    // store's own mint, which counts from one, can never have produced.
+    let unheld = format!("{LOCAL_GATEWAY_ROUTE_TABLE_VPC_ASSOCIATION_ID_PREFIX}-0ffffffffffffffff");
+
+    // Rows differ in how many ids are named, in the order they are named, and in whether one
+    // of them names an association the account holds.
+    let cases: Vec<(Vec<String>, Vec<usize>)> = vec![
+        (ids_at(&[0]), vec![0]),
+        (ids_at(&[6]), vec![6]),
+        (ids_at(&[1, 4]), vec![1, 4]),
+        (ids_at(&[4, 1]), vec![1, 4]),
+        (ids_at(&[5, 2, 3]), vec![2, 3, 5]),
+        (ids_at(&all), all.clone()),
+        (vec![unheld.clone()], Vec::new()),
+        (vec![unheld.clone(), ids[2].clone()], vec![2]),
+    ];
+    for (asked, expected_indices) in cases {
+        let borrowed: Vec<&str> = asked.iter().map(String::as_str).collect();
+        let case = format!("LocalGatewayRouteTableVpcAssociationIds={borrowed:?}");
+        let reported = described_ids(
+            &router,
+            &case,
+            &indexed("LocalGatewayRouteTableVpcAssociationId", &borrowed),
+        )
+        .await;
+        let expected = ids_at(&expected_indices);
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected {expected:?}, got {reported:?}"
+        );
+    }
+
+    let (status, body) = describe(&router, &[param("DryRun", "true")]).await;
+    assert_eq!(
+        status, 412,
+        "DryRun=true: expected HTTP 412, got {status} with body {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "DryRunOperation",
+        "DryRun=true: expected DryRunOperation, got {body}"
+    );
+    assert!(
+        elements(&body, ID_ELEMENT).is_empty(),
+        "DryRun=true: a dry run reports no association, got {body}"
+    );
+
+    let reported = described_ids(&router, "DryRun=false", &[param("DryRun", "false")]).await;
+    assert_eq!(
+        reported,
+        ids_at(&all),
+        "DryRun=false: expected the ordinary report, got {reported:?}"
+    );
+}

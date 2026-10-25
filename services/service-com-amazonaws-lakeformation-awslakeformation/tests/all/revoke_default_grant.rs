@@ -15,11 +15,12 @@
 //! not hold), the principal, the permissions named, and whether the request is
 //! condition-scoped.
 
-use std::sync::Arc;
-
 use serde_json::{json, Value};
-use service_com_amazonaws_lakeformation_awslakeformation::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
+
+// The one copy of the harness every permission suite shares: the Glue+LakeFormation
+// emulator, the seeded catalog, the `restJson1` wire path and the error-code extractor.
+use crate::glue_catalog::{error_code, lake_formation as call};
 
 /// The group the default grant names, spelled as Lake Formation spells it on the wire.
 const IAM_ALLOWED_PRINCIPALS: &str = "IAM_ALLOWED_PRINCIPALS";
@@ -41,54 +42,10 @@ type DefaultGrantCase = (
     u16,
 );
 
-/// One emulator over one shared engine, reached exactly as the production router reaches
-/// it: `MultiServiceRouter::dispatch` of a buffered HTTP request.
-fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.register_service(EmulatedService::new(engine));
-    router
-}
-
-/// `POST /<operation>` with `body` as the JSON payload, answering `(status, body)`.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!(
-            "https://lakeformation.us-east-1.amazonaws.com/{operation}"
-        ))
-        .header("content-type", "application/json")
-        .header(
-            "authorization",
-            "AWS4-HMAC-SHA256 \
-             Credential=AKIDEXAMPLE/20260101/us-east-1/lakeformation/aws4_request, \
-             SignedHeaders=host, Signature=0000",
-        )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(body).expect("serialize the request body"),
-        ))
-        .expect("a valid request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let payload = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-    };
-    (status, payload)
-}
-
-/// The wire error code (`__type`) of an error envelope, or `""` for a success body.
-fn error_code(payload: &Value) -> String {
-    payload
-        .get("__type")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .rsplit(['#', ':'])
-        .next()
-        .unwrap_or_default()
-        .to_string()
+/// The Data Catalog this suite's rows revoke on: the `sales` and `finance` databases and
+/// `sales`'s `orders` table, seeded through the shared harness.
+async fn emulator_with_catalog() -> MultiServiceRouter {
+    crate::glue_catalog::emulator_with_catalog(&[("sales", &["orders"]), ("finance", &[])]).await
 }
 
 /// A `RevokePermissions` body.
@@ -129,7 +86,7 @@ async fn list_permissions(router: &MultiServiceRouter, resource: &Value) -> Vec<
 
 #[tokio::test]
 async fn the_default_database_grant_is_revocable_exactly_once() {
-    let router = emulator();
+    let router = emulator_with_catalog().await;
     let resource = json!({ "Database": { "Name": "sales" } });
     let body = revoke_body(IAM_ALLOWED_PRINCIPALS, &resource, &["ALL"], &[], None);
 
@@ -283,7 +240,7 @@ async fn the_default_grant_covers_only_a_database_and_only_all_to_iam_allowed_pr
 
     for (label, resource, principal, permissions, with_grant_option, condition, expected) in &cases
     {
-        let router = emulator();
+        let router = emulator_with_catalog().await;
         let body = revoke_body(
             principal,
             resource,
@@ -310,7 +267,7 @@ async fn the_default_grant_covers_only_a_database_and_only_all_to_iam_allowed_pr
 async fn the_default_grant_and_an_explicit_grant_are_revoked_independently() {
     // The default is held ON TOP of what `GrantPermissions` wrote for the same principal
     // and resource, so each is revocable on its own and neither revoke touches the other.
-    let router = emulator();
+    let router = emulator_with_catalog().await;
     let resource = json!({ "Database": { "Name": "sales" } });
     let grant = json!({
         "Principal": { "DataLakePrincipalIdentifier": IAM_ALLOWED_PRINCIPALS },
@@ -381,7 +338,7 @@ async fn the_default_grant_and_an_explicit_grant_are_revoked_independently() {
 async fn the_default_grant_is_per_database() {
     // Revoking one database's default says nothing about another's: the memory of the
     // revoke is keyed by the resource, so every other database still carries its own.
-    let router = emulator();
+    let router = emulator_with_catalog().await;
     let revoked = json!({ "Database": { "Name": "sales" } });
     let untouched: Vec<(&str, Value)> = vec![
         ("another database", json!({ "Database": { "Name": "finance" } })),

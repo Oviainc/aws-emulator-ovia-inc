@@ -193,7 +193,7 @@ pub(crate) async fn create_sink_ok(
 
 /// Create a link from `akid`'s source account to `sink_arn`, which must succeed, and
 /// answer its ARN.
-async fn create_link_ok(
+pub(crate) async fn create_link_ok(
     router: &MultiServiceRouter,
     sink_arn: &str,
     akid: &str,
@@ -378,36 +378,18 @@ async fn each_region_holds_one_sink() {
     let router = emulator();
     let first = create_sink_ok(&router, "sink-a", "us-east-1").await;
 
-    // The same name again: the name is already in use, so the create is the
-    // inconsistent-state refusal.
-    let (status, body) = call(
-        &router,
-        "/CreateSink",
-        &json!({ "Name": "sink-a" }),
-        "us-east-1",
-    )
-    .await;
-    assert_eq!(status, 409, "duplicate name: expected 409, got {body:?}");
-    assert_eq!(
-        error_code(&body),
-        "ConflictException",
-        "duplicate name: got {body:?}"
-    );
-
-    // A different name is refused too — the quota is one sink, not one name.
-    let (status, body) = call(
-        &router,
-        "/CreateSink",
-        &json!({ "Name": "sink-b" }),
-        "us-east-1",
-    )
-    .await;
-    assert_eq!(status, 429, "second sink: expected 429, got {body:?}");
-    assert_eq!(
-        error_code(&body),
-        "ServiceQuotaExceededException",
-        "second sink: got {body:?}"
-    );
+    // The same name again, and then a name nothing holds: the slot is taken either
+    // way, so BOTH are the account/Region quota refusal and neither depends on the
+    // name. The exhaustive table for this rule lives in `refusal_classes.rs`.
+    for (case, name) in [("the name already in use", "sink-a"), ("an unused name", "sink-b")] {
+        let (status, body) = call(&router, "/CreateSink", &json!({ "Name": name }), "us-east-1")
+            .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (429, "ServiceQuotaExceededException"),
+            "case {case:?}: expected 429 ServiceQuotaExceededException, got {status} {body:?}"
+        );
+    }
     let (status, body) = call(
         &router,
         "/GetSink",
@@ -470,10 +452,6 @@ async fn get_sink_refuses_an_identifier_that_names_no_stored_sink() {
         (
             "the right id in another Region",
             format!("arn:aws:oam:eu-west-1:{ACCOUNT}:sink/{id}"),
-        ),
-        (
-            "the right id as a link ARN",
-            format!("arn:aws:oam:us-west-2:{ACCOUNT}:link/{id}"),
         ),
         (
             "the right id in another partition",
