@@ -176,6 +176,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = crate::state::now_millis();
         let mut store = state.lock();
+        // The catalog the request names is resolved FIRST: an application lives inside a
+        // catalog, so a catalog that does not exist is the missing resource and is what
+        // the answer names — see [`crate::state::catalog_refusal`].
+        if let Some(missing) = store.catalog_refusal(&input.catalog) {
+            return Err(
+                RecallBenefitApplicationErrorModeled::ResourceNotFoundException(missing).into(),
+            );
+        }
+
         let Some(application) = store.application_mut(&input.catalog, &input.identifier) else {
             return Err(
                 RecallBenefitApplicationErrorModeled::ResourceNotFoundException(
