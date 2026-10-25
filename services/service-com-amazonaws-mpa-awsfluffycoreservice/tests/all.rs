@@ -43,6 +43,8 @@ mod policy_version_detail;
 mod policy_versions;
 #[path = "all/rejection_wording.rs"]
 mod rejection_wording;
+#[path = "all/reserved_tag_namespace.rs"]
+mod reserved_tag_namespace;
 #[path = "all/resource_arn_reads.rs"]
 mod resource_arn_reads;
 #[path = "all/resource_policies.rs"]

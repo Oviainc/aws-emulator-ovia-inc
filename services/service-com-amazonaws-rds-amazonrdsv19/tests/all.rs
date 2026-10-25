@@ -73,6 +73,8 @@ mod export_tasks;
 mod global_clusters;
 #[path = "all/modify_custom_db_engine_version.rs"]
 mod modify_custom_db_engine_version;
+#[path = "all/modify_event_subscription.rs"]
+mod modify_event_subscription;
 #[path = "all/not_found_paths.rs"]
 mod not_found_paths;
 #[path = "all/option_group_deletion.rs"]

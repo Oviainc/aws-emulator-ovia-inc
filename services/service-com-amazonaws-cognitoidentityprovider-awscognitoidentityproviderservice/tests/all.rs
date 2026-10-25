@@ -31,6 +31,8 @@ mod delete_group;
 mod delete_identity_provider;
 #[path = "all/delete_user_attributes.rs"]
 mod delete_user_attributes;
+#[path = "all/delete_user_pool_client.rs"]
+mod delete_user_pool_client;
 #[path = "all/delete_user_pool_domain.rs"]
 mod delete_user_pool_domain;
 #[path = "all/device_remembering.rs"]

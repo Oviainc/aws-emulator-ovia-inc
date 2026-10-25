@@ -4,11 +4,10 @@
 //! Returns a page of the assessments this catalog holds.
 //!
 //! An assessment is the RESULT of evaluating an entity or a change set against a
-//! framework. No operation of this service performs such an evaluation and this
-//! emulator runs none, so nothing creates an assessment record and this list is
-//! empty — see `crate::state::AssessmentRecord`. The page is still computed from the
-//! store, through the filters and the order the model documents, so it reports
-//! whatever the store holds rather than a constant.
+//! framework, which is what a succeeded `Intent=APPLY` change set submits a product's
+//! delivery options to — see `crate::state::AssessmentRecord`. The page is computed
+//! from the store, through the filters and the order the model documents, so it
+//! reports whatever the store holds rather than a constant.
 //!
 //! ## Shape of an operation
 //!
@@ -225,7 +224,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size =
             usize::try_from(input.max_results).expect("a page size in 1..=100 fits in usize");
 
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // An assessment exists once the change set that submitted the delivery
+        // option it assessed has succeeded, which is a change the clock owes
+        // rather than one a reader makes.
+        store.settle(now);
+
         let mut matched: Vec<&crate::state::AssessmentRecord> = store
             .assessments
             .values()

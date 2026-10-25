@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopAIRecommendationJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopAIRecommendationJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopAIRecommendationJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Asks a running AI recommendation job to stop: the job moves into the transient
+//! `Stopping` status now, and the clock owes it `Stopped` at
+//! [`crate::state::AI_RECOMMENDATION_JOB_STOPS_AFTER`]. The stored job's ARN is answered,
+//! an unknown name is refused with the modelled `ResourceNotFound`, and a job that has
+//! already reached a terminal status has no run to stop.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +135,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopAIRecommendationJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopAIRecommendationJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopAIRecommendationJob"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(job) = store
+            .ai_recommendation_jobs
+            .get_mut(&input.ai_recommendation_job_name)
+        else {
+            // A name nothing created names no job, so the stop is refused with the
+            // not-found failure this operation models, worded as the read and the delete
+            // word it: the job name the request presented, because there is no stored
+            // record to report anything else from.
+            return Err(StopAIRecommendationJobErrorModeled::ResourceNotFound(
+                ResourceNotFound {
+                    message: Some(crate::state::ai_recommendation_job_not_found(
+                        &input.ai_recommendation_job_name,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // Whatever the clock already owed this job is materialised FIRST, so the stop is
+        // judged against the status a read would report at this instant rather than against
+        // a stale one. That transition is a state change in its own right, so it leaves the
+        // same record here as it does on a reporting path.
+        let settled = job.settle_status(now);
+        let arn = job.arn.clone();
+        if job.is_terminal() {
+            // The job's run is over, so there is nothing left to stop, and the stored
+            // status stands untouched. This operation models only `ResourceNotFound` and
+            // the job IS found, so the refusal is a 400 `ValidationException`.
+            let refusal = crate::scaffolded::Scaffolded::validation(
+                crate::state::ai_recommendation_job_not_running(&job.name, &job.status),
+            );
+            drop(store);
+            if settled {
+                crate::state::record_state_change(Self::NAME, &arn, ctx);
+            }
+            return Err(refusal);
+        }
+
+        // A job already stopping is left alone: the stop an earlier call started is still
+        // in flight, and restarting its span would push the terminal status further away.
+        let stopping = job.is_stopping();
+        if !stopping {
+            job.request_stop(now);
+        }
+        // Every decision is taken under the one guard; it is released before anything is
+        // recorded, so no record is emitted while the store is locked.
+        drop(store);
+
+        // Recorded only when this call actually moved the job: a repeat of a stop already
+        // in flight changed nothing. A transition the clock owed is a move too, so either
+        // one leaves the record.
+        if !stopping || settled {
+            crate::state::record_state_change(Self::NAME, &arn, ctx);
+        }
+        Ok(StopAIRecommendationJobOutput {
+            // The ARN of the job this call stopped, read from the stored record rather
+            // than minted again, so it is the one the create answered.
+            ai_recommendation_job_arn: arn,
+        })
     }
 }
