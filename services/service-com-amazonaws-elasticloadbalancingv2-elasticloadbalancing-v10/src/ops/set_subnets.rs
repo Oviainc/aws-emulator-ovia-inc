@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetSubnets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetSubnets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetSubnets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the subnets — and so the Availability Zones — of the load balancer
+//! `LoadBalancerArn` names with the ones the request lists ("The specified subnets replace
+//! the previously enabled subnets"), and answers the zones it now carries, which every
+//! later read of that load balancer reports.
+//!
+//! Which zone a subnet is in is EC2's to say, so the request's subnets are resolved
+//! against EC2 exactly as `CreateLoadBalancer` resolves the ones a load balancer starts
+//! in — both through `crate::state::availability_zone_records`, so one reading of a
+//! request's subnets serves the create and the replacement.
+//!
+//! The documented rules this applies: "You must specify either subnets or subnet
+//! mappings" and not both, "you can specify only one subnet per Availability Zone",
+//! "[Application Load Balancers] You must specify subnets from at least two Availability
+//! Zones", and `EnablePrefixForIpv6SourceNat` "[Network Load Balancers with UDP
+//! listeners] ... The IP address type must be dualstack". A request one of them refuses is
+//! the modelled `InvalidConfigurationRequestException`; an ARN this store holds no load
+//! balancer for is the modelled `LoadBalancerNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +195,174 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetSubnets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetSubnetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetSubnets"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("SetSubnets")
+        })?;
+        let region = crate::state::request_region(ctx);
+
+        // The model: "You must specify either subnets or subnet mappings" — and the
+        // create's own documentation adds "but not both". Read from the request alone, so
+        // it is checked before anything is looked up.
+        let subnets = input.subnets.as_deref().unwrap_or_default();
+        let subnet_mappings = input.subnet_mappings.as_deref().unwrap_or_default();
+        if !subnets.is_empty() && !subnet_mappings.is_empty() {
+            return Err(invalid_configuration(
+                "Specify either Subnets or SubnetMappings, but not both".to_string(),
+            ));
+        }
+        if subnets.is_empty() && subnet_mappings.is_empty() {
+            return Err(invalid_configuration(
+                "You must specify either Subnets or SubnetMappings".to_string(),
+            ));
+        }
+        let requested_subnets: Vec<String> = subnets
+            .iter()
+            .cloned()
+            .chain(
+                subnet_mappings
+                    .iter()
+                    .filter_map(|mapping| mapping.subnet_id.clone()),
+            )
+            .collect();
+        // "You can specify only one subnet per Availability Zone": a request naming more
+        // subnets than a Region has zones names two of them in one zone whatever those
+        // subnets are, which is also what bounds the work one request can ask for on this
+        // path.
+        if requested_subnets.len() > crate::state::SUBNETS_PER_LOAD_BALANCER {
+            return Err(invalid_configuration(format!(
+                "You can specify only one subnet per Availability Zone, so at most {} \
+                 subnets, and this request names {}",
+                crate::state::SUBNETS_PER_LOAD_BALANCER,
+                requested_subnets.len()
+            )));
+        }
+
+        // What the load balancer is today, read under the lock and then released: the
+        // subnets are resolved against EC2 next, and nothing is held across that call.
+        let (family, scheme, carried_address_type) = {
+            let guard = state.lock();
+            let Some(load_balancer) = guard.load_balancers.get(&input.load_balancer_arn) else {
+                return Err(not_found(&input.load_balancer_arn));
+            };
+            (
+                load_balancer.family(),
+                load_balancer.scheme.clone(),
+                load_balancer.ip_address_type.clone(),
+            )
+        };
+
+        // "[Application Load Balancers] You must specify subnets from at least two
+        // Availability Zones", and one subnet per zone means at least two subnets.
+        if family == crate::state::LoadBalancerFamily::Application
+            && requested_subnets.len() < SUBNETS_PER_APPLICATION_LOAD_BALANCER
+        {
+            return Err(invalid_configuration(format!(
+                "An application load balancer must be placed in at least \
+                 {SUBNETS_PER_APPLICATION_LOAD_BALANCER} subnets, in as many Availability \
+                 Zones, and this request names {}",
+                requested_subnets.len()
+            )));
+        }
+
+        // The IP address type the load balancer will carry after this call: the one the
+        // request names, else the one it already has. Judged by the same two rules
+        // `SetIpAddressType` applies, so one call cannot set a type the other refuses.
+        let ip_address_type = input
+            .ip_address_type
+            .clone()
+            .unwrap_or(carried_address_type);
+        if let Err(rule) = crate::state::check_ip_address_type(family, &scheme, &ip_address_type) {
+            return Err(invalid_configuration(rule));
+        }
+        // `EnablePrefixForIpv6SourceNat`: "[Network Load Balancers with UDP listeners]
+        // Indicates whether to use an IPv6 prefix from each subnet for source NAT. The IP
+        // address type must be dualstack."
+        if input.enable_prefix_for_ipv6_source_nat.as_deref() == Some(SOURCE_NAT_PREFIX_ON)
+            && ip_address_type != DUALSTACK_ADDRESS_TYPE
+        {
+            return Err(invalid_configuration(format!(
+                "EnablePrefixForIpv6SourceNat can only be '{SOURCE_NAT_PREFIX_ON}' for a load \
+                 balancer whose IP address type is '{DUALSTACK_ADDRESS_TYPE}', and this one is \
+                 '{ip_address_type}'"
+            )));
+        }
+
+        // The subnets a load balancer is placed in are EC2's resources, and they are what
+        // say which Availability Zone each one is in — so they are resolved against EC2
+        // before anything is written. The store is locked only once the answer is in.
+        let resolved_subnets =
+            crate::state::network::subnets_by_id(ctx, &region, &requested_subnets).await;
+        let zones = crate::state::availability_zone_records(
+            subnets,
+            subnet_mappings,
+            &region,
+            resolved_subnets.as_deref(),
+        );
+
+        let mut guard = state.lock();
+        // Looked up again because the lock was released for the EC2 read: the load
+        // balancer may have been deleted while it ran.
+        let Some(load_balancer) = guard.load_balancers.get_mut(&input.load_balancer_arn) else {
+            return Err(not_found(&input.load_balancer_arn));
+        };
+        load_balancer.availability_zones = zones;
+        load_balancer.ip_address_type = ip_address_type;
+        if let Some(prefix) = input.enable_prefix_for_ipv6_source_nat.clone() {
+            load_balancer.enable_prefix_for_ipv6_source_nat = Some(prefix);
+        }
+
+        Ok(SetSubnetsOutput {
+            // Read back off the record rather than echoed from the request, so the answer
+            // is what a later `DescribeLoadBalancers` reports.
+            availability_zones: Some(
+                load_balancer
+                    .availability_zones
+                    .iter()
+                    .map(crate::state::AvailabilityZoneRecord::to_shape)
+                    .collect(),
+            ),
+            ip_address_type: Some(load_balancer.ip_address_type.clone()),
+            enable_prefix_for_ipv6_source_nat: load_balancer
+                .enable_prefix_for_ipv6_source_nat
+                .clone(),
+        })
     }
+}
+
+/// How many subnets an Application Load Balancer is placed in at least, from this
+/// operation's own documentation: "[Application Load Balancers] You must specify subnets
+/// from at least two Availability Zones" — one subnet per zone, so two subnets.
+const SUBNETS_PER_APPLICATION_LOAD_BALANCER: usize = 2;
+
+/// The `EnablePrefixForIpv6SourceNatEnum` value that turns source NAT prefixes on, from
+/// that enum's own values (`off`, `on`).
+const SOURCE_NAT_PREFIX_ON: &str = "on";
+
+/// The `IpAddressType` an IPv6 source NAT prefix requires, from
+/// `EnablePrefixForIpv6SourceNat`'s documentation: "The IP address type must be
+/// dualstack."
+const DUALSTACK_ADDRESS_TYPE: &str = "dualstack";
+
+/// The modelled refusal for an ARN this store holds no load balancer for, with the
+/// message every operation addressing one load balancer answers
+/// (`crate::state::load_balancer_not_found_message`).
+fn not_found(arn: &str) -> SetSubnetsError {
+    SetSubnetsErrorModeled::LoadBalancerNotFoundException(LoadBalancerNotFoundException {
+        message: Some(crate::state::load_balancer_not_found_message(arn)),
+    })
+    .into()
+}
+
+/// The modelled "the requested configuration is not valid" refusal, for a request this
+/// operation's documented rules cannot apply. The message states the rule and the values
+/// from the request it was judged against, because that is what the caller has to fix.
+fn invalid_configuration(detail: String) -> SetSubnetsError {
+    SetSubnetsErrorModeled::InvalidConfigurationRequestException(
+        InvalidConfigurationRequestException {
+            message: Some(detail),
+        },
+    )
+    .into()
 }

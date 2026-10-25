@@ -21,6 +21,10 @@ mod listener_lifecycle_certificates_and_rules;
 mod listener_rules;
 #[path = "all/listener_tls_certificates.rs"]
 mod listener_tls_certificates;
+#[path = "all/load_balancer_attributes.rs"]
+mod load_balancer_attributes;
+#[path = "all/load_balancer_network_capacity_and_policy.rs"]
+mod load_balancer_network_capacity_and_policy;
 #[path = "all/provisioning_loop.rs"]
 mod provisioning_loop;
 #[path = "all/query_error_envelope.rs"]
