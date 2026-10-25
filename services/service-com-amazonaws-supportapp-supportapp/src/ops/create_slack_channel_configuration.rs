@@ -187,6 +187,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // Whose account the role ARN names is a fact about the REQUEST, so it is
+        // settled before the store is reached: a role in another account cannot be
+        // passed to this service, and no configuration is recorded for it.
+        if let Some(message) =
+            crate::state::channel_role_account_refusal(&input.channel_role_arn)
+        {
+            return Err(
+                CreateSlackChannelConfigurationErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateSlackChannelConfigurationErrorModeled::InternalServerException(
                 InternalServerException {

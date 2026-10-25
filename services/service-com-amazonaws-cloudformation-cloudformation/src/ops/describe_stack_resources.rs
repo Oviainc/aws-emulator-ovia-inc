@@ -199,7 +199,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there is no stack store to read, so this
             // answers 501 rather than an empty, truthful-looking list.
@@ -214,6 +213,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it is that transition which installs the resources a deployment produced.
         store.settle(::std::time::SystemTime::now());
 
+        // Either selector names a stack of the Region the request was signed for, and
+        // nothing outside it.
+        let region = crate::state::request_region(ctx.parts());
         // "You must specify either StackName or PhysicalResourceId, but not both": the two
         // members are the two ways of naming ONE stack, so neither of them names none and
         // both of them name two.
@@ -230,7 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the stack are returned" — by name for a running stack, by stack id for a
             // deleted one. A name that resolves to nothing is a `ValidationError`, as it
             // is on every other read of a stack.
-            (Some(name_or_id), None) => store.resolve(name_or_id).ok_or_else(|| {
+            (Some(name_or_id), None) => store.resolve(&region, name_or_id).ok_or_else(|| {
                 crate::scaffolded::Scaffolded::validation_error(
                     crate::state::stack_does_not_exist(name_or_id),
                 )
@@ -238,7 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "If PhysicalResourceId is specified, the associated resources of the stack
             // that the resource belongs to are returned."
             (None, Some(physical_resource_id)) => store
-                .stack_of_physical_resource(physical_resource_id)
+                .stack_of_physical_resource(&region, physical_resource_id)
                 .ok_or_else(|| {
                     crate::scaffolded::Scaffolded::validation_error(
                         crate::state::stack_for_physical_resource_does_not_exist(

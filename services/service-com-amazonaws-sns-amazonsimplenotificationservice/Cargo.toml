@@ -28,9 +28,24 @@ tracing = { workspace = true }
 # and the message/subscription ids are formatted from a SHA-256 digest.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `arn`: the ONE parse of a caller-supplied resource ARN, shared with every other service —
+# a subscription's SQS endpoint ARN is read through it rather than split here.
+service-common = { path = "../common" }
+# The AWS SDK for SQS, driven over the in-process callback
+# (`OperationContext::callback`): `Publish` delivers a message to the queues subscribed to
+# the topic with `SendMessage` (`ops::publish::deliver_to_queues`). Only the generated
+# client is needed — the emulator supplies the transport, so the SDK's own HTTPS stack and
+# runtime are left out.
+aws-sdk-sqs = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# SQS is mounted beside SNS on one engine in the subscription-delivery tests, because an
+# `sqs` subscription's endpoint is a queue and a delivery is asserted where a client sees
+# it: on the queue.
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 
 [lints]
 workspace = true

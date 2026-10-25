@@ -170,7 +170,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteAlarmsErrorModeled::InternalServiceFault(InternalServiceFault {
                 message: Some("the CloudWatch alarm store is unavailable".into()),
@@ -178,92 +177,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let now = crate::state::now_secs();
-        let mut store = state.lock();
-
-        // "You can delete up to 100 alarms in one operation. However, this total can include
-        // no more than one composite alarm." — checked before anything is removed, so a
-        // refused request leaves the store exactly as it was.
-        let mut composites: Vec<&String> = input
-            .alarm_names
-            .iter()
-            .filter(|name| store.composite_alarms.contains_key(name.as_str()))
-            .collect();
-        composites.sort_unstable();
-        composites.dedup();
-        if composites.len() > 1 {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "AlarmNames names {} composite alarms, and one call can delete no more than \
-                 one",
-                composites.len()
-            )));
-        }
-        // "Log alarms cannot be batch deleted." — a call that deletes a log alarm deletes that
-        // alarm and nothing else, so one naming a log alarm beside any other alarm is refused
-        // before anything is removed.
-        let mut named: Vec<&String> = input.alarm_names.iter().collect();
-        named.sort_unstable();
-        named.dedup();
-        let log_alarms = named
-            .iter()
-            .filter(|name| store.log_alarms.contains_key(name.as_str()))
-            .count();
-        if log_alarms > 0 && named.len() > 1 {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "AlarmNames names {} alarms including a log alarm, and a log alarm cannot be \
-                 deleted in a batch",
-                named.len()
-            )));
-        }
-        // "you can't delete any composite alarm that is part of [a cycle] because there is
-        // always still a composite alarm that depends on that alarm that you want to delete"
-        // — generally: a composite alarm another composite alarm's `AlarmRule` references
-        // cannot be deleted while that reference stands. Only one composite alarm can be
-        // deleted per call, so a parent is never deleted by the same call.
-        if let Some(name) = composites.first() {
-            let parents = store.composite_alarm_parents(name.as_str());
-            if !parents.is_empty() {
-                return Err(DeleteAlarmsErrorModeled::ResourceConflict(ResourceConflict {
-                    message: Some(format!(
-                        "composite alarm {name} is referenced by the AlarmRule of {}",
-                        parents.join(", ")
-                    )),
-                })
-                .into());
-            }
-        }
-
-        // "If you specify any incorrect alarm names, the alarms you specify with correct
-        // names are still deleted." (DeleteAlarms documentation) — so the names that do
-        // exist are removed, and the call still reports the ones that did not with the
-        // modelled `ResourceNotFound`.
-        //
-        // The alarm's HISTORY is deliberately left in place: "CloudWatch retains the
-        // history of an alarm even if you delete the alarm" (`DescribeAlarmHistory`
-        // documentation), so only the 14-day retention window ever removes it.
-        // A name the request repeats names ONE alarm, so the deduplicated list is what is
-        // walked: deleting from the raw list would find the second mention of a name already
-        // removed by the first and report an alarm that did exist as missing.
-        let mut missing: Vec<&str> = Vec::new();
-        for name in &named {
-            let removed = store.alarms.remove(name.as_str()).is_some()
-                || store.composite_alarms.remove(name.as_str()).is_some()
-                || store.log_alarms.remove(name.as_str()).is_some();
-            if !removed {
-                missing.push(name.as_str());
-            }
-        }
+        // The store's lock is held for the deletion only, and released before the alarms are
+        // settled below.
+        let deleted = {
+            let mut store = state.lock();
+            delete_named_alarms(&mut store, &input, now)
+        };
         // A deleted alarm is an input every composite alarm whose rule references it loses,
-        // so the alarms downstream of this call are evaluated before it returns.
-        store.evaluate_composite_alarms(now);
-        missing.sort_unstable();
-        missing.dedup();
-        if !missing.is_empty() {
-            return Err(DeleteAlarmsErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!("no alarm named {}", missing.join(", "))),
-            })
-            .into());
-        }
+        // so the notifications those re-evaluations owe go out here — whether or not some
+        // name in the request matched no alarm.
+        crate::state::alarm_actions::settle_alarms(&*self.engine, ctx).await;
+        deleted?;
 
         Ok(DeleteAlarmsOutput)
     }
+}
+
+/// Delete the alarms `input` names, and re-evaluate the composite alarms downstream of them.
+///
+/// The whole deletion, so the one place that holds the store's lock is the caller's block.
+fn delete_named_alarms(
+    store: &mut crate::state::ComAmazonawsCloudwatchGraniteserviceversion20100801State,
+    input: &DeleteAlarmsInput,
+    now: f64,
+) -> Result<(), DeleteAlarmsError> {
+    // "You can delete up to 100 alarms in one operation. However, this total can include
+    // no more than one composite alarm." — checked before anything is removed, so a
+    // refused request leaves the store exactly as it was.
+    let mut composites: Vec<&String> = input
+        .alarm_names
+        .iter()
+        .filter(|name| store.composite_alarms.contains_key(name.as_str()))
+        .collect();
+    composites.sort_unstable();
+    composites.dedup();
+    if composites.len() > 1 {
+        return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+            "AlarmNames names {} composite alarms, and one call can delete no more than one",
+            composites.len()
+        )));
+    }
+    // "Log alarms cannot be batch deleted." — a call that deletes a log alarm deletes that
+    // alarm and nothing else, so one naming a log alarm beside any other alarm is refused
+    // before anything is removed.
+    let mut named: Vec<&String> = input.alarm_names.iter().collect();
+    named.sort_unstable();
+    named.dedup();
+    let log_alarms = named
+        .iter()
+        .filter(|name| store.log_alarms.contains_key(name.as_str()))
+        .count();
+    if log_alarms > 0 && named.len() > 1 {
+        return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+            "AlarmNames names {} alarms including a log alarm, and a log alarm cannot be \
+             deleted in a batch",
+            named.len()
+        )));
+    }
+    // "you can't delete any composite alarm that is part of [a cycle] because there is
+    // always still a composite alarm that depends on that alarm that you want to delete"
+    // — generally: a composite alarm another composite alarm's `AlarmRule` references
+    // cannot be deleted while that reference stands. Only one composite alarm can be
+    // deleted per call, so a parent is never deleted by the same call.
+    if let Some(name) = composites.first() {
+        let parents = store.composite_alarm_parents(name.as_str());
+        if !parents.is_empty() {
+            return Err(DeleteAlarmsErrorModeled::ResourceConflict(ResourceConflict {
+                message: Some(format!(
+                    "composite alarm {name} is referenced by the AlarmRule of {}",
+                    parents.join(", ")
+                )),
+            })
+            .into());
+        }
+    }
+
+    // "If you specify any incorrect alarm names, the alarms you specify with correct
+    // names are still deleted." (DeleteAlarms documentation) — so the names that do
+    // exist are removed, and the call still reports the ones that did not with the
+    // modelled `ResourceNotFound`.
+    //
+    // The alarm's HISTORY is deliberately left in place: "CloudWatch retains the
+    // history of an alarm even if you delete the alarm" (`DescribeAlarmHistory`
+    // documentation), so only the 14-day retention window ever removes it.
+    // A name the request repeats names ONE alarm, so the deduplicated list is what is
+    // walked: deleting from the raw list would find the second mention of a name already
+    // removed by the first and report an alarm that did exist as missing.
+    let mut missing: Vec<&str> = Vec::new();
+    for name in &named {
+        let removed = store.alarms.remove(name.as_str()).is_some()
+            || store.composite_alarms.remove(name.as_str()).is_some()
+            || store.log_alarms.remove(name.as_str()).is_some();
+        if !removed {
+            missing.push(name.as_str());
+        }
+    }
+    // A deleted alarm is an input every composite alarm whose rule references it loses,
+    // so the alarms downstream of this call are evaluated before it returns.
+    store.evaluate_composite_alarms(
+        now,
+        &mut crate::state::alarm_evaluation::EvaluationBudget::for_one_request(),
+    );
+    missing.sort_unstable();
+    missing.dedup();
+    if !missing.is_empty() {
+        return Err(DeleteAlarmsErrorModeled::ResourceNotFound(ResourceNotFound {
+            message: Some(format!("no alarm named {}", missing.join(", "))),
+        })
+        .into());
+    }
+    Ok(())
 }

@@ -190,7 +190,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeAlarmsErrorModeled::InternalServiceFault(InternalServiceFault {
                 message: Some("the CloudWatch alarm store is unavailable".into()),
@@ -231,13 +230,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .unwrap_or(1);
 
-        let now = crate::state::now_secs();
-        let mut store = state.lock();
-        // A composite alarm's state is its `AlarmRule` evaluated over the alarms the rule
-        // references, and each evaluation is due a span after the write that configured it.
-        // Materialising what the clock has already made due before reporting is what keeps
-        // this read's answer the same for every later caller.
-        store.evaluate_composite_alarms(now);
+        // An alarm's state is EVALUATED, not stored by a caller: a metric alarm's from the
+        // datapoints the metric store holds, a composite alarm's from its `AlarmRule` over
+        // the alarms the rule references, and each evaluation is due a span after the write
+        // that configured it. Materialising what the clock has already made due before
+        // reporting — and executing the actions those transitions owe — is what keeps this
+        // read's answer the same for every later caller.
+        crate::state::alarm_actions::settle_alarms(&*self.engine, ctx).await;
+        let store = state.lock();
 
         // "If you specify ChildrenOfAlarmName, you cannot specify any other parameters in
         // the request except for MaxRecords and NextToken" — likewise ParentsOfAlarmName.

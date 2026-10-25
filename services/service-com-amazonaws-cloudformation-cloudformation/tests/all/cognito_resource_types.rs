@@ -197,9 +197,10 @@ async fn every_published_cognito_type_may_be_declared_and_is_recorded() {
             Some(property) => {
                 assert_eq!(
                     xml_text(&body, "StackStatus").as_deref(),
-                    Some(status::CREATE_FAILED),
-                    "case {resource_type:?}: expected the stack to reach {:?}, got body {body}",
-                    status::CREATE_FAILED
+                    Some(status::ROLLBACK_COMPLETE),
+                    "case {resource_type:?}: expected the failed create to be rolled back \
+                     to {:?}, got body {body}",
+                    status::ROLLBACK_COMPLETE
                 );
                 let reason = xml_text(&body, "StackStatusReason").unwrap_or_default();
                 assert!(
