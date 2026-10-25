@@ -820,11 +820,38 @@ async fn deleting_a_table_and_its_keyspace_is_observable_by_the_next_call() {
         "ResourceNotFoundException",
     );
 
-    // "The DeleteKeyspace operation deletes a keyspace and all of its tables."
+    // "The DeleteKeyspace operation deletes a keyspace and all of its tables." The
+    // deletion is observable rather than instantaneous — `KeyspaceStatus` models
+    // `DELETING` — and the full table of shapes and refusals is in
+    // `tests/all/delete_keyspace_lifecycle.rs`.
     assert_ok(
         "delete the keyspace",
         emulator.call("DeleteKeyspace", json!({"keyspaceName": keyspace})).await,
     );
+    let going = assert_ok(
+        "GetTable while the keyspace deletion is in flight",
+        emulator
+            .call(
+                "GetTable",
+                json!({"keyspaceName": keyspace, "tableName": "surviving_tbl"}),
+            )
+            .await,
+    );
+    assert_eq!(
+        going["status"], json!(keyspaces::TABLE_STATUS_DELETING),
+        "a table goes with the keyspace being deleted, so it is DELETING too: {going}"
+    );
+    assert_failure(
+        "DeleteKeyspace repeated while the deletion is in flight",
+        emulator.call("DeleteKeyspace", json!({"keyspaceName": keyspace})).await,
+        409,
+        "ConflictException",
+    );
+
+    tokio::time::sleep(settle_wait()).await;
+
+    // The deletion the clock owed has completed: the keyspace, and the tables it held,
+    // are gone from every reader.
     for (case, operation, request) in [
         (
             "GetTable after the keyspace was deleted",
@@ -837,7 +864,7 @@ async fn deleting_a_table_and_its_keyspace_is_observable_by_the_next_call() {
             json!({"keyspaceName": keyspace}),
         ),
         (
-            "DeleteKeyspace repeated",
+            "DeleteKeyspace after the keyspace was deleted",
             "DeleteKeyspace",
             json!({"keyspaceName": keyspace}),
         ),

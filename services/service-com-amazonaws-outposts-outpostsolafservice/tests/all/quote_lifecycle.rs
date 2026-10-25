@@ -34,7 +34,7 @@ use crate::site_and_outpost_lifecycle::{
 /// The ARN prefix of a quote of this emulator, from the `QuoteIdentifier` pattern's
 /// ARN branch `arn:aws([a-z-]+)?:outposts:[a-z\d-]+:\d{12}:quote/` plus the home
 /// region and the canonical emulator account id.
-const QUOTE_ARN_PREFIX: &str = "arn:aws:outposts:us-east-1:000000000000:quote/";
+pub(crate) const QUOTE_ARN_PREFIX: &str = "arn:aws:outposts:us-east-1:000000000000:quote/";
 
 /// The account id every generated emulator presents, which `Quote$AccountId`
 /// (`^\d{12}$`) carries.
@@ -42,7 +42,7 @@ const ACCOUNT_ID: &str = "000000000000";
 
 /// A quote id this emulator never mints, used wherever a case needs an identifier
 /// that is well formed (so the boundary accepts it) but names nothing.
-const ABSENT_QUOTE_ID: &str = "oq-00000000000000000";
+pub(crate) const ABSENT_QUOTE_ID: &str = "oq-00000000000000000";
 
 /// An Outpost id this emulator never mints. See [`ABSENT_QUOTE_ID`].
 const ABSENT_OUTPOST_ID: &str = "op-00000000000000000";
@@ -105,7 +105,7 @@ pub(crate) async fn create_quote(outposts: &Outposts, body: &Value) -> Value {
 }
 
 /// `GetQuote` on an identifier, returning the `Quote` it answered with.
-async fn get_quote(outposts: &Outposts, identifier: &str) -> Value {
+pub(crate) async fn get_quote(outposts: &Outposts, identifier: &str) -> Value {
     outposts
         .ok("GET", &format!("/quotes/{}", segment(identifier)), None)
         .await["Quote"]

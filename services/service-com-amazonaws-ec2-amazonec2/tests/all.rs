@@ -17,6 +17,11 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// The virtual private gateway slice: create, read back, delete. Declared here rather than in
+// sorted position for the reason given above — the sorted neighbourhood is the contended
+// region of this file, and this suite lost several serialized squash merges to it.
+#[path = "all/vpn_gateways.rs"]
+mod vpn_gateways;
 // What `DescribeClientVpnTargetNetworks` reports for the target networks associated with one
 // Client VPN endpoint, and how the ids, the filters and the page size narrow it. Declared
 // here rather than in sorted position, for the reason the note above gives.

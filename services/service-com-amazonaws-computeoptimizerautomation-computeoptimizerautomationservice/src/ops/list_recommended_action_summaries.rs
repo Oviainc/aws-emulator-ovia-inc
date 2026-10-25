@@ -18,9 +18,9 @@
 //! whose resources have not been analysed yet — is summarised as no summaries at
 //! all.
 //!
-//! A recommended action is produced by Compute Optimizer's own analysis of a
-//! resource, so no operation of THIS API creates one: this handler only reads
-//! what the store holds, and it writes nothing.
+//! A recommended action is produced by the analysis of an account's resources
+//! that its enrollment starts, so no request carries one: this handler only
+//! reads what the store holds, and it writes nothing.
 //!
 //! ## Shape of an operation
 //!

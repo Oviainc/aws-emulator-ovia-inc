@@ -47,6 +47,8 @@ mod query_column_selection;
 mod query_statement_subset;
 #[path = "all/quota_service_code.rs"]
 mod quota_service_code;
+#[path = "all/reserved_tag_keys.rs"]
+mod reserved_tag_keys;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]

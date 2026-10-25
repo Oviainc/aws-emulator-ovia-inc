@@ -9,6 +9,8 @@
 //!
 //! A label that is not a signing-profile ARN is refused 400 `BadRequestException`;
 //! a well-formed ARN naming no stored profile is refused 404 `NotFoundException`;
+//! a request naming a key inside AWS's reserved namespace is refused 400
+//! `BadRequestException`, because `TagKey`'s pattern does not admit such a key;
 //! and a CANCELED profile's tags cannot be changed — the shape documents that it
 //! "also occurs when you call a tagging API on a cancelled signing profile". A
 //! refused call removes nothing.
@@ -132,6 +134,16 @@ fn refused(problem: crate::state::TaggingArnProblem, resource_arn: &str) -> Unta
     .into()
 }
 
+/// A 400 `BadRequestException` carrying `message` and `code` — the shape the
+/// tagging operations refuse a bad request with.
+fn bad_request(message: String, code: String) -> UntagResourceError {
+    UntagResourceErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+        code: Some(code),
+    })
+    .into()
+}
+
 /// The `UntagResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -184,6 +196,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // AWS reserves the `aws:` prefix for its own tags, which `TagKey`'s
+        // pattern states as a negative lookahead the boundary validator cannot
+        // compile — so the keys this request names are judged here, before
+        // anything is removed. One such key refuses the WHOLE call, the same
+        // all-or-nothing rule the write half follows, so every tag stays in
+        // place.
+        let named = input.tag_keys.iter().map(String::as_str);
+        if let Some(key) = crate::state::reserved_tag_key(named) {
+            return Err(bad_request(
+                crate::state::reserved_tag_key_message(key),
+                crate::state::ERROR_CODE_BAD_REQUEST.to_string(),
+            ));
+        }
+
         let mut store = state.lock();
         let profile = store
             .profile_for_tagging_mut(&region, &input.resource_arn)
@@ -193,16 +219,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the gate reads the status the store holds NOW — so a refused removal
         // leaves every tag in place.
         if !profile.accepts_tag_writes() {
-            return Err(UntagResourceErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(crate::state::tag_write_refused_message(
-                        &profile.profile_name,
-                        &profile.status,
-                    )),
-                    code: Some(crate::state::profile_status_error_code(&profile.status)),
-                },
-            )
-            .into());
+            return Err(bad_request(
+                crate::state::tag_write_refused_message(&profile.profile_name, &profile.status),
+                crate::state::profile_status_error_code(&profile.status),
+            ));
         }
 
         // "Removes one or more tags from a signing profile. To remove the tags,

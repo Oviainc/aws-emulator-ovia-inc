@@ -2,17 +2,52 @@
 
 //! Fixtures the speech-synthesis-task suites share.
 //!
-//! One definition of what a started task looks like in the store, and one way to seed
-//! it, so `error_semantics` (the read path) and `synthesis_tasks` (the list path)
-//! cannot drift on either. The request harness and the response readers live with the
-//! lexicon suite (`crate::lexicons_and_speech`), which every suite drives the service
-//! through.
+//! One definition of what a started task looks like in the store, one way to seed it,
+//! one way to read a task back and one reader for the `message` slot of an error
+//! document, so `error_semantics` (the read path), `synthesis_tasks` (the list path),
+//! `task_id_validity` (the two `TaskId` refusals) and `error_document_message` (the
+//! rendering) cannot drift on any of them. The request harness and the JSON readers
+//! live with the lexicon suite (`crate::lexicons_and_speech`), which every suite drives
+//! the service through.
 
 use std::time::SystemTime;
 
+use bytes::Bytes;
 use service_com_amazonaws_polly_parrot_v1::state::{service_state, StoredSynthesisTask};
 
-use crate::lexicons_and_speech::Polly;
+use crate::lexicons_and_speech::{json, Polly};
+
+/// One `GetSpeechSynthesisTask` call.
+pub(crate) async fn get_task(polly: &Polly, task_id: &str) -> http::Response<Bytes> {
+    polly
+        .call("GET", &format!("/v1/synthesisTasks/{task_id}"), "")
+        .await
+}
+
+/// The `message` slot of an error document: the JSON value under the key the error
+/// shape's member occupies, or `None` when the document carries NO such key at all —
+/// the difference a `body["message"].as_str()` reader cannot see.
+pub(crate) fn message_slot(response: &http::Response<Bytes>) -> Option<serde_json::Value> {
+    let body = json(response);
+    for key in ["message", "Message"] {
+        if let Some(value) = body.get(key) {
+            return Some(value.clone());
+        }
+    }
+    None
+}
+
+/// A `TaskId` in the form Amazon Polly mints one — a UUID in the canonical hyphenated
+/// form — derived from `label`, so a fixture still reads as the case it is about and
+/// two labels never collide.
+///
+/// A started task's id is minted, never chosen, and the read path refuses an id that is
+/// not of the minted form, so a fixture cannot use a prose id.
+pub(crate) fn fixture_task_id(label: &str) -> String {
+    ::uuid::Uuid::new_v5(&::uuid::Uuid::NAMESPACE_OID, label.as_bytes())
+        .hyphenated()
+        .to_string()
+}
 
 /// A synthesis task as a start call would have recorded it. A caller overrides the
 /// members its case is about.

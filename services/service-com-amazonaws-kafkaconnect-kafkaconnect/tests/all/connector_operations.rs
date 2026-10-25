@@ -509,9 +509,9 @@ async fn a_connectors_operations_page_oldest_first_each_exactly_once() {
             "round {round}: RestartConnector must succeed, got {status} {restarted}"
         );
         expected.push(text(&restarted, "connectorOperationArn"));
-        // The connector is RESTARTING until the clock returns it to RUNNING, and only a
-        // RUNNING connector can be restarted again.
-        past_one_transition().await;
+        // The connector is RESTARTING for as long as the restart it is running, and
+        // only a RUNNING connector can be restarted again.
+        past_the_whole_restart().await;
     }
     let (status, restarted) = restart(&emulator, other, None).await;
     assert_eq!(

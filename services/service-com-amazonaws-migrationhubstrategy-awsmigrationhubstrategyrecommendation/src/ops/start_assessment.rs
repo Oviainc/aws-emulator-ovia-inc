@@ -159,7 +159,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(StartAssessmentErrorModeled::InternalServerException(
                 InternalServerException {
@@ -212,12 +211,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(StartAssessmentErrorModeled::ValidationException)?;
         }
 
+        // The assessment is started in the portfolio of the Region this request was
+        // signed for, and is reported only by reads signed for that same Region.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
         // The store is bounded: past its quota an assessment is refused rather than
         // adding another record. `ServiceQuotaExceededException` is this operation's
-        // modelled refusal for reaching a quota.
-        if store.assessments.len() >= crate::state::ASSESSMENT_QUOTA {
+        // modelled refusal for reaching a quota. The quota is this Region's, as the
+        // service's quotas are.
+        if store.region(&region).assessments.len() >= crate::state::ASSESSMENT_QUOTA {
             return Err(StartAssessmentErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: format!(
@@ -229,13 +232,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // And the store keeps a portfolio for a bounded number of Regions: the Region
+        // comes from the caller's own credential scope, so this is what stops made-up
+        // Regions growing the store without bound.
+        if store.region_capacity_reached(&region) {
+            return Err(StartAssessmentErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this emulator holds assessments in at most {} Regions",
+                        crate::state::MAX_REGIONS
+                    ),
+                },
+            )
+            .into());
+        }
+
         // An assessment collects data for the servers the data source holds when it
         // starts, so count them with every completion the clock already owed
-        // materialised first.
-        store.settle_all(now);
-        let servers = store.imported_server_count();
+        // materialised first — the servers of this Region's portfolio.
+        let id = store.mint_assessment_id(&region);
+        let portfolio = store.region_entry(&region);
+        portfolio.settle_all(now);
+        let servers = portfolio.imported_server_count();
 
-        let id = store.mint_assessment_id();
         let assessment = crate::state::Assessment {
             id: id.clone(),
             // Data collection is not done the instant the call returns; the clock owes
@@ -256,9 +275,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             in_progress: servers,
             completion_due: Some(now + crate::state::COMPLETION_SPAN),
         };
-        store.assessments.insert(id.clone(), assessment);
-        // `GetLatestAssessmentId` answers with the most recently started assessment.
-        store.latest_assessment_id = Some(id.clone());
+        portfolio.assessments.insert(id.clone(), assessment);
+        // `GetLatestAssessmentId` answers with the most recently started assessment of
+        // the Region it is asked in.
+        portfolio.latest_assessment_id = Some(id.clone());
 
         Ok(StartAssessmentOutput {
             assessment_id: Some(id),
