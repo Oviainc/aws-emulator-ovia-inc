@@ -23542,6 +23542,47 @@ impl RecycledVolumeRecord {
 /// so a report id that names nothing is answered the same way.
 pub const INVALID_IMAGE_USAGE_REPORT_ID_NOT_FOUND: &str = "InvalidImageUsageReportId.NotFound";
 
+/// The code EC2 answers for something that is not an AMI usage report id at all.
+///
+/// EC2 separates "not an id of this kind" from "no such resource" with the resource's own
+/// `Invalid<Kind>.Malformed` code, the way [`INVALID_FPGA_IMAGE_ID_MALFORMED`] and
+/// [`INVALID_LAUNCH_TEMPLATE_ID_MALFORMED`] read; the recorded unit behind
+/// `issues/.../20261023T102725Z-ec2-deleteimageusagereport-stub.md` is where this code's
+/// spelling for a report id comes from — AWS answered `DeleteImageUsageReport` for the null
+/// report id with `InvalidImageUsageReportId.Malformed` (HTTP 400).
+pub const INVALID_IMAGE_USAGE_REPORT_ID_MALFORMED: &str = "InvalidImageUsageReportId.Malformed";
+
+/// The id prefix every AMI usage report id carries: `imgusgrpt-`.
+///
+/// `ImageUsageReportId` is a plain `String` in the model
+/// (`smithy_query(query="shape",shape="ImageUsageReportId")`), so the prefix is taken from
+/// the id AWS itself read as an "image-usage-report ID" in the recorded unit behind this
+/// resource's issue (`imgusgrpt-00000000000000000`). It is the prefix a report id is minted
+/// under as well, so one id form serves the mint and the readers.
+pub const IMAGE_USAGE_REPORT_ID_PREFIX: &str = "imgusgrpt";
+
+/// Whether `id` is a well-formed AMI usage report id — one EC2 could have ISSUED.
+///
+/// Two clauses, and each is a clause about the ID SPACE rather than about any one request:
+///
+/// * The EC2 resource id form: [`IMAGE_USAGE_REPORT_ID_PREFIX`] followed by 8 or 17
+///   lowercase hexadecimal digits, the short and the long form every id reader in this
+///   crate accepts for a resource whose own `@pattern` the model does not publish
+///   ([`prefixed_id_is_well_formed`]).
+/// * NOT the NULL id — the one definition of that clause, [`id_is_not_the_null_id`]: AWS
+///   answers the all-zero suffix `InvalidImageUsageReportId.Malformed` rather than
+///   `.NotFound`, and the mint counts from one
+///   ([`ComAmazonawsEc2Amazonec2State::next_id`]), so no report can ever hold it.
+///
+/// The null-id clause is this resource's, not a rule about every EC2 id: the same all-zero
+/// suffix on a network interface (`eni-00000000000000000`) IS answered `NotFound`, which is
+/// why [`prefixed_id_is_well_formed`] does not carry it — the same split
+/// [`instance_id_is_well_formed`] records.
+pub fn image_usage_report_id_is_well_formed(id: &str) -> bool {
+    prefixed_id_is_well_formed(IMAGE_USAGE_REPORT_ID_PREFIX, id)
+        && id_is_not_the_null_id(IMAGE_USAGE_REPORT_ID_PREFIX, id)
+}
+
 /// Refuse a request that named a report id the account holds no AMI usage report for: HTTP
 /// 400 `InvalidImageUsageReportId.NotFound`.
 pub fn invalid_image_usage_report_id_not_found<E>(report_id: &str) -> Scaffolded<E> {
@@ -23549,6 +23590,20 @@ pub fn invalid_image_usage_report_id_not_found<E>(report_id: &str) -> Scaffolded
         INVALID_IMAGE_USAGE_REPORT_ID_NOT_FOUND,
         400,
         format!("The image usage report id '{report_id}' does not exist"),
+    )
+}
+
+/// Refuse a report id the request named that is not a report id at all: HTTP 400
+/// `InvalidImageUsageReportId.Malformed`, which EC2 answers BEFORE it looks the id up.
+///
+/// The wording is AWS's own for this resource — "The image-usage-report ID
+/// '<id>' is malformed" — built from the id the request carried, as every malformed-id
+/// message in this crate is.
+pub fn invalid_image_usage_report_id_malformed<E>(report_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_IMAGE_USAGE_REPORT_ID_MALFORMED,
+        400,
+        format!("The image-usage-report ID '{report_id}' is malformed"),
     )
 }
 

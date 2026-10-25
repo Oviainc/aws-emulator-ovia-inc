@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateIntegrationResponse
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateIntegrationResponse`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateIntegrationResponse::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies a `patchOperations` list to the stored `IntegrationResponse` its
+//! `(restApiId, resourceId, httpMethod, statusCode)` names — the record
+//! `PutIntegrationResponse` created on the method's integration — and reports the updated
+//! record, exactly as `GetIntegrationResponse` and the owning `GetIntegration` read it
+//! back.
 //!
 //! ## Shape of an operation
 //!
@@ -110,6 +107,116 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use super::put_integration::MAX_TEMPLATE_CHARS;
+use super::put_integration_response::{
+    invalid_integration_response_mapping, is_integration_response_mapping_value,
+};
+use super::put_method::method_key;
+use super::put_method_response::{invalid_response_parameter, is_method_response_header};
+use crate::state::{
+    patch_enum_string, patch_optional_string, patch_string_map, Patch, PatchFailure, PatchOpKind,
+    MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
+};
+
+// The `path` values `UpdateIntegrationResponse` accepts are the ones `apply_patch` below
+// has an arm for: one per updateable member of the `IntegrationResponse` shape.
+// `statusCode` is NOT among them — it is the response's identity, the URI label that
+// addresses this very record, so it is reported but not patchable, the way
+// `UpdateMethodResponse` treats a method response's own status code.
+
+/// Apply one patch to a COPY of a stored integration response.
+///
+/// Each arm maps a supported path to the member it names and defers the edit itself to the
+/// service's shared patch semantics: `add`/`replace` set a single-valued member and
+/// `remove` clears an optional one, while a map path names ONE entry of that map
+/// (`/responseTemplates/application~1json`), with a `/` in the key escaped `~1` the way a
+/// JSON Pointer requires. The member rules are the ones `PutIntegrationResponse` enforces
+/// on the same members, reached through that operation's own helpers, so a record is held
+/// to one set of rules however it came to be.
+fn apply_patch(
+    entry: &mut GetIntegrationResponseOutput,
+    patch: &Patch,
+) -> Result<(), PatchFailure> {
+    match patch.member() {
+        // "Specifies the regular expression (regex) pattern used to choose an integration
+        // response based on the response from the back end"
+        // (`IntegrationResponse$selectionPattern`): an optional single-valued member, so a
+        // `remove` clears it — which is what makes the patched response the integration's
+        // default response, the one that carries no pattern of its own.
+        "selectionPattern" => {
+            patch_optional_string(&mut entry.selection_pattern, patch, MAX_STRING_CHARS)
+        }
+        // A modelled enum, whose value set is checked here because a patch `value` is a
+        // bare string on the wire and so reaches the handler unvalidated.
+        "contentHandling" => patch_enum_string(
+            &mut entry.content_handling,
+            patch,
+            CONTENT_HANDLING_STRATEGY_VALUES,
+        ),
+        // "The key is a method response header parameter name and the mapped value is an
+        // integration response header value, a static value enclosed within a pair of
+        // single quotes, or a JSON expression from the integration response body"
+        // (`IntegrationResponse$responseParameters`) — both sides of the mapping are held
+        // to the forms `PutIntegrationResponse` holds them to.
+        "responseParameters" => {
+            let name = crate::state::bounded_map_key(patch, 1)?;
+            if matches!(patch.op, PatchOpKind::Add | PatchOpKind::Replace) {
+                if !is_method_response_header(&name) {
+                    return Err(PatchFailure::BadRequest(invalid_response_parameter(&name)));
+                }
+                let value = patch.require_value()?;
+                if !is_integration_response_mapping_value(value) {
+                    return Err(PatchFailure::BadRequest(
+                        invalid_integration_response_mapping(value),
+                    ));
+                }
+            }
+            let mut parameters = crate::state::ordered_map(entry.response_parameters.take());
+            patch_string_map(
+                &mut parameters,
+                patch,
+                name,
+                MAX_COLLECTION_ENTRIES,
+                MAX_STRING_CHARS,
+            )?;
+            entry.response_parameters = crate::state::stored_map(parameters);
+            Ok(())
+        }
+        // "Response templates are represented as a key/value map, with a content-type as
+        // the key and a template as the value"
+        // (`IntegrationResponse$responseTemplates`): the entry's value is a mapping
+        // template, bounded as `PutIntegrationResponse` bounds the same value, and stored
+        // verbatim — nothing in the model constrains its text.
+        "responseTemplates" => {
+            let content_type = crate::state::bounded_map_key(patch, 1)?;
+            let mut templates = crate::state::ordered_map(entry.response_templates.take());
+            patch_string_map(
+                &mut templates,
+                patch,
+                content_type,
+                MAX_COLLECTION_ENTRIES,
+                MAX_TEMPLATE_CHARS,
+            )?;
+            entry.response_templates = crate::state::stored_map(templates);
+            Ok(())
+        }
+        _ => Err(patch.unsupported_path()),
+    }
+}
+
+/// The stored `IntegrationResponse` as THIS operation's output shape. Both are the model's
+/// `IntegrationResponse`, so a stored record is rendered the same way by every reader of
+/// it.
+fn output_of(stored: GetIntegrationResponseOutput) -> UpdateIntegrationResponseOutput {
+    UpdateIntegrationResponseOutput {
+        status_code: stored.status_code,
+        selection_pattern: stored.selection_pattern,
+        response_parameters: stored.response_parameters,
+        response_templates: stored.response_templates,
+        content_handling: stored.content_handling,
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -145,6 +252,37 @@ impl From<UpdateIntegrationResponseErrorModeled> for UpdateIntegrationResponseEr
     fn from(modeled: UpdateIntegrationResponseErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// The modelled failure for a patch this operation cannot apply.
+fn patch_failure(failure: PatchFailure) -> UpdateIntegrationResponseError {
+    match failure {
+        PatchFailure::BadRequest(message) => {
+            UpdateIntegrationResponseErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::NotFound(message) => {
+            UpdateIntegrationResponseErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::Conflict(message) => {
+            UpdateIntegrationResponseErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
+}
+
+/// Refuse a request naming a record that does not exist, with the message this service
+/// shares for that identifier.
+fn not_found(message: &str) -> UpdateIntegrationResponseError {
+    UpdateIntegrationResponseErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }
 
 /// The `UpdateIntegrationResponse` operation.
@@ -183,18 +321,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateIntegrationResponse` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateIntegrationResponseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateIntegrationResponse"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The list is read BEFORE the store lock is taken, so a malformed patch never
+        // reaches the records at all.
+        let patches =
+            crate::state::parse_patches(input.patch_operations.as_ref()).map_err(patch_failure)?;
+
+        let verb = method_key(&input.http_method);
+        let mut store = state.lock();
+
+        let api = store
+            .rest_apis
+            .get_mut(&input.rest_api_id)
+            .ok_or_else(|| not_found(&crate::state::no_such_rest_api(&input.rest_api_id)))?;
+        let resource = api
+            .resources
+            .get_mut(&input.resource_id)
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_RESOURCE))?;
+        let method = resource
+            .methods
+            .get_mut(&verb)
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_METHOD))?;
+        // A method with no integration carries no integration responses either: the
+        // identifiers in the URI name a record that does not exist.
+        let integration = method
+            .integration
+            .as_mut()
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_INTEGRATION))?;
+        // Patched on a COPY: a list whose later op is refused leaves the stored response
+        // untouched, rather than keeping the ops before it.
+        let mut updated = integration
+            .integration_responses
+            .as_ref()
+            .and_then(|responses| responses.get(&input.status_code))
+            .cloned()
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_METHOD_RESPONSE))?;
+
+        for patch in &patches {
+            apply_patch(&mut updated, patch).map_err(patch_failure)?;
+        }
+
+        integration
+            .integration_responses
+            .get_or_insert_with(::std::collections::HashMap::new)
+            .insert(input.status_code.clone(), updated.clone());
+
+        // The stored record IS the model's `IntegrationResponse`, so the update reports it
+        // exactly as `GetIntegrationResponse` will read it back.
+        Ok(output_of(updated))
     }
 }

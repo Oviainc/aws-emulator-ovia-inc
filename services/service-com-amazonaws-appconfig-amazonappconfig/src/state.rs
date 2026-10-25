@@ -25,8 +25,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     Action, AppliedExtension, DeletionProtectionSettings, DeploymentEvent,
-    ExperimentDefinitionSnapshot, ExperimentRunResult, Monitor, Parameter, Treatment,
-    TreatmentInput, TreatmentOverrides, Validator, VendedMetricsSettings,
+    ExperimentDefinitionSnapshot, ExperimentRunEvent, ExperimentRunResult, Monitor, Parameter,
+    Treatment, TreatmentInput, TreatmentOverrides, Validator, VendedMetricsSettings,
 };
 
 pub mod feature_flags;
@@ -121,6 +121,18 @@ pub const GROWTH_EXPONENTIAL: &str = "EXPONENTIAL";
 /// The `ReplicateTo` value meaning the strategy is saved nowhere but AppConfig, from
 /// `REPLICATE_TO_VALUES` in `crate::ops::types`.
 pub const REPLICATE_TO_NONE: &str = "NONE";
+
+/// `ExperimentRunEventType` values this service records on an experiment run's timeline,
+/// from `EXPERIMENT_RUN_EVENT_TYPE_VALUES` in `crate::ops::types` (the model's
+/// `ExperimentRunEventType` enum: `RUN_STARTED` | `EXPOSURE_UPDATED` |
+/// `OVERRIDES_UPDATED` | `RUN_STOPPED`).
+///
+/// Each value names an action a CALL on the run performs, so an entry of that type is on
+/// the timeline only where the call that performs it ran. `RUN_STARTED` is the entry the
+/// start of the run writes; the other three belong to the calls that change a run's
+/// exposure or overrides and to the one that stops it, and are recorded by those
+/// operations, each of which spells its own value where it writes its entry.
+pub const EVENT_RUN_STARTED: &str = "RUN_STARTED";
 
 /// `DeploymentEventType` values this service records, from
 /// `DEPLOYMENT_EVENT_TYPE_VALUES` in `crate::ops::types`.
@@ -663,6 +675,15 @@ const DESCRIPTION_ROLLBACK_COMPLETED: &str = "Deployment rollback completed";
 /// See [`DESCRIPTION_DEPLOYMENT_STARTED`].
 const DESCRIPTION_REVERT_COMPLETED: &str = "Deployment reverted";
 
+/// The description of each `ExperimentRunEvent` this service records.
+///
+/// The model documents the member only as "A description of the event"
+/// (`smithy_query(query="doc",shape="ExperimentRunEvent",member="Description")`), so each
+/// text follows the form of this service's deployment event descriptions
+/// ([`DESCRIPTION_DEPLOYMENT_STARTED`]): the action the entry records, with no trailing
+/// stop.
+const DESCRIPTION_RUN_STARTED: &str = "Experiment run started";
+
 /// How long after it completed a deployment may still be reverted: "AppConfig only
 /// allows a revert within 72 hours of deployment completion", from the model's own
 /// `StopDeployment` documentation. A DOCUMENTED duration, so it keeps its documented
@@ -1046,7 +1067,8 @@ impl ExperimentDefinition {
 /// record was last written; `ended_at` is set only once the run is over, which is also
 /// what moves `status` to [`EXPERIMENT_RUN_DONE`]. A run that is RUNNING stays running
 /// until a call ends it — nothing about it is owed by the clock, so there is nothing to
-/// materialize. `definition_snapshot` is the definition as it stood when the run started.
+/// materialize. `definition_snapshot` is the definition as it stood when the run started,
+/// and `event_log` is the timeline of what has been done to the run since.
 #[derive(Debug, Clone)]
 pub struct ExperimentRun {
     /// The run number, unique within the definition and counted from 1.
@@ -1068,6 +1090,11 @@ pub struct ExperimentRun {
     pub ended_at: Option<SystemTime>,
     pub definition_snapshot: ExperimentDefinitionSnapshot,
     pub tags: HashMap<String, String>,
+    /// This run's timeline, in the order the entries happened: one entry per action a
+    /// call performed on the run, appended as that call performed it. Nothing on it is
+    /// owed by the clock — a run moves only when a call moves it — so the log is written
+    /// only by the calls that act on the run and is never recomputed by a reader.
+    pub event_log: Vec<ExperimentRunEvent>,
 }
 
 impl ExperimentRun {
@@ -1075,6 +1102,48 @@ impl ExperimentRun {
     /// definition conflicts with it.
     pub fn is_active(&self) -> bool {
         self.status == EXPERIMENT_RUN_RUNNING
+    }
+
+    /// Record the first entry on this run's timeline: a caller started the run.
+    ///
+    /// It occurred when the run started, and reports the exposure and the overrides the
+    /// run began with — `ExperimentRunEvent` reports both "at the time of the event"
+    /// (`smithy_query(query="shape",shape="ExperimentRunEvent")`), which for this entry is
+    /// what the start wrote.
+    pub fn record_start_event(&mut self) {
+        self.event_log.push(experiment_run_event(
+            EVENT_RUN_STARTED,
+            TRIGGERED_BY_USER,
+            DESCRIPTION_RUN_STARTED.to_string(),
+            self.started_at,
+            self.exposure_percentage,
+            self.treatment_overrides.clone(),
+        ));
+    }
+}
+
+/// One experiment run event, as the model's `ExperimentRunEvent` shape.
+///
+/// `AssociatedDeployment` is deliberately unset, not overlooked: it names the deployment
+/// an event is associated with, and nothing in this service deploys a configuration on an
+/// experiment run's behalf, so any ARN here would name a deployment no `GetDeployment`
+/// could report.
+fn experiment_run_event(
+    event_type: &str,
+    triggered_by: &str,
+    description: String,
+    occurred_at: SystemTime,
+    exposure_percentage: Option<f32>,
+    treatment_overrides: Option<TreatmentOverrides>,
+) -> ExperimentRunEvent {
+    ExperimentRunEvent {
+        description: Some(description),
+        associated_deployment: None,
+        event_type: Some(event_type.to_string()),
+        occurred_at: Some(to_date_time(occurred_at)),
+        triggered_by: Some(triggered_by.to_string()),
+        exposure_percentage,
+        treatment_overrides,
     }
 }
 
@@ -3288,6 +3357,10 @@ pub const LISTING_HOSTED_CONFIGURATION_VERSIONS: &str = "ListHostedConfiguration
 /// The `kind` a `ListExtensionAssociations` cursor is stamped with, so a token minted by
 /// another listing cannot resume this one. See [`paginate`].
 pub const LISTING_EXTENSION_ASSOCIATIONS: &str = "ListExtensionAssociations";
+
+/// The `kind` a `ListExperimentRunEvents` cursor is stamped with, so a token minted by
+/// another listing cannot resume this one. See [`paginate`].
+pub const LISTING_EXPERIMENT_RUN_EVENTS: &str = "ListExperimentRunEvents";
 
 /// One page of a list operation: the items on it, and the token that resumes the walk
 /// after them (`None` on the last page).

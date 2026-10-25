@@ -85,6 +85,8 @@ mod harness;
 mod merge_branches_fast_forward;
 #[path = "all/merge_branches_squash.rs"]
 mod merge_branches_squash;
+#[path = "all/merge_conflicts.rs"]
+mod merge_conflicts;
 #[path = "all/merge_options.rs"]
 mod merge_options;
 #[path = "all/merge_pull_request_three_way.rs"]

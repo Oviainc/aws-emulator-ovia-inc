@@ -10,10 +10,10 @@
 //! (HTTP 404), and an `ExpectedBucketOwner` that is not the account's answers HTTP 403
 //! `AccessDenied`. Nothing is written: this is a report.
 //!
-//! The write side is `PutBucketIntelligentTieringConfiguration`, implemented in the same
-//! change so what this lists can be put; `GetBucketIntelligentTieringConfiguration` and
-//! `DeleteBucketIntelligentTieringConfiguration` are still the scaffold's 501 and are
-//! their own stub issues.
+//! The write side is `PutBucketIntelligentTieringConfiguration`, so what this lists is what
+//! a put recorded; `GetBucketIntelligentTieringConfiguration` reports ONE configuration by
+//! its own id and `DeleteBucketIntelligentTieringConfiguration` drops one, so what this
+//! lists is also what those two address.
 //!
 //! ## Shape of an operation
 //!
