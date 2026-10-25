@@ -11,7 +11,8 @@
 //! The policy table below is the class the rules are asserted over: the rows
 //! differ in security-service type, in resource-type form (single `ResourceType`
 //! vs a `ResourceTypeList`), in which optional members are present, in tag count
-//! and in policy status. Each rule is asserted on every row.
+//! and in whether they ask for a `PolicyStatus`. Each rule is asserted on every
+//! row.
 //!
 //! The request harness here ([`emulator`], [`call`], [`call_in`], [`error_code`]
 //! and the [`REGION`] / [`ACCOUNT`] constants) is `pub(crate)` so the sibling
@@ -194,12 +195,14 @@ fn cases() -> Vec<Case> {
             ]),
         },
         Case {
-            // A nested PolicyOption, an ExcludeMap, and an explicitly
-            // non-default PolicyStatus. No `ResourceSetIds`: those must name
-            // resource sets that EXIST, which needs an id this static table
-            // cannot know — the `policy_document_validation` suite creates the
-            // sets and asserts both sides of that rule.
-            name: "network-firewall-out-of-admin-scope",
+            // A nested PolicyOption, an ExcludeMap, and a PolicyStatus the
+            // caller is not entitled to set: the service derives that member,
+            // so this is the row where a requested value must not survive. No
+            // `ResourceSetIds`: those must name resource sets that EXIST, which
+            // needs an id this static table cannot know — the
+            // `policy_document_validation` suite creates the sets and asserts
+            // both sides of that rule.
+            name: "network-firewall-with-a-requested-policy-status",
             policy: json!({
                 "PolicyName": "nfw-vpcs",
                 "SecurityServicePolicyData": {
@@ -311,8 +314,10 @@ async fn put_policy_mints_identifiers_and_get_policy_reads_the_stored_policy_bac
             case.name
         );
 
-        // Everything the caller sent survives the round trip, and the service
-        // defaults PolicyStatus to ACTIVE only when the caller sent none.
+        // Everything the caller sent survives the round trip, except the
+        // members the SERVICE owns: the identifiers it mints and the
+        // `PolicyStatus` it derives (the `policy_status_derivation` suite
+        // asserts that rule over the administrative scopes it follows from).
         let (status, got) = call(&router, "GetPolicy", &json!({ "PolicyId": policy_id })).await;
         assert_eq!(
             status, 200,
@@ -335,6 +340,8 @@ async fn put_policy_mints_identifiers_and_get_policy_reads_the_stored_policy_bac
             .policy
             .as_object()
             .expect("the case policy is an object")
+            .iter()
+            .filter(|(member, _)| member.as_str() != "PolicyStatus")
         {
             assert_eq!(
                 stored.get(member),
@@ -344,15 +351,16 @@ async fn put_policy_mints_identifiers_and_get_policy_reads_the_stored_policy_bac
                 stored.get(member)
             );
         }
-        let expected_status = case.policy.get("PolicyStatus").cloned().unwrap_or_else(|| {
-            // `CustomerPolicyStatus` ACTIVE: the administrator can manage and
-            // delete the policy.
-            json!("ACTIVE")
-        });
+        // These policies are administered by the organisation's default
+        // administrator, whose scope is the whole organisation, so every row —
+        // including the one that SENT `OUT_OF_ADMIN_SCOPE` — is reported
+        // `ACTIVE`: the administrator can manage and delete it.
         assert_eq!(
-            stored["PolicyStatus"], expected_status,
-            "case {:?}: expected PolicyStatus {expected_status}, got {}",
-            case.name, stored["PolicyStatus"]
+            stored["PolicyStatus"],
+            json!("ACTIVE"),
+            "case {:?}: expected the derived PolicyStatus ACTIVE, got {}",
+            case.name,
+            stored["PolicyStatus"]
         );
     }
 }
