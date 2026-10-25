@@ -10,8 +10,9 @@
 //! The rules under test, each asserted over a TABLE of inputs rather than one case:
 //!
 //! * what `EnableControl` persists is what `ListEnabledControls` and
-//!   `GetEnabledControl` report, for any control, any target, any parameter list and any
-//!   tag map — and the two reporting operations agree, because they read one record;
+//!   `GetEnabledControl` report, for any catalogued control, any organizational-unit
+//!   target, any parameter list that control declares and any tag map — and the two
+//!   reporting operations agree, because they read one record;
 //! * an enablement is `UNDER_CHANGE` with `UNKNOWN` drift until the clock makes it due,
 //!   then `SUCCEEDED` and `IN_SYNC`, and reading it never changes it;
 //! * the listing is the stored set narrowed by `targetIdentifier` and by EVERY member of
@@ -33,8 +34,14 @@ use crate::landing_zone_lifecycle::{
     call, emulator, is_operation_identifier, manifest_governing, past_the_settle_span, Answer,
 };
 
-/// The `ControlIdentifier` of a control, shaped like the ARNs AWS Control Tower names
-/// its controls with and inside the modelled pattern `^arn:aws[0-9a-zA-Z_\-:\/]+$`.
+/// The `ControlIdentifier` of a control, as AWS Control Tower names its controls: the
+/// form `arn:aws:controltower:<region>::control/<CONTROL_NAME>`, inside the modelled
+/// pattern `^arn:aws[0-9a-zA-Z_\-:\/]+$`.
+///
+/// `name` must be a control this emulator's catalog publishes
+/// (`service_..._awscontroltowerapis::state::CONTROL_CATALOG`), because `EnableControl`
+/// resolves the identifier against it; `tests/all/enable_control_validation.rs` is where
+/// the identifiers it refuses are asserted.
 pub(crate) fn control(name: &str) -> String {
     format!("arn:aws:controltower:us-west-2::control/{name}")
 }
@@ -42,11 +49,6 @@ pub(crate) fn control(name: &str) -> String {
 /// An organizational-unit `TargetIdentifier`.
 pub(crate) fn ou(id: &str) -> String {
     format!("arn:aws:organizations::000000000000:ou/o-emulatororg/ou-abcd-{id}")
-}
-
-/// An account `TargetIdentifier` — the other target type the member's docs name.
-pub(crate) fn account(id: &str) -> String {
-    format!("arn:aws:organizations::000000000000:account/o-emulatororg/{id}")
 }
 
 /// The ARN prefix every enabled control this emulator mints carries: this service's ARN
@@ -153,22 +155,20 @@ async fn an_enabled_control_round_trips_through_list_and_get() {
             serde_json::Value::Null,
         ),
         (
-            "one string parameter and tags, on an ACCOUNT target",
-            control("AWS-GR_RESTRICT_ROOT_USER"),
-            account("123456789012"),
+            "one declared parameter and tags, on another OU",
+            control("AWS-GR_REGION_DENY"),
+            ou("1112"),
             serde_json::json!([{ "key": "AllowedRegions", "value": "us-west-2" }]),
             serde_json::json!({ "owner": "platform", "env": "test" }),
         ),
         (
-            "parameters spanning every JSON document type",
-            control("AWS-GR_AUDIT_BUCKET_POLICY_CHANGES_PROHIBITED"),
+            "every parameter the control declares, spanning the document types",
+            control("AWS-GR_REGION_DENY"),
             ou("2222"),
             serde_json::json!([
-                { "key": "text", "value": "a string" },
-                { "key": "count", "value": 7 },
-                { "key": "enabled", "value": true },
-                { "key": "list", "value": ["us-west-2", "eu-west-1"] },
-                { "key": "nested", "value": { "inner": { "deep": [1, 2, 3] } } }
+                { "key": "AllowedRegions", "value": ["us-west-2", "eu-west-1"] },
+                { "key": "ExemptedPrincipalArns", "value": "arn:aws:iam::000000000000:role/r" },
+                { "key": "ExemptedActions", "value": { "inner": { "deep": [1, 2, 3] } } }
             ]),
             serde_json::Value::Null,
         ),
@@ -361,7 +361,7 @@ async fn the_listing_is_narrowed_by_target_and_by_every_filter_member() {
     let encrypted = control("AWS-GR_ENCRYPTED_VOLUMES");
     let root_user = control("AWS-GR_RESTRICT_ROOT_USER");
     let first_ou = ou("5555");
-    let second_target = account("210987654321");
+    let second_target = ou("5556");
     let empty_ou = ou("6666");
 
     let (on_first_ou, _) = enable(
@@ -436,7 +436,7 @@ async fn the_listing_is_narrowed_by_target_and_by_every_filter_member() {
         ),
         (
             "filter.controlIdentifiers of a control nothing enabled",
-            serde_json::json!({ "filter": { "controlIdentifiers": [control("AWS-GR_ABSENT")] } }),
+            serde_json::json!({ "filter": { "controlIdentifiers": [control("AWS-GR_RDS_STORAGE_ENCRYPTED")] } }),
             none.clone(),
         ),
         // EnablementStatus value set: SUCCEEDED | FAILED | UNDER_CHANGE.
@@ -550,12 +550,21 @@ async fn the_listing_is_narrowed_by_target_and_by_every_filter_member() {
 async fn a_paginated_walk_returns_every_control_exactly_once() {
     let router = emulator();
     let target = ou("7777");
+    // Six catalogued controls on one target: one enablement per control/target pair.
+    let controls = [
+        "AWS-GR_ENCRYPTED_VOLUMES",
+        "AWS-GR_RESTRICT_ROOT_USER",
+        "AWS-GR_RESTRICTED_COMMON_PORTS",
+        "AWS-GR_RDS_STORAGE_ENCRYPTED",
+        "AWS-GR_EC2_VOLUME_INUSE_CHECK",
+        "AWS-GR_DISALLOW_VPN_CONNECTIONS",
+    ];
     let mut expected: Vec<String> = Vec::new();
-    for index in 0..6 {
+    for name in controls {
         let (arn, _) = enable(
             &router,
             serde_json::json!({
-                "controlIdentifier": control(&format!("AWS-GR_CONTROL_{index}")),
+                "controlIdentifier": control(name),
                 "targetIdentifier": target,
             }),
         )
@@ -676,7 +685,7 @@ async fn a_control_is_enabled_at_most_once_per_target() {
         &router,
         serde_json::json!({
             "controlIdentifier": encrypted,
-            "targetIdentifier": account("111122223333"),
+            "targetIdentifier": ou("8889"),
         }),
     )
     .await;
@@ -771,7 +780,7 @@ async fn a_request_the_state_cannot_satisfy_is_refused_with_its_modeled_error() 
             "parameters carrying the same key twice",
             "/enable-control",
             serde_json::json!({
-                "controlIdentifier": control("AWS-GR_RESTRICT_ROOT_USER"),
+                "controlIdentifier": control("AWS-GR_REGION_DENY"),
                 "targetIdentifier": ou("9999"),
                 "parameters": [
                     { "key": "AllowedRegions", "value": "us-west-2" },
@@ -824,27 +833,33 @@ async fn a_request_the_state_cannot_satisfy_is_refused_with_its_modeled_error() 
     );
 }
 
-/// RULE: `parameters` carries no modelled length, so `EnableControl` bounds both the
-/// count and the weight a caller may send: a list at either cap is accepted and one past
-/// it is refused with the operation's own `ValidationException`, naming the bound.
+/// RULE: an `EnabledControlParameter$value` is an unconstrained `Document`, so
+/// `EnableControl` bounds the WEIGHT of the configuration a caller may send: a list inside
+/// the cap is accepted and one past it is refused with the operation's own
+/// `ValidationException`, naming the bound. The entry COUNT needs no cap of its own: a key
+/// outside the control's declared set is refused anyway and each declared key may be given
+/// once, which `tests/all/enable_control_validation.rs` asserts.
 ///
-/// The rows sit on each cap and past it, and the weight rows vary the shape the weight
-/// is carried in (one long value, and many entries) so the bound is on the payload
-/// rather than on a particular document.
+/// The rows sit inside the cap and past it, and vary the shape the weight is carried in
+/// (one long value, and several declared keys) so the bound is on the payload rather than
+/// on a particular document.
 #[tokio::test]
-async fn the_parameter_list_is_bounded_in_count_and_in_weight() {
-    use service_com_amazonaws_controltower_awscontroltowerapis::state::{
-        MAX_ENABLED_CONTROL_PARAMETERS, MAX_ENABLED_CONTROL_PARAMETER_BYTES,
-    };
+async fn the_parameter_list_is_bounded_in_weight() {
+    use service_com_amazonaws_controltower_awscontroltowerapis::state::MAX_ENABLED_CONTROL_PARAMETER_BYTES;
 
-    /// `count` parameters with distinct keys, each carrying a string of `value_len`
-    /// bytes.
+    /// A configuration carrying the first `count` parameters the Region deny control
+    /// declares, each with a string value of `value_len` bytes.
     fn parameters(count: usize, value_len: usize) -> serde_json::Value {
+        // The keys that control declares, from
+        // `service_..._awscontroltowerapis::state::CONTROL_CATALOG`.
+        let declared = ["AllowedRegions", "ExemptedPrincipalArns", "ExemptedActions"];
         serde_json::Value::Array(
-            (0..count)
-                .map(|index| {
+            declared
+                .iter()
+                .take(count)
+                .map(|key| {
                     serde_json::json!({
-                        "key": format!("key-{index}"),
+                        "key": key,
                         "value": "x".repeat(value_len)
                     })
                 })
@@ -854,18 +869,13 @@ async fn the_parameter_list_is_bounded_in_count_and_in_weight() {
 
     let cases: Vec<(&str, serde_json::Value, bool)> = vec![
         (
-            "exactly the parameter-count cap",
-            parameters(MAX_ENABLED_CONTROL_PARAMETERS, 1),
+            "one parameter whose value sits inside the weight cap",
+            parameters(1, MAX_ENABLED_CONTROL_PARAMETER_BYTES - 1024),
             true,
         ),
         (
-            "one parameter past the count cap",
-            parameters(MAX_ENABLED_CONTROL_PARAMETERS + 1, 1),
-            false,
-        ),
-        (
-            "one parameter whose value sits inside the weight cap",
-            parameters(1, MAX_ENABLED_CONTROL_PARAMETER_BYTES - 1024),
+            "every declared parameter, together inside the weight cap",
+            parameters(3, MAX_ENABLED_CONTROL_PARAMETER_BYTES / 4),
             true,
         ),
         (
@@ -874,8 +884,8 @@ async fn the_parameter_list_is_bounded_in_count_and_in_weight() {
             false,
         ),
         (
-            "a list inside the count cap whose values together pass the weight cap",
-            parameters(100, MAX_ENABLED_CONTROL_PARAMETER_BYTES / 10),
+            "declared parameters whose values together pass the weight cap",
+            parameters(3, MAX_ENABLED_CONTROL_PARAMETER_BYTES / 2),
             false,
         ),
     ];
@@ -886,7 +896,7 @@ async fn the_parameter_list_is_bounded_in_count_and_in_weight() {
             &router,
             "/enable-control",
             serde_json::json!({
-                "controlIdentifier": control("AWS-GR_ENCRYPTED_VOLUMES"),
+                "controlIdentifier": control("AWS-GR_REGION_DENY"),
                 "targetIdentifier": ou("1212"),
                 "parameters": parameters,
             }),

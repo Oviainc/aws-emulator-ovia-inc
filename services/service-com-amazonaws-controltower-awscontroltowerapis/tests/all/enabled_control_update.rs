@@ -40,7 +40,7 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::enabled_control_lifecycle::{account, control, details, enable, entries, ou};
+use crate::enabled_control_lifecycle::{control, details, enable, entries, ou};
 use crate::landing_zone_lifecycle::{
     call, emulator, is_operation_identifier, past_the_settle_span, Answer,
 };
@@ -174,64 +174,73 @@ struct Row {
 /// count on either side of the update (none to one, one to many, many to one, one to
 /// none), the `Document` kind a value carries ("a key/value pair, where Key is of type
 /// String and Value is of type Document"), and whether a key is added, dropped, kept or
-/// re-valued. Every row names its own control/target pair, because a control is enabled at
-/// most once per target.
+/// re-valued. A configuration names only keys its control declares, so the rows that carry
+/// one name the control this emulator's catalog publishes with parameters; every row names
+/// its own control/target pair, because a control is enabled at most once per target.
 fn rows() -> Vec<Row> {
     vec![
         Row {
             case: "a control configured with nothing is given one parameter",
-            control_identifier: control("AWS-GR_ENCRYPTED_VOLUMES"),
+            control_identifier: control("AWS-GR_REGION_DENY"),
             target_identifier: ou("up01"),
             initial: None,
             requested: serde_json::json!([{ "key": "AllowedRegions", "value": "us-west-2" }]),
         },
         Row {
-            case: "one parameter grows into a configuration of every document kind",
-            control_identifier: control("AWS-GR_RESTRICT_ROOT_USER"),
+            case: "one parameter grows into a configuration of every declared key",
+            control_identifier: control("AWS-GR_REGION_DENY"),
             target_identifier: ou("up02"),
-            initial: Some(serde_json::json!([{ "key": "text", "value": "before" }])),
+            initial: Some(
+                serde_json::json!([{ "key": "AllowedRegions", "value": "before" }]),
+            ),
             requested: serde_json::json!([
-                { "key": "text", "value": "after" },
-                { "key": "count", "value": 7 },
-                { "key": "on", "value": true },
-                { "key": "regions", "value": ["us-west-2", "eu-west-1"] },
-                { "key": "nested", "value": { "inner": { "deep": [1, 2, 3] } } }
+                { "key": "AllowedRegions", "value": ["us-west-2", "eu-west-1"] },
+                { "key": "ExemptedPrincipalArns", "value": "arn:aws:iam::000000000000:role/r" },
+                { "key": "ExemptedActions", "value": { "inner": { "deep": [1, 2, 3] } } }
             ]),
         },
         Row {
             case: "a configuration of several keys is narrowed to one",
-            control_identifier: control("AWS-GR_MFA_ENABLED_FOR_IAM_CONSOLE_ACCESS"),
-            target_identifier: account("123456789012"),
+            control_identifier: control("AWS-GR_REGION_DENY"),
+            target_identifier: ou("up06"),
             initial: Some(serde_json::json!([
-                { "key": "first", "value": 1 },
-                { "key": "second", "value": "two" },
-                { "key": "third", "value": [true, false] }
+                { "key": "AllowedRegions", "value": 1 },
+                { "key": "ExemptedPrincipalArns", "value": "two" },
+                { "key": "ExemptedActions", "value": [true, false] }
             ])),
-            requested: serde_json::json!([{ "key": "second", "value": "two and a half" }]),
+            requested: serde_json::json!([
+                { "key": "ExemptedPrincipalArns", "value": "two and a half" }
+            ]),
         },
         Row {
             case: "an empty configuration clears the one applied",
-            control_identifier: control("AWS-GR_AUDIT_BUCKET_POLICY_CHANGES_PROHIBITED"),
+            control_identifier: control("AWS-GR_REGION_DENY"),
             target_identifier: ou("up03"),
-            initial: Some(serde_json::json!([{ "key": "on", "value": true }])),
+            initial: Some(serde_json::json!([{ "key": "ExemptedActions", "value": true }])),
             requested: serde_json::json!([]),
         },
         Row {
             case: "a value is replaced by one of another document kind",
-            control_identifier: control("AWS-GR_RESTRICTED_COMMON_PORTS"),
+            control_identifier: control("AWS-GR_REGION_DENY"),
             target_identifier: ou("up04"),
-            initial: Some(serde_json::json!([{ "key": "on", "value": true }])),
+            initial: Some(serde_json::json!([{ "key": "ExemptedActions", "value": true }])),
             requested: serde_json::json!([
-                { "key": "on", "value": { "enabled": false, "regions": ["us-west-2"] } }
+                {
+                    "key": "ExemptedActions",
+                    "value": { "enabled": false, "regions": ["us-west-2"] }
+                }
             ]),
         },
         Row {
             case: "a control enabled with an empty list is given a configuration",
-            control_identifier: control("AWS-GR_DETECT_CLOUDTRAIL_ENABLED_ON_SHARED_ACCOUNTS"),
+            control_identifier: control("AWS-GR_REGION_DENY"),
             target_identifier: ou("up05"),
             initial: Some(serde_json::json!([])),
             requested: serde_json::json!([
-                { "key": "ExemptedPrincipalArns", "value": ["arn:aws:iam::123456789012:role/r"] }
+                {
+                    "key": "ExemptedPrincipalArns",
+                    "value": ["arn:aws:iam::123456789012:role/r"]
+                }
             ]),
         },
     ]
@@ -444,30 +453,30 @@ async fn an_update_to_the_configuration_already_carried_is_refused() {
         (
             "the configured parameters in another order, which is the same configuration",
             Some(serde_json::json!([
-                { "key": "first", "value": 1 },
-                { "key": "second", "value": "two" },
-                { "key": "third", "value": true }
+                { "key": "AllowedRegions", "value": 1 },
+                { "key": "ExemptedPrincipalArns", "value": "two" },
+                { "key": "ExemptedActions", "value": true }
             ])),
             serde_json::json!([
-                { "key": "third", "value": true },
-                { "key": "first", "value": 1 },
-                { "key": "second", "value": "two" }
+                { "key": "ExemptedActions", "value": true },
+                { "key": "AllowedRegions", "value": 1 },
+                { "key": "ExemptedPrincipalArns", "value": "two" }
             ]),
             serde_json::json!([
-                { "key": "third", "value": true },
-                { "key": "first", "value": 1 }
+                { "key": "ExemptedActions", "value": true },
+                { "key": "AllowedRegions", "value": 1 }
             ]),
         ),
         (
             "a nested document repeated exactly",
             Some(serde_json::json!([
-                { "key": "nested", "value": { "inner": { "deep": [1, 2, 3] } } }
+                { "key": "ExemptedActions", "value": { "inner": { "deep": [1, 2, 3] } } }
             ])),
             serde_json::json!([
-                { "key": "nested", "value": { "inner": { "deep": [1, 2, 3] } } }
+                { "key": "ExemptedActions", "value": { "inner": { "deep": [1, 2, 3] } } }
             ]),
             serde_json::json!([
-                { "key": "nested", "value": { "inner": { "deep": [1, 2, 3, 4] } } }
+                { "key": "ExemptedActions", "value": { "inner": { "deep": [1, 2, 3, 4] } } }
             ]),
         ),
     ];
@@ -476,7 +485,7 @@ async fn an_update_to_the_configuration_already_carried_is_refused() {
         let router = emulator();
         let (arn, enable_operation) = enable_with(
             &router,
-            &control("AWS-GR_ENCRYPTED_VOLUMES"),
+            &control("AWS-GR_REGION_DENY"),
             &ou(&format!("sa{index:02}")),
             initial.clone(),
         )
@@ -528,27 +537,32 @@ async fn an_update_to_the_configuration_already_carried_is_refused() {
     }
 }
 
-/// RULE: the bound on an enabled control's parameter list is one rule, applied wherever a
-/// configuration is supplied: a list at either published cap is accepted, and one past a
-/// cap or repeating a key is refused with `ValidationException` (400) and writes nothing.
+/// RULE: the bound on an enabled control's configuration is one rule, applied wherever a
+/// configuration is supplied: a list inside the published weight cap, naming only keys the
+/// control declares, is accepted, and one past the cap, naming an undeclared key or
+/// repeating a key is refused with `ValidationException` (400) and writes nothing.
 ///
-/// The rows sit on each cap and past it, vary the shape the weight is carried in (one long
-/// value, and many entries), and repeat a key — the case the caps themselves do not cover.
-/// The caps come from `service_..._awscontroltowerapis::state`, which is where this
-/// emulator publishes them.
+/// The rows sit inside the cap and past it, vary the shape the weight is carried in (one
+/// long value, and several declared keys), name a key the control does not declare and
+/// repeat a key — the cases the cap itself does not cover. The cap comes from
+/// `service_..._awscontroltowerapis::state`, which is where this emulator publishes it.
 #[tokio::test]
 async fn the_requested_configuration_is_bounded_the_same_way_an_enablement_is() {
-    use service_com_amazonaws_controltower_awscontroltowerapis::state::{
-        MAX_ENABLED_CONTROL_PARAMETERS, MAX_ENABLED_CONTROL_PARAMETER_BYTES,
-    };
+    use service_com_amazonaws_controltower_awscontroltowerapis::state::MAX_ENABLED_CONTROL_PARAMETER_BYTES;
 
-    /// `count` parameters with distinct keys, each carrying a string of `value_len` bytes.
+    /// A configuration carrying the first `count` parameters the Region deny control
+    /// declares, each with a string value of `value_len` bytes.
     fn parameters(count: usize, value_len: usize) -> serde_json::Value {
+        // The keys that control declares, from
+        // `service_..._awscontroltowerapis::state::CONTROL_CATALOG`.
+        let declared = ["AllowedRegions", "ExemptedPrincipalArns", "ExemptedActions"];
         serde_json::Value::Array(
-            (0..count)
-                .map(|index| {
+            declared
+                .iter()
+                .take(count)
+                .map(|key| {
                     serde_json::json!({
-                        "key": format!("key-{index}"),
+                        "key": key,
                         "value": "x".repeat(value_len)
                     })
                 })
@@ -558,18 +572,13 @@ async fn the_requested_configuration_is_bounded_the_same_way_an_enablement_is() 
 
     let cases: Vec<(&str, serde_json::Value, bool)> = vec![
         (
-            "exactly the parameter-count cap",
-            parameters(MAX_ENABLED_CONTROL_PARAMETERS, 1),
+            "one parameter whose value sits inside the weight cap",
+            parameters(1, MAX_ENABLED_CONTROL_PARAMETER_BYTES - 1024),
             true,
         ),
         (
-            "one parameter past the count cap",
-            parameters(MAX_ENABLED_CONTROL_PARAMETERS + 1, 1),
-            false,
-        ),
-        (
-            "one parameter whose value sits inside the weight cap",
-            parameters(1, MAX_ENABLED_CONTROL_PARAMETER_BYTES - 1024),
+            "every declared parameter, together inside the weight cap",
+            parameters(3, MAX_ENABLED_CONTROL_PARAMETER_BYTES / 4),
             true,
         ),
         (
@@ -578,8 +587,13 @@ async fn the_requested_configuration_is_bounded_the_same_way_an_enablement_is() 
             false,
         ),
         (
-            "a list inside the count cap whose values together pass the weight cap",
-            parameters(100, MAX_ENABLED_CONTROL_PARAMETER_BYTES / 10),
+            "declared parameters whose values together pass the weight cap",
+            parameters(3, MAX_ENABLED_CONTROL_PARAMETER_BYTES / 2),
+            false,
+        ),
+        (
+            "a key the control does not declare",
+            serde_json::json!([{ "key": "NoSuchParameter", "value": true }]),
             false,
         ),
         (
@@ -598,9 +612,9 @@ async fn the_requested_configuration_is_bounded_the_same_way_an_enablement_is() 
         // for repeating the configured one.
         let (arn, enable_operation) = enable_with(
             &router,
-            &control("AWS-GR_ENCRYPTED_VOLUMES"),
+            &control("AWS-GR_REGION_DENY"),
             &ou(&format!("bd{index:02}")),
-            Some(serde_json::json!([{ "key": "seed", "value": "configured" }])),
+            Some(serde_json::json!([{ "key": "ExemptedActions", "value": "configured" }])),
         )
         .await;
         tokio::time::sleep(past_the_settle_span()).await;
@@ -634,7 +648,7 @@ async fn the_requested_configuration_is_bounded_the_same_way_an_enablement_is() 
                 ),
                 (
                     configuration(&serde_json::json!([
-                        { "key": "seed", "value": "configured" }
+                        { "key": "ExemptedActions", "value": "configured" }
                     ])),
                     Some(enable_operation.as_str()),
                 ),
@@ -656,9 +670,9 @@ async fn an_update_overlapping_an_operation_in_flight_is_a_conflict() {
         let router = emulator();
         let (arn, _) = enable_with(
             &router,
-            &control("AWS-GR_ENCRYPTED_VOLUMES"),
+            &control("AWS-GR_REGION_DENY"),
             &ou(&format!("cf{}", u8::from(start_a_second_operation))),
-            Some(serde_json::json!([{ "key": "stage", "value": "enabled" }])),
+            Some(serde_json::json!([{ "key": "AllowedRegions", "value": "enabled" }])),
         )
         .await;
 
@@ -667,7 +681,7 @@ async fn an_update_overlapping_an_operation_in_flight_is_a_conflict() {
             let first = update(
                 &router,
                 &arn,
-                serde_json::json!([{ "key": "stage", "value": "first update" }]),
+                serde_json::json!([{ "key": "AllowedRegions", "value": "first update" }]),
             )
             .await;
             assert_eq!(
@@ -677,7 +691,7 @@ async fn an_update_overlapping_an_operation_in_flight_is_a_conflict() {
             );
         }
 
-        let overlapping = serde_json::json!([{ "key": "stage", "value": "overlapping" }]);
+        let overlapping = serde_json::json!([{ "key": "AllowedRegions", "value": "overlapping" }]);
         let refused = update(&router, &arn, overlapping.clone()).await;
         assert_eq!(
             (refused.status, refused.error_code.as_deref()),
@@ -726,9 +740,9 @@ async fn an_identifier_no_enabled_control_matches_is_not_found() {
     let router = emulator();
     let (arn, enable_operation) = enable_with(
         &router,
-        &control("AWS-GR_ENCRYPTED_VOLUMES"),
+        &control("AWS-GR_REGION_DENY"),
         &ou("nf01"),
-        Some(serde_json::json!([{ "key": "keep", "value": "me" }])),
+        Some(serde_json::json!([{ "key": "AllowedRegions", "value": "me" }])),
     )
     .await;
     tokio::time::sleep(past_the_settle_span()).await;
@@ -752,7 +766,7 @@ async fn an_identifier_no_enabled_control_matches_is_not_found() {
         ),
         (
             "the control ARN rather than the enablement's",
-            control("AWS-GR_ENCRYPTED_VOLUMES"),
+            control("AWS-GR_REGION_DENY"),
         ),
         ("the target ARN rather than the enablement's", ou("nf01")),
     ];
@@ -797,7 +811,7 @@ async fn an_identifier_no_enabled_control_matches_is_not_found() {
             last_operation(&untouched),
         ),
         (
-            configuration(&serde_json::json!([{ "key": "keep", "value": "me" }])),
+            configuration(&serde_json::json!([{ "key": "AllowedRegions", "value": "me" }])),
             Some("SUCCEEDED"),
             Some(enable_operation.as_str()),
         ),
