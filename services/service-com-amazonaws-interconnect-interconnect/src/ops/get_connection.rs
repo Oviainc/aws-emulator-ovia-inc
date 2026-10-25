@@ -126,7 +126,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetConnectionErrorModeled::InterconnectServerException(
                 InterconnectServerException {
@@ -141,12 +141,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already made due (`deleting` -> `deleted`, `updating` -> the state the
         // connection came from), which was owed at this instant whether or not
         // anybody called. Nothing else about the record changes on a read.
+        //
+        // The lookup is scoped to the Region this request was signed for: a
+        // connection belongs to the Region it was created in, so one created
+        // through another Region's endpoint is not a connection this endpoint
+        // holds.
         let found = {
             let mut store = state.lock();
             store.materialise_due_transitions(::std::time::Instant::now());
             store
-                .connections
-                .get(&input.identifier)
+                .connection_in(&region, &input.identifier)
                 .map(|stored| stored.connection.clone())
         };
 
