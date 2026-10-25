@@ -47,6 +47,8 @@ mod scraper_deletion;
 mod scraper_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/taggable_resource_kinds.rs"]
+mod taggable_resource_kinds;
 #[path = "all/wire_fidelity.rs"]
 mod wire_fidelity;
 #[path = "all/workspace_configuration.rs"]

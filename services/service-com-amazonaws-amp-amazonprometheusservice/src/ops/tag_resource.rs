@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! IMPLEMENTED: merges tags into the stored workspace the `resourceArn` names — a new
-//! key is appended, an existing key's value replaced. An ARN that resolves to no live
+//! IMPLEMENTED: merges tags into the stored resource the `resourceArn` names — whatever
+//! kind of taggable resource that is (`crate::state::TaggedResource`) — so a new key is
+//! appended and an existing key's value replaced. An ARN that resolves to no live
 //! resource is refused with `NotFoundException` (404), the code aps answers on this
 //! ARN-addressed path (`crate::state::arn_not_found`).
 //!
@@ -178,9 +179,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialize_due(::std::time::SystemTime::now());
 
-        let resolved = store.workspace_id_of_arn(&input.resource_arn);
-        let Some(workspace) = resolved.and_then(|workspace_id| store.workspaces.get_mut(&workspace_id))
-        else {
+        // The ARN names ONE of the service's taggable resources, and the merge is applied
+        // to that resource's own stored tag map — the same map its readers report.
+        let Some(tags) = store.tags_of_arn_mut(&input.resource_arn) else {
             // An ARN that resolves to no live resource: 404 with the code aps answers on
             // the ARN-addressed tagging path, whatever resource type the ARN names (see
             // `crate::state::arn_not_found`).
@@ -194,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resulting_tags = input
             .tags
             .keys()
-            .chain(workspace.tags.keys())
+            .chain(tags.keys())
             .collect::<std::collections::BTreeSet<_>>()
             .len();
         if resulting_tags > crate::state::TAGS_PER_RESOURCE_LIMIT {
@@ -215,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already associated with the resource, the new tag value that you specify
         // replaces the previous value for that tag."
         for (key, value) in input.tags {
-            workspace.tags.insert(key, value);
+            tags.insert(key, value);
         }
 
         Ok(TagResourceOutput {})
