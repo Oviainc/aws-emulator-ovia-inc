@@ -2427,11 +2427,16 @@ pub struct ProductRestEndpointPage {
     /// creating request addressed: an ARN names the Region its resource was created in,
     /// so it cannot be rebuilt per read from whatever Region a later caller signs for.
     pub product_rest_endpoint_page_arn: String,
+    /// The Region the creating request addressed, kept beside the ARN that names it: a
+    /// later WRITE that re-resolves this page's display content derives the identified
+    /// endpoint's invoke URL in the page's OWN Region, rather than in whatever Region the
+    /// writing caller happened to sign for.
+    pub region: String,
     /// The REST endpoint this page documents, as the request identified it.
     pub rest_endpoint_identifier: wire::RestEndpointIdentifier,
-    /// The display content this page reports, resolved ONCE by
-    /// [`resolve_endpoint_display_content`] rather than per read, so the endpoint it
-    /// names does not follow the Region a later reader signs for.
+    /// The display content this page reports, resolved by
+    /// [`resolve_endpoint_display_content`] at every WRITE rather than per read, so the
+    /// endpoint it names does not follow the Region a later reader signs for.
     pub display_content: wire::EndpointDisplayContentResponse,
     /// "The timestamp when the product REST endpoint page was last modified" — the
     /// creation instant until something rewrites the record.
@@ -2446,7 +2451,8 @@ pub struct ProductRestEndpointPage {
     pub available_at: Instant,
 }
 
-/// The members `CreateProductRestEndpointPage` and `GetProductRestEndpointPage` each
+/// The members `CreateProductRestEndpointPage`, `GetProductRestEndpointPage` and
+/// `UpdateProductRestEndpointPage` each
 /// report for one page — the Get response carries the create's members plus
 /// `RawDisplayContent` — so [`ProductRestEndpointPage::to_wire`] projects the record
 /// ONCE and every reader serializes that projection rather than assembling its own.
