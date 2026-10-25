@@ -804,3 +804,268 @@ async fn refused_tags_store_no_configuration() {
         listed_configurations(&listed.body)
     );
 }
+
+/// `DeleteHsmConfiguration` for one identifier.
+async fn delete_one(emulator: &Emulator, identifier: &str) -> Answer {
+    emulator
+        .call(
+            "DeleteHsmConfiguration",
+            &[("HsmConfigurationIdentifier", identifier)],
+        )
+        .await
+}
+
+/// A delete removes the configuration it names: every later read reports it
+/// absent, the secret-bearing values it held leave the store with it, and the
+/// configurations it did not name are untouched, in creation order.
+///
+/// The rows differ along everything the rule generalises over: the form and size
+/// of the identifier, whether the configuration carries tags, and the position
+/// the record holds in the account's creation order (first, middle, last).
+#[tokio::test]
+async fn a_delete_removes_the_configuration_it_names() {
+    let emulator = Emulator::new();
+
+    let rows = vec![
+        simple_case("a plain identifier, deleted first", "hsm-delete-one"),
+        CreateCase {
+            case: "a tagged configuration in the middle of the order",
+            identifier: "hsm-2-delete-01".to_string(),
+            description: "tagged HSM connection".to_string(),
+            ip_address: "198.51.100.8",
+            partition_name: "partition-delete-2",
+            certificate: "-----BEGIN CERTIFICATE-----\nR0hJ\n-----END CERTIFICATE-----\n"
+                .to_string(),
+            password: "delete-secret-2",
+            tags: vec![("owner", "admin"), ("environment", "test")],
+        },
+        simple_case("a mixed-case identifier", "HSM-Delete-Mixed"),
+        {
+            let mut long = simple_case("a long identifier, deleted last", "placeholder");
+            long.identifier = identifier_of_length(64);
+            long
+        },
+    ];
+
+    for row in &rows {
+        assert_eq!(
+            create_configuration(&emulator, row).await.status,
+            200,
+            "case {}: the create must be served before the delete is exercised",
+            row.case
+        );
+    }
+
+    // Deleting in creation order leaves, after each row, exactly the rows that
+    // follow it — so the delete removes ONE record and reorders nothing.
+    for (ordinal, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let deleted = delete_one(&emulator, &row.identifier).await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {case}: expected the delete to be served with 200, got {} with body {}",
+            deleted.status, deleted.body
+        );
+        assert_eq!(
+            deleted.error_code(),
+            None,
+            "case {case}: expected no fault in the delete's answer, got body {}",
+            deleted.body
+        );
+
+        // Absent for every later read, and the store holds neither of the two
+        // secret-bearing values any more.
+        let read = describe_one(&emulator, &row.identifier).await;
+        assert_refused(case, &read, 400, "HsmConfigurationNotFoundFault");
+        assert!(
+            read.text("Message")
+                .is_some_and(|message| message.contains(&row.identifier)),
+            "case {case}: expected the read's message to name {}, got {:?}",
+            row.identifier,
+            read.text("Message")
+        );
+        let secrets = stored_secrets(&emulator, &row.identifier);
+        assert_eq!(
+            secrets, None,
+            "case {case}: expected the stored certificate and password to be gone, got {secrets:?}"
+        );
+
+        // A second delete of the same identifier names no configuration, so it
+        // is refused exactly as a delete of one that never existed.
+        let again = delete_one(&emulator, &row.identifier).await;
+        assert_refused(case, &again, 400, "HsmConfigurationNotFoundFault");
+
+        let expected_rest: Vec<String> = rows[ordinal + 1..]
+            .iter()
+            .map(|rest| rest.identifier.clone())
+            .collect();
+        let listed = emulator.call("DescribeHsmConfigurations", &[]).await;
+        assert_eq!(
+            listed_configurations(&listed.body),
+            expected_rest,
+            "case {case}: expected the remaining account to be {expected_rest:?}, got {:?}",
+            listed_configurations(&listed.body)
+        );
+    }
+}
+
+/// An `HsmConfigurationIdentifier` that names no configuration is refused by the
+/// delete, and the configurations the account does hold are untouched.
+///
+/// The rows differ along how the requested identifier misses: a name nothing
+/// resembles, a case variant of a stored one, a prefix of it and a name carrying
+/// one extra character — the identifier is compared exactly as it was stored.
+#[tokio::test]
+async fn deleting_an_identifier_that_names_no_configuration_is_refused() {
+    let emulator = Emulator::new();
+
+    let present = simple_case("the stored configuration", "hsm-present");
+    assert_eq!(
+        create_configuration(&emulator, &present).await.status,
+        200,
+        "the stored configuration must be created before the misses are exercised"
+    );
+
+    for (case, missing) in [
+        ("an identifier nothing resembles", "hsm-absent"),
+        ("an upper-case variant of a stored identifier", "HSM-PRESENT"),
+        ("a prefix of a stored identifier", "hsm-pres"),
+        ("a stored identifier with one extra character", "hsm-presentx"),
+        ("an identifier with a trailing hyphen", "hsm-present-"),
+    ] {
+        let answer = delete_one(&emulator, missing).await;
+        assert_refused(case, &answer, 400, "HsmConfigurationNotFoundFault");
+        // The fixed text of the fault as this service words a DELETE's
+        // not-found refusal — the resource, then the identifier the REQUEST
+        // carried, which is its only variable part (the same shape as
+        // `DeleteClusterParameterGroup`'s "Cluster parameter group not found:
+        // <name>"). The READ of the same identifier words the same fault its
+        // own way, so both are pinned here.
+        let expected = format!("HSM configuration not found: {missing}");
+        assert_eq!(
+            answer.text("Message").as_deref(),
+            Some(expected.as_str()),
+            "case {case}: expected the message {expected:?}, got {:?}",
+            answer.text("Message")
+        );
+        let expected_read = format!("HSM configuration '{missing}' not found.");
+        assert_eq!(
+            describe_one(&emulator, missing)
+                .await
+                .text("Message")
+                .as_deref(),
+            Some(expected_read.as_str()),
+            "case {case}: expected the read's message {expected_read:?}"
+        );
+    }
+
+    // Every refused delete removed nothing.
+    let listed = emulator.call("DescribeHsmConfigurations", &[]).await;
+    assert_eq!(
+        listed_configurations(&listed.body),
+        vec![present.identifier.clone()],
+        "case the whole account: expected only {:?}, got {:?}",
+        present.identifier,
+        listed_configurations(&listed.body)
+    );
+    assert_eq!(
+        stored_secrets(&emulator, &present.identifier),
+        Some((present.certificate.clone(), present.password.to_string())),
+        "case the whole account: a refused delete dropped the stored certificate or password"
+    );
+}
+
+/// A configuration a cluster is configured from is still where that cluster
+/// stores its database encryption keys, so the delete is refused and the record
+/// stays readable; a configuration no cluster uses is removed.
+///
+/// The rows differ along how many clusters hold the configuration: none, one,
+/// and more than one — "in use by one or more Amazon Redshift clusters".
+#[tokio::test]
+async fn a_configuration_a_cluster_uses_cannot_be_deleted() {
+    let emulator = Emulator::new();
+
+    for (case, identifier, clusters) in [
+        ("no cluster uses it", "hsm-used-by-none", &[][..]),
+        (
+            "one cluster uses it",
+            "hsm-used-by-one",
+            &["hsm-cluster-a"][..],
+        ),
+        (
+            "two clusters use it",
+            "hsm-used-by-two",
+            &["hsm-cluster-b", "hsm-cluster-c"][..],
+        ),
+    ] {
+        assert_eq!(
+            create_configuration(&emulator, &simple_case(case, identifier))
+                .await
+                .status,
+            200,
+            "case {case}: the create must be served"
+        );
+        for cluster in clusters {
+            let created = emulator
+                .call(
+                    "CreateCluster",
+                    &[
+                        ("ClusterIdentifier", cluster),
+                        ("NodeType", "ra3.xlplus"),
+                        ("MasterUsername", "admin"),
+                        ("HsmConfigurationIdentifier", identifier),
+                    ],
+                )
+                .await;
+            assert_eq!(
+                created.status, 200,
+                "case {case}: the cluster {cluster} must be created, got {} with body {}",
+                created.status, created.body
+            );
+        }
+
+        let answer = delete_one(&emulator, identifier).await;
+        if clusters.is_empty() {
+            assert_eq!(
+                answer.status, 200,
+                "case {case}: expected the delete to be served, got {} with body {}",
+                answer.status, answer.body
+            );
+            assert_refused(
+                case,
+                &describe_one(&emulator, identifier).await,
+                400,
+                "HsmConfigurationNotFoundFault",
+            );
+            continue;
+        }
+
+        assert_refused(case, &answer, 400, "InvalidHsmConfigurationStateFault");
+        let message = answer.text("Message").unwrap_or_default();
+        for cluster in clusters {
+            assert!(
+                message.contains(cluster),
+                "case {case}: expected the message to name the cluster {cluster}, got {message:?}"
+            );
+        }
+
+        // The refused delete removed nothing: the configuration is still the
+        // record a read reports, secrets included.
+        let read = describe_one(&emulator, identifier).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case}: expected the configuration to still be readable, got {} with body {}",
+            read.status, read.body
+        );
+        assert_eq!(
+            listed_configurations(&read.body),
+            vec![identifier.to_string()],
+            "case {case}: expected the read to report {identifier}, got {:?}",
+            listed_configurations(&read.body)
+        );
+        assert!(
+            stored_secrets(&emulator, identifier).is_some(),
+            "case {case}: the refused delete dropped the stored certificate and password"
+        );
+    }
+}
