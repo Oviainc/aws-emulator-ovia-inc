@@ -28,6 +28,10 @@
 //!   `LanguageNotSupportedException`. A voice the seeded catalog does not carry is not
 //!   narrowed, because that catalog is a stated subset;
 //! * `ContentType` is the `OutputFormat`'s documented media type;
+//! * `ssml` input is checked against the SSML vocabulary Amazon Polly publishes — its
+//!   tag set, each tag's attributes and each attribute's value domain (see
+//!   [`ssml::SUPPORTED_ELEMENTS`]) — so markup outside it is `InvalidSsmlException`
+//!   rather than a green light for a document the real service refuses;
 //! * `RequestCharacters` is the billed character count — every character of plain
 //!   text, and for `ssml` the text content only, because "SSML tags are not counted
 //!   as billed characters";
@@ -316,12 +320,369 @@ pub const DEFAULT_ENGINE: &str = "standard";
 /// `SynthesizeSpeechInput$TextType`: "The default value is plain text."
 pub const DEFAULT_TEXT_TYPE: &str = "text";
 
+/// The SSML vocabulary Amazon Polly accepts: its elements, their attributes and the
+/// value domain of each attribute.
+///
+/// Amazon Polly does not accept SSML in general — it accepts the finite tag set its
+/// supported-SSML-tags documentation publishes, with the attributes that
+/// documentation gives each tag and the values it gives each attribute. Anything
+/// outside that vocabulary is `InvalidSsmlException`, whose own documentation asks the
+/// caller to "verify the SSML syntax, spelling of tags and values": a tag or a value
+/// outside the published set is as much a refusal as malformed XML.
+///
+/// Everything here is a transcription of that documentation. An element's row names
+/// the tag as the documentation spells it (`amazon:effect` keeps its prefix, because
+/// that is the tag's published name) and lists only the attributes documented for it;
+/// the [`Domain`] on each attribute is the value set documented for that attribute.
+/// Nothing in this table is derived from any request the emulator has seen.
+pub mod ssml {
+    /// What an attribute accepts, as the tag's documentation states it.
+    #[derive(Debug, Clone, Copy)]
+    pub enum Domain {
+        /// Exactly one of a published list of keywords.
+        Keywords(&'static [&'static str]),
+        /// A keyword, or a relative loudness in decibels (`+6dB`, `-6dB`).
+        KeywordsOrDecibels(&'static [&'static str]),
+        /// A keyword, or a percentage: an UNSIGNED percentage is an absolute setting
+        /// and is bounded below by `min_percent`, while a SIGNED one is a change
+        /// relative to the current value and so carries no such floor.
+        KeywordsOrPercent {
+            /// The keywords the attribute also accepts.
+            keywords: &'static [&'static str],
+            /// The smallest percentage the documentation allows.
+            min_percent: f64,
+        },
+        /// A duration in seconds or milliseconds (`2s`, `500ms`), at most `max_ms`
+        /// where the documentation publishes a cap.
+        Duration {
+            /// The documented maximum, in milliseconds.
+            max_ms: Option<f64>,
+        },
+        /// A language tag, as `xml:lang` carries one.
+        LanguageTag,
+        /// A free value the service passes through — a mark name, an alias, a phoneme
+        /// string, an audio source. The documentation publishes no value set for it,
+        /// so none is invented here.
+        Text,
+    }
+
+    impl Domain {
+        /// Whether `value` is inside this domain.
+        pub fn accepts(&self, value: &str) -> bool {
+            match self {
+                Self::Keywords(keywords) => keywords.contains(&value),
+                Self::KeywordsOrDecibels(keywords) => {
+                    keywords.contains(&value) || decibels(value).is_some()
+                }
+                Self::KeywordsOrPercent {
+                    keywords,
+                    min_percent,
+                } => {
+                    keywords.contains(&value)
+                        || percentage(value)
+                            .is_some_and(|(signed, magnitude)| signed || magnitude >= *min_percent)
+                }
+                Self::Duration { max_ms } => duration_ms(value)
+                    .is_some_and(|ms| max_ms.is_none_or(|max| ms <= max)),
+                Self::LanguageTag => {
+                    !value.is_empty()
+                        && value.split('-').all(|subtag| {
+                            !subtag.is_empty() && subtag.chars().all(|c| c.is_ascii_alphanumeric())
+                        })
+                }
+                Self::Text => true,
+            }
+        }
+    }
+
+    /// A non-negative decimal number, as SSML spells one. No sign, no exponent.
+    fn decimal(text: &str) -> Option<f64> {
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+            return None;
+        }
+        text.parse::<f64>().ok().filter(|n| n.is_finite())
+    }
+
+    /// A duration in milliseconds, from a value spelled in seconds or milliseconds.
+    pub fn duration_ms(value: &str) -> Option<f64> {
+        if let Some(number) = value.strip_suffix("ms") {
+            decimal(number)
+        } else {
+            decimal(value.strip_suffix('s')?).map(|seconds| seconds * 1000.0)
+        }
+    }
+
+    /// A percentage, as `(whether it carried a sign, its magnitude)`. A signed
+    /// percentage is a change relative to the current value; an unsigned one is an
+    /// absolute setting.
+    pub fn percentage(value: &str) -> Option<(bool, f64)> {
+        let body = value.strip_suffix('%')?;
+        match body.strip_prefix(['+', '-']) {
+            Some(magnitude) => decimal(magnitude).map(|n| (true, n)),
+            None => decimal(body).map(|n| (false, n)),
+        }
+    }
+
+    /// A loudness in decibels, as `volume` spells one.
+    pub fn decibels(value: &str) -> Option<f64> {
+        let body = value.strip_suffix("dB")?;
+        decimal(body.strip_prefix(['+', '-']).unwrap_or(body))
+    }
+
+    /// One element of the vocabulary.
+    #[derive(Debug, Clone, Copy)]
+    pub struct Element {
+        /// The tag's published name, prefix included.
+        pub name: &'static str,
+        /// The attributes the tag documents, each with its value domain.
+        pub attributes: &'static [(&'static str, Domain)],
+    }
+
+    /// `<break strength>`.
+    const BREAK_STRENGTH: &[&str] = &["none", "x-weak", "weak", "medium", "strong", "x-strong"];
+    /// `<emphasis level>`.
+    const EMPHASIS_LEVEL: &[&str] = &["strong", "moderate", "reduced"];
+    /// `<phoneme alphabet>`.
+    const PHONEME_ALPHABET: &[&str] = &["ipa", "x-sampa"];
+    /// `<prosody volume>`, beside a decibel offset.
+    const PROSODY_VOLUME: &[&str] = &[
+        "default", "silent", "x-soft", "soft", "medium", "loud", "x-loud",
+    ];
+    /// `<prosody rate>`, beside a percentage.
+    const PROSODY_RATE: &[&str] = &["x-slow", "slow", "medium", "fast", "x-fast"];
+    /// `<prosody pitch>`, beside a percentage.
+    const PROSODY_PITCH: &[&str] = &["default", "x-low", "low", "medium", "high", "x-high"];
+    /// `<say-as interpret-as>`.
+    const SAY_AS_INTERPRET_AS: &[&str] = &[
+        "characters",
+        "spell-out",
+        "cardinal",
+        "number",
+        "ordinal",
+        "digits",
+        "fraction",
+        "unit",
+        "date",
+        "time",
+        "address",
+        "expletive",
+        "telephone",
+    ];
+    /// `<say-as format>`: the date formats, plus the two clock formats.
+    const SAY_AS_FORMAT: &[&str] = &[
+        "mdy", "dmy", "ymd", "md", "dm", "ym", "my", "y", "m", "d", "yyyymmdd", "hms12", "hms24",
+    ];
+    /// `<w role>`.
+    const W_ROLE: &[&str] = &["amazon:VB", "amazon:VBD", "amazon:NN", "amazon:SENSE_1"];
+    /// `<amazon:effect name>`.
+    const EFFECT_NAME: &[&str] = &["whispered", "drc"];
+    /// `<amazon:effect phonation>`.
+    const EFFECT_PHONATION: &[&str] = &["soft"];
+    /// `<amazon:domain name>`.
+    const DOMAIN_NAME: &[&str] = &["news", "conversational"];
+    /// `<amazon:breath duration>` and `<amazon:auto-breaths duration>`.
+    const BREATH_DURATION: &[&str] = &["default", "x-short", "short", "medium", "long", "x-long"];
+    /// `<amazon:breath volume>` and `<amazon:auto-breaths volume>`.
+    const BREATH_VOLUME: &[&str] = &["default", "x-soft", "soft", "medium", "loud", "x-loud"];
+    /// `<amazon:auto-breaths frequency>`.
+    const BREATH_FREQUENCY: &[&str] = &["default", "x-low", "low", "medium", "high", "x-high"];
+
+    /// The longest pause `<break time>` may ask for: the documentation caps it at ten
+    /// seconds.
+    pub const MAX_BREAK_MS: f64 = 10_000.0;
+
+    /// The smallest `<prosody rate>` percentage the documentation allows.
+    pub const MIN_RATE_PERCENT: f64 = 20.0;
+
+    /// Every element Amazon Polly's supported-SSML-tags documentation publishes, with
+    /// that documentation's attributes and value domains.
+    pub const SUPPORTED_ELEMENTS: &[Element] = &[
+        Element {
+            // The document element. `version` and `xml:lang` are SSML's own
+            // declarations on it; namespace declarations are XML's and are not
+            // attributes of any tag.
+            name: "speak",
+            attributes: &[("version", Domain::Text), ("xml:lang", Domain::LanguageTag)],
+        },
+        Element {
+            name: "break",
+            attributes: &[
+                ("strength", Domain::Keywords(BREAK_STRENGTH)),
+                (
+                    "time",
+                    Domain::Duration {
+                        max_ms: Some(MAX_BREAK_MS),
+                    },
+                ),
+            ],
+        },
+        Element {
+            name: "emphasis",
+            attributes: &[("level", Domain::Keywords(EMPHASIS_LEVEL))],
+        },
+        Element {
+            name: "lang",
+            attributes: &[("xml:lang", Domain::LanguageTag)],
+        },
+        Element {
+            name: "mark",
+            attributes: &[("name", Domain::Text)],
+        },
+        Element {
+            name: "p",
+            attributes: &[],
+        },
+        Element {
+            name: "phoneme",
+            attributes: &[
+                ("alphabet", Domain::Keywords(PHONEME_ALPHABET)),
+                ("ph", Domain::Text),
+            ],
+        },
+        Element {
+            name: "prosody",
+            attributes: &[
+                ("volume", Domain::KeywordsOrDecibels(PROSODY_VOLUME)),
+                (
+                    "rate",
+                    Domain::KeywordsOrPercent {
+                        keywords: PROSODY_RATE,
+                        min_percent: MIN_RATE_PERCENT,
+                    },
+                ),
+                (
+                    "pitch",
+                    Domain::KeywordsOrPercent {
+                        keywords: PROSODY_PITCH,
+                        min_percent: 0.0,
+                    },
+                ),
+                // The maximum-duration attribute, which the documentation spells with
+                // the vendor prefix and publishes no cap for.
+                ("amazon:max-duration", Domain::Duration { max_ms: None }),
+            ],
+        },
+        Element {
+            name: "s",
+            attributes: &[],
+        },
+        Element {
+            name: "say-as",
+            attributes: &[
+                ("interpret-as", Domain::Keywords(SAY_AS_INTERPRET_AS)),
+                ("format", Domain::Keywords(SAY_AS_FORMAT)),
+            ],
+        },
+        Element {
+            name: "sub",
+            attributes: &[("alias", Domain::Text)],
+        },
+        Element {
+            name: "w",
+            attributes: &[("role", Domain::Keywords(W_ROLE))],
+        },
+        Element {
+            name: "audio",
+            attributes: &[("src", Domain::Text)],
+        },
+        Element {
+            name: "amazon:effect",
+            attributes: &[
+                ("name", Domain::Keywords(EFFECT_NAME)),
+                ("phonation", Domain::Keywords(EFFECT_PHONATION)),
+                (
+                    "vocal-tract-length",
+                    Domain::KeywordsOrPercent {
+                        keywords: &[],
+                        min_percent: 0.0,
+                    },
+                ),
+            ],
+        },
+        Element {
+            name: "amazon:domain",
+            attributes: &[("name", Domain::Keywords(DOMAIN_NAME))],
+        },
+        Element {
+            name: "amazon:breath",
+            attributes: &[
+                ("duration", Domain::Keywords(BREATH_DURATION)),
+                ("volume", Domain::Keywords(BREATH_VOLUME)),
+            ],
+        },
+        Element {
+            name: "amazon:auto-breaths",
+            attributes: &[
+                ("duration", Domain::Keywords(BREATH_DURATION)),
+                ("volume", Domain::Keywords(BREATH_VOLUME)),
+                ("frequency", Domain::Keywords(BREATH_FREQUENCY)),
+            ],
+        },
+    ];
+
+    /// The name this element is spelled with, as the vocabulary names one.
+    ///
+    /// A vendor-prefixed tag (`amazon:effect`) is published WITH its prefix, so the
+    /// prefix is part of its name; every other tag is matched on its local name, so a
+    /// document that binds SSML to a prefix of its own still reads as SSML.
+    pub fn element_name(element: &quick_xml::events::BytesStart<'_>) -> String {
+        let qualified = String::from_utf8_lossy(element.name().as_ref()).to_string();
+        if qualified.starts_with("amazon:") {
+            qualified
+        } else {
+            String::from_utf8_lossy(element.local_name().as_ref()).to_string()
+        }
+    }
+
+    /// Check one element — its tag and every attribute it carries — against the
+    /// vocabulary.
+    ///
+    /// `Err` carries why the document is outside it, which the caller answers with
+    /// `InvalidSsmlException`.
+    pub fn check_element(
+        name: &str,
+        element: &quick_xml::events::BytesStart<'_>,
+    ) -> Result<(), String> {
+        let Some(declared) = SUPPORTED_ELEMENTS.iter().find(|known| known.name == name) else {
+            return Err(format!("<{name}> is not an SSML element Amazon Polly supports"));
+        };
+        for attribute in element.attributes() {
+            let attribute = attribute.map_err(|e| e.to_string())?;
+            let key = String::from_utf8_lossy(attribute.key.as_ref()).to_string();
+            // A namespace declaration is XML's own and belongs to no tag's attribute
+            // list, so it is not checked against one.
+            if key == "xmlns" || key.starts_with("xmlns:") {
+                continue;
+            }
+            let raw = String::from_utf8_lossy(attribute.value.as_ref()).to_string();
+            let value = quick_xml::escape::unescape(&raw)
+                .map_err(|e| e.to_string())?
+                .to_string();
+            let Some((_, domain)) = declared
+                .attributes
+                .iter()
+                .find(|(declared_key, _)| *declared_key == key)
+            else {
+                return Err(format!("<{name}> documents no {key} attribute"));
+            };
+            if !domain.accepts(&value) {
+                return Err(format!(
+                    "the {key} attribute of <{name}> does not accept {value:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The characters Amazon Polly bills for.
 ///
 /// Every character of plain text; for `ssml`, the text content only, because "SSML
 /// tags are not counted as billed characters" (`TextLengthExceededException`). The
-/// SSML document is read with a real XML parser, so `Err` here means the SSML is not
-/// well-formed — which is `InvalidSsmlException`.
+/// SSML document is read with a real XML parser and every element it carries is
+/// checked against the published vocabulary ([`ssml`]), so `Err` here means the SSML
+/// is not well-formed, or not the SSML Amazon Polly accepts — both of which are
+/// `InvalidSsmlException`.
 pub fn billed_characters(text: &str, text_type: &str) -> Result<usize, String> {
     if text_type != "ssml" {
         return Ok(text.chars().count());
@@ -335,10 +696,10 @@ pub fn billed_characters(text: &str, text_type: &str) -> Result<usize, String> {
         match reader.read_event().map_err(|e| e.to_string())? {
             Event::Eof => break,
             Event::Start(ref e) => {
-                check_ssml_root(e, &mut root_seen)?;
+                check_ssml_element(e, &mut root_seen)?;
                 depth += 1;
             }
-            Event::Empty(ref e) => check_ssml_root(e, &mut root_seen)?,
+            Event::Empty(ref e) => check_ssml_element(e, &mut root_seen)?,
             Event::End(_) => depth -= 1,
             Event::Text(ref t) => {
                 // Entities count as the character they stand for, so the raw bytes
@@ -364,20 +725,21 @@ pub fn billed_characters(text: &str, text_type: &str) -> Result<usize, String> {
     Ok(billed)
 }
 
-/// Check that the first element of an SSML document is `<speak>`, as SSML requires.
-fn check_ssml_root(
+/// Check one element of an SSML document: that the document element is `<speak>`, as
+/// SSML requires, and that the element and its attributes are inside the vocabulary
+/// Amazon Polly publishes ([`ssml::check_element`]).
+fn check_ssml_element(
     element: &quick_xml::events::BytesStart<'_>,
     root_seen: &mut bool,
 ) -> Result<(), String> {
-    if *root_seen {
-        return Ok(());
+    let name = ssml::element_name(element);
+    if !*root_seen {
+        if name != "speak" {
+            return Err(format!("the document element is <{name}>, not <speak>"));
+        }
+        *root_seen = true;
     }
-    let name = String::from_utf8_lossy(element.local_name().as_ref()).to_string();
-    if name != "speak" {
-        return Err(format!("the document element is <{name}>, not <speak>"));
-    }
-    *root_seen = true;
-    Ok(())
+    ssml::check_element(&name, element)
 }
 
 /// How long the emulator's timeline model says `billed` characters take to speak, in
