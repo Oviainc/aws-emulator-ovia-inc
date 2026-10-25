@@ -78,6 +78,15 @@
 //! [`ProvisionedConcurrencyRecord::materialize`] brings it up to whatever the clock has
 //! already made due.
 //!
+//! The function-scaling slice hangs off the same record, one entry per qualifier:
+//! `PutFunctionScalingConfig` "Sets the scaling configuration for a Lambda Managed
+//! Instances function" for the version or published view its `Qualifier` names, so what
+//! it persists lives on [`FunctionRecord::function_scaling_configs`] keyed by that
+//! qualifier, and `GetFunctionScalingConfig` reports exactly that record. The bounds the
+//! call asked for are the REQUESTED configuration at once, and become the APPLIED one —
+//! "the actual scaling settings in effect" — when the CLOCK makes that due (see
+//! [`FunctionScalingConfigRecord::materialize`]); nothing sleeps for it.
+//!
 //! `GetAccountSettings` reports on the same records at the account level:
 //! "Retrieves details about your account's limits and usage in an Amazon Web Services
 //! Region", so its usage is what the store holds and its unreserved concurrency is what
@@ -115,7 +124,8 @@ use crate::ops::types::{
     CreateFunctionOutput, DeadLetterConfig, DestinationConfig, DocumentDBEventSourceConfig,
     DurableConfig, Environment, EnvironmentResponse, EphemeralStorage,
     EventSourceMappingLoggingConfig, EventSourceMappingMetricsConfig, FileSystemConfig,
-    FilterCriteria, FunctionCodeLocation, GetLayerVersionOutput, GetProvisionedConcurrencyConfigOutput,
+    FilterCriteria, FunctionCodeLocation, FunctionScalingConfig, GetFunctionScalingConfigOutput,
+    GetLayerVersionOutput, GetProvisionedConcurrencyConfigOutput,
     ImageConfig, ImageConfigResponse, InstanceRequirements, Layer, LayerVersionContentOutput,
     LayerVersionsListItem, LoggingConfig, PropagateTags, ProvisionedConcurrencyConfigListItem,
     ProvisionedPollerConfig, PutFunctionConcurrencyOutput, ResolvedS3Object,
@@ -1097,6 +1107,85 @@ impl ProvisionedConcurrencyRecord {
     }
 }
 
+/// The qualifier that names the PUBLISHED view of a function's unpublished
+/// configuration.
+///
+/// The model spells it in two places: `PublishedFunctionQualifier`, the shape every
+/// function-scaling operation's `Qualifier` targets, admits exactly
+/// `^(\$LATEST\.PUBLISHED|[0-9]+)$`, and `NamespacedFunctionName` admits it as an ARN's
+/// qualifier beside [`VERSION_LATEST`]. Every function has it, because every function has
+/// the unpublished version it is the published view of.
+pub const VERSION_LATEST_PUBLISHED: &str = "$LATEST.PUBLISHED";
+
+/// How long after a `PutFunctionScalingConfig` the bounds it asked for become the ones in
+/// effect.
+///
+/// An EMULATOR-CHOSEN span, like [`ACTIVATION_DELAY`]: AWS publishes no duration for it,
+/// only the distinction the model's own two members draw between the configuration that
+/// was requested and the one "that is currently applied to the function", which
+/// "represents the actual scaling settings in effect". It is never zero, so a caller that
+/// reads the configuration straight after setting it still sees bounds that are requested
+/// and not yet applied.
+pub const FUNCTION_SCALING_APPLY_DELAY: Duration = Duration::from_millis(500);
+
+/// The scaling configuration of one qualifier of a function: the execution-environment
+/// bounds a `PutFunctionScalingConfig` call asked for, and the bounds in effect.
+///
+/// Held per qualifier on [`FunctionRecord::function_scaling_configs`], because the
+/// operation takes a `Qualifier` to say which version or published view of the function
+/// it sets the configuration for, so each of them holds its own.
+///
+/// Applying the bounds is owed by the CLOCK rather than by anybody calling: the record
+/// stores the instant the requested bounds become the applied ones and
+/// [`Self::materialize`] brings it up to whatever the clock has already made due.
+#[derive(Debug, Clone, Default)]
+pub struct FunctionScalingConfigRecord {
+    /// "The scaling configuration to apply to the function", exactly as the most recent
+    /// call stated it; a later call REPLACES it, because the operation sets the
+    /// configuration rather than adding to one.
+    pub requested: FunctionScalingConfig,
+    /// The configuration in effect, absent until the first requested one has been
+    /// applied — nothing here reports settings as in effect before the clock owes them.
+    pub applied: Option<FunctionScalingConfig>,
+    /// When [`Self::requested`] becomes the applied configuration, while it is still
+    /// being applied; see [`FUNCTION_SCALING_APPLY_DELAY`].
+    pub applied_due: Option<SystemTime>,
+}
+
+impl FunctionScalingConfigRecord {
+    /// Record that `requested` was asked for at `now`: it replaces whatever the previous
+    /// call asked for, the bounds in effect are unchanged until the clock makes the new
+    /// ones due, and that instant is stored rather than waited for.
+    pub fn request(&mut self, requested: FunctionScalingConfig, now: SystemTime) {
+        self.requested = requested;
+        self.applied_due = Some(now + FUNCTION_SCALING_APPLY_DELAY);
+    }
+
+    /// Bring this record up to whatever the clock has already made due: bounds whose
+    /// application instant has passed are the ones in effect, and would have been in
+    /// effect at that same instant even if nobody had called.
+    pub fn materialize(&mut self, now: SystemTime) {
+        if self.applied_due.is_some_and(|due| now >= due) {
+            self.applied = Some(self.requested.clone());
+            self.applied_due = None;
+        }
+    }
+
+    /// What a reader of one configuration reports, built entirely out of what is stored;
+    /// `function_arn` is the ARN of the qualifier the configuration was set on.
+    ///
+    /// Read it only after [`Self::materialize`], so bounds the clock has already applied
+    /// are not reported as still only requested.
+    #[must_use]
+    pub fn reported(&self, function_arn: String) -> GetFunctionScalingConfigOutput {
+        GetFunctionScalingConfigOutput {
+            function_arn: Some(function_arn),
+            applied_function_scaling_config: self.applied.clone(),
+            requested_function_scaling_config: Some(self.requested.clone()),
+        }
+    }
+}
+
 /// The runtime management configuration of one function version: "the runtime update
 /// mode" and, in [`UPDATE_RUNTIME_ON_MANUAL`] mode only, the runtime version the
 /// version is pinned to.
@@ -1353,6 +1442,11 @@ pub struct FunctionRecord {
     /// alias and the version it invokes hold their own, and a qualifier nobody has
     /// configured holds none at all.
     pub provisioned_concurrency_configs: BTreeMap<String, ProvisionedConcurrencyRecord>,
+    /// The scaling configuration of each qualifier that has had one stored, keyed by the
+    /// qualifier the `PutFunctionScalingConfig` call addressed — a published version
+    /// number or [`VERSION_LATEST_PUBLISHED`]. A qualifier nobody has configured holds
+    /// none at all.
+    pub function_scaling_configs: BTreeMap<String, FunctionScalingConfigRecord>,
 }
 
 impl FunctionRecord {
@@ -1398,6 +1492,11 @@ impl FunctionRecord {
         // And the same rule for every provisioned concurrency allocation under way: the
         // warm-up the clock has already made due is finished, so the allocation is ready.
         for config in self.provisioned_concurrency_configs.values_mut() {
+            config.materialize(now);
+        }
+        // And the same rule for every scaling configuration still being applied: bounds
+        // the clock has already made due are the ones in effect.
+        for config in self.function_scaling_configs.values_mut() {
             config.materialize(now);
         }
     }
@@ -1498,6 +1597,40 @@ impl FunctionRecord {
         self.aliases
             .get(qualifier)
             .map(|alias| alias.function_version.clone())
+    }
+
+    /// The qualifier label a `PublishedFunctionQualifier` names on this function, or
+    /// `None` when the function has no such qualifier.
+    ///
+    /// That shape admits exactly two forms, and they resolve differently:
+    /// [`VERSION_LATEST_PUBLISHED`] names the published view of the unpublished
+    /// configuration, which every function has, while a number names a version only once
+    /// that version has been published. An alias is not among them — the pattern admits
+    /// no alias name — so [`Self::resolved_version`] is not what reads this qualifier.
+    #[must_use]
+    pub fn published_qualifier(&self, qualifier: &str) -> Option<String> {
+        if qualifier == VERSION_LATEST_PUBLISHED {
+            return Some(VERSION_LATEST_PUBLISHED.to_string());
+        }
+        let number = qualifier.parse::<u64>().ok()?;
+        self.versions
+            .contains_key(&number)
+            .then(|| number.to_string())
+    }
+
+    /// The ARN of the qualifier `published_qualifier` names, as the model's `FunctionArn`
+    /// spells it.
+    ///
+    /// That pattern admits `$LATEST` or a published version as an ARN's qualifier but no
+    /// `.`-bearing label, so the published view of the unpublished configuration is
+    /// reported by the function's unqualified ARN, and a published version by its own
+    /// qualified one.
+    #[must_use]
+    pub fn published_qualifier_arn(&self, published_qualifier: &str) -> String {
+        if published_qualifier == VERSION_LATEST_PUBLISHED {
+            return self.arn.clone();
+        }
+        self.versioned_arn(published_qualifier)
     }
 
     /// The configuration of `version`, or `None` when this function has no such
