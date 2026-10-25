@@ -389,6 +389,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 tags: crate::state::to_btree_map(input.tags),
                 definitions,
                 status_summaries: vec![crate::state::StatusSummaryRecord::deployment(created_at)],
+                // Nothing is being torn down: a freshly created manager has had no
+                // delete accepted for it.
+                deletes_at: None,
             },
         );
 

@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDhcpOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDhcpOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDhcpOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores one DHCP option set the caller named, in the ONE store of option sets this
+//! service has ([`crate::state::ComAmazonawsEc2Amazonec2State::dhcp_options`]), so the set
+//! it mints is reported by `DescribeDhcpOptions` and resolvable by `AssociateDhcpOptions`
+//! exactly as the Region's default set is.
+//!
+//! Every option name the request carries must be one this operation documents, and its
+//! values must satisfy what that option publishes (how many, of what form), so a set this
+//! service holds can never carry an option no instance could be configured from. The
+//! service owns the set's id and its owning account; the caller owns only the options and
+//! the tags.
 //!
 //! ## Shape of an operation
 //!
@@ -94,6 +96,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -161,18 +165,329 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDhcpOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDhcpOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDhcpOptions"))
+        // `ctx` carries request metadata only; a DHCP option set belongs to the account
+        // rather than to one Region, so this operation reads nothing out of it. The store is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "A DHCP configuration option" (`DhcpConfigurations`) is the one member the request
+        // must carry, and the model lets a client omit it (`clientOptional`), so an absent
+        // or empty list is refused here rather than read as "a set with no options".
+        if input.dhcp_configurations.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter DhcpConfigurations",
+            ));
+        }
+        // No option may be named twice, so a request can carry at most one entry per
+        // documented option name; the cap is checked before the loop so the work below is
+        // bounded whatever a caller sends.
+        if input.dhcp_configurations.len() > DHCP_OPTION_NAMES.len() {
+            return Err(state::invalid_parameter_value(format!(
+                "DhcpConfigurations carries {} options, above the maximum of {}",
+                input.dhcp_configurations.len(),
+                DHCP_OPTION_NAMES.len(),
+            )));
+        }
+
+        // Each option, in the order the request names them: the name must be one of the
+        // options this operation documents, named at most once, and its values must be what
+        // that option publishes.
+        let mut dhcp_configurations: Vec<DhcpConfiguration> =
+            Vec::with_capacity(input.dhcp_configurations.len());
+        for configuration in &input.dhcp_configurations {
+            let key = configuration.key.as_deref().unwrap_or_default();
+            if key.is_empty() {
+                return Err(state::missing_parameter(
+                    "The request must contain the parameter DhcpConfiguration.Key",
+                ));
+            }
+            if !DHCP_OPTION_NAMES.contains(&key) {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({key}) for parameter name is invalid. Unknown DHCP option"
+                )));
+            }
+            if dhcp_configurations
+                .iter()
+                .any(|stored| stored.key.as_deref() == Some(key))
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({key}) for parameter name is invalid. \
+                     The DHCP option is given more than once"
+                )));
+            }
+            let values: &[String] = configuration.values.as_deref().unwrap_or_default();
+            validate_option(key, values)?;
+            dhcp_configurations.push(DhcpConfiguration {
+                key: Some(key.to_string()),
+                values: Some(
+                    values
+                        .iter()
+                        .map(|value| AttributeValue {
+                            value: Some(value.clone()),
+                        })
+                        .collect(),
+                ),
+            });
+        }
+
+        // "The tags to assign to the DHCP option" — "you must specify the resource type to
+        // tag, otherwise the request will fail" (`TagSpecification`), and the only type this
+        // action tags is the option set it creates. The tag payload's own bounds are the
+        // ones every create of this crate holds its tags to, so the one shared reader
+        // applies them.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_DHCP_OPTIONS,
+            Self::NAME,
+        )?;
+
+        // The caller-chosen bytes this set would add to the store: its options and its tags.
+        let payload_bytes = state::dhcp_configuration_list_bytes(&dhcp_configurations)
+            .saturating_add(state::tag_list_bytes(&tags));
+
+        let state = state::require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of. The
+        // ceiling is the one every DHCP option set of the account counts against, so a
+        // caller-created set and a Region's default set share it.
+        if !store.has_dhcp_option_set_room() {
+            return Err(state::dhcp_options_limit_exceeded());
+        }
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // One write: the store mints the id and derives the owning account, so a
+        // caller-created set is stored exactly as the Region's default set is.
+        let dhcp_options_id = store.insert_dhcp_options(dhcp_configurations, tags);
+
+        // The answer is the record as it was stored, so `CreateDhcpOptions` and
+        // `DescribeDhcpOptions` cannot drift apart.
+        let Some(dhcp_options) = store.dhcp_options.get(&dhcp_options_id).cloned() else {
+            return Err(state::internal_error(
+                "the DHCP options set just created could not be read back",
+            ));
+        };
+        Ok(CreateDhcpOptionsOutput {
+            dhcp_options: Some(dhcp_options),
+        })
     }
+}
+
+/// Every DHCP option a request may name, as `CreateDhcpOptions` documents them ("The
+/// following are the individual DHCP options you can specify") — the ONE list that decides
+/// whether an option name is known, so an option no instance could be configured from is
+/// never stored:
+///
+/// ```text
+/// smithy_query(query="doc",shape="CreateDhcpOptions",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// Its length is also the most options one request can carry, since no option may be named
+/// twice.
+const DHCP_OPTION_NAMES: [&str; 6] = [
+    state::DHCP_OPTION_DOMAIN_NAME,
+    state::DHCP_OPTION_DOMAIN_NAME_SERVERS,
+    state::DHCP_OPTION_NTP_SERVERS,
+    state::DHCP_OPTION_NETBIOS_NAME_SERVERS,
+    state::DHCP_OPTION_NETBIOS_NODE_TYPE,
+    state::DHCP_OPTION_IPV6_ADDRESS_PREFERRED_LEASE_TIME,
+];
+
+/// The most DNS servers `domain-name-servers` admits: "The IP addresses of up to four DNS
+/// servers, or AmazonProvidedDNS" (`CreateDhcpOptions`). The same count bounds
+/// `netbios-name-servers`: "The IP addresses of up to four NetBIOS name servers".
+const MAX_SERVERS: usize = 4;
+
+/// The most NTP servers `ntp-servers` admits of EACH address family: "The IP addresses of
+/// up to eight Network Time Protocol (NTP) servers (four IPv4 addresses and four IPv6
+/// addresses)" (`CreateDhcpOptions`).
+const MAX_NTP_SERVERS_PER_FAMILY: usize = 4;
+
+/// The NetBIOS node types a request may name: "The NetBIOS node type (1, 2, 4, or 8)"
+/// (`CreateDhcpOptions`), in the order that documentation lists them.
+const NETBIOS_NODE_TYPES: [&str; 4] = ["1", "2", "4", "8"];
+
+/// The shortest DHCPv6 lease renewal interval `ipv6-address-preferred-lease-time` admits:
+/// "Acceptable values are between 140 and 2147483647 seconds" (`CreateDhcpOptions`).
+const MIN_PREFERRED_LEASE_TIME: i64 = 140;
+
+/// The longest, from the same sentence.
+const MAX_PREFERRED_LEASE_TIME: i64 = 2_147_483_647;
+
+/// The most values an option the API publishes no count for may carry, and the most bytes
+/// one of its values may hold.
+///
+/// `domain-name` is the one such option: its value is free-form text ("Otherwise, specify a
+/// custom domain name"), which a caller chooses the size of, so the bytes a single set can
+/// hold are bounded here — a count of values is not a bound on the bytes each one holds.
+/// The byte ceiling is a domain name's own maximum length, 255 octets (RFC 1035), which is
+/// what the value is; the count admits the "multiple domain names separated by spaces" the
+/// documentation warns about being given as separate values.
+const MAX_FREE_FORM_VALUES: usize = 4;
+
+/// The byte ceiling of one free-form value, from the same sentence.
+const MAX_FREE_FORM_VALUE_BYTES: usize = 255;
+
+/// Is `values` what the DHCP option `key` publishes?
+///
+/// One function per option name, so each rule reads next to the sentence it comes from.
+/// `key` is known to be one of [`DHCP_OPTION_NAMES`] by the time this runs, so the final
+/// arm cannot be reached — and an unknown option admits nothing, which is why it answers a
+/// refusal rather than accepting whatever it was given.
+fn validate_option<E>(
+    key: &str,
+    values: &[String],
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    // Every option of a set configures something, so an option with no value at all
+    // configures nothing: it is refused rather than stored empty.
+    if values.is_empty() {
+        return Err(state::missing_parameter(format!(
+            "The request must contain at least one value for the DHCP option {key}"
+        )));
+    }
+    match key {
+        // "If you're using AmazonProvidedDNS in us-east-1, specify ec2.internal. … Otherwise,
+        // specify a custom domain name." Free-form text, bounded in count and in bytes.
+        state::DHCP_OPTION_DOMAIN_NAME => {
+            if values.len() > MAX_FREE_FORM_VALUES {
+                return Err(too_many_values(key, values.len(), MAX_FREE_FORM_VALUES));
+            }
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FREE_FORM_VALUE_BYTES)
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({oversize}) for parameter {key} is invalid. \
+                     A domain name holds at most {MAX_FREE_FORM_VALUE_BYTES} bytes"
+                )));
+            }
+            Ok(())
+        }
+        // "The IP addresses of up to four DNS servers, or AmazonProvidedDNS."
+        state::DHCP_OPTION_DOMAIN_NAME_SERVERS => {
+            if values.len() > MAX_SERVERS {
+                return Err(too_many_values(key, values.len(), MAX_SERVERS));
+            }
+            for value in values {
+                if value != state::AMAZON_PROVIDED_DNS && !is_ip_address(value) {
+                    return Err(not_an_address(key, value));
+                }
+            }
+            Ok(())
+        }
+        // "The IP addresses of up to eight Network Time Protocol (NTP) servers (four IPv4
+        // addresses and four IPv6 addresses)": a per-family count, so eight servers are
+        // admitted only as four of each.
+        state::DHCP_OPTION_NTP_SERVERS => {
+            for family in [state::is_ipv4_address, state::is_ipv6_address] {
+                let named = values.iter().filter(|value| family(value)).count();
+                if named > MAX_NTP_SERVERS_PER_FAMILY {
+                    return Err(too_many_values(key, named, MAX_NTP_SERVERS_PER_FAMILY));
+                }
+            }
+            for value in values {
+                if !is_ip_address(value) {
+                    return Err(not_an_address(key, value));
+                }
+            }
+            Ok(())
+        }
+        // "The IP addresses of up to four NetBIOS name servers."
+        state::DHCP_OPTION_NETBIOS_NAME_SERVERS => {
+            if values.len() > MAX_SERVERS {
+                return Err(too_many_values(key, values.len(), MAX_SERVERS));
+            }
+            for value in values {
+                if !is_ip_address(value) {
+                    return Err(not_an_address(key, value));
+                }
+            }
+            Ok(())
+        }
+        // "The NetBIOS node type (1, 2, 4, or 8)" — one node type, out of the published
+        // four.
+        state::DHCP_OPTION_NETBIOS_NODE_TYPE => {
+            if values.len() > 1 {
+                return Err(too_many_values(key, values.len(), 1));
+            }
+            for value in values {
+                if !NETBIOS_NODE_TYPES.contains(&value.as_str()) {
+                    return Err(state::invalid_parameter_value(format!(
+                        "Value ({value}) for parameter {key} is invalid. \
+                         The NetBIOS node type must be {types}",
+                        types = NETBIOS_NODE_TYPES.join(", "),
+                    )));
+                }
+            }
+            Ok(())
+        }
+        // "A value (in seconds, …) for how frequently a running instance with an IPv6
+        // assigned to it goes through DHCPv6 lease renewal. Acceptable values are between
+        // 140 and 2147483647 seconds."
+        state::DHCP_OPTION_IPV6_ADDRESS_PREFERRED_LEASE_TIME => {
+            if values.len() > 1 {
+                return Err(too_many_values(key, values.len(), 1));
+            }
+            for value in values {
+                let seconds = value.parse::<i64>().ok().filter(|seconds| {
+                    (MIN_PREFERRED_LEASE_TIME..=MAX_PREFERRED_LEASE_TIME).contains(seconds)
+                });
+                if seconds.is_none() {
+                    return Err(state::invalid_parameter_value(format!(
+                        "Value ({value}) for parameter {key} is invalid. \
+                         Acceptable values are between {MIN_PREFERRED_LEASE_TIME} and \
+                         {MAX_PREFERRED_LEASE_TIME} seconds"
+                    )));
+                }
+            }
+            Ok(())
+        }
+        // Unreachable: the caller has already refused every name outside
+        // [`DHCP_OPTION_NAMES`]. An option this function states no rule for admits no value,
+        // so it could never store one even if that check were bypassed.
+        _ => Err(state::invalid_parameter_value(format!(
+            "Value ({key}) for parameter name is invalid. Unknown DHCP option"
+        ))),
+    }
+}
+
+/// Whether `value` is an IP address of either family — what every option documented as
+/// taking "the IP addresses of" accepts.
+fn is_ip_address(value: &str) -> bool {
+    state::is_ipv4_address(value) || state::is_ipv6_address(value)
+}
+
+/// Refuse an option given more values than it admits, naming the count it carries and the
+/// count it publishes.
+fn too_many_values<E>(
+    key: &str,
+    given: usize,
+    maximum: usize,
+) -> crate::scaffolded::Scaffolded<E> {
+    state::invalid_parameter_value(format!(
+        "Value ({given}) for parameter {key} is invalid. \
+         The option takes at most {maximum} values"
+    ))
+}
+
+/// Refuse a value of an option that takes IP addresses that is not one.
+fn not_an_address<E>(key: &str, value: &str) -> crate::scaffolded::Scaffolded<E> {
+    state::invalid_parameter_value(format!(
+        "Value ({value}) for parameter {key} is invalid. Expected an IP address"
+    ))
 }

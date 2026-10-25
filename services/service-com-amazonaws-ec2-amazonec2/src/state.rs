@@ -1947,6 +1947,33 @@ pub const DHCP_OPTIONS_ID_PREFIX: &str = "dopt";
 /// neither looked up nor refused as malformed.
 pub const DHCP_OPTIONS_DEFAULT: &str = "default";
 
+/// The resource type a `TagSpecification` names to tag a DHCP options set, from the
+/// `ResourceType` enum — "The tags to assign to the DHCP option"
+/// (`CreateDhcpOptionsRequest$TagSpecifications`), so it is the one type that create may
+/// name.
+pub const RESOURCE_TYPE_DHCP_OPTIONS: &str = "dhcp-options";
+
+/// The DHCP option whose values are the NTP servers an instance of the VPC synchronises
+/// its clock with: "ntp-servers - The IP addresses of up to eight Network Time Protocol
+/// (NTP) servers (four IPv4 addresses and four IPv6 addresses)" (`CreateDhcpOptions`).
+pub const DHCP_OPTION_NTP_SERVERS: &str = "ntp-servers";
+
+/// The DHCP option whose values are the NetBIOS name servers of the VPC:
+/// "netbios-name-servers - The IP addresses of up to four NetBIOS name servers"
+/// (`CreateDhcpOptions`).
+pub const DHCP_OPTION_NETBIOS_NAME_SERVERS: &str = "netbios-name-servers";
+
+/// The DHCP option whose value is the NetBIOS node type of the VPC: "netbios-node-type -
+/// The NetBIOS node type (1, 2, 4, or 8)" (`CreateDhcpOptions`).
+pub const DHCP_OPTION_NETBIOS_NODE_TYPE: &str = "netbios-node-type";
+
+/// The DHCP option whose value is how often a running instance renews its DHCPv6 lease:
+/// "ipv6-address-preferred-lease-time - A value (in seconds, minutes, hours, or years) for
+/// how frequently a running instance with an IPv6 assigned to it goes through DHCPv6 lease
+/// renewal" (`CreateDhcpOptions`).
+pub const DHCP_OPTION_IPV6_ADDRESS_PREFERRED_LEASE_TIME: &str =
+    "ipv6-address-preferred-lease-time";
+
 /// EC2's error code for a request that named something that is not a DHCP options set id
 /// at all, so there is nothing to look up — answered BEFORE the id is resolved, the same
 /// ordering [`require_well_formed_id`] keeps for every other resource of this module.
@@ -3144,8 +3171,54 @@ impl ComAmazonawsEc2Amazonec2State {
     /// later deleted does not give its Region's set back (the Region's default set outlives
     /// every VPC of it, as it does on AWS).
     pub fn has_dhcp_option_set_capacity(&self, region: &str) -> bool {
-        self.default_dhcp_options_ids.contains_key(region)
-            || self.dhcp_options.len() < MAX_DHCP_OPTION_SETS
+        self.default_dhcp_options_ids.contains_key(region) || self.has_dhcp_option_set_room()
+    }
+
+    /// Whether another DHCP option set fits inside the store's ceiling
+    /// ([`MAX_DHCP_OPTION_SETS`]).
+    ///
+    /// The ONE question a path that is about to store a set asks: `CreateDhcpOptions` asks it
+    /// for the set a caller named, and [`Self::has_dhcp_option_set_capacity`] asks it for the
+    /// Region's default set, so the two cannot drift apart on how many sets an account holds.
+    /// A path that answers `false` refuses with [`dhcp_options_limit_exceeded`] rather than
+    /// overshooting the ceiling.
+    pub fn has_dhcp_option_set_room(&self) -> bool {
+        self.dhcp_options.len() < MAX_DHCP_OPTION_SETS
+    }
+
+    /// Store a DHCP option set a caller created, as the modelled [`DhcpOptions`] shape, and
+    /// answer the `DhcpOptionsId` it was minted with.
+    ///
+    /// Every member the SERVICE owns is derived here rather than taken from a caller — the
+    /// id ([`DHCP_OPTIONS_ID_PREFIX`], from the one id mint) and the owning account — so a
+    /// caller-created set is reported by `DescribeDhcpOptions` exactly as the Region's
+    /// default set is ([`Self::default_dhcp_options_id`]), and the two cannot drift. The
+    /// record's caller-chosen bytes are charged against the store's byte budget here, so no
+    /// writer can store them uncharged.
+    ///
+    /// A WRITER: the caller must have asked [`Self::has_dhcp_option_set_room`] and
+    /// [`Self::would_exceed_stored_bytes`] first, so a request past either bound is refused
+    /// instead of overshooting it.
+    pub fn insert_dhcp_options(
+        &mut self,
+        dhcp_configurations: Vec<DhcpConfiguration>,
+        tags: Vec<Tag>,
+    ) -> String {
+        let dhcp_options_id = self.next_id(DHCP_OPTIONS_ID_PREFIX);
+        self.add_stored_bytes(
+            dhcp_configuration_list_bytes(&dhcp_configurations)
+                .saturating_add(tag_list_bytes(&tags)),
+        );
+        self.dhcp_options.insert(
+            dhcp_options_id.clone(),
+            DhcpOptions {
+                owner_id: Some(::engine::emulator_account_id().to_string()),
+                tags: Some(tags),
+                dhcp_options_id: Some(dhcp_options_id.clone()),
+                dhcp_configurations: Some(dhcp_configurations),
+            },
+        );
+        dhcp_options_id
     }
 
     /// The bytes `region`'s default DHCP option set would ADD to the store: none when the
@@ -6531,6 +6604,23 @@ pub fn tag_list(tags: &BTreeMap<String, String>) -> Vec<Tag> {
             value: Some(value.clone()),
         })
         .collect()
+}
+
+/// The bytes a modelled `DhcpConfiguration` list holds: every option name and every value
+/// of it, which in a caller-created set are all caller-chosen strings.
+pub fn dhcp_configuration_list_bytes(configurations: &[DhcpConfiguration]) -> usize {
+    configurations
+        .iter()
+        .map(|configuration| {
+            configuration.key.as_ref().map_or(0, String::len)
+                + configuration
+                    .values
+                    .iter()
+                    .flatten()
+                    .map(|value| value.value.as_ref().map_or(0, String::len))
+                    .sum::<usize>()
+        })
+        .sum()
 }
 
 /// The bytes a Region's default DHCP option set record holds, for the store's byte budget.
@@ -18483,6 +18573,16 @@ pub fn allocation_id_is_well_formed(id: &str) -> bool {
 /// the form is decided: the crate's CIDR helpers are about blocks, not single addresses.
 pub fn is_ipv4_address(candidate: &str) -> bool {
     candidate.parse::<::std::net::Ipv4Addr>().is_ok()
+}
+
+/// Whether `candidate` is an IPv6 address, the other form an option documented as taking
+/// "four IPv4 addresses and four IPv6 addresses"
+/// ([`DHCP_OPTION_NTP_SERVERS`]) accepts.
+///
+/// `Ipv6Addr`'s own parser decides the form, the way [`is_ipv4_address`] leaves the dotted
+/// quad to `Ipv4Addr`.
+pub fn is_ipv6_address(candidate: &str) -> bool {
+    candidate.parse::<Ipv6Addr>().is_ok()
 }
 
 /// Refuse an allocation id the request named that this service cannot resolve: a

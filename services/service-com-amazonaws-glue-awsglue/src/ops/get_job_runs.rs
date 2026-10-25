@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetJobRuns
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetJobRuns`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetJobRuns::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports every run of one job definition: the records `StartJobRun` wrote in
+//! [`crate::state`], each projected through [`crate::state::JobRunEntry::to_job_run`] —
+//! the SAME projection the single-run read serves — newest run first, in pages.
+//!
+//! REPORTING, not mutating: the only state it writes is the state changes the CLOCK
+//! already owed this job's runs ([`crate::state::JobEntry::settle_due_runs`]) — changes
+//! that were due at their stored instant whether or not anybody called — so listing runs
+//! never moves one and two listings of settled runs report the same runs.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +76,18 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::JobRunEntry;
+
+/// The largest page `MaxResults` accepts, from the member's own range
+/// (`GetJobRunsRequest$MaxResults`, `OrchestrationPageSize200` range 1..200) — and so the
+/// page size for a request that names none.
+const MAX_PAGE_SIZE: i32 = 200;
+
+/// How many digits the instant part of a continuation token is padded to, so the token
+/// orders the same way as a string as the instant it names orders as a number. Twenty
+/// digits hold any nanosecond count this clock can report.
+const CURSOR_INSTANT_DIGITS: usize = 20;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,18 +160,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetJobRuns` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetJobRunsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetJobRuns"))
+        // Job definitions, and the runs they hold, live in one per-account namespace, so
+        // nothing here depends on the request's Region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // An unreachable store is an internal mounting fault, reported through this
+            // operation's own server error, the same way `GetJobRun` reports it.
+            return Err(GetJobRunsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue job store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // "The maximum size of the response" (`MaxResults`, range 1..200). Absent, the
+        // page is the largest the model accepts for it; the clamp re-states that range
+        // here so the page size is never 0 even if the boundary validator ever stops
+        // enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // `JobName` is `@required` with `length 1..255`, so an absent or over-long one is
+        // refused at the boundary: reaching here, the only question is whether this
+        // account holds that job definition.
+        let Some(job) = store.jobs.get_mut(&input.job_name) else {
+            return Err(GetJobRunsErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(format!("Job {} not found", input.job_name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        // The only write a read makes: the state changes the clock had already made due.
+        job.settle_due_runs(now);
+
+        // "GetJobRuns returns the job runs in chronological order, with the newest jobs
+        // returned first": the order is over the instant each run STARTED, so it is taken
+        // from that instant rather than from the order the store happens to hold the runs
+        // in, with the run's id breaking a tie between two runs started in the same
+        // nanosecond so the order is total and the same on every call.
+        let mut ordered: Vec<&JobRunEntry> = job.runs.iter().collect();
+        ordered.sort_by_cached_key(|run| ::std::cmp::Reverse(page_cursor(run)));
+
+        // The token is the ordering key of the last run of the previous page, so the page
+        // resumes at the first run strictly older than it — which stays correct across
+        // runs started or dropped between two calls, exactly as a table listing's
+        // name-keyed token does. A token this service never issued is DELIBERATELY a
+        // position in that order rather than a refusal, for the same reason: the cursor is
+        // a key in the listing's own order, so every string names one, and the sibling
+        // listings of this crate resolve a cursor the same way.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => ordered.partition_point(|run| page_cursor(run).as_str() >= cursor),
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(ordered.len());
+        let page = &ordered[start..end];
+
+        // Element for element the SAME projection the single-run read serves, so a client
+        // that works from a listing is never less informed than one that re-reads each
+        // run.
+        let job_runs: Vec<JobRun> = page.iter().map(|run| run.to_job_run()).collect();
+        // The token names the last entry of the page, taken from the page itself so there
+        // is no index arithmetic to underflow on an empty page, and is absent once the
+        // page reaches the end of the listing.
+        let next_token = if end < ordered.len() {
+            page.last().copied().map(page_cursor)
+        } else {
+            None
+        };
+
+        Ok(GetJobRunsOutput {
+            job_runs: Some(job_runs),
+            next_token,
+        })
     }
+}
+
+/// One run's place in this listing, as the continuation token renders it: the instant the
+/// run started, zero-padded so the string orders as the number does, then the run's id to
+/// separate two runs started in the same nanosecond.
+///
+/// Ordering runs by this key DESCENDING is the newest-first order the operation documents,
+/// and comparing a token against it is what resumes a page — so any string a request sends
+/// names a well-defined place in that order, the way a table listing's name-keyed token
+/// does.
+fn page_cursor(run: &JobRunEntry) -> String {
+    let started_on = run
+        .started_on
+        .duration_since(::std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{started_on:0CURSOR_INSTANT_DIGITS$}:{}", run.id)
 }

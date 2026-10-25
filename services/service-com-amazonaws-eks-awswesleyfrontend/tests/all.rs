@@ -27,6 +27,8 @@ mod cancel_update;
 mod capability_lifecycle;
 #[path = "all/certificate_authority.rs"]
 mod certificate_authority;
+#[path = "all/certificate_authority_activation.rs"]
+mod certificate_authority_activation;
 #[path = "all/child_create_resolves_the_cluster_first.rs"]
 mod child_create_resolves_the_cluster_first;
 #[path = "all/cluster_config_update.rs"]

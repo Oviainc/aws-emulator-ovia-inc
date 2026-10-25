@@ -177,6 +177,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // So a manager whose teardown has come due is gone before this request looks
+        // for it, rather than being updated on its way out of the store.
+        store.settle(now);
 
         let Some(manager) = store.managers.get_mut(&input.manager_arn) else {
             return Err(
@@ -191,6 +194,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // A manager whose teardown the service has accepted is on its way out, so it
+        // takes no further mutation while that teardown is in flight.
+        if manager.is_deleting() {
+            return Err(UpdateConfigurationManagerErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::TEARDOWN_IN_FLIGHT_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
 
         // Each member is optional and only what the request carries is replaced, so an
         // update naming one member leaves the other as it was stored.
