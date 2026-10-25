@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RejectAgreementCancellationRequest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RejectAgreementCancellationRequest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RejectAgreementCancellationRequest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Rejects a stored cancellation request that is in `PENDING_APPROVAL` status —
+//! moving it to `REJECTED` with the buyer's rejection reason as its
+//! `statusMessage`, and leaving the agreement it belongs to as it was — and
+//! refuses one in any other status with a `ConflictException`.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -159,6 +155,31 @@ impl<Eng> RejectAgreementCancellationRequest<Eng> {
     }
 }
 
+/// The `RejectAgreementCancellationRequest` answer for a stored cancellation
+/// request, read from the record this call has just rejected.
+///
+/// Every member comes from the record — `createdAt` is "when the cancellation
+/// request was originally created", `reasonCode`/`description` are "the
+/// original" ones "provided when the cancellation request was created" and
+/// `statusMessage` is the rejection reason as the rejecting call stored it — so
+/// nothing here is echoed from this call's own input, and a later
+/// `GetAgreementCancellationRequest` of the same request reports the same
+/// values from the same record.
+fn to_output(
+    stored: &crate::state::AgreementCancellationRequest,
+) -> RejectAgreementCancellationRequestOutput {
+    RejectAgreementCancellationRequestOutput {
+        agreement_id: Some(stored.agreement_id.clone()),
+        agreement_cancellation_request_id: Some(stored.id.clone()),
+        status: Some(stored.status.clone()),
+        status_message: stored.status_message.clone(),
+        reason_code: Some(stored.reason_code.clone()),
+        description: stored.description.clone(),
+        created_at: Some(::aws_smithy_types::DateTime::from(stored.created_at)),
+        updated_at: Some(::aws_smithy_types::DateTime::from(stored.updated_at)),
+    }
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for RejectAgreementCancellationRequest<Eng>
 {
@@ -176,18 +197,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RejectAgreementCancellationRequest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RejectAgreementCancellationRequestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RejectAgreementCancellationRequest"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                RejectAgreementCancellationRequestErrorModeled::InternalServerException(
+                    crate::state::store_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A cancellation request is a child of the agreement it was sent over,
+        // and this call names both. Resolution goes PARENT-FIRST, so
+        // `ResourceNotFoundException`'s `resourceType` and `resourceId` name the
+        // OUTERMOST resource that failed to resolve, the way the siblings
+        // `AcceptAgreementCancellationRequest` and
+        // `GetAgreementCancellationRequest` resolve the same pair.
+        if !store.agreements.contains_key(&input.agreement_id) {
+            return Err(crate::state::not_found(
+                RejectAgreementCancellationRequestErrorModeled::ResourceNotFoundException(
+                    crate::state::agreement_not_found(&input.agreement_id),
+                ),
+            ));
+        }
+
+        // The agreement resolved, so the child is what this call acts on. Both
+        // ids are required and both select: a cancellation request of another
+        // agreement is not the one this call names.
+        let found = store
+            .agreement_cancellation_requests
+            .get_mut(&input.agreement_cancellation_request_id)
+            .filter(|request| request.agreement_id == input.agreement_id);
+        let Some(request) = found else {
+            return Err(crate::state::not_found(
+                RejectAgreementCancellationRequestErrorModeled::ResourceNotFoundException(
+                    crate::state::agreement_cancellation_request_not_found(
+                        &input.agreement_cancellation_request_id,
+                    ),
+                ),
+            ));
+        };
+
+        // "Only cancellation requests in PENDING_APPROVAL status can be
+        // rejected. A ConflictException is thrown if the cancellation request is
+        // in any other status." Every other value of
+        // `AgreementCancellationRequestStatus` is one the request has already
+        // been moved to, so rejecting it now would move it a second time — which
+        // also makes a replayed reject of the same request a conflict rather
+        // than a second rejection.
+        if !request.is_pending_approval() {
+            let status = request.status.clone();
+            return Err(
+                RejectAgreementCancellationRequestErrorModeled::ConflictException(
+                    crate::state::conflict(
+                        crate::state::RESOURCE_TYPE_AGREEMENT_CANCELLATION_REQUEST,
+                        &input.agreement_cancellation_request_id,
+                        format!(
+                            "agreement cancellation request {} is {status}, and only a {} \
+                             cancellation request can be rejected",
+                            input.agreement_cancellation_request_id,
+                            crate::state::CANCELLATION_STATUS_PENDING_APPROVAL
+                        ),
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // "Once rejected, the cancellation request transitions to REJECTED
+        // status and the agreement remains active", and the buyer's required
+        // `rejectionReason` is what the request reports as its `statusMessage`
+        // from then on — both written through
+        // [`crate::state::AgreementCancellationRequest::reject`], the one writer
+        // of that transition, so `GetAgreementCancellationRequest` and
+        // `ListAgreementCancellationRequests` report the rejected request from
+        // the same record this call wrote. REJECTED is terminal, so nothing is
+        // owed to the clock here; and because the cancellation was refused, the
+        // agreement the request was sent over is left exactly as it was rather
+        // than being moved by this call.
+        request.reject(now, input.rejection_reason);
+        let output = to_output(request);
+        crate::state::audit(
+            Self::NAME,
+            "rejected",
+            &input.agreement_cancellation_request_id,
+            ctx.parts(),
+        );
+
+        Ok(output)
     }
 }

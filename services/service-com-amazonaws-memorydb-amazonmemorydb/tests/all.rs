@@ -45,6 +45,8 @@ mod parameters;
 mod refusal_fault_codes;
 #[path = "all/refusal_messages.rs"]
 mod refusal_messages;
+#[path = "all/request_level_guards.rs"]
+mod request_level_guards;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

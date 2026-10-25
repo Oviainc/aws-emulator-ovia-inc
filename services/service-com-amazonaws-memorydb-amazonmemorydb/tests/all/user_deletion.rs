@@ -255,12 +255,12 @@ async fn deleting_a_user_that_is_not_in_state_is_refused_and_changes_nothing() {
     let router = router();
     create_user(&router, "kept-user").await;
     create_user(&router, "doomed-user").await;
-    // An ACL may name a user that was never created (`CreateACL` takes names, not
-    // references), so a name appearing in an ACL is NOT a user in state.
+    // An ACL's members ARE users, so a membership can only name users that exist: the
+    // delete below takes one of these two out of the store and out of this membership.
     ok(
         &router,
         "CreateACL",
-        &json!({ "ACLName": "acl-mixed", "UserNames": ["kept-user", "ghost-user", "doomed-user"] }),
+        &json!({ "ACLName": "acl-mixed", "UserNames": ["kept-user", "doomed-user"] }),
         "acl-mixed",
     )
     .await;
@@ -273,10 +273,9 @@ async fn deleting_a_user_that_is_not_in_state_is_refused_and_changes_nothing() {
     .await;
 
     // (case, name) — the rows differ in WHY the name is not a user: never used at all,
-    // used only inside an ACL, and deleted a moment ago.
+    // and deleted a moment ago (which also took it out of the ACL that listed it).
     for (case, name) in [
         ("never created", "never-created"),
-        ("named by an ACL but never created", "ghost-user"),
         ("deleted a moment ago", "doomed-user"),
     ] {
         let (status, body) = call(&router, "DeleteUser", &json!({ "UserName": name })).await;
@@ -293,8 +292,7 @@ async fn deleting_a_user_that_is_not_in_state_is_refused_and_changes_nothing() {
     }
 
     // Nothing the refusals named changed: the surviving user is still there, and the
-    // ACL still lists exactly the names the delete that DID run left behind — the
-    // never-created name among them.
+    // ACL still lists exactly the names the delete that DID run left behind.
     let listed = ok(&router, "DescribeUsers", &json!({}), "survivors").await;
     assert_eq!(
         user_names(&listed),
@@ -305,7 +303,7 @@ async fn deleting_a_user_that_is_not_in_state_is_refused_and_changes_nothing() {
         acl_membership(&router, "survivors").await,
         vec![(
             "acl-mixed".to_string(),
-            vec!["kept-user".to_string(), "ghost-user".to_string()],
+            vec!["kept-user".to_string()],
         )],
         "case \"survivors\": a refused delete must leave every ACL's UserNames \
          untouched, and only the deleted user leaves them"

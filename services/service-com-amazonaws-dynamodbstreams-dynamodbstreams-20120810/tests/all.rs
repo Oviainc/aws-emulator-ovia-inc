@@ -17,3 +17,5 @@ mod list_streams_discovery;
 mod state_roundtrip;
 #[path = "all/stream_consumer.rs"]
 mod stream_consumer;
+#[path = "all/stream_enable_readiness.rs"]
+mod stream_enable_readiness;

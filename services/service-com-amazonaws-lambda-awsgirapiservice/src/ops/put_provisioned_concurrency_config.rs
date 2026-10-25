@@ -271,7 +271,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // executions unreserved for functions that aren't configured with a per-function
         // limit."
         let committed_elsewhere = store.reserved_concurrency_except(None).saturating_add(
-            store.unreserved_provisioned_concurrency_except(Some((&reference.name, &qualifier))),
+            store.unreserved_provisioned_concurrency_except(Some((
+                &reference.name,
+                Some(&qualifier),
+            ))),
         );
         // A function that reserves capacity has already committed it, and the check above
         // keeps this allocation inside that reservation; one that reserves none commits

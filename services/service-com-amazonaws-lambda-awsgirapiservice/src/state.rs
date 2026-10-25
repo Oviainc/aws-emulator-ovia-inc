@@ -69,8 +69,10 @@
 //! version", so what it persists is the single
 //! [`FunctionRecord::reserved_concurrent_executions`] of the function it addressed.
 //! `GetFunctionConcurrency` and `GetFunction` report exactly that value, and the account's
-//! unreserved capacity is what every such value leaves (see
-//! [`ComAmazonawsLambdaAwsgirapiserviceState::reserved_concurrency_except`] and
+//! unreserved capacity is what every allocation it has committed to an individual function
+//! leaves — reservations and the provisioned concurrency of the functions that reserve
+//! nothing alike (see
+//! [`ComAmazonawsLambdaAwsgirapiserviceState::allocated_concurrency`] and
 //! [`MIN_UNRESERVED_CONCURRENT_EXECUTIONS`]).
 //!
 //! The provisioned-concurrency slice hangs off the same record, one entry per qualifier:
@@ -3356,29 +3358,53 @@ impl ComAmazonawsLambdaAwsgirapiserviceState {
     }
 
     /// The provisioned concurrency the stored functions have allocated out of the
-    /// account's UNRESERVED capacity, leaving out the one configuration `exclude` names
-    /// when it names one (a function name and a qualifier).
+    /// account's UNRESERVED capacity, leaving out what `exclude` names when it names
+    /// something: a function name beside one of its qualifiers leaves out that one
+    /// configuration, and a function name beside `None` leaves out every configuration of
+    /// that function.
     ///
     /// A function that reserves concurrency allocates its provisioned concurrency out of
     /// that reservation — `PutFunctionConcurrency` "reserves capacity for that
     /// concurrency level", and the reservation is the whole of what the account commits
     /// to that function — so only the functions reserving nothing commit anything here
-    /// beyond what [`Self::reserved_concurrency_except`] already counts.
+    /// beyond what [`Self::reserved_concurrency_except`] already counts. That is also why
+    /// a caller weighing a NEW reservation for a function leaves out the whole of that
+    /// function's provisioned concurrency: the reservation it is weighing is what that
+    /// capacity would come out of from then on.
     #[must_use]
     pub fn unreserved_provisioned_concurrency_except(
         &self,
-        exclude: Option<(&str, &str)>,
+        exclude: Option<(&str, Option<&str>)>,
     ) -> i32 {
         self.functions
             .iter()
             .filter(|(_, function)| function.reserved_concurrent_executions.is_none())
-            .map(|(name, function)| {
-                let excluded = exclude
-                    .filter(|(excluded_name, _)| *excluded_name == name.as_str())
-                    .map(|(_, qualifier)| qualifier);
-                function.provisioned_concurrency_except(excluded)
+            .filter_map(|(name, function)| {
+                let excluded = exclude.filter(|(excluded_name, _)| *excluded_name == name.as_str());
+                match excluded {
+                    // Every configuration of this function is left out.
+                    Some((_, None)) => None,
+                    Some((_, Some(qualifier))) => {
+                        Some(function.provisioned_concurrency_except(Some(qualifier)))
+                    }
+                    None => Some(function.provisioned_concurrency_except(None)),
+                }
             })
             .fold(0i32, i32::saturating_add)
+    }
+
+    /// The concurrency this account has ALLOCATED to individual functions: what every
+    /// function reserves, plus the provisioned concurrency allocated on the functions that
+    /// reserve none.
+    ///
+    /// This is the one quantity the account's unreserved capacity is measured against, so
+    /// [`Self::account_limit`] reports the limit less this, and an operation that commits
+    /// more capacity weighs its documented floor against the same sum with its own
+    /// allocation left out.
+    #[must_use]
+    pub fn allocated_concurrency(&self) -> i32 {
+        self.reserved_concurrency_except(None)
+            .saturating_add(self.unreserved_provisioned_concurrency_except(None))
     }
 
     /// `AccountLimit`: the account's quotas, with the one limit that is not a constant
@@ -3387,18 +3413,22 @@ impl ComAmazonawsLambdaAwsgirapiserviceState {
     /// `UnreservedConcurrentExecutions` is modelled as "The maximum number of
     /// simultaneous function executions, minus the capacity that's reserved for
     /// individual functions with PutFunctionConcurrency", so it is the account's
-    /// concurrency limit less the concurrency the stored functions reserve. The member is
-    /// `@range(min: 0)`, so the subtraction is floored at zero.
+    /// concurrency limit less every allocation the account has committed to an individual
+    /// function — each reservation, and the provisioned concurrency of the functions that
+    /// reserve nothing, which is capacity kept initialised for one alias or version and so
+    /// is no longer available to a function without a per-function limit (see
+    /// [`Self::allocated_concurrency`]). The member is `@range(min: 0)`, so the
+    /// subtraction is floored at zero.
     #[must_use]
     pub fn account_limit(&self) -> AccountLimit {
-        let reserved = self.reserved_concurrency_except(None);
+        let allocated = self.allocated_concurrency();
         AccountLimit {
             total_code_size: TOTAL_CODE_SIZE_LIMIT,
             code_size_unzipped: CODE_SIZE_UNZIPPED_LIMIT,
             code_size_zipped: CODE_SIZE_ZIPPED_LIMIT,
             concurrent_executions: CONCURRENT_EXECUTIONS_LIMIT,
             unreserved_concurrent_executions: Some(
-                CONCURRENT_EXECUTIONS_LIMIT.saturating_sub(reserved).max(0),
+                CONCURRENT_EXECUTIONS_LIMIT.saturating_sub(allocated).max(0),
             ),
         }
     }

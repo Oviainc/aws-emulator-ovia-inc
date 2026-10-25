@@ -242,27 +242,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // against the version's own declaration: a name it does not declare is not a
         // parameter of this extension, and a required one it declares must be given.
         let parameters = input.parameters.unwrap_or_default();
-        let mut supplied: Vec<&String> = parameters.keys().collect();
-        supplied.sort();
-        if let Some(unknown) = supplied
-            .into_iter()
-            .find(|name| !version.parameters.contains_key(name.as_str()))
-        {
-            return Err(bad_request(format!(
-                "Extension {} version {} declares no parameter named {unknown}.",
-                extension.name, version.version_number
-            )));
-        }
-        let mut declared: Vec<(&String, &Parameter)> = version.parameters.iter().collect();
-        declared.sort_by(|left, right| left.0.cmp(right.0));
-        if let Some((missing, _)) = declared
-            .into_iter()
-            .find(|(name, parameter)| parameter.required && !parameters.contains_key(name.as_str()))
-        {
-            return Err(bad_request(format!(
-                "Parameter {missing} is required by extension {} version {}.",
-                extension.name, version.version_number
-            )));
+        if let Some(reason) = crate::state::parameter_value_rejection(
+            &version.parameters,
+            &parameters,
+            &extension.name,
+            version.version_number,
+        ) {
+            return Err(bad_request(reason));
         }
 
         let extension_id = extension.id.clone();

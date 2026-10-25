@@ -14,8 +14,9 @@ use sha2::{Digest, Sha256};
 use ::aws_smithy_schema_server::{envelope, Violation, ViolationKind};
 
 use crate::ops::types::{
-    AssetConfiguration, ConflictException, InternalServerException, JobError, OriginDetails,
-    ResourceNotFoundException, ResponseDetails, ServiceLimitExceededException, ValidationException,
+    Action, AssetConfiguration, ConflictException, Event, InternalServerException, JobError,
+    OriginDetails, ResourceNotFoundException, ResponseDetails, ServiceLimitExceededException,
+    ValidationException,
 };
 
 /// The service's SigV4 signing name, and so the ARN service segment.
@@ -31,6 +32,12 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// `ENTITLED`, the other, describes a subscriber's copy of someone else's data
 /// set, which only a data grant or a Marketplace subscription mints.
 pub const ORIGIN_OWNED: &str = "OWNED";
+
+/// `Origin` for a subscriber's copy of someone else's data set — the other of the
+/// model's `Origin` values (see [`ORIGIN_OWNED`]), which a data grant or an AWS
+/// Marketplace subscription mints. An event action watches a data set this account
+/// subscribes to, so this is the only `Origin` one can be created for.
+pub const ORIGIN_ENTITLED: &str = "ENTITLED";
 
 /// The modelled maximum of `MaxResults` (`@range(min: 1, max: 200)` on
 /// `com.amazonaws.dataexchange#MaxResults`), which is also the page bound when the
@@ -107,6 +114,25 @@ pub struct SentNotification {
     pub accepted_at: DateTime,
 }
 
+/// One asset stored in a revision: the file, table or API the revision publishes.
+///
+/// An asset is never created directly — it is what an import job puts into a
+/// revision (`StartJob`), and what `GetAsset` / `ListRevisionAssets` report — so the
+/// record carries the members those readers answer with, in the form they answer
+/// them in.
+#[derive(Debug, Clone)]
+pub struct Asset {
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    /// One of the model's `AssetType` values, enumerated by
+    /// `crate::ops::types::ASSET_TYPE_VALUES`; a revision's assets all carry the
+    /// `AssetType` of the data set they belong to.
+    pub asset_type: String,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
 /// One stored revision of a data set.
 #[derive(Debug, Clone)]
 pub struct Revision {
@@ -115,6 +141,9 @@ pub struct Revision {
     pub data_set_id: String,
     pub comment: Option<String>,
     pub finalized: bool,
+    /// The assets this revision holds, in the order they were imported. A revision
+    /// is created empty: assets arrive through an import job.
+    pub assets: Vec<Asset>,
     pub revoked: bool,
     pub revocation_comment: Option<String>,
     pub revoked_at: Option<DateTime>,
@@ -154,6 +183,25 @@ pub struct Job {
     pub updated_at: DateTime,
 }
 
+/// One stored event action: which event fires it, what it does when it fires, and
+/// the identity and tags it carries.
+///
+/// `event_source_id` is lifted out of `event` so a listing can filter on the source
+/// without re-matching on which event member the action watches.
+#[derive(Debug, Clone)]
+pub struct EventAction {
+    pub id: String,
+    pub arn: String,
+    pub event: Event,
+    pub action: Action,
+    /// The id of the resource whose events fire this action — the data set a
+    /// `RevisionPublished` event names.
+    pub event_source_id: String,
+    pub tags: HashMap<String, String>,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
 /// Per-service state for com-amazonaws-dataexchange-dataexchange. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsDataexchangeDataexchangeState {
@@ -165,6 +213,11 @@ pub struct ComAmazonawsDataexchangeDataexchangeState {
     pub jobs: HashMap<String, Job>,
     /// Creation order of `jobs`, so `ListJobs` pages deterministically.
     pub job_order: Vec<String>,
+    /// Every event action this emulator holds, keyed by its `EventActionId`.
+    pub event_actions: HashMap<String, EventAction>,
+    /// Creation order of `event_actions`, so `ListEventActions` pages
+    /// deterministically.
+    pub event_action_order: Vec<String>,
 }
 
 impl ComAmazonawsDataexchangeDataexchangeState {
@@ -172,20 +225,30 @@ impl ComAmazonawsDataexchangeDataexchangeState {
     /// when this emulator holds no resource with that ARN.
     ///
     /// The target is located by the ARN each resource was MINTED with
-    /// ([`data_set_arn`], [`revision_arn`]), so the whole ARN — partition, vendor,
+    /// ([`data_set_arn`], [`revision_arn`], [`event_action_arn`]), so the whole ARN —
+    /// partition, vendor,
     /// region, account and resource path — is the identity being compared, and this
     /// crate holds no second account of what an ARN looks like: an ARN naming the
     /// same ids under another partition, region or account addresses nothing,
     /// because those fields are part of a resource's identity.
     ///
-    /// The scan is bounded by the store: at most [`MAX_DATA_SETS`] data sets, each
-    /// holding at most [`MAX_REVISIONS_PER_DATA_SET`] revisions.
+    /// The scan is bounded by the store: at most [`MAX_EVENT_ACTIONS`] event actions
+    /// and at most [`MAX_DATA_SETS`] data sets, each holding at most
+    /// [`MAX_REVISIONS_PER_DATA_SET`] revisions.
     ///
-    /// A data set and its revisions are the taggable resources this emulator stores.
-    /// The model's other two — event actions and data grants, whose creates also
-    /// carry `Tags` — are minted by operations that are still scaffolds, so no ARN
-    /// can address one yet, and one will be found here as soon as the record exists.
+    /// A data set, its revisions and the event actions this emulator stores are the
+    /// taggable resources it holds. The model's remaining one — a data grant, whose
+    /// create also carries `Tags` — is minted by an operation that is still a
+    /// scaffold, so no ARN can address one yet, and one will be found here as soon as
+    /// the record exists.
     pub fn resource_tags(&self, resource_arn: &str) -> Option<&HashMap<String, String>> {
+        if let Some(event_action) = self
+            .event_actions
+            .values()
+            .find(|event_action| event_action.arn == resource_arn)
+        {
+            return Some(&event_action.tags);
+        }
         self.data_sets.values().find_map(|data_set| {
             if data_set.arn == resource_arn {
                 return Some(&data_set.tags);
@@ -203,6 +266,13 @@ impl ComAmazonawsDataexchangeDataexchangeState {
         &mut self,
         resource_arn: &str,
     ) -> Option<&mut HashMap<String, String>> {
+        if let Some(event_action) = self
+            .event_actions
+            .values_mut()
+            .find(|event_action| event_action.arn == resource_arn)
+        {
+            return Some(&mut event_action.tags);
+        }
         self.data_sets.values_mut().find_map(|data_set| {
             if data_set.arn == resource_arn {
                 return Some(&mut data_set.tags);
@@ -269,6 +339,9 @@ pub const RESOURCE_TYPE_REVISION: &str = "REVISION";
 /// `ResourceType` for a job, from the same `ResourceType` enum.
 pub const RESOURCE_TYPE_JOB: &str = "JOB";
 
+/// `ResourceType` for an event action, from the same `ResourceType` enum.
+pub const RESOURCE_TYPE_EVENT_ACTION: &str = "EVENT_ACTION";
+
 /// The `State` a job is in before anything has started it: one of the model's
 /// `State` values, enumerated by `crate::ops::types::STATE_VALUES`. A job does no
 /// work until `StartJob` moves it on, so this is the state a created job carries.
@@ -298,6 +371,19 @@ pub fn revision_not_found(revision_id: &str) -> ResourceNotFoundException {
         message: format!("The revision {revision_id} couldn't be found."),
         resource_id: Some(revision_id.to_string()),
         resource_type: Some(RESOURCE_TYPE_REVISION.to_string()),
+    }
+}
+
+/// The modelled 404 for an `EventActionId` that names no stored event action.
+///
+/// `EventActionId` is modelled as a plain `__string` (it carries no pattern, unlike
+/// `Id`), so there is no malformed-id refusal in front of this one: any id that
+/// addresses no stored event action is this 404.
+pub fn event_action_not_found(event_action_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("The event action {event_action_id} couldn't be found."),
+        resource_id: Some(event_action_id.to_string()),
+        resource_type: Some(RESOURCE_TYPE_EVENT_ACTION.to_string()),
     }
 }
 
@@ -452,6 +538,32 @@ pub fn data_set_not_configured_for_marketplace() -> ValidationException {
     invalid_request("Data set not configured for AWS Marketplace Data Product.")
 }
 
+/// The modelled 400 for finalizing a revision that holds no assets: a revision is
+/// published to subscribers, so there has to be something in it to publish.
+///
+/// `assets` is what the revision holds at the moment of the refusal, which is what
+/// makes the sentence state the record rather than a remembered example. The wording
+/// is the one AWS answers with, recorded in
+/// `dataexchange.finalize-revision-without-assets-rejected`.
+pub fn revision_has_no_assets_to_finalize(assets: usize) -> ValidationException {
+    invalid_request(format!(
+        "Cannot set Finalized to true for a Revision which has {assets} Assets."
+    ))
+}
+
+/// The modelled 400 for an event action whose event names a data set this account
+/// owns: an event action exports a revision of a data set this account SUBSCRIBES
+/// to, so the data set it watches must carry `Origin` [`ORIGIN_ENTITLED`].
+///
+/// The wording is the one AWS answers with, recorded in
+/// `dataexchange.event-action-requires-entitled-dataset-rejected`.
+pub fn event_action_requires_entitled_data_set() -> ValidationException {
+    invalid_request(format!(
+        "Event actions are only compatible with Data Sets where the value for Origin is \
+         {ORIGIN_ENTITLED}."
+    ))
+}
+
 /// The modelled 400 for a request the model's own constraints cannot express.
 /// `message` names the member and the bound it broke, so the caller can fix the
 /// request from it alone.
@@ -482,6 +594,10 @@ pub fn invalid_request(message: impl Into<String>) -> ValidationException {
 // MAX_JOB_DETAIL_ENTRIES entries in any one caller-sized detail list and at most
 // MAX_TAGS asset-configuration tags (the model's own `@length(max: 50)` on
 // `ListOfTag`) of at most MAX_TAG_KEY_CHARS/MAX_TAG_VALUE_CHARS characters.
+//
+// Event actions too: at most MAX_EVENT_ACTIONS of them, each holding one action
+// whose caller-sized text is bounded by MAX_BUCKET_CHARS, MAX_KEY_PATTERN_CHARS and
+// MAX_KMS_KEY_ARN_CHARS, plus the same bounded tag map.
 // ---------------------------------------------------------------------------
 
 /// Emulator resource guard, NOT an AWS-published value: how many data sets this
@@ -510,6 +626,28 @@ pub const MAX_JOBS: usize = 500;
 /// "Amazon Redshift datashare assets per import job from Redshift") but carries no
 /// value for any of them.
 pub const MAX_JOB_DETAIL_ENTRIES: usize = 100;
+
+/// Emulator resource guard, NOT an AWS-published value: how many event actions this
+/// emulator stores. The limit is the one the model's `LimitName` enum calls
+/// [`LIMIT_EVENT_ACTIONS_PER_ACCOUNT`]; the model carries no number for it.
+pub const MAX_EVENT_ACTIONS: usize = 250;
+
+/// The model's `LimitName` value for the event-action count limit, reported on the
+/// modelled `ServiceLimitExceededException`.
+pub const LIMIT_EVENT_ACTIONS_PER_ACCOUNT: &str = "Event actions per account";
+
+/// Amazon S3's own bucket-naming rule: a bucket name is 3-63 characters long. The
+/// destination bucket of an auto-export action is stored, so it is bounded by the
+/// longest name S3 itself admits.
+pub const MAX_BUCKET_CHARS: usize = 63;
+
+/// Amazon S3's own object-key limit: a key is at most 1024 characters. An auto-export
+/// `KeyPattern` names the keys the export writes, so it is bounded by the same.
+pub const MAX_KEY_PATTERN_CHARS: usize = 1_024;
+
+/// Emulator resource guard, NOT an AWS quota: the longest `KmsKeyArn` this emulator
+/// stores. The model constrains it only as a string.
+pub const MAX_KMS_KEY_ARN_CHARS: usize = 2_048;
 
 /// The model's `LimitName` value for the per-data-set revision limit.
 pub const LIMIT_REVISIONS_PER_DATA_SET: &str = "Revisions per data set";
@@ -590,6 +728,58 @@ pub fn data_set_limit_exceeded() -> ServiceLimitExceededException {
     }
 }
 
+/// The modelled 402 for a create that would take the store past [`MAX_EVENT_ACTIONS`].
+pub fn event_action_limit_exceeded() -> ServiceLimitExceededException {
+    ServiceLimitExceededException {
+        limit_name: Some(LIMIT_EVENT_ACTIONS_PER_ACCOUNT.to_string()),
+        limit_value: MAX_EVENT_ACTIONS as f64,
+        message: format!(
+            "The {LIMIT_EVENT_ACTIONS_PER_ACCOUNT} limit of {MAX_EVENT_ACTIONS} has been reached."
+        ),
+    }
+}
+
+/// Refuse an event action's `Action` the store will not hold, and one that describes
+/// nothing to do.
+///
+/// `Action` and the details under it are modelled structures, so the boundary walk
+/// has already refused a missing `@required` member; what it cannot state is that an
+/// action has to name WHICH action it performs (the model's `Action` carries one
+/// optional member, `ExportRevisionToS3`), nor how much caller-sized text the stored
+/// record may carry. Both are checked here, so every operation that stores an action
+/// — the create and the update — refuses the same values with the same sentence.
+pub fn bound_action(action: &Action) -> Result<(), String> {
+    let Some(export) = action.export_revision_to_s3.as_ref() else {
+        return Err(
+            "Action must name the action to perform: ExportRevisionToS3".to_string()
+        );
+    };
+    bound_chars(
+        "Action.ExportRevisionToS3.RevisionDestination.Bucket",
+        &export.revision_destination.bucket,
+        MAX_BUCKET_CHARS,
+    )?;
+    if let Some(key_pattern) = export.revision_destination.key_pattern.as_deref() {
+        bound_chars(
+            "Action.ExportRevisionToS3.RevisionDestination.KeyPattern",
+            key_pattern,
+            MAX_KEY_PATTERN_CHARS,
+        )?;
+    }
+    if let Some(kms_key_arn) = export
+        .encryption
+        .as_ref()
+        .and_then(|encryption| encryption.kms_key_arn.as_deref())
+    {
+        bound_chars(
+            "Action.ExportRevisionToS3.Encryption.KmsKeyArn",
+            kms_key_arn,
+            MAX_KMS_KEY_ARN_CHARS,
+        )?;
+    }
+    Ok(())
+}
+
 /// Mint a fresh identifier for a data set or a revision.
 ///
 /// The model's `com.amazonaws.dataexchange#Id` is `^[a-zA-Z0-9]{30,40}$`, so the
@@ -639,6 +829,20 @@ pub fn revision_arn(region: &str, data_set_id: &str, revision_id: &str) -> Strin
         SERVICE,
         region,
         &format!("data-sets/{data_set_id}/revisions/{revision_id}"),
+    )
+}
+
+/// `arn:aws:dataexchange:<region>:<account>:event-actions/<event_action_id>`.
+pub fn event_action_arn(region: &str, event_action_id: &str) -> String {
+    ::engine::emulator_arn(SERVICE, region, &format!("event-actions/{event_action_id}"))
+}
+
+/// `arn:aws:dataexchange:<region>:<account>:data-sets/<data_set_id>/revisions/<revision_id>/assets/<asset_id>`.
+pub fn asset_arn(region: &str, data_set_id: &str, revision_id: &str, asset_id: &str) -> String {
+    ::engine::emulator_arn(
+        SERVICE,
+        region,
+        &format!("data-sets/{data_set_id}/revisions/{revision_id}/assets/{asset_id}"),
     )
 }
 

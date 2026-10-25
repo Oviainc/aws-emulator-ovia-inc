@@ -1122,13 +1122,28 @@ pub fn customer_managed_key_arn(identifier: &str, region: &str) -> String {
     }
 }
 
-/// The [`ComAmazonawsAppfabricFabricfrontendserviceState::client_tokens`] key for one operation's token.
+/// The [`ComAmazonawsAppfabricFabricfrontendserviceState::client_tokens`] key for
+/// one operation's token in one Region.
 ///
 /// Keyed by operation as well as token, because an idempotency token is scoped
 /// to the operation it was passed to: the same token on `CreateAppBundle` and on
 /// `CreateIngestion` is two independent requests.
-pub fn client_token_key(operation: &str, token: &str) -> String {
-    format!("{operation}#{token}")
+///
+/// Keyed by Region too, because each Region is its own endpoint holding its own
+/// resources and its own quota: a token spent against one Region says nothing
+/// about a call signed for another, so the same token in a second Region is a
+/// fresh request there rather than a retry that replays the first Region's
+/// resource.
+///
+/// Every component is length-prefixed (as [`request_fingerprint`]'s are), so no
+/// caller-chosen token value can make two different (Region, operation, token)
+/// triples render alike.
+pub fn client_token_key(region: &str, operation: &str, token: &str) -> String {
+    let mut key = String::new();
+    push_component(&mut key, region);
+    push_component(&mut key, operation);
+    push_component(&mut key, token);
+    key
 }
 
 /// A canonical rendering of a create request's parameters, so a replayed

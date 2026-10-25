@@ -313,6 +313,12 @@ async fn a_document_missing_its_body_is_told_so_before_any_exclusivity_rule() {
     let plan = create_active_plan(&router, "validation-plan").await;
 
     let body_required = Some(state::DOCUMENT_BODY_REQUIRED_MESSAGE.to_string());
+    // The two exclusivity refusals are worded by the service's single source for them,
+    // so this suite pins the PRECEDENCE of the rules without re-spelling their
+    // sentences (what each sentence must say is pinned by
+    // `rescore_document_shape_refusals`).
+    let title_exclusive = state::document_member_choice_message("Title", "TokenizedTitle");
+    let body_exclusive = state::document_member_choice_message("Body", "TokenizedBody");
     let cases = vec![
         DocumentCase {
             // The precedence row: the document fails BOTH rules, and the one it is
@@ -360,9 +366,7 @@ async fn a_document_missing_its_body_is_told_so_before_any_exclusivity_rule() {
                 "d1",
                 json!({ "Body": "a body", "Title": "a title", "TokenizedTitle": ["a"] })
             )]),
-            expected_message: Some(
-                "Document d1 provides both Title and TokenizedTitle; provide one.".to_string(),
-            ),
+            expected_message: Some(title_exclusive.clone()),
         },
         DocumentCase {
             case: "a pre-tokenized body, and both title forms",
@@ -370,9 +374,7 @@ async fn a_document_missing_its_body_is_told_so_before_any_exclusivity_rule() {
                 "d2",
                 json!({ "TokenizedBody": ["a", "body"], "Title": "t", "TokenizedTitle": ["t"] })
             )]),
-            expected_message: Some(
-                "Document d2 provides both Title and TokenizedTitle; provide one.".to_string(),
-            ),
+            expected_message: Some(title_exclusive.clone()),
         },
         DocumentCase {
             case: "both body forms, with one title form",
@@ -380,9 +382,7 @@ async fn a_document_missing_its_body_is_told_so_before_any_exclusivity_rule() {
                 "d3",
                 json!({ "Body": "a body", "TokenizedBody": ["a", "body"], "Title": "t" })
             )]),
-            expected_message: Some(
-                "Document d3 provides both Body and TokenizedBody; provide one.".to_string(),
-            ),
+            expected_message: Some(body_exclusive.clone()),
         },
         DocumentCase {
             case: "a text body only",

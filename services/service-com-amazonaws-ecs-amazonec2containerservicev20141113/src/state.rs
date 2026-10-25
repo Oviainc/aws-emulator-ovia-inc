@@ -38,7 +38,15 @@
 //! A service's task set is placed by the CALL that changes what the service wants
 //! ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::scale_service`], driven by
 //! `CreateService` and `UpdateService`), and each task it places then crosses `PENDING`
-//! -> `RUNNING` on the same clock. The scheduler's steady-state work beyond that —
+//! -> `RUNNING` on the same clock. A service whose deployment controller is not the ECS
+//! one takes its tasks from a TASK SET instead
+//! ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::scale_task_set`], driven by
+//! `CreateTaskSet`), placed the same way off the same clock. Where the capacity a
+//! placement needs does not exist, nothing is placed and the scheduler records WHY on the
+//! service's event stream
+//! ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::placement_capacity_reason`]);
+//! the desired count is the caller's and does not move because the scheduler could not
+//! meet it. The scheduler's steady-state work beyond that —
 //! replacing a task somebody else stopped, re-placing a daemon's task when a container
 //! instance registers later — is not modelled: nothing runs between calls, and a
 //! reporting operation may not place a task nobody asked for.
@@ -56,10 +64,10 @@ use crate::ops::types::{
     DeploymentCircuitBreaker, DeploymentConfiguration, DeploymentController, EphemeralStorage,
     Failure, KeyValuePair, LoadBalancer, ManagedInstancesProvider, NetworkConfiguration,
     PlacementConstraint, PlacementStrategy, PlatformDevice, PortMapping, ProxyConfiguration,
-    Resource, RuntimePlatform, Service, ServiceConnectConfiguration,
+    Resource, RuntimePlatform, Scale, Service, ServiceConnectConfiguration,
     ServiceCurrentRevisionSummary, ServiceDeploymentBrief, ServiceEvent, ServiceRegistry,
     ServiceVolumeConfiguration, Setting, Tag, Task, TaskDefinition,
-    TaskDefinitionPlacementConstraint, TaskOverride,
+    TaskDefinitionPlacementConstraint, TaskOverride, TaskSet,
     ThresholdConfiguration, VersionInfo, Volume, VpcLatticeConfiguration,
     CLUSTER_SETTING_NAME_VALUES,
 };
@@ -883,6 +891,93 @@ pub const SERVICE_LINKED_ROLE_RESOURCE: &str =
 /// event stream for your service. A maximum of 100 of the latest events are displayed."
 pub const MAX_SERVICE_EVENTS: usize = 100;
 
+/// `TaskSet$status` for a task set that is NOT serving production traffic — the status
+/// every task set a client creates starts in. The member's doc: "PRIMARY: The task set
+/// is serving production traffic. ACTIVE: The task set isn't serving production traffic",
+/// and `UpdateServicePrimaryTaskSet` is what promotes one ("Modifies which task set in a
+/// service is the primary task set").
+pub const TASK_SET_ACTIVE: &str = "ACTIVE";
+
+/// `TaskSet$status` for the task set that IS serving production traffic.
+pub const TASK_SET_PRIMARY: &str = "PRIMARY";
+
+/// `StabilityStatus` for a task set that has reached its steady state. The
+/// `TaskSet$stabilityStatus` doc: the task set is in `STEADY_STATE` when "The task
+/// `runningCount` is equal to the `computedDesiredCount`" and "The `pendingCount` is 0";
+/// "If any of those conditions aren't met, the stability status returns STABILIZING."
+pub const STABILITY_STATUS_STEADY_STATE: &str = "STEADY_STATE";
+
+/// See [`STABILITY_STATUS_STEADY_STATE`]: the task set has not reached its steady state.
+pub const STABILITY_STATUS_STABILIZING: &str = "STABILIZING";
+
+/// The only unit a scale is measured in, from the `ScaleUnit` enum (`PERCENT`), and so
+/// the unit a stored scale carries when the request named none.
+pub const SCALE_UNIT_PERCENT: &str = "PERCENT";
+
+/// The lowest `Scale$value` a task set may carry. The member's doc: "The value,
+/// specified as a percent total of a service's `desiredCount`, to scale the task set.
+/// Accepted values are numbers between 0 and 100."
+pub const MIN_SCALE_PERCENT: f64 = 0.0;
+
+/// The highest `Scale$value` a task set may carry — see [`MIN_SCALE_PERCENT`].
+pub const MAX_SCALE_PERCENT: f64 = 100.0;
+
+/// How many task sets one service may hold. The `CreateTaskSet` doc points at the quota
+/// ("For information about the maximum number of task sets and other quotas, see Amazon
+/// ECS service quotas"), where "Task sets per service" is 5.
+pub const MAX_TASK_SETS_PER_SERVICE: usize = 5;
+
+/// The message a `TaskSetNotFoundException` carries. A FIXED sentence naming nothing from
+/// the request, like this service's other not-found sentences.
+pub const TASK_SET_NOT_FOUND_MESSAGE: &str = "The specified task set was not found.";
+
+/// `TaskSet$startedBy` for a task set CodeDeploy created: "If an CodeDeploy deployment
+/// created the task set, the `startedBy` parameter is `CODE_DEPLOY`. If an external
+/// deployment created the task set, the `startedBy` field isn't used."
+pub const TASK_SET_STARTED_BY_CODE_DEPLOY: &str = "CODE_DEPLOY";
+
+/// Why a `Scale` a request carries cannot be stored, or `None` when it can.
+///
+/// `Scale$value`: "Accepted values are numbers between 0 and 100" — a percentage of the
+/// service's desired count, so a value outside that range describes no task set. The
+/// bound is reported as the double it is, the way the refused percentage reads.
+pub fn scale_violation(scale: &Scale) -> Option<String> {
+    if scale.value > MAX_SCALE_PERCENT {
+        return Some(format!(
+            "TaskSet Scale value for percent can not be greater than {MAX_SCALE_PERCENT:.1}"
+        ));
+    }
+    if scale.value < MIN_SCALE_PERCENT {
+        return Some(format!(
+            "TaskSet Scale value for percent can not be less than {MIN_SCALE_PERCENT:.1}"
+        ));
+    }
+    None
+}
+
+/// The scale a task set is STORED with: the one the request carried, with the only unit
+/// the `ScaleUnit` enum has filled in, and `Scale$value`'s own modelled default (`0`) for
+/// a request that named no scale at all.
+pub fn stored_scale(requested: Option<&Scale>) -> Scale {
+    Scale {
+        value: requested.map(|scale| scale.value).unwrap_or_default(),
+        unit: Some(SCALE_UNIT_PERCENT.to_string()),
+    }
+}
+
+/// The service event the scheduler writes when it wants to place a task and cannot.
+///
+/// The Amazon ECS service event message for a placement that finds no instance to run
+/// on, whose `reason` sentence says WHICH capacity was missing — the same sentence
+/// `RunTask` refuses with, since both describe the one condition.
+pub fn unable_to_place_message(service_name: &str, reason: &str) -> String {
+    format!(
+        "(service {service_name}) was unable to place a task because no container instance \
+         met all of its requirements. Reason: {reason} For more information, see the \
+         Troubleshooting section of the Amazon ECS Developer Guide."
+    )
+}
+
 /// The scheduling strategy a service takes when the request names none. The
 /// `CreateService$desiredCount` doc — "This is required if schedulingStrategy is
 /// `REPLICA` or isn't specified" — makes `REPLICA` the unspecified case.
@@ -900,6 +995,12 @@ pub const DEPLOYMENT_CONTROLLER_ECS: &str = "ECS";
 /// Named here because the service it controls must carry a load balancer: CodeDeploy
 /// shifts traffic between two target groups, which only a listener can reach.
 pub const DEPLOYMENT_CONTROLLER_CODE_DEPLOY: &str = "CODE_DEPLOY";
+
+/// The deployment controller a third party drives, from the `DeploymentControllerType`
+/// enum. The `CreateTaskSet` doc: "This is used when a service uses the EXTERNAL
+/// deployment controller type", so a service under this controller takes its tasks from
+/// the task sets a client creates rather than from its own scheduler.
+pub const DEPLOYMENT_CONTROLLER_EXTERNAL: &str = "EXTERNAL";
 
 /// `propagateTags` when the request names none. The member's doc: "If no value is
 /// specified, the tags aren't propagated. ... The default is NONE."
@@ -2340,6 +2441,116 @@ impl ServiceFields {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TaskCapacityExceeded;
 
+/// Which optional task-set fields a response carries, as `DescribeTaskSets$include`
+/// (the `TaskSetField` enum: `TAGS`) selects them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TaskSetFields {
+    pub tags: bool,
+}
+
+impl TaskSetFields {
+    /// Every optional field — what the operation that CREATED the task set returns,
+    /// since the caller just supplied them and `CreateTaskSet` has no `include` member
+    /// to narrow them with.
+    pub fn all() -> Self {
+        Self { tags: true }
+    }
+
+    /// The fields the `include` list of a describe request asks for. Unknown entries
+    /// cannot reach here: `include` targets the closed `TaskSetField` enum.
+    pub fn from_include(include: Option<&Vec<String>>) -> Self {
+        let mut fields = Self::default();
+        for field in include.into_iter().flatten() {
+            if field == "TAGS" {
+                fields.tags = true;
+            }
+        }
+        fields
+    }
+}
+
+/// A service's `include` selection carries over to the task sets reported INSIDE it:
+/// `DescribeServices$include` and `DescribeTaskSets$include` name the same `TAGS` field,
+/// so a request that asked for the service's tags asked for its task sets' too.
+impl From<ServiceFields> for TaskSetFields {
+    fn from(fields: ServiceFields) -> Self {
+        Self { tags: fields.tags }
+    }
+}
+
+/// A set of tasks of ONE service, as `CreateTaskSet` created it.
+///
+/// The record holds the task set's CONFIGURATION only. `computedDesiredCount` is derived
+/// from the service's `desiredCount` and this scale, and `runningCount`/`pendingCount`
+/// are counted off the tasks this task set actually placed (see
+/// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::task_set_view`]), so a
+/// reported count can never drift from the records that exist.
+#[derive(Debug, Clone)]
+pub struct TaskSetRecord {
+    /// `TaskSet$id`, an `ecs-svc/` identifier like a deployment's.
+    pub id: String,
+    pub arn: String,
+    pub cluster_name: String,
+    pub cluster_arn: String,
+    pub service_name: String,
+    pub service_arn: String,
+    pub external_id: Option<String>,
+    pub status: String,
+    pub task_definition_arn: String,
+    /// The family and revision the ARN above names, kept so the scheduler can read the
+    /// revision back when it places a task — as [`ServiceRecord::task_definition`] is.
+    pub task_definition: (String, i32),
+    pub launch_type: Option<String>,
+    pub capacity_provider_strategy: Vec<CapacityProviderStrategyItem>,
+    pub platform_version: Option<String>,
+    pub network_configuration: Option<NetworkConfiguration>,
+    pub load_balancers: Vec<LoadBalancer>,
+    pub service_registries: Vec<ServiceRegistry>,
+    /// `TaskSet$scale`: "A floating-point percentage of your desired number of tasks to
+    /// place and keep running in the task set."
+    pub scale: Scale,
+    pub tags: Vec<Tag>,
+    /// The `clientToken` the create carried, so repeating that create is idempotent
+    /// ("An identifier that you provide to ensure the idempotency of the request").
+    pub client_token: Option<String>,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
+impl TaskSetRecord {
+    /// The key this record is stored under: the cluster, the service and the task set's
+    /// own id — the three things every task-set operation addresses one by.
+    pub fn key(&self) -> (String, String, String) {
+        (
+            self.cluster_name.clone(),
+            self.service_name.clone(),
+            self.id.clone(),
+        )
+    }
+
+    /// Whether `reference` names this task set. The `taskSets` doc: "The ID or full
+    /// Amazon Resource Name (ARN) of task sets to describe."
+    pub fn is_named_by(&self, reference: &str) -> bool {
+        let reference = reference.trim();
+        reference == self.id || reference == self.arn
+    }
+}
+
+/// Where ONE placement takes its capacity from, and whose task it is.
+///
+/// A service's own scheduler and a task set place tasks the same way and differ only in
+/// this: the launch type or capacity provider the placement runs under, the platform
+/// version it asks for, and the `startedBy` the placed task carries.
+#[derive(Debug, Clone)]
+pub struct Placement {
+    pub launch_type: Option<String>,
+    pub capacity_provider_name: Option<String>,
+    pub platform_version: Option<String>,
+    /// `Task$startedBy` of every task this placement places: the deployment id for a
+    /// service's own scheduler, the task-set id for a task set's.
+    pub started_by: String,
+}
+
 /// What one pass over the task map counts for ONE service.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ServiceTally {
@@ -2383,6 +2594,10 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// cluster ("Service names must be unique within a cluster, but you can have
     /// similarly named services in multiple clusters"), which is exactly this key.
     pub services: HashMap<(String, String), ServiceRecord>,
+    /// `(clusterName, serviceName, taskSetId)` -> the task set. A task set belongs to one
+    /// service of one cluster — the three members every task-set operation addresses one
+    /// by — and `CreateTaskSet` mints an id that is unique across them all.
+    pub task_sets: HashMap<(String, String, String), TaskSetRecord>,
     /// `serviceDeploymentArn` -> the service deployment. A service's rollouts are its
     /// HISTORY, so a record outlives the rollout it names (`ListServiceDeployments` lists
     /// finished deployments as well as the one under way) and the key is the ARN the
@@ -2417,6 +2632,8 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// Monotonic source of service-event ids, so every event of every service is
     /// distinct.
     next_service_event_seq: u64,
+    /// Monotonic source of task-set ids, so every task set of every service is distinct.
+    next_task_set_seq: u64,
 }
 
 impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
@@ -2657,6 +2874,14 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     pub fn next_deployment_id(&mut self) -> String {
         self.next_deployment_seq += 1;
         format!("ecs-svc/{:019}", self.next_deployment_seq)
+    }
+
+    /// Mint the id of the next task set. `TaskSet$id` is "The ID of the task set", an
+    /// `ecs-svc/` identifier like a deployment's; the counter is what makes every task
+    /// set of every service distinct.
+    pub fn next_task_set_id(&mut self) -> String {
+        self.next_task_set_seq += 1;
+        format!("ecs-svc/{:019}", self.next_task_set_seq)
     }
 
     /// Mint the ARN of the service revision a deployment rolls out. A service revision is
@@ -2957,12 +3182,21 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// tasks in the cluster that are in the RUNNING state" and `pendingCount` the same
     /// for `PENDING`; a task that has been asked to stop is no longer one of them.
     pub fn service_tally(&self, cluster_name: &str, service_name: &str) -> ServiceTally {
+        self.tally_wanted(|task| {
+            task.cluster_name == cluster_name && task.service_name.as_deref() == Some(service_name)
+        })
+    }
+
+    /// The RUNNING/PENDING split of every task `wanted` selects that is still wanted
+    /// RUNNING — defined once, so the service's counts and a task set's cannot disagree
+    /// about what each status counts.
+    fn tally_wanted(&self, wanted: impl Fn(&TaskRecord) -> bool) -> ServiceTally {
         let mut tally = ServiceTally::default();
-        for task in self.tasks.values().filter(|task| {
-            task.cluster_name == cluster_name
-                && task.service_name.as_deref() == Some(service_name)
-                && task.desired_status == STATUS_RUNNING
-        }) {
+        for task in self
+            .tasks
+            .values()
+            .filter(|task| task.desired_status == STATUS_RUNNING && wanted(task))
+        {
             if task.last_status == STATUS_RUNNING {
                 tally.running += 1;
             } else if task.last_status == STATUS_PENDING {
@@ -3144,7 +3378,16 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             task_sets: if scheduler_owned {
                 None
             } else {
-                Some(Vec::new())
+                // "If the service uses the CODE_DEPLOY deployment controller, the
+                // deploymentController, taskSets and deployments parameters will be
+                // returned": the task sets the service actually holds, which for a
+                // controller that is not the ECS scheduler is where its tasks come from.
+                Some(
+                    self.service_task_sets(&service.cluster_name, &service.name)
+                        .into_iter()
+                        .map(|task_set| self.task_set_view(task_set, fields.into()))
+                        .collect(),
+                )
             },
             deployments: Some(if scheduler_owned {
                 // The current rollout, then the deployments it is replacing — which are
@@ -3396,6 +3639,166 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             SERVICE_DEPLOYMENT_STOPPED,
             &format!("Service {name} was deleted"),
         );
+        // A task set belongs to the service it was created in, so a deleted service keeps
+        // none: the tasks it placed were stopped above with every other task of the
+        // service.
+        self.task_sets
+            .retain(|(cluster, service, _), _| (cluster, service) != (&key.0, &key.1));
+    }
+
+    /// The task sets of ONE service, oldest first.
+    ///
+    /// Task set ids are minted from a fixed-width monotonic counter, so sorting the ids
+    /// orders the task sets by the call that created them.
+    pub fn service_task_sets(
+        &self,
+        cluster_name: &str,
+        service_name: &str,
+    ) -> Vec<&TaskSetRecord> {
+        let mut found: Vec<&TaskSetRecord> = self
+            .task_sets
+            .values()
+            .filter(|task_set| {
+                task_set.cluster_name == cluster_name && task_set.service_name == service_name
+            })
+            .collect();
+        found.sort_by(|left, right| left.id.cmp(&right.id));
+        found
+    }
+
+    /// The task set a `taskSet` reference names in one service of one cluster, if this
+    /// store holds it. The member's doc: "The ID or full Amazon Resource Name (ARN) of
+    /// task sets", so a reference is either form.
+    pub fn resolve_task_set(
+        &self,
+        cluster_name: &str,
+        service_name: &str,
+        reference: &str,
+    ) -> Option<&TaskSetRecord> {
+        self.task_sets.values().find(|task_set| {
+            task_set.cluster_name == cluster_name
+                && task_set.service_name == service_name
+                && task_set.is_named_by(reference)
+        })
+    }
+
+    /// How many tasks `task_set` wants. `TaskSet$computedDesiredCount`: "This is
+    /// calculated by multiplying the service's `desiredCount` by the task set's `scale`
+    /// percentage. The result is always rounded up."
+    pub fn computed_desired_count(&self, task_set: &TaskSetRecord) -> i32 {
+        let Some(service) = self
+            .services
+            .get(&(task_set.cluster_name.clone(), task_set.service_name.clone()))
+        else {
+            return 0;
+        };
+        let desired = f64::from(service.desired_count.max(0));
+        let computed = (desired * task_set.scale.value / MAX_SCALE_PERCENT).ceil();
+        if computed <= 0.0 {
+            return 0;
+        }
+        // The product of a count and a percentage cannot leave the `Integer` the member
+        // targets, but the cast is still bounded rather than wrapped.
+        computed.min(f64::from(i32::MAX)) as i32
+    }
+
+    /// What the task map counts for ONE task set: the tasks it placed and still wants,
+    /// split by lifecycle status — the same split [`Self::service_tally`] makes, keyed on
+    /// the task set that placed the task rather than on the service.
+    pub fn task_set_tally(&self, task_set: &TaskSetRecord) -> ServiceTally {
+        self.tally_wanted(|task| {
+            task.cluster_name == task_set.cluster_name
+                && task.started_by.as_deref() == Some(task_set.id.as_str())
+        })
+    }
+
+    /// The `TaskSet` every task-set-returning operation reports, built from what is
+    /// stored.
+    ///
+    /// `computedDesiredCount` is DERIVED from the service's desired count and this task
+    /// set's scale, and `runningCount`/`pendingCount` are COUNTED off the task map, so
+    /// the `stabilityStatus` that follows from them is read rather than asserted.
+    pub fn task_set_view(&self, task_set: &TaskSetRecord, fields: TaskSetFields) -> TaskSet {
+        let tally = self.task_set_tally(task_set);
+        let computed_desired_count = self.computed_desired_count(task_set);
+        let service = self
+            .services
+            .get(&(task_set.cluster_name.clone(), task_set.service_name.clone()));
+        // "A platform family is specified only for tasks that use the Fargate launch
+        // type", and so is a platform version — the same rule a service's projection
+        // follows, read off the capacity THIS task set runs on.
+        let fargate = task_set.launch_type.as_deref() == Some(LAUNCH_TYPE_FARGATE)
+            || task_set.capacity_provider_strategy.iter().any(|item| {
+                MANAGED_CAPACITY_PROVIDERS.contains(&item.capacity_provider.as_str())
+            });
+        let os_family = self
+            .task_definitions
+            .get(&task_set.task_definition)
+            .and_then(|definition| definition.runtime_platform.as_ref())
+            .and_then(|platform| platform.operating_system_family.clone())
+            .unwrap_or_else(|| DEFAULT_OS_FAMILY.to_string());
+        let requested_platform_version = fargate.then(|| {
+            task_set
+                .platform_version
+                .clone()
+                .unwrap_or_else(|| PLATFORM_VERSION_LATEST.to_string())
+        });
+        TaskSet {
+            id: Some(task_set.id.clone()),
+            task_set_arn: Some(task_set.arn.clone()),
+            service_arn: Some(task_set.service_arn.clone()),
+            cluster_arn: Some(task_set.cluster_arn.clone()),
+            // "If an CodeDeploy deployment created the task set, the `startedBy`
+            // parameter is `CODE_DEPLOY`. If an external deployment created the task set,
+            // the `startedBy` field isn't used."
+            started_by: service
+                .filter(|service| service.controller() == DEPLOYMENT_CONTROLLER_CODE_DEPLOY)
+                .map(|_| TASK_SET_STARTED_BY_CODE_DEPLOY.to_string()),
+            external_id: task_set.external_id.clone(),
+            status: Some(task_set.status.clone()),
+            task_definition: Some(task_set.task_definition_arn.clone()),
+            computed_desired_count,
+            pending_count: tally.pending,
+            running_count: tally.running,
+            created_at: Some(task_set.created_at),
+            updated_at: Some(task_set.updated_at),
+            launch_type: task_set.launch_type.clone(),
+            capacity_provider_strategy: Some(task_set.capacity_provider_strategy.clone()),
+            platform_version: requested_platform_version
+                .as_deref()
+                .map(|requested| resolved_platform_version(requested, &os_family)),
+            platform_family: fargate.then(|| os_family_display(&os_family)),
+            network_configuration: task_set.network_configuration.clone(),
+            load_balancers: Some(task_set.load_balancers.clone()),
+            service_registries: Some(task_set.service_registries.clone()),
+            scale: Some(task_set.scale.clone()),
+            // "The task `runningCount` is equal to the `computedDesiredCount`" and "The
+            // `pendingCount` is 0"; otherwise the task set is still stabilizing.
+            stability_status: Some(
+                if tally.running == computed_desired_count && tally.pending == 0 {
+                    STABILITY_STATUS_STEADY_STATE
+                } else {
+                    STABILITY_STATUS_STABILIZING
+                }
+                .to_string(),
+            ),
+            // "The Unix timestamp for the time when the task set stability status was
+            // retrieved": the stability status is computed from the tasks as they stand
+            // when the task set was last written, which is the instant it carries.
+            stability_status_at: Some(task_set.updated_at),
+            // `DescribeTaskSets$include`: "If `TAGS` is specified, the tags are included
+            // in the response. If this field is omitted, tags aren't included" — and an
+            // untagged task set omits the member rather than reporting an empty list, as
+            // a service's projection does.
+            tags: if fields.tags && !task_set.tags.is_empty() {
+                Some(task_set.tags.clone())
+            } else {
+                None
+            },
+            // A Fargate ephemeral-storage setting is encrypted with a customer key the
+            // caller supplies, and nothing here supplies one.
+            fargate_ephemeral_storage: None,
+        }
     }
 
     /// Place or stop tasks so the service holds exactly the `desiredCount` tasks it
@@ -3406,6 +3809,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// runs on the call that CHANGES what the service wants, never on a read. A task of
     /// a superseded deployment is no longer wanted, so a new deployment replaces the
     /// task set it inherited.
+    ///
+    /// A placement the cluster cannot satisfy places NOTHING and records WHY on the
+    /// service's event stream instead (see [`Self::record_placement_failure`]): the
+    /// desired count is what the caller asked for and does not move because the scheduler
+    /// could not meet it.
     ///
     /// `Err` means the placement would push this emulator past [`MAX_TASKS`]; nothing is
     /// changed in that case.
@@ -3422,6 +3830,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         if !service.places_tasks() {
             return Ok(());
         }
+        let placement = service_placement(&service);
 
         // Task ids are minted from a fixed-width monotonic counter and the ARN ends with
         // the id, so sorting the ARNs orders the task set oldest first.
@@ -3476,10 +3885,155 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             return Ok(());
         }
 
+        if to_place > 0 {
+            if let Some(reason) = self.placement_capacity_reason(&service, &placement) {
+                self.record_placement_failure(key, &reason, now);
+                return Ok(());
+            }
+        }
         for _ in 0..to_place {
-            self.place_service_task(&service, definition, region, now);
+            self.place_service_task(&service, definition, &placement, region, now);
         }
         Ok(())
+    }
+
+    /// Place or stop tasks so `task_set` holds exactly the `computedDesiredCount` tasks
+    /// it wants, from `definition`.
+    ///
+    /// The same scheduler work [`Self::scale_service`] does, for the task set of a
+    /// service whose deployment controller is not the ECS one: the `Service$taskSets` doc
+    /// describes those as "a set of Amazon ECS tasks in either an CodeDeploy or an
+    /// `EXTERNAL` deployment", and how many tasks the set wants is the
+    /// `TaskSet$computedDesiredCount` the service's desired count and this scale come to.
+    /// It runs on the call that CHANGES what the task set wants, never on a read.
+    pub fn scale_task_set(
+        &mut self,
+        key: &(String, String, String),
+        definition: &TaskDefinitionRecord,
+        region: &str,
+        now: SystemTime,
+    ) -> Result<(), TaskCapacityExceeded> {
+        let Some(task_set) = self.task_sets.get(key).cloned() else {
+            return Ok(());
+        };
+        let Some(service) = self
+            .services
+            .get(&(task_set.cluster_name.clone(), task_set.service_name.clone()))
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let placement = task_set_placement(&task_set);
+        let desired = usize::try_from(self.computed_desired_count(&task_set)).unwrap_or(0);
+
+        let mut live: Vec<String> = self
+            .tasks
+            .values()
+            .filter(|task| {
+                task.cluster_name == task_set.cluster_name
+                    && task.started_by.as_deref() == Some(task_set.id.as_str())
+                    && task.desired_status == STATUS_RUNNING
+                    && task.is_active()
+            })
+            .map(|task| task.task_arn.clone())
+            .collect();
+        live.sort();
+
+        let to_place = desired.saturating_sub(live.len());
+        if self.tasks.len() + to_place > MAX_TASKS {
+            return Err(TaskCapacityExceeded);
+        }
+        if live.len() > desired {
+            for arn in live[desired..].iter().rev() {
+                self.stop_service_task(
+                    arn,
+                    now,
+                    &format!("Scaling activity initiated by task set {}", task_set.id),
+                );
+            }
+            return Ok(());
+        }
+        if to_place > 0 {
+            if let Some(reason) = self.placement_capacity_reason(&service, &placement) {
+                let service_key = (task_set.cluster_name.clone(), task_set.service_name.clone());
+                self.record_placement_failure(&service_key, &reason, now);
+                return Ok(());
+            }
+        }
+        for _ in 0..to_place {
+            self.place_service_task(&service, definition, &placement, region, now);
+        }
+        Ok(())
+    }
+
+    /// Why the scheduler cannot place a task of `service` under `placement` right now, or
+    /// `None` when it can.
+    ///
+    /// The capacity a placement runs on has to EXIST before Amazon ECS has anywhere to
+    /// put the task: "The EC2 launch type runs your tasks on Amazon EC2 instances
+    /// registered to your cluster" (and `EXTERNAL` on the registered on-premises
+    /// capacity), and an Auto Scaling group capacity provider's capacity is the container
+    /// instances its group registers — unless the provider scales that group itself, in
+    /// which case the capacity is coming and the task is parked instead
+    /// ([`awaits_provisioned_capacity`]). The sentence this answers is the one `RunTask`
+    /// refuses the same condition with, so a client reads one explanation whichever call
+    /// hit it.
+    pub fn placement_capacity_reason(
+        &self,
+        service: &ServiceRecord,
+        placement: &Placement,
+    ) -> Option<String> {
+        if self.registered_container_instances(&service.cluster_name) > 0 {
+            return None;
+        }
+        if needs_registered_capacity(placement.launch_type.as_deref()) {
+            return Some(NO_CONTAINER_INSTANCES_MESSAGE.to_string());
+        }
+        let provider = placement
+            .capacity_provider_name
+            .as_deref()
+            .and_then(|name| self.capacity_providers.get(name))?;
+        needs_registered_capacity_now(provider)
+            .then(|| empty_capacity_provider_message(&provider.name))
+    }
+
+    /// Append the scheduler's own account of a placement it could not make to the
+    /// service's event stream.
+    ///
+    /// `Service$events` is "The event stream for your service", and this is the entry
+    /// Amazon ECS writes there when it wants to place a task and finds nowhere to put it
+    /// — the documented place a client reads why `runningCount` is below `desiredCount`.
+    /// A consecutive repeat of the same sentence is not appended: the event stream holds
+    /// "the latest events" of the service, and re-stating the same unchanged condition
+    /// would push every other event out of it.
+    fn record_placement_failure(
+        &mut self,
+        key: &(String, String),
+        reason: &str,
+        now: SystemTime,
+    ) {
+        let Some(service) = self.services.get(key) else {
+            return;
+        };
+        let message = unable_to_place_message(&service.name, reason);
+        if service
+            .events
+            .last()
+            .is_some_and(|event| event.message == message)
+        {
+            return;
+        }
+        let event = self.mint_service_event(now, message);
+        let Some(service) = self.services.get_mut(key) else {
+            return;
+        };
+        service.events.push(event);
+        // "A maximum of 100 of the latest events are displayed", so only the latest are
+        // kept at all.
+        if service.events.len() > MAX_SERVICE_EVENTS {
+            let first_kept = service.events.len() - MAX_SERVICE_EVENTS;
+            service.events.drain(..first_kept);
+        }
     }
 
     /// Place ONE task of `service`, `PENDING` with its start owed by the clock
@@ -3490,21 +4044,13 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         &mut self,
         service: &ServiceRecord,
         definition: &TaskDefinitionRecord,
+        placement: &Placement,
         region: &str,
         now: SystemTime,
     ) {
-        let (launch_type, capacity_provider_name) = match &service.launch_type {
-            Some(launch_type) => (Some(launch_type.clone()), None),
-            None => (
-                None,
-                service
-                    .capacity_provider_strategy
-                    .first()
-                    .map(|item| item.capacity_provider.clone()),
-            ),
-        };
         let awaiting_capacity = awaits_provisioned_capacity(
-            capacity_provider_name
+            placement
+                .capacity_provider_name
                 .as_deref()
                 .and_then(|name| self.capacity_providers.get(name)),
             self.registered_container_instances(&service.cluster_name),
@@ -3539,12 +4085,12 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             cpu: definition.cpu.clone(),
             memory: definition.memory.clone(),
             overrides: None,
-            launch_type,
-            capacity_provider_name,
-            platform_version: service.platform_version.clone(),
+            launch_type: placement.launch_type.clone(),
+            capacity_provider_name: placement.capacity_provider_name.clone(),
+            platform_version: placement.platform_version.clone(),
             // `Task$startedBy`: for a task the service scheduler placed, the id of the
-            // deployment that placed it.
-            started_by: Some(service.deployment_id.clone()),
+            // deployment that placed it; for a task set's, the id of that task set.
+            started_by: Some(placement.started_by.clone()),
             // `Task$group`: "The name of the task group associated with the task", which
             // for a service's task is `service:<service name>`.
             group: format!("service:{}", service.name),
@@ -4343,6 +4889,44 @@ pub fn initial_task_status(awaiting_capacity: bool) -> &'static str {
     }
 }
 
+/// Where a task the SERVICE's own scheduler places takes its capacity from. "A service
+/// will return either a `capacityProviderStrategy` or `launchType` parameter, but not
+/// both", so exactly one of the two decides the placement.
+pub fn service_placement(service: &ServiceRecord) -> Placement {
+    let (launch_type, capacity_provider_name) = match &service.launch_type {
+        Some(launch_type) => (Some(launch_type.clone()), None),
+        None => (
+            None,
+            service
+                .capacity_provider_strategy
+                .first()
+                .map(|item| item.capacity_provider.clone()),
+        ),
+    };
+    Placement {
+        launch_type,
+        capacity_provider_name,
+        platform_version: service.platform_version.clone(),
+        started_by: service.deployment_id.clone(),
+    }
+}
+
+/// Where a task a TASK SET places takes its capacity from. The task set carries its own
+/// launch type or capacity provider strategy ("If a `launchType` is specified, the
+/// `capacityProviderStrategy` parameter must be omitted"), so its tasks are placed on
+/// that rather than on the service's.
+pub fn task_set_placement(task_set: &TaskSetRecord) -> Placement {
+    Placement {
+        launch_type: task_set.launch_type.clone(),
+        capacity_provider_name: task_set
+            .capacity_provider_strategy
+            .first()
+            .map(|item| item.capacity_provider.clone()),
+        platform_version: task_set.platform_version.clone(),
+        started_by: task_set.id.clone(),
+    }
+}
+
 /// `ManagedScaling$status` when Amazon ECS scales the Auto Scaling group itself, from the
 /// `ManagedScalingStatus` enum (`ENABLED` / `DISABLED`). The member is optional and the
 /// doc states the default is off ("the default is off"), so an absent or `DISABLED`
@@ -4761,12 +5345,59 @@ pub fn rollout_state_reason(deployment_id: &str, settled: bool) -> String {
     }
 }
 
+/// The task-set ID a `taskSet` reference names: the value as given when it is an id,
+/// otherwise the id a task-set ARN ends with
+/// (`task-set/<cluster>/<service>/<id>`, where the id itself carries an `ecs-svc/`
+/// prefix). The member's doc: "The ID or full Amazon Resource Name (ARN) of task sets",
+/// so a reference is either form and an ARN is never wrapped in another one.
+pub fn task_set_id_from_reference(reference: &str) -> String {
+    let reference = reference.trim();
+    match reference.rsplit_once(":task-set/") {
+        Some((_, tail)) => tail.splitn(3, '/').nth(2).unwrap_or(tail).to_string(),
+        None => reference.to_string(),
+    }
+}
+
+/// Why a `clientToken` a request carries cannot be stored, or `None` when it can.
+///
+/// Every such member's doc: "It must be unique and is case sensitive. Up to 36 ASCII
+/// characters in the range of 33-126 (inclusive) are allowed." Shared by every operation
+/// that takes one, so a token one of them refuses is refused by the others too.
+pub fn client_token_violation(token: &str) -> Option<String> {
+    let legal = token.len() <= MAX_CLIENT_TOKEN_LENGTH
+        && !token.is_empty()
+        && token.bytes().all(|byte| (33..=126).contains(&byte));
+    if legal {
+        return None;
+    }
+    Some(format!(
+        "clientToken must be up to {MAX_CLIENT_TOKEN_LENGTH} ASCII characters in the \
+         range 33-126; got {token:?}"
+    ))
+}
+
 /// The ARN of a service: `arn:aws:ecs:<region>:<account>:service/<cluster>/<name>`.
 pub fn service_arn(region: &str, cluster_name: &str, service_name: &str) -> String {
     ::engine::emulator_arn(
         ARN_NAMESPACE,
         region,
         &format!("service/{cluster_name}/{service_name}"),
+    )
+}
+
+/// The ARN of a task set:
+/// `arn:aws:ecs:<region>:<account>:task-set/<cluster>/<service>/<task set id>`. The id a
+/// task set carries already has its own `ecs-svc/` prefix, so the ARN ends with it.
+pub fn task_set_arn(
+    region: &str,
+    cluster_name: &str,
+    service_name: &str,
+    task_set_id: &str,
+) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("task-set/{cluster_name}/{service_name}/{task_set_id}"),
     )
 }
 

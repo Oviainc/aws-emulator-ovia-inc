@@ -772,6 +772,22 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
             .retain(|_, t| !(t.user_pool_id == user_pool_id && t.username == username));
     }
 
+    /// Revoke every token this emulator issued to `username` in `user_pool_id`,
+    /// and forget its outstanding challenge sessions.
+    ///
+    /// A revoked record stays stored and stays refused: the token checks reject a
+    /// revoked token wherever one is presented, so a token a caller still holds
+    /// authorizes nothing after the user it names is deactivated.
+    pub fn revoke_user_tokens(&mut self, user_pool_id: &str, username: &str) {
+        self.auth_sessions
+            .retain(|_, s| !(s.user_pool_id == user_pool_id && s.username == username));
+        for record in self.issued_tokens.values_mut() {
+            if record.user_pool_id == user_pool_id && record.username == username {
+                record.revoked = true;
+            }
+        }
+    }
+
     /// Forget every session and token issued in `user_pool_id`. Called when the
     /// pool they belong to is deleted.
     pub fn forget_pool_credentials(&mut self, user_pool_id: &str) {

@@ -217,6 +217,41 @@ pub const EMPTY_RESOURCE_POLICY: &str = "{}";
 /// no `ListTagsForResource` could report.
 pub const MAX_RESOURCE_TAGS: usize = 200;
 
+/// The tag-key namespace Amazon Web Services keeps for the tags it generates
+/// itself.
+///
+/// `Tag$Key`'s `@pattern` admits a colon, so the key SYNTAX cannot state this
+/// rule: AWS's tagging rules keep the `aws:` namespace for the tags AWS applies
+/// on a caller's behalf, and a caller can neither create, edit nor remove a key
+/// inside it. Every request member of this service that carries tag keys is
+/// judged against it through [`is_reserved_tag_key`], so a key AWS owns is
+/// refused rather than stored as a user tag the tag reports would hand back.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` lies inside the namespace [`RESERVED_TAG_KEY_PREFIX`] keeps.
+///
+/// The prefix is matched however it is cased: it names ONE namespace, and
+/// `Tag$Key`'s pattern admits every casing of it, so spelling it in capitals
+/// does not put a key outside it.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// The first of `keys`, in the order given, that [`is_reserved_tag_key`] — the
+/// key a refusal names — or `None` when every key is one a caller may name.
+pub fn first_reserved_tag_key<'a, I>(keys: I) -> Option<&'a str>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    keys.into_iter().find(|key| is_reserved_tag_key(key))
+}
+
+/// The same, for the tag pairs a request carries.
+pub fn first_reserved_tag(tags: &[Tag]) -> Option<&str> {
+    first_reserved_tag_key(tags.iter().map(|tag| tag.key.as_str()))
+}
+
 /// The `NextToken` prefix `ListChangeSets` pages with.
 pub const CHANGE_SET_PAGE_PREFIX: &str = "CS";
 
@@ -1931,6 +1966,21 @@ pub fn validation_message(message: impl Into<String>) -> ValidationException {
 /// member named ahead of what was wrong with it.
 pub fn validation(field: &str, message: impl Into<String>) -> ValidationException {
     validation_message(format!("{field}: {}", message.into()))
+}
+
+/// The modelled `ValidationException` payload for a tag key no caller may name:
+/// one inside the namespace [`RESERVED_TAG_KEY_PREFIX`] keeps.
+///
+/// Stated against `field` — the request member that carried the key — and built
+/// from the request, so the refusal names the offending key the caller sent.
+pub fn reserved_tag_key(field: &str, key: &str) -> ValidationException {
+    validation(
+        field,
+        format!(
+            "tag key '{key}' begins with '{RESERVED_TAG_KEY_PREFIX}', the prefix reserved for \
+             the tags Amazon Web Services creates, which a caller cannot create, edit or remove"
+        ),
+    )
 }
 
 /// The modelled `ValidationException` payload for a member this service could

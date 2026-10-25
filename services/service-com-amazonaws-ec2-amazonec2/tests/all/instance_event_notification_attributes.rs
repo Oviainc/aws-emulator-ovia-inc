@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end cover for `RegisterInstanceEventNotificationAttributes` and
+//! End-to-end cover for `RegisterInstanceEventNotificationAttributes`,
+//! `DeregisterInstanceEventNotificationAttributes` and
 //! `DescribeInstanceEventNotificationAttributes`, driven over the wire the service actually
 //! speaks: `ec2Query` — an `application/x-www-form-urlencoded` POST whose body carries
 //! `Action=…`, answered with XML (README.md / OPERATIONS.md "Wire protocol").
@@ -8,13 +9,15 @@
 //! The rule under test is that the tag keys registered to appear in scheduled event
 //! notifications are ONE registration per Region — either every tag key of that Region is
 //! registered (`IncludeAllTagsOfInstance`) or exactly the keys registered individually are
-//! (`InstanceTagKeys`) — that a register UNIONS the keys it names into it, and that the
-//! describe of that Region reports back exactly what the register answered with.
+//! (`InstanceTagKeys`) — that a register UNIONS the keys it names into it, that a
+//! deregister REMOVES the keys it names from it (and, with `IncludeAllTagsOfInstance=false`,
+//! every one of them) while answering the keys it took out, and that the describe of that
+//! Region reports what the registration holds afterwards.
 //!
 //! So the tables below span that class rather than one recorded request: key sets that
 //! differ in count, in content, in the order they arrive in and in whether they repeat a
-//! key; both modes of the attribute, in both orders; several Regions; and the published
-//! tag-key length bound with one character past it.
+//! key; keys nothing registered; both modes of the attribute, in both orders; several
+//! Regions; and the published tag-key length bound with one character past it.
 
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -27,6 +30,9 @@ const REGION: &str = "us-east-1";
 
 /// `RegisterInstanceEventNotificationAttributes`.
 const REGISTER: &str = "RegisterInstanceEventNotificationAttributes";
+
+/// `DeregisterInstanceEventNotificationAttributes`.
+const DEREGISTER: &str = "DeregisterInstanceEventNotificationAttributes";
 
 /// `DescribeInstanceEventNotificationAttributes`.
 const DESCRIBE: &str = "DescribeInstanceEventNotificationAttributes";
@@ -91,6 +97,9 @@ fn emulator() -> MultiServiceRouter {
 /// The form fields of a register that names `keys` individually: ec2Query flattens
 /// `InstanceTagKeys` under its `InstanceTagKey` XML name, inside the `InstanceTagAttribute`
 /// structure — indexed from 1, which is what [`super::ec2_query::indexed`] builds.
+///
+/// The deregister's own `InstanceTagKeys` carries the same XML name inside the same
+/// `InstanceTagAttribute` structure, so this builds the key fields of either request.
 fn register_keys(keys: &[&str]) -> Vec<Param> {
     indexed("InstanceTagAttribute.InstanceTagKey", keys)
 }
@@ -98,6 +107,14 @@ fn register_keys(keys: &[&str]) -> Vec<Param> {
 /// The form fields of a register that asks for every tag key of the Region.
 fn register_all() -> Vec<Param> {
     vec![param("InstanceTagAttribute.IncludeAllTagsOfInstance", "true")]
+}
+
+/// The form fields of a deregister that asks for every tag key of the Region: "Specify
+/// `false` to deregister all tag keys"
+/// (`DeregisterInstanceTagAttributeRequest$IncludeAllTagsOfInstance`), which is the mirror of
+/// the register's `true`.
+fn deregister_all() -> Vec<Param> {
+    vec![param("InstanceTagAttribute.IncludeAllTagsOfInstance", "false")]
 }
 
 /// The registration a response carries, or a panic naming the case: the one
@@ -121,6 +138,7 @@ fn registration(case: &str, body: &str) -> Registration {
                 .collect()
         })
         .unwrap_or_default();
+
     Registration {
         include_all: match include_all.as_str() {
             "true" => true,
@@ -154,6 +172,31 @@ async fn describe(router: &MultiServiceRouter, case: &str, region: &str) -> Regi
         "case {case:?}: expected HTTP 200 from {DESCRIBE}, got {status} with body {body}"
     );
     registration(case, &body)
+}
+
+/// One deregister call in `region`, required to succeed, as the attribute it answers with.
+async fn deregister(
+    router: &MultiServiceRouter,
+    case: &str,
+    region: &str,
+    params: &[Param],
+) -> Registration {
+    let (status, body) = call(router, region, DEREGISTER, params).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from {DEREGISTER}, got {status} with body {body}"
+    );
+    registration(case, &body)
+}
+
+/// How many Regions the store holds a registration ENTRY for, read off the state the
+/// emulator serves from: an emptied registration must leave none behind.
+fn stored_regions(engine: &engine::InMemoryEngine) -> usize {
+    engine
+        .state::<ec2::state::ComAmazonawsEc2Amazonec2State>()
+        .lock()
+        .instance_event_tag_registrations
+        .len()
 }
 
 /// The registration of `region`, asserted against `expected` as a SET.
@@ -367,6 +410,294 @@ async fn describing_changes_nothing_a_later_caller_sees() {
             expected.sorted(),
             "case {case:?}: expected {region} to report {expected:?}, got {first:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The deregister
+// ---------------------------------------------------------------------------
+
+/// The attribute a deregister answers with: the tag keys it took OUT of the registration, as
+/// a set, beside the mode the registration is LEFT in — derived from the row rather than
+/// written out twice.
+fn removed(keys: &[&str], left: &Registration) -> Registration {
+    let mut answer = Registration::of(keys);
+    answer.include_all = left.include_all;
+    answer
+}
+
+/// The rule: a deregister removes exactly the tag keys it names from the Region's
+/// registration, leaves every other key where it is, and answers the keys it removed — which
+/// the registration no longer holds, so only the describe reports what is left.
+///
+/// The rows differ along what the rule generalises over: how many keys of how many the
+/// request names, a key nothing registered, the same key named twice, keys with punctuation
+/// and non-ASCII keys, and a registration in the include-all mode, whose mode naming keys
+/// must not turn off.
+#[tokio::test]
+async fn a_deregister_removes_the_keys_it_names_and_answers_the_keys_it_removed() {
+    // (case, what is registered first, the keys the deregister names, what is left)
+    let cases: [(&str, Vec<Param>, &[&str], Registration); 7] = [
+        (
+            "one of three keys",
+            register_keys(&["Name", "Stage", "Owner"]),
+            &["Stage"],
+            Registration::of(&["Name", "Owner"]),
+        ),
+        (
+            "two of three keys in one request",
+            register_keys(&["Name", "Stage", "Owner"]),
+            &["Name", "Owner"],
+            Registration::of(&["Stage"]),
+        ),
+        (
+            "the only registered key",
+            register_keys(&["Name"]),
+            &["Name"],
+            Registration::empty(),
+        ),
+        (
+            "every registered key, named explicitly",
+            register_keys(&["Name", "Stage"]),
+            &["Stage", "Name"],
+            Registration::empty(),
+        ),
+        (
+            "a key nothing registered",
+            register_keys(&["Name"]),
+            &["Absent"],
+            Registration::of(&["Name"]),
+        ),
+        (
+            "the same key named twice in one request",
+            register_keys(&["cost.center/team-1", "aws:cloudformation:stack-name"]),
+            &["cost.center/team-1", "cost.center/team-1"],
+            Registration::of(&["aws:cloudformation:stack-name"]),
+        ),
+        (
+            // The include-all mode holds no individual key, so naming keys removes none —
+            // and the mode is not what naming keys asks about, so it stays on.
+            "a non-ASCII key against the include-all mode",
+            register_all(),
+            &["Eigentümer"],
+            Registration::all(),
+        ),
+    ];
+
+    for (case, seed, keys, left) in cases {
+        // A fresh emulator per row, so a row starts from a Region with nothing registered.
+        let (router, engine) = super::ec2_query::emulator();
+        register(&router, case, REGION, &seed).await;
+
+        let expected = removed(keys, &left);
+        let answered = deregister(&router, case, REGION, &register_keys(keys)).await;
+        assert_eq!(
+            answered.sorted(),
+            expected.sorted(),
+            "case {case:?}: expected {DEREGISTER} to answer {expected:?}, got {answered:?}"
+        );
+        assert_registration(&router, case, REGION, &left).await;
+
+        // A registration with nothing left in it is one nothing has registered in, so the
+        // store keeps no entry for the Region at all.
+        let stored_expected = usize::from(left != Registration::empty());
+        let stored = stored_regions(&engine);
+        assert_eq!(
+            stored, stored_expected,
+            "case {case:?}: expected the store to hold {stored_expected} entr(y/ies) for \
+             {left:?}, got {stored}"
+        );
+    }
+}
+
+/// `IncludeAllTagsOfInstance=false` deregisters ALL tag keys ("Specify `false` to deregister
+/// all tag keys"), whichever mode the Region's registration is in, and answers the keys it
+/// took out.
+///
+/// The rows are the states a registration can be in: individual keys, the include-all mode,
+/// and a Region nothing has registered in at all.
+#[tokio::test]
+async fn deregistering_all_tag_keys_empties_the_registration_whichever_mode_it_is_in() {
+    // (case, what is registered first, the keys the deregister must answer with)
+    let cases: [(&str, Vec<Param>, &[&str]); 4] = [
+        (
+            "two individually registered keys",
+            register_keys(&["Name", "Stage"]),
+            &["Name", "Stage"],
+        ),
+        ("one individually registered key", register_keys(&["Name"]), &["Name"]),
+        // The include-all mode holds no individual key, so there is none to report.
+        ("the include-all mode", register_all(), &[]),
+        ("a Region nothing has registered in", Vec::new(), &[]),
+    ];
+
+    for (case, seed, answered_keys) in cases {
+        let (router, engine) = super::ec2_query::emulator();
+        if !seed.is_empty() {
+            register(&router, case, REGION, &seed).await;
+        }
+
+        let expected = Registration::of(answered_keys);
+        let answered = deregister(&router, case, REGION, &deregister_all()).await;
+        assert_eq!(
+            answered.sorted(),
+            expected.sorted(),
+            "case {case:?}: expected {DEREGISTER} to answer {expected:?}, got {answered:?}"
+        );
+        assert_registration(&router, case, REGION, &Registration::empty()).await;
+        assert_eq!(
+            stored_regions(&engine),
+            0,
+            "case {case:?}: expected a Region with nothing registered to hold no entry"
+        );
+    }
+}
+
+/// A deregister is a fact of the Region the request was signed for: it reaches only that
+/// Region's registration, and every other Region is left exactly as it was.
+///
+/// The rows are Regions in different partitions, one in each mode of the attribute.
+#[tokio::test]
+async fn a_deregister_reaches_only_the_region_it_was_signed_for() {
+    let router = emulator();
+    // (case, the Region, what is registered there, what it must report after the deregister
+    // in the first Region)
+    let cases: [(&str, &str, Vec<Param>, Registration); 3] = [
+        (
+            "the Region the deregister is signed for",
+            "us-east-1",
+            register_keys(&["Name", "Stage"]),
+            Registration::of(&["Stage"]),
+        ),
+        (
+            "another Region with the same key registered",
+            "eu-west-2",
+            register_keys(&["Name", "Stage"]),
+            Registration::of(&["Name", "Stage"]),
+        ),
+        (
+            "a Region in the include-all mode",
+            "ap-southeast-1",
+            register_all(),
+            Registration::all(),
+        ),
+    ];
+
+    for (case, region, seed, _) in &cases {
+        register(&router, case, region, seed).await;
+    }
+    deregister(
+        &router,
+        "the deregister under test",
+        "us-east-1",
+        &register_keys(&["Name"]),
+    )
+    .await;
+    for (case, region, _, expected) in &cases {
+        assert_registration(&router, case, region, expected).await;
+    }
+}
+
+/// Every refusal the deregister makes, each with the EC2 error code and HTTP status it
+/// answers — the same ones the register answers for the same bad request, since the two
+/// requests carry the same attribute — and none of them writes anything.
+///
+/// The rows differ along what makes the request bad: both members of the attribute in one
+/// request, neither of them, no attribute at all, a key with no characters, a key one
+/// character past the published bound, and a dry run of each of the deregister's two modes.
+#[tokio::test]
+async fn a_bad_deregister_is_refused_with_the_ec2_error_code_for_it() {
+    let router = emulator();
+    let seeded = Registration::of(&["Name"]);
+    register(&router, "the refusal table's key", REGION, &register_keys(&["Name"])).await;
+
+    let mut both = deregister_all();
+    both.extend(register_keys(&["Name"]));
+    let mut both_on = vec![param("InstanceTagAttribute.IncludeAllTagsOfInstance", "true")];
+    both_on.extend(register_keys(&["Name"]));
+    let past_bound: String = std::iter::repeat_n('k', MAX_KEY_CHARS + 1).collect();
+    // (case, the deregister's form fields, the HTTP status, the EC2 error code)
+    let cases: [(&str, Vec<Param>, u16, &str); 8] = [
+        (
+            "both members of the attribute",
+            both,
+            400,
+            ec2::state::INVALID_PARAMETER_COMBINATION,
+        ),
+        (
+            // The flag carries the other value, which this request has no reading for —
+            // but it is still the flag, named beside a tag key.
+            "both members of the attribute, with the flag the other way round",
+            both_on,
+            400,
+            ec2::state::INVALID_PARAMETER_COMBINATION,
+        ),
+        (
+            // `true` is not a value this request has a reading for: "Specify `false` to
+            // deregister all tag keys", so the request names neither member.
+            "neither member of the attribute",
+            vec![param("InstanceTagAttribute.IncludeAllTagsOfInstance", "true")],
+            400,
+            ec2::state::MISSING_PARAMETER,
+        ),
+        (
+            // `InstanceTagAttribute` is a modelled `@required` member, so the boundary
+            // validator refuses a request without it BEFORE the handler runs — with its
+            // own `MalformedInput`, not with the handler's `MissingParameter`.
+            "no attribute at all",
+            Vec::new(),
+            400,
+            "MalformedInput",
+        ),
+        (
+            "a key with no characters",
+            register_keys(&[""]),
+            400,
+            ec2::state::INVALID_PARAMETER_VALUE,
+        ),
+        (
+            "a key one character past the published length bound",
+            register_keys(&[past_bound.as_str()]),
+            400,
+            ec2::state::INVALID_PARAMETER_VALUE,
+        ),
+        (
+            "a dry run of a deregister of one key that would have succeeded",
+            {
+                let mut params = register_keys(&["Name"]);
+                params.push(param("DryRun", "true"));
+                params
+            },
+            412,
+            ec2::state::DRY_RUN_OPERATION,
+        ),
+        (
+            "a dry run of a deregister of all tag keys",
+            {
+                let mut params = deregister_all();
+                params.push(param("DryRun", "true"));
+                params
+            },
+            412,
+            ec2::state::DRY_RUN_OPERATION,
+        ),
+    ];
+
+    for (case, params, status_expected, code_expected) in cases {
+        let (status, body) = call(&router, REGION, DEREGISTER, &params).await;
+        assert_eq!(
+            status, status_expected,
+            "case {case:?}: expected HTTP {status_expected} from {DEREGISTER}, got {status} \
+             with body {body}"
+        );
+        let code = error_code(&body);
+        assert_eq!(
+            code, code_expected,
+            "case {case:?}: expected error code {code_expected:?} from {DEREGISTER}, got \
+             {code:?} with body {body}"
+        );
+        // Nothing the refusal named was written: the Region still reports what it held.
+        assert_registration(&router, case, REGION, &seeded).await;
     }
 }
 

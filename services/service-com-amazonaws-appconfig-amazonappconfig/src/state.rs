@@ -462,6 +462,51 @@ pub fn parameter_rejection(parameters: &HashMap<String, Parameter>) -> Option<St
     })
 }
 
+/// Why the `supplied` parameter VALUES are not a set this service will store against an
+/// extension version declaring `declared`, or `None` when they are.
+///
+/// Both halves of the rule come from the declaration rather than from the request: a name
+/// the version does not declare "is not a parameter of this extension", and "a parameter
+/// value must be specified in the extension association" for every parameter the version
+/// marks required (`smithy_query(query="shape",shape="Parameter")`). Every operation that
+/// writes an association's `ParameterValueMap` refuses through this one function, so the
+/// create side and the update side cannot drift apart, and each half reads the names
+/// sorted so a request breaking the rule twice is refused with the same wording whichever
+/// order the map happened to iterate in.
+pub fn parameter_value_rejection(
+    declared: &HashMap<String, Parameter>,
+    supplied: &HashMap<String, String>,
+    extension_name: &str,
+    version_number: i32,
+) -> Option<String> {
+    let mut names: Vec<&str> = supplied.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    if let Some(unknown) = names
+        .into_iter()
+        .find(|name| !declared.contains_key(*name))
+    {
+        return Some(format!(
+            "Extension {extension_name} version {version_number} declares no parameter \
+             named {unknown}."
+        ));
+    }
+    let mut required: Vec<&str> = declared
+        .iter()
+        .filter(|(_, parameter)| parameter.required)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    required.sort_unstable();
+    required
+        .into_iter()
+        .find(|name| !supplied.contains_key(*name))
+        .map(|missing| {
+            format!(
+                "Parameter {missing} is required by extension {extension_name} version \
+                 {version_number}."
+            )
+        })
+}
+
 /// A resource one of this service's tag operations can address, as the resource portion
 /// of its ARN names it.
 ///
@@ -2783,6 +2828,19 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
     /// created none under that id. `GetExtensionAssociation` is the caller this exists for.
     pub fn extension_association(&self, association_id: &str) -> Option<&ExtensionAssociation> {
         self.extension_associations.get(association_id)
+    }
+
+    /// The extension association `association_id` names, for a caller that EDITS it in
+    /// place rather than creating another one.
+    ///
+    /// `UpdateExtensionAssociation` is the caller this exists for: the association keeps
+    /// the id and ARN its create minted, the extension version it binds and the resource
+    /// it is bound to, so only the members an update carries change.
+    pub fn extension_association_mut(
+        &mut self,
+        association_id: &str,
+    ) -> Option<&mut ExtensionAssociation> {
+        self.extension_associations.get_mut(association_id)
     }
 
     /// Every extension association this account created, for a reader that must report

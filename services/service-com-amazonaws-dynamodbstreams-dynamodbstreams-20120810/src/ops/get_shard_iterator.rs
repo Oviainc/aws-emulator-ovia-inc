@@ -6,6 +6,10 @@
 //! to it. The token is a digest, not an encoding of the input: the position lives
 //! only in the store, so it cannot be decoded or forged.
 //!
+//! A shard is addressable only while the stream SERVES it, so a stream whose
+//! asynchronous enable is still pending — which exposes no shards — has no shard to
+//! iterate and the request is `ResourceNotFoundException`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -196,7 +200,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 )
             })?;
-            let shard = stream.shard(&input.shard_id).ok_or_else(|| {
+            // The shard must be one the stream SERVES at this instant: while the
+            // stream's asynchronous enable is still pending it exposes no shards
+            // at all, so there is nothing to place an iterator in and the shard is
+            // as absent as one of another stream.
+            let shard = stream.shard_at(&input.shard_id, now).ok_or_else(|| {
                 GetShardIteratorErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(format!(

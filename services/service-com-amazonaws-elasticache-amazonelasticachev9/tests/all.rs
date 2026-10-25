@@ -156,3 +156,8 @@ mod delete_user_built_in_user;
 // user-group id already taken).
 #[path = "all/refusal_message_fidelity.rs"]
 mod refusal_message_fidelity;
+
+// Appended for the same reason: the suite about a request that states how a user
+// authenticates twice, which drives both writers through the `ModifyUser` suite's reader.
+#[path = "all/user_authentication_mode_conflict.rs"]
+mod user_authentication_mode_conflict;

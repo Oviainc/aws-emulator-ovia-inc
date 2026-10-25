@@ -21,15 +21,16 @@
 //! and in which direction the size changes mid-walk.
 //!
 //! As in `tests/all/sub_check_results.rs`, the sub-check results a run produced are
-//! PLACED in the store (a configuration check of this emulator evaluates no rule, so no
-//! API of this service writes one); every call under test goes over the wire.
+//! PLACED in the store once the run has ended (a run produces only the handful of results
+//! its check's rules decide, which is fewer than these rows page over); every call under
+//! test goes over the wire.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_ssmsap_ssmsap::ops::types::CONFIGURATION_CHECK_TYPE_VALUES;
 use service_com_amazonaws_ssmsap_ssmsap::state::MAX_PAGE_SIZE;
 
 use crate::application_lifecycle::Emulator;
-use crate::configuration_checks::{read_record, settle};
+use crate::configuration_checks::read_record;
 use crate::sub_check_results::{member, place_results, sub_check_results};
 
 /// How many pages a walk follows before it gives up: a reader that handed out a token
@@ -156,7 +157,7 @@ async fn a_token_resumes_at_a_position_whatever_page_size_follows_it() {
             .one_check(&application_id, CONFIGURATION_CHECK_TYPE_VALUES[0])
             .await;
         let stored = sub_check_results(0xC0, count, 1);
-        place_results(&emulator, &operation_id, stored.clone());
+        place_results(&emulator, &operation_id, stored.clone()).await;
 
         let mut expected: Vec<String> = stored.iter().map(|result| result.id.clone()).collect();
         expected.sort();
@@ -185,10 +186,9 @@ async fn repeating_a_listing_reports_the_same_page_and_changes_nothing() {
     let operation_id = emulator
         .one_check("HDB-CURSOR-REPEAT", CONFIGURATION_CHECK_TYPE_VALUES[0])
         .await;
-    place_results(&emulator, &operation_id, sub_check_results(0xC1, 5, 2));
-    // Wait out the terminal status the clock owes the run, so nothing further is due and
-    // the two reads of the record must be identical.
-    settle().await;
+    // Placing the results waits out the terminal status the clock owes the run, so
+    // nothing further is due and the two reads of the record must be identical.
+    place_results(&emulator, &operation_id, sub_check_results(0xC1, 5, 2)).await;
     let before = read_record(&emulator.get_check(&operation_id).await);
 
     for max_results in [None, Some(1), Some(2), Some(MAX_PAGE_SIZE)] {

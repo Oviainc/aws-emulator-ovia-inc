@@ -606,7 +606,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // DEEP_ARCHIVE" (`CopyObjectRequest$StorageClass`) — which is exactly what this
         // operation's one modelled error reports: "The source object of the COPY action is
         // not in the active tier and is only stored in Amazon S3 Glacier."
-        if ARCHIVED_STORAGE_CLASSES.contains(&source_object.storage_class.as_str()) {
+        if crate::state::ARCHIVED_STORAGE_CLASSES.contains(&source_object.storage_class.as_str()) {
             return Err(CopyObjectErrorModeled::ObjectNotInActiveTierError(
                 ObjectNotInActiveTierError {},
             )
@@ -706,6 +706,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // headers are refused above, and a retention is placed on a stored version
             // afterwards, by `PutObjectRetention`.
             retention: None,
+            // And no restore: the copy is stored in a non-archived storage class (the source
+            // had to be out of one for this copy to be served at all), so there is nothing
+            // to restore; `RestoreObject` is what asks for one.
+            restore: None,
             body: source_object.body.clone(),
         };
         if replaces_metadata {
@@ -846,14 +850,6 @@ const ACCESS_POINT_ARN_PREFIX: &str = "arn:";
 /// (`smithy_query(query="shape",shape="MetadataDirective,TaggingDirective")`), and `COPY`
 /// is the default for each, so this is the only value that changes what is stored.
 const DIRECTIVE_REPLACE: &str = "REPLACE";
-
-/// The `StorageClass` values a source object cannot be copied out of until it is restored:
-/// "Before using an object as a source object for the copy operation, you must restore a
-/// copy of it if … the storage class of the source object is `GLACIER` or `DEEP_ARCHIVE`"
-/// (`smithy_query(query="doc",shape="CopyObjectRequest",member="StorageClass")`). Both are
-/// values of the `StorageClass` enum
-/// (`smithy_query(query="shape",shape="StorageClass")`).
-const ARCHIVED_STORAGE_CLASSES: [&str; 2] = ["GLACIER", "DEEP_ARCHIVE"];
 
 /// The source one `x-amz-copy-source` value names.
 #[derive(Debug)]

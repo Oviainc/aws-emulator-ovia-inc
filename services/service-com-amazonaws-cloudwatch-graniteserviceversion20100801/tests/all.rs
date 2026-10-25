@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/alarm_action_dispatch.rs"]
 mod alarm_action_dispatch;
+#[path = "all/alarm_action_failures.rs"]
+mod alarm_action_failures;
 #[path = "all/alarm_actions_switch.rs"]
 mod alarm_actions_switch;
 #[path = "all/alarm_configuration.rs"]
@@ -23,6 +25,8 @@ mod alarm_evaluation;
 mod alarm_history;
 #[path = "all/alarm_history_data.rs"]
 mod alarm_history_data;
+#[path = "all/alarm_reason_datapoints.rs"]
+mod alarm_reason_datapoints;
 #[path = "all/composite_alarms.rs"]
 mod composite_alarms;
 #[path = "all/dashboards.rs"]
