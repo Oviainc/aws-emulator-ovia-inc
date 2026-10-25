@@ -254,16 +254,16 @@ pub fn official_lens(lens: &str) -> Option<&'static OfficialLens> {
         .find(|official| official.alias == alias)
 }
 
-/// The questions a lens ATTACHED TO A WORKLOAD (or applied to a review template) asks, as
-/// this emulator knows it, in the lens's own order.
+/// The questions an AWS-OFFICIAL lens asks, as this emulator's catalog carries them, in
+/// the lens's own order.
 ///
-/// An AWS-official lens asks what its catalog entry asks ([`official_lens`]). A CUSTOM
-/// lens asks nothing HERE even once `CreateLensVersion` has published a version of it: its
-/// question set is lens CONTENT, held on its own [`super::LensRecord`] in the store rather
-/// than in this static catalog, and "the lens cannot be applied to workloads … until it's
-/// published with CreateLensVersion" (`ImportLens` doc) is enforced by `AssociateLenses`,
-/// still a stub with its own issue — so no custom lens in this emulator is attached to a
-/// workload for its questions to be reported or counted.
+/// The official half of a lens review's question set: a lens AWS publishes asks what its
+/// catalog entry asks ([`official_lens`]), and empty for an official alias this catalog
+/// carries no content for. A CUSTOM lens's questions are not here — its question set is
+/// lens CONTENT, held on its own [`super::LensRecord`] in the store — so an operation that
+/// reports the questions of whatever lens a request named resolves them through
+/// [`super::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::lens_review_questions`],
+/// which is this table for an official lens and the imported document for a custom one.
 pub fn lens_questions(lens: &str) -> &'static [FrameworkQuestion] {
     official_lens(lens).map_or(&[][..], |official| official.questions)
 }
@@ -274,12 +274,13 @@ pub fn lens_question_count(lens: &str) -> usize {
     lens_questions(lens).len()
 }
 
-/// The ONE question a lens asks under `question_id`, when it asks it.
+/// The ONE question an AWS-official lens asks under `question_id`, when it asks it.
 ///
 /// `QuestionId` is how every operation that reads or writes a single answer names the
-/// question, so this is the one lookup they share — and a lens this emulator holds no
-/// question set for asks nothing here ([`lens_questions`]), so no `QuestionId` of such a
-/// lens resolves.
+/// question, so this is the one lookup over this catalog they share — the official-lens
+/// counterpart of
+/// [`super::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::lens_review_question`],
+/// which resolves a question of WHATEVER lens a request named.
 pub fn lens_question(lens: &str, question_id: &str) -> Option<&'static FrameworkQuestion> {
     lens_questions(lens)
         .iter()

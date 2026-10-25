@@ -205,9 +205,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A question belongs to the LENS under review, so a `QuestionId` that lens does
-        // not ask names no answer of this lens review to report.
-        let question = crate::state::lens_question(&input.lens_alias, &input.question_id)
+        // A question belongs to the LENS under review — the questions that lens's own
+        // content defines (`crate::state::...::lens_review_question`) — so a `QuestionId`
+        // that lens does not ask names no answer of this lens review to report.
+        let question = store
+            .lens_review_question(&input.lens_alias, &input.question_id)
             .ok_or_else(|| {
                 GetAnswerErrorModeled::ResourceNotFoundException(crate::state::question_not_found(
                     &input.workload_id,
@@ -230,7 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &crate::state::request_region(ctx.parts()),
             )),
             answer: Some(crate::state::answer_projection(
-                question,
+                &question,
                 workload.answer(&input.lens_alias, &input.question_id),
             )),
         })
