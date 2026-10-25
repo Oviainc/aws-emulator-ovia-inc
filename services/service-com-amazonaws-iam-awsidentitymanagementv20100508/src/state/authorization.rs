@@ -61,6 +61,9 @@ pub const LIST_POLICIES: &str = "iam:ListPolicies";
 /// `iam:CreateGroup`.
 pub const CREATE_GROUP: &str = "iam:CreateGroup";
 
+/// `iam:ListUserTags`.
+pub const LIST_USER_TAGS: &str = "iam:ListUserTags";
+
 /// The decision value for a request the policies in force permit — one of the three
 /// `PolicyEvaluationDecisionType` declares
 /// (`smithy_query(query="shape",shape="PolicyEvaluationDecisionType")`).
@@ -93,7 +96,9 @@ pub fn decision_name(identity: Decision, resource: Decision) -> &'static str {
 ///
 /// `Ok(())` when the call is permitted; `Err` is the refusal the operation answers
 /// through its error channel (HTTP 403, error code `AccessDenied`), worded from the
-/// principal, the action and the resource the decision was made about.
+/// principal, the action and the resource the decision was made about — which this
+/// spelling names by its ARN. An operation whose request addresses ONE entity by name
+/// words it as that entity instead, through [`authorize_named`].
 ///
 /// A READ: the store is only consulted, so authorizing a call changes nothing a later
 /// caller sees.
@@ -102,6 +107,25 @@ pub fn authorize(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     action: &str,
     resource: &str,
+) -> Result<(), AccessDenied> {
+    authorize_named(store, ctx, action, resource, resource)
+}
+
+/// [`authorize`], with the resource the refusal NAMES (`named_as`) stated separately from
+/// the ARN the decision is made against (`resource`).
+///
+/// A denial reports "the resource the request was made on" ("Troubleshoot access denied
+/// error messages", IAM User Guide), and for a request that addresses a single entity by
+/// name that is the entity, not the collection it lives in — so such an operation words
+/// it as the entity's TYPE followed by the name the request carried (`user Bob`), with the
+/// type that disambiguates which entity a name belongs to. The ARN stays what the DECISION
+/// is made against, because a policy statement's `Resource` matches ARNs.
+pub fn authorize_named(
+    store: &IamState,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    action: &str,
+    resource: &str,
+    named_as: &str,
 ) -> Result<(), AccessDenied> {
     let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
     // A credential this account holds no IAM user for carries no identity-based
@@ -144,7 +168,7 @@ pub fn authorize(
         "the caller's identity-based policies do not permit this call"
     );
     Err(AccessDenied::new(format!(
-        "User: {principal} is not authorized to perform: {action} on resource: {resource} {reason}"
+        "User: {principal} is not authorized to perform: {action} on resource: {named_as} {reason}"
     )))
 }
 

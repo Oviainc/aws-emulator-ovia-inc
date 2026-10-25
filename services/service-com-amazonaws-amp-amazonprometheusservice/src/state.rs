@@ -118,6 +118,8 @@ pub const METRIC_NAME_LABEL: &str = "__name__";
 /// ACTIVE and workspace status is ACTIVE."; `ACTIVE` — "Logging configuration has been
 /// created/updated."; `UPDATING` — "Logging configuration is being updated.
 /// Update/Deletion is disallowed until logging configuration is ACTIVE and workspace
+/// status is ACTIVE."; `DELETING` — "Logging configuration is being deleting.
+/// Update/Deletion is disallowed until logging configuration is ACTIVE and workspace
 /// status is ACTIVE." (`crate::ops::types::LOGGING_CONFIGURATION_STATUS_CODE_VALUES`
 /// carries the full list, including the two failure codes nothing here reaches: this
 /// emulator runs no vended-log delivery that could fail.)
@@ -126,6 +128,9 @@ pub const LOGGING_STATUS_CREATING: &str = "CREATING";
 pub const LOGGING_STATUS_ACTIVE: &str = "ACTIVE";
 /// See [`LOGGING_STATUS_CREATING`].
 pub const LOGGING_STATUS_UPDATING: &str = "UPDATING";
+/// See [`LOGGING_STATUS_CREATING`]. The transient status a configuration whose DELETION
+/// has been accepted reports until the clock removes the record.
+pub const LOGGING_STATUS_DELETING: &str = "DELETING";
 
 /// The `resourceType` the modelled `ResourceNotFoundException` reports for a workspace's
 /// rules-and-alerting logging configuration. The member is a free-form `String`
@@ -642,7 +647,7 @@ pub struct LoggingConfiguration {
     /// The CloudWatch log group the vended log data is published to.
     pub log_group_arn: String,
     /// One of [`LOGGING_STATUS_CREATING`], [`LOGGING_STATUS_ACTIVE`],
-    /// [`LOGGING_STATUS_UPDATING`].
+    /// [`LOGGING_STATUS_UPDATING`], [`LOGGING_STATUS_DELETING`].
     pub status_code: String,
     /// `LoggingConfigurationStatus$statusReason` — "If failed, the reason for the
     /// failure", so `None` while nothing has failed.
@@ -651,8 +656,8 @@ pub struct LoggingConfiguration {
     /// When the configuration was most recently CHANGED, i.e. by the call that created
     /// it or last updated what it points at — not by the clock moving its status on.
     pub modified_at: SystemTime,
-    /// When the clock owes this configuration's move out of a transient status
-    /// (`CREATING`/`UPDATING` -> `ACTIVE`), if one is pending.
+    /// When the clock owes this configuration's next transition, if one is pending:
+    /// `CREATING`/`UPDATING` become `ACTIVE`, `DELETING` is removed.
     pub transition_due: Option<SystemTime>,
     /// The `clientToken` of the call that created it, never overwritten — so replaying
     /// that exact create still answers from the stored record after later updates, which
@@ -666,16 +671,23 @@ pub struct LoggingConfiguration {
 }
 
 impl LoggingConfiguration {
-    /// Apply the transition the clock already owes this configuration at `now`.
+    /// Apply the transition the clock already owes this configuration at `now`, and
+    /// report whether the workspace must stop holding it.
     ///
     /// The due instant was recorded by the call that started the transition, so it is
-    /// owed whether or not anybody calls again. Every transient status this emulator
-    /// puts a configuration in resolves to `ACTIVE`.
-    fn materialize_due(&mut self, now: SystemTime) {
-        if self.transition_due.is_some_and(|due| now >= due) {
-            self.transition_due = None;
-            self.status_code = LOGGING_STATUS_ACTIVE.to_string();
+    /// owed whether or not anybody calls again. A configuration being DELETED is GONE
+    /// once its due instant has passed — hence the `true` — and every other transient
+    /// status this emulator puts a configuration in resolves to `ACTIVE`.
+    fn materialize_due(&mut self, now: SystemTime) -> bool {
+        if self.transition_due.is_none_or(|due| now < due) {
+            return false;
         }
+        self.transition_due = None;
+        if self.status_code == LOGGING_STATUS_DELETING {
+            return true;
+        }
+        self.status_code = LOGGING_STATUS_ACTIVE.to_string();
+        false
     }
 }
 
@@ -932,8 +944,15 @@ impl ComAmazonawsAmpAmazonprometheusserviceState {
                 // standing for one: a later call carrying it is a new request.
                 workspace.configuration.update_token = None;
             }
-            if let Some(logging) = workspace.logging_configuration.as_mut() {
-                logging.materialize_due(now);
+            // A rules-and-alerting logging configuration settles on its own clock, and
+            // the removal `DeleteLoggingConfiguration` owes leaves the workspace holding
+            // none at all.
+            if workspace
+                .logging_configuration
+                .as_mut()
+                .is_some_and(|logging| logging.materialize_due(now))
+            {
+                workspace.logging_configuration = None;
             }
             // The attached policy's transition is owed on its own clock, independently
             // of the workspace's: a policy put on an active workspace becomes ACTIVE
