@@ -4,30 +4,31 @@
 //! over HTTP.
 //!
 //! One rule is pinned here: a request naming a resource this service cannot resolve is
-//! refused with a shape the OPERATION'S OWN modelled error list declares — the 404
-//! `ResourceNotFoundException` only where that operation declares it, and otherwise the
-//! 400 `InvalidRequestException` every operation of this service declares — with the
-//! identifier the request carried for the unresolvable resource named in `Message`, and
-//! never an empty success.
+//! answered as a NOT-FOUND condition — the service's 404 `ResourceNotFoundException`,
+//! carrying the identifier the request sent for the unresolvable resource — and never as
+//! an empty success. The 400 `InvalidRequestException` stays for a request that is WRONG
+//! rather than unresolvable, and for the two listings whose recorded answer names a scope
+//! the request only reaches THROUGH the resource it reports on (`ListNodes`, scoped to the
+//! member that owns the nodes; `ListProposalVotes`, reporting on one proposal).
 //!
-//! The shape is not a free choice: a generated client's error union for an operation holds
-//! exactly the shapes that operation declares, so an exception outside that set reaches a
-//! caller as an unmodelled error no typed handler can catch, and branching that reads a
-//! 404 as "the resource is gone" and a 400 as "fix the request" takes the wrong branch.
+//! Which code comes back is not a free choice: branching that reads a 404 as "the resource
+//! is gone" and a 400 as "fix the request" takes the wrong branch when the two are
+//! conflated, and a not-found reported as request validation is indistinguishable from a
+//! genuinely malformed request.
 //!
-//! The table spans the classes the rule generalises over: both halves of it (an operation
-//! that declares the not-found and one that does not), the operation kinds that resolve a
-//! scope (an id-addressed read and a listing), whether the request identifies the resource
-//! by id or by ARN, and which label of a nested path is the one that resolves to nothing
-//! (the parent that scopes the call, or the leaf it targets).
+//! The table spans the classes the rule generalises over: the operation kinds that resolve
+//! a scope (an id-addressed read and a listing), whether the request identifies the
+//! resource by id or by ARN, which label of a nested path is the one that resolves to
+//! nothing (the parent that scopes the call, or the leaf it targets), and both answers an
+//! unresolvable scope can carry.
 //!
-//! The catalog each row's expected pair comes from is the operation's own error list in
-//! the model (`smithy_query(query="operation", operation="<Name>")`): `ListMembers`,
-//! `ListNodes` and `ListProposalVotes` declare AccessDeniedException (403),
+//! An operation whose own modelled error list omits `ResourceNotFoundException`
+//! (`smithy_query(query="operation", operation="<Name>")` — `ListMembers`, `ListNodes` and
+//! `ListProposalVotes` declare only AccessDeniedException (403),
 //! InternalServiceErrorException (500), InvalidRequestException (400) and
-//! ThrottlingException (429) and no not-found, while `GetNetwork`, `GetMember`, `GetNode`,
-//! `GetProposal`, `GetAccessor`, `ListProposals` and `ListTagsForResource` declare
-//! ResourceNotFoundException (404) as well.
+//! ThrottlingException (429)) reaches the shape through its handler's `extra_errors`
+//! widening, so the error a caller receives is the one the service answers and not the one
+//! the operation's error list happened to list.
 
 use serde_json::json;
 
@@ -36,16 +37,16 @@ use crate::modelled_error_payloads::unknown_id;
 use crate::network_and_node_lifecycle::{create_node, REGION};
 use crate::resource_tags::label;
 
-/// The refusal of an operation whose modelled error list declares the not-found.
+/// The answer for a resource the request named and this service does not hold.
 const NOT_FOUND: (u16, &str) = (404, "ResourceNotFoundException");
 
-/// The refusal of an operation whose modelled error list does NOT declare it: every
-/// operation of this service declares `InvalidRequestException`, so that is the shape an
-/// unresolvable scope is reported in there.
+/// The refusal of a request that is WRONG rather than unresolvable, and of the two
+/// listings whose recorded answer names the scope they reach the reported resource
+/// through: every operation of this service declares `InvalidRequestException`.
 const INVALID_REQUEST: (u16, &str) = (400, "InvalidRequestException");
 
-/// One row: the request, the (status, error code) pair the operation's modelled error list
-/// allows for an unresolvable resource, and the identifier its `Message` must name.
+/// One row: the request, the (status, error code) pair the service answers an unresolvable
+/// resource with, and the identifier its `Message` must name.
 struct ScopeCase {
     case: &'static str,
     method: &'static str,
@@ -54,8 +55,8 @@ struct ScopeCase {
     names: String,
 }
 
-/// An unresolvable resource is refused with a shape the operation's own modelled error
-/// list declares, naming the identifier the request carried for it.
+/// An unresolvable resource is reported as a not-found, naming the identifier the request
+/// carried for it.
 #[tokio::test]
 async fn an_unresolvable_resource_is_refused_with_a_shape_the_operation_declares() {
     let router = new_router();
@@ -105,13 +106,13 @@ async fn an_unresolvable_resource_is_refused_with_a_shape_the_operation_declares
     let gone_accessor = unknown_id("ac", 'G');
 
     let cases: Vec<ScopeCase> = vec![
-        // The operations whose model declares NO not-found: the refusal is the invalid
-        // request, whatever the listing was scoped by.
+        // `ListMembers` reports on the members of the network its path names, so the
+        // network it cannot resolve is a not-found — whatever filters the request carried.
         ScopeCase {
             case: "ListMembers/unknown-network",
             method: "GET",
             path: format!("/networks/{gone_network}/members"),
-            refusal: INVALID_REQUEST,
+            refusal: NOT_FOUND,
             names: gone_network.clone(),
         },
         ScopeCase {
@@ -120,7 +121,7 @@ async fn an_unresolvable_resource_is_refused_with_a_shape_the_operation_declares
             path: format!(
                 "/networks/{other_gone_network}/members?status=AVAILABLE&isOwned=true&maxResults=5"
             ),
-            refusal: INVALID_REQUEST,
+            refusal: NOT_FOUND,
             names: other_gone_network.clone(),
         },
         // `ListNodes` is scoped to the member that owns the nodes, so the scope it reports
@@ -155,8 +156,8 @@ async fn an_unresolvable_resource_is_refused_with_a_shape_the_operation_declares
             refusal: INVALID_REQUEST,
             names: gone_proposal.clone(),
         },
-        // The other half of the rule: an operation that DOES declare the not-found answers
-        // it, so a caller can still tell "that resource is gone" from "fix the request".
+        // The other half of the rule: an id-addressed read answers the same not-found for
+        // the same id, so a caller sees one classification for one condition.
         ScopeCase {
             case: "ListProposals/unknown-network",
             method: "GET",
@@ -306,7 +307,7 @@ async fn an_unresolvable_resource_is_refused_with_a_shape_the_operation_declares
     }
 
     // And the listing whose refusal this suite is about reports the network's own member,
-    // which is what makes the 400 a refusal and not a disguised empty page.
+    // which is what makes the 404 a refusal and not a disguised empty page.
     let answer = call(&router, "GET", &format!("/networks/{network_id}/members"), None).await;
     assert_eq!(
         answer.body["Members"].as_array().map(Vec::len),
