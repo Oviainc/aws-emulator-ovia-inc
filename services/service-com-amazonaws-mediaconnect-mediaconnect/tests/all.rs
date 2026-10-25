@@ -55,6 +55,8 @@ mod flow_sources;
 mod flow_sub_resource_tag_retention;
 #[path = "all/flow_sub_resource_tags.rs"]
 mod flow_sub_resource_tags;
+#[path = "all/flow_vpc_interfaces.rs"]
+mod flow_vpc_interfaces;
 #[path = "all/gateway_instances.rs"]
 mod gateway_instances;
 #[path = "all/gateway_lifecycle.rs"]

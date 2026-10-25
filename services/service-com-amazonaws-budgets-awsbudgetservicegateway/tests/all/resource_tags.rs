@@ -52,13 +52,14 @@ use super::budget_lifecycle::{account, caller_account, call, is_error, router};
 /// `arn:{partition}:budgets::{account}:budget/{BudgetName}` — a global service, so the
 /// region field is empty — and that layout is why `BudgetName`'s modelled `@pattern`
 /// forbids ':' and the '/action/' substring inside a name.
-fn budget_arn(account_id: &str, budget_name: &str) -> String {
+/// `pub(crate)` so the sibling read-side suite names a budget's ARN the same way.
+pub(crate) fn budget_arn(account_id: &str, budget_name: &str) -> String {
     format!("arn:aws:{ARN_SERVICE}::{account_id}:budget/{budget_name}")
 }
 
 /// The ARN of a budget action, which is named beneath the budget it acts on:
 /// `…:budget/{BudgetName}/action/{ActionId}`.
-fn action_arn(account_id: &str, budget_name: &str, action_id: &str) -> String {
+pub(crate) fn action_arn(account_id: &str, budget_name: &str, action_id: &str) -> String {
     format!(
         "{}/action/{action_id}",
         budget_arn(account_id, budget_name)
@@ -76,7 +77,7 @@ async fn tag(router: &MultiServiceRouter, resource_arn: &str, tags: &[(String, S
 }
 
 /// One `ListTagsForResource` call.
-async fn list_tags(router: &MultiServiceRouter, resource_arn: &str) -> (u16, Value) {
+pub(crate) async fn list_tags(router: &MultiServiceRouter, resource_arn: &str) -> (u16, Value) {
     call(
         router,
         "ListTagsForResource",
@@ -86,7 +87,7 @@ async fn list_tags(router: &MultiServiceRouter, resource_arn: &str) -> (u16, Val
 }
 
 /// `(Key, Value)` pairs as the wire `ResourceTagList`.
-fn tag_list(tags: &[(String, String)]) -> Value {
+pub(crate) fn tag_list(tags: &[(String, String)]) -> Value {
     Value::Array(
         tags.iter()
             .map(|(key, value)| json!({"Key": key, "Value": value}))
@@ -96,7 +97,7 @@ fn tag_list(tags: &[(String, String)]) -> Value {
 
 /// The `ResourceTags` an answer reports, as `(Key, Value)` pairs in the order they were
 /// reported.
-fn reported(body: &Value) -> Vec<(String, String)> {
+pub(crate) fn reported(body: &Value) -> Vec<(String, String)> {
     body["ResourceTags"]
         .as_array()
         .map(|tags| {
@@ -113,12 +114,12 @@ fn reported(body: &Value) -> Vec<(String, String)> {
 }
 
 /// A `(Key, Value)` pair, so a table row reads as the tag it is.
-fn pair(key: &str, value: &str) -> (String, String) {
+pub(crate) fn pair(key: &str, value: &str) -> (String, String) {
     (key.to_string(), value.to_string())
 }
 
 /// `n` distinct tags, for the rows that vary the SIZE of a tag set.
-fn many_tags(n: usize) -> Vec<(String, String)> {
+pub(crate) fn many_tags(n: usize) -> Vec<(String, String)> {
     (0..n)
         .map(|index| pair(&format!("key-{index}"), &format!("value-{index}")))
         .collect()
@@ -133,16 +134,19 @@ const NAME_FORMS: [(&str, &str); 3] = [
 ];
 
 /// One row of the tag-set table: a case name and the tags one `TagResource` call supplies.
-struct Row {
-    case: String,
-    tags: Vec<(String, String)>,
+pub(crate) struct Row {
+    pub(crate) case: String,
+    pub(crate) tags: Vec<(String, String)>,
 }
 
 /// The tag-set table. Its rows differ along what the rule generalises over: the number of
 /// tags (none, one, several, the `ResourceTagList` maximum), the key length at each
 /// published `@length` bound of `ResourceTagKey` (1 and 128), the value length at each
 /// published bound of `ResourceTagValue` (0 and 256), and non-ascii content.
-fn tag_rows() -> Vec<Row> {
+///
+/// `pub(crate)` so the sibling read-side suite asserts the create path over the SAME tag
+/// sets rather than a second copy of this table.
+pub(crate) fn tag_rows() -> Vec<Row> {
     vec![
         Row {
             case: "no tags at all".to_string(),
