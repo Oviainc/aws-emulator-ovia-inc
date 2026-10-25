@@ -536,7 +536,7 @@ fn insert_item(
     }
     let key = {
         let table = store.active_table(region, name, now).map_err(lift)?;
-        table.check_index_key_limits(&item).map_err(lift)?;
+        table.check_index_keys(&item).map_err(lift)?;
         table.key_of_item(&item).map_err(lift)?
     };
     if store
@@ -648,7 +648,7 @@ fn update_item(
     store
         .active_table(region, name, now)
         .map_err(lift)?
-        .check_index_key_limits(&item)
+        .check_index_keys(&item)
         .map_err(lift)?;
     store
         .put_item(region, name, now, key, item.clone())
