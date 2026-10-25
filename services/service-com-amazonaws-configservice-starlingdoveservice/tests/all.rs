@@ -106,6 +106,8 @@ mod aggregate_config_rule_compliance_summary;
 mod external_evaluation;
 #[path = "all/configuration_aggregator_sources_status.rs"]
 mod configuration_aggregator_sources_status;
+#[path = "all/aggregate_compliance_by_config_rules.rs"]
+mod aggregate_compliance_by_config_rules;
 #[path = "all/put_evaluations.rs"]
 mod put_evaluations;
 #[path = "all/conformance_pack_rule_names.rs"]
