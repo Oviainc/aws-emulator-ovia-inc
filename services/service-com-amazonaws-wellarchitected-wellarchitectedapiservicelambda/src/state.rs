@@ -28,8 +28,8 @@
 //! OF, pinned at the profile version the workload is reviewed against — the version
 //! `UpgradeProfileVersion` moves to the one that profile is at. The agent profiles
 //! (`CreateAgentProfile`, `GetAgentProfile`, `ListAgentProfiles`) and the optimization
-//! goals recorded against one (`CreateAgentGoal`, `GetAgentGoal`, `DeleteAgentGoal`) are
-//! backed the same way,
+//! goals recorded against one (`CreateAgentGoal`, `GetAgentGoal`, `UpdateAgentGoal`,
+//! `DeleteAgentGoal`) are backed the same way,
 //! each goal keyed under the profile it belongs to. The contexts recorded against a
 //! profile (`CreateAgentContext`, `GetAgentContext`, `ListAgentContexts`) are held
 //! exactly like the goals, keyed under the profile they belong to. The recommendation
@@ -4116,9 +4116,8 @@ pub struct AgentGoalRecord {
 
 impl AgentGoalRecord {
     /// The `GoalSummary` projection every goal operation answers with
-    /// (`CreateAgentGoal`, `GetAgentGoal`, `ListAgentGoals`, and — once it is
-    /// implemented — `UpdateAgentGoal`), so one place decides how a stored goal
-    /// is reported.
+    /// (`CreateAgentGoal`, `GetAgentGoal`, `ListAgentGoals` and `UpdateAgentGoal`), so
+    /// one place decides how a stored goal is reported.
     pub fn to_summary(&self) -> GoalSummary {
         GoalSummary {
             id: self.id.clone(),
@@ -4380,6 +4379,19 @@ pub struct CreateAgentGoalToken {
     pub fingerprint: String,
 }
 
+/// What an `UpdateAgentGoal` idempotency token resolves to: the goal the original request
+/// updated, the profile it belongs to, and that request's parameter fingerprint.
+///
+/// The update itself has no value to mint, so what the token is for here is keeping a
+/// retry from acting a SECOND time: the replay answers the goal as the original request
+/// left it instead of stamping `lastModifiedAt` again.
+#[derive(Debug, Clone)]
+pub struct UpdateAgentGoalToken {
+    pub profile_arn: String,
+    pub goal_id: String,
+    pub fingerprint: String,
+}
+
 /// What a `CreateAgentContext` idempotency token resolves to: the context the original
 /// request created, the profile it belongs to, and that request's parameter fingerprint.
 #[derive(Debug, Clone)]
@@ -4494,6 +4506,10 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// `CreateAgentGoal`'s `clientToken` -> what the original request created. Caller
     /// input keys it, so it is a BOUNDED [`TokenLedger`].
     pub create_agent_goal_tokens: TokenLedger<CreateAgentGoalToken>,
+    /// `UpdateAgentGoal`'s `clientToken` -> the goal the original request updated. Held
+    /// exactly as the create ledger above is, and bounded for the same reason: caller
+    /// input keys it, so write it through [`TokenLedger::remember`].
+    pub update_agent_goal_tokens: TokenLedger<UpdateAgentGoalToken>,
     /// Every context recorded against an agent profile, keyed by that profile's ARN then
     /// by the context's `UUID`. A `BTreeMap` because context-id order is the stable order
     /// `ListAgentContexts` pages over.
@@ -4681,9 +4697,9 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         self.agent_goals.get(profile_arn)?.get(id)
     }
 
-    /// Drop one goal of an agent profile and everything keyed to it: any create token
-    /// that resolved to it, and the profile's goal map once its last goal is gone, so an
-    /// emptied profile leaves nothing behind.
+    /// Drop one goal of an agent profile and everything keyed to it: any create or update
+    /// token that resolved to it, and the profile's goal map once its last goal is gone,
+    /// so an emptied profile leaves nothing behind.
     pub fn remove_agent_goal(&mut self, profile_arn: &str, id: &str) -> Option<AgentGoalRecord> {
         let goals = self.agent_goals.get_mut(profile_arn)?;
         let record = goals.remove(id)?;
@@ -4692,7 +4708,14 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         }
         self.create_agent_goal_tokens
             .retain(|token| !(token.profile_arn == profile_arn && token.goal_id == id));
+        self.update_agent_goal_tokens
+            .retain(|token| !(token.profile_arn == profile_arn && token.goal_id == id));
         Some(record)
+    }
+
+    /// [`Self::agent_goal`] for a caller that is about to write to the goal.
+    pub fn agent_goal_mut(&mut self, profile_arn: &str, id: &str) -> Option<&mut AgentGoalRecord> {
+        self.agent_goals.get_mut(profile_arn)?.get_mut(id)
     }
 
     /// How many goals the agent profile `profile_arn` names currently holds — what
@@ -5088,6 +5111,8 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
             .retain(|token| token.profile_arn != profile_arn);
         self.agent_goals.remove(profile_arn);
         self.create_agent_goal_tokens
+            .retain(|token| token.profile_arn != profile_arn);
+        self.update_agent_goal_tokens
             .retain(|token| token.profile_arn != profile_arn);
         self.agent_contexts.remove(profile_arn);
         self.create_agent_context_tokens
