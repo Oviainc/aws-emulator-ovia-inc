@@ -45,6 +45,8 @@ mod replication_set_precondition;
 mod rotation_deletes;
 #[path = "all/rotation_override_listing.rs"]
 mod rotation_override_listing;
+#[path = "all/rotation_override_reads.rs"]
+mod rotation_override_reads;
 #[path = "all/rotation_overrides.rs"]
 mod rotation_overrides;
 #[path = "all/rotation_reads.rs"]
