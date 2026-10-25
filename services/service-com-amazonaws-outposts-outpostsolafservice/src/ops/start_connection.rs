@@ -171,6 +171,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
 
         let mut store = state.lock();
+        // An Outpost's hardware is installed as its provisioning finishes, so the
+        // installation the clock has already made due is materialised before the
+        // `AssetId` is resolved against it: the asset ids a caller read out of
+        // `ListAssets` are the ones it can start a connection for.
+        store.settle_outposts();
         // A connection installs one Outpost SERVER, named by the `AssetId` of that
         // unit of hardware, so an asset no Outpost of this store holds has no
         // connection to start: the not-found error this call models, worded by the
