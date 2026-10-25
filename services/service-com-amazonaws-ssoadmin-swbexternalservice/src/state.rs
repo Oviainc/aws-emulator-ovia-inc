@@ -13,8 +13,8 @@
 //! [`ComAmazonawsSsoadminSwbexternalserviceState::permission_set_surface_withdrawn`] and
 //! [`ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE`], which every operation of that surface asks
 //! before looking anything up. The account's AMBIENT instance — the one `ListInstances`
-//! hands out ([`SEED_INSTANCE_TYPE`]) — is the ORGANIZATION instance, so that surface is
-//! served on it by default.
+//! hands out ([`SEED_INSTANCE_TYPE`]) — is an ACCOUNT instance, so that surface is
+//! withdrawn on it until an `UpdateInstance` enables permission sets.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
@@ -172,14 +172,18 @@ impl InstanceType {
 /// discovers through `ListInstances` because IAM Identity Center was already enabled on
 /// this account before the session started.
 ///
-/// It is an ORGANIZATION instance. An account whose Identity Center was enabled through
-/// AWS Organizations holds the organization instance, and that is the instance whose ARN
-/// `ListInstances` hands out, so multi-account permissions — permission sets, the account
-/// assignments built from them and the ABAC attribute configuration — are served on it
-/// (`DescribeInstance$PermissionSetsEnabled` reports `true`). The account-instance
-/// restriction belongs to an instance a caller creates through `CreateInstance`, which
-/// AWS documents as creating the instance of a standalone account.
-pub const SEED_INSTANCE_TYPE: InstanceType = InstanceType::Organization;
+/// It is an ACCOUNT instance: the instance of a single standalone account, which serves
+/// no multi-account permissions, so permission sets, the account assignments built from
+/// them and the ABAC attribute configuration are all WITHDRAWN on it
+/// (`DescribeInstance$PermissionSetsEnabled` reports `false`) until an `UpdateInstance`
+/// turns that enablement on — "Enables permission sets for this Identity Center
+/// instance", the one documented way it changes.
+///
+/// The ORGANIZATION instance of an AWS Organizations organization is enabled through
+/// Organizations and not through this API, so no operation here hands one out; a caller
+/// that needs that surface on this account's instance enables permission sets on it
+/// explicitly.
+pub const SEED_INSTANCE_TYPE: InstanceType = InstanceType::Account;
 
 /// The refusal every operation of the permission-set / account-assignment surface
 /// answers with when the instance it resolves is an ACCOUNT instance, as the message of
@@ -2094,11 +2098,11 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     /// holds, the stand-in for an account whose IAM Identity Center was enabled before
     /// this session started.
     ///
-    /// It is an ORGANIZATION instance ([`SEED_INSTANCE_TYPE`]): the instance an account
-    /// discovers through `ListInstances` is the one its Organizations enablement created,
-    /// so the permission-set surface is served on it. It is enabled at most once
-    /// per store, and not at all when the store already holds an instance (one instance
-    /// per account), so no request ever adds a second instance or revives a deleted one.
+    /// It is an ACCOUNT instance ([`SEED_INSTANCE_TYPE`]), so the permission-set surface
+    /// is withdrawn on it until an `UpdateInstance` enables permission sets. It is
+    /// enabled at most once per store, and not at all when the store already holds an
+    /// instance (one instance per account), so no request ever adds a second instance or
+    /// revives a deleted one.
     fn enable_ambient_instance(&mut self, region: &str, now: SystemTime) {
         let already_decided = self.ambient_instance_enabled || !self.instances.is_empty();
         self.ambient_instance_enabled = true;

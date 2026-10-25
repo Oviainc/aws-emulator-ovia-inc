@@ -308,17 +308,16 @@ async fn paging_the_catalogue_walks_every_member_exactly_once() {
 }
 
 /// RULE: `SearchSchemas` over the catalogue reports the members indexed under every
-/// keyword — their name and the event source and detail type their documents record —
-/// each with its stored versions and no `SchemaArn`, which a schema AWS publishes does
-/// not have.
+/// keyword — the event source and detail type their documents record — each with its
+/// stored versions and no `SchemaArn`, which a schema AWS publishes does not have.
 #[tokio::test]
 async fn searching_the_catalogue_reports_members_without_arns() {
     let emulator = Emulator::new();
 
     // Rows: a keyword that is a source namespace, keywords of an event's detail type,
     // a source and detail-type pair that must BOTH occur, and a keyword nothing
-    // carries. A search selects on what the registry indexes a schema under: its name,
-    // and the event source and detail type its document declares.
+    // carries. A search selects on what the registry indexes a schema under: the event
+    // source and detail type its document declares.
     let cases: Vec<(&str, Option<&str>)> = vec![
         ("aws.ecs", Some("aws.ecs@ECSTaskStateChange")),
         ("task,state", Some("aws.ecs@ECSTaskStateChange")),

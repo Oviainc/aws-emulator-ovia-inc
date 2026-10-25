@@ -3,19 +3,25 @@
 //! The instance a client DISCOVERS, and the surface it serves — end to end over the
 //! `awsJson1_1` wire.
 //!
-//! The rule under test: the instance an account whose IAM Identity Center is already
-//! enabled hands out through `ListInstances` is its ORGANIZATION instance, so multi-account
-//! permissions are served on it with no enabling call first — `DescribeInstance` reports
-//! `PermissionSetsEnabled: true`, and every operation of the permission-set,
-//! account-assignment and ABAC surface answers from state against that ARN instead of
-//! refusing it as an account instance. The instance a caller creates through
-//! `CreateInstance` is the instance of a standalone account and keeps that restriction,
-//! which `account_instance_restriction.rs` pins.
+//! The rule under test: the IAM Identity Center instance an account already holds — the
+//! one `ListInstances` hands out with no create first — is an ACCOUNT instance, which
+//! serves no multi-account permissions. So `DescribeInstance` reports
+//! `PermissionSetsEnabled: false` for it, and every operation of the permission-set,
+//! account-assignment and ABAC attribute-configuration surface is refused on that ARN with
+//! the modelled `ValidationException` (HTTP 400) BEFORE any resource lookup: a read of the
+//! surface included, so neither an empty configuration nor a `ResourceNotFoundException`
+//! stands in for the refusal, and a refused write persists nothing.
+//! `UpdateInstance {PermissionSetsEnabled: true}` — "Enables permission sets for this
+//! Identity Center instance" — is the one documented call that opens the surface, after
+//! which the whole lifecycle runs against that same discovered ARN.
 //!
 //! The tables span what the rule generalises over: the REGION the discovery and the calls
-//! that follow it are signed for, the SHAPE of the permission set the canonical flow is
-//! driven with, and EVERY implemented operation of the surface — not only the
-//! `ListInstances` -> `CreatePermissionSet` pair of the report.
+//! that follow it are signed for, EVERY implemented operation of the withdrawn surface
+//! (reads as well as writes) against inputs that vary the permission set, the account, the
+//! principal, the page size, the request id and the attribute key — the table
+//! `account_instance_restriction.rs` owns, since the restriction is one rule over both the
+//! instance a caller creates and the instance an account discovers — and the SHAPE of the
+//! permission set the lifecycle is driven with once permission sets are enabled.
 //!
 //! Every call goes through `MultiServiceRouter::dispatch`, the one path a socket-served
 //! request takes, and nothing here writes to the store: the instance under test is the one
@@ -24,6 +30,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::account_instance_restriction::{instance_id_of, surface_calls, VARIANTS};
 use crate::ssoadmin_permission_sets::{call, call_in_region, error_code, router};
 
 /// The Regions a discovery is signed for. SOURCE: `RegionName`'s modelled pattern
@@ -31,8 +38,9 @@ use crate::ssoadmin_permission_sets::{call, call_in_region, error_code, router};
 /// and none of them is the Region the harness signs for by default.
 const REGIONS: [&str; 4] = ["us-east-1", "eu-west-2", "ap-southeast-2", "us-gov-east-1"];
 
-/// One shape of permission set the canonical flow is driven with: the `CreatePermissionSet`
-/// members beside `InstanceArn`.
+/// One shape of permission set the lifecycle is driven with once permission sets are
+/// enabled on the discovered instance: the `CreatePermissionSet` members beside
+/// `InstanceArn`.
 struct FlowCase {
     label: &'static str,
     /// `PermissionSetName`: `length(min: 1, max: 32)`, `^[\w+=,.@-]+$`.
@@ -50,12 +58,11 @@ struct FlowCase {
 
 /// The rows: they differ along the members the create carries, the published bounds of the
 /// name's length, both `PrincipalType` values, both forms the `PrincipalId` pattern admits
-/// and the bounds of a 12-digit account id. The report's own case — a bare
-/// `(InstanceArn, Name)` create — is the first row.
+/// and the bounds of a 12-digit account id.
 fn flow_cases() -> Vec<FlowCase> {
     vec![
         FlowCase {
-            label: "a bare create, the reported shape of the request",
+            label: "a bare create",
             name: "DemoSet".to_string(),
             description: None,
             session_duration: None,
@@ -136,45 +143,72 @@ async fn discovered_instance_arn(router: &MultiServiceRouter, region: &str) -> S
         .to_string()
 }
 
+/// `DescribeInstance` for `instance_arn`, which must be served whatever the instance's
+/// kind: the restriction belongs to the surface built on permission sets, not to reading
+/// the instance.
+async fn describe_instance(router: &MultiServiceRouter, case: &str, instance_arn: &str) -> Value {
+    let (status, body) =
+        call(router, "DescribeInstance", &json!({"InstanceArn": instance_arn})).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: DescribeInstance expected 200, got {status} {body}"
+    );
+    body
+}
+
+/// Assert one call of the withdrawn surface was refused as the account-instance
+/// restriction: HTTP 400, error code `ValidationException`, and the refusal says why.
+fn assert_withdrawn(case: &str, status: u16, body: &Value) {
+    assert_eq!(
+        status, 400,
+        "case {case:?}: the surface is withdrawn on the discovered instance, so this call \
+         must be refused 400, got {status} {body}"
+    );
+    assert_eq!(
+        error_code(body),
+        "ValidationException",
+        "case {case:?}: a permanent instance-kind restriction is a ValidationException, \
+         never a not-found, got {body}"
+    );
+    let message = body["message"]
+        .as_str()
+        .or_else(|| body["Message"].as_str())
+        .unwrap_or_default();
+    assert!(
+        message.contains("account instances"),
+        "case {case:?}: the refusal must say the operation is unsupported for account \
+         instances, got {message:?}"
+    );
+}
+
 /// One call that must be SERVED: 200, and so never the account-instance refusal. Answers
 /// the response body for the caller to read on.
-async fn served(
-    router: &MultiServiceRouter,
-    case: &str,
-    operation: &str,
-    body: &Value,
-) -> Value {
+async fn served(router: &MultiServiceRouter, case: &str, operation: &str, body: &Value) -> Value {
     let (status, answer) = call(router, operation, body).await;
     assert_eq!(
         status, 200,
-        "case {case:?}: {operation} must be served on the instance ListInstances hands \
-         out, got {status} {answer}"
+        "case {case:?}: {operation} must be served once permission sets are enabled, got \
+         {status} {answer}"
     );
     answer
 }
 
-/// The discovered instance reports permission sets ENABLED and serves a create of one,
-/// whatever Region the client discovered it from and with no call enabling anything first.
+/// The discovered instance reports permission sets DISABLED and refuses a create of one,
+/// whatever Region the client discovered it from.
 #[tokio::test]
-async fn the_discovered_instance_serves_permission_sets_in_every_region() {
+async fn the_discovered_instance_reports_permission_sets_disabled_in_every_region() {
     for region in REGIONS {
         // A fresh store per row: the instance under test is the one the account hands out
         // when nothing has yet decided its Identity Center enablement.
         let router = router();
         let instance_arn = discovered_instance_arn(&router, region).await;
 
-        let (status, described) =
-            call_in_region(&router, region, "DescribeInstance", &json!({"InstanceArn": instance_arn}))
-                .await;
-        assert_eq!(
-            status, 200,
-            "case {region:?}: DescribeInstance expected 200, got {status} {described}"
-        );
+        let described = describe_instance(&router, region, &instance_arn).await;
         assert_eq!(
             described["PermissionSetsEnabled"],
-            Value::Bool(true),
-            "case {region:?}: the discovered instance must report permission sets enabled, \
-             got {:?}",
+            Value::Bool(false),
+            "case {region:?}: the discovered instance is an account instance, so it must \
+             report permission sets disabled, got {:?}",
             described["PermissionSetsEnabled"]
         );
         assert_eq!(
@@ -191,32 +225,102 @@ async fn the_discovered_instance_serves_permission_sets_in_every_region() {
             &json!({"InstanceArn": instance_arn, "Name": "DiscoveredSet"}),
         )
         .await;
-        assert_eq!(
-            status, 200,
-            "case {region:?}: CreatePermissionSet on the discovered instance expected 200, \
-             got {status} {created}"
-        );
-        let minted = created["PermissionSet"]["PermissionSetArn"]
-            .as_str()
-            .unwrap_or_else(|| panic!("case {region:?}: no minted PermissionSetArn: {created}"));
-        let instance_id = instance_arn.rsplit('/').next().unwrap_or_default();
-        assert!(
-            minted.starts_with(&format!("arn:aws:sso:::permissionSet/{instance_id}/ps-")),
-            "case {region:?}: the minted ARN must sit under the discovered instance, got \
-             {minted:?}"
-        );
+        assert_withdrawn(region, status, &created);
     }
 }
 
-/// The canonical client flow, over every row of the table: discover the instance, create a
-/// permission set on it, read it back, grant an assignment from it, poll that grant, give
-/// it back and delete the set — each step answered from the state the step before wrote.
+/// THE RULE, over the whole table: on the instance a client discovers, every operation of
+/// the permission-set / account-assignment / ABAC surface answers 400 `ValidationException`
+/// — whatever permission set, account, principal, page size, request id or attribute key
+/// the request names, since no resource of that surface can exist on it.
 #[tokio::test]
-async fn the_canonical_flow_runs_on_the_discovered_instance() {
+async fn every_operation_of_the_withdrawn_surface_is_refused_on_the_discovered_instance() {
+    let router = router();
+    let instance_arn = discovered_instance_arn(&router, "us-east-1").await;
+
+    for variant in VARIANTS {
+        for surface_call in surface_calls(&instance_arn, variant) {
+            let (status, body) = call(&router, surface_call.operation, &surface_call.body).await;
+            assert_withdrawn(&surface_call.label, status, &body);
+        }
+    }
+}
+
+/// A refused call of the surface WRITES NOTHING: the ABAC create the recorded client sends
+/// is refused rather than persisted, so the read that follows it is the same refusal — not
+/// a configuration, and not a not-found that would tell the client to create one — and the
+/// instance a later caller discovers is byte-identical to the one before the refusals.
+#[tokio::test]
+async fn a_refused_call_persists_nothing_on_the_discovered_instance() {
+    let router = router();
+    let instance_arn = discovered_instance_arn(&router, "us-east-1").await;
+    let before = describe_instance(&router, "before the refusals", &instance_arn).await;
+
+    for variant in VARIANTS {
+        let configuration = json!({
+            "InstanceArn": instance_arn,
+            "InstanceAccessControlAttributeConfiguration": {
+                "AccessControlAttributes": [{
+                    "Key": variant.attribute_key,
+                    "Value": {"Source": ["${path:enterprise.department}"]},
+                }],
+            },
+        });
+        let (status, body) = call(
+            &router,
+            "CreateInstanceAccessControlAttributeConfiguration",
+            &configuration,
+        )
+        .await;
+        assert_withdrawn(variant.label, status, &body);
+
+        let (status, read_back) = call(
+            &router,
+            "DescribeInstanceAccessControlAttributeConfiguration",
+            &json!({"InstanceArn": instance_arn}),
+        )
+        .await;
+        assert_withdrawn(variant.label, status, &read_back);
+        assert_eq!(
+            read_back["InstanceAccessControlAttributeConfiguration"],
+            Value::Null,
+            "case {:?}: a refused create persists no configuration to report, got \
+             {read_back}",
+            variant.label
+        );
+    }
+
+    let after = describe_instance(&router, "after the refusals", &instance_arn).await;
+    assert_eq!(
+        before, after,
+        "a refused call must change nothing a later caller sees, got {before} then {after}"
+    );
+}
+
+/// `UpdateInstance {PermissionSetsEnabled: true}` is the one call that opens the surface on
+/// the discovered instance: after it the whole lifecycle runs against that same ARN, each
+/// step answered from the state the step before wrote, over every row of the table.
+#[tokio::test]
+async fn enabling_permission_sets_opens_the_lifecycle_on_the_discovered_instance() {
     for flow in flow_cases() {
         let case = flow.label;
         let router = router();
         let instance_arn = discovered_instance_arn(&router, "us-east-1").await;
+
+        served(
+            &router,
+            case,
+            "UpdateInstance",
+            &json!({"InstanceArn": instance_arn, "PermissionSetsEnabled": true}),
+        )
+        .await;
+        let described = describe_instance(&router, case, &instance_arn).await;
+        assert_eq!(
+            described["PermissionSetsEnabled"],
+            Value::Bool(true),
+            "case {case:?}: the enablement must be stored on the instance, got {:?}",
+            described["PermissionSetsEnabled"]
+        );
 
         let created = served(
             &router,
@@ -229,6 +333,13 @@ async fn the_canonical_flow_runs_on_the_discovered_instance() {
             .as_str()
             .unwrap_or_else(|| panic!("case {case:?}: no minted PermissionSetArn: {created}"))
             .to_string();
+        let instance_id = instance_id_of(&instance_arn);
+        assert!(
+            permission_set_arn
+                .starts_with(&format!("arn:aws:sso:::permissionSet/{instance_id}/ps-")),
+            "case {case:?}: the minted ARN must sit under the discovered instance, got \
+             {permission_set_arn:?}"
+        );
 
         // ROUND TRIP: the describe answers from the stored record, not from the request.
         let described = served(
@@ -338,7 +449,8 @@ async fn the_canonical_flow_runs_on_the_discovered_instance() {
         .await;
 
         // The delete removed the record, so the read that answered from it is now a
-        // missing resource — never the account-instance refusal.
+        // missing resource — never the account-instance refusal, since this instance now
+        // serves the surface.
         let (status, gone) = call(
             &router,
             "DescribePermissionSet",
@@ -354,175 +466,5 @@ async fn the_canonical_flow_runs_on_the_discovered_instance() {
             "ResourceNotFoundException",
             "case {case:?}: expected ResourceNotFoundException, got {gone}"
         );
-    }
-}
-
-/// EVERY implemented operation of the permission-set, account-assignment and ABAC surface,
-/// against the discovered instance: each one is served, so none of them refuses that ARN as
-/// an account instance. The calls run in dependency order — a read follows the write whose
-/// record it reports.
-#[tokio::test]
-async fn every_operation_of_the_surface_is_served_on_the_discovered_instance() {
-    let router = router();
-    let instance_arn = discovered_instance_arn(&router, "us-east-1").await;
-    let case = "the discovered instance";
-
-    let created = served(
-        &router,
-        case,
-        "CreatePermissionSet",
-        &json!({"InstanceArn": instance_arn, "Name": "SurfaceWalk"}),
-    )
-    .await;
-    let permission_set_arn = created["PermissionSet"]["PermissionSetArn"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no minted PermissionSetArn: {created}"))
-        .to_string();
-    let on_set = json!({
-        "InstanceArn": instance_arn,
-        "PermissionSetArn": permission_set_arn,
-    });
-    let assignment = json!({
-        "InstanceArn": instance_arn,
-        "TargetId": "123456789012",
-        "TargetType": "AWS_ACCOUNT",
-        "PermissionSetArn": permission_set_arn,
-        "PrincipalType": "GROUP",
-        "PrincipalId": "f81d4fae-7dec-11d0-a765-00a0c91e6bf6",
-    });
-    let customer_reference = json!({"Name": "ReadOnlyPolicy", "Path": "/"});
-    let abac_configuration = json!({
-        "InstanceArn": instance_arn,
-        "InstanceAccessControlAttributeConfiguration": {
-            "AccessControlAttributes": [
-                {"Key": "Department", "Value": {"Source": ["${path:enterprise.department}"]}},
-            ],
-        },
-    });
-
-    // Each row: the operation and the body it takes. Every member beyond the two ARNs is
-    // the one the sibling suite of that operation sends, and the order is the one the
-    // records require.
-    let mut walk: Vec<(&str, Value)> = vec![
-        (
-            "UpdatePermissionSet",
-            json!({
-                "InstanceArn": instance_arn,
-                "PermissionSetArn": permission_set_arn,
-                "Description": "the set this walk drives",
-                "SessionDuration": "PT2H",
-                "RelayState": "https://example.com/console",
-            }),
-        ),
-        (
-            "PutInlinePolicyToPermissionSet",
-            json!({
-                "InstanceArn": instance_arn,
-                "PermissionSetArn": permission_set_arn,
-                "InlinePolicy": "{\"Version\":\"2012-10-17\",\"Statement\":[]}",
-            }),
-        ),
-        ("GetInlinePolicyForPermissionSet", on_set.clone()),
-        (
-            "AttachManagedPolicyToPermissionSet",
-            json!({
-                "InstanceArn": instance_arn,
-                "PermissionSetArn": permission_set_arn,
-                "ManagedPolicyArn": "arn:aws:iam::aws:policy/ReadOnlyAccess",
-            }),
-        ),
-        ("ListManagedPoliciesInPermissionSet", on_set.clone()),
-        (
-            "DetachManagedPolicyFromPermissionSet",
-            json!({
-                "InstanceArn": instance_arn,
-                "PermissionSetArn": permission_set_arn,
-                "ManagedPolicyArn": "arn:aws:iam::aws:policy/ReadOnlyAccess",
-            }),
-        ),
-        (
-            "AttachCustomerManagedPolicyReferenceToPermissionSet",
-            json!({
-                "InstanceArn": instance_arn,
-                "PermissionSetArn": permission_set_arn,
-                "CustomerManagedPolicyReference": customer_reference,
-            }),
-        ),
-        (
-            "ListCustomerManagedPolicyReferencesInPermissionSet",
-            on_set.clone(),
-        ),
-        (
-            "DetachCustomerManagedPolicyReferenceFromPermissionSet",
-            json!({
-                "InstanceArn": instance_arn,
-                "PermissionSetArn": permission_set_arn,
-                "CustomerManagedPolicyReference": customer_reference,
-            }),
-        ),
-        (
-            "PutPermissionsBoundaryToPermissionSet",
-            json!({
-                "InstanceArn": instance_arn,
-                "PermissionSetArn": permission_set_arn,
-                "PermissionsBoundary": {
-                    "ManagedPolicyArn": "arn:aws:iam::aws:policy/PowerUserAccess",
-                },
-            }),
-        ),
-        ("GetPermissionsBoundaryForPermissionSet", on_set.clone()),
-        ("DeletePermissionsBoundaryFromPermissionSet", on_set.clone()),
-        ("CreateAccountAssignment", assignment.clone()),
-        (
-            "ListAccountAssignments",
-            json!({
-                "InstanceArn": instance_arn,
-                "AccountId": "123456789012",
-                "PermissionSetArn": permission_set_arn,
-            }),
-        ),
-        ("ListAccountsForProvisionedPermissionSet", on_set.clone()),
-        ("DeleteAccountAssignment", assignment),
-        (
-            "DescribeAccountAssignmentDeletionStatus",
-            // The `RequestId` the delete above answers with is not known until the walk
-            // reaches it, so this row carries the instance alone and the loop fills the
-            // request id in from that answer.
-            json!({"InstanceArn": instance_arn}),
-        ),
-        (
-            "CreateInstanceAccessControlAttributeConfiguration",
-            abac_configuration.clone(),
-        ),
-        (
-            "DescribeInstanceAccessControlAttributeConfiguration",
-            json!({"InstanceArn": instance_arn}),
-        ),
-        (
-            "UpdateInstanceAccessControlAttributeConfiguration",
-            abac_configuration,
-        ),
-        (
-            "DeleteInstanceAccessControlAttributeConfiguration",
-            json!({"InstanceArn": instance_arn}),
-        ),
-    ];
-    walk.push(("DeletePermissionSet", on_set));
-
-    // The one request id this walk cannot write down in advance: the delete's own.
-    let mut deletion_request_id: Option<String> = None;
-    for (operation, mut body) in walk {
-        if operation == "DescribeAccountAssignmentDeletionStatus" {
-            let request_id = deletion_request_id
-                .as_deref()
-                .unwrap_or_else(|| panic!("the delete answered no RequestId to poll by"));
-            body["AccountAssignmentDeletionRequestId"] = json!(request_id);
-        }
-        let answer = served(&router, case, operation, &body).await;
-        if operation == "DeleteAccountAssignment" {
-            deletion_request_id = answer["AccountAssignmentDeletionStatus"]["RequestId"]
-                .as_str()
-                .map(str::to_string);
-        }
     }
 }
