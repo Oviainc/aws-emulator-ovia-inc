@@ -179,7 +179,10 @@ pub(crate) struct ReservationCase {
 }
 
 /// An instant `offset` after now (`Ok`) or before it (`Err`).
-fn instant_from(now: SystemTime, offset: Result<Duration, Duration>) -> SystemTime {
+///
+/// `pub(crate)` because `offering_listing` places a reservation against the clock the same
+/// way — it is the one spelling of "this long either side of now" the suites seed with.
+pub(crate) fn instant_from(now: SystemTime, offset: Result<Duration, Duration>) -> SystemTime {
     match offset {
         Ok(ahead) => now + ahead,
         Err(behind) => now - behind,
