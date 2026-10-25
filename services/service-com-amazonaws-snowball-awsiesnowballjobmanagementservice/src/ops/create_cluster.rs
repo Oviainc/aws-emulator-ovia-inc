@@ -6,7 +6,10 @@
 //! back, so a later `DescribeCluster` or `UpdateCluster` reads what was stored. A cluster
 //! is created `AwaitingQuorum` — it is still waiting for its node jobs — and an
 //! `InitialClusterSize` creates that many node jobs with it, each inheriting the
-//! cluster's attributes, which is what can give the cluster its quorum straight away.
+//! cluster's attributes, which is what can give the cluster its quorum straight away. An
+//! initial size that does not meet the node count the order's own
+//! `OnDeviceServiceConfiguration` declares is refused as a misprovisioned order unless
+//! `ForceCreateJobs` overrides it.
 //!
 //! ## Shape of an operation
 //!
@@ -201,6 +204,80 @@ pub const CLUSTER_JOB_TYPE: &str = "LOCAL_USE";
 /// the Snowball; Edge device type is supported when ordering clustered jobs."
 pub const CLUSTER_SNOWBALL_TYPE: &str = "EDGE";
 
+/// How many nodes a cluster order's own `OnDeviceServiceConfiguration` declares it needs,
+/// as a bound on the order's `InitialClusterSize`.
+///
+/// The on-device configuration is request input, so the node count it declares is
+/// computable from the order alone — no catalog and no staged capacity data is involved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeRequirement {
+    /// The configuration names the node count outright, so a cluster meets it only at
+    /// exactly that many nodes: fewer is underprovisioned, more is overprovisioned.
+    Exactly(i32),
+    /// The configuration names a number of nodes the cluster must be able to lose, so it
+    /// is met from this many nodes upward and a smaller cluster is underprovisioned.
+    AtLeast(i32),
+}
+
+impl NodeRequirement {
+    /// The node count a cluster needs to meet this requirement.
+    fn nodes(self) -> i32 {
+        match self {
+            Self::Exactly(nodes) | Self::AtLeast(nodes) => nodes,
+        }
+    }
+
+    /// Whether a cluster of `size` nodes meets it.
+    fn is_met_by(self, size: i32) -> bool {
+        match self {
+            Self::Exactly(nodes) => size == nodes,
+            Self::AtLeast(nodes) => size >= nodes,
+        }
+    }
+
+    /// How this requirement reads in a refusal: what the configuration asked for.
+    fn describe(self) -> String {
+        match self {
+            Self::Exactly(nodes) => format!("{nodes} nodes"),
+            Self::AtLeast(nodes) => format!("at least {nodes} nodes"),
+        }
+    }
+}
+
+/// The node counts `configuration` declares, each paired with the member that declared it.
+///
+/// Only the Amazon S3 compatible storage configuration states a capacity requirement in
+/// nodes: `S3OnDeviceServiceConfiguration$ServiceSize` is "how many nodes are needed for
+/// Amazon S3 compatible storage on Snow family devices" (so it is the node count outright),
+/// and `S3OnDeviceServiceConfiguration$FaultTolerance` is "the number of nodes that can go
+/// down without degrading the performance of the cluster" (so a cluster that tolerates that
+/// many losses needs one more node than that). The NFS and tape gateway configurations
+/// state a storage limit "for one Snow Family device" and the EKS Anywhere one states
+/// versions, none of which is a node count, so neither bounds the cluster's size; nor does
+/// `StorageLimit`, which selects among service configurations rather than naming nodes.
+fn declared_node_requirements(
+    configuration: Option<&OnDeviceServiceConfiguration>,
+) -> Vec<(&'static str, NodeRequirement)> {
+    let Some(s3) = configuration.and_then(|configuration| configuration.s3_on_device_service.as_ref())
+    else {
+        return Vec::new();
+    };
+    let mut requirements: Vec<(&'static str, NodeRequirement)> = Vec::new();
+    if let Some(service_size) = s3.service_size {
+        requirements.push((
+            "S3OnDeviceService.ServiceSize",
+            NodeRequirement::Exactly(service_size),
+        ));
+    }
+    if let Some(fault_tolerance) = s3.fault_tolerance {
+        requirements.push((
+            "S3OnDeviceService.FaultTolerance",
+            NodeRequirement::AtLeast(fault_tolerance.saturating_add(1)),
+        ));
+    }
+    requirements
+}
+
 /// The `CreateCluster` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -325,11 +402,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cluster. If not provided, will be treated as 0"
         // (`CreateClusterRequest$InitialClusterSize`). The member is modelled
         // `range 0..16`, so a request that reaches here is already within those bounds.
-        // `ForceCreateJobs` guards over- and under-provisioning, which the model defines
-        // against "what [is] needed to meet capacity requirement specified with
-        // OnDeviceServiceConfiguration" — a requirement this emulator stages no data for
-        // and so cannot compute, which is why no request is treated as misprovisioned and
-        // the flag changes nothing.
         //
         // An initial size past the five-node quorum is created as asked: this operation
         // models no limit error (`smithy_query(query="operation",
@@ -340,8 +412,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cluster is refused past the quorum. So the quorum is what the join enforces and
         // what the cluster's state turns on, not a bound on this member, whose own
         // modelled bound is `range 0..16`.
-        let initial_cluster_size =
-            usize::try_from(input.initial_cluster_size.unwrap_or(0)).unwrap_or(0);
+        let requested_size = input.initial_cluster_size.unwrap_or(0);
+        let initial_cluster_size = usize::try_from(requested_size).unwrap_or(0);
+
+        // `ForceCreateJobs` is "Force to create cluster when user attempts to overprovision
+        // or underprovision a cluster. A cluster is overprovisioned or underprovisioned if
+        // the initial size of the cluster is more (overprovisioned) or less
+        // (underprovisioned) than what [is] needed to meet capacity requirement specified
+        // with OnDeviceServiceConfiguration" — so the node count the order asks for is
+        // measured against the node count the order's OWN on-device configuration declares
+        // (see `declared_node_requirements`), and an order that does not meet it is a set
+        // of inputs that cannot hold together, which is what
+        // `InvalidInputCombinationException` ("One or more inputs were invalid") says. The
+        // flag is the caller's explicit override: with it set the cluster is created as
+        // asked.
+        //
+        // The comparison is what the order's own initial provisioning is measured by, so it
+        // applies to an order that provisions nodes with the cluster. An order carrying no
+        // initial size asks for no node job at all — "Creates an empty cluster … You use
+        // the CreateJob action separately to create the jobs for each of these nodes" — so
+        // it attempts no provisioning for the configuration to disagree with, and the nodes
+        // it will eventually hold are each a `CreateJob` of their own.
+        if requested_size > 0 && !input.force_create_jobs {
+            for (member, requirement) in
+                declared_node_requirements(input.on_device_service_configuration.as_ref())
+            {
+                if requirement.is_met_by(requested_size) {
+                    continue;
+                }
+                let provisioning = if requested_size > requirement.nodes() {
+                    "overprovisioned"
+                } else {
+                    "underprovisioned"
+                };
+                let needed = requirement.describe();
+                return Err(CreateClusterErrorModeled::InvalidInputCombinationException(
+                    InvalidInputCombinationException {
+                        message: Some(format!(
+                            "Cluster creation failed. One or more inputs were invalid: this \
+                             cluster is {provisioning}, because {member} needs {needed} and \
+                             this request asked for an InitialClusterSize of \
+                             {requested_size}. Set ForceCreateJobs to create it anyway."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
 
         // Nothing in this API deletes a cluster or a job, so a store that cannot hold the
         // cluster together with the node jobs it asks for refuses the create rather than

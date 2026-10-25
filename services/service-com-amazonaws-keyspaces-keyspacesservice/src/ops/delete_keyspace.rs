@@ -154,6 +154,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             })
         })?;
+        // The CDC stream store, shared with KeyspacesStreams: a stream follows one
+        // table's changes, and no table outlives its keyspace. Resolved before either
+        // store is locked, and locked AFTER this service's own — one lock order
+        // everywhere.
+        let streams = crate::state::cdc_stream_state(&*self.engine).ok_or_else(|| {
+            DeleteKeyspaceErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "Amazon Keyspaces could not reach the CDC stream store for this request."
+                        .to_string(),
+                ),
+            })
+        })?;
         let region = crate::state::request_region(ctx);
 
         let mut store = state.lock();
@@ -197,6 +209,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 table_name,
             );
         }
+        // The tables are gone, so the CDC streams that followed them are: a stream
+        // captures the changes of one table, and that table no longer exists.
+        streams
+            .lock()
+            .forget_streams_in_keyspace(&region, &input.keyspace_name);
 
         Ok(DeleteKeyspaceOutput {})
     }

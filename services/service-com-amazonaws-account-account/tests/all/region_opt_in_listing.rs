@@ -327,7 +327,17 @@ async fn each_account_reports_its_own_opt_in_statuses() {
         member_regions.status, member_regions.body
     );
     let member_regions = member_regions.regions();
-    let own_regions = list_regions(&router, json!({"AccountId": own})).await.regions();
+    // The caller's own account is reached by the standalone call: naming its own
+    // id is refused, so the comparison uses the standalone read.
+    let named = list_regions(&router, json!({"AccountId": own})).await;
+    assert_eq!(
+        (named.status, named.error_code()),
+        (403, "AccessDeniedException"),
+        "case \"the caller's own id named\": expected the 403 refusal, got {} with {:?}",
+        named.status,
+        named.body
+    );
+    let own_regions = list_regions(&router, json!({})).await.regions();
 
     assert_eq!(
         status_of(&member_regions, "af-south-1"),

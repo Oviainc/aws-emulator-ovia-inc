@@ -9,10 +9,9 @@
 //! issue happens to quote: every Region below is both a storing and a reading Region,
 //! so the assertions are about the partition, not about a particular Region name.
 
-use service_com_amazonaws_polly_parrot_v1::ops::list_lexicons::LEXICON_PAGE_SIZE;
 use service_com_amazonaws_polly_parrot_v1::ops::put_lexicon::{MAX_LEXICONS, MAX_STORED_LEXICONS};
 
-use crate::lexicons_and_speech::{error_code, json, listed_names, pls, Polly};
+use crate::lexicons_and_speech::{error_code, json, listed_names, listed_names_in_order, pls, Polly};
 
 /// The Regions the tables below span. Four real AWS Regions in three partitions of the
 /// globe, including the emulator's own default (`us-east-1`), so a rule that happened
@@ -229,30 +228,32 @@ async fn a_delete_reaches_only_the_callers_region() {
     }
 }
 
-/// RULE: `ListLexicons` pages one Region's lexicons in name order, and a page never
-/// carries a lexicon of another Region however many pages it takes.
+/// RULE: `ListLexicons` reports one Region's lexicons in name order in a single
+/// response, and that response never carries a lexicon of another Region however many
+/// the Region holds.
 #[tokio::test]
-async fn pagination_stays_inside_the_callers_region() {
+async fn a_listing_stays_inside_the_callers_region() {
     let polly = Polly::new();
     let content = pls("ipa", "en-US", 1);
 
-    // Enough in one Region to need several pages, and a handful in each other Region
-    // whose names INTERLEAVE with them, so a page that leaked across the partition
-    // would show up inside a page rather than only at the end.
-    let paged_region = "eu-west-1";
-    let total = LEXICON_PAGE_SIZE * 2 + 3;
+    // A big store in one Region — the per-Region quota, the most it can hold — and a
+    // handful in each other Region whose names INTERLEAVE with them, so a listing that
+    // leaked across the partition would show up in the middle of the list rather than
+    // only at its end.
+    let full_region = "eu-west-1";
+    let total = MAX_LEXICONS;
     for index in 0..total {
         let name = format!("Lex{index:03}");
         assert_eq!(
             polly
-                .put_lexicon_in(paged_region, &name, &content)
+                .put_lexicon_in(full_region, &name, &content)
                 .await
                 .status(),
             200,
-            "PutLexicon {name} in {paged_region} failed"
+            "PutLexicon {name} in {full_region} failed"
         );
     }
-    for region in REGIONS.iter().filter(|region| **region != paged_region) {
+    for region in REGIONS.iter().filter(|region| **region != full_region) {
         for index in [0usize, 7, total - 1] {
             let name = format!("Lex{index:03}");
             assert_eq!(
@@ -263,46 +264,24 @@ async fn pagination_stays_inside_the_callers_region() {
         }
     }
 
-    let mut seen: Vec<String> = Vec::new();
-    let mut query = String::new();
-    let mut pages = 0;
-    loop {
-        let page = json(&polly.list_lexicons_in(paged_region, &query).await);
-        let names: Vec<String> = page["Lexicons"]
-            .as_array()
-            .expect("Lexicons is a list")
-            .iter()
-            .map(|entry| entry["Name"].as_str().unwrap_or_default().to_string())
-            .collect();
-        assert!(
-            !names.is_empty(),
-            "page {pages}: a page reached through a NextToken must not be empty"
-        );
-        assert!(
-            names.len() <= LEXICON_PAGE_SIZE,
-            "page {pages}: {} entries is over the page size",
-            names.len()
-        );
-        seen.extend(names);
-        pages += 1;
-        match page["NextToken"].as_str() {
-            Some(token) => query = format!("?NextToken={token}"),
-            None => break,
-        }
-        assert!(pages < 10, "pagination did not terminate");
-    }
+    let body = json(&polly.list_lexicons_in(full_region, "").await);
+    let seen: Vec<String> = listed_names_in_order(&body);
     let expected: Vec<String> = (0..total).map(|index| format!("Lex{index:03}")).collect();
-    assert!(
-        pages > 1,
-        "{total} lexicons must not fit in one page, got {pages}"
-    );
     assert_eq!(
         seen, expected,
-        "the pages together must be exactly {paged_region}'s lexicons, in name order"
+        "one call must report exactly {full_region}'s lexicons, in name order, got {} entries",
+        seen.len()
+    );
+    assert_eq!(
+        body["NextToken"].as_str(),
+        None,
+        "region {full_region:?}: the whole list is in the response, so no NextToken is owed, \
+         got {:?}",
+        body["NextToken"]
     );
 
-    // Every other Region still reports its own three, whole, in one page.
-    for region in REGIONS.iter().filter(|region| **region != paged_region) {
+    // Every other Region still reports its own three, whole.
+    for region in REGIONS.iter().filter(|region| **region != full_region) {
         let body = json(&polly.list_lexicons_in(region, "").await);
         let names: Vec<String> = listed_names(&body).into_iter().collect();
         let expected: Vec<String> = [0usize, 7, total - 1]
@@ -316,7 +295,7 @@ async fn pagination_stays_inside_the_callers_region() {
         assert_eq!(
             body["NextToken"].as_str(),
             None,
-            "region {region:?}: three lexicons fit in one page, so no NextToken is owed"
+            "region {region:?}: the whole list is in the response, so no NextToken is owed"
         );
     }
 }

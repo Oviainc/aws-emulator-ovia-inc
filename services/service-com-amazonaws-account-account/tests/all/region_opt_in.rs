@@ -456,13 +456,20 @@ async fn a_regions_opt_status_is_per_account() {
         "case {own}: another account's opt-in must leave the caller's own status {DISABLED}"
     );
 
-    // Naming the caller's own id explicitly is the same account as naming none.
+    // Naming the caller's own id is refused: the caller's own record is reached
+    // by the standalone call, which still reports its own status.
     let named = get_status(&router, json!({ "AccountId": own, "RegionName": region })).await;
     assert_eq!(
-        named.member("RegionOptStatus"),
-        DISABLED,
-        "case {own}: naming the caller's own id must land on the caller's own record, got {:?}",
+        (named.status, named.error_code()),
+        (403, "AccessDeniedException"),
+        "case {own}: naming the caller's own id must be refused, got {} with {:?}",
+        named.status,
         named.body
+    );
+    assert_eq!(
+        status_of(&router, region).await,
+        DISABLED,
+        "case {own}: the refused call must leave the caller's own status {DISABLED}"
     );
 
     // A reporting call never mints an account record, so an account this

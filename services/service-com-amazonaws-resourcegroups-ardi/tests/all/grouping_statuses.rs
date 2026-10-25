@@ -30,7 +30,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use super::resource_group_lifecycle::{error_code, is_modelled_token, Emulator};
+use super::resource_group_lifecycle::{error_code, is_modelled_token, static_group, Emulator};
 
 /// Every value the modelled `GroupingStatus` enum declares — the domain of the
 /// `status` filter.
@@ -83,8 +83,12 @@ fn item_arns(page: &Value) -> Vec<String> {
 }
 
 /// Create `name` and record `arns` as its members. Returns the group's ARN.
+///
+/// The group is created with the service configuration a static-membership
+/// operation serves (see `static_group`), since `GroupResources` is the only way
+/// a grouping status is recorded.
 async fn group_with_members(emulator: &Emulator, name: &str, arns: &[&str]) -> String {
-    let created = emulator.ok("/groups", &json!({ "Name": name })).await;
+    let created = emulator.ok("/groups", &static_group(name)).await;
     let group_arn = created["Group"]["GroupArn"]
         .as_str()
         .unwrap_or_else(|| panic!("CreateGroup must answer a GroupArn, got {created}"))

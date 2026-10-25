@@ -8,13 +8,15 @@
 //! `InvalidCampaignStateException` (HTTP 409) carrying that state.
 //!
 //! Each request of the batch is then reported on its own, as the response's two lists
-//! say: a request for a channel subtype the campaign is not configured for fails with
-//! `InvalidInput`, one past the campaign's buffer ceiling
+//! say: a request for a channel subtype the campaign is not configured for, or one
+//! whose `expirationTime` the clock has already passed, fails with `InvalidInput`, one
+//! past the campaign's buffer ceiling
 //! (`crate::state::MAX_OUTBOUND_REQUESTS_PER_CAMPAIGN`) with `BufferLimitExceeded`, and
 //! anything else is taken under a minted `DialRequestId`. The call is idempotent, as
-//! the model's documentation says ("This API is idempotent"): a `clientToken` the
-//! campaign has already taken is answered with the id it was given then, and stores
-//! nothing further.
+//! the model's documentation says ("This API is idempotent"): a `clientToken` whose
+//! request the campaign still has pending is answered with the id it was given then,
+//! and stores nothing further — a token whose request has expired holds nothing, since
+//! an expired request is no longer in the campaign's buffer.
 //!
 //! ## Shape of an operation
 //!
@@ -187,6 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // One instant for the whole batch, so every request of it is weighed against
+        // the same clock reading.
+        let now = ::std::time::SystemTime::now();
+
         let mut store = state.lock();
         let Some(campaign) = store.campaign(&input.id) else {
             return Err(
@@ -205,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // outbound requests and the refusal names the state it is in. The state is
         // the one the campaign is at NOW — a campaign whose scheduled run window has
         // closed is past dialling even though the last call wrote `Running`.
-        let current = campaign.state_at(::std::time::SystemTime::now());
+        let current = campaign.state_at(now);
         if current != crate::state::CampaignState::Running {
             return Err(
                 PutOutboundRequestBatchErrorModeled::InvalidCampaignStateException(
@@ -242,11 +248,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 });
                 continue;
             }
+            // A request whose `expirationTime` has already passed is one the campaign
+            // can never dial, so it is reported on the same per-request failure
+            // channel, with the same `InvalidInput` code, as one the campaign cannot
+            // serve for any other reason — and the rest of the batch is unaffected.
             let outcome = store.take_outbound_request(
                 &input.id,
                 &request.client_token,
                 channel_subtype,
-                request.expiration_time.secs(),
+                request.expiration_time,
+                now,
             );
             match outcome {
                 Some(crate::state::OutboundRequestOutcome::Taken(id)) => {
@@ -260,6 +271,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         client_token: Some(request.client_token.clone()),
                         id: None,
                         failure_code: Some("BufferLimitExceeded".to_string()),
+                    });
+                }
+                Some(crate::state::OutboundRequestOutcome::Expired) => {
+                    failed_requests.push(FailedRequest {
+                        client_token: Some(request.client_token.clone()),
+                        id: None,
+                        failure_code: Some("InvalidInput".to_string()),
                     });
                 }
                 // The campaign was resolved above under the guard this walk still

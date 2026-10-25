@@ -31,6 +31,8 @@ mod parameter_validation;
 mod regex_pattern_set_lifecycle;
 #[path = "all/regex_pattern_set_listing.rs"]
 mod regex_pattern_set_listing;
+#[path = "all/regex_pattern_set_updates.rs"]
+mod regex_pattern_set_updates;
 #[path = "all/response_members.rs"]
 mod response_members;
 #[path = "all/rule_group_lifecycle.rs"]

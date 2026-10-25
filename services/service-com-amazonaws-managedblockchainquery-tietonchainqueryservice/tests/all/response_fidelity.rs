@@ -36,6 +36,7 @@ use crate::chain_query_slice::{
     drain, error_code, refusal_explanation, unseeded_bitcoin_address, Emulator,
     GENERIC_VALIDATION_MESSAGE,
 };
+use crate::native_token_denomination::{amount_units, holding_decimals};
 
 /// Every response member of this service that carries a `ChainAddress`:
 /// `OwnerIdentifier$address`, `ContractIdentifier$contractAddress` /
@@ -712,9 +713,13 @@ async fn one_balance_fact_is_reported_by_every_operation_that_reports_balances()
                 .as_str()
                 .unwrap_or_else(|| panic!("case {case}: balance is required: {single:?}"))
                 .to_string();
+            // A balance is an amount of the token, quoted in that token's own unit — the
+            // rule `native_token_denomination.rs` owns.
+            let decimals = holding_decimals(key);
             assert!(
-                balance.parse::<i128>().is_ok(),
-                "case {case}: a balance is a base-10 integer, got {balance:?}"
+                amount_units(&balance, decimals).is_some(),
+                "case {case}: a balance is an amount of at most {decimals} decimal places, \
+                 got {balance:?}"
             );
 
             let batched = emulator

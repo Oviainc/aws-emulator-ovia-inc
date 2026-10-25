@@ -260,7 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect(),
             list_certificate_arns: Vec::new(),
             default_rule_id: String::new(),
-            rule_arns: Vec::new(),
+            rules: Vec::new(),
         };
 
         let mut guard = state.lock();

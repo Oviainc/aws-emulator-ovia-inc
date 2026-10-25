@@ -340,7 +340,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             benefit_application_details: input.benefit_application_details,
             programs,
             status: crate::state::STATUS_PENDING_SUBMISSION.to_string(),
-            stage: None,
             status_reason: None,
             status_reason_codes: Vec::new(),
             created_at_millis: now,

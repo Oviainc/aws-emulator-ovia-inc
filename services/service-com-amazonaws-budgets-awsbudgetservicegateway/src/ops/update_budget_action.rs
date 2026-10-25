@@ -206,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
+        let mut store = crate::state::store_at(&state, now);
         let held = store
             .budgets
             .get_mut(&(input.account_id.clone(), input.budget_name.clone()))

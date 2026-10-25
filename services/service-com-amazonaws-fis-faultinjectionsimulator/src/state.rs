@@ -2152,13 +2152,21 @@ pub fn page_size(max_results: Option<i32>) -> usize {
 /// the rule is judged the same whether the template is being created or updated: FIS
 /// states it about a template, not about a request.
 ///
-/// Two rules the model cannot express: `source` is one of
+/// Three rules the model cannot express: a template DECLARES at least one stop condition
+/// (the member is `@required` on the create and the lists carry no `@length`, so the
+/// "at least one" floor is server-side — "no alarm" is expressed by the explicit
+/// [`STOP_CONDITION_SOURCE_NONE`] entry rather than by an empty list), `source` is one of
 /// [`STOP_CONDITION_SOURCE_NONE`] / [`STOP_CONDITION_SOURCE_ALARM`], and a stop condition
 /// naming the alarm source carries the alarm's ARN in `value` ("This is required if the
 /// source is a CloudWatch alarm").
 pub fn stop_conditions_refusal(
     conditions: &[ExperimentTemplateStopCondition],
 ) -> Option<ValidationException> {
+    if conditions.is_empty() {
+        return Some(invalid_input(
+            "stopConditions must declare at least one stop condition.",
+        ));
+    }
     for (index, condition) in conditions.iter().enumerate() {
         // `source` is required on both the create's and the update's stop-condition
         // input, so a stored condition always carries one; an absent one is refused by
@@ -2183,6 +2191,30 @@ pub fn stop_conditions_refusal(
         }
     }
     None
+}
+
+/// `None` when the log configuration a template carries names somewhere to log; otherwise
+/// the `ValidationException` that refuses the request.
+///
+/// Taken over the STORED configuration, so a created and an updated template are judged by
+/// the same rule. A template carrying NO log configuration is not logging at all, which is
+/// admissible; a configuration it DOES carry says where the experiment's logs go, and both
+/// destinations being modelled optional (only `logSchemaVersion` is `@required` on the
+/// create's input) is what makes "at least one destination" a server-side rule: experiment
+/// logging is delivered to a CloudWatch Logs log group or to an Amazon S3 bucket, so a
+/// configuration naming neither describes no delivery.
+pub fn log_configuration_refusal(
+    configuration: Option<&ExperimentTemplateLogConfiguration>,
+) -> Option<ValidationException> {
+    let configuration = configuration?;
+    if configuration.cloud_watch_logs_configuration.is_some()
+        || configuration.s3_configuration.is_some()
+    {
+        return None;
+    }
+    Some(invalid_input(
+        "logConfiguration must name cloudWatchLogsConfiguration or s3Configuration.",
+    ))
 }
 
 /// `None` when `value` is absent or is one of `admitted`; otherwise the
@@ -2530,7 +2562,11 @@ pub fn wait_duration(value: &str) -> Result<Duration, WaitDurationProblem> {
 /// Taken over the STORED actions rather than over one request's input shape, so a created
 /// and an updated template are judged by the same rule.
 ///
-/// The rule this enforces is the built-in `aws:fis:wait` action's: it takes a required
+/// The first rule is the template's own: it DECLARES at least one action. `actions` is
+/// `@required` on the create and the maps carry no `@length`, so the "at least one" floor
+/// is server-side — an experiment with no action has nothing to carry out.
+///
+/// The next rule this enforces is the built-in `aws:fis:wait` action's: it takes a required
 /// `duration` parameter, an ISO 8601 duration within the documented 1 to 720 minutes. An
 /// action id FIS defines elsewhere carries its own parameter catalog, which this service
 /// does not hold, so its parameters are stored as sent. The other rule here is on the
@@ -2539,6 +2575,9 @@ pub fn wait_duration(value: &str) -> Result<Duration, WaitDurationProblem> {
 pub fn actions_refusal(
     actions: &HashMap<String, ExperimentTemplateAction>,
 ) -> Option<ValidationException> {
+    if actions.is_empty() {
+        return Some(invalid_input("actions must declare at least one action."));
+    }
     // The map's iteration order is not stable, so the refusal is taken over the action
     // names in order: one request always earns the same message. The entries are sorted
     // as PAIRS, so no path through this function can turn a lookup miss into an

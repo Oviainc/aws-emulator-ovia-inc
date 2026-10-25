@@ -513,6 +513,163 @@ pub fn invalid_api_id_message(api_id: &str) -> String {
     format!("Invalid API ID {api_id}")
 }
 
+/// `ownerContact`'s documented maximum length: "This field accepts any string input
+/// with a length of 0 - 256 characters."
+pub const OWNER_CONTACT_MAX_LEN: usize = 256;
+
+/// The name a refusal names the OIDC configuration by.
+pub const OPEN_ID_CONNECT_CONFIG: &str = "OpenID Connect Config";
+
+/// The name a refusal names the Cognito user pool configuration by.
+pub const USER_POOL_CONFIG: &str = "User Pool Config";
+
+/// The name a refusal names the Lambda authorizer configuration by.
+pub const LAMBDA_AUTHORIZER_CONFIG: &str = "Lambda Authorizer Config";
+
+/// Why the authentication configuration a request carries for a GraphQL API is not
+/// well formed, as the text a `BadRequestException` (HTTP 400) states it with, or
+/// `None` when it is well formed.
+///
+/// The configuration members of a GraphQL API are the same whether the request
+/// CREATES the API or UPDATES it, and so are the grounds on which either request is
+/// refused, so the rules are stated here once:
+///
+/// * an authentication type that is set up through a member of its own
+///   ([`missing_auth_config`]) is not configured without that member — checked for
+///   the API's own `authenticationType` and, independently, for every
+///   `additionalAuthenticationProviders` entry, which the refusal names by its
+///   1-based position, the only way a caller can tell them apart;
+/// * an authentication type identifies ONE way of authenticating the API, so the API
+///   cannot name it twice;
+/// * an OIDC provider is identified by its issuer, which "must exactly match the
+///   value of `iss` in the ID token" — an absolute URL;
+/// * `ownerContact` "accepts any string input with a length of 0 - 256 characters"
+///   (its own member documentation), a bound the plain `String` target leaves to the
+///   service.
+///
+/// The per-type presence of the API's OWN user-pool and Lambda configurations is
+/// taken as a flag rather than as the structure, because the API-level and the
+/// per-provider user-pool configurations are modelled with different shapes
+/// (`UserPoolConfig` vs `CognitoUserPoolConfig`) while the rule over them is one.
+pub fn graphql_api_config_refusal(
+    authentication_type: &str,
+    open_id_connect_config: Option<&OpenIDConnectConfig>,
+    user_pool_config: bool,
+    lambda_authorizer_config: bool,
+    additional_authentication_providers: &[AdditionalAuthenticationProvider],
+    owner_contact: Option<&str>,
+) -> Option<String> {
+    if let Some(config) = missing_auth_config(
+        Some(authentication_type),
+        open_id_connect_config.is_some(),
+        user_pool_config,
+        lambda_authorizer_config,
+    ) {
+        return Some(api_level_missing_config_message(config));
+    }
+    for (position, provider) in additional_authentication_providers.iter().enumerate() {
+        if let Some(config) = missing_auth_config(
+            provider.authentication_type.as_deref(),
+            provider.open_id_connect_config.is_some(),
+            provider.user_pool_config.is_some(),
+            provider.lambda_authorizer_config.is_some(),
+        ) {
+            return Some(format!(
+                "{config} is missing for additional authentication provider {}",
+                position + 1
+            ));
+        }
+    }
+
+    // The set of types already named holds at most one entry per value of the
+    // modelled `AuthenticationType` enum, because the request is refused as soon as a
+    // type repeats: its size is bounded by the model, not by the length of the list
+    // the caller sent, and membership is a set lookup rather than a scan of it.
+    let mut specified = std::collections::BTreeSet::from([authentication_type.to_string()]);
+    for (position, provider) in additional_authentication_providers.iter().enumerate() {
+        let Some(provider_type) = provider.authentication_type.clone() else {
+            continue;
+        };
+        if specified.contains(&provider_type) {
+            return Some(format!(
+                "Authentication type {provider_type} for additional authentication provider {} \
+                 already specified on the API. It can only be specified once.",
+                position + 1
+            ));
+        }
+        specified.insert(provider_type);
+    }
+
+    for config in open_id_connect_config.into_iter().chain(
+        additional_authentication_providers
+            .iter()
+            .filter_map(|provider| provider.open_id_connect_config.as_ref()),
+    ) {
+        if !is_absolute_url(&config.issuer) {
+            return Some("Issuer is not a valid URL".to_string());
+        }
+    }
+
+    if owner_contact.is_some_and(|contact| contact.chars().count() > OWNER_CONTACT_MAX_LEN) {
+        return Some(format!(
+            "ownerContact accepts 0-{OWNER_CONTACT_MAX_LEN} characters"
+        ));
+    }
+
+    None
+}
+
+/// The configuration `authentication_type` is set up through and the request did
+/// not carry, or `None` when it carried it (or the type needs none at all:
+/// `API_KEY` and `AWS_IAM` are configured by nothing).
+///
+/// Source: the per-type configuration members of `CreateGraphqlApiRequest`,
+/// `UpdateGraphqlApiRequest` and `AdditionalAuthenticationProvider` —
+/// `openIDConnectConfig` ("The OIDC configuration"), `userPoolConfig` ("The Amazon
+/// Cognito user pool configuration") and `lambdaAuthorizerConfig` ("Configuration
+/// for Lambda function authorization").
+fn missing_auth_config(
+    authentication_type: Option<&str>,
+    open_id_connect_config: bool,
+    user_pool_config: bool,
+    lambda_authorizer_config: bool,
+) -> Option<&'static str> {
+    match authentication_type? {
+        "OPENID_CONNECT" if !open_id_connect_config => Some(OPEN_ID_CONNECT_CONFIG),
+        "AMAZON_COGNITO_USER_POOLS" if !user_pool_config => Some(USER_POOL_CONFIG),
+        "AWS_LAMBDA" if !lambda_authorizer_config => Some(LAMBDA_AUTHORIZER_CONFIG),
+        _ => None,
+    }
+}
+
+/// How the service states the absence of the API's OWN authentication
+/// configuration, per configuration.
+///
+/// The service does not word these from one template: the recorded refusals state
+/// the OIDC configuration's absence as "OpenID Connect Config missing" and the
+/// Cognito user pool's as "User Pool Config is empty", so each is stated as the
+/// service states it rather than derived from the other. No recording covers the
+/// Lambda authorizer configuration, so its absence is worded the way the
+/// per-provider refusal words a missing configuration, and the requirement that
+/// wording answers is the 400 and `BadRequestException` rather than the text.
+fn api_level_missing_config_message(config: &str) -> String {
+    match config {
+        OPEN_ID_CONNECT_CONFIG => format!("{OPEN_ID_CONNECT_CONFIG} missing"),
+        USER_POOL_CONFIG => format!("{USER_POOL_CONFIG} is empty"),
+        other => format!("{other} is missing"),
+    }
+}
+
+/// Whether `candidate` is an absolute URL, as an OIDC issuer has to be.
+///
+/// Parsed with the `url` crate (WHATWG URL), so the judgement is a real parse
+/// rather than a string test: a relative reference, a bare host or a value with no
+/// scheme is not one. A scheme-relative or opaque URL (`mailto:…`) carries no host,
+/// which an issuer an ID token is checked against must have.
+fn is_absolute_url(candidate: &str) -> bool {
+    ::url::Url::parse(candidate).is_ok_and(|parsed| parsed.has_host())
+}
+
 /// The modelled bounds and alphabet of an `EnvironmentVariableKey`, and whether
 /// `candidate` satisfies them.
 ///
@@ -595,6 +752,13 @@ pub const MERGED_API_TYPE: &str = "MERGED";
 /// "Valid merge types are `MANUAL_MERGE` (default) and `AUTO_MERGE`"
 /// (`SourceApiAssociationConfig$mergeType`).
 pub const DEFAULT_MERGE_TYPE: &str = "MANUAL_MERGE";
+
+/// The `GraphQLApiIntrospectionConfig` a GraphQL API takes when the request that
+/// created or updated it named none: "If no value is provided, the introspection
+/// configuration will be set to `ENABLED` by default"
+/// (`GraphqlApi$introspectionConfig`).
+pub const DEFAULT_INTROSPECTION_CONFIG: &str = "ENABLED";
+
 
 /// The `SourceApiAssociationStatus` a fresh association carries: creating it schedules
 /// the merge of the source API's schema into the Merged API, which has not run yet.

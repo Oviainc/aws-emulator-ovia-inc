@@ -120,6 +120,9 @@ mod review_template_lens_review;
 #[path = "all/review_template_lens_review_reads.rs"]
 mod review_template_lens_review_reads;
 
+#[path = "all/review_template_lens_review_upgrade.rs"]
+mod review_template_lens_review_upgrade;
+
 #[path = "all/review_template_listing.rs"]
 mod review_template_listing;
 

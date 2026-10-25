@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeOrganizationHealth
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeOrganizationHealth`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the organization-wide health figures for the member accounts the request's
+//! scope selects.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeOrganizationHealth::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An organization-wide read belongs to the account that ADMINISTERS DevOps Guru for
+//! the organization, so a caller that administers none is refused with the modelled
+//! HTTP 403 `AccessDeniedException` — decided BEFORE any lookup, so the refusal reports
+//! nothing about what the organization holds. The administrator is read through
+//! [`crate::state::ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::administers_organization`],
+//! and nothing a client of this emulator can call records one.
+//!
+//! For that administering caller the four figures are the ones this store already
+//! computes for the account it serves — the open-insight tally over the very insight
+//! records the insight reads walk, the metrics the stored anomaly evidence names, and
+//! one resource-analysis hour per monitored resource of the coverage — scoped by
+//! `AccountIds` and `OrganizationalUnitIds` through
+//! [`crate::state::OrganizationAccountScope`], the scope every `*Organization*` read of
+//! this service shares. So this read and `DescribeAccountHealth` cannot disagree about
+//! the one member account whose analysis output this store holds. A pure read: it never
+//! writes to the store.
 //!
 //! ## Shape of an operation
 //!
@@ -153,20 +163,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeOrganizationHealth` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeOrganizationHealthErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeOrganizationHealth"))
+        // Every figure comes from the store and the deserialized input, so no request
+        // metadata takes part and the context is unused.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| internal("the DevOps Guru insight store is unavailable"))?;
+
+        // The caller: the one account this emulator serves. An organization-wide view
+        // belongs to the account that administers DevOps Guru for the organization, so a
+        // caller that administers none is refused before anything is looked up.
+        let caller = crate::state::requested_account_id(None);
+        let scope = crate::state::OrganizationAccountScope::of(
+            &input.account_ids,
+            &input.organizational_unit_ids,
+        );
+
+        let guard = state.lock();
+        if !guard.administers_organization(&caller) {
+            return Err(DescribeOrganizationHealthErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: format!(
+                        "Access denied when reading organization-wide health: account \
+                         {caller} does not administer DevOps Guru for an organization"
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The member accounts of the organization this store records: the ONE account
+        // this emulator serves, which belongs to no organizational unit (see
+        // `OrganizationAccountScope::holds_served_member`). A scope that leaves it out
+        // selects no member, and the figures over no member are zeros — this emulator
+        // holds no other account's analysis output, so reporting anything else would
+        // report analysis that never ran.
+        if !scope.holds_served_member(&caller) {
+            return Ok(DescribeOrganizationHealthOutput {
+                open_proactive_insights: 0,
+                open_reactive_insights: 0,
+                metrics_analyzed: 0,
+                resource_hours: 0,
+            });
+        }
+
+        // The open counts are the account-level tally over the store's insights — the
+        // map every insight read walks — and the metrics are those the stored anomaly
+        // evidence names, so this read agrees with `DescribeAccountHealth` and with the
+        // insight and anomaly reads over the same store.
+        let insights = guard.account_insight_tally();
+        let monitored = guard.resource_collection.monitored_resource_count();
+        // `crate::state`'s coverage caps bound the count far below `i64::MAX`, so the
+        // saturating arm is unreachable; it is here so the conversion cannot panic.
+        let monitored = i64::try_from(monitored).unwrap_or(i64::MAX);
+
+        Ok(DescribeOrganizationHealthOutput {
+            open_proactive_insights: insights.open_proactive,
+            open_reactive_insights: insights.open_reactive,
+            metrics_analyzed: guard.analyzed_metric_count(),
+            // One resource-analysis hour per monitored resource in the last hour, as
+            // `DescribeAccountHealth` reports it over this same coverage.
+            resource_hours: monitored,
+        })
     }
+}
+
+/// The modelled HTTP 500 for a store this handler cannot reach. `RetryAfterSeconds` is
+/// 0 because the condition is not a transient load spike a wait would clear.
+fn internal(message: &str) -> DescribeOrganizationHealthError {
+    DescribeOrganizationHealthErrorModeled::InternalServerException(InternalServerException {
+        message: message.to_string(),
+        retry_after_seconds: 0,
+    })
+    .into()
 }

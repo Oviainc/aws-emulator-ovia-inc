@@ -9749,6 +9749,7 @@ dependencies = [
  "http",
  "serde_json",
  "service-com-amazonaws-applicationautoscaling-anyscalefrontendservice",
+ "service-com-amazonaws-keyspacesstreams-keyspacesstreams",
  "sha2 0.10.9",
  "tokio",
  "tracing",

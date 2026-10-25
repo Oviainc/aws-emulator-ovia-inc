@@ -207,23 +207,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(selected) = selected else {
             // Whether the image itself is unknown or it holds no version matching the
-            // selection, the resource being accessed is not found. An image no store
-            // holds is reported exactly as the image reader reports it; an image that IS
-            // there names what of it could not be resolved.
-            let image_arn = crate::state::resource_arn(
-                &crate::state::request_region(ctx),
-                "image",
-                &input.image_name,
-            );
-            let message = if store.images.contains_key(&input.image_name) {
-                let selector = match (input.version, input.alias.as_deref()) {
-                    (Some(version), _) => format!("version {version}"),
-                    (None, Some(alias)) => format!("alias \"{alias}\""),
-                    (None, None) => "any version".to_string(),
-                };
-                format!("Could not find {selector} of image \"{image_arn}\".")
-            } else {
+            // selection, the resource being accessed is not found, and the refusal names
+            // the resource the REQUEST identified: an image no store holds by the image's
+            // ARN, a version named by its number by that version's own ARN, and a
+            // selection that determines no ARN by what of the image could not be
+            // resolved.
+            let region = crate::state::request_region(ctx);
+            let image_arn = crate::state::resource_arn(&region, "image", &input.image_name);
+            let message = if !store.images.contains_key(&input.image_name) {
                 crate::state::image_does_not_exist(&image_arn)
+            } else if let Some(version) = input.version {
+                crate::state::image_version_does_not_exist(&crate::state::image_version_arn(
+                    &region,
+                    &input.image_name,
+                    version,
+                ))
+            } else {
+                let selector = match input.alias.as_deref() {
+                    Some(alias) => format!("alias \"{alias}\""),
+                    None => "any version".to_string(),
+                };
+                crate::state::image_version_not_resolved(&image_arn, &selector)
             };
             return Err(DescribeImageVersionErrorModeled::ResourceNotFound(ResourceNotFound {
                 message: Some(message),
