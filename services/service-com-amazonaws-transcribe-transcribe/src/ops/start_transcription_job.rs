@@ -560,6 +560,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             identify_language: input.identify_language,
             identify_multiple_languages: input.identify_multiple_languages,
             language_options: input.language_options,
+            // What automatic language identification determined is part of
+            // processing the media, so it is filled in when the job completes —
+            // nothing is identified for a job that is still queued or in progress.
+            identified_language_score: None,
+            language_codes: None,
             language_id_settings: input.language_id_settings,
             toxicity_detection: input.toxicity_detection,
             subtitles: input.subtitles.map(|subtitles| SubtitlesOutput {
