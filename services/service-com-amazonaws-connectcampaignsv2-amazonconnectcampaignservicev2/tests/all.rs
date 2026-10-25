@@ -45,6 +45,8 @@ mod connect_instance_integration_list_paging;
 mod connect_instance_integrations;
 #[path = "all/instance_communication_limits.rs"]
 mod instance_communication_limits;
+#[path = "all/instance_communication_limits_isolation.rs"]
+mod instance_communication_limits_isolation;
 #[path = "all/instance_onboarding.rs"]
 mod instance_onboarding;
 #[path = "all/instance_onboarding_tags_and_outbound_requests.rs"]
