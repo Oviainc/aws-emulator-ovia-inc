@@ -524,9 +524,11 @@ async fn the_expression_selects_the_reported_names() {
 
     // (the Expression, the names it selects). The rows differ along the shape of the
     // pattern: a bare literal, a trailing wildcard, a leading one, a wildcard in the
-    // middle, an alternation of two patterns, the pattern that matches everything, a
-    // regular-expression metacharacter (a literal here, so it selects the names that
-    // really carry it — none), and a literal nothing matches.
+    // middle, an alternation of two patterns, the pattern that matches everything, the
+    // regular-expression metacharacters (which keep their meaning, so `events.*` selects
+    // the `events`-prefixed names and `orders_[0-9]*` the year-suffixed one), a pattern
+    // in another case (no match: the comparison is case-sensitive) and a literal nothing
+    // matches.
     let rows: Vec<(&str, Vec<&str>)> = vec![
         ("events", vec!["events"]),
         ("events*", vec!["events", "events_raw"]),
@@ -538,7 +540,9 @@ async fn the_expression_selects_the_reported_names() {
         ),
         ("events|orders*", vec!["events", "orders", "orders_2024"]),
         ("*", CATALOG_TABLES.to_vec()),
-        ("events.*", Vec::new()),
+        ("events.*", vec!["events_raw"]),
+        ("orders_[0-9]*", vec!["orders_2024"]),
+        ("EVENTS*", Vec::new()),
         ("clicks", Vec::new()),
     ];
 
@@ -576,15 +580,16 @@ async fn the_expression_selects_the_reported_names() {
         reported_names(&page)
     );
 
-    // Every string is a valid pattern, so the only refusal is a pattern carrying more
-    // wildcards than this catalog matches against every stored name: the pattern is
+    // A value that is no pattern at all cannot select anything, so it is refused rather
+    // than answered with an empty listing — and so is one whose compiled matcher would be
+    // larger than this catalog compiles (`MAX_PATTERN_PROGRAM_BYTES`): the pattern is
     // request text, so the work it can buy is bounded by the handler.
-    let ceiling = service_com_amazonaws_glue_awsglue::state::MAX_PATTERN_WILDCARDS;
+    let oversized = format!("(?:{}){{200}}", "[a-z0-9]{200}");
     for pattern in [
-        "*".repeat(ceiling + 1),
-        // `|`-separated alternatives count too, and the whole pattern stays inside the
-        // modelled 256-character `ExpressionString` the boundary already enforces.
-        format!("a{}", "|a".repeat(ceiling + 1)),
+        "events[".to_string(),
+        "(events".to_string(),
+        "a{2,1}".to_string(),
+        oversized,
     ] {
         let (status, body) = athena(
             &router,
@@ -598,31 +603,30 @@ async fn the_expression_selects_the_reported_names() {
         .await;
         assert_eq!(
             status, 400,
-            "case Expression past the wildcard ceiling: must be refused, got {status} \
-             with {body}"
+            "case Expression {pattern:?}: must be refused, got {status} with {body}"
         );
         assert!(
             error_code(&body).contains("InvalidRequestException"),
-            "case Expression past the wildcard ceiling: expected InvalidRequestException, \
-             got {}",
+            "case Expression {pattern:?}: expected InvalidRequestException, got {}",
             error_code(&body)
         );
     }
-    // One wildcard under the ceiling is served.
+    // A pattern of several wildcards is served: the matcher never backtracks, so what
+    // bounds the work is the compiled size rather than a count of wildcards.
     let page = athena_ok(
         &router,
         "ListTableMetadata",
         &json!({
             "CatalogName": GLUE_CATALOG,
             "DatabaseName": "filtered_db",
-            "Expression": "*".repeat(ceiling)
+            "Expression": "*".repeat(8)
         }),
     )
     .await;
     assert_eq!(
         reported_names(&page),
         CATALOG_TABLES.to_vec(),
-        "case Expression at the wildcard ceiling: every name matches, got {:?}",
+        "case Expression of several wildcards: every name matches, got {:?}",
         reported_names(&page)
     );
 }

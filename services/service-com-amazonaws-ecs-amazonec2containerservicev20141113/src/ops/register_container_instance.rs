@@ -417,6 +417,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             instance.status_reason = None;
             instance.agent_connected = true;
             instance.version_info = version_info;
+            // The agent that re-registers reports its own version, so any update this
+            // service was still waiting to materialise is no longer the newest word on it.
+            instance.agent_update_status = None;
+            instance.agent_update_due_at = None;
             instance.registered_resources = registered_resources;
             instance.attributes = attributes;
             instance.platform_devices = platform_devices;
@@ -464,6 +468,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // can accept task placement requests."
             agent_connected: true,
             version_info,
+            // "If an update wasn't ever requested, this value is NULL": a registration
+            // requests none, and a re-registration is the agent reporting itself afresh.
+            agent_update_status: None,
+            agent_update_due_at: None,
             registered_resources,
             attributes,
             platform_devices,

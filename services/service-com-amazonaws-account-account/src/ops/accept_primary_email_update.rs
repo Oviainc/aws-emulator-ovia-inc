@@ -2,9 +2,10 @@
 
 //! @op AcceptPrimaryEmailUpdate
 //! Accepts the primary email update a `StartPrimaryEmailUpdate` recorded against
-//! the MEMBER account the request names: the presented address has to be the one
-//! the update was started for, and only an update still waiting for its one-time
-//! passcode can be accepted. An accepted update is `ACCEPTED`, and its
+//! the MEMBER account the request names: the presented address has to be an
+//! email address and has to be the one the update was started for, and only an
+//! update still waiting for its one-time passcode can be accepted. An accepted
+//! update is `ACCEPTED`, and its
 //! `COMPLETED` status — at which point the address IS the account's primary
 //! email — is owed by the clock
 //! ([`crate::state::PRIMARY_EMAIL_UPDATE_COMPLETION`]).
@@ -189,6 +190,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The address presented here is the one that becomes the account's root
+        // user email address, so it is held to the same syntax
+        // `StartPrimaryEmailUpdate` holds the proposed address to — this model's
+        // own email-address expression — before any stored update is looked at.
+        // `PrimaryEmailAddress`'s `@length(min: 5, max: 64)` and `Otp`'s
+        // `^[a-zA-Z0-9]{6}$` were already enforced at the boundary.
+        if let Err(refusal) = crate::state::validated_email_address(
+            crate::state::PRIMARY_EMAIL_MEMBER,
+            &input.primary_email,
+        ) {
+            return Err(AcceptPrimaryEmailUpdateErrorModeled::ValidationException(refusal).into());
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // Materialise every completion the clock already owes before deciding,
@@ -238,7 +252,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // presented here "must match the PrimaryEmail from the
         // StartPrimaryEmailUpdate API call". `@length(min: 5, max: 64)` on the
         // address and `^[a-zA-Z0-9]{6}$` on `Otp` were already enforced at the
-        // boundary, so reaching here means both are well formed.
+        // boundary, and the address's syntax above, so reaching here means both
+        // are well formed.
         if input.primary_email != update.requested_email {
             return Err(AcceptPrimaryEmailUpdateErrorModeled::ValidationException(
                 crate::state::primary_email_does_not_match_request(),

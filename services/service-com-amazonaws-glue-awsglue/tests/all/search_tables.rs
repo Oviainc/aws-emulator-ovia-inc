@@ -888,16 +888,21 @@ async fn g_a_searched_table_is_the_table_the_single_read_serves() {
         every_table()
     );
 
-    let other = ok(
+    // A catalog of ANOTHER account is reachable only through that catalog's own resource
+    // policy, so the search over one is refused rather than answered with an empty page.
+    let (status, body) = call(
         &router,
         "SearchTables",
         &json!({ "CatalogId": "210987654321" }),
     )
     .await;
-    let found = hit_set(&other);
+    assert_eq!(
+        status, 400,
+        "case \"a catalog of another account\": expected 400, got {status} with {body}"
+    );
     assert!(
-        found.is_empty(),
-        "case \"a catalog the store does not hold\": expected no tables, got {found:?}"
+        error_code(&body).contains("AccessDeniedException"),
+        "case \"a catalog of another account\": expected AccessDeniedException, got {body}"
     );
 }
 

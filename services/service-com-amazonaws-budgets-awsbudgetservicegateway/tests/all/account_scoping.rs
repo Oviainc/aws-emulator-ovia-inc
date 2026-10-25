@@ -237,6 +237,16 @@ fn every_operation(account_id: &str, action_id: &str) -> Vec<(&'static str, Valu
                 "Notification": notification()
             }),
         ),
+        (
+            "UpdateSubscriber",
+            json!({
+                "AccountId": account_id,
+                "BudgetName": BUDGET,
+                "Notification": notification(),
+                "OldSubscriber": email_subscriber(0),
+                "NewSubscriber": email_subscriber(3)
+            }),
+        ),
         ("CreateBudgetAction", simple_create_body(account_id, BUDGET)),
         (
             "DescribeBudgetAction",

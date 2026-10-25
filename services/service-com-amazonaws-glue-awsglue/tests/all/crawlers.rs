@@ -281,6 +281,79 @@ async fn reads_do_not_change_what_a_later_caller_sees() {
     );
 }
 
+/// `GetCrawlers` lists the crawlers the account holds, in name order, one bounded page
+/// at a time, and each element is the projection `GetCrawler` serves for that crawler —
+/// so a client that enumerates the account reads exactly the crawlers that exist.
+///
+/// The rows differ along the page size, which is what the listing generalises over: the
+/// whole set at once, each page size from one up to one past the count, and the empty
+/// account.
+#[tokio::test]
+async fn get_crawlers_lists_the_account_in_name_order() {
+    let router = emulator();
+
+    // An account holding no crawler lists none — never an absent list, which a client
+    // could not tell from "not answered".
+    let empty = ok(&router, "GetCrawlers", &json!({})).await;
+    assert_eq!(
+        empty["Crawlers"].as_array().map(Vec::len),
+        Some(0),
+        "an account with no crawler must list none, got {empty}"
+    );
+
+    // Created out of order, so the listing's order is the store's and not the creates'.
+    let names = ["orders-crawler", "clicks-crawler", "events-crawler"];
+    for name in names {
+        create_crawler(&router, name).await;
+    }
+    let mut expected: Vec<String> = names.iter().map(ToString::to_string).collect();
+    expected.sort();
+
+    for page_size in [None, Some(1), Some(2), Some(3), Some(4)] {
+        let case = format!("MaxResults {page_size:?}");
+        let mut seen: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut body = json!({});
+            if let Some(size) = page_size {
+                body["MaxResults"] = json!(size);
+            }
+            if let Some(cursor) = token.as_ref() {
+                body["NextToken"] = json!(cursor);
+            }
+            let answer = ok(&router, "GetCrawlers", &body).await;
+            let page = answer["Crawlers"].as_array().expect("Crawlers is a list");
+            if let Some(size) = page_size {
+                assert!(
+                    page.len() <= size,
+                    "case {case}: a page must hold at most {size} crawlers, got {}",
+                    page.len()
+                );
+            }
+            for crawler in page {
+                let name = crawler["Name"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("case {case}: a crawler carries a Name"));
+                // The listing's element is the single read's own projection.
+                assert_eq!(
+                    crawler,
+                    &get_crawler(&router, name).await,
+                    "case {case}: the listed crawler must be the one GetCrawler serves"
+                );
+                seen.push(name.to_string());
+            }
+            token = answer["NextToken"].as_str().map(str::to_string);
+            if token.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            seen, expected,
+            "case {case}: the crawlers must be listed in name order, got {seen:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Refusals
 // ---------------------------------------------------------------------------

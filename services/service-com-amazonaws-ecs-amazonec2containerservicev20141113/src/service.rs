@@ -92,14 +92,22 @@ const INVALID_PARAMETER_MESSAGE: &str =
 /// How this service words the refusal of a request whose values failed the rules the
 /// model declares.
 ///
-/// A cluster read that asks for an unknown `include` field is the one such refusal
-/// Amazon ECS states in its own sentence ([`INVALID_CLUSTER_IDENTIFIER`]); every other
-/// one keeps the framework's clause, which states the value, the position and the
-/// requirement it failed, falling back to [`INVALID_PARAMETER_MESSAGE`] when there is no
-/// clause to state.
+/// Three cases, in the order they are decided. A cluster read that asks for an unknown
+/// `include` field is the one such refusal Amazon ECS states in its own sentence
+/// ([`INVALID_CLUSTER_IDENTIFIER`]). A value outside an ENUM's value set is worded from
+/// the request — the member in Amazon ECS's own words and the values it accepts
+/// ([`crate::state::enum_value_message`]), the sentence the corpus records for
+/// `assignPublicIp`. Every other one keeps the framework's clause, which states the
+/// value, the position and the requirement it failed, falling back to
+/// [`INVALID_PARAMETER_MESSAGE`] when there is no clause to state.
 fn refusal_message(violations: &[Violation]) -> String {
     if violations.iter().any(is_unknown_cluster_field) {
         return INVALID_CLUSTER_IDENTIFIER.to_string();
+    }
+    if let [violation] = violations {
+        if let ViolationKind::EnumValue(accepted) = &violation.kind {
+            return crate::state::enum_value_message(&violation.path, accepted);
+        }
     }
     ::aws_smithy_schema_server::envelope(violations)
         .unwrap_or_else(|| INVALID_PARAMETER_MESSAGE.to_string())

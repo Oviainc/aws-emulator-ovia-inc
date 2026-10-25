@@ -294,6 +294,20 @@ pub const UPDATE_RUNTIME_ON_FUNCTION_UPDATE: &str = "FunctionUpdate";
 /// Automatically update to the most recent and secure runtime version".
 pub const DEFAULT_UPDATE_RUNTIME_ON: &str = UPDATE_RUNTIME_ON_AUTO;
 
+/// Lambda's sentence for a runtime management configuration that selects the manual
+/// update mode without the runtime version ARN that mode requires.
+///
+/// The requirement is conditional, so the model cannot express it as a required member —
+/// `RuntimeVersionArn` is documented as "This is only required if you're using the
+/// Manual runtime update mode" — and Lambda diagnoses it with this one fixed sentence:
+/// the member that is missing, the condition that makes it required, and what to do
+/// about it. Every word of it is fixed: nothing of the request appears in it, and the
+/// condition names the mode as the service's own sentence spells it.
+pub const RUNTIME_VERSION_ARN_REQUIRED_MESSAGE: &str =
+    "Missing runtime version ARN. A runtime version ARN is required when \
+     UpdateRuntimeVersionOn=Manual. Provide a valid runtime version ARN and retry the \
+     request.";
+
 /// The `FunctionCodeLocation` `RepositoryType` of a .zip file archive package: Lambda
 /// keeps the archive in its own S3 bucket and vends a download location for it.
 pub const REPOSITORY_TYPE_S3: &str = "S3";
@@ -398,6 +412,36 @@ pub fn unreserved_floor_message(specified: &str, floor: i32) -> String {
          below its minimum value of [{floor}]."
     )
 }
+
+/// Lambda's sentence for an allocation of provisioned concurrency larger than the
+/// capacity the account has left UNRESERVED.
+///
+/// A DIFFERENT rule from [`unreserved_floor_message`], with a different remedy: this one
+/// says the pool the allocation is drawn from does not hold what was asked for at all,
+/// while the floor rule says the pool holds it but may not be emptied that far. The only
+/// value interpolated is the account's unreserved concurrency — the quantity
+/// `AccountLimit$UnreservedConcurrentExecutions` reports — so nothing of the request
+/// appears in it.
+#[must_use]
+pub fn provisioned_above_unreserved_message(unreserved: i32) -> String {
+    format!(
+        "Specified ConcurrentExecutions for function is greater than account's unreserved \
+         concurrency [{unreserved}]."
+    )
+}
+
+/// Lambda's sentence for an allocation of provisioned concurrency larger than the
+/// concurrency the FUNCTION reserves.
+///
+/// A function that reserves concurrency allocates its provisioned concurrency out of that
+/// reservation, so the two are weighed against each other per function rather than
+/// against the account — a different rule again from
+/// [`provisioned_above_unreserved_message`] and [`unreserved_floor_message`], and the one
+/// signal a caller has for which limit to raise. The sentence is a CONSTANT: it has no
+/// slot, so neither the reservation nor the requested amount is interpolated into it.
+pub const PROVISIONED_ABOVE_RESERVED_MESSAGE: &str =
+    "Requested Provisioned Concurrency should not be greater than the \
+     reservedConcurrentExecution for function";
 
 /// The IAM policy language version a resource-based policy document carries.
 /// `2012-10-17` is the current version of the language every AWS policy document is

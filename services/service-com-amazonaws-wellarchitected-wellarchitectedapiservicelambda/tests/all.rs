@@ -161,6 +161,12 @@ mod review_template_answer_updates;
 #[path = "all/review_template_answers.rs"]
 mod review_template_answers;
 
+// Declared in its sorted position, beside the review-template suite it extends, rather
+// than at the end of this list: the tail is where every new suite appends, and an
+// insertion there is what repeatedly refused to merge.
+#[path = "all/review_template_imported_lens_answers.rs"]
+mod review_template_imported_lens_answers;
+
 #[path = "all/review_template_deletion.rs"]
 mod review_template_deletion;
 

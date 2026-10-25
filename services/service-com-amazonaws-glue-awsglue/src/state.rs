@@ -17,8 +17,10 @@
 //! each catalog, CONNECTION definitions (`CreateConnection` / `GetConnection`). A job is
 //! named per account ("The name you assign to this job definition. It must be unique in
 //! your account" — `CreateJobRequest$Name`) and a connection per catalog, which is where
-//! each lives here. A job definition also holds the RUNS `StartJobRun` started of it
-//! ([`JobRunEntry`]), because every operation that addresses a run names its job too.
+//! each lives here; because Glue is a regional service, the job namespace is keyed by the
+//! REGION the create was served in as well, so a job is reachable only through the
+//! endpoint that created it. A job definition also holds the RUNS `StartJobRun` started
+//! of it ([`JobRunEntry`]), because every operation that addresses a run names its job too.
 //!
 //! A catalog also holds ONE security configuration of its own
 //! ([`Catalog::encryption_settings`]): the encryption settings a write set for it, which
@@ -435,14 +437,17 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// `DatabaseInput$Name`/`TableInput$Name`, the model documents no case fold for
     /// `Crawler$Name`.
     pub crawlers: HashMap<String, CrawlerEntry>,
-    /// Every job definition this emulator holds, keyed by its name.
+    /// Every job definition this emulator holds, keyed by the REGION it was created in
+    /// and then by its name.
     ///
     /// Jobs live BESIDE the catalog tree, like crawlers: `GetJob`, `UpdateJob`,
     /// `DeleteJob` and `StartJobRun` address a job by name alone, with no `CatalogId`
     /// member, and `CreateJob$Name` is documented as unique per account ("It must be
-    /// unique in your account"). The key is the name exactly as sent — the model
-    /// documents no case fold for `Job$Name`.
-    pub jobs: HashMap<String, JobEntry>,
+    /// unique in your account"). Glue is a REGIONAL service, so that namespace is per
+    /// account AND per Region: a job created through one Region's endpoint is served only
+    /// through that endpoint, and the same name is free in every other Region. The inner
+    /// key is the name exactly as sent — the model documents no case fold for `Job$Name`.
+    pub jobs: HashMap<String, HashMap<String, JobEntry>>,
     /// Every schema registry this emulator holds, keyed by `RegistryName`, in name order.
     ///
     /// Registries live BESIDE the catalog tree: a schema-registry operation addresses its
@@ -747,7 +752,48 @@ impl ComAmazonawsGlueAwsglueState {
 
     /// Whether the store can hold another job definition, i.e. is below [`MAX_JOBS`].
     pub fn can_store_job(&self) -> bool {
-        self.jobs.len() < MAX_JOBS
+        self.stored_jobs() < MAX_JOBS
+    }
+
+    /// How many job definitions this store holds across every Region. The walk is over
+    /// the Regions one process has been addressed in, so it is bounded.
+    pub fn stored_jobs(&self) -> usize {
+        self.jobs.values().map(HashMap::len).sum()
+    }
+
+    /// The job definition `name` of the Region `region`, or `None` when that Region holds
+    /// no job under that name — which is every job of every other Region, because a Glue
+    /// job exists only in the Region it was created in.
+    pub fn job(&self, region: &str, name: &str) -> Option<&JobEntry> {
+        self.jobs.get(region).and_then(|jobs| jobs.get(name))
+    }
+
+    /// [`Self::job`] mutably: the one record every write to a job definition, and every
+    /// write to one of its runs, lands in.
+    pub fn job_mut(&mut self, region: &str, name: &str) -> Option<&mut JobEntry> {
+        self.jobs
+            .get_mut(region)
+            .and_then(|jobs| jobs.get_mut(name))
+    }
+
+    /// Store `entry` as the Region `region`'s job definition under its own name.
+    pub fn insert_job(&mut self, region: &str, entry: JobEntry) {
+        self.jobs
+            .entry(region.to_string())
+            .or_default()
+            .insert(entry.name.clone(), entry);
+    }
+
+    /// Every job definition the Region `region` holds, in name order.
+    pub fn jobs_in(&self, region: &str) -> Vec<&JobEntry> {
+        let mut found: Vec<&JobEntry> = self
+            .jobs
+            .get(region)
+            .into_iter()
+            .flat_map(HashMap::values)
+            .collect();
+        found.sort_by(|left, right| left.name.cmp(&right.name));
+        found
     }
 
     /// Whether the store can hold another schema registry, i.e. is below
@@ -875,7 +921,10 @@ impl ComAmazonawsGlueAwsglueState {
                 .then(|| self.crawlers.get(&resource.name).map(|crawler| &crawler.tags))
                 .flatten(),
             TaggedResourceKind::Job => is_served_account(&resource.account_id)
-                .then(|| self.jobs.get(&resource.name).map(|job| &job.tags))
+                .then(|| {
+                    self.job(&resource.region, &resource.name)
+                        .map(|job| &job.tags)
+                })
                 .flatten(),
         }
     }
@@ -910,7 +959,9 @@ impl ComAmazonawsGlueAwsglueState {
                 if !is_served_account(&resource.account_id) {
                     return None;
                 }
-                self.jobs.get_mut(&resource.name).map(|job| &mut job.tags)
+                let region = resource.region.clone();
+                let name = resource.name.clone();
+                self.job_mut(&region, &name).map(|job| &mut job.tags)
             }
         }
     }
@@ -945,7 +996,7 @@ impl ComAmazonawsGlueAwsglueState {
                 crawler.tags.clone(),
             ));
         }
-        for job in self.jobs.values() {
+        for job in self.jobs_in(region) {
             found.push((
                 TaggedResourceKind::Job.arn(region, &job.name),
                 job.tags.clone(),
@@ -2054,6 +2105,79 @@ pub fn admits_flex_execution_class(command: &JobCommand, glue_version: &str) -> 
 /// The first Glue major version that takes [`DEFAULT_TIMEOUT_MINUTES_FROM_GLUE_5`].
 const FIRST_GLUE_MAJOR_VERSION_WITH_SHORT_DEFAULT_TIMEOUT: u32 = 5;
 
+/// The capacity, in DPUs, a Spark job whose definition names none runs with: "When you
+/// specify an Apache Spark ETL job (`JobCommand.Name`="glueetl") or Apache Spark
+/// streaming ETL job (`JobCommand.Name`="gluestreaming"), you can allocate from 2 to 100
+/// DPUs. The default is 10 DPUs." (`CreateJob$MaxCapacity`.)
+pub const DEFAULT_SPARK_DPUS: f64 = 10.0;
+
+/// The capacity, in DPUs, a Python shell job whose definition names none runs with:
+/// "When you specify a Python shell job (`JobCommand.Name`="pythonshell"), you can
+/// allocate either 0.0625 or 1 DPU. The default is 0.0625 DPU." (`CreateJob$MaxCapacity`.)
+pub const DEFAULT_PYTHON_SHELL_DPUS: f64 = 0.0625;
+
+/// The `WorkerType` a Spark job whose definition names no worker configuration runs
+/// with, and the number of such workers.
+///
+/// From Glue 2.0 on, a Spark job's capacity is expressed as a worker type and a worker
+/// count rather than as a DPU figure — "For Glue version 2.0 or later jobs, you cannot
+/// specify a `Maximum capacity`. Instead, you should specify a `Worker type` and the
+/// `Number of workers`" (`CreateJob$MaxCapacity`) — so the documented default of
+/// [`DEFAULT_SPARK_DPUS`] is carried as that many `G.1X` workers, each of which "maps to
+/// 1 DPU" (`CreateJob$WorkerType`).
+pub const DEFAULT_SPARK_WORKER_TYPE: &str = "G.1X";
+/// See [`DEFAULT_SPARK_WORKER_TYPE`]: ten one-DPU workers are the ten DPUs
+/// `CreateJob$MaxCapacity` documents as a Spark job's default.
+pub const DEFAULT_SPARK_WORKERS: i32 = 10;
+
+/// The lowest `GlueVersion` whose jobs express capacity as a worker configuration, by the
+/// sentence quoted on [`DEFAULT_SPARK_WORKER_TYPE`].
+pub const MIN_WORKER_TYPE_GLUE_VERSION: f64 = 2.0;
+
+/// The `JobCommand$Name` of an Apache Spark STREAMING ETL job, the second of the two
+/// commands [`DEFAULT_SPARK_DPUS`] is documented for.
+pub const SPARK_STREAMING_COMMAND: &str = "gluestreaming";
+
+/// The `JobCommand$Name` of a Python shell job, the command [`DEFAULT_PYTHON_SHELL_DPUS`]
+/// is documented for.
+pub const PYTHON_SHELL_COMMAND: &str = "pythonshell";
+
+/// The capacity a job definition runs with when it named none of `MaxCapacity`,
+/// `WorkerType` and `NumberOfWorkers`, as `(worker_type, number_of_workers,
+/// max_capacity)`.
+///
+/// The service fills a concrete capacity in rather than leaving a job no runner could
+/// size: the figure is the one `CreateJob$MaxCapacity` documents for the job's COMMAND
+/// ([`DEFAULT_SPARK_DPUS`] for a Spark batch or streaming job,
+/// [`DEFAULT_PYTHON_SHELL_DPUS`] for a Python shell job), and from
+/// [`MIN_WORKER_TYPE_GLUE_VERSION`] on a Spark job's figure is expressed as the worker
+/// configuration that version takes ([`DEFAULT_SPARK_WORKER_TYPE`]).
+///
+/// A command this service documents no default capacity for — a Ray job, whose published
+/// worker configuration this emulator would have to invent — is left with none, so
+/// nothing is reported that the service does not state.
+pub fn default_capacity(
+    command: &JobCommand,
+    glue_version: &str,
+) -> (Option<String>, Option<i32>, Option<f64>) {
+    let expresses_workers = glue_version
+        .parse::<f64>()
+        .is_ok_and(|version| version >= MIN_WORKER_TYPE_GLUE_VERSION);
+    match command.name.as_deref() {
+        Some(SPARK_ETL_COMMAND) | Some(SPARK_STREAMING_COMMAND) if expresses_workers => (
+            Some(DEFAULT_SPARK_WORKER_TYPE.to_string()),
+            Some(DEFAULT_SPARK_WORKERS),
+            dpu_per_worker(DEFAULT_SPARK_WORKER_TYPE)
+                .map(|per_worker| per_worker * f64::from(DEFAULT_SPARK_WORKERS)),
+        ),
+        Some(SPARK_ETL_COMMAND) | Some(SPARK_STREAMING_COMMAND) => {
+            (None, None, Some(DEFAULT_SPARK_DPUS))
+        }
+        Some(PYTHON_SHELL_COMMAND) => (None, None, Some(DEFAULT_PYTHON_SHELL_DPUS)),
+        _ => (None, None, None),
+    }
+}
+
 /// The DPUs one worker of `worker_type` maps to, as `CreateJob$WorkerType` documents
 /// each predefined worker ("For the `G.1X` worker type, each worker maps to 1 DPU", "…
 /// `G.2X` … 2 DPU", "… `G.4X` … 4 DPU", "… `G.8X` … 8 DPU", "… `G.025X` … 0.25 DPU",
@@ -2116,8 +2240,9 @@ pub struct JobEntry {
     pub connections: Option<ConnectionsList>,
     pub max_retries: i32,
     /// The job's capacity in DPUs: what the create named, else what its worker
-    /// configuration maps to (see [`JobEntry::from_create_input`]). `None` when the
-    /// create named neither, because this service documents no figure for that job.
+    /// configuration maps to, else the documented default for its command and Glue
+    /// version (see [`capacity_members`]). `None` only for a command this service
+    /// publishes no default capacity for.
     pub max_capacity: Option<f64>,
     /// The job timeout in minutes: what the create named, else the documented default
     /// for its Glue version.
@@ -2150,14 +2275,22 @@ pub struct JobEntry {
 impl JobEntry {
     /// Build a stored job from a `CreateJob` request plus the members the SERVICE
     /// fills: the documented defaults for an absent `JobMode`, `GlueVersion`,
-    /// `ExecutionProperty` and `Timeout`, the capacity its worker configuration maps
-    /// to, and the create instant.
+    /// `ExecutionProperty`, `Timeout` and worker/capacity configuration
+    /// ([`capacity_members`]), and the create instant.
     pub fn from_create_input(input: &CreateJobInput, now: SystemTime) -> Self {
         let glue_version = input
             .glue_version
             .clone()
             .unwrap_or_else(|| DEFAULT_GLUE_VERSION.to_string());
         let max_concurrent_runs = max_concurrent_runs_of(input.execution_property.as_ref());
+        let (worker_type, number_of_workers, max_capacity) = capacity_members(
+            input.max_capacity,
+            input.allocated_capacity,
+            input.worker_type.as_deref(),
+            input.number_of_workers,
+            &input.command,
+            &glue_version,
+        );
         Self {
             name: input.name.clone(),
             job_mode: input
@@ -2176,12 +2309,12 @@ impl JobEntry {
             non_overridable_arguments: input.non_overridable_arguments.clone(),
             connections: input.connections.clone(),
             max_retries: input.max_retries,
-            max_capacity: capacity_of(input),
+            max_capacity,
             timeout: input
                 .timeout
                 .unwrap_or_else(|| default_timeout_minutes(&glue_version)),
-            worker_type: input.worker_type.clone(),
-            number_of_workers: input.number_of_workers,
+            worker_type,
+            number_of_workers,
             security_configuration: input.security_configuration.clone(),
             notification_property: input.notification_property.clone(),
             glue_version,
@@ -2218,6 +2351,15 @@ impl JobEntry {
             .clone()
             .unwrap_or_else(|| self.glue_version.clone());
         let max_concurrent_runs = max_concurrent_runs_of(update.execution_property.as_ref());
+        let command = update.command.clone().unwrap_or_default();
+        let (worker_type, number_of_workers, max_capacity) = capacity_members(
+            update.max_capacity,
+            update.allocated_capacity,
+            update.worker_type.as_deref(),
+            update.number_of_workers,
+            &command,
+            &glue_version,
+        );
         // Carried over rather than overwritten; moved out so the whole record below is
         // rebuilt, which is what makes "completely overwritten" exhaustive.
         let name = std::mem::take(&mut self.name);
@@ -2237,22 +2379,17 @@ impl JobEntry {
             execution_property: ExecutionProperty {
                 max_concurrent_runs,
             },
-            command: update.command.clone().unwrap_or_default(),
+            command,
             default_arguments: update.default_arguments.clone(),
             non_overridable_arguments: update.non_overridable_arguments.clone(),
             connections: update.connections.clone(),
             max_retries: update.max_retries,
-            max_capacity: capacity_from(
-                update.max_capacity,
-                update.allocated_capacity,
-                update.worker_type.as_deref(),
-                update.number_of_workers,
-            ),
+            max_capacity,
             timeout: update
                 .timeout
                 .unwrap_or_else(|| default_timeout_minutes(&glue_version)),
-            worker_type: update.worker_type.clone(),
-            number_of_workers: update.number_of_workers,
+            worker_type,
+            number_of_workers,
             security_configuration: update.security_configuration.clone(),
             notification_property: update.notification_property.clone(),
             glue_version,
@@ -2369,13 +2506,35 @@ fn max_concurrent_runs_of(property: Option<&ExecutionProperty>) -> i32 {
         .unwrap_or(DEFAULT_MAX_CONCURRENT_RUNS)
 }
 
-/// The capacity, in DPUs, a `CreateJob` request asks for: see [`capacity_from`].
-fn capacity_of(input: &CreateJobInput) -> Option<f64> {
-    capacity_from(
-        input.max_capacity,
-        input.allocated_capacity,
-        input.worker_type.as_deref(),
-        input.number_of_workers,
+/// The capacity members a submitted job definition is STORED with, as
+/// `(worker_type, number_of_workers, max_capacity)`.
+///
+/// What the definition named, read by [`capacity_from`] — else, when it named no capacity
+/// at all, the documented default for its command and Glue version
+/// ([`default_capacity`]), because the service fills those in rather than storing a job
+/// with no capacity for a runner to size. `CreateJob` and `UpdateJob` submit the same four
+/// capacity members with the same documentation, so both resolve them here.
+fn capacity_members(
+    max_capacity: Option<f64>,
+    allocated_capacity: i32,
+    worker_type: Option<&str>,
+    number_of_workers: Option<i32>,
+    command: &JobCommand,
+    glue_version: &str,
+) -> (Option<String>, Option<i32>, Option<f64>) {
+    let named = capacity_from(
+        max_capacity,
+        allocated_capacity,
+        worker_type,
+        number_of_workers,
+    );
+    if named.is_none() && worker_type.is_none() && number_of_workers.is_none() {
+        return default_capacity(command, glue_version);
+    }
+    (
+        worker_type.map(str::to_string),
+        number_of_workers,
+        named,
     )
 }
 
@@ -2777,6 +2936,180 @@ pub fn has_crawl_target(targets: &CrawlerTargets) -> bool {
         || any(&targets.delta_targets)
         || any(&targets.iceberg_targets)
         || any(&targets.hudi_targets)
+}
+
+/// Every DISTINCT Amazon SQS queue the crawl of `targets` consumes, in order: the
+/// `EventQueueArn` of each S3 target that names one, beside the dead-letter queue it names
+/// for the same crawl.
+///
+/// An S3 target naming an event queue is crawled FROM that queue — "a policy that
+/// specifies whether to crawl the entire dataset again, or to crawl only folders that
+/// were added since the last crawler run" (`CreateCrawler$RecrawlPolicy`) — so these are
+/// the queues the crawler's role has to be able to consume. The list is DEDUPLICATED: the
+/// same queue named by two targets is one queue to decide about, and the number of
+/// decisions one request can ask for is what [`MAX_CHECKED_EVENT_QUEUES`] bounds.
+pub fn crawl_event_queues(targets: &CrawlerTargets) -> Vec<String> {
+    let mut queues: Vec<String> = targets
+        .s3_targets
+        .iter()
+        .flatten()
+        .flat_map(|target| {
+            target
+                .event_queue_arn
+                .iter()
+                .chain(target.dlq_event_queue_arn.iter())
+        })
+        .filter(|queue| !queue.trim().is_empty())
+        .cloned()
+        .collect();
+    queues.sort();
+    queues.dedup();
+    queues
+}
+
+/// The IAM store a crawler's `Role` is resolved against.
+///
+/// It is the IAM service's OWN state struct, reached through the SAME shared engine this
+/// service's store lives in, so Glue reads the very records `CreateRole`,
+/// `PutRolePolicy` and `AttachRolePolicy` wrote rather than a second copy of them.
+pub type IamState =
+    ::service_com_amazonaws_iam_awsidentitymanagementv20100508::ComAmazonawsIamAwsidentitymanagementv20100508State;
+
+/// The IAM store in the SAME shared engine, which is where the account's roles live.
+/// `None` means the engine carries no such store — a deployment with no IAM to ask,
+/// which is evidence of nothing.
+pub fn iam_state<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<IamState>> {
+    ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::service_state(engine)
+}
+
+/// The Amazon SQS actions a crawler performs against the event queue of an S3 target it
+/// crawls in event mode: it RECEIVES the change messages, reads the queue's attributes to
+/// learn what is pending, and DELETES each message it has processed.
+pub const EVENT_QUEUE_ACTIONS: [&str; 3] = [
+    "sqs:ReceiveMessage",
+    "sqs:GetQueueAttributes",
+    "sqs:DeleteMessage",
+];
+
+/// The most policy documents this check reads for ONE role.
+///
+/// A role carries its inline policies plus the managed policies attached to it. A role
+/// whose documents outnumber this is one the check does not finish reading, and an unread
+/// document might be the one that carries the grant — so nothing is shown about such a
+/// role and the create goes ahead. The count is taken BEFORE any document is read, so the
+/// reading itself is bounded by it.
+pub const MAX_ROLE_DOCUMENTS: usize = 32;
+
+/// The most event queues one `CreateCrawler` request may have decided about.
+///
+/// CHOSEN, not documented: the target lists carry no modelled length, so the number of
+/// distinct queues a request can name — and with it the number of policy evaluations the
+/// create pays for, each over at most [`MAX_ROLE_DOCUMENTS`] documents — is bounded here
+/// rather than left to the request. A create past the ceiling is refused with the
+/// operation's own modelled `InvalidInputException`.
+pub const MAX_CHECKED_EVENT_QUEUES: usize = 32;
+
+/// The identity-based policy documents in force on the role a crawler's `Role` names: its
+/// inline role policies plus the documents of the managed policies attached to it.
+///
+/// `Role` is "the IAM role or Amazon Resource Name (ARN) of an IAM role"
+/// (`CreateCrawler$Role`), so a value that reads as this account's role ARN resolves to
+/// the name it carries and anything else is taken as the role name itself.
+///
+/// `None` when nothing can be SHOWN about the role's permissions: this account holds no
+/// such role, it carries more documents than [`MAX_ROLE_DOCUMENTS`] (counted before any is
+/// read), or one of its attachments is an AWS-managed policy whose document IAM does not
+/// carry. Called with the IAM guard held, and it CLONES what it reads, so the caller drops
+/// the guard before deciding anything: nothing bounded by the request runs under it.
+pub fn role_policy_documents(role: &str, iam: &IamState) -> Option<Vec<String>> {
+    use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_store;
+
+    let name = ::service_common::iam_role::role_name(role).unwrap_or(role);
+    let stored = iam.roles.get(&iam_store::name_key(name))?;
+    let role_key = iam_store::name_key(&stored.role_name);
+    let inline = iam.role_inline_policies.get(&role_key);
+    let attached = iam.role_attached_policies.get(&role_key);
+    // Counted FIRST, so a role carrying more documents than this check reads costs no
+    // clone and no parse: an unread document might carry the grant, so nothing is shown
+    // about such a role either way.
+    let held = inline.map_or(0, |policies| policies.len())
+        + attached.map_or(0, |attachments| attachments.len());
+    if held > MAX_ROLE_DOCUMENTS {
+        return None;
+    }
+    let mut documents: Vec<String> = inline
+        .into_iter()
+        .flat_map(|policies| policies.values())
+        .map(|policy| policy.policy_document.clone())
+        .collect();
+    for arn in attached.into_iter().flatten() {
+        match default_policy_document(iam, arn) {
+            Some(document) => documents.push(document),
+            // An AWS-managed policy ARN this emulator's IAM carries no document for might
+            // be the one that carries the grant, and this account cannot read it: nothing
+            // can be shown about this role. Which ARNs are in AWS's namespace is IAM's
+            // OWN reading, called rather than re-derived.
+            None if iam_store::is_aws_managed_policy_arn(arn) => return None,
+            None => {}
+        }
+    }
+    Some(documents)
+}
+
+/// Why the crawler role whose policies are `prepared` cannot consume the event queue
+/// `queue_arn`, or `None` when those documents admit the whole crawl.
+///
+/// A crawler that crawls an S3 target from an event queue runs AS its `Role`, so the
+/// policies in force on that role must admit the queue operations the crawl makes
+/// ([`EVENT_QUEUE_ACTIONS`]) on that queue. The decision is made against the account's own
+/// IAM records — the ones `CreateRole`/`PutRolePolicy`/`AttachRolePolicy` wrote, collected
+/// by [`role_policy_documents`] — through the shared evaluator every service that decides
+/// authorization uses, so no two services answer differently.
+///
+/// The documents are PREPARED once per request and passed in, so a request naming several
+/// queues parses them once rather than once per queue, and the caller holds no IAM guard
+/// while this runs.
+pub fn event_queue_refusal(
+    prepared: &[::service_common::iam_authorization::PreparedDocument],
+    queue_arn: &str,
+) -> Option<String> {
+    let withheld = EVENT_QUEUE_ACTIONS.iter().any(|action| {
+        let request = ::service_common::iam_authorization::Request::new(action, queue_arn, &[]);
+        let stated =
+            ::service_common::iam_authorization::identity_decision_prepared(prepared, &request);
+        // Nothing stated is an implicit deny in IAM, and the documents in force on the
+        // role ARE the authority on what it may do: a role whose policies say nothing
+        // about the call may not make it.
+        stated != ::service_common::iam_authorization::Decision::Allowed
+    });
+    withheld.then(|| messages::event_queue_inaccessible(queue_arn))
+}
+
+/// The default version's document of the managed policy `arn` names, or `None` when the
+/// account holds no such policy and it is none of the AWS-managed policies IAM carries.
+fn default_policy_document(iam: &IamState, arn: &str) -> Option<String> {
+    use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_store;
+
+    // An AWS-managed policy is not account state: IAM holds its document in its own
+    // catalogue, so a role's grant that lives in one is read from there.
+    if let Some(managed) = iam_store::aws_managed_policy(arn) {
+        return Some(managed.document.to_string());
+    }
+    let managed = iam.policy_by_arn(arn)?;
+    managed
+        .policy
+        .default_version_id
+        .as_deref()
+        .and_then(|default| managed.versions.get(default))
+        .or_else(|| {
+            managed
+                .versions
+                .values()
+                .find(|version| version.is_default_version)
+        })
+        .and_then(|version| version.document.clone())
 }
 
 /// Whether an `UpdateCrawler` request names at least one member of the crawler to
@@ -3503,9 +3836,10 @@ pub fn next_version_id(current: &str) -> String {
 ///
 /// This is the TOP-LEVEL error body only. A per-item failure a batch reports inside its
 /// output (`BatchDeleteTable`'s `TableError$ErrorDetail`) has its own recorded wording
-/// and is built by [`super::catalog_error_detail`]. The job and connection slices are
-/// not here either: no recording or doc states their wording, so their messages are not
-/// requirements and are left to the issues that own them rather than guessed at.
+/// and is built by [`super::catalog_error_detail`]. Of the job and connection slices only
+/// `StartJobRun`'s missing-metadata refusal is here, because the corpus records it; the
+/// rest of their messages are not requirements and are left to the issues that own them
+/// rather than guessed at.
 ///
 /// The schema-registry misses ARE here, because every operation that resolves a
 /// `RegistryId` or a `SchemaId` resolves the same two references and so has to describe
@@ -3535,6 +3869,44 @@ pub mod messages {
     /// resource kind and withholds the name. What is pinned here is the behaviour — 400,
     /// `AlreadyExistsException`, and no disclosure of the requested name.
     pub const CRAWLER_ALREADY_EXISTS: &str = "Crawler already exists.";
+
+    /// Any catalog operation whose `CatalogId` names a Data Catalog of ANOTHER account
+    /// that no resource-based policy grants the caller
+    /// ([`super::foreign_catalog_refusal`]). Recorded template: it names the calling
+    /// principal, the IAM action the operation performs and the ARN of the catalog the
+    /// request addressed, each read off the request and this emulator's own identity.
+    pub fn not_authorized_on_catalog(action: &str, catalog_arn: &str) -> String {
+        let prefix = super::IAM_ACTION_PREFIX;
+        format!(
+            "User: {} is not authorized to perform: {prefix}{action} on resource: \
+             {catalog_arn} because no resource-based policy allows the {prefix}{action} \
+             action",
+            super::request_principal()
+        )
+    }
+
+    /// `CreateCrawler` for an S3 target whose `EventQueueArn` (or `DlqEventQueueArn`)
+    /// names a queue the crawler's `Role` cannot consume ([`super::event_queue_refusal`]).
+    /// Recorded template: the refusal names the queue the create could not reach and
+    /// states the two things that account for it — no such queue, or no access to it —
+    /// without disclosing which, and names neither the role nor the action.
+    pub fn event_queue_inaccessible(queue_arn: &str) -> String {
+        format!(
+            "SQS queue {queue_arn} does not exist or the role provided does not have \
+             access to it."
+        )
+    }
+
+    /// `GetJobRuns` for a `JobName` the endpoint's Region holds no job definition for.
+    /// Recorded constant: the run listing's refusal names neither the job nor the Region.
+    pub const JOB_RUNS_JOB_NOT_FOUND: &str = "Job not found.";
+
+    /// `StartJobRun` for a `JobName` the endpoint's Region holds no job definition for —
+    /// a name nothing created, or one created through ANOTHER Region's endpoint.
+    /// Recorded constant: the start's refusal names the metadata it could not read rather
+    /// than the requested name, which is why it is not [`super::messages`]'s per-resource
+    /// template.
+    pub const JOB_METADATA_MISSING: &str = "Failed to start job run due to missing metadata.";
 
     /// Any Data Catalog operation whose `DatabaseName`/`Name` names no database
     /// (`GetDatabase`, `DeleteDatabase`, `UpdateDatabase`, and the parent-database miss
@@ -3663,73 +4035,65 @@ pub fn fold_name(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
-/// Ceiling on the number of `*` wildcards and `|` alternatives one pattern passed to
-/// [`matches_name_pattern`] may carry.
+/// Ceiling on the size of the matcher one name pattern compiles to, in bytes.
 ///
 /// A pattern is request text and every stored name is matched against it, so the work it
-/// can buy is bounded here rather than left to grow with a model's pattern length:
-/// matching is O(name length x wildcards) per name, so this ceiling and the per-database
-/// table ceiling together bound one request. It lives beside the matcher because every
-/// listing that takes such a pattern needs the same bound; each refuses a pattern past it
-/// with its OWN modelled client error.
-pub const MAX_PATTERN_WILDCARDS: usize = 64;
+/// can buy is bounded here rather than left to grow with a model's pattern length: the
+/// compiled matcher runs in time linear in the name and never backtracks, and this
+/// ceiling bounds how large a program a pattern may build — so this ceiling and the
+/// per-database table ceiling together bound one request. It lives beside the matcher
+/// because every listing that takes such a pattern needs the same bound; each refuses a
+/// pattern past it with its OWN modelled client error.
+pub const MAX_PATTERN_PROGRAM_BYTES: usize = 64 * 1024;
 
-/// How many wildcards and alternatives `pattern` carries, the count
-/// [`MAX_PATTERN_WILDCARDS`] bounds.
-pub fn pattern_wildcards(pattern: &str) -> usize {
-    pattern
-        .chars()
-        .filter(|character| *character == '*' || *character == '|')
-        .count()
-}
-
-/// Whether `name` matches the Hive-style `pattern` in FULL: `|` separates alternatives
-/// and `*` matches any run of characters (including none) within one, every other
-/// character — `.`, `[`, `(` included — being a literal.
+/// The matcher a name pattern selects names with, or the reason the value is no pattern
+/// this catalog can match.
 ///
-/// This is the pattern language the catalog's table listing takes: the Data Catalog is
-/// Hive-metastore compatible (the model folds both `DatabaseInput$Name` and
-/// `TableInput$Name` "for Hive compatibility"), which is why `events*` selects `events`
-/// and `events_raw`. It lives here rather than in one operation's file because every
-/// listing of these tables has to select them the same way — `GetTables`'s own
-/// `Expression`, and Athena's `ListTableMetadata` over this same catalog — so there is
-/// ONE pattern language and two listings of one set of tables can never disagree.
+/// The pattern language is the one the Data Catalog's listings document: "A regular
+/// expression pattern. If present, only those tables whose names match the pattern are
+/// returned" (`GetTablesRequest$Expression`), in which `*` additionally stands for any run
+/// of characters (including none) — the Hive-metastore substitution that makes `events*`
+/// select `events` and `events_raw` while `ev_.*` selects `ev_one` and `ev_two`. The
+/// pattern is anchored at both ends, because a listing selects the names that match it as
+/// a WHOLE, and compared case-sensitively: a stored catalog name is folded to lowercase
+/// ([`fold_name`]), the pattern is not, and a pattern in another case selects nothing.
 ///
-/// Every string is a valid pattern, so a pattern is never refused as malformed. Matching
-/// is O(name length x wildcards) and needs no backtracking, so a caller that bounds the
-/// pattern's wildcards bounds the work it can buy.
-pub fn matches_name_pattern(pattern: &str, name: &str) -> bool {
-    pattern
-        .split('|')
-        .any(|alternative| matches_wildcard(alternative, name))
-}
-
-/// Whether `name` matches one alternative of [`matches_name_pattern`] in full. The
-/// pattern's literal segments (what sits between its `*`s) must appear in order: the
-/// first as a prefix, the last as a suffix, and each middle one at its leftmost
-/// occurrence after the previous — which is the standard wildcard match.
-fn matches_wildcard(pattern: &str, name: &str) -> bool {
-    let mut segments = pattern.split('*');
-    // `split` always yields at least one segment, so this cannot be `None`.
-    let first = segments.next().unwrap_or_default();
-    if !name.starts_with(first) {
-        return false;
-    }
-    // Safe to slice: `starts_with` means `first.len()` is a character boundary.
-    let mut rest = &name[first.len()..];
-    let after_first: Vec<&str> = segments.collect();
-    let Some((last, middle)) = after_first.split_last() else {
-        // No `*` at all: the pattern is a literal, so it must be the whole name.
-        return rest.is_empty();
-    };
-    for segment in middle {
-        match rest.find(segment) {
-            // `find` answers a character boundary, so this slice is safe too.
-            Some(at) => rest = &rest[at + segment.len()..],
-            None => return false,
+/// A `*` that is ESCAPED (`\*`) or inside a character class (`[*]`) is the regular
+/// expression's own star rather than the wildcard, so it is left as written: substituting
+/// there would change `[*]` into a class of dot-or-star and `\*` into any run of dots,
+/// i.e. a different pattern from the one the caller sent.
+///
+/// It lives here rather than in one operation's file because every listing of these
+/// tables has to select them the same way — `GetTables`'s own `Expression`, and Athena's
+/// `ListTableMetadata` over this same catalog — so there is ONE pattern language and two
+/// listings of one set of tables can never disagree.
+pub fn compile_name_pattern(pattern: &str) -> Result<::regex::Regex, ::regex::Error> {
+    let mut translated = String::with_capacity(pattern.len() + 1);
+    let mut escaped = false;
+    let mut in_class = false;
+    for character in pattern.chars() {
+        let wildcard = character == '*' && !escaped && !in_class;
+        if wildcard {
+            translated.push_str(".*");
+        } else {
+            translated.push(character);
+        }
+        // The state for the NEXT character: a backslash escapes exactly the one after it,
+        // and a class runs from an unescaped `[` to the next unescaped `]`.
+        if escaped {
+            escaped = false;
+        } else {
+            match character {
+                '\\' => escaped = true,
+                '[' => in_class = true,
+                ']' => in_class = false,
+                _ => {}
+            }
         }
     }
-    rest.ends_with(last)
+    ::regex::RegexBuilder::new(&format!("^(?:{translated})$"))
+        .size_limit(MAX_PATTERN_PROGRAM_BYTES)
+        .build()
 }
 
 /// The IAM user name of the identity this emulator's long-term credentials speak for.
@@ -3774,6 +4138,56 @@ pub fn resolve_catalog_id(catalog_id: Option<&String>) -> String {
 /// miss rather than quietly given a new, empty catalog.
 pub fn is_known_catalog(catalog_id: &str) -> bool {
     catalog_id == ::engine::emulator_account_id()
+}
+
+/// The resource portion of a Data Catalog's ARN: the catalog itself, which is the
+/// resource a Data Catalog resource policy is attached to and the one an authorization
+/// refusal names.
+pub const CATALOG_ARN_RESOURCE: &str = "catalog";
+
+/// The IAM action namespace every Glue action is spelled under, as an authorization
+/// refusal names the action (`glue:GetTables`).
+pub const IAM_ACTION_PREFIX: &str = "glue:";
+
+/// The ARN of the Data Catalog `catalog_id` names, as addressed in `region`.
+///
+/// The canonical layout and partition come from the shared minter, so this ARN matches
+/// every other ARN this emulator emits; only the ACCOUNT field is replaced, because a
+/// request may address the catalog of another account and that account is what such an
+/// ARN names.
+pub fn catalog_arn(region: &str, catalog_id: &str) -> String {
+    let canonical = ::engine::emulator_arn(ARN_NAMESPACE, region, CATALOG_ARN_RESOURCE);
+    let mut fields: Vec<&str> = canonical.split(':').collect();
+    // Field 5 of an ARN is the account; the canonical form always has it.
+    if let Some(account) = fields.get_mut(4) {
+        *account = catalog_id;
+    }
+    fields.join(":")
+}
+
+/// The refusal a request addressed to the Data Catalog `catalog_id` earns when that
+/// catalog belongs to another account, or `None` when the request addresses the catalog
+/// this emulator serves.
+///
+/// Authorization comes BEFORE the entity lookup: a `CatalogId` of another account is
+/// reachable on the real service only through that catalog's own resource-based policy,
+/// so a caller holding no grant on it is refused as unauthorized rather than told the
+/// entity does not exist — which would also answer a cross-account read out of the
+/// caller's OWN catalog whenever the two hold a same-named entity. This store holds one
+/// catalog ([`is_known_catalog`]) and no Data Catalog resource policy — `PutResourcePolicy`
+/// is not implemented — so no grant on a foreign catalog can exist here and every
+/// cross-account request for one is refused.
+///
+/// `action` is the operation's own name, which the refusal names as the IAM action
+/// ([`IAM_ACTION_PREFIX`]) the caller may not perform.
+pub fn foreign_catalog_refusal(catalog_id: &str, region: &str, action: &str) -> Option<String> {
+    if is_known_catalog(catalog_id) {
+        return None;
+    }
+    Some(messages::not_authorized_on_catalog(
+        action,
+        &catalog_arn(region, catalog_id),
+    ))
 }
 
 /// Whether `account_id` — field 5 of an ARN — is the account this emulator serves, and

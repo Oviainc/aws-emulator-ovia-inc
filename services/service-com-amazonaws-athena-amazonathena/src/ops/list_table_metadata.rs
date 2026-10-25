@@ -21,17 +21,16 @@
 //!
 //! `Expression` selects the tables whose WHOLE name matches the pattern, in the one
 //! pattern language the catalog serving these tables implements
-//! ([`::service_com_amazonaws_glue_awsglue::state::matches_name_pattern`]): `*` matches
-//! any run of characters, `|` separates alternatives, every other character is a
-//! literal. Both models' prose calls the member a regular expression; the difference
-//! shows only on a regex metacharacter, and the catalog's reading is the one a client
-//! observes — a listing of these tables through Glue's own `GetTables` and a listing
-//! through this operation select the same tables for the same pattern. Matching one name
-//! is linear in its length times the pattern's wildcards and never backtracks, and a
-//! pattern carrying more wildcards than
-//! [`::service_com_amazonaws_glue_awsglue::state::MAX_PATTERN_WILDCARDS`] is refused with
-//! `InvalidRequestException` — so the work one request can buy is that ceiling times the
-//! tables one database holds, which the catalog bounds on every create.
+//! ([`::service_com_amazonaws_glue_awsglue::state::compile_name_pattern`]): the value is
+//! a regular expression — which both models' prose calls it — in which `*` additionally
+//! stands for any run of characters, so `events*` selects the `events`-prefixed tables
+//! while `ev_.*` selects `ev_one` and `ev_two`. A listing of these tables through Glue's
+//! own `GetTables` and a listing through this operation therefore select the same tables
+//! for the same pattern. Matching one name is linear in its length and never backtracks,
+//! and a value that is no pattern at all, or whose compiled matcher would be larger than
+//! [`::service_com_amazonaws_glue_awsglue::state::MAX_PATTERN_PROGRAM_BYTES`], is refused
+//! with `InvalidRequestException` — so the work one request can buy is that ceiling times
+//! the tables one database holds, which the catalog bounds on every create.
 //!
 //! `MaxResults` truncates the page and the returned `NextToken` is the last name on it,
 //! so the next call resumes at the first table name strictly after it.
@@ -247,20 +246,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // `Expression` is a Hive-style pattern matched against the WHOLE table name (see
-        // the module header). Every string is a valid pattern, so the only refusal is a
-        // pattern carrying more wildcards than the catalog matches against every stored
-        // name — checked BEFORE the catalog's store is reached, so a request that is
-        // going to be refused never takes its lock.
-        let filter = input.expression.as_deref();
-        if let Some(pattern) = filter {
-            let wildcards = glue_state::pattern_wildcards(pattern);
-            if wildcards > glue_state::MAX_PATTERN_WILDCARDS {
-                return Err(invalid_request(crate::state::too_many_pattern_wildcards(
-                    wildcards,
-                )));
-            }
-        }
+        // `Expression` is a regular expression in which `*` stands for any run of
+        // characters, matched against the WHOLE table name through the ONE pattern
+        // language the Data Catalog's listings share (see the module header). A value
+        // that is no pattern at all, or whose matcher would be larger than that language
+        // compiles, is refused BEFORE the catalog's store is reached, so a request that
+        // is going to be refused never takes its lock.
+        let filter = match input.expression.as_deref() {
+            None => None,
+            Some(pattern) => match glue_state::compile_name_pattern(pattern) {
+                Ok(matcher) => Some(matcher),
+                Err(reason) => {
+                    return Err(invalid_request(crate::state::malformed_pattern(
+                        pattern, &reason,
+                    )));
+                }
+            },
+        };
 
         // Absent `MaxResults`, page at the largest value the model accepts for it
         // (`MaxTableMetadataCount`, range 1..50). The clamp re-states that range in the
@@ -294,9 +296,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .tables_ordered()
             .into_iter()
             .filter(|table| {
-                filter.is_none_or(|pattern| {
-                    glue_state::matches_name_pattern(pattern, &table.name)
-                })
+                filter
+                    .as_ref()
+                    .is_none_or(|matcher| matcher.is_match(&table.name))
             })
             .collect();
 

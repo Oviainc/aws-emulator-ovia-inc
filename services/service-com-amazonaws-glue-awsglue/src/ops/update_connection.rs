@@ -91,9 +91,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 // here — hence the `UpdateConnectionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.glue#UpdateConnection")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.glue#UpdateConnection",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum UpdateConnectionErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     EntityNotFoundException(EntityNotFoundException),
     GlueEncryptionException(GlueEncryptionException),
     InvalidInputException(InvalidInputException),
@@ -151,7 +155,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateConnectionErrorModeled::InvalidInputException(
                 InvalidInputException {
@@ -163,16 +166,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
-        // A `CatalogId` no Data Catalog in this account answers to addresses no
-        // connection, and this operation models no not-found error for a catalog, so the
-        // refusal is the modelled client-input error — as on `CreateConnection`.
-        if !crate::state::is_known_catalog(&catalog_id) {
-            return Err(UpdateConnectionErrorModeled::InvalidInputException(
-                InvalidInputException {
-                    message: Some(format!(
-                        "CatalogId {catalog_id} is not a Data Catalog in this account"
-                    )),
-                    from_federation_source: None,
+        // Whether the caller may address this catalog at all is decided BEFORE the
+        // connection lookup: any id but this account's names another account's catalog,
+        // reachable only through that catalog's own resource policy (see
+        // `crate::state::foreign_catalog_refusal`).
+        if let Some(message) = crate::state::foreign_catalog_refusal(
+            &catalog_id,
+            &crate::state::request_region(ctx.parts()),
+            Self::NAME,
+        ) {
+            return Err(UpdateConnectionErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
                 },
             )
             .into());

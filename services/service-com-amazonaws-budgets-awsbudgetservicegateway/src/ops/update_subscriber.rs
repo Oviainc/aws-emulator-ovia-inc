@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSubscriber
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSubscriber`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSubscriber::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces ONE subscriber of a notification a budget already holds, IN PLACE: the
+//! subscriber `OldSubscriber` names is swapped for `NewSubscriber` at the position it
+//! occupied, so the notification's remaining subscribers keep their value and their
+//! order (the order a paginated `DescribeSubscribersForNotification` indexes into) and
+//! the set never changes size — which is why this operation models no creation-limit
+//! error.
+//!
+//! A subscriber carries no id: its subscription type and its address are its identity
+//! ([`crate::state::same_subscriber`]), so a budget this account does not hold, a
+//! notification that budget does not alert on, or a subscriber that notification does
+//! not hold is a `NotFoundException`, and a `NewSubscriber` naming one of the
+//! notification's OTHER subscribers is a `DuplicateRecordException`. The replacement's
+//! address is held to the form its own `SubscriptionType` names
+//! ([`crate::state::subscriber_address_violation`]), and the set this call would leave
+//! behind to the documented per-type subscriber split
+//! ([`crate::state::subscriber_limit_violation`]) — both refused with
+//! `InvalidParameterException`, the client error this operation models.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +164,202 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSubscriber` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSubscriberErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSubscriber"))
+        // The budgets control plane is scoped to the account the caller signed with, so
+        // an `AccountId` naming any other account is refused with the modelled 403
+        // before anything is read or written (`crate::state::foreign_account_refusal`).
+        if let Some(message) = crate::state::foreign_account_refusal(&input.account_id) {
+            return Err(UpdateSubscriberErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateSubscriberErrorModeled::InternalErrorException(InternalErrorException {
+                message: Some(
+                    "budgets is mounted on an engine that holds no state for it".to_string(),
+                ),
+            })
+        })?;
+
+        // The modelled `BudgetName` `@pattern` the boundary validator cannot compile —
+        // refused as the request-validation failure it is (HTTP 400
+        // `ValidationException`), naming the member path and the constraint.
+        if let Some(message) =
+            crate::state::budget_name_violation(&["BudgetName"], &input.budget_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        // The subscriber this call would ESTABLISH is held to the same address rule as
+        // the one a create establishes — "either an Amazon SNS topic or an email address"
+        // (`Subscriber`), with no line breaks (`Subscriber$Address`) — so an update
+        // cannot leave a notification holding an address a create would have been
+        // refused. `OldSubscriber` is not checked: it only NAMES the subscriber to
+        // replace, and whatever it names is already stored or absent. Checked before the
+        // budget is looked up, so a request that is malformed in itself is refused the
+        // same way whichever notification it names.
+        crate::state::subscriber_address_violation(::std::slice::from_ref(&input.new_subscriber))
+            .map_err(|message| {
+                UpdateSubscriberErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+            })?;
+
+        let now = ::std::time::SystemTime::now();
+        // Every write this call makes is made under the store's lock, and the lock is
+        // released at the end of this block: the alert it leaves owed is published
+        // afterwards, so no delivery is made while the store is held.
+        let alerts = {
+            // The one door into the store (`crate::state::store_at`): the deletions the
+            // clock already owes — a budget past its end date, with everything held
+            // inside it — are materialised before this call resolves anything, so a
+            // subscriber of an expired budget is as absent here as it is to every read.
+            let mut store = crate::state::store_at(&state, now);
+            // A subscriber is held inside the notification, which is held inside the
+            // budget, so the budget is resolved by the same `(AccountId, BudgetName)`
+            // identity every other operation uses.
+            let stored = store
+                .budgets
+                .get_mut(&(input.account_id.clone(), input.budget_name.clone()))
+                .ok_or_else(|| {
+                    UpdateSubscriberErrorModeled::NotFoundException(NotFoundException {
+                        message: Some(format!(
+                            "Unable to update subscriber: {} - the budget doesn't exist.",
+                            input.budget_name
+                        )),
+                    })
+                })?;
+            // The budget an alert for one of its notifications names, read before the
+            // notification inside it is reached mutably below.
+            let source = crate::state::alerts::source(&input.account_id, &stored.budget);
+            // A notification carries no id either: the caller names the one holding the
+            // subscriber by value, and `crate::state::same_notification` holds which
+            // members that identity is made of (the service-owned alarm state is not one
+            // of them).
+            let held = crate::state::find_notification_mut(stored, &input.notification)
+                .ok_or_else(|| {
+                    // The refusal names the notification the caller asked for by the
+                    // members that identify it, so it reads as the notification being
+                    // missing rather than the budget that was found.
+                    UpdateSubscriberErrorModeled::NotFoundException(NotFoundException {
+                        message: Some(format!(
+                            "Unable to update subscriber: {} - the notification doesn't exist \
+                             (NotificationType {}, ComparisonOperator {}, Threshold {}, \
+                             ThresholdType {}).",
+                            input.budget_name,
+                            input.notification.notification_type,
+                            input.notification.comparison_operator,
+                            input.notification.threshold,
+                            input
+                                .notification
+                                .threshold_type
+                                .as_deref()
+                                .unwrap_or(crate::state::THRESHOLD_TYPE_PERCENTAGE)
+                        )),
+                    })
+                })?;
+
+            // The subscription type and the address are what identify a subscriber, so
+            // `OldSubscriber` names at most one of the notification's subscribers. Its
+            // POSITION is resolved once here: the replacement goes back in the same
+            // place, and the collision scan below has to know which held subscriber is
+            // the one being replaced.
+            let found = held.subscribers.iter().position(|subscriber| {
+                crate::state::same_subscriber(subscriber, &input.old_subscriber)
+            });
+            let Some(index) = found else {
+                return Err(UpdateSubscriberErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(format!(
+                            "Unable to update subscriber: {} - the subscriber doesn't exist.",
+                            input.budget_name
+                        )),
+                    },
+                )
+                .into());
+            };
+
+            // A notification cannot hold two of the same subscriber, so a `NewSubscriber`
+            // that names one of its OTHER subscribers is the duplicate record, not a
+            // merge of the two. Naming the subscriber being replaced is not a collision
+            // with itself: that call leaves the set exactly as it was, and stays
+            // accepted.
+            let collides = held
+                .subscribers
+                .iter()
+                .enumerate()
+                .any(|(position, subscriber)| {
+                    position != index
+                        && crate::state::same_subscriber(subscriber, &input.new_subscriber)
+                });
+            if collides {
+                return Err(UpdateSubscriberErrorModeled::DuplicateRecordException(
+                    DuplicateRecordException {
+                        message: Some(format!(
+                            "Unable to update subscriber: {} - the subscriber already exists.",
+                            input.budget_name
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            // The set this call would leave behind is held to the same per-type split as
+            // the set a create establishes ("one SNS subscriber and up to 10 email
+            // subscribers, for a total of 11"), because a replacement can change a
+            // subscriber's TYPE and so put the notification over one half of it while
+            // the total stays where it was. This operation models no
+            // `CreationLimitExceededException`, so the refusal is the client error it
+            // does model — "the cause is an invalid input value". Checked before anything
+            // is written, so a refused update leaves the subscribers as they were.
+            let replaced = held
+                .subscribers
+                .iter()
+                .enumerate()
+                .map(|(position, subscriber)| {
+                    if position == index {
+                        &input.new_subscriber
+                    } else {
+                        subscriber
+                    }
+                });
+            crate::state::subscriber_limit_violation(replaced).map_err(|message| {
+                UpdateSubscriberErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+            })?;
+
+            // A subscriber this call ATTACHES to a notification that is already in alarm
+            // is owed that notification's alert, the same way a create of one is: the
+            // threshold it alerts on has been passed, and the replacement is now one of
+            // the addresses that alert goes to. A call whose `NewSubscriber` names the
+            // subscriber already held attaches nothing, so it owes nothing.
+            let attached =
+                !crate::state::same_subscriber(&held.subscribers[index], &input.new_subscriber);
+            // Replaced IN PLACE at the position just resolved, so the notification's
+            // subscribers keep their relative order and the set keeps its size — "each
+            // notification must have at least one subscriber", which a swap cannot
+            // violate.
+            held.subscribers[index] = input.new_subscriber;
+            if attached {
+                crate::state::alerts::owed(
+                    &source,
+                    &held.notification,
+                    ::std::slice::from_ref(&held.subscribers[index]),
+                )
+            } else {
+                Vec::new()
+            }
+        };
+
+        crate::state::alerts::deliver(ctx, &alerts).await;
+
+        Ok(UpdateSubscriberOutput {})
     }
 }

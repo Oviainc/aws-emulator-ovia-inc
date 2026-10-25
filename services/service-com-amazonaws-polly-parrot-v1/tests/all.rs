@@ -27,6 +27,8 @@ mod lexicons_and_speech;
 mod pls_alphabet_support;
 #[path = "all/pls_document_validity.rs"]
 mod pls_document_validity;
+#[path = "all/ssml_vocabulary.rs"]
+mod ssml_vocabulary;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 // The synthesis-task fixtures the task suites share.

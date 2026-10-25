@@ -153,9 +153,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Job definitions live in one per-account namespace, so nothing here depends on
-        // the request's Region.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // An unreachable store is an internal mounting fault, reported through this
             // operation's own server error.
@@ -179,12 +176,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // retrieved" asks for. An empty map narrows nothing.
         let required_tags = input.tags.unwrap_or_default();
 
+        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
         // Name order, so one page follows another deterministically however the store
-        // happens to hash its keys.
+        // happens to hash its keys. Only THIS Region's jobs are listed: a job exists only
+        // in the Region it was created in.
         let mut names: Vec<&String> = store
-            .jobs
-            .values()
+            .jobs_in(&region)
+            .into_iter()
             .filter(|job| {
                 required_tags
                     .iter()

@@ -20,7 +20,9 @@
 //! simultaneous executions unreserved for functions that aren't configured with a
 //! per-function limit" — see [`crate::state::MIN_UNRESERVED_CONCURRENT_EXECUTIONS`]. A
 //! request that would push the account's unreserved capacity below that floor is refused
-//! and stores nothing.
+//! and stores nothing, and so is one below the provisioned concurrency the function's
+//! aliases and versions already keep initialised, which is allocated out of the
+//! reservation and so has to fit inside it.
 //!
 //! ## Shape of an operation
 //!
@@ -253,6 +255,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "ReservedConcurrentExecutions",
                 crate::state::MIN_UNRESERVED_CONCURRENT_EXECUTIONS,
             )));
+        }
+
+        // A reserving function's provisioned concurrency is allocated OUT OF its
+        // reservation, so the capacity its aliases and versions already keep initialised
+        // has to fit inside the reservation being set: the same per-function rule
+        // `PutProvisionedConcurrencyConfig` weighs a new allocation against, enforced from
+        // the other side, and refused with the one sentence that states it.
+        let provisioned = store
+            .functions
+            .get(&reference.name)
+            .map_or(0, |record| record.provisioned_concurrency_except(None));
+        if requested < provisioned {
+            return Err(invalid_parameter(
+                crate::state::PROVISIONED_ABOVE_RESERVED_MESSAGE.to_string(),
+            ));
         }
 
         let Some(record) = store.functions.get_mut(&reference.name) else {

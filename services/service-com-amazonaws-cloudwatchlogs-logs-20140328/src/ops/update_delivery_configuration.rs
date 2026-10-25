@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDeliveryConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDeliveryConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: changes the configuration members of the one stored delivery the request's
+//! `id` names, leaving its source and destination as they are. This is the ONLY file to
+//! touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`UpdateDeliveryConfiguration::handle`] with real behaviour and
@@ -152,18 +152,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDeliveryConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDeliveryConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries only request metadata; the delivery this call reconfigures is
+        // identified by its own id and by nothing about the request.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateDeliveryConfigurationError::from(
+                UpdateDeliveryConfigurationErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // "The ID of the delivery to be updated by this request": an id this account holds no
+        // delivery under names no delivery, which is the modelled not-found refusal — the one
+        // every delivery operation answers such an id with.
+        let Some(delivery) = store.deliveries.get_mut(&input.id) else {
+            return Err(
+                UpdateDeliveryConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::DELIVERY_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "Use this operation to update the configuration of a delivery to change EITHER the
+        // S3 path pattern OR the format of the delivered logs": each configuration member
+        // stands on its own, so one this request names is stored as given and one it does
+        // not name is left as the delivery already had it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDeliveryConfiguration"))
+        // "The list of record fields to be delivered to the destination, in order" is stored
+        // as given, so the empty list the member admits (`RecordFields` is `@length(min: 0)`)
+        // is a list the caller named rather than the absence of one.
+        if let Some(record_fields) = input.record_fields.as_ref() {
+            delivery.record_fields = Some(record_fields.clone());
+        }
+        if let Some(field_delimiter) = input.field_delimiter.as_ref() {
+            delivery.field_delimiter = Some(field_delimiter.clone());
+        }
+        if let Some(s3_delivery_configuration) = input.s3_delivery_configuration.as_ref() {
+            delivery.s3_delivery_configuration = Some(s3_delivery_configuration.clone());
+        }
+
+        // "You can't use this operation to change the source or destination of the delivery":
+        // the delivery keeps its source, its destination, the destination type read off that
+        // destination, its tags, and the id and ARN that identify it. The modelled response
+        // carries no member at all, so what this call changed is read back through
+        // `GetDelivery` and `DescribeDeliveries`.
+        Ok(UpdateDeliveryConfigurationOutput {})
     }
 }

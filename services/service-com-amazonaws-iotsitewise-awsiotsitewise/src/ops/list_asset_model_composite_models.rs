@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAssetModelCompositeModels
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAssetModelCompositeModels`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAssetModelCompositeModels::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation enumerates, as a page, the composite models stored
+//! for one asset model in the shared engine store (`crate::state`); this is the ONLY
+//! file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +155,157 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAssetModelCompositeModels` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAssetModelCompositeModelsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAssetModelCompositeModelsError::Modeled(
+                ListAssetModelCompositeModelsErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        // A pure read: nothing below writes, so two callers listing the same model
+        // in either order see the same composite models.
+        let store = state.lock();
+        // `assetModelId` is a `CustomID` label: a raw UUID or `externalId:<id>`.
+        let asset_model_id = store
+            .resolve_asset_model_id(&input.asset_model_id)
+            .ok_or_else(|| not_found(&input.asset_model_id))?;
+        let record = store
+            .asset_models
+            .get(&asset_model_id)
+            .ok_or_else(|| not_found(&input.asset_model_id))?;
+
+        // `assetModelVersion` selects the LATEST (the documented default) or the
+        // ACTIVE version of the model whose composite models this lists: those are
+        // DIFFERENT definitions while a write the model already accepted is still
+        // settling. The selector is resolved on the record through the shared
+        // `version_view`, so this listing and the reads of the model itself answer
+        // from the same version, and a version the model does not have — one still
+        // being created has no active version — is the modelled 404 rather than
+        // another version's composite models under its name.
+        let record = record
+            .version_view(input.asset_model_version.as_deref(), now)
+            .ok_or_else(|| no_active_version(&asset_model_id, record.state(now)))?;
+        let record = &*record;
+
+        // Every composite model the model holds, at any nesting depth: this is the
+        // paginated list of the composite models associated with the asset model,
+        // and each summary carries the `path` that places it in the chain it sits
+        // in, which is how a nested one is told from a top-level one.
+        // `DescribeAssetModel`, by contrast, reports only the immediate children.
+        // The order is the model's stored order, stable across calls, which is what
+        // makes `nextToken` resumable. Derived through the shared
+        // `composite_model_summary`, so this listing and the describes cannot
+        // disagree about one stored composite model.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAssetModelCompositeModels"))
+        // INVARIANT: every stored composite model carries an id — the create either
+        // takes the caller's or mints one — so `composite_model_summary` answers for
+        // each of them and nothing is dropped from the enumeration here. A record
+        // that somehow carried none is reported as the server failure it is, rather
+        // than silently left out of a page that claims to be complete.
+        let mut summaries: Vec<AssetModelCompositeModelSummary> =
+            Vec::with_capacity(record.composite_models.len());
+        for composite in &record.composite_models {
+            let summary = composite
+                .id
+                .as_deref()
+                .and_then(|id| record.composite_model_summary(id))
+                .ok_or_else(|| {
+                    internal_failure(format!(
+                        "A composite model stored on asset model {asset_model_id} carries no id."
+                    ))
+                })?;
+            summaries.push(summary);
+        }
+
+        // `nextToken` is this enumeration's resume point: the id of the first
+        // composite model of the next page, hex-encoded so the token matches the
+        // modelled `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this
+        // enumeration is refused rather than answered with an empty page, which
+        // would report absence as success.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                summaries
+                    .iter()
+                    .position(|summary| summary.id == resume)
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        // `maxResults` carries the modelled range 1..250, which the runtime
+        // validates BEFORE this handler runs, so a value that arrives here is
+        // already in range and nothing is being coerced; `max(1)` only keeps the
+        // slice arithmetic below total. The default is the one AWS documents for
+        // this operation.
+        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
+        let end = start.saturating_add(max_results).min(summaries.len());
+
+        let next_token = summaries
+            .get(end)
+            .map(|summary| ::hex::encode(summary.id.as_bytes()));
+
+        Ok(ListAssetModelCompositeModelsOutput {
+            asset_model_composite_model_summaries: summaries[start..end].to_vec(),
+            next_token,
+        })
     }
 }
+
+/// The page size AWS documents for this operation when the caller gives no
+/// `maxResults`.
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// Decode a `nextToken` back into the composite model id it names.
+fn decode_token(token: &str) -> Result<String, ListAssetModelCompositeModelsError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never
+/// issued.
+fn invalid_token() -> ListAssetModelCompositeModelsError {
+    ListAssetModelCompositeModelsErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: "The nextToken is not a token this operation issued.".to_string(),
+    })
+    .into()
+}
+
+/// HTTP 500 `InternalFailureException` for a stored record that broke an
+/// invariant this handler reads it under.
+fn internal_failure(message: String) -> ListAssetModelCompositeModelsError {
+    ListAssetModelCompositeModelsErrorModeled::InternalFailureException(InternalFailureException {
+        message,
+    })
+    .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` for a listing scoped to the ACTIVE
+/// version of a model that has none, in this service's one wording for that
+/// absence.
+fn no_active_version(asset_model_id: &str, state: &str) -> ListAssetModelCompositeModelsError {
+    ListAssetModelCompositeModelsErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::no_active_version_message(asset_model_id, state),
+        },
+    )
+    .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the asset model label that
+/// resolved to nothing.
+fn not_found(label: &str) -> ListAssetModelCompositeModelsError {
+    ListAssetModelCompositeModelsErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(crate::state::RESOURCE_ASSET_MODEL, label),
+        },
+    )
+    .into()
+}
+

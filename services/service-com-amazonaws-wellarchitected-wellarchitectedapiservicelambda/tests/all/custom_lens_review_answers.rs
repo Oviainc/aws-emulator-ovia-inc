@@ -36,7 +36,7 @@ use super::workload_harness::{
 
 /// The shape of one lens document: `(pillar id, questions in it, choices per question)`,
 /// exactly what `super::custom_lens_import::lens_document` builds a document from.
-type Shape = &'static [(&'static str, usize, usize)];
+pub(crate) type Shape = &'static [(&'static str, usize, usize)];
 
 /// The alias of the AWS-official lens this emulator ships a question set for, and how many
 /// questions that lens asks: the published Well-Architected Framework numbering (OPS 1-11,
@@ -54,11 +54,11 @@ const PAGE_CEILING: usize = 50;
 /// built from spells it: the pillar it belongs to, its id, its title and its choices as
 /// `(ChoiceId, Choice$Title)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ExpectedQuestion {
-    pillar_id: String,
-    question_id: String,
-    title: String,
-    choices: Vec<(String, String)>,
+pub(crate) struct ExpectedQuestion {
+    pub(crate) pillar_id: String,
+    pub(crate) question_id: String,
+    pub(crate) title: String,
+    pub(crate) choices: Vec<(String, String)>,
 }
 
 /// The questions a document of `shape` defines, in the document's own order: pillar by
@@ -67,7 +67,7 @@ struct ExpectedQuestion {
 /// Derived from the SHAPE, mirroring the ids and titles
 /// `super::custom_lens_import::lens_document` writes, so the expectation comes from the
 /// document the test sent rather than from the service that answered.
-fn expected_questions(shape: Shape) -> Vec<ExpectedQuestion> {
+pub(crate) fn expected_questions(shape: Shape) -> Vec<ExpectedQuestion> {
     shape
         .iter()
         .flat_map(|(pillar_id, questions, choices)| {
@@ -88,14 +88,14 @@ fn expected_questions(shape: Shape) -> Vec<ExpectedQuestion> {
 }
 
 /// How many questions a document of `shape` defines in all.
-fn question_count(shape: Shape) -> usize {
+pub(crate) fn question_count(shape: Shape) -> usize {
     shape.iter().map(|(_, questions, _)| questions).sum()
 }
 
 /// Import a document of `shape` as a fresh custom lens and answer its ARN. The caller
 /// waits for the import to land and publishes the version itself, so a table can import
 /// every row's lens before waiting once.
-async fn import_shape(client: &Client, case: &str, shape: Shape) -> String {
+pub(crate) async fn import_shape(client: &Client, case: &str, shape: Shape) -> String {
     let document = lens_document(&format!("Lens {case}"), None, shape).to_string();
     imported_arn(
         &import(client, &document, None, &format!("tok-import-{case}"), None).await,
@@ -106,7 +106,7 @@ async fn import_shape(client: &Client, case: &str, shape: Shape) -> String {
 /// Publish version `1.0` of an imported lens, so it can be applied to a workload or a
 /// review template: "The lens cannot be applied to workloads … until it's published with
 /// CreateLensVersion" (`ImportLens` doc).
-async fn publish(client: &Client, case: &str, lens_arn: &str) {
+pub(crate) async fn publish(client: &Client, case: &str, lens_arn: &str) {
     let published = create_version(
         client,
         lens_arn,
@@ -212,7 +212,7 @@ async fn collect_answers(
     (collected, pages)
 }
 
-fn string_member(summary: &Value, name: &str) -> String {
+pub(crate) fn string_member(summary: &Value, name: &str) -> String {
     summary
         .get(name)
         .and_then(Value::as_str)
@@ -221,7 +221,7 @@ fn string_member(summary: &Value, name: &str) -> String {
 }
 
 /// The `Choices` a summary reports, as `(ChoiceId, Title)` in the order they were served.
-fn reported_choices(summary: &Value) -> Vec<(String, String)> {
+pub(crate) fn reported_choices(summary: &Value) -> Vec<(String, String)> {
     summary
         .get("Choices")
         .and_then(Value::as_array)
