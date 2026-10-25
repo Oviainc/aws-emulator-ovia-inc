@@ -19,11 +19,13 @@
 //!
 //! The contract below also refuses a disassociation "with autoEnableOrganizationMembers
 //! configuration for your organization set to ALL ... before removing them from your
-//! organization". That configuration is now stored —
-//! `UpdateOrganizationConfiguration` writes it and
-//! `DescribeOrganizationConfiguration` reports it — so the refusal is implementable
-//! here; it is this operation's own behaviour and is not modelled yet, so a
-//! disassociation succeeds whatever the organization's auto-enablement says.
+//! organization": while the administrator's stored organization configuration
+//! auto-enables GuardDuty for every account in the organization, the organization
+//! owns each member relationship, so the whole call is refused with HTTP 400 under
+//! the `InvalidInputException` class
+//! ([`crate::state::organization_managed_members_message`]) and no member moves.
+//! The configuration is the one `UpdateOrganizationConfiguration` writes and
+//! `DescribeOrganizationConfiguration` reports.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -202,8 +204,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         // Only the Region's endpoint that serves the detector administers its
         // members, and only the account that owns it can disassociate them.
-        if state.detector_in(&region, &input.detector_id).is_none() {
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
             return Err(not_owned(&input.detector_id));
+        };
+        // An organization that auto-enables GuardDuty for every one of its accounts
+        // owns their member relationships, so none of them can be ended here
+        // whatever the request names: "you'll receive an error if you attempt to
+        // disassociate a member account before removing them from your
+        // organization" (the modelled contract above). Read before the clock
+        // advances, so a refused call changes nothing at all.
+        if detector.organization.auto_enables_all_members() {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::organization_managed_members_message(
+                    crate::state::DISASSOCIATE_MEMBER_ACTION,
+                ),
+            ));
         }
         // The relationship changes now, so the clock advances once for the whole
         // call: every member this call moves carries the same `UpdatedAt`.

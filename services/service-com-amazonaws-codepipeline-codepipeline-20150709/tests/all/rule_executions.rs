@@ -5,11 +5,12 @@
 //!
 //! The rule under test: a rule execution exists only once a stage condition's rule has
 //! been evaluated, so a pipeline configured with no condition rules has none to report
-//! — the listing answers one empty page and issues no cursor — while a pipeline that
-//! does configure condition rules would have rule executions no plane in this emulator
-//! records, so it is refused rather than answered with "none ran". Everything the
-//! request names is checked against the store: the pipeline must exist and an
-//! execution id in the filter must name an execution of that pipeline.
+//! — the listing answers one empty page and issues no cursor — and so has a pipeline
+//! that declares them but has never run. What a pipeline whose conditions HAVE been
+//! evaluated reports, and what the evaluation does to the execution, is
+//! `tests/all/stage_condition_rules.rs`. Everything the request names is checked
+//! against the store: the pipeline must exist and an execution id in the filter must
+//! name an execution of that pipeline.
 //!
 //! The harness comes from the sibling suite (`tests/all/pipeline_lifecycle.rs`), so
 //! every assertion here goes through the same router the production emulator builds.
@@ -398,14 +399,15 @@ async fn a_filter_execution_id_must_name_an_execution_of_that_pipeline() {
     }
 }
 
-/// A pipeline that DOES configure condition rules is refused as not implemented: the
-/// real service reports the executions of those rules, and nothing in this emulator
-/// evaluates one, so an empty list would be a claim that none ran.
+/// A pipeline that DOES configure condition rules reports no rule execution until one
+/// has been evaluated: declaring a rule is not running it, so a pipeline nothing has
+/// started yet answers the same empty page — and the call is answered rather than
+/// refused, whichever site declares the rules and however many it declares.
 ///
 /// The rows span every site a stage can carry conditions at, and both ends of
 /// `RuleDeclarationList`'s modelled length (1..5).
 #[tokio::test]
-async fn a_pipeline_that_declares_condition_rules_is_refused_as_not_implemented() {
+async fn a_pipeline_that_declares_condition_rules_has_none_until_one_is_evaluated() {
     // (case, condition site, the value that site carries)
     let cases: Vec<(&str, &str, Value)> = vec![
         (
@@ -450,19 +452,24 @@ async fn a_pipeline_that_declares_condition_rules_is_refused_as_not_implemented(
 
     for (case, site, value) in cases {
         let emulator = Emulator::new();
-        let (name, _) = seed(&emulator, declaration_with("ruled", site, value), 1).await;
-        let (status, code) = emulator
-            .expect_error("ListRuleExecutions", &json!({"pipelineName": name}))
+        let (name, _) = seed(&emulator, declaration_with("ruled", site, value), 0).await;
+        let page = emulator
+            .ok("ListRuleExecutions", &json!({"pipelineName": name}))
             .await;
         assert_eq!(
-            (status, code.as_str()),
-            (501, "NotImplemented"),
-            "case {case:?}: rule executions this emulator never recorded must not be \
-             reported as none"
+            page["ruleExecutionDetails"],
+            json!([]),
+            "case {case:?}: a declared rule that nothing has evaluated has no execution \
+             to report, got {page}"
+        );
+        assert!(
+            page["nextToken"].is_null(),
+            "case {case:?}: expected no nextToken from a page that was not truncated, got \
+             {page}"
         );
 
-        // The refusal covers the whole call: a cursor for a listing this emulator does
-        // not record is one it cannot judge, so it is not reported as malformed.
+        // And a cursor this listing never issued is still refused as the model
+        // declares, whatever the pipeline declares.
         let (status, code) = emulator
             .expect_error(
                 "ListRuleExecutions",
@@ -471,8 +478,8 @@ async fn a_pipeline_that_declares_condition_rules_is_refused_as_not_implemented(
             .await;
         assert_eq!(
             (status, code.as_str()),
-            (501, "NotImplemented"),
-            "case {case:?}: the unimplemented plane is reported before a cursor is judged"
+            (400, "InvalidNextTokenException"),
+            "case {case:?}: an unissued nextToken must be refused as the model declares"
         );
     }
 }
