@@ -217,6 +217,41 @@ impl Emulator {
             .to_string()
     }
 
+    /// Create one [`ConfigurationRequest`] row under `region`'s endpoint, apply
+    /// the further revisions the row carries, assert each call succeeded, and
+    /// hand back the minted ARN — the row-shaped counterpart of
+    /// [`Self::create_configuration_ok`], so every configuration suite mints a
+    /// table row through one path.
+    pub async fn create_configuration_row_ok_in(
+        &self,
+        region: &str,
+        request: &ConfigurationRequest,
+    ) -> String {
+        let reply = self
+            .call_in(region, "POST", "/v1/configurations", Some(request.to_json()))
+            .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {request:?}: expected CreateConfiguration in {region} to succeed, got {} {}",
+            reply.status, reply.body
+        );
+        let arn = reply.body["arn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {request:?}: CreateConfiguration returned no arn"))
+            .to_string();
+        for body in &request.extra_revisions {
+            let updated = self
+                .update_configuration_in(region, &arn, None, body)
+                .await;
+            assert_eq!(
+                updated.status, 200,
+                "case {request:?}: expected UpdateConfiguration to succeed, got {} {}",
+                updated.status, updated.body
+            );
+        }
+        arn
+    }
+
     /// `UpdateConfiguration`, which the model binds to
     /// `PUT /v1/configurations/{Arn}`.
     pub async fn update_configuration(
@@ -523,6 +558,95 @@ impl ClusterRequest {
 /// timer feature; nothing else has to make progress here.
 pub fn sleep_past_activation() {
     std::thread::sleep(CLUSTER_ACTIVATION_DELAY + Duration::from_millis(250));
+}
+
+/// One row of a `CreateConfiguration` table: the member values one request
+/// carries, as every configuration suite of this crate writes its rows.
+///
+/// `None` means "the request omits it", which is how a row tests a documented
+/// default; `extra_revisions` are bodies a suite submits through
+/// `UpdateConfiguration` after the create, so a row can exercise a
+/// configuration that holds more than its first revision.
+#[derive(Debug, Clone)]
+pub struct ConfigurationRequest {
+    pub name: String,
+    pub description: Option<String>,
+    pub kafka_versions: Vec<String>,
+    /// The `server.properties` body, as raw bytes: the member is a blob, so it
+    /// is base64 on the wire and may hold bytes that are not UTF-8 at all.
+    pub server_properties: Vec<u8>,
+    pub extra_revisions: Vec<Vec<u8>>,
+}
+
+impl ConfigurationRequest {
+    /// A minimal request: only the two required members, so every optional
+    /// member's documented default applies.
+    pub fn named(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            description: None,
+            kafka_versions: Vec::new(),
+            server_properties: b"auto.create.topics.enable=true\n".to_vec(),
+            extra_revisions: Vec::new(),
+        }
+    }
+
+    pub fn to_json(&self) -> Value {
+        let mut body = json!({
+            "name": self.name,
+            // A blob member travels base64-encoded in a restJson1 payload.
+            "serverProperties": ::aws_smithy_types::base64::encode(&self.server_properties),
+        });
+        if let Some(description) = &self.description {
+            body["description"] = json!(description);
+        }
+        if !self.kafka_versions.is_empty() {
+            body["kafkaVersions"] = json!(self.kafka_versions);
+        }
+        body
+    }
+
+    /// What `Configuration$Description` must report: the description as given,
+    /// and the empty string when the request named none.
+    pub fn expected_description(&self) -> String {
+        self.description.clone().unwrap_or_default()
+    }
+}
+
+/// The configuration table every configuration suite of this crate walks. The
+/// rows differ along what those rules generalise over: whether a description
+/// was given (and whether it is empty or carries non-ASCII text), how many
+/// Kafka versions were named, and the size and byte content of the
+/// `server.properties` blob. One table, so a suite that adds a rule tests it
+/// over the same inputs every other one does.
+pub fn configuration_rows() -> Vec<ConfigurationRequest> {
+    vec![
+        ConfigurationRequest::named("no-description"),
+        ConfigurationRequest {
+            description: Some("a described configuration".to_string()),
+            kafka_versions: vec!["2.8.1".to_string()],
+            ..ConfigurationRequest::named("one-version")
+        },
+        ConfigurationRequest {
+            description: Some(String::new()),
+            kafka_versions: vec!["3.4.0".to_string(), "3.5.1".to_string(), "3.6.0".to_string()],
+            server_properties: Vec::new(),
+            ..ConfigurationRequest::named("three-versions-empty-properties")
+        },
+        ConfigurationRequest {
+            description: Some("héllo — ünicode".to_string()),
+            kafka_versions: vec!["3.6.0".to_string()],
+            // Bytes that are not valid UTF-8: a blob is a byte string, so the
+            // round trip must not go through a string conversion.
+            server_properties: vec![0x00, 0xff, 0xfe, 0x10, 0x80],
+            ..ConfigurationRequest::named("binary_properties-1")
+        },
+        ConfigurationRequest {
+            description: Some("a large properties file".to_string()),
+            server_properties: b"num.partitions=1\n".repeat(512),
+            ..ConfigurationRequest::named("large-properties")
+        },
+    ]
 }
 
 /// One row of a `CreateVpcConnection` table: every member the request carries.
