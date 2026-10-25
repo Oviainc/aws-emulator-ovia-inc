@@ -42,7 +42,10 @@ use super::object_storage::delete_bucket;
 
 /// `GET /?x-id=ListBuckets…` — `ListBuckets`, with whatever extra query parameters the
 /// case under test carries.
-async fn list_buckets(router: &MultiServiceRouter, query: &str) -> Answer {
+///
+/// `pub(crate)`: the published-sample-data suite reads the account's listing back through
+/// this one sender rather than standing up a second copy of it.
+pub(crate) async fn list_buckets(router: &MultiServiceRouter, query: &str) -> Answer {
     send(router, "GET", &format!("/?x-id=ListBuckets{query}"), &[], "").await
 }
 

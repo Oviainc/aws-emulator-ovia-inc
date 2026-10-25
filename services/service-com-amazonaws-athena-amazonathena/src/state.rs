@@ -15,12 +15,22 @@
 //! its creation is asynchronous (see [`DataCatalogRecord::status_at`]), and even then the
 //! due instant is stored once and every read derives the status from it rather than
 //! writing.
+//!
+//! Athena's TABLE METADATA is not kept here at all: Athena registers no tables of its
+//! own, and the data catalog its metadata reads address — [`GLUE_DATA_CATALOG_NAME`], or
+//! a registered `GLUE` catalog naming the same catalog id — IS the account's Glue Data
+//! Catalog. So those reads project what GLUE persisted ([`to_table_metadata`]) instead of
+//! holding a second copy that could drift from the catalog a client writes through.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
+use ::service_com_amazonaws_glue_awsglue::ops::types::Column as GlueColumn;
+use ::service_com_amazonaws_glue_awsglue::state as glue_state;
+
 use crate::ops::types::{
-    DataCatalog, EngineVersion, Tag, WorkGroup, WorkGroupConfiguration, CONNECTION_TYPE_VALUES,
+    Column, DataCatalog, EngineVersion, TableMetadata, Tag, WorkGroup, WorkGroupConfiguration,
+    CONNECTION_TYPE_VALUES,
 };
 
 /// The `WorkGroupState` a freshly created workgroup is in. One of
@@ -205,6 +215,260 @@ pub fn open_configuration_bytes(configuration: &WorkGroupConfiguration) -> usize
         }
     }
     bytes
+}
+
+/// The name Athena addresses the account's Glue Data Catalog by.
+///
+/// Athena's own documentation names it `AwsDataCatalog`, and a data catalog a client
+/// registers of its own cannot take that name (`CreateDataCatalog`'s `Name` leaves "the
+/// remainder of the length constraint of 256 ... reserved for use by Athena"), so this
+/// one name always means the Glue Data Catalog.
+pub const GLUE_DATA_CATALOG_NAME: &str = "AwsDataCatalog";
+
+/// Whether `catalog_name` names the Glue Data Catalog ([`GLUE_DATA_CATALOG_NAME`]).
+///
+/// Matched without regard to ASCII case: Athena addresses this same catalog as
+/// `awsdatacatalog` from its query layer, where every identifier is lowercased, so a
+/// client that spells it that way addresses the catalog it means.
+pub fn is_glue_data_catalog(catalog_name: &str) -> bool {
+    catalog_name.eq_ignore_ascii_case(GLUE_DATA_CATALOG_NAME)
+}
+
+/// The `CatalogId` the Glue Data Catalog of THIS account is held under in Glue's store:
+/// Glue's own default, which is the account id ("If none is provided, the Amazon Web
+/// Services account ID is used by default"). Athena's `AwsDataCatalog` is that catalog,
+/// so a metadata read resolves it through Glue's own rule rather than restating it.
+pub fn glue_data_catalog_id() -> String {
+    glue_state::resolve_catalog_id(None)
+}
+
+/// The refusal message for a read whose named data catalog this account does not hold.
+///
+/// NOT recorded: what is pinned is the behaviour — HTTP 400 with the operation's own
+/// `InvalidRequestException`, naming a catalog being a problem with the input rather than
+/// one the metastore reported — and the sentence names the kind of entity and the
+/// requested name, the way this service's other per-resource misses do (`GetWorkGroup`'s
+/// "WorkGroup {name} is not found."). ONE sentence for the class, so every operation that
+/// answers it words it identically.
+pub fn data_catalog_not_found(catalog_name: &str) -> String {
+    format!("DataCatalog {catalog_name} is not found.")
+}
+
+/// The refusal message for a metadata read whose `DatabaseName` names no database the
+/// addressed data catalog holds. The miss is the METASTORE's answer, which is why it is
+/// reported as `MetadataException` rather than as a bad request, and the sentence is the
+/// Hive-metastore wording for an absent namespace, built from the requested name.
+pub fn database_not_found(database_name: &str) -> String {
+    format!("Database does not exist: {database_name}")
+}
+
+/// The refusal message for a metadata read whose `TableName` names no table the
+/// addressed database holds. The per-kind counterpart of [`database_not_found`]: the same
+/// metastore answers it, so it is the same `MetadataException` and follows the same
+/// template, built from the requested name.
+pub fn table_not_found(table_name: &str) -> String {
+    format!("Table does not exist: {table_name}")
+}
+
+/// The refusal message for a listing whose `Expression` carries more wildcards than the
+/// catalog matches against every stored name
+/// ([`glue_state::MAX_PATTERN_WILDCARDS`]). Beside the other refusal sentences of this
+/// slice, so a reader of the pattern language is told the same thing wherever it is
+/// matched.
+pub fn too_many_pattern_wildcards(wildcards: usize) -> String {
+    format!(
+        "Expression carries {wildcards} wildcards, more than the {} this catalog matches",
+        glue_state::MAX_PATTERN_WILDCARDS
+    )
+}
+
+/// One stored Glue table as the `TableMetadata` Athena reports for it.
+///
+/// Every member is the catalog's, never the reading request's: the name, the instant the
+/// catalog recorded the create, the last access time the catalog holds, the table type,
+/// the table's columns (its storage descriptor's), its partition keys and its table
+/// properties ([`hive_table_properties`]). A member the catalog does not determine for
+/// that table stays absent, so a client reads "unknown" only where the catalog knows
+/// nothing — a table stored with no storage descriptor has no column list to report,
+/// which is not the same as a table whose column list is empty.
+///
+/// `Parameters` is the ONE member always reported: a Hive table's property set is
+/// something the catalog always determines for it — every stored member of the table's
+/// storage descriptor contributes one, and a table that names none simply has an empty
+/// set — so there is no "unknown" state for it to stand in for.
+pub fn to_table_metadata(table: &glue_state::TableEntry) -> TableMetadata {
+    TableMetadata {
+        name: table.name.clone(),
+        create_time: Some(::aws_smithy_types::DateTime::from(table.create_time)),
+        last_access_time: table.last_access_time,
+        table_type: table.table_type.clone(),
+        columns: table
+            .storage_descriptor
+            .as_ref()
+            .and_then(|storage| storage.columns.as_ref())
+            .map(|columns| columns.iter().map(to_column).collect()),
+        partition_keys: table
+            .partition_keys
+            .as_ref()
+            .map(|keys| keys.iter().map(to_column).collect()),
+        parameters: Some(hive_table_properties(table)),
+    }
+}
+
+/// The Hive table property that carries where a table's data lives: the stored
+/// `StorageDescriptor$Location`.
+const LOCATION_PROPERTY: &str = "location";
+
+/// The Hive table property carrying `StorageDescriptor$InputFormat`.
+const INPUT_FORMAT_PROPERTY: &str = "inputformat";
+
+/// The Hive table property carrying `StorageDescriptor$OutputFormat`.
+const OUTPUT_FORMAT_PROPERTY: &str = "outputformat";
+
+/// The Hive table property carrying the serialization library of the stored
+/// `SerDeInfo`.
+const SERDE_LIBRARY_PROPERTY: &str = "serde.serialization.lib";
+
+/// The prefix each `SerDeInfo$Parameters` entry is carried under, one Hive table
+/// property per entry: `serde.param.<name>`.
+const SERDE_PARAMETER_PREFIX: &str = "serde.param.";
+
+/// A stored Data Catalog table's properties, as the `TableMetadata$Parameters`
+/// ("a set of custom key/value pairs for table properties") Athena reports for it.
+///
+/// Athena presents a Data Catalog table as the HIVE table it is, so this is one flat
+/// property set rather than the structured definition the catalog holds: the table's own
+/// `Parameters`, plus its STORAGE DESCRIPTOR rendered as the Hive properties that
+/// describe it — where the data lives, the input and output formats, the serialization
+/// library and each of the SerDe's own parameters under
+/// [`SERDE_PARAMETER_PREFIX`]. Athena's `TableMetadata` models no storage descriptor of
+/// its own, and these properties are how a client reads one back.
+///
+/// A member the catalog does not hold contributes no property, so the set says exactly
+/// what the stored definition carries. A property derived from the storage descriptor
+/// wins over a table parameter of the same name: it is what the catalog actually holds
+/// for that aspect of the table.
+pub fn hive_table_properties(
+    table: &glue_state::TableEntry,
+) -> ::std::collections::HashMap<String, String> {
+    let mut properties = table.parameters.clone().unwrap_or_default();
+    let Some(storage) = table.storage_descriptor.as_ref() else {
+        return properties;
+    };
+    for (property, value) in [
+        (LOCATION_PROPERTY, storage.location.as_ref()),
+        (INPUT_FORMAT_PROPERTY, storage.input_format.as_ref()),
+        (OUTPUT_FORMAT_PROPERTY, storage.output_format.as_ref()),
+    ] {
+        if let Some(value) = value {
+            properties.insert(property.to_string(), value.clone());
+        }
+    }
+    let Some(serde) = storage.serde_info.as_ref() else {
+        return properties;
+    };
+    if let Some(library) = serde.serialization_library.as_ref() {
+        properties.insert(SERDE_LIBRARY_PROPERTY.to_string(), library.clone());
+    }
+    for (name, value) in serde.parameters.iter().flatten() {
+        properties.insert(format!("{SERDE_PARAMETER_PREFIX}{name}"), value.clone());
+    }
+    properties
+}
+
+/// One column of a stored Glue table as Athena's own `Column` shape.
+///
+/// Athena's column carries the three members it models — the name, the data type and the
+/// comment — and the Data Catalog's per-column `Parameters`, which Athena's shape does
+/// not model, are left behind rather than folded into another member.
+fn to_column(column: &GlueColumn) -> Column {
+    Column {
+        name: column.name.clone(),
+        r#type: column.r#type.clone(),
+        comment: column.comment.clone(),
+    }
+}
+
+/// Where the metadata of the data catalog a read names comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataSource {
+    /// A Glue Data Catalog this emulator holds, under this `CatalogId` — the account's
+    /// own, which a registered `GLUE` catalog may name a second time.
+    GlueDataCatalog(String),
+    /// A registered catalog whose metadata an external metastore or a connector function
+    /// serves, carrying that catalog's `DataCatalogType`.
+    ExternalMetastore(String),
+    /// A registered `GLUE` catalog naming the Data Catalog of ANOTHER account, carrying
+    /// that `CatalogId`. The obstacle is the catalog it names rather than an external
+    /// metastore: this emulator holds the Data Catalog of its own account only.
+    ForeignGlueCatalog(String),
+    /// No data catalog of that name: neither the Glue Data Catalog nor one this account
+    /// registered.
+    Unregistered,
+}
+
+/// Which metadata source `catalog_name` addresses, given the `catalogs` this account
+/// registered.
+///
+/// [`GLUE_DATA_CATALOG_NAME`] is the account's Glue Data Catalog. A catalog a client
+/// registered is resolved from its OWN stored record: a `GLUE` catalog reads the Glue Data
+/// Catalog the `catalog-id` parameter its type documents names ([`PARAMETER_CATALOG_ID`])
+/// — so one naming the catalog this emulator holds is that same catalog under a second
+/// Athena name, while one naming another account's names a Data Catalog this emulator
+/// does not hold ([`MetadataSource::ForeignGlueCatalog`]); a `HIVE`, `LAMBDA` or
+/// `FEDERATED` catalog reads through an external Hive metastore or a connector function,
+/// which this emulator does not host.
+pub fn metadata_source(
+    catalogs: &BTreeMap<String, DataCatalogRecord>,
+    catalog_name: &str,
+) -> MetadataSource {
+    let glue_catalog_id = glue_data_catalog_id();
+    if is_glue_data_catalog(catalog_name) {
+        return MetadataSource::GlueDataCatalog(glue_catalog_id);
+    }
+    let Some(record) = catalogs.get(catalog_name) else {
+        return MetadataSource::Unregistered;
+    };
+    if record.catalog_type != DATA_CATALOG_TYPE_GLUE {
+        return MetadataSource::ExternalMetastore(record.catalog_type.clone());
+    }
+    match record.parameters.get(PARAMETER_CATALOG_ID) {
+        Some(catalog_id) if *catalog_id == glue_catalog_id => {
+            MetadataSource::GlueDataCatalog(glue_catalog_id)
+        }
+        // A GLUE catalog carries that parameter (its type requires it), and one naming
+        // any other id names a Data Catalog of another account.
+        Some(catalog_id) => MetadataSource::ForeignGlueCatalog(catalog_id.clone()),
+        None => MetadataSource::ExternalMetastore(record.catalog_type.clone()),
+    }
+}
+
+/// The refusal message for a metadata read of a registered catalog whose metastore this
+/// emulator does not host.
+///
+/// Athena reads such a catalog by calling that catalog's own metastore or connector
+/// function, so a metastore that answers nothing is what `MetadataException` reports; the
+/// sentence names the catalog the request addressed and the type that decides where its
+/// metadata lives.
+pub fn metastore_unreachable(catalog_name: &str, catalog_type: &str) -> String {
+    format!(
+        "Catalog {catalog_name} is a {catalog_type} data catalog, whose metadata is served \
+         by a metastore this emulator does not host."
+    )
+}
+
+/// The refusal message for a metadata read of a registered `GLUE` catalog that names the
+/// Data Catalog of another account.
+///
+/// The counterpart of [`metastore_unreachable`] for the other obstacle: the metastore is
+/// the Glue Data Catalog, and the catalog this one names is one this emulator does not
+/// hold, so the sentence names the catalog the request addressed and the `CatalogId` it
+/// points at.
+pub fn foreign_glue_catalog(catalog_name: &str, catalog_id: &str) -> String {
+    format!(
+        "Catalog {catalog_name} names the Data Catalog {catalog_id}, which is not a Data \
+         Catalog this account holds."
+    )
 }
 
 /// The `DataCatalogType` a federated catalog carries — the one type whose creation the

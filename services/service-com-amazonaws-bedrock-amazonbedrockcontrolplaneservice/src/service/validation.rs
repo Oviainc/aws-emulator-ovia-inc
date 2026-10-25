@@ -20,7 +20,11 @@
 //!    offending member, joined with `; `, in the order the walk found them
 //!    ([`envelope`]);
 //! 2. a clause states the value the member held, its dotted path and the requirement it
-//!    failed;
+//!    failed — EXCEPT for a value outside a `@range` bound, which this service states
+//!    WITHOUT the number that broke it ([`echoes_refused_value`]): a numeric member's
+//!    refusal advertises the bound the model declares, which is the whole of what a caller
+//!    needs to resubmit, and the rejected number is request content this API's refusals
+//!    keep out of the sentence;
 //! 3. a reported `@pattern` is the expression WITHOUT the `^` / `$` anchors the model
 //!    spells it with ([`unanchored`]): the advertised constraint is the character grammar
 //!    a value must satisfy, and a caller that lifts the expression out of the message to
@@ -152,6 +156,20 @@ fn render_bound(bound: f64) -> String {
     } else {
         format!("{bound}")
     }
+}
+
+/// Whether a violation of this class states the value it refused.
+///
+/// A `@range` violation does NOT: the clause names the member and the bound it broke and
+/// stops there, for every numeric member of every operation — a `@range` minimum as much
+/// as a maximum, an integer member as much as a fractional one, and whether the bound was
+/// declared on the member's target or inherited by it. Every other class this module words
+/// keeps the value (rule 2), and an absent member has none to state.
+fn echoes_refused_value(kind: &ViolationKind) -> bool {
+    !matches!(
+        kind,
+        ViolationKind::MinValue(_) | ViolationKind::MaxValue(_)
+    )
 }
 
 /// The requirement a violation states, or `None` for a class this module has no wording
@@ -388,6 +406,11 @@ struct Clause {
     /// The framework's own clause, kept verbatim for a violation class this module has no
     /// wording for, so one such class does not cost the refusal its other clauses.
     verbatim: Option<String>,
+    /// Whether the clause states the value the member held: false while EVERY violation
+    /// folded into it is one of the classes that does not ([`echoes_refused_value`]). A
+    /// clause one violation of another class also joined — which only a collection's
+    /// element set can be — states the value, since that class's own rule asks for it.
+    echoes_value: bool,
 }
 
 impl Clause {
@@ -416,7 +439,11 @@ impl Clause {
         // No value at all: an absent member, reported as the `null` it was. Read off what
         // the clause COLLECTED rather than off the violation that opened it, so a clause
         // that did collect a value always echoes it.
-        let subject = if self.values.is_empty() {
+        let subject = if !self.echoes_value {
+            // A class whose clause carries no value at all: the member and the requirement
+            // are the whole sentence, whatever the request held.
+            "Value".to_string()
+        } else if self.values.is_empty() {
             "Value null".to_string()
         } else if self.depth == 0 {
             format!(
@@ -520,9 +547,15 @@ pub(crate) fn envelope(violations: &[Violation]) -> Option<String> {
                     depth,
                     values: Vec::new(),
                     verbatim,
+                    // Decided by the OR-fold below, over this violation and every later one
+                    // that joins the clause.
+                    echoes_value: false,
                 })
             }
         };
+        // One clause, several violations: it echoes the value as soon as ANY of them is a
+        // class that states one.
+        clause.echoes_value |= echoes_refused_value(&violation.kind);
         if let Some(value) = violation.value.as_deref() {
             // One rendered value per violation PATH: the same element breaking two of its
             // shape's constraints is one value, two elements are two.

@@ -49,6 +49,12 @@ mod local_gateway_routes;
 mod transit_gateway_prefix_list_references;
 #[path = "all/ec2_query_error_envelope.rs"]
 mod ec2_query_error_envelope;
+// What `CreatePublicIpv4Pool` mints and persists, read back through the describe. Declared
+// here rather than in sorted position, for the reason the suites above give: the sorted
+// neighbourhood is where every new ec2 suite inserts its lines, and these two lines have
+// already lost several serialized squash merges there.
+#[path = "all/create_public_ipv4_pool.rs"]
+mod create_public_ipv4_pool;
 #[path = "all/address_transfers.rs"]
 mod address_transfers;
 #[path = "all/allowed_images_settings.rs"]
@@ -236,6 +242,7 @@ mod network_performance_subscriptions;
 mod placement_groups;
 #[path = "all/principal_id_format.rs"]
 mod principal_id_format;
+// The public IPv4 pool slice: create a pool, then report it back out of the store.
 #[path = "all/public_ipv4_pools.rs"]
 mod public_ipv4_pools;
 // What `DeleteQueuedReservedInstances` deletes and what it reports per id.

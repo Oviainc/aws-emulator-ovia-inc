@@ -1679,6 +1679,35 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
         })
     }
 
+    /// The virtual cluster that still references the security configuration
+    /// `configuration_id` names, if one does — the OLDEST such cluster, so the answer does
+    /// not depend on the store's iteration order.
+    ///
+    /// A `securityConfigurationId` is a reference a virtual cluster holds for as long as
+    /// the cluster is registered: it is reported on every read of that cluster, so the
+    /// configuration it names is in use and cannot leave the store while it is held. A
+    /// TERMINATED cluster has been torn down and holds nothing any more, on the same terms
+    /// as [`Self::cluster_mapped_to_namespace`]: what its record still reports is what it
+    /// referenced while it existed.
+    ///
+    /// Read out of the stored cluster records rather than out of a reference count beside
+    /// them, so what a delete resolves against and what every read reports can never
+    /// disagree. The walk is bounded by [`MAX_VIRTUAL_CLUSTERS`].
+    pub fn cluster_referencing_security_configuration(
+        &self,
+        region: &str,
+        configuration_id: &str,
+    ) -> Option<&VirtualClusterRecord> {
+        self.virtual_clusters
+            .values()
+            .filter(|record| {
+                record.region == region
+                    && record.state != CLUSTER_TERMINATED
+                    && record.security_configuration_id.as_deref() == Some(configuration_id)
+            })
+            .min_by_key(|record| record.sequence)
+    }
+
     /// Whether this store holds the resource `arn` names, for a request signed for
     /// `region`.
     ///

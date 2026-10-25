@@ -242,6 +242,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
 
+        // "The message to send. The minimum size is one character": a `MessageBody`
+        // holding no character is the required parameter not supplied, which is what
+        // `MissingParameter` reports. Refused before the store is touched, so nothing is
+        // enqueued for it.
+        if input.message_body.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::missing_parameter(
+                "MessageBody",
+            ));
+        }
+
         // "A message can include only XML, JSON, and unformatted text. The following
         // Unicode characters are allowed ... If a message contains characters outside
         // the allowed set, Amazon SQS rejects the message and returns an

@@ -62,14 +62,14 @@ use crate::hypervisor_property_mappings::{
 /// member is `@length(min: 20, max: 2048)` with pattern
 /// `^arn:(aws|aws-cn|aws-us-gov):iam::([0-9]+):role/(\S+)$`
 /// (`smithy_query(query="shape",shape="IamRoleArn")`).
-fn role_arn(partition: &str, path_and_name: &str) -> String {
+pub(crate) fn role_arn(partition: &str, path_and_name: &str) -> String {
     format!(
         "arn:{partition}:iam::{}:role/{path_and_name}",
         engine::EMULATOR_ACCOUNT_ID
     )
 }
 
-async fn start_sync(router: &MultiServiceRouter, arn: &str) -> Reply {
+pub(crate) async fn start_sync(router: &MultiServiceRouter, arn: &str) -> Reply {
     call(
         router,
         "StartVirtualMachinesMetadataSync",
@@ -133,7 +133,7 @@ async fn put_mappings(
 /// Walk the whole documented workflow for one hypervisor with API calls only, and hand
 /// back the ARN the import minted: import, create and associate a gateway, put the
 /// mappings the sync runs under.
-async fn served_hypervisor_with_mappings(
+pub(crate) async fn served_hypervisor_with_mappings(
     router: &MultiServiceRouter,
     name: &str,
     host: &str,

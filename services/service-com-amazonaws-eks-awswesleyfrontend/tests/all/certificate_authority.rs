@@ -7,7 +7,9 @@
 //!
 //! The wire harness (`emulator`, `call`, `encode_label`, `Answer`) is this test
 //! target's shared one in `tests/all/wire.rs`; this file reuses it rather than
-//! keeping a second copy.
+//! keeping a second copy, and its own certificate-authority helpers are shared
+//! with the activation suite (`tests/all/certificate_authority_activation.rs`)
+//! for the same reason.
 //!
 //! Every suite here asserts a RULE over a TABLE of inputs rather than one recorded
 //! request: the rows differ along what the rule generalises over (whether an
@@ -30,7 +32,7 @@ use crate::wire::{call, emulator, encode_label, Answer};
 
 /// The region every request in this suite is signed for, except where a case
 /// deliberately uses another one.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The smallest `CreateCluster` request this service accepts, for a cluster the
 /// certificate-authority calls then act on.
@@ -42,7 +44,11 @@ fn minimal_cluster(name: &str) -> serde_json::Value {
     })
 }
 
-async fn create_cluster(router: &MultiServiceRouter, region: &str, name: &str) -> Answer {
+pub(crate) async fn create_cluster(
+    router: &MultiServiceRouter,
+    region: &str,
+    name: &str,
+) -> Answer {
     call(
         router,
         region,
@@ -54,7 +60,11 @@ async fn create_cluster(router: &MultiServiceRouter, region: &str, name: &str) -
 }
 
 /// `DescribeCluster`: the cluster record the certificate authorities hang off.
-async fn describe_cluster(router: &MultiServiceRouter, region: &str, cluster: &str) -> Answer {
+pub(crate) async fn describe_cluster(
+    router: &MultiServiceRouter,
+    region: &str,
+    cluster: &str,
+) -> Answer {
     call(
         router,
         region,
@@ -67,7 +77,7 @@ async fn describe_cluster(router: &MultiServiceRouter, region: &str, cluster: &s
 
 /// `DescribeUpdate`: `GET /clusters/{name}/updates/{updateId}`, which is where the
 /// update the append returns is read back from.
-async fn describe_update(
+pub(crate) async fn describe_update(
     router: &MultiServiceRouter,
     region: &str,
     cluster: &str,
@@ -88,7 +98,7 @@ async fn describe_update(
 }
 
 /// `CreateCertificateAuthority`: `POST /clusters/{clusterName}/certificate-authorities`.
-async fn append_authority(
+pub(crate) async fn append_authority(
     router: &MultiServiceRouter,
     region: &str,
     cluster: &str,
@@ -110,7 +120,7 @@ async fn append_authority(
 
 /// `DescribeCertificateAuthority`:
 /// `GET /clusters/{clusterName}/certificate-authorities/{certificateAuthorityId}`.
-async fn describe_authority(
+pub(crate) async fn describe_authority(
     router: &MultiServiceRouter,
     region: &str,
     cluster: &str,
@@ -132,7 +142,7 @@ async fn describe_authority(
 
 /// Wait out a clock-owed move, with enough slack that a loaded machine does not
 /// race the due instant.
-async fn settle(span: Duration) {
+pub(crate) async fn settle(span: Duration) {
     tokio::time::sleep(span + Duration::from_millis(250)).await;
 }
 
@@ -141,7 +151,7 @@ async fn settle(span: Duration) {
 /// an update id ("A UUID that is used to track the update", `Update$id`) — the
 /// `8-4-4-4-12` hex layout with the version nibble 4 and the variant's two top bits
 /// `10`, which is what the service's own formatter sets.
-fn is_uuid(value: &str) -> bool {
+pub(crate) fn is_uuid(value: &str) -> bool {
     let widths = [8usize, 4, 4, 4, 12];
     let groups: Vec<&str> = value.split('-').collect();
     groups.len() == widths.len()
@@ -157,7 +167,7 @@ fn is_uuid(value: &str) -> bool {
 
 /// A timestamp member, as restJson1 puts an `@timestamp` on the wire: epoch
 /// seconds.
-fn epoch(case: &str, member: &str, value: &serde_json::Value) -> f64 {
+pub(crate) fn epoch(case: &str, member: &str, value: &serde_json::Value) -> f64 {
     value
         .as_f64()
         .unwrap_or_else(|| panic!("case {case:?}: expected epoch seconds for {member}, got {value:?}"))
@@ -165,11 +175,11 @@ fn epoch(case: &str, member: &str, value: &serde_json::Value) -> f64 {
 
 /// Two instants are the same to well inside a second, which is as close as two
 /// epoch-seconds numbers computed from one stored instant need to be.
-fn same_instant(left: f64, right: f64) -> bool {
+pub(crate) fn same_instant(left: f64, right: f64) -> bool {
     (left - right).abs() < 0.001
 }
 
-fn str_member(case: &str, member: &str, value: &serde_json::Value) -> String {
+pub(crate) fn str_member(case: &str, member: &str, value: &serde_json::Value) -> String {
     value
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: expected a string {member}, got {value:?}"))

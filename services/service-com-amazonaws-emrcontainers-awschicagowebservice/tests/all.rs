@@ -35,6 +35,8 @@ mod resource_tagging;
 mod security_configuration;
 #[path = "all/security_configuration_delete.rs"]
 mod security_configuration_delete;
+#[path = "all/security_configuration_in_use.rs"]
+mod security_configuration_in_use;
 #[path = "all/security_configuration_list.rs"]
 mod security_configuration_list;
 #[path = "all/start_job_run_required_members.rs"]

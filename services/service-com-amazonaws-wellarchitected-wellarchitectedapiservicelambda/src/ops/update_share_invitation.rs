@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateShareInvitation
-//! IMPLEMENTED: answers the share invitation the calling principal was offered. The
-//! invitation is resolved from [`crate::state`] by its `ShareInvitationId` alone — it
-//! names no resource, so the search spans every stored share — and the answer moves the
-//! share it mediates out of `PENDING`: `ACCEPT` to `ACCEPTED`, `REJECT` to `REJECTED`.
-//! The answered invitation is returned and stops being outstanding, so
-//! `ListShareInvitations` no longer reports it and `ListWorkloadShares` reports the
-//! share's new status. An id that names no invitation THIS principal was offered is
+//! IMPLEMENTED: answers the share invitation the calling principal was offered, of
+//! whichever resource kind it offers. The invitation is resolved from [`crate::state`] by
+//! its `ShareInvitationId` alone — it names no resource and carries no resource kind, so
+//! the search spans every stored share — and the answer moves the share it mediates out
+//! of `PENDING`: `ACCEPT` to `ACCEPTED`, `REJECT` to `REJECTED`. The answered invitation
+//! is returned, reporting the members of the kind of resource it offers, and stops being
+//! outstanding, so `ListShareInvitations` no longer reports it and the share's listing
+//! reports its new status. An id that names no invitation THIS principal was offered is
 //! `ResourceNotFoundException` (404); one whose share has already left `PENDING` is
 //! `ConflictException` (409).
 //!
@@ -182,15 +183,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        // "This API operation can be called independently of any resource" (this
-        // operation's doc): the invitation is named by its `ShareInvitationId` alone, so it
-        // is resolved across every stored share. It is offered to the principal the
-        // resource was shared WITH, and every request this emulator serves is attributed to
-        // its one account, so that account is the principal the invitation is resolved for
-        // — never a value read off the request. An invitation addressed to any other
-        // principal is not this caller's to answer, and is refused with the same 404 as an
-        // id no invitation carries, so neither discloses the other.
-        let Some(share) = store.workload_share_by_invitation_mut(
+        // "Update a workload or custom lens share invitation. This API operation can be
+        // called independently of any resource" (this operation's doc): the invitation is
+        // named by its `ShareInvitationId` alone, so it is resolved across every stored
+        // share whatever resource it shares — the same shares `ListShareInvitations`
+        // reports invitations for, so an invitation that was listed can be answered. It is
+        // offered to the principal the resource was shared WITH, and every request this
+        // emulator serves is attributed to its one account, so that account is the
+        // principal the invitation is resolved for — never a value read off the request. An
+        // invitation addressed to any other principal is not this caller's to answer, and
+        // is refused with the same 404 as an id no invitation carries, so neither discloses
+        // the other.
+        let Some(mut share) = store.share_by_invitation_mut(
             &input.share_invitation_id,
             ::engine::emulator_account_id(),
         ) else {
@@ -205,8 +209,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // left `PENDING` — answered already, or revoked or expired by its sharer — has
         // nothing left to answer, which is the modelled `ConflictException`'s own "the
         // resource has already been processed, was deleted" case.
-        if share.status != crate::state::DEFAULT_SHARE_STATUS {
-            let standing = share.status.clone();
+        if share.status() != crate::state::DEFAULT_SHARE_STATUS {
+            let standing = share.status().to_string();
             return Err(UpdateShareInvitationErrorModeled::ConflictException(
                 crate::state::share_invitation_answered_conflict(
                     &input.share_invitation_id,
@@ -216,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        share.status = answered_status.to_string();
+        share.set_status(answered_status);
         Ok(UpdateShareInvitationOutput {
             share_invitation: Some(share.to_invitation()),
         })

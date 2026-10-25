@@ -416,16 +416,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = std::time::SystemTime::now();
+        // The identity whose call writes the commit, which is the actor a pull
+        // request reading from this branch attributes the source update to.
+        let actor = crate::state::caller_identity_arn(ctx.parts());
         // "If no name is specified, the user's ARN is used as the author name and
         // committer name" — the caller this request was signed by — and "if no email
         // address is specified, the email address is left blank".
         let user = UserInfo {
-            name: Some(
-                input
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| crate::state::caller_identity_arn(ctx.parts())),
-            ),
+            name: Some(input.name.clone().unwrap_or_else(|| actor.clone())),
             email: input.email.clone(),
             date: Some(crate::state::git_date(now)),
         };
@@ -460,14 +458,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
         // "A commit is created on the branch that contains the revision": the branch
-        // moves to it, and the commits earlier than it keep the file.
-        repository.branches.insert(
-            input.branch_name.clone(),
-            crate::state::Branch {
-                name: input.branch_name.clone(),
-                commit_id: commit_id.clone(),
-            },
-        );
+        // moves to it, through the one place a branch tip moves, so every OPEN pull
+        // request reading from it follows the new tip; the commits earlier than it
+        // keep the file.
+        repository.set_branch_tip(&input.branch_name, &commit_id, now, Some(&actor));
         repository.last_modified_date = now;
         // Keep the history bounded: the oldest commits no ref reaches are dropped
         // here, together with every git object no remaining ref reaches.

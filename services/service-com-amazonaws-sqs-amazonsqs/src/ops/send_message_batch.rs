@@ -487,6 +487,18 @@ fn prepare(
 ) -> Result<Prepared, BatchResultErrorEntry> {
     let fifo = queue.is_fifo();
 
+    // An entry whose `MessageBody` holds no character leaves out a member it had to
+    // carry — "the minimum size is one character" for the body of a message
+    // (`SendMessageRequest$MessageBody`) — and fails ALONE under its own `Id`, exactly
+    // as the other missing-member refusals here do.
+    if entry.message_body.is_empty() {
+        return Err(refused(
+            entry,
+            MISSING_PARAMETER,
+            "The request must contain the parameter MessageBody.".to_string(),
+        ));
+    }
+
     // "A message can include only XML, JSON, and unformatted text. The following Unicode
     // characters are allowed ... If a message contains characters outside the allowed
     // set, Amazon SQS rejects the message".

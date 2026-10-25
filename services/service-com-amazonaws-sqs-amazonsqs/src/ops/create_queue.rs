@@ -16,7 +16,14 @@
 //!   and values for all its attributes, the CreateQueue action will return the URL of
 //!   the existing queue instead of creating a new one. If you attempt to create a
 //!   queue with a name that already exists but with different attribute names or
-//!   values, the CreateQueue action will return an error."
+//!   values, the CreateQueue action will return an error." — the comparison that
+//!   decides which of the two happens is [`crate::state::recreate_refusal`], and the
+//!   attributes it leaves out of it are
+//!   [`crate::state::ATTRIBUTES_NOT_COMPARED_ON_RECREATE`].
+//! - "If you delete a queue, you must wait at least 60 seconds before creating a queue
+//!   with the same name" — a name deleted inside
+//!   [`crate::state::QUEUE_DELETED_RECENTLY_INTERVAL`] is answered with the modelled
+//!   `QueueDeletedRecently`.
 //! - "If you don't specify the FifoQueue attribute, Amazon SQS creates a standard
 //!   queue", and "A FIFO queue name must end with the .fifo suffix."
 //!
@@ -215,12 +222,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The tags the create carries are bounded exactly as `TagQueue`'s are, so the
-        // per-queue tag cap cannot be exceeded at create time either. The queue does
-        // not exist yet, so the merge is against an empty map.
-        let tags = input.tags.unwrap_or_default();
-        if let Some(why) = state::tag_refusal(&::std::collections::BTreeMap::new(), &tags) {
-            return Err(crate::scaffolded::Scaffolded::validation(why));
+        // per-queue tag cap and the reserved key prefix hold at create time too. The
+        // queue does not exist yet, so the merge is against an empty map.
+        let supplied_tags = input.tags;
+        let no_tags = ::std::collections::HashMap::new();
+        if let Some(why) = state::tag_refusal(
+            &::std::collections::BTreeMap::new(),
+            supplied_tags.as_ref().unwrap_or(&no_tags),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(why));
         }
+        // Key-ordered, as the queue stores them. `None` when the request carried no
+        // `tags` member at all, which says nothing about the queue's tags.
+        let tags: Option<::std::collections::BTreeMap<String, String>> =
+            supplied_tags.map(|tags| tags.into_iter().collect());
 
         let supplied = input.attributes.unwrap_or_default();
         // "If you don't specify the FifoQueue attribute, Amazon SQS creates a standard
@@ -250,8 +265,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The documented defaults, overlaid with what this request supplied: the
-        // attribute set the queue carries, and the one an idempotent re-create of the
-        // same name has to match exactly.
+        // attribute set the queue carries, and the one a re-create of the same name is
+        // compared against (see [`state::recreate_refusal`]).
         let mut attributes: ::std::collections::BTreeMap<String, String> =
             state::SETTABLE_ATTRIBUTES
                 .iter()
@@ -270,19 +285,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             CreateQueueErrorModeled::UnsupportedOperation(state::store_unavailable())
         })?;
         let mut store = store.lock();
+        let now = ::std::time::SystemTime::now();
 
+        // A request naming an existing queue either asks for nothing different about it,
+        // and is answered with that queue's url, or asks to change it, which is what
+        // `QueueNameExists` reports.
         if let Some(existing) = store.queues.get(&input.queue_name) {
-            if existing.attributes == attributes {
-                return Ok(CreateQueueOutput {
+            return match state::recreate_refusal(existing, &attributes, tags.as_ref()) {
+                None => Ok(CreateQueueOutput {
                     queue_url: Some(existing.url.clone()),
-                });
-            }
-            return Err(CreateQueueErrorModeled::QueueNameExists(QueueNameExists {
-                message: Some(format!(
-                    "A queue already exists with the name {} and attributes that differ from the ones this request supplied.",
-                    input.queue_name,
-                )),
-            })
+                }),
+                Some(why) => Err(CreateQueueErrorModeled::QueueNameExists(QueueNameExists {
+                    message: Some(why),
+                })
+                .into()),
+            };
+        }
+
+        // "If you delete a queue, you must wait at least 60 seconds before creating a
+        // queue with the same name." A name whose queue was deleted inside that interval
+        // is not available yet, whoever asks for it.
+        store.forget_lapsed_deletions(now);
+        if store.deleted_recently(&input.queue_name, now).is_some() {
+            return Err(CreateQueueErrorModeled::QueueDeletedRecently(
+                QueueDeletedRecently {
+                    message: Some(format!(
+                        "You must wait {} seconds after deleting a queue before you can create another with the same name.",
+                        state::QUEUE_DELETED_RECENTLY_INTERVAL.as_secs(),
+                    )),
+                },
+            )
             .into());
         }
 
@@ -301,7 +333,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let now = ::std::time::SystemTime::now();
         let region = state::request_region(ctx.parts());
         let url = state::queue_url(ctx.parts(), &region, &input.queue_name);
         let queue = state::Queue {
@@ -309,7 +340,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             url: url.clone(),
             arn: state::queue_arn(&region, &input.queue_name),
             attributes,
-            tags: tags.into_iter().collect(),
+            tags: tags.unwrap_or_default(),
             messages: ::std::collections::VecDeque::new(),
             handles: ::std::collections::HashMap::new(),
             deduplication: ::std::collections::BTreeMap::new(),

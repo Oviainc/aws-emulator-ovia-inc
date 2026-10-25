@@ -53,6 +53,8 @@ mod model_import_jobs;
 mod model_invocation_logging;
 #[path = "all/prompt_routers.rs"]
 mod prompt_routers;
+#[path = "all/range_refusal_wording.rs"]
+mod range_refusal_wording;
 #[path = "all/provisioned_model_throughputs.rs"]
 mod provisioned_model_throughputs;
 #[path = "all/provisioned_model_units_wire_form.rs"]

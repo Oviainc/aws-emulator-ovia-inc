@@ -28,8 +28,9 @@ fn document(value: &Value) -> String {
 }
 
 /// A policy that allows one named principal one action — a document the lockout
-/// safety check has no reason to refuse.
-fn allow(action: &str) -> String {
+/// safety check has no reason to refuse. Shared with the suites that need a
+/// policy to attach rather than a policy to scrutinise.
+pub fn allow(action: &str) -> String {
     document(&json!({
         "Version": "2012-10-17",
         "Statement": [{

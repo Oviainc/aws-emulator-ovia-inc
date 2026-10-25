@@ -298,9 +298,13 @@ async fn reported_tags(
         .unwrap_or_default()
 }
 
-/// The logical id [`one_queue_template`] declares its queue under, and so the value
-/// CloudFormation records on that queue as its `aws:cloudformation:logical-id` tag. Named
-/// once here, so the template and the assertion cannot name two different resources.
+/// The logical id [`one_queue_template`] declares its queue under, and so the resource
+/// the stack's `Ref` and every assertion below address. Named once here, so the template
+/// and the assertion cannot name two different resources.
+///
+/// It is NOT a tag on the queue: `CreateQueue` refuses a caller a tag key in the reserved
+/// `aws:` namespace, so CloudFormation leaves its three `aws:cloudformation:*` records off
+/// a queue — see the tag assertion in the update test.
 const QUEUE_LOGICAL_ID: &str = "Queue";
 
 /// The template one of the update rows deploys: one `AWS::SQS::Queue` carrying
@@ -528,32 +532,20 @@ async fn an_update_applies_changed_queue_properties_in_place() {
             );
         }
         let tags = reported_tags(&router, case, &url).await;
-        // The tags the update declares, PLUS the three CloudFormation records on every
-        // resource it provisions and that the update leaves alone — the queue was created
-        // with them, and an in-place update re-states only the tags the declaration names.
-        // The whole set is held to by
-        // `services/service-com-amazonaws-cloudformation-cloudformation/tests/all/stack_tag_propagation.rs`.
-        let mut expected_tags: BTreeMap<String, String> = row
+        // Exactly the tags the update declares. Amazon SQS's `CreateQueue` refuses a
+        // CALLER a tag key in the reserved `aws:` namespace, so CloudFormation leaves its
+        // three `aws:cloudformation:*` records off a queue rather than having the stack
+        // fail over tags it adds of its own accord — the documented exception in the
+        // provisioner's `applicable_tags`, which `AWS::IAM::Role` and the other
+        // reserved-namespace types already take.
+        let expected_tags: BTreeMap<String, String> = row
             .expected_tags
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect();
-        expected_tags.insert(
-            "aws:cloudformation:stack-name".to_string(),
-            row.stack_name.to_string(),
-        );
-        expected_tags.insert(
-            "aws:cloudformation:stack-id".to_string(),
-            xml_text(&body, "StackId").unwrap_or_default(),
-        );
-        expected_tags.insert(
-            "aws:cloudformation:logical-id".to_string(),
-            QUEUE_LOGICAL_ID.to_string(),
-        );
         assert_eq!(
             tags, expected_tags,
-            "case {case:?}: expected the declared tag map beside the aws:cloudformation \
-             ones after the update, got {tags:?}"
+            "case {case:?}: expected exactly the declared tag map after the update, got {tags:?}"
         );
 
         // The same queue, not a new one: the name still resolves to the same url, the

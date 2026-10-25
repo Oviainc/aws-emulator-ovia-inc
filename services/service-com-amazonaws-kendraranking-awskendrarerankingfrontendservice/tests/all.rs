@@ -15,6 +15,8 @@
 mod arn_refusal_single_source;
 #[path = "all/control_plane_fidelity.rs"]
 mod control_plane_fidelity;
+#[path = "all/handler_list_ceiling_report.rs"]
+mod handler_list_ceiling_report;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/plan_capacity_quota.rs"]

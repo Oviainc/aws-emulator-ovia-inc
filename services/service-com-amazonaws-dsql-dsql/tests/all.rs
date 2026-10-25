@@ -41,6 +41,8 @@ mod policy_version_conflict_and_lockout;
 mod reserved_tag_keys;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/retired_cluster_token_cleanup.rs"]
+mod retired_cluster_token_cleanup;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stream_lifecycle.rs"]

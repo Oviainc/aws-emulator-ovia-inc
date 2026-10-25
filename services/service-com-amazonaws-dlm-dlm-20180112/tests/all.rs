@@ -35,3 +35,5 @@ mod policy_type;
 mod region_isolation;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/unresolvable_policy_id.rs"]
+mod unresolvable_policy_id;

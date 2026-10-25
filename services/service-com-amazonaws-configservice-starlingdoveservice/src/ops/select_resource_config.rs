@@ -18,7 +18,8 @@
 //!   selects and filters on are the members of `ConfigurationItem`;
 //! * `Limit` is the page size, with the modelled default of 0 meaning the maximum
 //!   ([`crate::state::SELECT_RESULTS_PAGE_SIZE`]); a limit outside the modelled range
-//!   is `InvalidLimitException`;
+//!   is `InvalidLimitException`, and a `LIMIT` the EXPRESSION itself carries bounds the
+//!   rows the query answers before any of them are paged;
 //! * `NextToken` resumes the page after the results already answered, and a token
 //!   outside the opaque form this operation issues is `InvalidNextTokenException`.
 //!

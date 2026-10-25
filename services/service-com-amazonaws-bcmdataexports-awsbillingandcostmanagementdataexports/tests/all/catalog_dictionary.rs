@@ -277,7 +277,34 @@ const PUBLISHED_PROPERTIES: &[(&str, &[PropertyRow])] = &[
 
 /// `GetTable` for `table`, requiring HTTP 200.
 async fn get_table(client: &Client, table: &str) -> Value {
-    client.ok("GetTable", &json!({ "TableName": table })).await
+    get_table_configured(client, table, None).await
+}
+
+/// `GetTable` for `table` under `properties`, requiring HTTP 200.
+async fn get_table_configured(client: &Client, table: &str, properties: Option<Value>) -> Value {
+    let request = match properties {
+        None => json!({ "TableName": table }),
+        Some(properties) => json!({ "TableName": table, "TableProperties": properties }),
+    };
+    client.ok("GetTable", &request).await
+}
+
+/// The configuration a table's WHOLE published column set is reported under: every
+/// property it publishes that accepts `TRUE`, set to `TRUE`.
+///
+/// A property the dictionary publishes as INCLUDING something (the resource IDs on line
+/// items, the fission columns, the IAM principal columns) reports the columns it includes
+/// only at that value, so a request naming no property is answered with a published schema
+/// that is not the table's complete one. `None` for a table that publishes no such
+/// property.
+fn every_included_column(table: &str) -> Option<Value> {
+    let (_, properties) = PUBLISHED_PROPERTIES.iter().find(|(name, _)| *name == table)?;
+    let configured: serde_json::Map<String, Value> = properties
+        .iter()
+        .filter(|(_, valid_values, _)| valid_values.contains(&"TRUE"))
+        .map(|(name, _, _)| ((*name).to_string(), json!("TRUE")))
+        .collect();
+    (!configured.is_empty()).then(|| Value::Object(configured))
 }
 
 /// The reported schema as `(Name, Type, Description)` triples, in response order.
@@ -356,7 +383,10 @@ async fn the_published_columns_are_reported_with_their_published_kind_of_data() 
     let client = Client::new();
 
     for (table, columns) in PUBLISHED_COLUMNS {
-        let body = get_table(&client, table).await;
+        // Read under the configuration that includes every column the table can publish:
+        // a property that includes columns reports them only at `TRUE`, so the complete
+        // published set is the one this configuration selects.
+        let body = get_table_configured(&client, table, every_included_column(table)).await;
         let reported: BTreeMap<String, String> = schema_of(table, &body)
             .into_iter()
             .map(|(name, data_type, _)| (name, data_type))

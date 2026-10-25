@@ -1,15 +1,37 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResourceSetResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResourceSetResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResourceSetResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a page of the resources currently associated with one Firewall
+//! Manager resource set — the membership `BatchAssociateResource` writes and
+//! `BatchDisassociateResource` removes from — in the stable URI order the store
+//! keeps it in. A REPORTING operation: it writes nothing.
+//!
+//! Administrator-gated, like every organisation-scoped Firewall Manager
+//! operation and like the `PutResourceSet` / `GetResourceSet` /
+//! `ListResourceSets` that write and read the same records: with no Firewall
+//! Manager default administrator association in this account/Region the call is
+//! refused by [`crate::state::require_administrator`] BEFORE the identifier is
+//! looked up, so a nonexistent resource set and a stored one get the same
+//! refusal.
+//!
+//! The `Identifier` is this operation's own `ResourceId` (length 1..1024) rather
+//! than the 22-character `Base62Id` `GetResourceSet` takes, so — exactly as for
+//! the batch operations' `ResourceSetIdentifier` — a caller may name the set by
+//! its `Id` or by its ARN, and both resolve through the one shared
+//! [`crate::state::resolve_resource_set_id`]. An identifier that names neither
+//! is `ResourceNotFoundException`.
+//!
+//! Paging follows the model's `NextToken` / `MaxResults` pair: at most
+//! `MaxResults` resources per page (bounded by the one page-size rule
+//! [`crate::state::page_size`] holds every paginated operation of this service
+//! to), and a `NextToken` ONLY when a resource remains after the page. The token
+//! is opaque and carries the URI the next page starts at, so it round-trips into
+//! the next page without a server-side cursor.
+//!
+//! Each reported resource carries the account it belongs to, read off the
+//! account field of its own ARN rather than stored beside it: the URI is the
+//! membership, and a second copy of the account could disagree with it.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +185,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResourceSetResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourceSetResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResourceSetResources"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListResourceSetResourcesErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the Firewall Manager store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        // The authorization gate, BEFORE the identifier is looked up and before
+        // any of the store's contents is reported.
+        crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
+
+        // The set whose membership is being reported, named by its `Id` or by its
+        // ARN through the one shared resolver.
+        let Some(record) = crate::state::resolve_resource_set_id(&store, &input.identifier)
+            .and_then(|id| store.resource_sets.get(&id))
+        else {
+            return Err(
+                ListResourceSetResourcesErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(),
+                )
+                .into(),
+            );
+        };
+
+        // A token this service did not mint for a resource-membership page names
+        // no page boundary. The refusal is a bad request, not an invented page:
+        // the modelled `InvalidInputException` is exactly "the parameters of the
+        // request were invalid".
+        let start = match input.next_token.as_deref() {
+            Some(token) => match crate::state::decode_uri_page_token(token) {
+                Some(start) => Some(start),
+                None => {
+                    return Err(
+                        ListResourceSetResourcesErrorModeled::InvalidInputException(
+                            InvalidInputException {
+                                message: Some(
+                                    "NextToken is not a pagination token issued by \
+                                     ListResourceSetResources"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+            None => None,
+        };
+
+        // The membership is ordered by the resource's URI, so the boundary is a
+        // key: resume at the first URI at or after the token's. With no token the
+        // lower bound is the empty URI, which sorts before every ARN.
+        let lower = start.unwrap_or_default();
+        let mut remaining = record.resources.range(lower..);
+
+        // The page is bounded whether or not the caller asked for a bound, by the
+        // one page-size rule every paginated operation of this service shares.
+        let page_size = crate::state::page_size(input.max_results);
+        let items: Vec<Resource> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(|uri| Resource {
+                uri: uri.clone(),
+                account_id: resource_account_id(uri),
+            })
+            .collect();
+        // A token only when a resource is left AFTER this page, so the last page
+        // carries none.
+        let next_token = remaining.next().map(|uri| crate::state::encode_key_token(uri));
+
+        Ok(ListResourceSetResourcesOutput { items, next_token })
     }
+}
+
+/// The account a member resource belongs to (`Resource$AccountId`: "the Amazon
+/// Web Services account ID that the associated resource belongs to"), read off
+/// the account field of the resource's own ARN.
+///
+/// Derived rather than stored, so it cannot disagree with the URI it describes.
+/// `None` when that field carries no `AWSAccountId` — a global service's ARN
+/// leaves it empty — because the modelled member is optional and its pattern
+/// (`^[0-9]+$`) admits nothing else.
+fn resource_account_id(uri: &str) -> Option<String> {
+    crate::state::parse_arn(uri)
+        .map(|arn| arn.account)
+        .filter(|account| crate::state::is_account_id(account))
+        .map(str::to_string)
 }
