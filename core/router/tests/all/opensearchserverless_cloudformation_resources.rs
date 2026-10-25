@@ -9,8 +9,8 @@
 //! and a collection `BatchGetCollection` reports — addressed by the server-minted
 //! `CollectionId` that `{"Ref": <collection>}` returns, not by the name the template
 //! declared — and deleting the stack takes both away. A resource the owning service
-//! REFUSES is not reported as created: the stack settles into `CREATE_FAILED` carrying
-//! that refusal.
+//! REFUSES is not reported as created: the failed create is rolled back and the stack
+//! settles into `ROLLBACK_COMPLETE` carrying that refusal.
 //!
 //! This suite needs TWO services on one engine — CloudFormation reaches OpenSearch
 //! Serverless through the in-process callback, so a single-service router has no
@@ -624,8 +624,8 @@ fn a_stack_whose_resource_the_owning_service_refuses_fails_instead_of_reporting_
             );
             assert_eq!(
                 xml_text(&described, "StackStatus"),
-                "CREATE_FAILED",
-                "case DescribeStacks(no encryption policy): the stack must have failed, got {described}"
+                "ROLLBACK_COMPLETE",
+                "case DescribeStacks(no encryption policy): the failed create must have been rolled back, got {described}"
             );
             let reason = xml_text(&described, "StackStatusReason");
             assert!(

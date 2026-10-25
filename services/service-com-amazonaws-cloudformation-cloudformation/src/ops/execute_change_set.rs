@@ -205,6 +205,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let now = ::std::time::SystemTime::now();
+        // A change set, like the stack it plans changes for, belongs to the Region the
+        // request is signed for.
+        let request_region = crate::state::request_region(ctx.parts());
         // The store is written under the lock and the lock is RELEASED with this block:
         // the calls that create or delete the stack's resources run after it, and each of
         // those reaches another service's own handler, which takes that service's lock.
@@ -213,7 +216,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.settle(now);
 
             let change_set = store
-                .resolve_change_set(&input.change_set_name, input.stack_name.as_deref())
+                .resolve_change_set(
+                    &request_region,
+                    &input.change_set_name,
+                    input.stack_name.as_deref(),
+                )
                 .ok_or_else(|| {
                     ExecuteChangeSetError::from(
                         ExecuteChangeSetErrorModeled::ChangeSetNotFoundException(
@@ -278,7 +285,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The stack the change set belongs to. An operation already in flight on it is
             // exactly the case `InvalidChangeSetStatusException` documents ("the stack
             // status might be UPDATE_IN_PROGRESS").
-            let Some(stack) = store.resolve_mut(&stack_id) else {
+            let Some(stack) = store.resolve_mut(&request_region, &stack_id) else {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
                     crate::state::stack_does_not_exist(&stack_id),
                 ));
@@ -366,7 +373,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
             // The change set is executing now and reaches EXECUTE_COMPLETE with the stack
             // it applied, on the same due instant.
-            if let Some(change_set) = store.resolve_change_set_mut(&change_set_id, None) {
+            if let Some(change_set) =
+                store.resolve_change_set_mut(&request_region, &change_set_id, None)
+            {
                 change_set.execution_status = execution_status::EXECUTE_IN_PROGRESS.to_string();
                 change_set.pending = Some(PendingChangeSetStatus {
                     status: None,
@@ -391,19 +400,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .await;
 
-        let mut store = state.lock();
-        if let Some(stack) = store.resolve_mut(&stack_id) {
-            stack.record_materialised_resources(materialised.resources);
-            if let Some(failure) = materialised.failure {
-                // A resource an owning service refused: the stack does not reach the
-                // status this execution was headed for, and the reason reported is the one
-                // that service gave.
-                let failed = if stack.status == status::CREATE_IN_PROGRESS {
-                    status::CREATE_FAILED
-                } else {
-                    status::UPDATE_FAILED
-                };
-                stack.fail_transition(::std::time::SystemTime::now(), failed, failure);
+        // What the failure (if any) owes the stack beyond the failed status it records.
+        // A CREATE that fails is ROLLED BACK, exactly as one `CreateStack` started is:
+        // "ROLLBACK — Roll back the stack creation. This is the default", and the stack a
+        // CREATE change set executes into existence is a stack creation. An UPDATE keeps
+        // the previous template in force and is reported as `UPDATE_FAILED`.
+        let unwind = {
+            let mut store = state.lock();
+            match store.resolve_mut(&request_region, &stack_id) {
+                None => None,
+                Some(stack) => {
+                    stack.record_materialised_resources(materialised.resources);
+                    match materialised.failure {
+                        None => None,
+                        Some(failure) => {
+                            // A resource an owning service refused: the stack does not
+                            // reach the status this execution was headed for, and the
+                            // reason reported is the one that service gave.
+                            let creating = stack.status == status::CREATE_IN_PROGRESS;
+                            let failed = if creating {
+                                status::CREATE_FAILED
+                            } else {
+                                status::UPDATE_FAILED
+                            };
+                            let failed_at = ::std::time::SystemTime::now();
+                            stack.fail_transition(failed_at, failed, failure.clone());
+                            if creating && !stack.disable_rollback {
+                                stack.begin_rollback(failed_at, failure);
+                                Some(stack.current_resources())
+                            } else {
+                                None
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        // Removing what the failed create had made, with the store unlocked: the same
+        // unwind `CreateStack` performs, since the clock already owes the rolled-back
+        // status.
+        if let Some(resources) = unwind {
+            let deleted = crate::state::provisioning::unwind(ctx, &region, &resources).await;
+            let mut store = state.lock();
+            if let Some(stack) = store.resolve_mut(&request_region, &stack_id) {
+                stack.record_materialised_resources(deleted.resources);
+                if let Some(failure) = deleted.failure {
+                    stack.fail_transition(
+                        ::std::time::SystemTime::now(),
+                        status::ROLLBACK_FAILED,
+                        failure,
+                    );
+                }
             }
         }
 

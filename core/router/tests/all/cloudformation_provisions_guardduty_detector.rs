@@ -533,8 +533,9 @@ async fn a_second_detector_in_one_region_fails_the_stack() {
             .await;
     assert_eq!(
         opt_element(&second, "StackStatus").as_deref(),
-        Some("CREATE_FAILED"),
-        "case {case:?}: expected the second stack to fail, got {second}"
+        Some("ROLLBACK_COMPLETE"),
+        "case {case:?}: expected the second stack's failed create to be rolled back, got \
+         {second}"
     );
     let reason = opt_element(&second, "StackStatusReason").unwrap_or_default();
     assert!(
