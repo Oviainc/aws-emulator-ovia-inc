@@ -21,6 +21,8 @@ mod channel_lifecycle;
 mod cluster_lifecycle;
 #[path = "all/compatible_kafka_versions.rs"]
 mod compatible_kafka_versions;
+#[path = "all/configuration_deletion.rs"]
+mod configuration_deletion;
 #[path = "all/configuration_lifecycle.rs"]
 mod configuration_lifecycle;
 #[path = "all/configuration_revision_properties.rs"]

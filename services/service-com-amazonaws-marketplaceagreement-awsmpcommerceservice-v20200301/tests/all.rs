@@ -49,6 +49,8 @@ mod purchase_order_associations;
 mod purchase_order_updates;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
+#[path = "all/search_filter_combinations.rs"]
+mod search_filter_combinations;
 #[path = "all/selector_resolution.rs"]
 mod selector_resolution;
 #[path = "all/selector_values.rs"]

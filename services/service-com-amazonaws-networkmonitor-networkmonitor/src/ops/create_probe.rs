@@ -5,6 +5,9 @@
 //! Mints a `probeId`, attaches the probe record to the stored monitor in
 //! [`crate::state`], and answers from the record it stored. A repeat carrying
 //! the same `clientToken` replays the first probe rather than minting a second.
+//! A monitor holds only so many probes in one source subnet
+//! ([`crate::state::check_probes_per_subnet`]), so a request past that bound is
+//! refused and mints nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -139,7 +142,10 @@ impl From<CreateProbeErrorModeled> for CreateProbeError {
 ///
 /// Used for the probe rules the model documents in prose but its constraints
 /// cannot express — the `sourceArn` subnet rule and the `destination` /
-/// `destinationPort` rules; see [`crate::state::build_probe`].
+/// `destinationPort` rules (see [`crate::state::build_probe`]), and the
+/// probe-count limits ([`crate::state::check_probes_per_subnet`]), which AWS
+/// refuses as a validation failure rather than as the quota failure the model
+/// also declares.
 fn validation(message: String) -> CreateProbeError {
     CreateProbeErrorModeled::ValidationException(ValidationException {
         message: Some(message),
@@ -273,16 +279,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .monitor(&region, &input.monitor_name)
             .map_or(0, |monitor| monitor.probes.len());
         if probe_count >= crate::state::MAX_PROBES_PER_MONITOR {
-            return Err(CreateProbeErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "this emulator keeps at most {} probes per monitor",
-                        crate::state::MAX_PROBES_PER_MONITOR
-                    )),
-                },
-            )
-            .into());
+            return Err(validation(
+                crate::state::PROBES_PER_MONITOR_MESSAGE.to_string(),
+            ));
         }
+        // The probe has to satisfy the probe rules on its own before the request
+        // is judged on how many probes its subnet already holds, so a malformed
+        // probe is refused for what it says.
+        // `crate::state::build_probe` below applies the same rules when it
+        // writes the record.
+        crate::state::validate_probe_spec(&spec, &crate::state::member_path("probe"))
+            .map_err(validation)?;
+        // A probe occupies a slot in the subnet its `sourceArn` names, and a
+        // monitor holds only so many probes per subnet. Checked before a probe
+        // id is minted, so a refused create mints nothing.
+        crate::state::check_probes_per_subnet(
+            store.monitor(&region, &input.monitor_name),
+            ::std::iter::once(spec.source_arn.as_str()),
+        )
+        .map_err(validation)?;
 
         let probe_id = store.next_probe_id(now);
         // The probe this request describes sits at its `probe` member, which is

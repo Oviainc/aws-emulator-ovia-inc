@@ -210,6 +210,9 @@ pub enum DatastoreAction {
     /// Starting a FHIR export job on the data store, which reads it rather than
     /// changing it but still needs a settled, usable data store to export from.
     ExportFrom,
+    /// Restoring the data store to a point in time, which mints a new data store
+    /// from this one's backup and so needs this one settled and usable too.
+    Restore,
 }
 
 impl DatastoreAction {
@@ -218,6 +221,7 @@ impl DatastoreAction {
         match self {
             Self::Delete => "deleted",
             Self::ExportFrom => "exported from",
+            Self::Restore => "restored",
         }
     }
 }

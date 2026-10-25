@@ -576,6 +576,15 @@ async fn mission_profile_round_trips_every_member_it_was_created_with() {
         None,
     )
     .await;
+    // The far end of an UPLINK dataflow, so the two-edge row below carries one dataflow
+    // in each direction rather than two of the same kind.
+    let (_, _, uplink_arn) = create_config(
+        &router,
+        "profile-uplink",
+        json!({"antennaUplinkConfig": antenna_uplink_config_data()}),
+        None,
+    )
+    .await;
 
     // Rows differ along what the rule generalises over: the optional pre/post-pass
     // durations (absent, both published bounds), the number of dataflow edges, the
@@ -613,7 +622,7 @@ async fn mission_profile_round_trips_every_member_it_was_created_with() {
                 "contactPostPassDurationSeconds": 21600,
                 "dataflowEdges": [
                     [downlink_arn, endpoint_arn],
-                    [endpoint_arn, telemetry_arn],
+                    [endpoint_arn, uplink_arn],
                 ],
                 "trackingConfigArn": tracking_arn,
                 "telemetrySinkConfigArn": telemetry_arn,

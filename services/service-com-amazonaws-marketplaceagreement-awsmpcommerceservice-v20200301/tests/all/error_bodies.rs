@@ -285,7 +285,10 @@ async fn every_error_body_carries_a_unique_modelled_request_id() {
         (
             "a handler's own input check: a token naming no page",
             "SearchAgreements",
-            json!({"nextToken": "0123456789abcdef00000001"}),
+            json!({
+                "nextToken": "0123456789abcdef00000001",
+                "filters": [{"name": "AgreementType", "values": ["PurchaseAgreement"]}],
+            }),
         ),
         (
             "a handler's own input check: a filter member naming no agreement",

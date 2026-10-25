@@ -535,9 +535,10 @@ async fn the_compliance_summary_is_computed_over_the_rules_in_state() {
             "case {case:?}: expected a ComplianceSummary, got {body}"
         );
 
-        // Nothing has evaluated any of these rules — no operation of this emulator can
-        // record an evaluation result yet — so every rule is INSUFFICIENT_DATA and
-        // contributes to neither count, under the cap and with CapExceeded clear.
+        // Nothing has delivered an evaluation for any of these rules — they are
+        // managed rules, whose evaluator Config runs itself and this emulator does not
+        // — so every rule is INSUFFICIENT_DATA and contributes to neither count, under
+        // the cap and with CapExceeded clear.
         for member in ["CompliantResourceCount", "NonCompliantResourceCount"] {
             assert_eq!(
                 summary[member]["CappedCount"],

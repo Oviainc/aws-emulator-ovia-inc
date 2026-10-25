@@ -44,7 +44,7 @@ use crate::api_lifecycle::{
 };
 
 /// The Region [`call`] signs for, and the one a derived invoke URL therefore names.
-const REGION: &str = "eu-west-1";
+pub(crate) const REGION: &str = "eu-west-1";
 
 /// How far the reported `LastModified` may sit from this test's clock reading, in
 /// seconds. The service reports the instant at second granularity, so a whole second of
@@ -54,17 +54,20 @@ const LAST_MODIFIED_SLACK_SECONDS: f64 = 60.0;
 
 /// The portal-products collection URI (`CreatePortalProduct`'s modelled
 /// `POST /v2/portalproducts`).
-const PRODUCTS: &str = "/v2/portalproducts";
+pub(crate) const PRODUCTS: &str = "/v2/portalproducts";
 
 /// The pages collection of one product (`POST|GET
 /// /v2/portalproducts/{PortalProductId}/productrestendpointpages`).
-fn pages_of(portal_product_id: &str) -> String {
+pub(crate) fn pages_of(portal_product_id: &str) -> String {
     format!("{PRODUCTS}/{portal_product_id}/productrestendpointpages")
 }
 
 /// Create one portal product and answer its id — the parent every page in this suite is
 /// created under.
-async fn product(emulator: &smithy_server_runtime::MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn product(
+    emulator: &smithy_server_runtime::MultiServiceRouter,
+    name: &str,
+) -> String {
     let (status, created) = call(
         emulator,
         "POST",
@@ -83,7 +86,7 @@ async fn product(emulator: &smithy_server_runtime::MultiServiceRouter, name: &st
 /// REST API: the API's default execute-api host, then the stage, then the endpoint's
 /// path. Written out here rather than taken from the service, so the table asserts the
 /// rule rather than the implementation. The method is not part of a URL.
-fn invoke_url(rest_api_id: &str, stage: &str, path: &str, region: &str) -> String {
+pub(crate) fn invoke_url(rest_api_id: &str, stage: &str, path: &str, region: &str) -> String {
     let path = path.strip_prefix('/').unwrap_or(path);
     format!("https://{rest_api_id}.execute-api.{region}.amazonaws.com/{stage}/{path}")
 }
@@ -109,17 +112,17 @@ struct Row {
 }
 
 /// A `restApiId` at the modelled maximum (`IdentifierParts$RestApiId`, len 1..50).
-fn max_rest_api_id() -> String {
+pub(crate) fn max_rest_api_id() -> String {
     "r".repeat(50)
 }
 
 /// A `stage` at the modelled maximum (`IdentifierParts$Stage`, len 1..128).
-fn max_stage() -> String {
+pub(crate) fn max_stage() -> String {
     "s".repeat(128)
 }
 
 /// A `body` at the modelled maximum (`DisplayContentOverrides$Body`, len 1..32768).
-fn max_body() -> String {
+pub(crate) fn max_body() -> String {
     "b".repeat(32768)
 }
 
@@ -337,7 +340,7 @@ fn request_of(row: &Row) -> Value {
 }
 
 /// One member of a response's `displayContent`.
-fn content_member(document: &Value, member: &str) -> Option<String> {
+pub(crate) fn content_member(document: &Value, member: &str) -> Option<String> {
     document
         .get("displayContent")
         .and_then(|content| content.get(member))

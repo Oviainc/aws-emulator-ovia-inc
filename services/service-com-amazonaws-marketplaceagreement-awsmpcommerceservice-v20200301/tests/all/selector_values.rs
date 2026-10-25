@@ -151,6 +151,22 @@ fn filters() -> Vec<FilterValues> {
 /// `@length(min: 1, max: 1)`, so the value is that list's first element).
 const FIRST_FILTER_VALUE_PATH: &str = "filters.1.member.values.1.member";
 
+/// The filter list one row sends: the filter under test FIRST, so a refusal's
+/// path names it, followed by the agreement-type filter
+/// `SearchAgreementsInput$filters` requires of every search — unless the row is
+/// about that filter itself, which already carries it.
+fn filters_for(name: &str, value: &str) -> serde_json::Value {
+    let under_test = json!({"name": name, "values": [value]});
+    if name == "AgreementType" {
+        json!([under_test])
+    } else {
+        json!([
+            under_test,
+            {"name": "AgreementType", "values": ["PurchaseAgreement"]},
+        ])
+    }
+}
+
 /// Two stores, so a value the handler only compared while scanning cannot pass:
 /// one holding an agreement, and one holding nothing at all.
 async fn stores() -> Vec<(&'static str, MultiServiceRouter)> {
@@ -173,7 +189,7 @@ async fn a_filter_value_outside_its_published_set_is_refused() {
                 let answer = call(
                     &router,
                     "SearchAgreements",
-                    json!({"filters": [{"name": filter.name, "values": [value]}]}),
+                    json!({"filters": filters_for(filter.name, value)}),
                 )
                 .await;
                 assert_eq!(
@@ -215,7 +231,7 @@ async fn every_published_filter_value_is_served() {
                 let answer = call(
                     &router,
                     "SearchAgreements",
-                    json!({"filters": [{"name": filter.name, "values": [value]}]}),
+                    json!({"filters": filters_for(filter.name, value)}),
                 )
                 .await;
                 assert_eq!(

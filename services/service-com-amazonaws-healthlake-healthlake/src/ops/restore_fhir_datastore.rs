@@ -259,10 +259,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             // The status is the SERVICE's own state, so the
                             // sentence states it; the requested id is caller
                             // input, which this service's error text never
-                            // quotes back.
-                            message: Some(format!(
-                                "Specified datastore is in status {} and cannot be restored.",
-                                source.status.as_wire()
+                            // quotes back. Stated through the one shared helper
+                            // every operation on this resource uses.
+                            message: Some(crate::state::datastore_in_transition_message(
+                                source.status,
+                                crate::state::DatastoreAction::Restore,
                             )),
                         },
                     )

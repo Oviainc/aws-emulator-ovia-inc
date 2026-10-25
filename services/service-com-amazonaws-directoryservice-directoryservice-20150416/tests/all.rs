@@ -17,6 +17,8 @@ mod ad_assessment;
 mod certificates;
 #[path = "all/computers.rs"]
 mod computers;
+#[path = "all/conditional_forwarder_deletion.rs"]
+mod conditional_forwarder_deletion;
 #[path = "all/conditional_forwarders.rs"]
 mod conditional_forwarders;
 #[path = "all/directory_data_access.rs"]

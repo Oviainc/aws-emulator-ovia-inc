@@ -200,8 +200,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every config a profile wires up must exist, and a reference whose member names
         // ONE config type must name a config of that type: `trackingConfigArn` is "ARN of
         // a tracking Config" and `telemetrySinkConfigArn` a telemetry-sink one, while a
-        // dataflow edge joins configs of whatever types the dataflow runs between, so an
-        // edge endpoint is only required to exist.
+        // dataflow edge may join configs of several type pairs, so an edge endpoint is
+        // resolved here under no one type and its PAIR is type-checked below.
         let mut referenced: Vec<(&String, Option<&str>)> =
             vec![(&input.tracking_config_arn, Some("tracking"))];
         if let Some(arn) = input.telemetry_sink_config_arn.as_ref() {
@@ -221,6 +221,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 )
                 .into());
+            }
+        }
+
+        // An edge is one dataflow of a contact, not any two configs that happen to exist:
+        // its source's capability must originate a dataflow and its destination's must
+        // receive data from that source, or the graph describes no dataflow the service
+        // could run and the profile is refused rather than stored (see
+        // `state::dataflow_edge_fault`).
+        for edge in &input.dataflow_edges {
+            if let Some(refusal) = guard.dataflow_edge_fault(edge) {
+                return Err(
+                    CreateMissionProfileErrorModeled::InvalidParameterException(refusal).into(),
+                );
             }
         }
 

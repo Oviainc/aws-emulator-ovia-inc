@@ -93,7 +93,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::normalize_zone_id;
+use crate::state::{no_such_delegation_set, normalize_delegation_set_id, normalize_zone_id};
 
 /// The most hosted zones one response carries.
 ///
@@ -183,16 +183,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // A reusable delegation set has to exist to be filtered on, and this
-        // emulator mints none (CreateReusableDelegationSet is not implemented).
-        if let Some(set_id) = input.delegation_set_id.as_deref().filter(|id| !id.is_empty()) {
-            return Err(ListHostedZonesErrorModeled::NoSuchDelegationSet(NoSuchDelegationSet {
-                message: Some(format!(
-                    "no reusable delegation set exists with the ID {set_id}"
-                )),
-            })
-            .into());
-        }
+        // A reusable delegation set has to exist to be filtered on; when it
+        // does, the listing is the zones created in it.
+        let delegation_set = input
+            .delegation_set_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
 
         let page_size = input
             .max_items
@@ -208,12 +205,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let private_only = input.hosted_zone_type.as_deref() == Some(PRIVATE_HOSTED_ZONE);
 
         let store = state.lock();
+        // The filter names a set, so an id naming none is the refusal rather
+        // than an empty page: a caller asking about a set that does not exist
+        // is told so.
+        let set_id = match delegation_set.as_deref() {
+            None => None,
+            Some(requested) => {
+                let set_id = normalize_delegation_set_id(requested).to_string();
+                if !store.delegation_sets.contains_key(&set_id) {
+                    return Err(ListHostedZonesErrorModeled::NoSuchDelegationSet(
+                        no_such_delegation_set(requested),
+                    )
+                    .into());
+                }
+                Some(set_id)
+            }
+        };
         // The store keys zones by id in a BTreeMap, so this walk is a stable
         // total order and a marker always resumes at the same place.
         let matching = store
             .zones
             .values()
             .filter(|zone| !private_only || zone.private_zone)
+            .filter(|zone| {
+                set_id.is_none() || zone.delegation_set_id.as_deref() == set_id.as_deref()
+            })
             .filter(|zone| start.is_empty() || zone.id.as_str() >= start.as_str());
 
         let mut hosted_zones = Vec::new();

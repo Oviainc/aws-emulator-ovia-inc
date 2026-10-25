@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes a stored MSK configuration. The configuration leaves the registry, so the
+//! next reader no longer sees it and its name is free for a later create; the response
+//! reports the `DELETING` state the delete put it in, the same way
+//! [`crate::ops::delete_cluster`] reports a deleted cluster.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A configuration a cluster was created with is still being used by that cluster, so
+//! deleting it is refused with a `BadRequestException` and the configuration stays
+//! readable and `ACTIVE`: the association lives on the cluster record
+//! ([`crate::state::ComAmazonawsKafkaKafkaState::clusters_using_configuration`]), so it
+//! stops holding the configuration down once those clusters are gone.
+//!
+//! An `Arn` this endpoint's region holds no configuration for — not shaped like an MSK
+//! configuration ARN, absent, already deleted, or belonging to another region — is a
+//! `BadRequestException` carrying
+//! [`crate::state::CONFIGURATION_ARN_NOT_FOUND_MESSAGE`], and NOT the
+//! `NotFoundException` the configuration readers answer: this delete reports an ARN it
+//! cannot resolve as a bad request. One lookup decides it, since only an ARN the
+//! registry minted can resolve at all.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +153,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteConfigurationErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some("the kafka service state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut state = state.lock();
+        // One condition, one refusal: an `Arn` that resolves to no configuration
+        // of this region is a bad request, whether it is malformed, names a
+        // configuration another region holds, or named one a delete already
+        // took. Resolved before anything is removed, through the same regional
+        // lookup the readers use, so a delete and a describe agree on which
+        // configurations this endpoint holds.
+        if state.configuration_in(&region, &input.arn).is_none() {
+            return Err(
+                DeleteConfigurationErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("Arn".to_string()),
+                    message: Some(
+                        crate::state::CONFIGURATION_ARN_NOT_FOUND_MESSAGE.to_string(),
+                    ),
+                })
+                .into(),
+            );
+        }
+
+        // A cluster created with this configuration still uses it, so the
+        // configuration cannot go: deleting it would leave that cluster naming a
+        // configuration nothing holds. Refused before the removal, so a refused
+        // delete leaves the configuration exactly as it was.
+        let holders = state.clusters_using_configuration(&region, &input.arn);
+        if !holders.is_empty() {
+            return Err(
+                DeleteConfigurationErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("Arn".to_string()),
+                    message: Some(crate::state::CONFIGURATION_IN_USE_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
+        state.unregister_configuration(&region, &input.arn);
+        Ok(DeleteConfigurationOutput {
+            arn: Some(input.arn),
+            state: Some(crate::state::CONFIGURATION_STATE_DELETING.to_string()),
+        })
     }
 }
