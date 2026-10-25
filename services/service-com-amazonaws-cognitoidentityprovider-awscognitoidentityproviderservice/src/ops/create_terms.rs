@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTerms
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTerms`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTerms::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores one set of terms documents for an app client of a stored user pool and
+//! returns the STORED resource, so a later `DescribeTerms` renders the same thing.
+//! The document is minted a `TermsId`; a name the app client already holds is
+//! refused with `TermsExistsException`, an unknown pool or app client with
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -191,20 +187,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTerms` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTermsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTerms"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        // `TermsType.Links` is a REQUIRED member holding at least one entry, so
+        // a stored terms document always carries one language-to-URL pair: a
+        // request that supplies none asks for a document that cannot exist.
+        let links = input
+            .links
+            .as_ref()
+            .filter(|links| !links.is_empty())
+            .ok_or_else(missing_links)?;
+
+        // `LinksType`'s key is a `LanguageIdType`, which admits only the
+        // languages managed login localizes: a URL for any other language is a
+        // link nothing would ever display.
+        if let Some(language) = crate::state::unsupported_link_language(links.keys()) {
+            return Err(unsupported_language(language));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // "The ID of the app client where you want to create terms documents.
+        // Must be an app client in the requested user pool."
+        // (`CreateTerms.ClientId`).
+        if !pool.clients.contains_key(&input.client_id) {
+            return Err(client_not_found(&input.client_id));
+        }
+
+        // "Terms document names must be unique to the app client."
+        // (`TermsExistsException`) — a second document of that name on that app
+        // client is refused and the stored one is left exactly as it was.
+        if pool
+            .terms_for_client(&input.client_id, &input.terms_name)
+            .is_some()
+        {
+            return Err(terms_exists(&input.terms_name));
+        }
+
+        let terms_id = crate::state::new_uuid();
+        let terms = crate::state::Terms {
+            terms_id: terms_id.clone(),
+            user_pool_id: pool.id.clone(),
+            client_id: input.client_id.clone(),
+            terms_name: input.terms_name.clone(),
+            terms_source: input.terms_source.clone(),
+            enforcement: input.enforcement.clone(),
+            links: links
+                .iter()
+                .map(|(language, url)| (language.clone(), url.clone()))
+                .collect(),
+            creation_date: now,
+            last_modified_date: now,
+        };
+        // Rendered from the record this call STORED, so the response is what a
+        // later read sees. The `TermsId` was just minted, so the entry cannot
+        // pre-exist: this stores the new record and hands it straight back.
+        let stored = pool.terms.entry(terms_id).or_insert(terms).to_terms_type();
+        Ok(CreateTermsOutput {
+            terms: Some(stored),
+        })
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> CreateTermsError {
+    CreateTermsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for an app client the named pool
+/// does not hold.
+fn client_not_found(client_id: &str) -> CreateTermsError {
+    CreateTermsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool client {client_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `TermsExistsException` for a name the app client already
+/// holds terms documents under.
+fn terms_exists(terms_name: &str) -> CreateTermsError {
+    CreateTermsErrorModeled::TermsExistsException(TermsExistsException {
+        message: Some(format!(
+            "Terms documents named {terms_name} already exist for this app client."
+        )),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException` for a request that supplies no
+/// language-to-URL link at all.
+fn missing_links() -> CreateTermsError {
+    CreateTermsErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(
+            "Links must carry at least one language-to-URL entry for the requested TermsName."
+                .to_string(),
+        ),
+        reason_code: None,
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException` for a `Links` key that names no
+/// language managed login localizes.
+fn unsupported_language(language: &str) -> CreateTermsError {
+    CreateTermsErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(format!(
+            "Links carries a language managed login does not localize: {language}."
+        )),
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> CreateTermsError {
+    CreateTermsErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }
