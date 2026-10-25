@@ -120,19 +120,117 @@ pub const MANAGEMENT_ACCOUNT_ONLY: &str =
 pub const LEGAL_ADDRESS_ROLE: &str = "TaxAddress";
 
 /// The `TaxRegistrationType` values whose legal address AWS derives from the tax
-/// number itself rather than from the request, paired with the country the type
-/// belongs to.
+/// number itself rather than from the request.
 ///
 /// A request that submits a `legalAddress` for one of them is refused: the
 /// address is not the caller's to supply. `PAN` is India's Permanent Account
 /// Number, and the model's own `ValidationExceptionErrorCode` enum carries
-/// `NonIndiaCustomerCanNotSetPAN`, so the type is India-only.
+/// `NonIndiaCustomerCanNotSetPAN`, so the type is India-only — the country it
+/// belongs to is in [`TYPE_JURISDICTIONS`]. An entry of such a type that submits
+/// no address is stored with the address derived
+/// ([`derived_legal_address`]), because the member is one the service fills in.
 ///
 /// Country rules that make a member REQUIRED (Saudi Arabia's `addressLine3`,
 /// Turkey's `districtOrCounty`, Kenya's `personType`, …) are a different class:
 /// they are the per-country business rules [`COUNTRY_RULES`] carries and
 /// [`check_country_requirements`] applies.
-pub const TYPES_WITH_DERIVED_LEGAL_ADDRESS: &[(&str, &str)] = &[("PAN", "India")];
+pub const TYPES_WITH_DERIVED_LEGAL_ADDRESS: &[&str] = &["PAN"];
+
+/// The country each country-specific `TaxRegistrationType` value belongs to: the
+/// `Address$countryCode` of that country, and the country's name as a refusal
+/// states it.
+///
+/// A `TaxRegistrationEntry` carries no country member: the jurisdiction a
+/// registration is held in is its `legalAddress.countryCode`. An entry that
+/// carries no legal address therefore identifies its jurisdiction only through
+/// its registration type, and only for the types the model ties to ONE country:
+/// Brazil's `CNPJ` and `CPF` ("If you're setting a TRN in Brazil for the CNPJ tax
+/// type …", "for CPF tax types Brazil, you must specify the legal address"),
+/// India's `PAN` (the `ValidationExceptionErrorCode` value
+/// `NonIndiaCustomerCanNotSetPAN`), and Malaysia's `NRIC` and `SST`
+/// ("`RegistrationType` valid values are `NRIC` for individual, and TIN and sales
+/// and service tax (SST) for Business"). `VAT`, `GST`, `TIN` and `NIP` are tied
+/// to no single country by any sentence the model states, so an entry of one of
+/// those carrying no address identifies no jurisdiction at all.
+pub const TYPE_JURISDICTIONS: &[(&str, &str, &str)] = &[
+    ("CNPJ", "BR", "Brazil"),
+    ("CPF", "BR", "Brazil"),
+    ("PAN", "IN", "India"),
+    ("NRIC", "MY", "Malaysia"),
+    ("SST", "MY", "Malaysia"),
+];
+
+/// The jurisdictions whose registration legal NAME the service fills in from the
+/// tax registration number, so an entry held in one need not carry it.
+///
+/// `TaxRegistrationEntry$legalName` is not `@required`, and the model states
+/// where it may be omitted: "If you're setting a TRN in Brazil, you don't need to
+/// specify the legal name. For TRNs in other countries, you must specify the
+/// legal name", plus the operation's own Mexico note — "You do not need to
+/// provide address and legal name. These will be populated based on your tax
+/// registration number."
+pub const COUNTRIES_WITH_DERIVED_LEGAL_NAME: &[&str] = &["BR", "MX"];
+
+/// The jurisdictions whose registration legal ADDRESS the service fills in from
+/// the tax registration number, each with the registration types the carve-out is
+/// documented for — an EMPTY type list meaning every type of that country.
+///
+/// `TaxRegistrationEntry$legalAddress` is not `@required`, and the model states
+/// where it may be omitted: "If you're setting a TRN in Brazil for the CNPJ tax
+/// type, you don't need to specify the legal address. For TRNs in other countries
+/// and for CPF tax types Brazil, you must specify the legal address", plus the
+/// operation's Mexico note, which carves out every Mexican registration. The
+/// per-TYPE carve-out is [`TYPES_WITH_DERIVED_LEGAL_ADDRESS`].
+///
+/// The Mexican row is the carve-out as the documentation states it, and it is
+/// REACHED only by an entry that identifies Mexico some other way: the country an
+/// entry with no legal address identifies comes from [`TYPE_JURISDICTIONS`], and
+/// no `TaxRegistrationType` belongs to Mexico, so today a Mexican entry that
+/// carries no address at all names no country and is refused for the jurisdiction
+/// ([`MISSING_LEGAL_ADDRESS_JURISDICTION`]) rather than admitted by this row. The
+/// row stays because it is what the service documents, and a later fixer whose
+/// request carries the account's country has the rule already written down.
+pub const COUNTRIES_WITH_DERIVED_LEGAL_ADDRESS: &[(&str, &[&str])] =
+    &[("BR", &["CNPJ"]), ("MX", &[])];
+
+/// What a stored registration reports for a member the real service fills in
+/// from the tax registration number, where the entry left it out.
+///
+/// NOT a derived value, and not the model's rule for this member: filling one in
+/// means reading the account's registration back from the tax authority's
+/// registry, which this emulator has none of ([`SETTLED_REGISTRATION_STATUS`] is
+/// the other consequence of that), so the LOOKUP is knowingly not emulated and
+/// the member says "not known" instead of carrying a legal name or a postcode
+/// nothing produced. A later fixer holding a source for the real value fills it
+/// in here, and nothing else changes.
+///
+/// The value itself is the one the model uses for an address member whose value
+/// is unknown — `Address$addressLine1` and `Address$city` carry `"Unknown"` as
+/// their default
+/// (`smithy_query(query="shape",shape="com.amazonaws.taxsettings#Address")`) —
+/// extended, as this emulator's own choice, to the members with no modelled
+/// default (`postalCode`, and `legalName`), which cannot be left empty: both are
+/// `@required` where they are reported and both forbid a blank value.
+pub const DERIVED_MEMBER_UNKNOWN: &str = "Unknown";
+
+/// The refusal of an entry whose jurisdiction requires a legal name and that
+/// carries none, stating the rule the way the model does ("For TRNs in other
+/// countries, you must specify the legal name").
+pub const MISSING_LEGAL_NAME: &str = "You must specify the legalName for TRNs in this country.";
+
+/// The refusal of an entry that carries no legal address and whose jurisdiction
+/// is one the service does not fill the address in for.
+pub const MISSING_LEGAL_ADDRESS: &str =
+    "You must specify the legalAddress for TRNs in this country.";
+
+/// The refusal of an entry that identifies no jurisdiction at all: it carries no
+/// legal address, and its registration type belongs to no one country, so the
+/// country the address would be filled in for can be neither read from the
+/// request nor derived from the type. A different sentence from
+/// [`MISSING_LEGAL_ADDRESS`] because a different thing is wrong: there is no
+/// country whose rule could be stated.
+pub const MISSING_LEGAL_ADDRESS_JURISDICTION: &str =
+    "You must specify the legalAddress, which states the country your TRN is registered in.";
 
 /// The jurisdictions this emulator stores a SUPPLEMENTAL TRN for.
 ///
@@ -672,9 +770,10 @@ impl StoredSupplementalRegistration {
 ///
 /// `legalName` and `legalAddress` are stored unconditionally because every shape
 /// that reports a registration (`TaxRegistration`,
-/// `TaxRegistrationWithJurisdiction`) marks both `@required`: a record missing
-/// either could not be reported, so `PutTaxRegistration` refuses the write
-/// instead of storing one.
+/// `TaxRegistrationWithJurisdiction`) marks both `@required`. The entry they come
+/// from may leave either out where the service fills it in from the tax
+/// registration number, and the record then carries the value a read of the tax
+/// authority's registry would have filled in — see [`DERIVED_MEMBER_UNKNOWN`].
 #[derive(Debug, Clone, Default)]
 pub struct StoredTaxRegistration {
     /// `TaxRegistrationEntry$registrationId`, as submitted.
@@ -682,10 +781,12 @@ pub struct StoredTaxRegistration {
     /// `TaxRegistrationEntry$registrationType`, one of the model's
     /// `TaxRegistrationType` values.
     pub registration_type: String,
-    /// `TaxRegistrationEntry$legalName`, as submitted.
+    /// `TaxRegistrationEntry$legalName`, as submitted, or the value the service
+    /// filled in where the entry's jurisdiction let it be omitted.
     pub legal_name: String,
-    /// `TaxRegistrationEntry$legalAddress`, as submitted. Also the source of the
-    /// `Jurisdiction` that `ListTaxRegistrations` reports.
+    /// `TaxRegistrationEntry$legalAddress`, as submitted, or the address the
+    /// service filled in where the entry's jurisdiction let it be omitted. Also
+    /// the source of the `Jurisdiction` that `ListTaxRegistrations` reports.
     pub legal_address: Address,
     /// `TaxRegistrationEntry$sector`, one of the model's `Sector` values.
     pub sector: Option<String>,
@@ -715,18 +816,40 @@ impl StoredTaxRegistration {
     /// The record `PutTaxRegistration` stores for `entry`.
     ///
     /// `revision` is the account's new revision number (its previous one plus
-    /// one), which the derived document access tokens carry. `legalName` and
-    /// `legalAddress` are optional on `TaxRegistrationEntry` but required on
-    /// every shape that reports a registration, so the caller refuses an entry
-    /// that omits either before reaching here.
+    /// one), which the derived document access tokens carry.
+    ///
+    /// `legalName` and `legalAddress` are optional on `TaxRegistrationEntry` and
+    /// `@required` on every shape that reports a registration: where the entry
+    /// omits one, the caller has already established that this is a registration
+    /// whose member the service fills in from the tax registration number
+    /// ([`check_tax_registration_entry`]), and the record carries the filled-in
+    /// value — the jurisdiction the entry identified, and
+    /// [`DERIVED_MEMBER_UNKNOWN`] for what only the tax authority's registry
+    /// holds.
     pub fn from_entry(
         entry: &TaxRegistrationEntry,
         account_id: &str,
         revision: u64,
         written_at: Instant,
     ) -> Self {
-        let legal_name = entry.legal_name.clone().unwrap_or_default();
-        let legal_address = entry.legal_address.clone().unwrap_or_default();
+        let legal_name = entry
+            .legal_name
+            .clone()
+            .unwrap_or_else(|| DERIVED_MEMBER_UNKNOWN.to_string());
+        let legal_address = entry.legal_address.clone().unwrap_or_else(|| {
+            // The judge admits an entry carrying no address only when the entry
+            // identifies the jurisdiction the address is filled in for, so a
+            // record stored here always reports a country.
+            let country_code = entry_country_code(entry).unwrap_or_else(|| {
+                debug_assert!(
+                    false,
+                    "an entry stored without a legal address must identify the jurisdiction the \
+                     address is filled in for"
+                );
+                ""
+            });
+            derived_legal_address(country_code)
+        });
         Self {
             registration_id: entry.registration_id.clone(),
             registration_type: entry.registration_type.clone(),
@@ -1057,27 +1180,111 @@ pub fn parameter_name(member_path: &str) -> String {
 /// Refuse an entry that submits a member its registration type does not admit.
 ///
 /// Today that is the legal address of a type AWS derives it from the tax number
-/// for ([`TYPES_WITH_DERIVED_LEGAL_ADDRESS`]): the address is not the caller's to
+/// for ([`type_with_derived_legal_address`]): the address is not the caller's to
 /// supply, so submitting one is a field violation naming that parameter.
 pub fn check_registration_type_members(
     entry: &TaxRegistrationEntry,
 ) -> Result<(), ValidationException> {
-    let derived = TYPES_WITH_DERIVED_LEGAL_ADDRESS
-        .iter()
-        .find(|(registration_type, _)| *registration_type == entry.registration_type);
-    if let Some((registration_type, country)) = derived {
-        if entry.legal_address.is_some() {
-            return Err(validation(
-                ERROR_CODE_FIELD_VALIDATION_FAILED,
-                "taxRegistrationEntry.legalAddress",
-                format!(
-                    "Legal address should not be provided for {country} {registration_type} Tax \
-                     Registration."
-                ),
-            ));
-        }
+    let registration_type = &entry.registration_type;
+    let Some((_, country)) = type_with_derived_legal_address(registration_type) else {
+        return Ok(());
+    };
+    if entry.legal_address.is_some() {
+        return Err(validation(
+            ERROR_CODE_FIELD_VALIDATION_FAILED,
+            "taxRegistrationEntry.legalAddress",
+            format!(
+                "Legal address should not be provided for {country} {registration_type} Tax \
+                 Registration."
+            ),
+        ));
     }
     Ok(())
+}
+
+/// The jurisdiction of a registration type AWS fills the legal address in for —
+/// its `Address$countryCode` and the country's name — or `None` for a type whose
+/// address comes from the request.
+///
+/// The carve-out is a fact about ONE country's tax number, so it is read off the
+/// rows [`TYPE_JURISDICTIONS`] ties to a country rather than off the type name
+/// alone: a type named in [`TYPES_WITH_DERIVED_LEGAL_ADDRESS`] with no
+/// jurisdiction row has no country whose number the address could come from, and
+/// carries no carve-out.
+pub fn type_with_derived_legal_address(
+    registration_type: &str,
+) -> Option<(&'static str, &'static str)> {
+    if !TYPES_WITH_DERIVED_LEGAL_ADDRESS.contains(&registration_type) {
+        return None;
+    }
+    type_jurisdiction(registration_type)
+}
+
+/// The country a country-specific `TaxRegistrationType` belongs to — its
+/// `Address$countryCode` and the country's name — or `None` for a type the model
+/// ties to no single country. See [`TYPE_JURISDICTIONS`].
+pub fn type_jurisdiction(registration_type: &str) -> Option<(&'static str, &'static str)> {
+    TYPE_JURISDICTIONS
+        .iter()
+        .find(|(declared, _, _)| *declared == registration_type)
+        .map(|(_, country_code, country)| (*country_code, *country))
+}
+
+/// The jurisdiction `entry` identifies: the country of the legal address it
+/// carries, else the country its registration type belongs to.
+///
+/// `None` for an entry that carries no address and whose type belongs to no one
+/// country: nothing in such a request says where the registration is held, so no
+/// per-country rule of this service can be applied to it.
+pub fn entry_country_code(entry: &TaxRegistrationEntry) -> Option<&str> {
+    match entry.legal_address.as_ref() {
+        Some(address) => Some(address.country_code.as_str()),
+        None => type_jurisdiction(&entry.registration_type).map(|(country_code, _)| country_code),
+    }
+}
+
+/// Whether the service fills in the legal NAME of a registration held in
+/// `country_code` from the tax registration number — see
+/// [`COUNTRIES_WITH_DERIVED_LEGAL_NAME`].
+pub fn legal_name_is_derived(country_code: &str) -> bool {
+    COUNTRIES_WITH_DERIVED_LEGAL_NAME
+        .iter()
+        .any(|code| code.eq_ignore_ascii_case(country_code))
+}
+
+/// Whether the service fills in the legal ADDRESS of a `registration_type`
+/// registration held in `country_code` from the tax registration number — see
+/// [`COUNTRIES_WITH_DERIVED_LEGAL_ADDRESS`] and
+/// [`TYPES_WITH_DERIVED_LEGAL_ADDRESS`].
+pub fn legal_address_is_derived(country_code: &str, registration_type: &str) -> bool {
+    if type_with_derived_legal_address(registration_type).is_some() {
+        return true;
+    }
+    COUNTRIES_WITH_DERIVED_LEGAL_ADDRESS
+        .iter()
+        .any(|(code, types)| {
+            code.eq_ignore_ascii_case(country_code)
+                && (types.is_empty() || types.contains(&registration_type))
+        })
+}
+
+/// The legal address stored for an entry that carried none, held in the
+/// jurisdiction `country_code`.
+///
+/// The country is what the entry identified ([`entry_country_code`]), so the
+/// jurisdiction every reader reports is the registration's own. The rest of the
+/// address is what the service would have read from the tax authority's registry,
+/// which this emulator has none of, so those members carry
+/// [`DERIVED_MEMBER_UNKNOWN`] — the model's own value for an address member whose
+/// value is not known.
+pub fn derived_legal_address(country_code: &str) -> Address {
+    Address {
+        address_line1: Some(DERIVED_MEMBER_UNKNOWN.to_string()),
+        city: Some(DERIVED_MEMBER_UNKNOWN.to_string()),
+        postal_code: DERIVED_MEMBER_UNKNOWN.to_string(),
+        country_code: country_code.to_string(),
+        ..Address::default()
+    }
 }
 
 /// Refuse an all-whitespace value for a member the model constrains with its
@@ -1319,14 +1526,17 @@ fn turkey_sector_is_individual(entry: &TaxRegistrationEntry) -> bool {
 /// countries
 /// (`smithy_query(query="doc",shape="com.amazonaws.taxsettings#PutTaxRegistration")`).
 ///
-/// Three documented rules are deliberately NOT rows here, because the fact they
+/// Two documented rules are deliberately NOT rows here, because the fact they
 /// turn on is not in the request and this service models no API that supplies
-/// one: Brazil's and Mexico's "complete the registration process in the console
-/// first" / "address and legal name are populated from your tax registration
-/// number" carve-outs (see `ops/put_tax_registration.rs`, which refuses an entry
-/// omitting either member for every country), and Turkey's "if your `sector` is
+/// one: Brazil's "complete the registration process in the console first", whose
+/// completion no member of the entry states, and Turkey's "if your `sector` is
 /// `Business` and you're subject to KDV tax, you must specify your industry",
-/// whose KDV liability no member of the entry states.
+/// whose KDV liability no member states either. The Brazil and Mexico carve-outs
+/// that make `legalName` and `legalAddress` omittable are not rules a rule row
+/// can carry — they REMOVE a requirement rather than add one — and live in
+/// [`COUNTRIES_WITH_DERIVED_LEGAL_NAME`] /
+/// [`COUNTRIES_WITH_DERIVED_LEGAL_ADDRESS`], which
+/// [`check_tax_registration_entry`] applies.
 pub const COUNTRY_RULES: &[CountryRule] = &[
     // Bangladesh: "You must specify the tax registration certificate document in
     // the taxRegistrationDocuments field of the VerificationDetails object."
@@ -1687,19 +1897,15 @@ pub const COUNTRY_RULES: &[CountryRule] = &[
 /// Refuse an entry that does not satisfy the per-country business rules
 /// `PutTaxRegistration` documents for the country of its legal address.
 ///
-/// The country is `legalAddress.countryCode`; an entry with no legal address has
-/// no country to apply a rule for, and is refused by the caller for omitting a
-/// member every shape that reports a registration requires. The first unmet rule
-/// in [`COUNTRY_RULES`] is the refusal, so the rule set is shared by every writer
-/// of a `TaxRegistrationEntry` rather than re-stated per operation.
+/// The country is the jurisdiction the entry identifies ([`entry_country_code`]);
+/// an entry that identifies none has no country whose rule could be applied. The
+/// first unmet rule in [`COUNTRY_RULES`] is the refusal, so the rule set is shared
+/// by every writer of a `TaxRegistrationEntry` rather than re-stated per
+/// operation.
 pub fn check_country_requirements(
     entry: &TaxRegistrationEntry,
 ) -> Result<(), ValidationException> {
-    let Some(country_code) = entry
-        .legal_address
-        .as_ref()
-        .map(|address| address.country_code.as_str())
-    else {
+    let Some(country_code) = entry_country_code(entry) else {
         return Ok(());
     };
     for rule in COUNTRY_RULES {
@@ -1719,11 +1925,12 @@ pub fn check_country_requirements(
 /// The one place both writers — `PutTaxRegistration` and the per-account loop of
 /// `BatchPutTaxRegistration` — decide whether an entry is storable, so the two
 /// operations cannot disagree about one entry: the structural refusals (a legal
-/// address submitted for a type AWS derives it from, a missing legal name or
-/// address, a blank value the boundary validator's regex engine could not refuse)
-/// and then the per-country business rules [`COUNTRY_RULES`] carries. Why each is
-/// not left to the boundary validator is spelled out on the helpers this calls
-/// and in `ops/put_tax_registration.rs`.
+/// address submitted for a type AWS derives it from, a legal name or address the
+/// entry's own jurisdiction requires and it omits, a blank value the boundary
+/// validator's regex engine could not refuse) and then the per-country business
+/// rules [`COUNTRY_RULES`] carries. Why each is not left to the boundary
+/// validator is spelled out on the helpers this calls and in
+/// `ops/put_tax_registration.rs`.
 pub fn check_tax_registration_entry(
     entry: &TaxRegistrationEntry,
 ) -> Result<(), ValidationException> {
@@ -1731,35 +1938,58 @@ pub fn check_tax_registration_entry(
     // itself does not take one from the request.
     check_registration_type_members(entry)?;
 
-    // Both shapes that report a registration (`TaxRegistration`,
-    // `TaxRegistrationWithJurisdiction`) mark `legalName` and `legalAddress`
-    // `@required`, so a record missing either could never be read back: refuse
-    // the write rather than store one.
-    let Some(legal_name) = entry.legal_name.as_deref() else {
+    // Which of the two optional members the entry MUST carry is the jurisdiction's
+    // rule, so the jurisdiction is resolved first.
+    let country_code = entry_country_code(entry);
+
+    // The legal address is required except where the service fills it in from the
+    // tax registration number, and an entry that identifies no jurisdiction at all
+    // names no country for either rule to be read from — it is refused for the
+    // address, the member its country would have come from.
+    if entry.legal_address.is_none() {
+        match country_code {
+            None => {
+                return Err(validation(
+                    ERROR_CODE_MISSING_INPUT,
+                    "taxRegistrationEntry.legalAddress",
+                    MISSING_LEGAL_ADDRESS_JURISDICTION,
+                ));
+            }
+            Some(code) if !legal_address_is_derived(code, &entry.registration_type) => {
+                return Err(validation(
+                    ERROR_CODE_MISSING_INPUT,
+                    "taxRegistrationEntry.legalAddress",
+                    MISSING_LEGAL_ADDRESS,
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+
+    // The legal name is required except where the service fills it in from the tax
+    // registration number.
+    if entry.legal_name.is_none() && country_code.is_none_or(|code| !legal_name_is_derived(code)) {
         return Err(validation(
             ERROR_CODE_MISSING_INPUT,
             "taxRegistrationEntry.legalName",
-            "legalName is required to store a tax registration.",
+            MISSING_LEGAL_NAME,
         ));
-    };
-    let Some(legal_address) = entry.legal_address.as_ref() else {
-        return Err(validation(
-            ERROR_CODE_MISSING_INPUT,
-            "taxRegistrationEntry.legalAddress",
-            "legalAddress is required to store a tax registration.",
-        ));
-    };
+    }
 
     check_not_blank(
         "taxRegistrationEntry.registrationId",
         &entry.registration_id,
     )?;
-    check_not_blank("taxRegistrationEntry.legalName", legal_name)?;
-    check_address("taxRegistrationEntry.legalAddress", legal_address)?;
+    if let Some(legal_name) = entry.legal_name.as_deref() {
+        check_not_blank("taxRegistrationEntry.legalName", legal_name)?;
+    }
+    if let Some(legal_address) = entry.legal_address.as_ref() {
+        check_address("taxRegistrationEntry.legalAddress", legal_address)?;
+    }
 
     // The per-country business rules the model documents for a
-    // `TaxRegistrationEntry`, keyed off `legalAddress.countryCode`. They run last
-    // because they are about an entry that is otherwise storable.
+    // `TaxRegistrationEntry`, keyed off the jurisdiction it identifies. They run
+    // last because they are about an entry that is otherwise storable.
     check_country_requirements(entry)
 }
 
