@@ -47,7 +47,12 @@
 //! model applied to an asset model lives in
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::interface_relationships`],
 //! keyed by the two models, carrying the property and hierarchy mappings the
-//! application resolved to. Every
+//! application resolved to. The applications of a workspace live in
+//! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::applications`], keyed by the
+//! minted `applicationId` — which identifies one across every workspace — each
+//! record naming the workspace it was created in, the Identity Center instance
+//! the create named and the instant the `CREATING` -> `ACTIVE` transition it
+//! owes falls due. Every
 //! handler reads and writes THIS struct through [`service_state`]; nothing in
 //! `src/ops/` keeps state of its own.
 
@@ -2925,6 +2930,11 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// Workspaces by `workspaceName`, which is what identifies one in an
     /// account and region.
     pub workspaces: HashMap<String, WorkspaceRecord>,
+    /// Applications by `applicationId`, which identifies one across every
+    /// workspace; the workspace it was created in lives on its record, because
+    /// the modelled reads address an application by `(workspaceName, id)`.
+    /// Written by `CreateApplication` and read by `DescribeApplication`.
+    pub applications: HashMap<String, ApplicationRecord>,
     /// Pipeline executions by `pipelineExecutionId`. The id alone identifies one,
     /// and the record names the workspace and pipeline it belongs to, so a read
     /// scoped to another pipeline resolves to nothing.
@@ -3644,6 +3654,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
                 tags_of(self.tasks.get(&task_key(workspace, name)), arn)
             }
             DATASET_RESOURCE_TYPE => tags_of(self.datasets.get(id), arn),
+            APPLICATION_RESOURCE_TYPE => tags_of(self.applications.get(id), arn),
             WORKSPACE_RESOURCE_TYPE => tags_of(self.workspaces.get(id), arn),
             ACCESS_POLICY_RESOURCE_TYPE => tags_of(self.access_policies.get(id), arn),
             _ => None,
@@ -3667,6 +3678,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
                 tags_of_mut(self.tasks.get_mut(&task_key(workspace, name)), arn)
             }
             DATASET_RESOURCE_TYPE => tags_of_mut(self.datasets.get_mut(id), arn),
+            APPLICATION_RESOURCE_TYPE => tags_of_mut(self.applications.get_mut(id), arn),
             WORKSPACE_RESOURCE_TYPE => tags_of_mut(self.workspaces.get_mut(id), arn),
             ACCESS_POLICY_RESOURCE_TYPE => tags_of_mut(self.access_policies.get_mut(id), arn),
             _ => None,
@@ -5465,3 +5477,142 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsIotsitewiseAwsiotsitewiseState>)
 }
+
+// ---------------------------------------------------------------------------
+// The application slice: the record `CreateApplication` writes and
+// `DescribeApplication` reports, its bound, the resource kind a refusal names
+// and the values an application derives (its ARN, its DNS subdomain and the
+// Identity Center application it reports).
+//
+// One section, like the history-selection and aggregate sections above: what an
+// application IS and every value derived from it sit beside each other, so the
+// create and the read cannot disagree about either.
+// ---------------------------------------------------------------------------
+
+/// The ARN resource-type segment of an application ARN, as [`application_arn`]
+/// builds it.
+pub const APPLICATION_RESOURCE_TYPE: &str = "application";
+
+/// See [`MAX_ASSET_MODELS`]: the same bound, for the application map.
+/// `CreateApplication` is the only thing that adds an application and it declares
+/// the modelled `LimitExceededException` (HTTP 410), so that is how this store
+/// refuses past the cap. The emulator's own bound, not a published AWS default.
+pub const MAX_APPLICATIONS: usize = 1_000;
+
+/// The resource kind a not-found refusal names for an application of a
+/// workspace; see [`not_found_message`].
+pub const RESOURCE_APPLICATION: &str = "Application";
+
+/// The resource segment an IAM Identity Center application ARN carries, which is
+/// what an instance ARN's own `instance/` segment becomes in the ARN of an
+/// application created in that instance; see [`idc_application_arn`].
+const IDC_INSTANCE_SEGMENT: &str = "instance/";
+/// See [`IDC_INSTANCE_SEGMENT`].
+const IDC_APPLICATION_SEGMENT: &str = "application/";
+
+/// A stored application of a workspace: everything `DescribeApplication`
+/// reports, plus the `tags` the tagging operations read.
+///
+/// An application is minted with an id of its own and `ListApplications` spans
+/// every workspace, so the id identifies it on its own; the workspace it was
+/// created in is held here because the modelled reads address an application by
+/// `(workspaceName, id)`.
+#[derive(Debug, Clone)]
+pub struct ApplicationRecord {
+    pub id: String,
+    pub arn: String,
+    /// The workspace the create named. A read naming another workspace names no
+    /// application this store holds, however the id resolves.
+    pub workspace_name: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// The Identity Center instance ARN the create named — what
+    /// [`Self::idc_application_arn`] was derived from.
+    pub idc_instance_arn: String,
+    /// The Identity Center application this application reports, derived once
+    /// here so every later read reports the same ARN; see
+    /// [`idc_application_arn`].
+    pub idc_application_arn: String,
+    pub dns_subdomain: String,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+    /// The instant the transition the clock owes — `CREATING` to `ACTIVE` —
+    /// falls due.
+    pub active_at: SystemTime,
+    /// The `clientToken` of the create that made this application, if it carried
+    /// one, so a retry of that same create replays its answer rather than
+    /// minting a second application.
+    pub client_token: Option<String>,
+    pub tags: HashMap<String, String>,
+}
+
+impl ApplicationRecord {
+    /// The application's `ApplicationStatus` as of `now`: [`STATE_CREATING`]
+    /// until the transition the create owes falls due, [`STATE_ACTIVE`] from
+    /// then on. Derived, so a read never has to write.
+    ///
+    /// `ApplicationStatus` spells only `CREATING`, `ACTIVE` and `DELETING`
+    /// (smithy_query query="shape" shape="ApplicationStatus"), so an application
+    /// owes exactly this one transition and the settling state is the same for
+    /// every record rather than stored per record.
+    pub fn status(&self, now: SystemTime) -> String {
+        state_at(STATE_CREATING, self.active_at, now).to_string()
+    }
+}
+
+/// The canonical ARN of an application in `region`.
+///
+/// The resource section carries the application's own id and not its workspace:
+/// unlike a pipeline or a task, an application is minted with an id that
+/// identifies it across every workspace, which is also why `ListApplications`
+/// takes no workspace.
+pub fn application_arn(region: &str, application_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{APPLICATION_RESOURCE_TYPE}/{application_id}"),
+    )
+}
+
+/// The `dnsSubdomain` an application reports.
+///
+/// DERIVED from the application's own id rather than minted, for the reason
+/// [`portal_start_url`] states: it is then stable across reads and unique per
+/// application without anything being written on a read. The modelled
+/// `DnsSubdomain` is a DNS label (len 1..63, `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
+/// and every id [`new_id`] mints is one already — 36 characters of lowercase hex
+/// and hyphens, beginning and ending with a hex digit. Derived through this one
+/// function so the form has a single place to change if a subdomain ever has to
+/// differ from the id.
+pub fn application_dns_subdomain(application_id: &str) -> String {
+    application_id.to_string()
+}
+
+/// The `idcApplicationArn` an application reports: the Identity Center
+/// application that was created in the instance `idc_instance_arn` names.
+///
+/// DERIVED from the two things that identify it — the instance the create named
+/// and the application's own id — rather than minted, so it is stable across
+/// reads and unique per application. Identity Center nests an application under
+/// its instance, so the instance ARN's own resource segment becomes the
+/// application one and the application's id is appended; an instance ARN
+/// carrying no such segment gets the application segment and the id appended
+/// instead, so every application still reports an ARN that names it uniquely.
+///
+/// Split at the FIRST `instance/`, which in an instance ARN is the one its
+/// resource section opens with: an ARN's resource section is its last field, so
+/// nothing ahead of that segment can be a second one.
+pub fn idc_application_arn(idc_instance_arn: &str, application_id: &str) -> String {
+    match idc_instance_arn.split_once(IDC_INSTANCE_SEGMENT) {
+        Some((prefix, instance_id)) => {
+            format!("{prefix}{IDC_APPLICATION_SEGMENT}{instance_id}/{application_id}")
+        }
+        None => format!("{idc_instance_arn}/{IDC_APPLICATION_SEGMENT}{application_id}"),
+    }
+}
+
+// An application's tags live on its own record, reached by ARN like every other
+// taggable resource's; the shared `TaggedRecord` seam is what
+// `ComAmazonawsIotsitewiseAwsiotsitewiseState::tags_for_resource` resolves it
+// through.
+tagged_record!(ApplicationRecord);
