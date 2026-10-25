@@ -183,6 +183,65 @@ pub const UPDATABLE_STATUSES: &[&str] = &[STATUS_PENDING_SUBMISSION];
 /// `crate::ops::types::BENEFIT_APPLICATION_STATUS_VALUES`.
 pub const RECALLABLE_STATUSES: &[&str] = &[STATUS_IN_REVIEW, STATUS_ACTION_REQUIRED];
 
+/// The `BenefitApplicationStage` of an application the partner has not submitted yet: the
+/// record is still the partner's own draft, so AWS's processing workflow has not started
+/// on it.
+///
+/// `BenefitApplicationStage` is an unconstrained string in the model
+/// (`smithy_query(query="shape",shape="BenefitApplicationStage")`), so the stage
+/// vocabulary is CHOSEN here: these five names are this emulator's, not values AWS
+/// publishes. What is not chosen is the relation — the stage is the position in the
+/// processing workflow that the application's current `BenefitApplicationStatus` puts it
+/// at, which is what [`stage_for_status`] computes and the only thing this service knows
+/// about AWS's review.
+pub const STAGE_DRAFT: &str = "DRAFT";
+
+/// The stage of a submitted application AWS is reviewing. See [`STAGE_DRAFT`] for where
+/// the vocabulary comes from.
+pub const STAGE_REVIEW: &str = "REVIEW";
+
+/// The stage of a submitted application whose review is waiting on the partner. See
+/// [`STAGE_DRAFT`].
+pub const STAGE_PARTNER_ACTION: &str = "PARTNER_ACTION";
+
+/// The stage of an application AWS's review has decided, either way. See [`STAGE_DRAFT`].
+pub const STAGE_DECISION: &str = "DECISION";
+
+/// The stage of an application the partner withdrew, which therefore never reached a
+/// decision. See [`STAGE_DRAFT`].
+pub const STAGE_CLOSED: &str = "CLOSED";
+
+/// Every stage [`stage_for_status`] reports, so a caller (and a test) can enumerate the
+/// values this service's `Stages` filter can select on.
+pub const BENEFIT_APPLICATION_STAGE_VALUES: &[&str] = &[
+    STAGE_DRAFT,
+    STAGE_REVIEW,
+    STAGE_PARTNER_ACTION,
+    STAGE_DECISION,
+    STAGE_CLOSED,
+];
+
+/// The workflow stage an application in `status` stands at, or `None` for a status that is
+/// no `BenefitApplicationStatus` value (nothing in the store holds one, so no stage is
+/// invented for it).
+///
+/// The modelled `Stage` is "the current stage in the benefit application processing
+/// workflow", and the only thing this service knows about where an application stands in
+/// that workflow is the status it holds: a draft has not entered the workflow, a submitted
+/// application is under review or back with the partner, and a decided or withdrawn one
+/// has left it. So the stage is a projection of the status rather than a separately stored
+/// field, which is also what keeps it from going stale when the status moves.
+pub fn stage_for_status(status: &str) -> Option<&'static str> {
+    match status {
+        STATUS_PENDING_SUBMISSION => Some(STAGE_DRAFT),
+        STATUS_IN_REVIEW => Some(STAGE_REVIEW),
+        STATUS_ACTION_REQUIRED => Some(STAGE_PARTNER_ACTION),
+        STATUS_APPROVED | STATUS_REJECTED => Some(STAGE_DECISION),
+        STATUS_CANCELED => Some(STAGE_CLOSED),
+        _ => None,
+    }
+}
+
 /// The two `BenefitStatus` values the model declares (see
 /// `crate::ops::types::BENEFIT_STATUS_VALUES`).
 pub const BENEFIT_STATUS_ACTIVE: &str = "ACTIVE";
@@ -905,11 +964,14 @@ pub struct BenefitApplication {
     /// requests, not a caller-supplied value — the model binds no `Programs` member on
     /// any application input.
     pub programs: Vec<String>,
-    /// A `BenefitApplicationStatus` value.
+    /// A `BenefitApplicationStatus` value. The workflow `Stage` this application reports
+    /// is this status's position in the processing workflow, computed by
+    /// [`BenefitApplication::stage`] rather than stored beside it, so the two cannot
+    /// disagree.
     pub status: String,
-    /// The workflow stage. AWS sets it as its own review workflow advances and no input
-    /// member carries one, so it stays absent in this emulator.
-    pub stage: Option<String>,
+    /// Why the application holds the status it holds, when the transition into it carried
+    /// a reason. Replaced by every transition (see [`BenefitApplication::set_status`]), so
+    /// it never explains a status the application has left.
     pub status_reason: Option<String>,
     pub status_reason_codes: Vec<String>,
     pub created_at_millis: i64,
@@ -959,6 +1021,30 @@ impl BenefitApplication {
     /// only the time.
     pub fn touch(&mut self, now_millis: i64) {
         self.updated_at_millis = bump_millis(self.updated_at_millis, now_millis);
+    }
+
+    /// This application's modelled `Stage`: the stage of the processing workflow its
+    /// current status puts it at (see [`stage_for_status`]).
+    pub fn stage(&self) -> Option<String> {
+        stage_for_status(&self.status).map(str::to_string)
+    }
+
+    /// Move this application to `status`, with `reason` as the explanation of the status
+    /// it is moving INTO.
+    ///
+    /// `StatusReason` (and the `StatusReasonCodes` beside it) say why the application
+    /// holds the status it holds, so a transition replaces them: a transition the caller
+    /// gives no reason for leaves none behind rather than keeping the previous status's
+    /// explanation. The workflow `Stage` needs no write at all — it follows the status
+    /// itself (see [`BenefitApplication::stage`]).
+    ///
+    /// Neither `UpdatedAt` nor the revision is touched here: the caller records the write
+    /// with [`BenefitApplication::touch`] or [`BenefitApplication::revise`], whichever
+    /// that transition is.
+    pub fn set_status(&mut self, status: &str, reason: Option<String>) {
+        self.status = status.to_string();
+        self.status_reason = reason;
+        self.status_reason_codes.clear();
     }
 
     /// Whether a recall may take this application back to draft: true exactly for the
