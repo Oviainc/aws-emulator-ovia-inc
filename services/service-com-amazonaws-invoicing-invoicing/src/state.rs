@@ -488,10 +488,8 @@ impl ComAmazonawsInvoicingInvoicingState {
         }
     }
 
-    /// Every account of the requester's organization: its MANAGEMENT account — the
-    /// requester's own ([`::engine::emulator_account_id`]), the only identity this
-    /// emulator presents to a caller — plus every LINKED account this service's state
-    /// names under it.
+    /// Every LINKED account this service's state names under the requester's
+    /// management-account organization.
     ///
     /// An operation documented over "linked accounts under the requester management
     /// account organization" (`BatchGetInvoiceProfile`) has to decide membership from
@@ -503,12 +501,12 @@ impl ComAmazonawsInvoicingInvoicingState {
     /// `smithy_query(query="shape", shape="InvoiceUnitRule")` and
     /// `smithy_query(query="operation", operation="CreateInvoiceUnit")`.
     ///
-    /// The requester's own account is ALWAYS a member, whether or not a stored
-    /// configuration names it: an account belongs to the organization it is the
-    /// management account of, which is why the recorded behaviour of this service answers
-    /// the requester's own invoice profile and reserves the 403 for an account id from
-    /// OUTSIDE the organization. A caller holds credentials for its own account, so
-    /// refusing that account would leave no account it could ever be answered for.
+    /// Membership is derived from those configurations and from NOTHING else — no
+    /// account is a member because of who asked. The requester's own account
+    /// ([`::engine::emulator_account_id`], the identity this emulator presents to a
+    /// caller) is the MANAGEMENT account of this organization, and a management account
+    /// is not a linked account under itself, so it is a member exactly when a stored
+    /// configuration names it as one — the same test every other account id takes.
     ///
     /// `BillSourceAccounts` is deliberately NOT a source: the model documents those as
     /// accounts that "can be payer accounts from other organizations that have
@@ -519,9 +517,8 @@ impl ComAmazonawsInvoicingInvoicingState {
     /// account an update dropped from a rule left that invoice unit, not the
     /// organization. A deleted invoice unit takes its accounts with it — state is the
     /// only record either way.
-    pub fn organization_accounts(&self) -> BTreeSet<String> {
+    pub fn linked_accounts(&self) -> BTreeSet<String> {
         let mut accounts = BTreeSet::new();
-        accounts.insert(::engine::emulator_account_id().to_string());
         for unit in self.live_invoice_units() {
             accounts.insert(unit.invoice_receiver.clone());
             for version in std::iter::once(&unit.current).chain(unit.superseded.iter()) {
@@ -1045,7 +1042,7 @@ pub fn resource_tag_list(tags: &BTreeMap<String, String>) -> Vec<ResourceTag> {
         .collect()
 }
 
-/// The invoice profile this service holds for an account of its organization.
+/// The invoice profile this service holds for a linked account of its organization.
 ///
 /// Every other member of `InvoiceProfile` describes the invoice RECEIVER itself —
 /// `ReceiverName`, `ReceiverAddress`, `ReceiverEmail`, `Issuer` and
@@ -1055,7 +1052,7 @@ pub fn resource_tag_list(tags: &BTreeMap<String, String>) -> Vec<ResourceTag> {
 /// to report them from. Each is an optional member, so they are reported ABSENT —
 /// "not on file here" — rather than invented. `AccountId`, the member that says whose
 /// profile this is, is the one this service can answer, and it is answered only for an
-/// account [`ComAmazonawsInvoicingInvoicingState::organization_accounts`] holds.
+/// account [`ComAmazonawsInvoicingInvoicingState::linked_accounts`] holds.
 pub fn invoice_profile(account_id: &str) -> InvoiceProfile {
     InvoiceProfile {
         account_id: Some(account_id.to_string()),
