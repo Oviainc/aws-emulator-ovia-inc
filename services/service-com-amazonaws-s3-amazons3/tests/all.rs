@@ -17,6 +17,8 @@ mod bucket_abac;
 mod bucket_accelerate_configuration;
 #[path = "all/bucket_acl.rs"]
 mod bucket_acl;
+#[path = "all/bucket_analytics_configuration.rs"]
+mod bucket_analytics_configuration;
 #[path = "all/bucket_cors.rs"]
 mod bucket_cors;
 #[path = "all/bucket_deletion_emptiness.rs"]
