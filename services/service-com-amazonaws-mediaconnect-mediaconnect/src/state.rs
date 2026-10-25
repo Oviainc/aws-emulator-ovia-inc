@@ -2690,8 +2690,8 @@ pub const ROUTER_INPUT_TYPE_MEDIALIVE_CHANNEL: &str = "MEDIALIVE_CHANNEL";
 /// The `RouterOutputState` enum the model declares for a router output
 /// (`smithy_query(query="shape",shape="RouterOutputState")`: CREATING | STANDBY | STARTING
 /// | ACTIVE | STOPPING | DELETING | UPDATING | ERROR | RECOVERING | MIGRATING). Only the
-/// states a router output's creation, stop, reconfiguration and deletion reach are named
-/// here; the rest belong to operations that are still scaffolded.
+/// states a router output's creation, start, stop, reconfiguration and deletion reach are
+/// named here; the rest belong to operations that are still scaffolded.
 pub const ROUTER_OUTPUT_STATE_CREATING: &str = "CREATING";
 /// See [`ROUTER_OUTPUT_STATE_CREATING`]. A router output that finished being created is
 /// not carrying content yet: it waits in `STANDBY` until StartRouterOutput — and it is
@@ -2699,9 +2699,14 @@ pub const ROUTER_OUTPUT_STATE_CREATING: &str = "CREATING";
 /// carrying content (see [`ROUTER_OUTPUT_STATE_STOPPING`]).
 pub const ROUTER_OUTPUT_STATE_STANDBY: &str = "STANDBY";
 /// See [`ROUTER_OUTPUT_STATE_CREATING`]. The state of a router output that is carrying
-/// content — what StartRouterOutput (still scaffolded) settles an output into, and the
-/// state StopRouterOutput takes it out of.
+/// content — what StartRouterOutput settles an output into, and the state StopRouterOutput
+/// takes it out of.
 pub const ROUTER_OUTPUT_STATE_ACTIVE: &str = "ACTIVE";
+/// See [`ROUTER_OUTPUT_STATE_CREATING`]. The non-terminal state a router output is
+/// answered in while a start is in flight: StartRouterOutput accepts the start and the
+/// clock settles the output into [`ROUTER_OUTPUT_STATE_ACTIVE`] one [`TRANSITION_SPAN`]
+/// later, so a caller reading the output straight after the start still sees it starting.
+pub const ROUTER_OUTPUT_STATE_STARTING: &str = "STARTING";
 /// See [`ROUTER_OUTPUT_STATE_CREATING`]. The non-terminal state a router output is
 /// answered in while a stop is in flight: StopRouterOutput accepts the stop and the clock
 /// settles the output into [`ROUTER_OUTPUT_STATE_STANDBY`] one [`TRANSITION_SPAN`] later,
@@ -2931,6 +2936,34 @@ pub fn maintenance_time_of_day(time: &str) -> Option<Duration> {
     Some(Duration::from_secs(
         hours * SECONDS_PER_HOUR + minutes * SECONDS_PER_MINUTE + seconds,
     ))
+}
+
+/// Why `configuration` is not a maintenance configuration this service can honour, or
+/// `None` when it is one.
+///
+/// A `PreferredDayTime` preference states WHEN the resource is maintained and the window
+/// every start schedules is derived from it ([`maintenance_window_schedule`]), so a `Time`
+/// that names no time of day names no preference either: the operation that accepts one
+/// refuses it rather than storing a preference no window can be scheduled inside. The
+/// `Default` member states no time at all, so there is nothing to refuse in it. Every
+/// operation that takes a `MaintenanceConfiguration` (CreateRouterInput,
+/// CreateRouterOutput, UpdateRouterOutput) judges it HERE, so one unacceptable preference
+/// is refused with one sentence.
+pub fn maintenance_configuration_rejection(
+    configuration: &MaintenanceConfiguration,
+) -> Option<String> {
+    match configuration {
+        MaintenanceConfiguration::PreferredDayTime(preference) => {
+            maintenance_time_of_day(&preference.time).is_none().then(|| {
+                format!(
+                    "MaintenanceConfiguration PreferredDayTime Time {:?} is not a time of \
+                     day. Use 24-hour HH:MM format, for example 02:00.",
+                    preference.time
+                )
+            })
+        }
+        MaintenanceConfiguration::Default(_) => None,
+    }
 }
 
 /// The maintenance window a resource configured by `configuration` is next maintained in,
@@ -3692,6 +3725,19 @@ pub struct StoredRouterOutput {
     /// freshly created output has none, and the operations that record one are still
     /// scaffolded — the member is reported from here either way, never as a literal.
     pub messages: Vec<RouterOutputMessage>,
+    /// The maintenance window currently scheduled for this output, or `None` while none is.
+    ///
+    /// `RouterOutput$MaintenanceSchedule` is optional while
+    /// [`Self::maintenance_configuration`] is reported for every output: the configuration
+    /// is the PREFERENCE a create or an update states, and this is the concrete window the
+    /// service resolved it to ([`maintenance_window_schedule`]) — which StartRouterOutput
+    /// schedules and answers, because an output that is carrying content is one maintenance
+    /// has to be scheduled around. It is the router output side of
+    /// [`StoredRouterInput::maintenance_schedule`], held rather than recomputed per read so
+    /// every later read reports the window the caller was told about — until the clock
+    /// passes its end, when the next occurrence of the same preference is owed (see
+    /// [`Self::settle`]).
+    pub maintenance_schedule: Option<MaintenanceSchedule>,
     /// The `@idempotencyToken` of the create that minted this output
     /// (`CreateRouterOutputRequest$ClientToken`, "a unique identifier for the request to
     /// ensure idempotency"), or `None` when the request carried none: a create replaying a
@@ -3713,11 +3759,15 @@ pub struct StoredRouterOutput {
 }
 
 impl StoredRouterOutput {
-    /// Materialise the state change the clock already made due, if it is due at `now`.
+    /// Materialise the state change the clock already made due, if it is due at `now`, and
+    /// re-schedule a maintenance window the clock has already carried this output past.
     ///
-    /// The same contract as [`StoredFlow::settle`]: this is the only write a reporting
-    /// operation (BatchGetRouterOutput, GetRouterOutput) performs, because the change was
-    /// owed at `due_at` whether or not anybody called.
+    /// The same contract as [`StoredFlow::settle`] and [`StoredRouterInput::settle`]: these
+    /// are the only writes a reporting operation (BatchGetRouterOutput, GetRouterOutput)
+    /// performs, because each was owed at its own instant whether or not anybody called. A
+    /// window that has closed is spent, and the output is maintained again at the next
+    /// occurrence of the preference it carries, so a read never reports a maintenance window
+    /// that lies entirely in the past.
     pub fn settle(&mut self, now: SystemTime) {
         if let Some(pending) = self.pending.take() {
             if now >= pending.due_at {
@@ -3725,6 +3775,16 @@ impl StoredRouterOutput {
             } else {
                 self.pending = Some(pending);
             }
+        }
+        if self
+            .maintenance_schedule
+            .as_ref()
+            .is_some_and(|schedule| maintenance_window_has_closed(schedule, now))
+        {
+            self.maintenance_schedule = Some(maintenance_window_schedule(
+                &self.maintenance_configuration,
+                now,
+            ));
         }
     }
 
@@ -3859,11 +3919,16 @@ impl StoredRouterOutput {
             routed_input_arn: self.routed_input_arn.clone(),
             maintenance_type: self.maintenance_type().to_string(),
             maintenance_configuration: self.maintenance_configuration.clone(),
-            // Nothing has scheduled maintenance for this output: the schedule members are
-            // optional, and the operations that would fill them (the maintenance slice) are
-            // still scaffolded, so they are reported as absent rather than invented.
-            maintenance_schedule_type: None,
-            maintenance_schedule: None,
+            // The window the service has scheduled for this output, and the one type the
+            // `MaintenanceScheduleType` enum declares for it. Both are absent until
+            // something schedules a window (StartRouterOutput does), which is what the
+            // model's optional members say about an output that has none yet — reported the
+            // way the router input projection reports the same pair.
+            maintenance_schedule_type: self
+                .maintenance_schedule
+                .as_ref()
+                .map(|_| MAINTENANCE_SCHEDULE_TYPE_WINDOW.to_string()),
+            maintenance_schedule: self.maintenance_schedule.clone(),
             fabric_configuration: self.fabric_configuration.clone(),
         }
     }

@@ -11,9 +11,12 @@
 //! `*_FAILED` with that refusal as the reason, never in `*_COMPLETE`.
 //!
 //! The types here are `AWS::RDS::DBInstance` (whose documented `Ref` return value is the
-//! `DBInstanceIdentifier`) and the `AWS::RDS::DBSubnetGroup` a DB instance's
+//! `DBInstanceIdentifier`), the `AWS::RDS::DBSubnetGroup` a DB instance's
 //! `DBSubnetGroupName` names, which Amazon RDS resolves before it will create an instance in
-//! it. `crate::state::provisioner` is the layer under test.
+//! it, and the `AWS::RDS::DBParameterGroup` its `DBParameterGroupName` names, whose declared
+//! parameter settings are the ones `DescribeDBParameters` reports for the group — with its
+//! cluster-scoped sibling `AWS::RDS::DBClusterParameterGroup` beside it, since one
+//! provisioning arm serves both. `crate::state::provisioner` is the layer under test.
 //!
 //! Every case drives the real request path for BOTH services through one router — the
 //! CloudFormation calls over the awsQuery wire (the harness `stack_lifecycle.rs` owns) and
@@ -406,13 +409,263 @@ async fn a_db_instance_a_stack_declares_exists_in_rds_once_the_stack_reports_it_
     }
 }
 
+/// One row of the parameter-group table: the stack a template declares, and the group
+/// Amazon RDS must hold once it is deployed.
+struct ParameterGroupCase<'a> {
+    case: &'a str,
+    stack_name: &'a str,
+    template: &'a str,
+    /// The member Amazon RDS addresses this group KIND by, which is also what the type's
+    /// `Ref` returns: `DBParameterGroupName` for the instance-scoped group,
+    /// `DBClusterParameterGroupName` for the cluster-scoped one.
+    name_member: &'a str,
+    /// The action that reports the group itself, and the one that reports its parameters.
+    group_describe: &'a str,
+    parameters_describe: &'a str,
+    /// The name the stack must report for the group: `Some` where the template NAMES it,
+    /// `None` where CloudFormation generates the name.
+    declared_name: Option<&'a str>,
+    /// `DBParameterGroupFamily` Amazon RDS must report for the group.
+    family: &'a str,
+    /// `Description` it must report.
+    description: &'a str,
+    /// The parameter settings the template declares, which the group must carry as the ones
+    /// a caller set.
+    parameters: &'a [(&'a str, &'a str)],
+}
+
+/// The `(ParameterName, ParameterValue)` pairs Amazon RDS reports for the parameters a
+/// CALLER set on `group` — the group's parameter report with the `user` source, which is the
+/// vocabulary that member's documentation publishes ("Valid Values: user | system |
+/// engine-default").
+async fn user_parameters(
+    router: &MultiServiceRouter,
+    case: &ParameterGroupCase<'_>,
+    group: &str,
+) -> (u16, String, Vec<(String, String)>) {
+    let (status_code, body) = rds(
+        router,
+        case.parameters_describe,
+        &[(case.name_member, group), ("Source", "user")],
+    )
+    .await;
+    let reported = xml_texts(&body, "ParameterName")
+        .into_iter()
+        .zip(xml_texts(&body, "ParameterValue"))
+        .collect();
+    (status_code, body, reported)
+}
+
+/// `DescribeDBParameterGroups` on one DB parameter group name, as a client calls it.
+async fn describe_parameter_group(
+    router: &MultiServiceRouter,
+    group: &str,
+) -> (u16, String) {
+    rds(
+        router,
+        "DescribeDBParameterGroups",
+        &[("DBParameterGroupName", group)],
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_parameter_group_a_stack_declares_exists_in_rds_with_the_parameters_it_declared() {
+    // The rows differ along what the rule generalises over: the parameter-group KIND (the
+    // instance-scoped `AWS::RDS::DBParameterGroup` and the cluster-scoped
+    // `AWS::RDS::DBClusterParameterGroup`, whose owning API addresses a group by its own
+    // member), whether the template NAMES the group or leaves CloudFormation to generate the
+    // name, the spelling of that name, the engine family, the template spelling (YAML and
+    // JSON), how MANY parameters the declaration carries (none, one, several) and whether an
+    // instance of the same stack is placed in the group.
+    let cases: &[ParameterGroupCase<'_>] = &[
+        ParameterGroupCase {
+            case: "a generated name, two declared parameters, and an instance using the \
+                   group",
+            stack_name: "rds-effective-params",
+            template: concat!(
+                "Resources:\n",
+                "  Params:\n",
+                "    Type: AWS::RDS::DBParameterGroup\n",
+                "    Properties:\n",
+                "      Description: the probe stack's parameters\n",
+                "      Family: mysql8.0\n",
+                "      Parameters:\n",
+                "        max_connections: '150'\n",
+                "        autocommit: '0'\n",
+                "  Database:\n",
+                "    Type: AWS::RDS::DBInstance\n",
+                "    Properties:\n",
+                "      Engine: mysql\n",
+                "      DBInstanceClass: db.t3.micro\n",
+                "      DBParameterGroupName: !Ref Params\n",
+            ),
+            name_member: "DBParameterGroupName",
+            group_describe: "DescribeDBParameterGroups",
+            parameters_describe: "DescribeDBParameters",
+            declared_name: None,
+            family: "mysql8.0",
+            description: "the probe stack's parameters",
+            parameters: &[("autocommit", "0"), ("max_connections", "150")],
+        },
+        ParameterGroupCase {
+            case: "a named group declaring no parameters at all, in JSON",
+            stack_name: "rds-named-params",
+            template: r#"{"Resources":{"Params":{"Type":"AWS::RDS::DBParameterGroup",
+                     "Properties":{"DBParameterGroupName":"cfn-probe-params",
+                       "Description":"a named probe group","Family":"postgres16"}}}}"#,
+            name_member: "DBParameterGroupName",
+            group_describe: "DescribeDBParameterGroups",
+            parameters_describe: "DescribeDBParameters",
+            declared_name: Some("cfn-probe-params"),
+            family: "postgres16",
+            description: "a named probe group",
+            parameters: &[],
+        },
+        ParameterGroupCase {
+            case: "a MIXED-CASE declared name and one declared parameter",
+            stack_name: "rds-mixed-case-params",
+            template: concat!(
+                "Resources:\n",
+                "  Params:\n",
+                "    Type: AWS::RDS::DBParameterGroup\n",
+                "    Properties:\n",
+                "      DBParameterGroupName: CFN-Probe-Params\n",
+                "      Description: a mixed-case probe group\n",
+                "      Family: aurora-mysql8.0\n",
+                "      Parameters:\n",
+                "        max_connections: '64'\n",
+            ),
+            name_member: "DBParameterGroupName",
+            group_describe: "DescribeDBParameterGroups",
+            parameters_describe: "DescribeDBParameters",
+            declared_name: Some("CFN-Probe-Params"),
+            family: "aurora-mysql8.0",
+            description: "a mixed-case probe group",
+            parameters: &[("max_connections", "64")],
+        },
+        ParameterGroupCase {
+            case: "the CLUSTER-scoped group kind, generated name, two declared parameters",
+            stack_name: "rds-cluster-params",
+            template: concat!(
+                "Resources:\n",
+                "  Params:\n",
+                "    Type: AWS::RDS::DBClusterParameterGroup\n",
+                "    Properties:\n",
+                "      Description: the probe stack's cluster parameters\n",
+                "      Family: aurora-mysql8.0\n",
+                "      Parameters:\n",
+                "        binlog_format: ROW\n",
+                "        time_zone: UTC\n",
+            ),
+            name_member: "DBClusterParameterGroupName",
+            group_describe: "DescribeDBClusterParameterGroups",
+            parameters_describe: "DescribeDBClusterParameters",
+            declared_name: None,
+            family: "aurora-mysql8.0",
+            description: "the probe stack's cluster parameters",
+            parameters: &[("binlog_format", "ROW"), ("time_zone", "UTC")],
+        },
+        ParameterGroupCase {
+            case: "the CLUSTER-scoped group kind, a declared name and no parameters, in JSON",
+            stack_name: "rds-named-cluster-params",
+            template: r#"{"Resources":{"Params":{
+                     "Type":"AWS::RDS::DBClusterParameterGroup",
+                     "Properties":{
+                       "DBClusterParameterGroupName":"cfn-probe-cluster-params",
+                       "Description":"a named probe cluster group",
+                       "Family":"aurora-postgresql16"}}}}"#,
+            name_member: "DBClusterParameterGroupName",
+            group_describe: "DescribeDBClusterParameterGroups",
+            parameters_describe: "DescribeDBClusterParameters",
+            declared_name: Some("cfn-probe-cluster-params"),
+            family: "aurora-postgresql16",
+            description: "a named probe cluster group",
+            parameters: &[],
+        },
+    ];
+
+    for case in cases {
+        let router = router();
+        let (status_code, created) =
+            create_stack(&router, case.stack_name, case.template, &[]).await;
+        assert_eq!(
+            status_code, 200,
+            "case {:?}: CreateStack must answer 200, got {status_code} {created}",
+            case.case
+        );
+        wait_for_the_transition().await;
+
+        let (_, described) = describe_stack(&router, case.stack_name).await;
+        assert_eq!(
+            xml_text(&described, "StackStatus").as_deref(),
+            Some(status::CREATE_COMPLETE),
+            "case {:?}: the stack must reach CREATE_COMPLETE, got {described}",
+            case.case
+        );
+
+        let group = physical_id(&router, case.stack_name, "Params").await;
+        if let Some(declared) = case.declared_name {
+            assert_eq!(
+                group, declared,
+                "case {:?}: the template named the group, so that name is its physical id",
+                case.case
+            );
+        }
+
+        // The whole of the rule: Amazon RDS holds the group the stack reports, under the
+        // name the stack published, with the configuration the template declared.
+        let (status_code, reported) = rds(
+            &router,
+            case.group_describe,
+            &[(case.name_member, group.as_str())],
+        )
+        .await;
+        assert_eq!(
+            status_code, 200,
+            "case {:?}: {}({group}) must answer 200, got {status_code} {reported}",
+            case.case, case.group_describe
+        );
+        assert_eq!(
+            xml_text(&reported, "DBParameterGroupFamily").as_deref(),
+            Some(case.family),
+            "case {:?}: RDS must report the declared family, got {reported}",
+            case.case
+        );
+        assert_eq!(
+            xml_text(&reported, "Description").as_deref(),
+            Some(case.description),
+            "case {:?}: RDS must report the declared description, got {reported}",
+            case.case
+        );
+
+        // The parameters the template declared are the ones a caller set on the group, so
+        // the group's parameter report answers exactly those under the `user` source.
+        let (status_code, body, settings) = user_parameters(&router, case, &group).await;
+        assert_eq!(
+            status_code, 200,
+            "case {:?}: {}({group}) must answer 200, got {status_code} {body}",
+            case.case, case.parameters_describe
+        );
+        let expected: Vec<(String, String)> = case
+            .parameters
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        assert_eq!(
+            settings, expected,
+            "case {:?}: RDS must report the declared parameters as the group's own, got \
+             {settings:?} in {body}",
+            case.case
+        );
+    }
+}
+
 /// The DB parameter group row's own assertion: the group's name reaches the database.
 ///
-/// `AWS::RDS::DBParameterGroup` is a type this emulator records rather than creates (Amazon
-/// RDS's `CreateDBParameterGroup` is still a stub, so there is no API to create it through
-/// and the resource is left declared-only), but the instance that NAMES it is created for
-/// real — so the `DBParameterGroupName` the stack resolved is the one in force on the
-/// database RDS reports.
+/// The instance that NAMES the group is created for real too, so the
+/// `DBParameterGroupName` the stack resolved is the one in force on the database Amazon RDS
+/// reports — the pair a client reads when it asks which parameters its instance runs with.
 #[tokio::test]
 async fn the_parameter_group_a_stack_declares_is_the_one_in_force_on_its_instance() {
     let router = router();
@@ -449,6 +702,66 @@ async fn the_parameter_group_a_stack_declares_is_the_one_in_force_on_its_instanc
             .iter()
             .any(|name| name == &group),
         "the instance must report {group:?} as its DB parameter group, got {reported}"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_stack_deletes_the_db_parameter_group_it_created() {
+    let router = router();
+    // The group is deleted only once the instance that is a member of it is gone — Amazon
+    // RDS refuses the delete of a group an instance still uses — so a stack declaring both
+    // exercises the dependency order the deletion walks.
+    let template = concat!(
+        "Resources:\n",
+        "  Params:\n",
+        "    Type: AWS::RDS::DBParameterGroup\n",
+        "    Properties:\n",
+        "      Description: the probe stack's parameters\n",
+        "      Family: mysql8.0\n",
+        "      Parameters:\n",
+        "        max_connections: '200'\n",
+        "  Database:\n",
+        "    Type: AWS::RDS::DBInstance\n",
+        "    Properties:\n",
+        "      DBInstanceIdentifier: cfn-probe-params-member\n",
+        "      Engine: mysql\n",
+        "      DBInstanceClass: db.t3.micro\n",
+        "      DBParameterGroupName: !Ref Params\n",
+    );
+    create_stack(&router, "rds-deleted-params", template, &[]).await;
+    wait_for_the_transition().await;
+    let group = physical_id(&router, "rds-deleted-params", "Params").await;
+    let (status_code, _) = describe_parameter_group(&router, &group).await;
+    assert_eq!(
+        status_code, 200,
+        "the stack's parameter group must exist before the delete"
+    );
+
+    let (status_code, deleted) = call(
+        &router,
+        "DeleteStack",
+        &[member("StackName", "rds-deleted-params")],
+    )
+    .await;
+    assert_eq!(
+        status_code, 200,
+        "DeleteStack must answer 200, got {status_code} {deleted}"
+    );
+    // Twice: the stack's own terminal status and the removal Amazon RDS owes the instance
+    // it put in `deleting` are two clocks, and both have to be past due.
+    wait_for_the_transition().await;
+    wait_for_the_transition().await;
+
+    let (status_code, reported) = describe_parameter_group(&router, &group).await;
+    assert_eq!(
+        status_code, 404,
+        "deleting the stack must delete the DB parameter group it created, got \
+         {status_code} {reported}"
+    );
+    assert_eq!(
+        xml_text(&reported, "Code").as_deref(),
+        Some("DBParameterGroupNotFound"),
+        "the group must be gone under RDS's own not-found code, got {reported}"
     );
 }
 

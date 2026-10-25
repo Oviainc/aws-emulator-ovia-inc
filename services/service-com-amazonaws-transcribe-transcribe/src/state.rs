@@ -2004,6 +2004,210 @@ pub fn parse_name_page_cursor(token: &str) -> Option<&str> {
         .filter(|name| !name.is_empty())
 }
 
+/// What a listing refuses a `NextToken` this service never handed out with, naming
+/// the `operation` whose previous answer the caller should have copied it from.
+///
+/// Single-homed beside the token codec it belongs to, so every listing of this
+/// service refuses an alien cursor in the same words.
+pub fn invalid_next_token_message(operation: &str) -> String {
+    format!(
+        "The NextToken in your request is not valid. Use the NextToken returned by \
+         your previous {operation} request."
+    )
+}
+
+/// The creation sequence a listing's `NextToken` resumes after — `None` when the
+/// request carried no token — or `operation`'s own refusal for a token this service
+/// never handed out.
+///
+/// Generic over the error channel because each listing models its own: `refuse` is
+/// what lifts the single-homed refusal text ([`invalid_next_token_message`]) into it,
+/// so no handler spells that text or the token format itself.
+pub fn resume_after_sequence<E>(
+    token: Option<&str>,
+    operation: &str,
+    refuse: impl FnOnce(String) -> E,
+) -> Result<Option<u64>, E> {
+    match token {
+        None => Ok(None),
+        Some(token) => match parse_page_cursor(token) {
+            Some(sequence) => Ok(Some(sequence)),
+            None => Err(refuse(invalid_next_token_message(operation))),
+        },
+    }
+}
+
+/// The record NAME a listing's `NextToken` resumes strictly after — `None` when the
+/// request carried no token — or `operation`'s own refusal for a token this service
+/// never handed out.
+///
+/// The name-keyed counterpart of [`resume_after_sequence`], for the one listing of
+/// this service whose records carry no creation sequence (see [`name_page_cursor`]).
+pub fn resume_after_name<'t, E>(
+    token: Option<&'t str>,
+    operation: &str,
+    refuse: impl FnOnce(String) -> E,
+) -> Result<Option<&'t str>, E> {
+    match token {
+        None => Ok(None),
+        Some(token) => match parse_name_page_cursor(token) {
+            Some(name) => Ok(Some(name)),
+            None => Err(refuse(invalid_next_token_message(operation))),
+        },
+    }
+}
+
+/// How many records one page of a listing carries: what the request's `MaxResults`
+/// asked for, or `default` where it asked for nothing.
+///
+/// Every listing of this service models `MaxResults` `@range(min: 1, max: 100)`, so
+/// the boundary validator has already refused anything outside it; the clamp states
+/// that dependency rather than relying on it silently. Single-homed so the nine
+/// listings cannot disagree about what a page size is — only about the default their
+/// own model documents, which each one passes in.
+pub fn page_size(max_results: Option<i32>, default: i32) -> usize {
+    usize::try_from(max_results.unwrap_or(default))
+        .unwrap_or(MAX_LIST_MAX_RESULTS)
+        .clamp(1, MAX_LIST_MAX_RESULTS)
+}
+
+/// A stored record one of this service's sequence-paged listings reports.
+///
+/// The three facts such a listing needs of any family's record, whatever shape it is
+/// projected onto: the creation sequence it is ordered and paged by, the name its
+/// `*NameContains` filter searches and its cursor carries, and the status its status
+/// filter selects on.
+pub trait ListedRecord {
+    /// Creation order, newest = largest. The cursor a listing of this family pages
+    /// with ([`page_cursor`]).
+    fn sequence(&self) -> u64;
+    /// The name this record is keyed by.
+    fn name(&self) -> &str;
+    /// The record's own status or state, or `None` for a family the model gives no
+    /// such member at all (a vocabulary filter has no `VocabularyState`), whose
+    /// listing publishes no status filter either.
+    fn status(&self) -> Option<&str> {
+        None
+    }
+}
+
+/// Give each family's record the [`ListedRecord`] view of itself, naming the member
+/// that family's status lives on where it has one.
+macro_rules! listed_records {
+    ($($record:ident $(, status = $status:ident)?;)+) => {
+        $(
+            impl ListedRecord for $record {
+                fn sequence(&self) -> u64 {
+                    self.sequence
+                }
+
+                fn name(&self) -> &str {
+                    &self.name
+                }
+
+                $(
+                    fn status(&self) -> Option<&str> {
+                        Some(&self.$status)
+                    }
+                )?
+            }
+        )+
+    };
+}
+
+listed_records! {
+    TranscriptionJobRecord, status = status;
+    MedicalTranscriptionJobRecord, status = status;
+    MedicalScribeJobRecord, status = status;
+    CallAnalyticsJobRecord, status = status;
+    LanguageModelRecord, status = status;
+    VocabularyRecord, status = state;
+    MedicalVocabularyRecord, status = state;
+    VocabularyFilterRecord;
+}
+
+/// What a listing selects the records of its page on: the two filters every
+/// sequence-paged listing of this service publishes, however it spells their members
+/// (`Status` / `StateEquals` / `StatusEquals`, and `JobNameContains` / `NameContains`).
+///
+/// A filter the request left out is `None`, which selects everything.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ListFilter<'a> {
+    /// Keep only records whose own status or state is exactly this.
+    pub status_equals: Option<&'a str>,
+    /// Keep only records whose name contains this, case-insensitively.
+    pub name_contains: Option<&'a str>,
+}
+
+/// One page of a listing: the records that belong on it, already projected onto the
+/// shape that listing reports, and the cursor to the rest.
+#[derive(Debug, Clone)]
+pub struct ListPage<T> {
+    /// The page itself, in the order the records were given in.
+    pub items: Vec<T>,
+    /// The `NextToken` the caller resumes with, or `None` when this page is the last:
+    /// "If NextToken is present in your response, it indicates that not all results
+    /// are displayed" (the doc of every listing's `NextToken` output member).
+    pub next_token: Option<String>,
+}
+
+/// One page of `records` — already ordered, newest first — resuming strictly past
+/// `resume_below`, narrowed by `filter`, at most `page_size` long, with each kept
+/// record projected by `project`.
+///
+/// THE PAGING RULE, single-homed here beside the token codec so every listing of this
+/// service pages the same way: a record at or above the resumed cursor was on an
+/// earlier page and is skipped; the filters select what the page may hold; and a
+/// `NextToken` is emitted only when a FURTHER MATCHING record was found after the
+/// page filled, built from the last record placed ON the page rather than from the
+/// one that overflowed it — which is what makes the next page resume exactly where
+/// this one stopped.
+pub fn list_page<'r, R, T>(
+    records: impl IntoIterator<Item = &'r R>,
+    resume_below: Option<u64>,
+    page_size: usize,
+    filter: ListFilter<'_>,
+    project: impl Fn(&R) -> T,
+) -> ListPage<T>
+where
+    R: ListedRecord + 'r,
+{
+    // "The search is not case sensitive" (the doc of every `*NameContains` member of
+    // this service's listings), so the needle is folded once here and each candidate
+    // name folded as it is tested.
+    let needle = filter.name_contains.map(str::to_lowercase);
+    let mut items = Vec::new();
+    let mut next_token = None;
+    let mut last_on_page: Option<(u64, String)> = None;
+    for record in records {
+        if resume_below.is_some_and(|sequence| record.sequence() >= sequence) {
+            continue;
+        }
+        if filter
+            .status_equals
+            .is_some_and(|wanted| record.status() != Some(wanted))
+        {
+            continue;
+        }
+        if needle
+            .as_deref()
+            .is_some_and(|needle| !record.name().to_lowercase().contains(needle))
+        {
+            continue;
+        }
+        if items.len() == page_size {
+            // A further match exists, so the caller gets a cursor to it.
+            next_token = last_on_page
+                .as_ref()
+                .map(|(sequence, name)| page_cursor(*sequence, name));
+            break;
+        }
+        items.push(project(record));
+        last_on_page = Some((record.sequence(), record.name().to_string()));
+    }
+    ListPage { items, next_token }
+}
+
 /// What a request's two content members say about where a vocabulary's terms come
 /// from: a list in the request, or a file the service would have to read.
 ///

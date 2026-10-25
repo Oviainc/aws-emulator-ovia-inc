@@ -15,6 +15,8 @@
 mod alert_manager_definition;
 #[path = "all/anomaly_detector_lifecycle.rs"]
 mod anomaly_detector_lifecycle;
+#[path = "all/anomaly_detector_update.rs"]
+mod anomaly_detector_update;
 #[path = "all/default_scraper_configuration.rs"]
 mod default_scraper_configuration;
 #[path = "all/kms_key_arn_and_parent_resolution.rs"]

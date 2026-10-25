@@ -160,11 +160,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // to the name the store is keyed by.
         let log_group_name =
             crate::state::log_group_name_from_identifier(&input.log_group_identifier);
-        let not_found = |resource_kind: &str| {
+        let not_found = |message: &str| {
             GetDataProtectionPolicyError::from(
                 GetDataProtectionPolicyErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::resource_not_found_message(resource_kind)),
+                        message: Some(message.to_string()),
                     },
                 ),
             )
@@ -173,13 +173,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let group = store
             .log_groups
             .get(log_group_name)
-            .ok_or_else(|| not_found("log group"))?;
+            .ok_or_else(|| not_found(&crate::state::resource_not_found_message("log group")))?;
         // A group that holds no policy has no policy to report: the resource this
-        // operation reads is the policy, not the group.
+        // operation reads is the policy, not the group. The request identifies that policy
+        // by nothing of its own — only by the group it is attached to — so the refusal
+        // states nothing about it beyond that the resource is not there.
         let policy = group
             .data_protection_policy
             .as_ref()
-            .ok_or_else(|| not_found("data protection policy"))?;
+            .ok_or_else(|| not_found(crate::state::UNIDENTIFIED_RESOURCE_NOT_FOUND_MESSAGE))?;
 
         Ok(GetDataProtectionPolicyOutput {
             // "The log group name or ARN that you specified in your request" — the

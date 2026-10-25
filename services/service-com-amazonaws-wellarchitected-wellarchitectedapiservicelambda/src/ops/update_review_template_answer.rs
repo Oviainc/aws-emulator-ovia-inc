@@ -278,55 +278,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let answer = template.answer_mut(&input.lens_alias, &question);
+        // Every member that writes the answer is optional, so a request that supplies NONE
+        // of them asks for no change: it reports the question as it stands — still
+        // `UNANSWERED` where nothing has answered it — and leaves the template's and its
+        // lens review's `UpdatedAt` where they were, rather than recording an update
+        // nothing wrote. The rule lives in `crate::state` (`answer_write_requested`),
+        // shared with `UpdateAnswer`, which records an answer from the very same five
+        // members.
+        let answers_the_question = crate::state::answer_write_requested(
+            input.selected_choices.as_deref(),
+            input.choice_updates.as_ref(),
+            input.is_applicable,
+            input.reason.as_deref(),
+            input.notes.as_deref(),
+        );
 
-        // "The values entered replace the previously selected choices"
-        // (`SelectedChoices` doc): the choices named are the ones in place, so every other
-        // choice of the question is not.
-        if let Some(selected) = input.selected_choices.as_deref() {
-            answer.select_only(&question, selected);
-        }
+        if answers_the_question {
+            let answer = template.answer_mut(&input.lens_alias, &question);
 
-        // Each `ChoiceUpdate` carries one choice's answer in full — `Status` is
-        // `@required` on the shape — so it REPLACES what was stored for that choice, down
-        // to a reason or notes it leaves out.
-        if let Some(updates) = input.choice_updates {
-            for (choice_id, update) in updates {
-                answer.choice_answers.insert(
-                    choice_id,
-                    crate::state::ChoiceAnswerRecord {
-                        status: update.status,
-                        reason: update.reason,
-                        notes: update.notes,
-                    },
-                );
+            // "The values entered replace the previously selected choices"
+            // (`SelectedChoices` doc): the choices named are the ones in place, so every
+            // other choice of the question is not.
+            if let Some(selected) = input.selected_choices.as_deref() {
+                answer.select_only(&question, selected);
             }
-        }
 
-        // Each remaining member of the answer is replaced by the value the request
-        // supplies and left as stored when it supplies none, so they are written
-        // independently of each other.
-        if let Some(is_applicable) = input.is_applicable {
-            answer.is_applicable = is_applicable;
-        }
-        if let Some(reason) = input.reason {
-            answer.reason = Some(reason);
-        }
-        if let Some(notes) = input.notes {
-            answer.notes = Some(notes);
-        }
+            // Each `ChoiceUpdate` carries one choice's answer in full — `Status` is
+            // `@required` on the shape — so it REPLACES what was stored for that choice,
+            // down to a reason or notes it leaves out.
+            if let Some(updates) = input.choice_updates {
+                for (choice_id, update) in updates {
+                    answer.choice_answers.insert(
+                        choice_id,
+                        crate::state::ChoiceAnswerRecord {
+                            status: update.status,
+                            reason: update.reason,
+                            notes: update.notes,
+                        },
+                    );
+                }
+            }
 
-        // The selected choices of an answer ARE the choices it records `SELECTED` for, so
-        // the two members a client reads back agree whichever of them the request wrote
-        // through.
-        answer.resolve_selected_choices(&question);
+            // Each remaining member of the answer is replaced by the value the request
+            // supplies and left as stored when it supplies none, so they are written
+            // independently of each other.
+            if let Some(is_applicable) = input.is_applicable {
+                answer.is_applicable = is_applicable;
+            }
+            if let Some(reason) = input.reason {
+                answer.reason = Some(reason);
+            }
+            if let Some(notes) = input.notes {
+                answer.notes = Some(notes);
+            }
 
-        // Answering a question changes the template and the lens review that asks it, so
-        // both report this write as the instant they were last updated.
-        template
-            .lens_review_record_mut(&input.lens_alias, now)
-            .updated_at = now;
-        template.updated_at = now;
+            // The selected choices of an answer ARE the choices it records `SELECTED` for,
+            // so the two members a client reads back agree whichever of them the request
+            // wrote through.
+            answer.resolve_selected_choices(&question);
+
+            // Answering a question changes the template and the lens review that asks it,
+            // so both report this write as the instant they were last updated.
+            template
+                .lens_review_record_mut(&input.lens_alias, now)
+                .updated_at = now;
+            template.updated_at = now;
+        }
 
         Ok(UpdateReviewTemplateAnswerOutput {
             // The template as STORED, which is the resource this answer belongs to, and

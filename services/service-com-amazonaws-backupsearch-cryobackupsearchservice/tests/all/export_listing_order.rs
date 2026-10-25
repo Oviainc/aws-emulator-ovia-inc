@@ -149,10 +149,10 @@ async fn export_jobs_are_paged_newest_created_first_whatever_the_page_size() {
     for export_count in [1_usize, 2, 3, 5] {
         for max_results in [1_usize, 2, 3, 5, 1000] {
             let (emulator, engine) = emulator_with_engine();
-            seed_job(&engine, "exportable", state::COMPLETED, Vec::new());
+            let exportable = seed_job(&engine, state::COMPLETED, Vec::new());
             let mut created: Vec<String> = Vec::new();
             for index in 0..export_count {
-                created.push(start_export(&emulator, "exportable", index).await);
+                created.push(start_export(&emulator, &exportable, index).await);
             }
             let newest_first: Vec<String> = created.iter().rev().cloned().collect();
             let case = format!("{export_count} exports, MaxResults={max_results}");
@@ -194,10 +194,11 @@ async fn the_newest_first_order_is_the_same_inside_every_filter() {
     // reaches here; seeding also pins each CreationTime, so "newest-created" is a
     // property of the record and not of how fast the test ran.
     let (emulator, engine) = emulator_with_engine();
-    let owners = ["search-job-a", "search-job-b"];
-    for owner in owners {
-        seed_job(&engine, owner, state::COMPLETED, Vec::new());
-    }
+    // Two owning search jobs, each named the way a started one is: the identifier a
+    // record is reached by has to be one this service's guard admits.
+    let owners: Vec<String> = (0..2)
+        .map(|_| seed_job(&engine, state::COMPLETED, Vec::new()))
+        .collect();
     // Every value the model's `ExportJobStatus` enum declares, from the service's own
     // `types::EXPORT_JOB_STATUS_VALUES`.
     let statuses = types::EXPORT_JOB_STATUS_VALUES;
@@ -212,13 +213,13 @@ async fn the_newest_first_order_is_the_same_inside_every_filter() {
         // right because the filter kept a prefix would fail here.
         for index in 0..9_usize {
             let identifier = format!("seeded-export-{index}");
-            let owner = owners[index % owners.len()];
+            let owner = owners[index % owners.len()].clone();
             let status = statuses[index % statuses.len()];
             store.insert_export_job(state::ExportJob {
                 identifier: identifier.clone(),
                 arn: state::export_job_arn("backup-search", REGION, &identifier),
-                search_job_identifier: owner.to_string(),
-                search_job_arn: state::search_job_arn("backup-search", REGION, owner),
+                search_job_identifier: owner.clone(),
+                search_job_arn: state::search_job_arn("backup-search", REGION, &owner),
                 status: status.to_string(),
                 // One second apart and increasing with the insertion order, so the
                 // reported order can be checked against the member itself.
@@ -239,7 +240,7 @@ async fn the_newest_first_order_is_the_same_inside_every_filter() {
                 // `settle` cannot move a row's status out from under the filter.
                 next_status_due: None,
             });
-            created.push((identifier, owner.to_string(), status.to_string()));
+            created.push((identifier, owner, status.to_string()));
         }
     }
 
@@ -249,15 +250,16 @@ async fn the_newest_first_order_is_the_same_inside_every_filter() {
     for status in statuses {
         filters.push((None, Some(status)));
     }
-    for owner in owners {
-        filters.push((Some(owner), None));
+    for owner in &owners {
+        filters.push((Some(owner.as_str()), None));
         for status in statuses {
-            filters.push((Some(owner), Some(status)));
+            filters.push((Some(owner.as_str()), Some(status)));
         }
     }
     // A search job this store holds no export for: the filter selects nothing, which is
     // still an order (the empty one) and must not be a refusal.
-    filters.push((Some("search-job-c"), None));
+    let no_exports = seed_job(&engine, state::COMPLETED, Vec::new());
+    filters.push((Some(no_exports.as_str()), None));
 
     for (wanted_owner, wanted_status) in filters {
         let case = format!(
@@ -329,10 +331,10 @@ async fn both_job_listings_of_this_service_report_newest_created_first() {
         search_jobs.push(started.string("SearchJobIdentifier"));
     }
 
-    seed_job(&engine, "exportable", state::COMPLETED, Vec::new());
+    let exportable = seed_job(&engine, state::COMPLETED, Vec::new());
     let mut exports: Vec<String> = Vec::new();
     for index in 0..3_usize {
-        exports.push(start_export(&emulator, "exportable", index).await);
+        exports.push(start_export(&emulator, &exportable, index).await);
     }
 
     let listed_jobs = call(&emulator, REGION, "GET", "/search-jobs", None).await;
@@ -349,10 +351,10 @@ async fn both_job_listings_of_this_service_report_newest_created_first() {
                 .to_string()
         })
         .collect();
-    // The seeded "exportable" job is listed too, and it was inserted after the three
+    // The seeded exportable job is listed too, and it was inserted after the three
     // started ones, so it opens the newest-first sequence.
     let mut expected_jobs: Vec<String> = search_jobs.clone();
-    expected_jobs.push("exportable".to_string());
+    expected_jobs.push(exportable.clone());
     expected_jobs.reverse();
     assert_eq!(
         listed_search_jobs, expected_jobs,

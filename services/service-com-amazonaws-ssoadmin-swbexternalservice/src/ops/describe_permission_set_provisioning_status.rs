@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePermissionSetProvisioningStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribePermissionSetProvisioningStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the stored status of the permission-set provisioning the request
+//! id names, under the instance the request names. This is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribePermissionSetProvisioningStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A READ: the status it reports is DERIVED from the due instant the
+//! `ProvisionPermissionSet` call stored, so polling neither advances a workflow nor
+//! creates one, and the answer is the record that call wrote. A request id nothing was
+//! ever minted for, one minted under another instance, and one whose permission set has
+//! since gone are all the same answer — this instance tracks no provisioning under that
+//! id.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +157,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribePermissionSetProvisioningStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribePermissionSetProvisioningStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribePermissionSetProvisioningStatus"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribePermissionSetProvisioningStatusErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A READ, except for what the CLOCK already owes — the instances themselves, the
+        // account's ambient instance if nothing has enabled one yet, and the copy an
+        // earlier provisioning has become due to deliver (`on_request`): reporting a
+        // tracked workflow's status neither advances it nor creates one, and the status
+        // itself is derived from the due instant the provisioning stored.
+        store.on_request(&region, now);
+
+        // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: permission
+        // sets are a feature of an organization instance, so on an account instance no
+        // provisioning can ever have run and the refusal does not depend on whether this
+        // request id names one. An ARN this account holds no instance for is NOT this
+        // refusal — it falls through to the 404 below.
+        if store.permission_set_surface_withdrawn(&input.instance_arn) {
+            return Err(
+                DescribePermissionSetProvisioningStatusErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
+                        ),
+                        // The model's `ValidationExceptionReason` enum carries only KMS
+                        // key states, none of which this refusal is.
+                        reason: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        if store.instance(&input.instance_arn).is_none() {
+            return Err(
+                DescribePermissionSetProvisioningStatusErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "No instance found with the ARN {}",
+                            input.instance_arn
+                        )),
+                        reason: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Never minted, belonging to another instance, or gone with the permission set it
+        // named — all the same answer: this instance tracks no provisioning under that id.
+        let record = store
+            .permission_set_provisioning(
+                &input.instance_arn,
+                &input.provision_permission_set_request_id,
+            )
+            .ok_or_else(|| {
+                DescribePermissionSetProvisioningStatusErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::permission_set_provisioning_not_found_message(
+                                &input.provision_permission_set_request_id,
+                            ),
+                        ),
+                        reason: None,
+                    },
+                )
+            })?;
+
+        // Answered from the STORED record, so this read cannot disagree with what the
+        // call that minted the request id reported, and its `Status` is the one the clock
+        // implies at this instant.
+        Ok(DescribePermissionSetProvisioningStatusOutput {
+            permission_set_provisioning_status: Some(record.to_shape(now)),
+        })
     }
 }

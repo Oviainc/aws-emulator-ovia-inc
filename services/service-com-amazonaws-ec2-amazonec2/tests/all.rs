@@ -175,6 +175,8 @@ mod instance_event_notification_attributes;
 mod instance_event_windows;
 #[path = "all/instance_lifecycle.rs"]
 mod instance_lifecycle;
+#[path = "all/instance_metadata_defaults.rs"]
+mod instance_metadata_defaults;
 #[path = "all/instance_type_offerings.rs"]
 mod instance_type_offerings;
 #[path = "all/instance_types.rs"]

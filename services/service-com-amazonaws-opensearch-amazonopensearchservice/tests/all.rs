@@ -53,6 +53,8 @@ mod scheduled_actions;
 mod service_software_rollback;
 #[path = "all/shared_es_signing_name_claim.rs"]
 mod shared_es_signing_name_claim;
+#[path = "all/single_package_association.rs"]
+mod single_package_association;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/vpc_endpoint_access.rs"]

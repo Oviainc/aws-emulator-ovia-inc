@@ -4,7 +4,9 @@
 //! Pages over the recovery points one search job covered, read from that job's record
 //! in [`crate::state`]: an identifier that names no search job is the modelled
 //! `ResourceNotFoundException` (404), and a job that exists answers 200 with one page
-//! of its stored backups plus the `NextToken` that resumes after it.
+//! of its stored backups plus the `NextToken` that resumes after it. An identifier that
+//! is not a well-formed one at all is refused before the lookup as invalid input —
+//! `ValidationException` (400), see [`crate::state::check_job_identifier`].
 //!
 //! ## Shape of an operation
 //!
@@ -158,6 +160,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The identifier's SYNTAX is judged before any store lookup: a string that cannot
+        // be an identifier of this service is invalid input, not a missing resource.
+        crate::state::check_job_identifier(&input.search_job_identifier)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListSearchJobBackupsErrorModeled::InternalServerException(
                 InternalServerException {
