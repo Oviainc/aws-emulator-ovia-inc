@@ -326,6 +326,11 @@ mod store_ceilings;
 // of this file — and this one lost repeated serialized squash merges to exactly that.
 #[path = "all/traffic_mirror_filters.rs"]
 mod traffic_mirror_filters;
+// What `CancelExportTask` cancels, what it refuses and what it leaves alone. Declared LAST
+// rather than in sorted position, for the reason the header records: a suite's own sorted
+// neighbourhood is where every new ec2 suite inserts its lines.
+#[path = "all/export_task_cancellation.rs"]
+mod export_task_cancellation;
 // Declared LAST for the same reason as the two suites above: the sorted region of this file
 // is where every new ec2 suite inserts its lines, and a landing that loses the squash merge
 // has to redo it.

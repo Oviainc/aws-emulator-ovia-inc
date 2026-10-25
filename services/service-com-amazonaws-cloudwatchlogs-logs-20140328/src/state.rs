@@ -1637,6 +1637,87 @@ pub fn delivery_source_service(resource_arn: &str) -> Option<&str> {
         .filter(|service| !service.is_empty())
 }
 
+/// The ARN service namespaces of the GLOBAL log senders: a resource of one of these lives in
+/// its partition rather than in a Region, which is why an ARN naming one carries an EMPTY
+/// Region segment, and each is reached through a single endpoint per partition rather than one
+/// per Region.
+///
+/// Source: these are the senders the `logType` member's own catalogue names that are global —
+/// "For CloudFront, the valid value is ACCESS_LOGS", "For Route 53 Global Resolver, the valid
+/// value is GLOBAL_RESOLVER_LOGS", "For Amazon Web Services Shield Advanced, the valid value
+/// is FLOW_LOGS"
+/// (`smithy_query(query="doc",shape="PutDeliverySourceRequest",member="logType")`) — and the
+/// documented ARN form of each carries no Region
+/// (`arn:aws:cloudfront::<account>:distribution/<id>`, `arn:aws:route53:::hostedzone/<id>`,
+/// `arn:aws:shield::<account>:protection/<id>`). A global vendor the catalogue does not name
+/// as a sender is left out rather than extrapolated: some global services publish their one
+/// endpoint in a Region other than the partition's usual global endpoint, so each would need
+/// its own.
+///
+/// A Region-less ARN is NOT by itself the mark of a global resource — an Amazon S3 bucket ARN
+/// (`arn:aws:s3:::<bucket>`) carries no Region either, and a bucket is regional — so this is a
+/// list of namespaces rather than a test on the ARN's Region segment.
+pub const GLOBAL_SERVICE_VENDORS: [&str; 3] = ["cloudfront", "route53", "shield"];
+
+/// The one Region each partition's global senders above are reached through, keyed by the
+/// partition segment of an ARN.
+///
+/// Source: the global endpoint each partition publishes for these services — the commercial
+/// partition's in US East (N. Virginia), the China partitions' in Beijing, the AWS GovCloud
+/// (US) partition's in US-Gov-West. A partition this does not name pins no Region, so nothing
+/// is refused for it.
+pub const PARTITION_GLOBAL_REGIONS: [(&str, &str); 3] = [
+    ("aws", "us-east-1"),
+    ("aws-cn", "cn-north-1"),
+    ("aws-us-gov", "us-gov-west-1"),
+];
+
+/// The partition segment of an ARN (`arn:<partition>:...`), or `None` for a value that is not
+/// an ARN at all. One split of an ARN's fields serves the whole crate ([`arn_parts`]).
+fn arn_partition(arn: &str) -> Option<&str> {
+    arn_parts(arn).map(|(partition, _service, _account, _resource)| partition)
+}
+
+/// The Region a delivery source for `resource_arn` can be created in, or `None` when the
+/// resource it names pins none.
+///
+/// A resource of a global service ([`GLOBAL_SERVICE_VENDORS`]) is served by one endpoint for
+/// the whole partition ([`PARTITION_GLOBAL_REGIONS`]), so that endpoint's Region is the only
+/// one that can hold a delivery source for it. Everything else — a regional resource, or one
+/// of a partition with no global endpoint named here — is left unpinned.
+pub fn delivery_source_required_region(resource_arn: &str) -> Option<&'static str> {
+    let (vendor, _resource) = arn_service_and_resource(resource_arn)?;
+    if !GLOBAL_SERVICE_VENDORS.contains(&vendor) {
+        return None;
+    }
+    let partition = arn_partition(resource_arn)?;
+    PARTITION_GLOBAL_REGIONS
+        .iter()
+        .find(|(name, _region)| *name == partition)
+        .map(|(_name, region)| *region)
+}
+
+/// The request-derived refusal for a delivery source whose resource is reached through
+/// another Region than the one this request was made in ([`delivery_source_required_region`]),
+/// or `None` when the request's Region can hold it.
+///
+/// The message names the member, the resource and both Regions, because that is what the
+/// caller has to change to make the request work.
+pub fn misplaced_delivery_source_message(
+    member: &str,
+    resource_arn: &str,
+    request_region: &str,
+) -> Option<String> {
+    let required = delivery_source_required_region(resource_arn)?;
+    (required != request_region).then(|| {
+        format!(
+            "1 validation error detected: {member} {resource_arn} names a resource of a global \
+             service, which is reached only through {required}, so its delivery source must be \
+             created in {required} and not in {request_region}"
+        )
+    })
+}
+
 /// The number of logical destinations one account holds: CloudWatch Logs documents a quota
 /// of 500 destinations per account per Region ("Destinations: 500 per account per Region",
 /// CloudWatch Logs quotas), so a put that would create a 501st destination is refused. The
@@ -4449,21 +4530,26 @@ pub fn log_stream_arn(region: &str, group_name: &str, stream_name: &str) -> Stri
 /// that is not an ARN. The resource segment is whatever follows the account, colons and
 /// slashes included, because a resource id carries its own separators.
 pub fn arn_service_and_resource(arn: &str) -> Option<(&str, &str)> {
-    arn_parts(arn).map(|(service, _account, resource)| (service, resource))
+    arn_parts(arn).map(|(_partition, service, _account, resource)| (service, resource))
 }
 
-/// The `(service, account, resource)` segments of an ARN
+/// The `(partition, service, account, resource)` segments of an ARN
 /// (`arn:<partition>:<service>:<region>:<account>:<resource>`), or `None` for anything
 /// that is not an ARN.
-fn arn_parts(arn: &str) -> Option<(&str, &str, &str)> {
+fn arn_parts(arn: &str) -> Option<(&str, &str, &str, &str)> {
     let rest = arn.strip_prefix("arn:")?;
     // partition, service, region, account, then the whole resource segment.
     let mut segments = rest.splitn(5, ':');
-    let _partition = segments.next()?;
+    let partition = segments.next()?;
     let service = segments.next()?;
     let _region = segments.next()?;
     let account = segments.next()?;
-    Some((service, account, segments.next().unwrap_or_default()))
+    Some((
+        partition,
+        service,
+        account,
+        segments.next().unwrap_or_default(),
+    ))
 }
 
 /// The destination vendor CloudWatch Logs delivers to without assuming a role: a Lambda
@@ -4485,7 +4571,7 @@ pub const SELF_DELIVERED_DESTINATION_VENDOR: &str = "lambda";
 /// no role either: there is no delivery to authorise, and such a `destinationArn` is
 /// refused for the resource it names instead.
 pub fn subscription_role_required_vendor(arn: &str) -> Option<&str> {
-    let (vendor, account, resource) = arn_parts(arn)?;
+    let (_partition, vendor, account, resource) = arn_parts(arn)?;
     if vendor == SELF_DELIVERED_DESTINATION_VENDOR
         || !SUBSCRIPTION_DESTINATIONS
             .iter()

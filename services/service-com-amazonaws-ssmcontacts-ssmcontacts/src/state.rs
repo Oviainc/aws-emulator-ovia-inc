@@ -36,7 +36,7 @@ use std::time::SystemTime;
 
 use crate::ops::types::{
     Contact, ContactChannel, ContactChannelAddress, DescribeEngagementOutput, DescribePageOutput,
-    Engagement, Plan, Receipt, RecurrenceSettings, Rotation, RotationOverride, Tag,
+    Engagement, Page, Plan, Receipt, RecurrenceSettings, Rotation, RotationOverride, Tag,
     DAY_OF_WEEK_VALUES,
 };
 
@@ -201,8 +201,9 @@ pub struct EngagementRecord {
 /// A page is NOT created by a call of its own — the model has no `CreatePage` — so
 /// `StartEngagement` is what mints them: starting an engagement of a contact pages every
 /// contact channel that contact's engagement plan targets. `DescribePage` rebuilds its whole
-/// response from this record, and `AcceptPage` is what stamps [`delivery_time`]/[`read_time`]
-/// and appends to [`receipts`].
+/// response from this record, `ListPagesByEngagement` reports the ones an engagement has
+/// sent, and `AcceptPage` is what stamps [`delivery_time`]/[`read_time`] and appends to
+/// [`receipts`].
 ///
 /// A record exists for every channel the plan targets from the instant the engagement starts,
 /// each stamped with the [`sent_time`] its own stage is due at, so the schedule the plan
@@ -369,10 +370,11 @@ pub struct ComAmazonawsSsmcontactsSsmcontactsState {
     /// name for an engagement.
     pub engagements_started: u64,
     /// Pages, keyed by `PageArn`: one per contact channel an engagement engaged.
-    /// `StartEngagement` inserts, `AcceptPage` acknowledges and `DescribePage` reports; the
-    /// model has no delete for a page, so the only call that removes one is
-    /// `StopEngagement`, and only for a page whose stage the stopped engagement never
-    /// reached ([`ComAmazonawsSsmcontactsSsmcontactsState::cancel_unsent_pages_of`]).
+    /// `StartEngagement` inserts, `AcceptPage` acknowledges, `DescribePage` reports one and
+    /// `ListPagesByEngagement` reports an engagement's own; the model has no delete for a
+    /// page, so the only call that removes one is `StopEngagement`, and only for a page whose
+    /// stage the stopped engagement never reached
+    /// ([`ComAmazonawsSsmcontactsSsmcontactsState::cancel_unsent_pages_of`]).
     ///
     /// Bounded by the channels it is derived from: a start pages each targeted channel at
     /// most once, so one start mints at most as many pages as the account holds channels
@@ -630,6 +632,32 @@ impl ComAmazonawsSsmcontactsSsmcontactsState {
             }
         }
         targets
+    }
+
+    /// The pages of one engagement that have been SENT as of `at`, as the modelled `Page`
+    /// summaries a listing reports, each with the insertion sequence an opaque `NextToken`
+    /// carries, in the order the plan engaged them.
+    ///
+    /// A page whose plan stage has not come round yet has not been sent, so it is not part of
+    /// the engagement a caller is listing. A page whose stage would only have come round
+    /// after the engagement was stopped is not here at all: stopping an engagement stops the
+    /// stages it had not reached, and [`Self::cancel_unsent_pages_of`] is what drops them.
+    pub fn sent_pages_of_engagement(
+        &self,
+        engagement_arn: &str,
+        at: SystemTime,
+    ) -> Vec<(u64, Page)> {
+        let mut pages: Vec<&PageRecord> = self
+            .pages
+            .values()
+            .filter(|page| page.engagement_arn == engagement_arn)
+            .filter(|page| page.sent_time <= at)
+            .collect();
+        pages.sort_by_key(|page| page.sequence);
+        pages
+            .into_iter()
+            .map(|page| (page.sequence, page_summary(page)))
+            .collect()
     }
 
     /// Drop the pages of the engagement `engagement_arn` names that had not been sent by
@@ -1249,6 +1277,26 @@ pub fn page_details(record: &PageRecord) -> DescribePageOutput {
     }
 }
 
+/// The `Page` summary a pages listing (`ListPagesByEngagement`, `ListPagesByContact`)
+/// returns for a stored page.
+///
+/// Deliberately smaller than [`page_details`]: the modelled `Page` carries the ARNs, the
+/// sender, the incident and the three instants, so the message bodies are reached through
+/// `DescribePage`. The acknowledgement instants are the ones `AcceptPage` recorded, so a
+/// listing reports what happened to the page rather than anything derived from the request.
+pub fn page_summary(record: &PageRecord) -> Page {
+    Page {
+        page_arn: record.arn.clone(),
+        engagement_arn: record.engagement_arn.clone(),
+        contact_arn: record.contact_arn.clone(),
+        sender: record.sender.clone(),
+        incident_id: record.incident_id.clone(),
+        sent_time: Some(::aws_smithy_types::DateTime::from(record.sent_time)),
+        delivery_time: record.delivery_time.map(::aws_smithy_types::DateTime::from),
+        read_time: record.read_time.map(::aws_smithy_types::DateTime::from),
+    }
+}
+
 /// The `Receipt` `ListPageReceipts` returns for one stored event.
 ///
 /// Every member the modelled `Receipt` carries is rebuilt from what recorded the event, so a
@@ -1321,6 +1369,9 @@ pub const TOKEN_SCOPE_ROTATIONS: &str = "rotations";
 
 /// The `NextToken` scope `ListEngagements` issues and accepts.
 pub const TOKEN_SCOPE_ENGAGEMENTS: &str = "engagements";
+
+/// The `NextToken` scope `ListPagesByEngagement` issues and accepts.
+pub const TOKEN_SCOPE_PAGES_BY_ENGAGEMENT: &str = "pages-by-engagement";
 
 /// The `NextToken` scope `ListRotationOverrides` issues and accepts.
 pub const TOKEN_SCOPE_ROTATION_OVERRIDES: &str = "rotation-overrides";

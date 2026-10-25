@@ -21,6 +21,17 @@
 //! `ListExperimentResolvedTargets`. It is computed once, at start, and held on the
 //! experiment record, so every read of it reports the resolution that start computed.
 //!
+//! An experiment started from a template that configured an EXPERIMENT REPORT also carries
+//! that report's generation ([`ExperimentReportRecord`]): `pending` while the experiment has
+//! not ended, and then — once the clock has ended the run, which is when FIS generates the
+//! report — the report is WRITTEN to the Amazon S3 output the configuration names, by
+//! calling this emulator's own S3 service in process
+//! ([`materialise_experiment_report`]), and `experimentReport.s3Reports` names the object
+//! that was written. The document is built from the experiment's own record
+//! ([`experiment_report_document`]); a generation with nowhere to write, or an output that
+//! will not take it, ends in the modelled `failed` state with the code that says which it
+//! was, rather than reporting a report nothing holds.
+//!
 //! Besides those caller-owned records it holds the service's own data: the built-in FIS
 //! ACTION catalog ([`ACTION_CATALOG`]), which `GetAction` reports from, and the TARGET
 //! RESOURCE TYPE catalog ([`TARGET_RESOURCE_TYPE_CATALOG`]) of the types those actions
@@ -96,9 +107,11 @@ use crate::ops::types::{
     CreateExperimentTemplateReportConfigurationInput, CreateExperimentTemplateStopConditionInput,
     CreateExperimentTemplateTargetInput, Experiment, ExperimentAction, ExperimentActionState,
     ExperimentCloudWatchLogsLogConfiguration, ExperimentLogConfiguration, ExperimentOptions,
-    ExperimentReportConfiguration, ExperimentReportConfigurationCloudWatchDashboard,
-    ExperimentReportConfigurationDataSources, ExperimentReportConfigurationOutputs,
-    ExperimentReportConfigurationOutputsS3Configuration, ExperimentS3LogConfiguration,
+    ExperimentReport, ExperimentReportConfiguration,
+    ExperimentReportConfigurationCloudWatchDashboard, ExperimentReportConfigurationDataSources,
+    ExperimentReportConfigurationOutputs, ExperimentReportConfigurationOutputsS3Configuration,
+    ExperimentReportError, ExperimentReportS3Report, ExperimentReportState,
+    ExperimentS3LogConfiguration,
     ExperimentError, ExperimentState, ExperimentStopCondition, ExperimentSummary,
     ExperimentTarget,
     ExperimentTargetAccountConfiguration, ExperimentTargetAccountConfigurationSummary,
@@ -495,6 +508,23 @@ pub const STOPPED_BY_REQUEST: &str = "Stopped by a StopExperiment request";
 /// here for the same reason [`STOPPED_BY_REQUEST`] is.
 pub const COMPLETED_REASON: &str = "Experiment completed";
 
+/// The `state.reason` a freshly accepted experiment carries, before its run begins.
+///
+/// `ExperimentState$reason` is "the reason for the state" of EVERY status FIS reports, not
+/// only of a terminal one, which is why [`ExperimentRecord::reason`] is a `String` rather
+/// than an `Option`: every status this service moves an experiment into names the reason it
+/// moved there, and this is the one the mint stamps. The wording is the one AWS publishes —
+/// the documented `StartExperiment` response pairs `"status": "initiating"` with
+/// `"reason": "Experiment is initiating."`.
+pub const INITIATING_REASON: &str = "Experiment is initiating.";
+
+/// The `state.reason` an experiment carries while its run is live.
+///
+/// FIS documents no wording for this one, so — like [`STOPPED_BY_REQUEST`] — the text is
+/// this emulator's own; what the contract requires is the reason being there beside the
+/// status at all. See [`INITIATING_REASON`].
+pub const RUNNING_REASON: &str = "Experiment is running.";
+
 /// The `state.reason` an experiment carries when the account's safety lever was engaged
 /// while it was running. Chosen here for the same reason [`STOPPED_BY_REQUEST`] is.
 pub const STOPPED_BY_SAFETY_LEVER: &str = "Stopped by the safety lever";
@@ -667,9 +697,11 @@ pub const EMPTY_TARGET_RESOLUTION_CODE: &str = "emptyTargetResolution";
 /// `reason` within `ExperimentStatusReason`'s modelled ceiling, cut at a character
 /// boundary so a clipped reason is still valid UTF-8.
 ///
-/// `ExperimentActionStatusReason` ("the reason for the state" of one ACTION) is modelled
-/// with the same `@length(min: 0, max: 512)`, so the reason of a skipped action
-/// ([`ActionSkip::reason`]) is clipped here too.
+/// `ExperimentActionStatusReason` ("the reason for the state" of one ACTION) and
+/// `ExperimentReportReason` ("the reason for the state of the experiment report
+/// generation") are modelled with the same `@length(min: 0, max: 512)`, so the reason of a
+/// skipped action ([`ActionSkip::reason`]) and of a failed report generation
+/// ([`ExperimentReportRecord::failed`]) are clipped here too.
 fn clipped_reason(reason: String) -> String {
     if reason.chars().count() <= EXPERIMENT_STATUS_REASON_CEILING {
         return reason;
@@ -719,6 +751,234 @@ impl ActionSkip {
             })),
         }
     }
+}
+
+/// How far along the GENERATION of one experiment's report is.
+///
+/// `ExperimentReportStatus` is modelled
+/// `pending | running | completed | cancelled | failed`. Four of the five are reachable
+/// here: a report is `pending` while its experiment has not ended (there is nothing to
+/// report on yet), `running` while the report is being written, and then `completed` (the
+/// report was written to the configured output) or `failed` (it could not be). `cancelled`
+/// reports a generation something cancelled, which nothing here does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExperimentReportStatus {
+    /// The experiment has not ended, so no report has been generated for it yet.
+    Pending,
+    /// The report is being written.
+    Running,
+    /// The report was written to the configured output. Terminal.
+    Completed,
+    /// The report could not be written. Terminal.
+    Failed,
+}
+
+impl ExperimentReportStatus {
+    /// The wire value of this status — one of `ExperimentReportStatus`'s enum values.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// The `experimentReport.state.reason` of a report whose experiment is still going.
+///
+/// `ExperimentReportState$reason` is "the reason for the state of the experiment report
+/// generation" and is modelled with the same `@length(min: 0, max: 512)` as
+/// `ExperimentState$reason`, so — as for the experiment's own state — every status this
+/// service reports names the reason it is in it. FIS documents no wording for any of them,
+/// so these four are explanatory strings of this emulator's own (see
+/// [`STOPPED_BY_REQUEST`]).
+pub const REPORT_PENDING_REASON: &str =
+    "Report generation has not started: the experiment has not ended.";
+
+/// See [`REPORT_PENDING_REASON`] — the reason while the report is being written.
+pub const REPORT_RUNNING_REASON: &str = "Report generation is in progress.";
+
+/// See [`REPORT_PENDING_REASON`] — the reason once the report object has been written.
+pub const REPORT_COMPLETED_REASON: &str =
+    "The experiment report was written to the configured Amazon S3 output.";
+
+/// The `ExperimentReportError$code` of a report whose configuration names no Amazon S3
+/// output to write it to.
+///
+/// `ExperimentReportConfiguration$outputs` (and the `s3Configuration` under it) is
+/// OPTIONAL, so a template may carry a report configuration that names no destination;
+/// there is then nowhere for the report to go, which is a failure of the generation and not
+/// of any request. Like [`INSUFFICIENT_PRIVILEGES_CODE`] this is the emulator's own token
+/// rather than a reproduction of AWS's, which publishes no catalog of
+/// `ExperimentReportErrorCode` values: what the contract requires is a code within the
+/// member's modelled `@length(0..128)` / `^[\s\S]+$` that tells this failure apart from any
+/// other.
+pub const REPORT_OUTPUT_NOT_CONFIGURED_CODE: &str = "outputNotConfigured";
+
+/// The `ExperimentReportError$code` of a report the configured Amazon S3 output would not
+/// take — a bucket that does not exist, say. See [`REPORT_OUTPUT_NOT_CONFIGURED_CODE`] for
+/// why the token is this emulator's own.
+pub const REPORT_OUTPUT_NOT_WRITTEN_CODE: &str = "outputNotWritten";
+
+/// The `ExperimentReportError$code` of a report whose DOCUMENT could not be built.
+///
+/// Unreachable while the document is assembled from owned JSON values — the serializer has
+/// nothing to fail on — but the generation reports it rather than writing a report with no
+/// bytes in it, so a report that could not be built can never present as one that was.
+/// See [`REPORT_OUTPUT_NOT_CONFIGURED_CODE`] for why the token is this emulator's own.
+pub const REPORT_NOT_BUILT_CODE: &str = "reportNotBuilt";
+
+/// The name of the object an experiment's report is written as, under
+/// `<prefix>/<experimentId>/`.
+pub const REPORT_OBJECT_NAME: &str = "experiment-report.json";
+
+/// The `ExperimentReportS3Report$reportType` of the report this emulator writes.
+///
+/// `ExperimentReportS3ReportType` is modelled as a plain string (`^[\s\S]+$`) with no
+/// documented catalog of values, so this names the format of the document that was
+/// ACTUALLY written — a JSON report built from the experiment's own persisted record (see
+/// [`experiment_report_document`]) — rather than claiming a format nothing produced.
+pub const REPORT_TYPE_JSON: &str = "json";
+
+/// The `content-type` the report object is stored with, for the format
+/// [`REPORT_TYPE_JSON`] names.
+pub const REPORT_CONTENT_TYPE: &str = "application/json";
+
+/// How long a report generation already in progress is left alone before another reader
+/// re-claims it.
+///
+/// The write of one report is a single in-process call, so a generation still `running`
+/// this long after it was claimed is one whose request was dropped between the claim and
+/// the write (a cancelled request, a disconnected client) — which would otherwise strand
+/// the report at `running` forever. The span bounds BOTH failure modes: nothing is
+/// re-claimed while a generation is plausibly in flight, so concurrent polling of one
+/// ended experiment issues one write and not one per poll, and a stranded generation
+/// still heals on the next read after it.
+pub const REPORT_CLAIM_GRACE: Duration = Duration::from_secs(1);
+
+/// The generation of ONE experiment's report: the `ExperimentReport` an experiment carrying
+/// an `experimentReportConfiguration` reports, and nothing at all for one that carries none.
+///
+/// FIS generates the report once the experiment has ENDED, so this record walks `pending`
+/// -> `running` -> `completed`/`failed` behind the experiment's own lifecycle, and
+/// `s3Reports` names where the report went only once there is an object to name.
+#[derive(Debug, Clone)]
+pub struct ExperimentReportRecord {
+    pub status: ExperimentReportStatus,
+    /// `ExperimentReportState$reason`, within [`EXPERIMENT_STATUS_REASON_CEILING`] — a
+    /// `String` for the same reason [`ExperimentRecord::reason`] is.
+    pub reason: String,
+    /// `ExperimentReportError$code`, set exactly when the generation FAILED.
+    pub error_code: Option<String>,
+    /// `ExperimentReport$s3Reports` — the report objects that were written, empty until one
+    /// has been.
+    pub s3_reports: Vec<ExperimentReportS3Report>,
+    /// When this generation was last CLAIMED, while it is in progress.
+    ///
+    /// Not part of the `ExperimentReport` shape: it is what [`REPORT_CLAIM_GRACE`] is
+    /// measured from, so a generation whose request was dropped is re-claimed while one
+    /// that is in flight is not.
+    pub claimed_at: Option<SystemTime>,
+}
+
+impl ExperimentReportRecord {
+    /// The record a started experiment with a report configuration carries: nothing has
+    /// been generated, because the experiment has not ended.
+    pub fn pending() -> Self {
+        Self {
+            status: ExperimentReportStatus::Pending,
+            reason: REPORT_PENDING_REASON.to_string(),
+            error_code: None,
+            s3_reports: Vec::new(),
+            claimed_at: None,
+        }
+    }
+
+    /// True when a reader at `now` may claim this generation: one nothing has started, or
+    /// one whose claim is older than [`REPORT_CLAIM_GRACE`] and so was left in progress by
+    /// a request that never finished it.
+    pub fn claimable_at(&self, now: SystemTime) -> bool {
+        match self.status {
+            ExperimentReportStatus::Pending => true,
+            ExperimentReportStatus::Running => self
+                .claimed_at
+                .is_none_or(|claimed_at| now >= claimed_at + REPORT_CLAIM_GRACE),
+            ExperimentReportStatus::Completed | ExperimentReportStatus::Failed => false,
+        }
+    }
+
+    /// Claim the generation: it is in progress from here, so a reader that arrives while it
+    /// is being written reports the `running` generation instead of starting another one.
+    pub fn generating(&mut self, now: SystemTime) {
+        self.status = ExperimentReportStatus::Running;
+        self.reason = REPORT_RUNNING_REASON.to_string();
+        self.error_code = None;
+        self.claimed_at = Some(now);
+    }
+
+    /// Record that the report object at `arn` was written.
+    pub fn written(&mut self, arn: String) {
+        self.status = ExperimentReportStatus::Completed;
+        self.reason = REPORT_COMPLETED_REASON.to_string();
+        self.error_code = None;
+        self.claimed_at = None;
+        self.s3_reports = vec![ExperimentReportS3Report {
+            arn: Some(arn),
+            report_type: Some(REPORT_TYPE_JSON.to_string()),
+        }];
+    }
+
+    /// Record that the report could not be written, with the code that says which failure
+    /// it was and the reason in prose.
+    pub fn failed(&mut self, code: &str, reason: String) {
+        self.status = ExperimentReportStatus::Failed;
+        self.reason = clipped_reason(reason);
+        self.error_code = Some(code.to_string());
+        self.claimed_at = None;
+        self.s3_reports = Vec::new();
+    }
+
+    /// The `ExperimentReport` an experiment carrying this record reports.
+    pub fn to_experiment_report(&self) -> ExperimentReport {
+        ExperimentReport {
+            state: Some(ExperimentReportState {
+                status: Some(self.status.as_wire().to_string()),
+                reason: Some(self.reason.clone()),
+                // "The error information of the experiment when the experiment report
+                // generation has failed", so it is reported exactly when it HAS failed.
+                error: self.error_code.as_ref().map(|code| ExperimentReportError {
+                    code: Some(code.clone()),
+                }),
+            }),
+            // "The S3 destination of the experiment report": there is nothing to name
+            // until a report object has been written.
+            s3_reports: (!self.s3_reports.is_empty()).then(|| self.s3_reports.clone()),
+        }
+    }
+}
+
+/// One claimed report generation: what the write has to do.
+///
+/// Handed out by [`ExperimentRecord::claim_report_generation`] so the write itself happens
+/// with no store lock held — the document is already built from the record at the instant
+/// the generation fell due, and a generation that can produce no report at all says which
+/// failure it is instead of carrying bytes nothing could write.
+#[derive(Debug, Clone)]
+pub enum ReportGeneration {
+    /// Write `document` to `key` in `bucket`.
+    Write {
+        bucket: String,
+        key: String,
+        document: Vec<u8>,
+    },
+    /// The experiment's report configuration names no Amazon S3 output, so there is
+    /// nowhere to write the report: the generation fails with
+    /// [`REPORT_OUTPUT_NOT_CONFIGURED_CODE`].
+    NoOutput,
+    /// The report DOCUMENT could not be built, carrying the reason: the generation fails
+    /// with [`REPORT_NOT_BUILT_CODE`] rather than writing a report with no bytes in it.
+    NotBuilt(String),
 }
 
 /// What the experiment options make of a template's actions when an experiment is started
@@ -1139,7 +1399,15 @@ pub struct ExperimentRecord {
     /// Copied from that template.
     pub role_arn: String,
     pub status: ExperimentStatus,
-    pub reason: Option<String>,
+    /// `ExperimentState$reason` — "the reason for the state", which FIS reports beside
+    /// EVERY status and not only a terminal one.
+    ///
+    /// A `String` rather than an `Option` precisely because of that: every status this
+    /// service moves an experiment into names the reason it moved there, so there is no
+    /// state in which the member is absent ([`INITIATING_REASON`] at the mint,
+    /// [`RUNNING_REASON`] when the run starts, [`COMPLETED_REASON`] or the failure's own
+    /// reason at the end, [`STOPPED_BY_REQUEST`] for a stop).
+    pub reason: String,
     /// Copied from the template, as `ExperimentTarget`s.
     pub targets: HashMap<String, ExperimentTarget>,
     /// What those targets RESOLVED to when this experiment was started, in the order
@@ -1159,6 +1427,10 @@ pub struct ExperimentRecord {
     pub experiment_options: ExperimentOptions,
     pub log_configuration: Option<ExperimentLogConfiguration>,
     pub experiment_report_configuration: Option<ExperimentReportConfiguration>,
+    /// The generation of this experiment's report, present exactly when it was started
+    /// with an `experiment_report_configuration` — FIS generates a report for an
+    /// experiment that configured one, and reports nothing at all for one that did not.
+    pub report: Option<ExperimentReportRecord>,
     /// The target account configurations the template carried when this experiment was
     /// started, keyed by `accountId`.
     ///
@@ -1234,7 +1506,7 @@ impl ExperimentRecord {
             // An accepted experiment starts up before it runs; the clock owes the move to
             // `running`.
             status: ExperimentStatus::Initiating,
-            reason: None,
+            reason: INITIATING_REASON.to_string(),
             targets,
             resolved_targets,
             actions: template
@@ -1269,6 +1541,10 @@ impl ExperimentRecord {
                 .experiment_report_configuration
                 .as_ref()
                 .map(experiment_report_configuration),
+            report: template
+                .experiment_report_configuration
+                .as_ref()
+                .map(|_| ExperimentReportRecord::pending()),
             target_account_configurations: template.target_account_configurations.clone(),
             creation_time: now,
             start_time: now,
@@ -1306,19 +1582,29 @@ impl ExperimentRecord {
             match self.status {
                 ExperimentStatus::Initiating => {
                     self.status = ExperimentStatus::Running;
+                    self.reason = RUNNING_REASON.to_string();
                     // The run started when the transition fell due, so what is left of it
                     // is measured from there and not from this call.
-                    self.transition_due = Some(due + self.run_span);
+                    //
+                    // CHECKED: [`run_span`] clamps the span into
+                    // [`MIN_RUN_SPAN`]..=[`MAX_RUN_SPAN`], but a `SystemTime` still holds a
+                    // finite range and its `Add<Duration>` PANICS past it rather than
+                    // answering. This runs on the read path of every reporting operation,
+                    // so an instant the span cannot be added to leaves the end of the run
+                    // due at `due` itself — the loop below then carries the outcome — in
+                    // place of a panic that every later read of the same record would take
+                    // again.
+                    self.transition_due = Some(due.checked_add(self.run_span).unwrap_or(due));
                 }
                 ExperimentStatus::Running => {
                     match &self.outcome {
                         ExperimentOutcome::Completed => {
                             self.status = ExperimentStatus::Completed;
-                            self.reason = Some(COMPLETED_REASON.to_string());
+                            self.reason = COMPLETED_REASON.to_string();
                         }
                         ExperimentOutcome::Failed(failure) => {
                             self.status = ExperimentStatus::Failed;
-                            self.reason = Some(failure.reason.clone());
+                            self.reason = failure.reason.clone();
                         }
                     }
                     // The experiment ended when the transition fell due, not when somebody
@@ -1354,15 +1640,92 @@ impl ExperimentRecord {
             return;
         }
         self.status = ExperimentStatus::Stopping;
-        self.reason = Some(reason.to_string());
+        self.reason = reason.to_string();
         self.transition_due = Some(now + TRANSITION_DELAY);
+    }
+
+    /// The bucket and key this experiment's report is written to, or `None` when its
+    /// report configuration names no Amazon S3 output.
+    ///
+    /// `ExperimentReportConfiguration$outputs`, the `s3Configuration` under it and that
+    /// configuration's `bucketName` are all OPTIONAL, so a configuration can name no
+    /// destination at all; the key is built by [`report_object_key`] from the configured
+    /// prefix.
+    pub fn report_destination(&self) -> Option<(String, String)> {
+        let s3 = self
+            .experiment_report_configuration
+            .as_ref()?
+            .outputs
+            .as_ref()?
+            .s3_configuration
+            .as_ref()?;
+        let bucket = s3
+            .bucket_name
+            .as_deref()
+            .filter(|bucket| !bucket.is_empty())?;
+        Some((
+            bucket.to_string(),
+            report_object_key(s3.prefix.as_deref(), &self.id),
+        ))
+    }
+
+    /// Claim the report generation the CLOCK owes this experiment at `now`, or `None` when
+    /// it owes none.
+    ///
+    /// FIS generates the experiment report once the experiment has ENDED, so the
+    /// generation falls due with the terminal status — whether that status was reached by
+    /// the run elapsing or by a stop — and it falls due whether or not anybody called.
+    /// Call it on a SETTLED record ([`settle`](Self::settle)), which is what moves the
+    /// experiment into that status.
+    ///
+    /// Claiming MARKS the generation in progress, so a reader that arrives while one is
+    /// being written reports the `running` generation and does not start another. A
+    /// generation left `running` for longer than [`REPORT_CLAIM_GRACE`] IS claimed again:
+    /// the write of one report is a single in-process call, so a claim older than that was
+    /// made by a request that never finished it (a cancelled request, a disconnected
+    /// client), which would otherwise strand the report at `running` forever. One that has
+    /// REACHED `completed` or `failed` is never claimed again.
+    pub fn claim_report_generation(&mut self, now: SystemTime) -> Option<ReportGeneration> {
+        if !self.status.is_terminal() || !self.report.as_ref()?.claimable_at(now) {
+            return None;
+        }
+        // Built here, from the record, while the status and times are the ones the ended
+        // run left: the write itself happens with no store lock held. The destination is
+        // resolved FIRST, so a generation with nowhere to go pays nothing for a document
+        // it would throw away.
+        //
+        // The document is stamped with the instant the generation FELL DUE — the
+        // experiment's own `endTime` — and not with this call: the report was owed then,
+        // whoever happened to look afterwards, so the same record always renders the same
+        // bytes. `now` is the fallback for a terminal record that carries no `endTime`,
+        // which no transition this service makes leaves behind.
+        let generated_at = self.end_time.unwrap_or(now);
+        let generation = match self.report_destination() {
+            None => ReportGeneration::NoOutput,
+            Some((bucket, key)) => match experiment_report_document(self, generated_at) {
+                Ok(document) => ReportGeneration::Write {
+                    bucket,
+                    key,
+                    document,
+                },
+                Err(error) => ReportGeneration::NotBuilt(format!(
+                    "The experiment report document could not be built: {error}"
+                )),
+            },
+        };
+        if let Some(report) = self.report.as_mut() {
+            report.generating(now);
+        }
+        Some(generation)
     }
 
     /// The `ExperimentState` this record reports.
     pub fn to_state(&self) -> ExperimentState {
         ExperimentState {
             status: Some(self.status.as_wire().to_string()),
-            reason: self.reason.clone(),
+            // "The reason for the state", which the model restricts to no status and FIS
+            // pairs with every one of them — see [`ExperimentRecord::reason`].
+            reason: Some(self.reason.clone()),
             // `ExperimentError` carries "the error information of the experiment when the
             // action has failed", so it is reported exactly when this experiment HAS
             // failed: the failure its run ended in, and nothing at all for a run that is
@@ -1396,9 +1759,12 @@ impl ExperimentRecord {
             experiment_options: Some(self.experiment_options.clone()),
             target_account_configurations_count: Some(self.target_account_configurations_count()),
             experiment_report_configuration: self.experiment_report_configuration.clone(),
-            // `ExperimentReport` describes a report this emulator does not generate: the
-            // report configuration is persisted, but no report is produced for it.
-            experiment_report: None,
+            // The generation of the report this experiment configured, and nothing at all
+            // for an experiment that configured none.
+            experiment_report: self
+                .report
+                .as_ref()
+                .map(ExperimentReportRecord::to_experiment_report),
         }
     }
 
@@ -3052,7 +3418,8 @@ fn policy_grants_service(document: &str, principal: &str) -> Option<bool> {
 
 /// `map` as an ordered rendering of its entries, or `null` when it is absent.
 ///
-/// Every map that goes into a fingerprint goes through here. A `HashMap`'s iteration order
+/// Every map that goes into a fingerprint or into an experiment report document
+/// ([`experiment_report_document`]) goes through here. A `HashMap`'s iteration order
 /// is NOT stable — two maps holding the same entries can walk them in different orders —
 /// and `serde_json`'s object type preserves insertion order verbatim in any build that
 /// resolves the crate's `preserve_order` feature, so an unsorted map would render one
@@ -3477,6 +3844,318 @@ fn experiment_report_configuration(
         }),
         pre_experiment_duration: configuration.pre_experiment_duration.clone(),
         post_experiment_duration: configuration.post_experiment_duration.clone(),
+    }
+}
+
+/// The key the report of the experiment `experiment_id` is written under, inside the bucket
+/// its report configuration names.
+///
+/// `ReportConfigurationS3OutputPrefix` is "the prefix of the S3 bucket where the experiment
+/// report will be stored", so the key is that prefix, then the experiment the report is
+/// about, then [`REPORT_OBJECT_NAME`] — which keeps the reports of two experiments sharing
+/// one prefix apart. A prefix the caller wrote with leading or trailing slashes names the
+/// same place as one without them, so they are trimmed rather than producing an empty key
+/// segment.
+pub fn report_object_key(prefix: Option<&str>, experiment_id: &str) -> String {
+    let prefix = prefix.unwrap_or_default().trim_matches('/');
+    if prefix.is_empty() {
+        format!("{experiment_id}/{REPORT_OBJECT_NAME}")
+    } else {
+        format!("{prefix}/{experiment_id}/{REPORT_OBJECT_NAME}")
+    }
+}
+
+/// The ARN of the report object `key` in `bucket` — `ExperimentReportS3Report$arn`, "the
+/// Amazon Resource Name (ARN) of the generated report".
+///
+/// Formatted here rather than through `::engine::emulator_arn` for the same reason
+/// [`action_arn`] is: an Amazon S3 object's ARN carries NEITHER a region nor an account
+/// segment (the AWS Service Authorization Reference gives it as
+/// `arn:${Partition}:s3:::${BucketName}/${ObjectName}`), and that helper always
+/// interpolates the emulator account.
+pub fn report_object_arn(bucket: &str, key: &str) -> String {
+    format!("arn:aws:s3:::{bucket}/{key}")
+}
+
+/// `at` as the ISO-8601 instant a report document states a time as, or `None` for a time
+/// the record does not carry (an `endTime` is absent until the experiment ends).
+fn report_timestamp(at: Option<SystemTime>) -> Option<String> {
+    at.and_then(|at| {
+        ::aws_smithy_types::DateTime::from(at)
+            .fmt(::aws_smithy_types::date_time::Format::DateTime)
+            .ok()
+    })
+}
+
+/// A modelled timestamp the record already holds, as a report document states it. See
+/// [`report_timestamp`], which does the same for a [`SystemTime`].
+fn report_datetime(at: Option<&::aws_smithy_types::DateTime>) -> Option<String> {
+    at.and_then(|at| at.fmt(::aws_smithy_types::date_time::Format::DateTime).ok())
+}
+
+/// The bytes of the experiment report for `record`, generated at `generated_at`, or the
+/// serializer's own error when the document could not be rendered — which the caller turns
+/// into a FAILED generation ([`REPORT_NOT_BUILT_CODE`]) rather than writing a report with
+/// no bytes in it.
+///
+/// Every value in it is READ OFF the experiment's own persisted record — its identity and
+/// execution role, the lifecycle its run walked and the state it ended in, the actions the
+/// run carried out or skipped with the state each of them reports, what its targets
+/// resolved to, its stop conditions, and the report configuration that asked for this
+/// report. Nothing is synthesised: what this emulator does not hold does not appear, and
+/// `notes` says so for the CloudWatch dashboards a report configuration may name, whose
+/// snapshots and metric data are produced by no part of this emulator.
+///
+/// Every map in it is rendered in key order ([`ordered_entries`], the crate's one map
+/// renderer) and `generated_at` is the instant the generation fell DUE rather than the one
+/// somebody polled at, so the same record always renders the same bytes.
+pub fn experiment_report_document(
+    record: &ExperimentRecord,
+    generated_at: SystemTime,
+) -> Result<Vec<u8>, ::serde_json::Error> {
+    let state = record.to_state();
+    let actions: BTreeMap<&str, ::serde_json::Value> = record
+        .actions
+        .iter()
+        .map(|(name, action)| {
+            (
+                name.as_str(),
+                ::serde_json::json!({
+                    "actionId": action.action_id,
+                    "description": action.description,
+                    "parameters": ordered_entries(action.parameters.as_ref()),
+                    "targets": ordered_entries(action.targets.as_ref()),
+                    "startAfter": action.start_after,
+                    "state": action.state.as_ref().map(|state| ::serde_json::json!({
+                        "status": state.status,
+                        "reason": state.reason,
+                    })),
+                    "startTime": report_datetime(action.start_time.as_ref()),
+                    "endTime": report_datetime(action.end_time.as_ref()),
+                }),
+            )
+        })
+        .collect();
+    let targets: BTreeMap<&str, ::serde_json::Value> = record
+        .targets
+        .iter()
+        .map(|(name, target)| {
+            (
+                name.as_str(),
+                ::serde_json::json!({
+                    "resourceType": target.resource_type,
+                    "resourceArns": target.resource_arns,
+                    "resourceTags": ordered_entries(target.resource_tags.as_ref()),
+                    "selectionMode": target.selection_mode,
+                    "parameters": ordered_entries(target.parameters.as_ref()),
+                    "filters": target.filters.as_ref().map(|filters| filters
+                        .iter()
+                        .map(|filter| ::serde_json::json!({
+                            "path": filter.path,
+                            "values": filter.values,
+                        }))
+                        .collect::<Vec<_>>()),
+                }),
+            )
+        })
+        .collect();
+    let resolved_targets: Vec<::serde_json::Value> = record
+        .resolved_targets
+        .iter()
+        .map(|resolved| {
+            ::serde_json::json!({
+                "targetName": resolved.target_name,
+                "resourceType": resolved.resource_type,
+                "targetInformation": ordered_entries(resolved.target_information.as_ref()),
+            })
+        })
+        .collect();
+    let stop_conditions: Vec<::serde_json::Value> = record
+        .stop_conditions
+        .iter()
+        .map(|condition| {
+            ::serde_json::json!({ "source": condition.source, "value": condition.value })
+        })
+        .collect();
+    let configuration = record.experiment_report_configuration.as_ref();
+    let dashboards: Vec<::serde_json::Value> = configuration
+        .and_then(|configuration| configuration.data_sources.as_ref())
+        .and_then(|sources| sources.cloud_watch_dashboards.as_ref())
+        .map(|dashboards| {
+            dashboards
+                .iter()
+                .map(|dashboard| {
+                    ::serde_json::json!({ "dashboardIdentifier": dashboard.dashboard_identifier })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut notes = vec![
+        "This report is built from the experiment's own record: the lifecycle its run \
+         walked, the actions the run carried out or skipped, and the resources its targets \
+         resolved to.",
+    ];
+    if !dashboards.is_empty() {
+        notes.push(
+            "The CloudWatch dashboards the report configuration names are listed under \
+             reportConfiguration.dataSources; no dashboard snapshot and no metric data is \
+             included, because this emulator captures none.",
+        );
+    }
+    let document = ::serde_json::json!({
+        "generatedAt": report_timestamp(Some(generated_at)),
+        "experiment": {
+            "id": record.id,
+            "arn": record.arn,
+            "experimentTemplateId": record.experiment_template_id,
+            "roleArn": record.role_arn,
+            "state": {
+                "status": state.status,
+                "reason": state.reason,
+                "error": state.error.as_ref().map(|error| ::serde_json::json!({
+                    "accountId": error.account_id,
+                    "code": error.code,
+                    "location": error.location,
+                })),
+            },
+            "creationTime": report_timestamp(Some(record.creation_time)),
+            "startTime": report_timestamp(Some(record.start_time)),
+            "endTime": report_timestamp(record.end_time),
+            "experimentOptions": {
+                "accountTargeting": record.experiment_options.account_targeting,
+                "emptyTargetResolutionMode": record.experiment_options.empty_target_resolution_mode,
+                "actionsMode": record.experiment_options.actions_mode,
+            },
+            "tags": ordered_entries(Some(&record.tags)),
+        },
+        "actions": actions,
+        "targets": targets,
+        "resolvedTargets": resolved_targets,
+        "stopConditions": stop_conditions,
+        "reportConfiguration": {
+            "preExperimentDuration": configuration
+                .and_then(|configuration| configuration.pre_experiment_duration.clone()),
+            "postExperimentDuration": configuration
+                .and_then(|configuration| configuration.post_experiment_duration.clone()),
+            "dataSources": { "cloudWatchDashboards": dashboards },
+        },
+        "notes": notes,
+    });
+    ::serde_json::to_vec_pretty(&document)
+}
+
+/// An Amazon S3 client over the in-process callback into this same emulator.
+///
+/// The callback is the framework's documented seam for calling another emulated service: it
+/// routes in process, so no network client is configured here. `region` is the request's
+/// own signing region, so a report is written where the caller's own S3 requests go.
+fn s3_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_s3::Client {
+    let config = ::aws_sdk_s3::Config::builder()
+        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
+        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
+        // The in-process transport routes on the request's own path, and a virtual-host
+        // bucket name is not a host this emulator resolves, so the request addresses its
+        // bucket in the path.
+        .force_path_style(true)
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(ctx.callback().http_client())
+        // The transport is in-process: there is nothing to retry, time out or watch for a
+        // stalled stream, and each of those would need a sleep implementation this client
+        // is not given. The same goes for caching the identity.
+        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
+        .stalled_stream_protection(::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
+        .build();
+    ::aws_sdk_s3::Client::from_conf(config)
+}
+
+/// Materialise the report generation the CLOCK owes the experiment `id` at `now`: write the
+/// report to the Amazon S3 output its configuration names, and record on the experiment
+/// where it went.
+///
+/// The SECOND write a reporting operation performs, beside
+/// [`ExperimentRecord::settle`], and owed on the same terms: FIS generates the experiment
+/// report once the experiment has ENDED, so the generation was due at `now` whether or not
+/// anybody called, and two reads at the same instant report the same report state. An
+/// experiment that configured no report owes nothing and nothing is written for it.
+///
+/// Takes the store lock TWICE and holds it across neither await: once to settle the clock
+/// and claim the generation ([`ExperimentRecord::claim_report_generation`], which also
+/// builds the document), and once to record what the write did. A generation that has
+/// reached its own terminal state, or one claimed within [`REPORT_CLAIM_GRACE`], is not
+/// claimed again, so the report object is written once.
+pub async fn materialise_experiment_report<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    id: &str,
+    now: SystemTime,
+) {
+    let Some(state) = service_state(engine) else {
+        return;
+    };
+    let generation = {
+        let mut store = state.lock();
+        let Some(record) = store.settled_experiment_mut(id, now) else {
+            return;
+        };
+        match record.claim_report_generation(now) {
+            Some(generation) => generation,
+            None => return,
+        }
+    };
+
+    let outcome = match generation {
+        // Nowhere to write it: the configuration asked for a report without naming an
+        // output, so the generation fails rather than reporting a report nothing holds.
+        ReportGeneration::NoOutput => Err((
+            REPORT_OUTPUT_NOT_CONFIGURED_CODE,
+            "experimentReportConfiguration names no \
+             outputs.s3Configuration.bucketName for the report to be written to."
+                .to_string(),
+        )),
+        // No document to write: the same rule, for the report that could not be built.
+        ReportGeneration::NotBuilt(reason) => Err((REPORT_NOT_BUILT_CODE, reason)),
+        ReportGeneration::Write {
+            bucket,
+            key,
+            document,
+        } => match s3_client(ctx, region)
+            .put_object()
+            .bucket(&bucket)
+            .key(&key)
+            .body(::aws_sdk_s3::primitives::ByteStream::from(document))
+            .content_type(REPORT_CONTENT_TYPE)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(report_object_arn(&bucket, &key)),
+            Err(error) => Err((
+                REPORT_OUTPUT_NOT_WRITTEN_CODE,
+                format!(
+                    "Could not write the experiment report to s3://{bucket}/{key}: {}",
+                    ::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                ),
+            )),
+        },
+    };
+
+    let mut store = state.lock();
+    let Some(report) = store
+        .experiments
+        .get_mut(id)
+        .and_then(|record| record.report.as_mut())
+    else {
+        return;
+    };
+    match outcome {
+        Ok(arn) => report.written(arn),
+        Err((code, reason)) => report.failed(code, reason),
     }
 }
 

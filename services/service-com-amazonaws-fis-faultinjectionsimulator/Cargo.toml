@@ -29,6 +29,10 @@ iso8601-duration = "0.2"
 # The IAM store StartExperiment resolves an experiment template's `roleArn` against, to
 # check the role's trust policy grants fis.amazonaws.com before an experiment is created.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# Amazon S3 client the experiment report of an ended experiment is written through, over
+# the in-process callback into this same emulator (no network client feature is enabled:
+# the transport is the emulator's own).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -36,6 +40,10 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The experiment-report suite mounts the S3 service beside FIS on one engine, because the
+# report of an ended experiment is written to object storage by calling S3 in process —
+# what the assembled emulator does.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

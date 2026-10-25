@@ -132,7 +132,16 @@ const SIGNED: &str =
      SignedHeaders=host, Signature=0123456789abcdef";
 
 /// `PutMethod` for `verb` on `resource`, with `request` as its body.
-async fn put_method(gateway: &Gateway, api: &str, resource: &str, verb: &str, request: Value) {
+///
+/// `pub(crate)` because the sibling `stage_export` suite stands a method up the same way
+/// before deploying it, so both suites put a method through one helper.
+pub(crate) async fn put_method(
+    gateway: &Gateway,
+    api: &str,
+    resource: &str,
+    verb: &str,
+    request: Value,
+) {
     let answer = gateway
         .call(
             "PUT",
@@ -225,7 +234,10 @@ async fn method_response(
 
 /// `CreateDeployment` of `api` to `stage`, asserting the modelled 201 and answering the
 /// deployment id.
-async fn deploy(gateway: &Gateway, api: &str, stage: &str) -> String {
+///
+/// `pub(crate)` for the sibling `stage_export` suite: an export is of what a stage SERVES,
+/// so every case there deploys through this same helper.
+pub(crate) async fn deploy(gateway: &Gateway, api: &str, stage: &str) -> String {
     let answer = gateway
         .call(
             "POST",

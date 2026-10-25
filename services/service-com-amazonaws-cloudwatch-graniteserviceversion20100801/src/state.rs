@@ -744,6 +744,18 @@ pub const MAX_DATAPOINTS_PER_SERIES: usize = 50_000;
 /// reached") reports on `PutMetricAlarm`.
 pub const MAX_ALARMS: usize = 5_000;
 
+/// An alarm's action list as the stored alarm carries it, and so as every reader of an alarm
+/// reports it: the actions the request configured, and the EMPTY list when it configured none.
+///
+/// `OKActions`, `AlarmActions` and `InsufficientDataActions` are `ResourceList`s of
+/// `length 0..5` on every alarm writer, so "no action" is a list of none rather than no list:
+/// a caller iterating a described alarm's actions, or reading one alarm to write it back, is
+/// never left telling an empty list from an absent one. Shared by the alarm writers so one
+/// rule answers them all.
+pub fn configured_actions(actions: Option<&[String]>) -> Option<Vec<String>> {
+    Some(actions.unwrap_or_default().to_vec())
+}
+
 /// The largest number of history items retained per alarm. Reaching it evicts the OLDEST,
 /// so repeated configuration or state updates cannot grow memory without limit.
 pub const MAX_HISTORY_ITEMS_PER_ALARM: usize = 1_000;

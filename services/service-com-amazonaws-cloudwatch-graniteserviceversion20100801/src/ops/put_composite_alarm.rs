@@ -399,9 +399,11 @@ fn write_composite_alarm(
         // state of the composite alarm. The default is TRUE."
         // (`PutCompositeAlarmInput$ActionsEnabled`)
         actions_enabled: Some(input.actions_enabled.unwrap_or(true)),
-        ok_actions: input.ok_actions.clone(),
-        alarm_actions: input.alarm_actions.clone(),
-        insufficient_data_actions: input.insufficient_data_actions.clone(),
+        ok_actions: crate::state::configured_actions(input.ok_actions.as_deref()),
+        alarm_actions: crate::state::configured_actions(input.alarm_actions.as_deref()),
+        insufficient_data_actions: crate::state::configured_actions(
+            input.insufficient_data_actions.as_deref(),
+        ),
         state_value,
         state_reason,
         state_reason_data,

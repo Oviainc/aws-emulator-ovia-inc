@@ -161,9 +161,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // algorithm that exists and carries nothing.
             let arn =
                 crate::state::resource_arn(&crate::state::request_region(ctx), "algorithm", name);
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Could not find algorithm \"{arn}\"."
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::entity_does_not_exist(crate::state::ALGORITHM_ENTITY, &arn),
+            ));
         };
         // The one write this reporting operation makes: a transition that was due at
         // the algorithm's `completed_at` whether or not anybody called.

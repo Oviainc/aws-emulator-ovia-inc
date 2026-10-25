@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AttachClusterNodeVolume
-//! IMPLEMENTED: validates the `ClusterArn` against `crate::state` — a cluster this
-//! account does not hold, or one that is not `InService`, is a 400 `ValidationException`
+//! IMPLEMENTED: resolves the `ClusterArn` against `crate::state` — a cluster this account
+//! does not hold is the modelled `ResourceNotFound`, one that is not `InService` fails the
+//! documented precondition with a 400 `ValidationException`
 //! — then resolves the node by `NodeId` inside that cluster, refusing a node it does not
 //! own with the modelled `ResourceNotFound`, and attaches the volume, answering the
 //! attachment it already holds when the same volume is attached again. The
@@ -166,15 +167,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        // The `ClusterArn` is a request parameter saying WHERE to attach, and it is
-        // checked before anything else: a precondition the request fails is a 400
-        // `ValidationException`, since the operation's modelled `ResourceNotFound`
-        // belongs to the node the cluster owns.
+        // The `ClusterArn` says WHERE to attach, and it is resolved before anything else.
+        // A cluster this account does not hold is the modelled `ResourceNotFound` — the
+        // same class as the node below, since both are resources the request addresses —
+        // and carries the cluster-node lookup's own fixed sentence, which states the
+        // condition and NOTHING from the request. The two sentences differ, so a caller
+        // tells an unknown cluster from an unknown node by the text.
         let Some(cluster) = store.cluster_by_arn_mut(&input.cluster_arn) else {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Specified cluster not found: {}.",
-                input.cluster_arn
-            )));
+            return Err(AttachClusterNodeVolumeErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(crate::state::CLUSTER_NODE_LOOKUP_CLUSTER_NOT_FOUND.to_string()),
+            })
+            .into());
         };
         // Documented on `ClusterArn`: "Your cluster must use EKS as the orchestration and
         // be in the InService state." The `Creating` -> `InService` transition the clock
@@ -216,12 +219,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(node) = cluster.node_by_instance_id_mut(&input.node_id) else {
             // The node is a resource the cluster owns, so a node the cluster does not
-            // have is the modelled `ResourceNotFound`.
+            // have is the modelled `ResourceNotFound`, worded with the node lookup's own
+            // fixed sentence rather than with the cluster ARN and the node id.
             return Err(AttachClusterNodeVolumeErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!(
-                    "Cluster {cluster_arn} has no node {}.",
-                    input.node_id
-                )),
+                message: Some(crate::state::CLUSTER_NODE_NOT_FOUND.to_string()),
             })
             .into());
         };

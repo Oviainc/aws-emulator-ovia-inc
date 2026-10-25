@@ -312,8 +312,9 @@ async fn a_constraint_refusal_names_every_member_and_its_constraint() {
         ),
         (
             // The organization-scoped member is judged exactly like the others:
-            // a value outside its enum is answered with the field list, and a
-            // value inside it is stored (`preference_writes`).
+            // a value outside its enum is answered with the field list. A value
+            // inside it is then judged against the rule about the CALLER
+            // (`preference_gates`), which answers a different message.
             "enum membership on the member-account visibility member",
             "UpdatePreferences",
             json!({"memberAccountDiscountVisibility": "Everyone"}),

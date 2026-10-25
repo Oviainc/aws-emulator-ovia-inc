@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: writes the connection definition the request's `ConnectionInput`
+//! redefines over the one stored under `Name` in the addressed Data Catalog, so the next
+//! `GetConnection` reports what this request sent. `ConnectionInput` is the whole
+//! client-settable definition, so a member it omits is CLEARED and
+//! `ConnectionSchemaVersion` is recomputed from what it carries, exactly as at create.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `CreationTime` stays the instant of the create, `LastUpdatedTime` becomes this call's
+//! instant and `LastUpdatedBy` the principal that issued it; the connection's tags are
+//! written through the tagging operations and this update leaves them alone.
+//!
+//! `Name` addresses the connection to update and this operation does not move a
+//! connection to another name — it models no already-exists error, so it has no way to
+//! report a destination name already taken — therefore a `ConnectionInput$Name` naming a
+//! different connection is refused with the modelled `InvalidInputException`, as is a
+//! `CatalogId` this emulator does not hold. A connection the addressed catalog does not
+//! hold is the modelled `EntityNotFoundException`; none of the three writes anything.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +151,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateConnection"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateConnectionErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        // A `CatalogId` no Data Catalog in this account answers to addresses no
+        // connection, and this operation models no not-found error for a catalog, so the
+        // refusal is the modelled client-input error — as on `CreateConnection`.
+        if !crate::state::is_known_catalog(&catalog_id) {
+            return Err(UpdateConnectionErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "CatalogId {catalog_id} is not a Data Catalog in this account"
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+        // A connection definition is stored under its name exactly as sent (the model
+        // documents no case fold for `Connection$Name`), so the two names are compared
+        // the same way.
+        if input.connection_input.name != input.name {
+            return Err(UpdateConnectionErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Name {} and ConnectionInput.Name {} must name the same connection",
+                        input.name, input.connection_input.name
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        let Some(entry) = store.connection_mut(&catalog_id, &input.name) else {
+            return Err(UpdateConnectionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(format!(
+                        "Connection {} not found in catalog {catalog_id}",
+                        input.name
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // Write the submitted definition into the stored record the read path serves, so
+        // the next `GetConnection`/`GetConnections` reports what this request sent.
+        entry.apply_input(
+            &input.connection_input,
+            // `Connection$LastUpdatedBy` is "the user, group, or role that last updated
+            // this connection definition": the identity this emulator's credentials speak
+            // for, derived as at create and never from the request.
+            Some(crate::state::request_principal()),
+            ::std::time::SystemTime::now(),
+        );
+        ::tracing::info!(
+            operation = "UpdateConnection",
+            catalog_id = %catalog_id,
+            connection = %input.name,
+            "updated a Glue connection definition"
+        );
+
+        Ok(UpdateConnectionOutput {})
     }
 }

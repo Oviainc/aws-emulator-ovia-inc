@@ -8,9 +8,9 @@
 //! `crate::state` BEFORE it acts, and refuses an unresolved one with a 400 carrying the
 //! error the model gives that reference — the operation's own `ResourceNotFound` for the
 //! resource it acts on or the parent it acts under, and `ValidationException` where the
-//! operation models no not-found error or where the reference is a `ClusterArn`
-//! parameter saying where to act. When every reference resolves, the answer is computed
-//! from what is stored, and the effect is readable back through the matching reader.
+//! operation models no not-found error. When every reference resolves, the answer is
+//! computed from what is stored, and the effect is readable back through the matching
+//! reader.
 //!
 //! Every case goes over the wire (`POST /` with `X-Amz-Target: SageMaker.<Op>`,
 //! `awsJson1_1`) through the same `MultiServiceRouter` the production router uses.
@@ -233,7 +233,9 @@ async fn an_absent_reference_is_refused_with_the_error_the_model_gives_it() {
     // Each row: the operation, a request naming only resources nothing was created for,
     // and the error code the model gives that reference.
     let cases: Vec<(&str, Value, &str)> = vec![
-        // `ClusterArn` says WHERE to act and is validated as a request parameter.
+        // The cluster is the resource the request addresses, so an absent one is the
+        // modelled not-found — for the operations that take it as a `ClusterArn`
+        // parameter as much as for those that take it by name.
         (
             "AttachClusterNodeVolume",
             json!({
@@ -241,8 +243,9 @@ async fn an_absent_reference_is_refused_with_the_error_the_model_gives_it() {
                 "NodeId": "i-0123456789abcdef0",
                 "VolumeId": "vol-0123456789abcdef0",
             }),
-            "ValidationException",
+            "ResourceNotFound",
         ),
+        // `ClusterArn` says WHERE to act for these two, which model no not-found error.
         (
             "CreateComputeQuota",
             json!({
@@ -262,7 +265,7 @@ async fn an_absent_reference_is_refused_with_the_error_the_model_gives_it() {
             }),
             "ValidationException",
         ),
-        // The cluster is the SUBJECT of these two, named by name or by ARN, so an absent
+        // The cluster is the SUBJECT of these, named by name or by ARN, so an absent
         // one is the modelled not-found.
         (
             "BatchAddClusterNodes",
@@ -1304,6 +1307,118 @@ async fn batch_add_cluster_nodes_adds_what_it_can_and_reports_what_it_cannot() {
             (400, "ValidationException"),
             "case {label} selector: expected 400 ValidationException, got {status} {parsed}"
         );
+    }
+}
+
+/// RULE: the HyperPod node lookup states each unknown identifier of a request with its
+/// OWN fixed sentence — one for a cluster this account does not hold, a DIFFERENT one for
+/// a node that cluster does not own — and neither sentence carries anything from the
+/// request, so a caller tells the two conditions apart by the text alone and no refusal
+/// reports an identifier it was never sent.
+#[tokio::test]
+async fn an_unknown_cluster_and_an_unknown_node_carry_their_own_fixed_refusals() {
+    // The two sentences are the whole point of the rule, so the fixture starts by pinning
+    // that they differ: a caller that cannot tell them apart learns nothing from either.
+    assert_ne!(
+        sm::CLUSTER_NODE_LOOKUP_CLUSTER_NOT_FOUND, sm::CLUSTER_NODE_NOT_FOUND,
+        "the unknown-cluster and unknown-node refusals must differ"
+    );
+
+    let emulator = Emulator::new();
+    let cluster_arn = create_cluster(&emulator, "hyperpod-a", &[("workers", "ml.m5.large")]).await;
+    // Adding a node over the wire leaves the clock to settle both the node and the cluster,
+    // so the attach rows below are past the documented `InService` precondition.
+    let node = add_running_node(&emulator, "hyperpod-a", "workers").await;
+    let absent_arn = absent_cluster_arn();
+    let volume = "vol-0123456789abcdef0";
+
+    // Rows differ along the operation, WHICH identifier is unknown, how the cluster is
+    // addressed (name or ARN), which selector picks the node (`NodeId` or
+    // `NodeLogicalId`) and the length of the unknown node id — `ClusterNodeId` is
+    // `^i-[a-f0-9]{8}(?:[a-f0-9]{9})?$`, so both the 8- and the 17-digit forms are tested.
+    let rows: Vec<(&str, &str, Value, &str, &str)> = vec![
+        (
+            "attach: a short node id the cluster does not own",
+            "AttachClusterNodeVolume",
+            json!({"ClusterArn": cluster_arn, "NodeId": "i-00000000", "VolumeId": volume}),
+            "ResourceNotFound",
+            sm::CLUSTER_NODE_NOT_FOUND,
+        ),
+        (
+            "attach: a long node id the cluster does not own",
+            "AttachClusterNodeVolume",
+            json!({
+                "ClusterArn": cluster_arn,
+                "NodeId": "i-0000000000000000f",
+                "VolumeId": volume,
+            }),
+            "ResourceNotFound",
+            sm::CLUSTER_NODE_NOT_FOUND,
+        ),
+        (
+            "attach: a cluster this account does not hold",
+            "AttachClusterNodeVolume",
+            json!({"ClusterArn": absent_arn, "NodeId": node, "VolumeId": volume}),
+            "ResourceNotFound",
+            sm::CLUSTER_NODE_LOOKUP_CLUSTER_NOT_FOUND,
+        ),
+        (
+            "describe: an unknown node of a cluster addressed by name",
+            "DescribeClusterNode",
+            json!({"ClusterName": "hyperpod-a", "NodeId": "i-00000000"}),
+            "ResourceNotFound",
+            sm::CLUSTER_NODE_NOT_FOUND,
+        ),
+        (
+            "describe: an unknown node of a cluster addressed by ARN",
+            "DescribeClusterNode",
+            json!({"ClusterName": cluster_arn, "NodeId": "i-0000000000000000f"}),
+            "ResourceNotFound",
+            sm::CLUSTER_NODE_NOT_FOUND,
+        ),
+        (
+            "describe: an unknown node picked by its logical id",
+            "DescribeClusterNode",
+            json!({"ClusterName": "hyperpod-a", "NodeLogicalId": "no-such-node"}),
+            "ResourceNotFound",
+            sm::CLUSTER_NODE_NOT_FOUND,
+        ),
+        (
+            "describe: a cluster name this account does not hold",
+            "DescribeClusterNode",
+            json!({"ClusterName": "no-such-cluster", "NodeId": node}),
+            "ResourceNotFound",
+            sm::CLUSTER_NODE_LOOKUP_CLUSTER_NOT_FOUND,
+        ),
+        (
+            "describe: a cluster ARN this account does not hold",
+            "DescribeClusterNode",
+            json!({"ClusterName": absent_arn, "NodeId": node}),
+            "ResourceNotFound",
+            sm::CLUSTER_NODE_LOOKUP_CLUSTER_NOT_FOUND,
+        ),
+    ];
+
+    for (case, operation, body, code, expected) in rows {
+        let (status, refused) = emulator.call(operation, &body).await;
+        assert_eq!(
+            (status, error_code(&refused).as_str()),
+            (400, code),
+            "case {case:?}: expected 400 {code}, got {status} with {refused}"
+        );
+        let text = message(&refused);
+        assert_eq!(
+            text, expected,
+            "case {case:?}: expected the refusal {expected:?}, got {text:?}"
+        );
+        // Nothing of the request's own values is echoed back: the sentence is fixed.
+        for leaked in [&cluster_arn, &absent_arn, &node] {
+            assert!(
+                !text.contains(leaked.as_str()),
+                "case {case:?}: the refusal must carry no identifier from the request, got \
+                 {text:?}"
+            );
+        }
     }
 }
 
