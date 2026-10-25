@@ -134,7 +134,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 DescribeConnectionProposalErrorModeled::InterconnectServerException(
@@ -156,10 +156,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.materialise_due_transitions(::std::time::Instant::now());
             // The `activationKey` is the proposal's only handle: the store's
             // `activationKey` -> connection-id index is what resolves it, and an entry
-            // lives exactly as long as the record it names.
+            // lives exactly as long as the record it names. The connection it names is
+            // then resolved in the Region this request was signed for, so a proposal
+            // whose connection was created through another Region's endpoint resolves
+            // to nothing here, exactly as an unknown key does.
             let connection_id = store.activation_keys.get(&input.activation_key).cloned();
             connection_id.and_then(|id| {
-                let stored = store.connections.get(&id)?;
+                let stored = store.connection_in(&region, &id)?;
                 let connection = &stored.connection;
                 // `provider` and `location` are documented as belonging to "the
                 // specific Environment of the proposal", so they are read from the

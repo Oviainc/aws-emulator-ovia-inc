@@ -36,7 +36,6 @@ const GATEWAY_ROWS: [(&str, Option<i64>); 2] = [
     ("ic-lifecycle-table-b", Some(64_512)),
 ];
 
-
 // ---------------------------------------------------------------------------
 // Shape checks, written from the model's own constraints
 // ---------------------------------------------------------------------------
@@ -565,8 +564,10 @@ async fn create_connection_computes_every_server_owned_member_and_persists_it() 
         );
 
         // The stored record is what a read returns: same content, every member.
+        // Read through the region the create was signed for, which is the region
+        // that holds the connection.
         let fetched = emulator
-            .ic_ok("GetConnection", json!({ "identifier": id }))
+            .ic_ok_in(case.region, "GetConnection", json!({ "identifier": id }))
             .await;
         assert_eq!(
             fetched["connection"], connection,
