@@ -134,6 +134,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `Identifier`'s presence and its `ResourceIdentifier` pattern are modelled
         // constraints, already refused by the centralized walk before this body runs.
+        //
+        // An identifier naming the OTHER resource kind cannot be authorized for this
+        // action, and that decision is taken before the link table is consulted, so
+        // the refusal says nothing about what is stored.
+        crate::state::require_resource_kind(
+            Self::NAME,
+            &input.identifier,
+            crate::state::ResourceKind::Link,
+        )?;
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteLinkErrorModeled::InternalServiceFault(InternalServiceFault {
                 message: Some("the link store is unavailable".to_string()),
@@ -149,10 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.remove_link(&region, &input.identifier).is_none() {
             return Err(DeleteLinkErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "no link matching '{}' exists in this account and Region",
-                        input.identifier
-                    )),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                     ..Default::default()
                 },
             )
