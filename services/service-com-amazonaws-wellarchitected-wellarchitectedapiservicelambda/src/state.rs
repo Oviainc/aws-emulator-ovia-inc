@@ -87,9 +87,10 @@ pub use official_lenses::{
 };
 
 use crate::ops::types::{
-    AgentProfileSummary, AgentRecommendationGenerationSummary, AgentRecommendationSummary,
-    AggregationConfiguration, Choice, ChoiceAnswer, ConflictException, ContextContent,
-    ContextSummary, GoalSummary, JiraSelectedQuestionConfiguration, LensReview, LensSummary,
+    AccountJiraConfigurationOutput, AgentProfileSummary, AgentRecommendationGenerationSummary,
+    AgentRecommendationSummary, AggregationConfiguration, Choice, ChoiceAnswer, ConflictException,
+    ContextContent, ContextSummary, GetGlobalSettingsOutput, GoalSummary,
+    JiraSelectedQuestionConfiguration, LensReview, LensSummary,
     Milestone, MilestoneSummary, PillarReviewSummary, Profile, ProfileQuestion,
     ProfileShareSummary, ProfileSummary, Progress, ResourceNotFoundException, ReviewTemplate,
     ReviewTemplateAnswer, ReviewTemplateLensReview, ReviewTemplatePillarReviewSummary,
@@ -140,6 +141,24 @@ pub const CHOICE_STATUS_SELECTED: &str = "SELECTED";
 /// (`smithy_query(query="shape", shape="TrustedAdvisorIntegrationStatus")`), and a
 /// workload nobody enabled the integration for is not integrated.
 pub const DEFAULT_TRUSTED_ADVISOR_INTEGRATION_STATUS: &str = "DISABLED";
+
+/// The `DISABLED` member every account-level opt-in status of this service publishes:
+/// `OrganizationSharingStatus`, `DiscoveryIntegrationStatus` and
+/// `AccountJiraIssueManagementStatus` each publish exactly `ENABLED` and `DISABLED`
+/// (`smithy_query(query="shape", shape="OrganizationSharingStatus")`). It is what an
+/// account that has turned none of them on reports: `UpdateGlobalSettings` is what
+/// "update[s] whether the Amazon Web Services account is opted into organization sharing
+/// and discovery integration features", so an account no write has opted in is not opted
+/// in.
+pub const GLOBAL_SETTING_DISABLED: &str = "DISABLED";
+
+/// `IntegrationStatus$NOT_CONFIGURED`: what an account's Jira integration reports until
+/// it is connected. The reported status publishes `CONFIGURED` and `NOT_CONFIGURED`,
+/// while the member a REQUEST carries (`IntegrationStatusInput`) publishes
+/// `NOT_CONFIGURED` alone (`smithy_query(query="shape",
+/// shape="IntegrationStatus,IntegrationStatusInput")`) — so no request can ask for
+/// `CONFIGURED`, which is reached by completing the Jira connection outside this API.
+pub const JIRA_INTEGRATION_NOT_CONFIGURED: &str = "NOT_CONFIGURED";
 
 /// The lens alias of the AWS-official Well-Architected Framework lens — the first entry
 /// of the AWS-official lens catalog this emulator publishes
@@ -4812,6 +4831,81 @@ pub struct CreateAgentContextToken {
     pub fingerprint: String,
 }
 
+/// The account-level settings `UpdateGlobalSettings` records and `GetGlobalSettings`
+/// reports — "Global settings for all workloads"
+/// (`smithy_query(query="doc", shape="GetGlobalSettings")`). There is one set per
+/// account, so the store holds a singleton rather than a map.
+///
+/// Every member is what the last write RECORDED: a member no write has named is `None`,
+/// and the projection ([`GlobalSettingsRecord::to_global_settings`]) is what answers such
+/// a member with the value an account that has configured nothing is running under.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GlobalSettingsRecord {
+    /// `OrganizationSharingStatus` as the last write recorded it.
+    pub organization_sharing_status: Option<String>,
+    /// `DiscoveryIntegrationStatus` as the last write recorded it.
+    pub discovery_integration_status: Option<String>,
+    /// `AccountJiraConfigurationInput$IntegrationStatus` as the last write recorded it.
+    pub jira_integration_status: Option<String>,
+    /// `AccountJiraConfigurationInput$IssueManagementStatus` as the last write recorded
+    /// it.
+    pub jira_issue_management_status: Option<String>,
+    /// `AccountJiraConfigurationInput$IssueManagementType` as the last write recorded it.
+    pub jira_issue_management_type: Option<String>,
+    /// `AccountJiraConfigurationInput$JiraProjectKey` as the last write recorded it — the
+    /// "Jira project key to sync workloads to".
+    pub jira_project_key: Option<String>,
+}
+
+impl GlobalSettingsRecord {
+    /// The `GetGlobalSettingsOutput` this account's settings project to.
+    ///
+    /// A status a write recorded is reported as recorded. A status no write has set is
+    /// reported as the one an account that has configured nothing is running under
+    /// ([`GLOBAL_SETTING_DISABLED`], and [`JIRA_INTEGRATION_NOT_CONFIGURED`] for the Jira
+    /// connection), because such an account is not unconfigured — it is running with the
+    /// feature off.
+    ///
+    /// The Jira members that are NOT a status are reported only once a write recorded
+    /// them: `IssueManagementType` publishes `AUTO` and `MANUAL`
+    /// (`smithy_query(query="shape", shape="IssueManagementType")`) and so has no member
+    /// standing for "nobody chose one", and a project key is a value, not a default.
+    /// `Subdomain` and `StatusMessage` are reported by the Jira CONNECTION and no request
+    /// of this API carries either (`smithy_query(query="shape",
+    /// shape="AccountJiraConfigurationInput")`), so this emulator holds nothing to report
+    /// them from.
+    pub fn to_global_settings(&self) -> GetGlobalSettingsOutput {
+        GetGlobalSettingsOutput {
+            organization_sharing_status: Some(
+                self.organization_sharing_status
+                    .clone()
+                    .unwrap_or_else(|| GLOBAL_SETTING_DISABLED.to_string()),
+            ),
+            discovery_integration_status: Some(
+                self.discovery_integration_status
+                    .clone()
+                    .unwrap_or_else(|| GLOBAL_SETTING_DISABLED.to_string()),
+            ),
+            jira_configuration: Some(AccountJiraConfigurationOutput {
+                integration_status: Some(
+                    self.jira_integration_status
+                        .clone()
+                        .unwrap_or_else(|| JIRA_INTEGRATION_NOT_CONFIGURED.to_string()),
+                ),
+                issue_management_status: Some(
+                    self.jira_issue_management_status
+                        .clone()
+                        .unwrap_or_else(|| GLOBAL_SETTING_DISABLED.to_string()),
+                ),
+                issue_management_type: self.jira_issue_management_type.clone(),
+                subdomain: None,
+                jira_project_key: self.jira_project_key.clone(),
+                status_message: None,
+            }),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-wellarchitected-wellarchitectedapiservicelambda. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
@@ -4962,6 +5056,10 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// this past that product — and [`Self::remove_agent_profile`] drops a deleted
     /// profile's recommendations with its generations, which is what keeps that bound real.
     pub agent_recommendations: HashMap<String, BTreeMap<String, AgentRecommendationRecord>>,
+    /// The account's global settings — what `UpdateGlobalSettings` records and
+    /// `GetGlobalSettings` reports. One set per account, so a singleton rather than a
+    /// map, and `Default` (every member unrecorded) is the account before any write.
+    pub global_settings: GlobalSettingsRecord,
     /// Monotonic input to [`Self::next_hex_id`]; never returned to a caller.
     id_counter: u64,
 }
