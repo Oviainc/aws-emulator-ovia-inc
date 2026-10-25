@@ -198,11 +198,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let sequence = store.next_sequence();
         // ONE lookup of the API, for both the bound and the insert, so what is checked
         // and what is written can never be two different records.
-        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
-            CreateRequestValidatorErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
-            })
-        })?;
+        //
+        // This operation reads `restApiId` while VALIDATING the request it was handed, so
+        // an identifier that resolves to no API is a BAD REQUEST (400) carrying the
+        // service's own fixed invalid-identifier sentence — not the missing-sub-resource
+        // `NotFoundException` (404) a read or a write of a record UNDER the API answers,
+        // which names the identifier back. Both classes are modelled here
+        // (`smithy_query(query="operation", operation="CreateRequestValidator")`:
+        // BadRequestException 400, NotFoundException 404), so the choice is this
+        // operation's contract.
+        let api = store
+            .rest_apis
+            .get_mut(&input.rest_api_id)
+            .ok_or_else(|| bad_request(crate::state::INVALID_REST_API_IDENTIFIER.to_string()))?;
         // One validator per request, and at most this many per API: the store cannot grow
         // past the bound however many requests arrive.
         if api.request_validators.len() >= MAX_REQUEST_VALIDATORS_PER_API {

@@ -311,10 +311,14 @@ async fn an_unknown_identifier_is_a_not_found_on_every_request_validator_operati
     let id = string_member(&created, "id", "the validator to read");
 
     // Rows span each identifier these operations resolve, one unknown at a time.
+    // `CreateRequestValidator` reads the API identifier while validating the request it
+    // was handed, so an unresolvable one is the modelled 400 `BadRequestException` there
+    // (asserted message-for-message in `request_validator_create_api_refusal`), while
+    // reading a record under the API is the 404 `NotFoundException` below.
     assert_failure(
         &create_validator(&gateway, missing, json!({ "name": "orphan" })).await,
-        404,
-        "NotFoundException",
+        400,
+        "BadRequestException",
         "CreateRequestValidator on an unknown API",
     );
     assert_failure(
