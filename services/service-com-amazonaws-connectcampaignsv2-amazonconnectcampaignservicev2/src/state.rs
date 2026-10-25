@@ -26,7 +26,8 @@
 //! The integration store is the single source of truth for what an onboarded Connect
 //! instance is integrated with: `PutConnectInstanceIntegration` writes one record per
 //! integration the instance holds, keyed by the kind and resource ARN that identify
-//! it, and `ListConnectInstanceIntegrations` projects those records.
+//! it, `ListConnectInstanceIntegrations` projects those records and
+//! `DeleteConnectInstanceIntegration` removes the one its identifier names.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
@@ -35,7 +36,8 @@ use crate::ops::types::{
     Campaign, CampaignSummary, ChannelSubtypeConfig, CommunicationLimits,
     CommunicationLimitsConfig, CommunicationTimeConfig, CustomerProfilesIntegrationSummary,
     EncryptionConfig, EntryLimitsConfig, InstanceCommunicationLimitsConfig, InstanceConfig,
-    InstanceOnboardingJobStatus, IntegrationConfig, IntegrationSummary, LambdaIntegrationSummary,
+    InstanceOnboardingJobStatus, IntegrationConfig, IntegrationIdentifier, IntegrationSummary,
+    LambdaIntegrationSummary,
     OpenHours, QConnectIntegrationSummary, Schedule, Source, TimeWindow, DAY_OF_WEEK_VALUES,
 };
 
@@ -964,6 +966,31 @@ pub fn integration_key(config: &IntegrationConfig) -> (IntegrationKind, &str) {
     }
 }
 
+/// The identity `identifier` names: the kind of integration, and the ARN of the
+/// resource it integrates (see [`IntegrationKind`]).
+///
+/// The `IntegrationIdentifier` counterpart of [`integration_key`]: the model declares
+/// the same kind-and-ARN pair in both the config a put carries and the identifier a
+/// delete carries, and reading it in one place is what keeps the key a put stores
+/// under and the key a delete resolves from disagreeing.
+pub fn integration_identifier_key(
+    identifier: &IntegrationIdentifier,
+) -> (IntegrationKind, &str) {
+    match identifier {
+        IntegrationIdentifier::customerProfiles(identifier) => (
+            IntegrationKind::CustomerProfiles,
+            identifier.domain_arn.as_str(),
+        ),
+        IntegrationIdentifier::qConnect(identifier) => (
+            IntegrationKind::QConnect,
+            identifier.knowledge_base_arn.as_str(),
+        ),
+        IntegrationIdentifier::Lambda(identifier) => {
+            (IntegrationKind::Lambda, identifier.function_arn.as_str())
+        }
+    }
+}
+
 /// One integration of one Connect instance: the config the
 /// `PutConnectInstanceIntegration` call persisted, and where in the store's order it
 /// sits.
@@ -1428,6 +1455,29 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
             .get(connect_instance_id)
             .into_iter()
             .flatten()
+    }
+
+    /// Remove the integration of `connect_instance_id` that `identifier` names (see
+    /// [`integration_identifier_key`]), and report whether one was removed.
+    ///
+    /// `false` means the instance holds no integration under that identity and nothing
+    /// was written, which is what the caller answers as not found. The integrations the
+    /// instance keeps hold the sequence numbers they were first put at, so removing one
+    /// does not renumber the rest or reorder a page a caller is part way through.
+    pub fn delete_instance_integration(
+        &mut self,
+        connect_instance_id: &str,
+        identifier: &IntegrationIdentifier,
+    ) -> bool {
+        let key = integration_identifier_key(identifier);
+        let Some(integrations) = self.instance_integrations.get_mut(connect_instance_id) else {
+            return false;
+        };
+        let Some(at) = integrations.iter().position(|stored| stored.key() == key) else {
+            return false;
+        };
+        integrations.remove(at);
+        true
     }
 }
 
