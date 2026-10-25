@@ -1937,6 +1937,34 @@ pub fn leave_stage_session(
     true
 }
 
+/// The sessions of the stage `stage_arn` in which `participant_id` is still
+/// [`PARTICIPANT_STATE_CONNECTED`], in the order the stage holds them.
+///
+/// The ONE lookup for "where in this stage is this participant still present", beside the
+/// [`leave_stage_session`] that acts on the answer, so an operation that takes a
+/// participant out of a stage and the records `ListParticipants` reports for it cannot
+/// disagree about which sessions it was in. Empty when this store holds no such stage, or
+/// when every record it holds for that participant has already left.
+pub fn connected_sessions_of(
+    state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    stage_arn: &str,
+    participant_id: &str,
+) -> Vec<String> {
+    let Some(sessions) = state.stage_sessions.get(stage_arn) else {
+        return Vec::new();
+    };
+    sessions
+        .iter()
+        .filter(|session| {
+            session.participants.iter().any(|participant| {
+                participant.participant_id == participant_id
+                    && participant.state == PARTICIPANT_STATE_CONNECTED
+            })
+        })
+        .map(|session| session.session_id.clone())
+        .collect()
+}
+
 /// Per-service state for com-amazonaws-ivsrealtime-amazoninteractivevideoservicerealtime. A handler reaches it through [`service_state`].
 ///
 /// ONE store per engine, not one per region: the minted ARN names the region the

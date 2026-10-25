@@ -158,3 +158,5 @@ mod delete_integration_response;
 mod update_authorizer;
 #[path = "all/update_gateway_response.rs"]
 mod update_gateway_response;
+#[path = "all/request_validator_collection.rs"]
+mod request_validator_collection;

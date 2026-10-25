@@ -9,7 +9,11 @@
 //! touches the store: whether the caller's IAM policies allow `bcm-data-exports:
 //! UntagResource` on the resource it names (the modelled `AccessDeniedException`), and
 //! whether the `ResourceArn` names this account at all (the modelled
-//! `ValidationException`) — see `crate::state::validate_taggable_resource_arn`.
+//! `ValidationException`) — see `crate::state::validate_taggable_resource_arn`. A
+//! `ResourceTagKeys` naming the reserved `aws:` namespace
+//! ([`crate::state::RESERVED_TAG_KEY_PREFIX`], matched however it is cased) is refused
+//! with the modelled `ValidationException` too: a caller may no more delete a tag Amazon
+//! Web Services generates than create one.
 //!
 //! IMPLEMENTED. This is the ONLY file to touch for this operation; the notes below on
 //! reaching this service's state and the modelled contract still apply.
@@ -166,6 +170,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.resource_arn,
         )
         .map_err(UntagResourceErrorModeled::AccessDeniedException)?;
+
+        // The reserved tag-key namespace is closed to a caller for REMOVAL as much as for
+        // creation: Amazon Web Services neither lets one set nor lets one delete a key
+        // under it, so a request naming one is a bad request whatever ARN it was sent to
+        // and is refused before the store is consulted. The rule is decided in
+        // `crate::state` so this operation, `TagResource` and `CreateExport` cannot drift
+        // apart on it.
+        crate::state::check_tag_keys_not_reserved(
+            crate::state::TAG_KEY_LIST_MEMBER,
+            input.resource_tag_keys.iter().map(String::as_str),
+        )
+        .map_err(UntagResourceErrorModeled::ValidationException)?;
 
         // The ARN's ACCOUNT is validated BEFORE the store is consulted, for the reason
         // `list_tags_for_resource` and `tag_resource` state: an ARN naming another account

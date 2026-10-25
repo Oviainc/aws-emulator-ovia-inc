@@ -44,7 +44,7 @@ use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommenda
 use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommendation::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::import_and_assess::{at, call, Answer};
+use crate::import_and_assess::{at, call, Answer, TEST_REGION};
 
 /// This service's message for an id that resolves to no resource, on an operation that
 /// reports the resource as absent. Spelled out independently of `src/state.rs`'s
@@ -240,8 +240,9 @@ pub(crate) fn emulator_with(components: Vec<ApplicationComponentRecord>) -> Mult
         let state = engine
             .state::<ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState>();
         let mut store = state.lock();
+        let portfolio = store.region_entry(TEST_REGION);
         for record in components {
-            store
+            portfolio
                 .application_components
                 .insert(record.id.clone(), record);
         }

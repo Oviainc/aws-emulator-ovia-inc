@@ -54,14 +54,14 @@ const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/S3BatchOperations";
 // `ComputeObjectChecksumAlgorithm`, `S3CannedAccessControlList`).
 // ---------------------------------------------------------------------------
 
-const ACTION_PUT_OBJECT_COPY: &str =
+pub(crate) const ACTION_PUT_OBJECT_COPY: &str =
     "<S3PutObjectCopy><TargetResource>arn:aws:s3:::destination-bucket</TargetResource>\
      <StorageClass>STANDARD_IA</StorageClass></S3PutObjectCopy>";
-const ACTION_PUT_OBJECT_TAGGING: &str =
+pub(crate) const ACTION_PUT_OBJECT_TAGGING: &str =
     "<S3PutObjectTagging><TagSet><member><Key>stage</Key><Value>archived</Value></member>\
      </TagSet></S3PutObjectTagging>";
 const ACTION_DELETE_OBJECT_TAGGING: &str = "<S3DeleteObjectTagging></S3DeleteObjectTagging>";
-const ACTION_LAMBDA_INVOKE: &str =
+pub(crate) const ACTION_LAMBDA_INVOKE: &str =
     "<LambdaInvoke><FunctionArn>arn:aws:lambda:us-west-2:123456789012:function:transform\
      </FunctionArn><InvocationSchemaVersion>2.0</InvocationSchemaVersion></LambdaInvoke>";
 const ACTION_INITIATE_RESTORE: &str =
@@ -81,17 +81,17 @@ const ACTION_PUT_OBJECT_ACL: &str =
 // modelled `JobManifestFormat`, or a generator over a source bucket.
 // ---------------------------------------------------------------------------
 
-const MANIFEST_CSV: &str =
+pub(crate) const MANIFEST_CSV: &str =
     "<Manifest><Spec><Format>S3BatchOperations_CSV_20180820</Format><Fields><member>Bucket\
      </member><member>Key</member></Fields></Spec><Location>\
      <ObjectArn>arn:aws:s3:::manifest-bucket/objects.csv</ObjectArn><ETag>etag-csv-0001</ETag>\
      </Location></Manifest>";
-const MANIFEST_INVENTORY: &str =
+pub(crate) const MANIFEST_INVENTORY: &str =
     "<Manifest><Spec><Format>S3InventoryReport_CSV_20161130</Format></Spec><Location>\
      <ObjectArn>arn:aws:s3:::inventory-bucket/manifest.json</ObjectArn>\
      <ObjectVersionId>3HL4kqtJlcpXroDTDmjVBH40Nrjfkd</ObjectVersionId>\
      <ETag>etag-inventory-0002</ETag></Location></Manifest>";
-const GENERATED_MANIFEST: &str =
+pub(crate) const GENERATED_MANIFEST: &str =
     "<ManifestGenerator><S3JobManifestGenerator>\
      <SourceBucket>arn:aws:s3:::source-bucket</SourceBucket>\
      <EnableManifestOutput>false</EnableManifestOutput><Filter>\
@@ -114,7 +114,7 @@ const REPORT_DISABLED: &str = "<Enabled>false</Enabled>";
 
 /// One `CreateJob` request: the members the model lets a caller vary.
 #[derive(Clone)]
-struct JobCase {
+pub(crate) struct JobCase {
     case: &'static str,
     /// The body of `<Operation>`: exactly one of the actions above.
     operation: &'static str,
@@ -136,7 +136,11 @@ struct JobCase {
 }
 
 impl JobCase {
-    const fn new(case: &'static str, operation: &'static str, source: &'static str) -> Self {
+    pub(crate) const fn new(
+        case: &'static str,
+        operation: &'static str,
+        source: &'static str,
+    ) -> Self {
         Self {
             case,
             operation,
@@ -282,7 +286,12 @@ fn create_cases() -> Vec<JobCase> {
 }
 
 /// Create one job and answer the job id the service assigned.
-async fn create_job(emulator: &Emulator, account_id: &str, case: &JobCase, token: &str) -> Reply {
+pub(crate) async fn create_job(
+    emulator: &Emulator,
+    account_id: &str,
+    case: &JobCase,
+    token: &str,
+) -> Reply {
     emulator
         .call(
             "POST",
@@ -293,7 +302,7 @@ async fn create_job(emulator: &Emulator, account_id: &str, case: &JobCase, token
         .await
 }
 
-async fn describe_job(emulator: &Emulator, account_id: &str, job_id: &str) -> Reply {
+pub(crate) async fn describe_job(emulator: &Emulator, account_id: &str, job_id: &str) -> Reply {
     emulator
         .call("GET", &format!("/v20180820/jobs/{job_id}"), account_id, "")
         .await
