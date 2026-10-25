@@ -6,9 +6,18 @@
 //! disassociates the ones `RemoveIamRoles` names, then reports the cluster back.
 //! The cluster's role list is a SET keyed by role ARN, and each association
 //! carries the `ApplyStatus` the model publishes: a new one is `adding` and a
-//! disassociated one is `removing` until the cluster's span has passed, after
-//! which the first is `in-sync` and the second is gone. The cluster itself
-//! reports the change in progress (`modifying`) for that same span.
+//! disassociated one is `removing` until this call's span
+//! ([`crate::state::IAM_ROLE_APPLY_SPAN`]) has passed, after which the first is
+//! `in-sync` and the second is gone. The cluster itself reports the change in
+//! progress (`modifying`) for that same span.
+//!
+//! That span is an IN-PLACE change's, not a provisioning one's: this call changes
+//! the configuration of a cluster that is already running, so it is due back in
+//! `available` within the gap between one call of a client's poll loop and the
+//! next — a client reconciling a cluster's roles attaches one and polls until the
+//! association is `in-sync`, and a change that outlived a poll gap would cost it a
+//! whole poll interval per role. Bringing a cluster UP is the slow transition and
+//! keeps [`crate::state::PROVISIONING_SPAN`].
 //!
 //! The default role is one OF the roles the cluster carries, so disassociating
 //! the role set as default leaves the cluster with no default.
@@ -234,11 +243,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A call that asked for a change leaves the service applying it: the
         // associations sit in a transient `ApplyStatus` and the cluster is only
         // intermittently available for queries until the change is applied, so
-        // it reports the work in progress until that falls due a span from this
-        // call. A call that named no change leaves the cluster as it stands.
+        // THIS RESPONSE reports the work in progress. The change is an in-place
+        // one, so it falls due `IAM_ROLE_APPLY_SPAN` from this call rather than a
+        // provisioning span — see this module's header. A call that named no
+        // change leaves the cluster exactly as it stands.
         if !add.is_empty() || !remove.is_empty() || input.default_iam_role_arn.is_some() {
             stored.cluster.cluster_status = Some(st::STATUS_MODIFYING.to_string());
-            stored.available_at = started + st::PROVISIONING_SPAN;
+            stored.available_at = started + st::IAM_ROLE_APPLY_SPAN;
         }
 
         // Re-derive every member this service computes from the cluster's own
