@@ -216,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     (FILTERABLE_ATTRIBUTES[2], record.domain.as_deref()),
                 ];
                 if crate::state::filters_match(&filters, &attributes).map_err(into_error)? {
-                    matching.push(crate::state::product_user_summary(&record, &provider_union));
+                    matching.push(state.product_user_summary(&record, &provider_union));
                 }
             }
         }

@@ -21,6 +21,8 @@ mod identity_provider_deregistration;
 mod identity_provider_subscriptions;
 #[path = "all/instance_products_follow_the_registrations.rs"]
 mod instance_products_follow_the_registrations;
+#[path = "all/license_based_subscription_expiry.rs"]
+mod license_based_subscription_expiry;
 #[path = "all/license_server_endpoint_deletion.rs"]
 mod license_server_endpoint_deletion;
 #[path = "all/license_server_endpoints.rs"]
