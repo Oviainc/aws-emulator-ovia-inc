@@ -122,7 +122,12 @@ fn listings() -> Vec<Listing> {
         },
         Listing {
             operation: "SearchAgreements",
-            required: json!({}),
+            // `SearchAgreementsInput$filters` requires the agreement-type
+            // filter of every search, so it is a member every call of this row
+            // must carry.
+            required: json!({
+                "filters": [{"name": "AgreementType", "values": ["PurchaseAgreement"]}],
+            }),
             agreement_id: false,
             agreement_type: false,
         },

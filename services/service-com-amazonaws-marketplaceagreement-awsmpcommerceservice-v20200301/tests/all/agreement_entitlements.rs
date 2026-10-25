@@ -27,7 +27,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::agreement_lifecycle::{
-    accept, agreement_over, call, cancel, create, emulator, term, variable_payment_term, Answer,
+    accept, agreement_over, agreement_type_filter, call, cancel, create, emulator, term,
+    variable_payment_term, Answer,
 };
 
 /// Longer than the provisioning span the service holds an entitlement `PENDING`
@@ -482,7 +483,11 @@ async fn the_licence_an_entitlement_granted_is_reported_wherever_the_model_asks_
         "two agreements grant two licences, got {first_license} twice"
     );
 
-    let summaries = search(&router, json!({"catalog": "AWSMarketplace"})).await;
+    let summaries = search(
+        &router,
+        json!({"catalog": "AWSMarketplace", "filters": [agreement_type_filter()]}),
+    )
+    .await;
     for (agreement, license) in [(&first, &first_license), (&second, &second_license)] {
         let summary = summaries.body["agreementViewSummaries"]
             .as_array()
@@ -524,7 +529,10 @@ async fn the_licence_an_entitlement_granted_is_reported_wherever_the_model_asks_
             &router,
             json!({
                 "catalog": "AWSMarketplace",
-                "filters": [{"name": "LicenseArn", "values": [license]}],
+                "filters": [
+                    agreement_type_filter(),
+                    {"name": "LicenseArn", "values": [license]},
+                ],
             }),
         )
         .await;
