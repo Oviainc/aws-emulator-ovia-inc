@@ -3003,6 +3003,40 @@ impl Table {
     }
 }
 
+/// How a listing operation pages over entries already in ascending name order:
+/// truncate `entries` to one page and answer the name the page stopped on, when more
+/// remain.
+///
+/// The three members DynamoDB's listings carry mean the same thing on each of them —
+/// `ListTables`'s `ExclusiveStartTableName`/`Limit`/`LastEvaluatedTableName` and
+/// `ListGlobalTables`'s `ExclusiveStartGlobalTableName`/`Limit`/
+/// `LastEvaluatedGlobalTableName` — so ONE function decides all three and the readers
+/// cannot drift apart: entries up to and including `exclusive_start` are dropped ("the
+/// first table name that this operation will evaluate" is the one AFTER it), what is
+/// left is truncated at `limit` (`default_limit` where the request named none), and the
+/// name it stopped on is reported only where entries remain beyond the page, "to apply
+/// in a subsequent operation to the `ExclusiveStart…Name` parameter".
+///
+/// `name_of` is how an entry's name is read, so a listing whose entries are more than a
+/// name pages by the same rule as one whose entries are the names themselves.
+pub fn page_by_name<T>(
+    entries: &mut Vec<T>,
+    exclusive_start: Option<&str>,
+    limit: Option<i32>,
+    default_limit: i32,
+    name_of: impl Fn(&T) -> &str,
+) -> Option<String> {
+    if let Some(start) = exclusive_start {
+        entries.retain(|entry| name_of(entry) > start);
+    }
+    let limit = usize::try_from(limit.unwrap_or(default_limit)).unwrap_or(0);
+    let truncated = entries.len() > limit;
+    entries.truncate(limit);
+    truncated
+        .then(|| entries.last().map(|entry| name_of(entry).to_string()))
+        .flatten()
+}
+
 /// Per-service state for com-amazonaws-dynamodb-dynamodb-20120810. A handler reaches it through [`service_state`].
 ///
 /// Tables are keyed by REGION and then by name, because that is the scope a DynamoDB
@@ -3024,6 +3058,23 @@ pub struct ComAmazonawsDynamodbDynamodb20120810State {
     /// [`Self::apply_due_transitions`], because "after 10 minutes, any request with
     /// the same client token is treated as a new request".
     pub transactions: HashMap<(String, String), CompletedTransaction>,
+    /// The replication group of every GLOBAL table this store holds, keyed by the
+    /// global table's name: the regions that hold a replica of it.
+    ///
+    /// A global table is ONE resource spanning several regions, so it is not one of the
+    /// per-region entries in [`Self::regions`]: each region of a group holds its own
+    /// replica table under the group's name, and this map is the relation between them —
+    /// what the global-table readers report ("Lists all global tables that have a replica
+    /// in the specified Region" — the `ListGlobalTables` doc). A table created on its
+    /// own joins no group, so it is not a global table and no reader reports it as one.
+    ///
+    /// A group is established by the REPLICA surface — `CreateGlobalTable`,
+    /// `UpdateGlobalTable`, `UpdateTable`'s `ReplicaUpdates` and `CreateTable`'s
+    /// `GlobalTableSourceArn` — none of which this slice serves yet (each answers the
+    /// scaffold's 501 for the member or the whole operation), so a store driven through
+    /// this slice's own API holds no group and the readers report nothing, exactly as
+    /// they do for an account that has created no global table.
+    pub global_table_groups: BTreeMap<String, BTreeSet<String>>,
     /// Every on-demand backup this emulator holds, keyed by its own `BackupArn`.
     ///
     /// ONE map rather than one per region, because a `BackupArn` already carries the
@@ -3085,6 +3136,24 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
             .unwrap_or_default();
         names.sort();
         names
+    }
+
+    /// The global tables whose replication group holds a replica in `region`, in
+    /// ascending name order, each with the regions of its group — the walk
+    /// `ListGlobalTables` pages over.
+    ///
+    /// `region` is the `RegionName` the request named ("Lists the global tables in a
+    /// specific Region" — `ListGlobalTables$RegionName`); a request that names none asks
+    /// for every global table this store holds, whichever regions their groups span.
+    pub fn global_tables_with_replica_in(
+        &self,
+        region: Option<&str>,
+    ) -> Vec<(String, Vec<String>)> {
+        self.global_table_groups
+            .iter()
+            .filter(|(_, group)| region.is_none_or(|region| group.contains(region)))
+            .map(|(name, group)| (name.clone(), group.iter().cloned().collect()))
+            .collect()
     }
 
     /// Whether that region already holds a table by that name.
