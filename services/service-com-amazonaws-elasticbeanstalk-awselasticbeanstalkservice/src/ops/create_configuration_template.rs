@@ -418,14 +418,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // absent rather than carrying a made-up value — a CUSTOM platform
         // version, in particular, has no solution stack name this service can
         // derive.
-        let resolved_stack = solution_stack_name
-            .as_deref()
-            .and_then(crate::state::solution_stack_named)
-            .or_else(|| {
-                platform_arn
-                    .as_deref()
-                    .and_then(|arn| crate::state::managed_platform_version(&region, arn))
-            });
+        let resolved_stack = crate::state::configuration_platform(
+            &region,
+            solution_stack_name.as_deref(),
+            platform_arn.as_deref(),
+        );
         let platform_arn =
             platform_arn.or_else(|| resolved_stack.map(|stack| stack.platform_arn(&region)));
         let solution_stack_name =
@@ -460,8 +457,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.clone().unwrap_or_default(),
         };
 
-        let output =
-            crate::state::configuration_settings_description!(CreateConfigurationTemplateOutput, &template);
+        let output = crate::state::configuration_settings_description!(
+            CreateConfigurationTemplateOutput,
+            store,
+            &region,
+            &template
+        );
         let subject = template.event_subject();
         let template_name = template.template_name.clone();
         store.configuration_templates.insert(template.key(), template);

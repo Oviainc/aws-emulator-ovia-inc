@@ -456,14 +456,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     (solution_stack_name.clone(), platform_arn.clone())
                 }
             };
-        let resolved_stack = requested_stack
-            .as_deref()
-            .and_then(crate::state::solution_stack_named)
-            .or_else(|| {
-                requested_platform_arn
-                    .as_deref()
-                    .and_then(|arn| crate::state::managed_platform_version(&region, arn))
-            });
+        let resolved_stack = crate::state::configuration_platform(
+            &region,
+            requested_stack.as_deref(),
+            requested_platform_arn.as_deref(),
+        );
         let platform_arn = requested_platform_arn
             .or_else(|| resolved_stack.map(|stack| stack.platform_arn(&region)));
         let solution_stack_name =
