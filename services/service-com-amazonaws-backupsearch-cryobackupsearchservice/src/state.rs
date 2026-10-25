@@ -192,6 +192,25 @@ pub const CREATING_DELAY: Duration = Duration::from_millis(250);
 /// own spans: it is the duration the service publishes.
 pub const CLIENT_TOKEN_VALIDITY: Duration = Duration::from_secs(8 * 60 * 60);
 
+/// The instant `span` after `base`, computed FALLIBLY: every clock instant this service
+/// stores — the instants a status is owed from ([`SearchJob::owed_statuses`],
+/// [`ExportJob::next_status_due`]) and the instant a [`ClientToken`]'s window closes —
+/// goes through here.
+///
+/// Adding a `Duration` to a `SystemTime` with `+` PANICS when the sum is not
+/// representable, and a panic is not an answer this service can give: a handler that
+/// aborts leaves the caller with no modelled response at all. So a sum the platform
+/// cannot represent is taken as the span having ALREADY elapsed — the base itself —
+/// which for an owed status means the transition is due at once and the next call
+/// materialises it, and for a token window means the window is already closed and the
+/// next call under that token is a new request. Either way the request is answered.
+///
+/// Under any clock whose sum is representable this is exactly `base + span`, so nothing
+/// a caller can observe changes.
+pub fn due_at(base: SystemTime, span: Duration) -> SystemTime {
+    base.checked_add(span).unwrap_or(base)
+}
+
 /// A `ClientToken` a request carried, together with the instant its validity window
 /// closes ([`CLIENT_TOKEN_VALIDITY`] after the request that used it completed).
 ///
@@ -209,16 +228,14 @@ impl ClientToken {
     /// The token `value` carried by a request that completed at `completed`, valid until
     /// [`CLIENT_TOKEN_VALIDITY`] after that instant.
     ///
-    /// Adding a duration to a `SystemTime` panics when the sum is not representable, so
-    /// the window's end is computed fallibly and an unrepresentable one is taken as a
-    /// window that has ALREADY closed: a clock far enough ahead makes the next call under
-    /// the token a new request rather than aborting the handler.
+    /// The window's end is computed fallibly through [`due_at`], like every other clock
+    /// instant this store holds: an unrepresentable sum is a window that has ALREADY
+    /// closed, so a clock far enough ahead makes the next call under the token a new
+    /// request rather than aborting the handler.
     pub fn minted(value: String, completed: SystemTime) -> Self {
         Self {
             value,
-            expires_at: completed
-                .checked_add(CLIENT_TOKEN_VALIDITY)
-                .unwrap_or(completed),
+            expires_at: due_at(completed, CLIENT_TOKEN_VALIDITY),
         }
     }
 

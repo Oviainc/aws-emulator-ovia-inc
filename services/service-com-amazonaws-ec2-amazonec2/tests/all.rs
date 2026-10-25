@@ -17,6 +17,11 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// The virtual private gateway slice: create, read back, delete. Declared here rather than in
+// sorted position for the reason given above — the sorted neighbourhood is the contended
+// region of this file, and this suite lost several serialized squash merges to it.
+#[path = "all/vpn_gateways.rs"]
+mod vpn_gateways;
 // What `DescribeClientVpnTargetNetworks` reports for the target networks associated with one
 // Client VPN endpoint, and how the ids, the filters and the page size narrow it. Declared
 // here rather than in sorted position, for the reason the note above gives.
@@ -132,6 +137,8 @@ mod fast_launch_images;
 // What `DisableFastSnapshotRestores` answers per (snapshot, Availability Zone) pair.
 #[path = "all/fast_snapshot_restores.rs"]
 mod fast_snapshot_restores;
+#[path = "all/fleet_instances.rs"]
+mod fleet_instances;
 #[path = "all/fpga_image_tasks_and_volume_io.rs"]
 mod fpga_image_tasks_and_volume_io;
 #[path = "all/get_password_data.rs"]

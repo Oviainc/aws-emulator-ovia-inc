@@ -22,6 +22,7 @@
 //! never change what a later caller sees.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fmt::Write as _;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -339,9 +340,11 @@ impl StoredChange {
 /// order for free.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RecordKey {
-    /// The record name with its labels reversed and a trailing dot, lowercased:
-    /// `www.example.com` sorts as `com.example.www.`.
-    pub name_sort_key: String,
+    /// The record name's octets with its labels reversed and a trailing dot,
+    /// lowercased: `www.example.com` sorts as `com.example.www.`. See
+    /// [`DnsNameKey`]: every spelling of one name gives one key, so this is
+    /// the name half of a record set's identity as well as its sort position.
+    pub name_sort_key: DnsNameKey,
     /// The `RRType` of the record set.
     pub rr_type: String,
     /// The `SetIdentifier`, which distinguishes the members of a routing group.
@@ -373,7 +376,7 @@ impl RecordKey {
 pub struct StoredZone {
     /// The bare zone id (`Z…`), which is also this zone's key in [`Route53State::zones`].
     pub id: String,
-    /// The domain name, normalized to a trailing dot by [`normalize_dns_name`].
+    /// The domain name in the canonical form [`canonical_dns_name`] gives.
     pub name: String,
     /// The `CallerReference` the zone was created with.
     pub caller_reference: String,
@@ -797,51 +800,191 @@ pub fn now_millis() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
-/// A DNS name normalized the way Route 53 stores it: with a trailing dot.
+/// The octets of a DNS name, one `Vec<u8>` per label, with every presentation
+/// escape resolved and the root label dropped.
 ///
-/// `Name`'s own documentation: "The trailing dot is optional; Amazon Route 53
-/// assumes that the domain name is fully qualified. This means that Route 53
-/// treats www.example.com (without a trailing dot) and www.example.com. (with a
-/// trailing dot) as identical."
-pub fn normalize_dns_name(name: &str) -> String {
-    let trimmed = name.trim();
-    if trimmed.is_empty() || trimmed.ends_with('.') {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}.")
+/// A name reaches the API in PRESENTATION form, where an octet may be spelled
+/// either literally, as `\DDD` (three octal digits — `\052` is `*`, octet 42),
+/// or as a backslash in front of the octet itself (`\.` is a dot INSIDE a label
+/// rather than a label separator). Resolving all three spellings down to octets
+/// is what makes two spellings of one name the same name, so it is the basis of
+/// both [`canonical_dns_name`] and [`dns_sort_key`].
+///
+/// An empty name has no labels, so it keys and renders as the empty name rather
+/// than as the root.
+fn dns_labels(name: &str) -> Vec<Vec<u8>> {
+    let bytes = name.trim().as_bytes();
+    if bytes.is_empty() {
+        return Vec::new();
     }
+    let mut labels: Vec<Vec<u8>> = Vec::new();
+    let mut label: Vec<u8> = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'.' => {
+                labels.push(std::mem::take(&mut label));
+                index += 1;
+            }
+            b'\\' => {
+                if let Some(octet) = octal_escape_at(bytes, index) {
+                    label.push(octet);
+                    index += 4;
+                } else if let Some(&escaped) =
+                    bytes.get(index + 1).filter(|byte| !byte.is_ascii_digit())
+                {
+                    label.push(escaped);
+                    index += 2;
+                } else {
+                    // Either nothing follows, or what follows is a digit run
+                    // that is no escape code of this form (`\777` is above one
+                    // octet, `\8` is not octal): the backslash is then an octet
+                    // of its own, and the digits are ordinary octets after it.
+                    label.push(b'\\');
+                    index += 1;
+                }
+            }
+            octet => {
+                label.push(octet);
+                index += 1;
+            }
+        }
+    }
+    labels.push(label);
+    // A trailing dot spells the root label, which names nothing of its own.
+    if labels.len() > 1 && labels.last().is_some_and(Vec::is_empty) {
+        labels.pop();
+    }
+    labels
 }
 
-/// The order key `ListResourceRecordSets` sorts by: the name's labels reversed,
-/// with the trailing dot kept, lowercased.
+/// The octet a `\DDD` escape at `index` stands for, if one starts there.
 ///
-/// From the operation's documentation: "ListResourceRecordSets sorts results
-/// first by DNS name with the labels reversed, for example: `com.example.www.`
-/// Note the trailing dot, which can change the sort order…". DNS names are
-/// case-insensitive, so the key is lowercased and `WWW.example.com` and
-/// `www.example.com` name the same record set.
-pub fn dns_sort_key(name: &str) -> String {
-    let normalized = normalize_dns_name(name).to_lowercase();
-    let body = normalized.strip_suffix('.').unwrap_or(&normalized);
-    if body.is_empty() {
-        return normalized;
+/// Route 53 writes these codes in OCTAL ("the escape code \\three-digit octal
+/// code" of the DNS domain-name format), so `\052` is the asterisk, octet 42.
+/// A code that is not three octal digits, or that is above one octet, is not an
+/// escape of this kind.
+fn octal_escape_at(bytes: &[u8], index: usize) -> Option<u8> {
+    let digits = bytes.get(index + 1..index + 4)?;
+    if !digits.iter().all(|digit| (b'0'..=b'7').contains(digit)) {
+        return None;
     }
-    let mut key = String::with_capacity(normalized.len());
-    for label in body.split('.').rev() {
-        key.push_str(label);
-        key.push('.');
+    let value = digits
+        .iter()
+        .fold(0u32, |value, digit| value * 8 + u32::from(digit - b'0'));
+    u8::try_from(value).ok()
+}
+
+/// Whether this octet is one a DNS name carries literally in Route 53's
+/// presentation of it.
+///
+/// The characters a name is spelled with are `a-z`, `0-9`, `-` (hyphen) and `_`
+/// (underscore); every other octet is presented as an octal escape code (the
+/// DNS domain-name format the `Name` member's documentation points at).
+fn is_plain_dns_octet(octet: u8) -> bool {
+    octet.is_ascii_lowercase() || octet.is_ascii_digit() || octet == b'-' || octet == b'_'
+}
+
+/// A DNS name in the ONE canonical form this service stores and returns it in:
+/// lower-cased, every octet outside the plain set escaped as `\DDD`, and
+/// terminated by the root dot.
+///
+/// Two parts of the same documented rule. The trailing dot: "The trailing dot
+/// is optional; Amazon Route 53 assumes that the domain name is fully
+/// qualified. This means that Route 53 treats www.example.com (without a
+/// trailing dot) and www.example.com. (with a trailing dot) as identical."
+/// The spelling: a name may only be written with `a-z`, `0-9`, `-` and `_`, so
+/// any other octet — the `*` of a wildcard label above all — comes back as its
+/// octal escape code, and a name's letters come back folded to lower case
+/// however they were sent.
+///
+/// Because the form is canonical, EVERY spelling of a name maps onto it: the
+/// escaped and the literal spelling of an octet, and either case of a letter,
+/// all name one resource.
+pub fn canonical_dns_name(name: &str) -> String {
+    let mut canonical = String::new();
+    for label in dns_labels(name) {
+        for octet in label {
+            let octet = octet.to_ascii_lowercase();
+            if is_plain_dns_octet(octet) {
+                canonical.push(char::from(octet));
+            } else {
+                let _ = write!(canonical, "\\{octet:03o}");
+            }
+        }
+        canonical.push('.');
     }
-    key
+    canonical
+}
+
+/// A name's labels, lower-cased, as [`dns_labels`] resolves them.
+///
+/// DNS names are case-insensitive, so folding here is what makes `WWW.example.com`
+/// and `www.example.com` one name.
+fn dns_lower_labels(name: &str) -> Vec<Vec<u8>> {
+    let mut labels = dns_labels(name);
+    for label in &mut labels {
+        label.make_ascii_lowercase();
+    }
+    labels
+}
+
+/// The order key `ListResourceRecordSets` sorts by, which is also a record
+/// set's name IDENTITY.
+///
+/// The sort position, from the operation's documentation: "ListResourceRecordSets
+/// sorts results first by DNS name with the labels reversed, for example:
+/// `com.example.www.` Note the trailing dot, which can change the sort order
+/// when the record name contains characters that appear before . (decimal 46) in
+/// the ASCII table. These characters include the following: ! " # $ % & ' ( ) *
+/// + , -". So `dotted` is the reversed labels' OCTETS, not their escaped
+/// spelling, joined by dots: those characters then sort where the documentation
+/// says they do. It is a byte string because an octet of a DNS name need not be
+/// text at all.
+///
+/// A name has ONE canonical spelling, so `WWW.example.com`, `www.example.com.`
+/// and `\167ww.example.com` give the same key and name the same record set.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DnsNameKey {
+    /// The reversed labels' octets joined by `.` — the documented sort position.
+    dotted: Vec<u8>,
+    /// How long each of those reversed labels is, which the dotted form alone
+    /// does not pin down: a label may CONTAIN a dot octet (`a\.b` is one label),
+    /// so `a\.b.example.com` and `b.a.example.com` share a sort position while
+    /// being different names. Compared only after `dotted`, so it breaks exactly
+    /// those ties and leaves the documented order alone.
+    label_lengths: Vec<usize>,
+}
+
+/// The [`DnsNameKey`] of a name.
+pub fn dns_sort_key(name: &str) -> DnsNameKey {
+    let labels = dns_lower_labels(name);
+    let mut dotted = Vec::with_capacity(name.len() + 1);
+    let mut label_lengths = Vec::with_capacity(labels.len());
+    for label in labels.iter().rev() {
+        dotted.extend_from_slice(label);
+        dotted.push(b'.');
+        label_lengths.push(label.len());
+    }
+    DnsNameKey {
+        dotted,
+        label_lengths,
+    }
 }
 
 /// Whether `name` is inside `zone_name` — the same name, or a subdomain of it.
 ///
 /// `ChangeResourceRecordSets` only accepts records for the zone it is called
 /// on, so this is what separates a record the zone owns from one it does not.
+/// Compared LABEL by label, so a name is in the zone only when the zone's whole
+/// labels are its suffix: `evil-example.com` is not inside `example.com`.
 pub fn name_is_in_zone(name: &str, zone_name: &str) -> bool {
-    let name_key = dns_sort_key(name);
-    let zone_key = dns_sort_key(zone_name);
-    name_key == zone_key || name_key.starts_with(&zone_key)
+    let name_labels = dns_lower_labels(name);
+    let zone_labels = dns_lower_labels(zone_name);
+    let Some(offset) = name_labels.len().checked_sub(zone_labels.len()) else {
+        return false;
+    };
+    name_labels[offset..] == zone_labels[..]
 }
 
 /// A resource's tag set as the wire carries it, in tag-key order.

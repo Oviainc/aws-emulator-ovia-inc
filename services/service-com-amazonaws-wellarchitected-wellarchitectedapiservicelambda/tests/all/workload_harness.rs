@@ -488,6 +488,25 @@ impl Client {
             .await
     }
 
+    /// Move the stored profile `profile_arn` to `profile_version`, as a revision of that
+    /// profile would.
+    ///
+    /// Minting a profile's next version belongs to `UpdateProfile`, still a stub with its
+    /// own issue, so a suite that needs a profile whose latest version is AHEAD of the
+    /// version a workload's association pinned — associating pins the version the profile
+    /// is at — seeds that revision here, exactly as the suites above seed a stored answer
+    /// whose writer is a stub. The operation under test and the reads of its result still
+    /// cross the HTTP boundary.
+    pub(crate) fn revise_profile_version(&self, profile_arn: &str, profile_version: &str) {
+        let state = self.store();
+        let mut store = state.lock();
+        let profile = store
+            .profiles
+            .get_mut(profile_arn)
+            .expect("the profile under test must exist");
+        profile.profile_version = profile_version.to_string();
+    }
+
     /// Record a share of `workload_id` with `shared_with` at `status` straight through
     /// the shared state, and answer its `(ShareId, ShareInvitationId)`.
     ///

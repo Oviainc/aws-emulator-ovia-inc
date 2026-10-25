@@ -318,11 +318,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             target.clone(),
         );
 
-        // The connector is updating until the clock has run every step of that
-        // operation: `settle_due` is what then leaves it running on the new
-        // settings, so a caller that reads it straight away still sees the
-        // transient state and the settings it is still running with.
-        let steps = u32::try_from(operation.remaining_states.len()).unwrap_or(1);
+        // The connector is updating for exactly as long as the update it is
+        // running: the change the clock owes it is the one that operation hands
+        // out, so `settle_due` leaves it running on the new settings at the
+        // instant the update reaches its terminal state and not before. A caller
+        // that reads it meanwhile still sees the transient state and the
+        // settings it is still running with.
         let connector_state = {
             let Some(connector) = state.connectors.get_mut(&connector_arn) else {
                 return Err(UpdateConnectorErrorModeled::InternalServerErrorException(
@@ -333,10 +334,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             };
             connector.state = crate::state::CONNECTOR_UPDATING.to_string();
-            connector.pending = Some(crate::state::PendingChange::in_steps(
-                crate::state::PendingKind::Settle,
-                steps,
-            ));
+            connector.pending = Some(operation.connector_settle());
             connector.pending_update = Some(target);
             connector.state.clone()
         };

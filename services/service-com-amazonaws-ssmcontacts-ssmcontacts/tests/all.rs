@@ -29,6 +29,8 @@ mod data_plane_precondition;
 mod default_onboarding;
 #[path = "all/engagement_lifecycle.rs"]
 mod engagement_lifecycle;
+#[path = "all/engagement_stop_pages.rs"]
+mod engagement_stop_pages;
 #[path = "all/onboarding.rs"]
 mod onboarding;
 #[path = "all/page_acknowledgement.rs"]

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpgradeProfileVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpgradeProfileVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpgradeProfileVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: moves the named workload's association of the named profile to the
+//! version that profile is now at, recording a milestone of the workload as it stood
+//! before the move when the request names one. Mutating: the association's
+//! `ProfileVersion`, the workload's `UpdatedAt`, the recorded milestone and the
+//! idempotency ledger are what it writes. A workload that is not stored, and a
+//! `ProfileArn` that names no profile associated with it, are each a modelled
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +182,203 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpgradeProfileVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpgradeProfileVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Nothing here is minted or Region-scoped — the profile is named by the ARN the
+        // request carries — so no request metadata is read.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpgradeProfileVersionErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool workload store is unavailable".to_string(),
+            })
+        })?;
+
+        // The instant this request is served at: what a milestone it records was recorded
+        // at and what the workload's `UpdatedAt` moves to, read once so both carry one
+        // reading of the clock.
+        let now = std::time::SystemTime::now();
+        let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
+            "MilestoneName": &input.milestone_name,
+            "ProfileArn": &input.profile_arn,
+            "WorkloadId": &input.workload_id,
+        }));
+
+        let mut store = state.lock();
+
+        // `@idempotencyToken` replay: "if you retry a request with the same client request
+        // token and the same parameters after the original request has completed
+        // successfully, the result of the original request is returned"
+        // (`UpgradeProfileVersionInput$ClientRequestToken`). The result here is an EMPTY
+        // body, so the replay's answer is that success — and, crucially, it acts a second
+        // time on nothing: the milestone the original request recorded stays the one
+        // milestone, where recording it again would collide with its own name.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpgradeProfileVersion"))
+        // The token is OPTIONAL on this operation (the SDKs generate one), so a request
+        // carrying none is not replayable and is served on its own.
+        if let Some(client_request_token) = input.client_request_token.as_deref() {
+            if let Some(recorded) = store
+                .upgrade_profile_version_tokens
+                .get(client_request_token)
+            {
+                if recorded.fingerprint != fingerprint {
+                    let profile_arn = recorded.profile_arn.clone();
+                    return Err(UpgradeProfileVersionErrorModeled::ConflictException(
+                        crate::state::idempotency_token_conflict(
+                            crate::state::PROFILE_RESOURCE_TYPE,
+                            profile_arn,
+                            client_request_token,
+                        ),
+                    )
+                    .into());
+                }
+                return Ok(UpgradeProfileVersionOutput);
+            }
+        }
+
+        // The profile version a workload is reviewed against is a member OF the workload
+        // (`Workload$Profiles`), so the workload has to exist to hold one — resolved
+        // first, before the ARN the request named, so a caller whose workload is gone is
+        // not told its profile is.
+        let workload = store.workloads.get(&input.workload_id).ok_or_else(|| {
+            UpgradeProfileVersionErrorModeled::ResourceNotFoundException(
+                crate::state::workload_not_found(&input.workload_id),
+            )
+        })?;
+        // What this operation upgrades is the ASSOCIATION of the profile with this
+        // workload, so an ARN the workload does not hold names nothing to upgrade — the
+        // same 404 `DisassociateProfiles` answers for an association it cannot resolve,
+        // worded in the one place both read it from.
+        if !workload.associates_profile(&input.profile_arn) {
+            return Err(UpgradeProfileVersionErrorModeled::ResourceNotFoundException(
+                crate::state::workload_profile_not_found(&input.workload_id, &input.profile_arn),
+            )
+            .into());
+        }
+        // The version to move to is the one the PROFILE is at — the latest version of it,
+        // which is what `ProfileNotificationSummary$LatestProfileVersion` reports a
+        // workload as being behind — so it is read off the stored profile rather than
+        // computed here. A profile that is no longer stored has no version to move to: an
+        // association outlives the profile a delete removed, and nothing can upgrade to a
+        // version of a resource that is gone.
+        let latest_version = store
+            .profiles
+            .get(&input.profile_arn)
+            .map(|profile| profile.profile_version.clone())
+            .ok_or_else(|| {
+                UpgradeProfileVersionErrorModeled::ResourceNotFoundException(
+                    crate::state::profile_not_found(&input.profile_arn),
+                )
+            })?;
+
+        // "The name of the milestone in a workload": a request that names one asks for the
+        // review AS IT STANDS to be kept before the upgrade changes which profile version
+        // it is against, so the milestone is checked and recorded BEFORE the move, under
+        // exactly the rules `CreateMilestone` records one by — "milestone names must be
+        // unique within a workload" (`smithy_query(query="shape", shape="MilestoneName")`),
+        // compared the way this service compares a name it meters for uniqueness
+        // (`crate::state::normalize_unique_name`), and the milestone ceiling of one
+        // workload, answered with the modelled `ServiceQuotaExceededException` this
+        // operation declares. Both are resolved before anything is written, so a refused
+        // request upgrades nothing.
+        if let Some(milestone_name) = input.milestone_name.clone() {
+            if let Some(existing) = store.milestone_holding_name(&input.workload_id, &milestone_name)
+            {
+                return Err(UpgradeProfileVersionErrorModeled::ConflictException(
+                    crate::state::milestone_name_conflict(
+                        &existing.milestone_name,
+                        &input.workload_id,
+                        existing.milestone_number,
+                    ),
+                )
+                .into());
+            }
+            let milestone_number = store.next_milestone_number(&input.workload_id);
+            if milestone_number > crate::state::MAX_MILESTONES_PER_WORKLOAD {
+                return Err(
+                    UpgradeProfileVersionErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: format!(
+                                "The workload with ID {} already holds the maximum of {} \
+                                 milestones",
+                                input.workload_id,
+                                crate::state::MAX_MILESTONES_PER_WORKLOAD
+                            ),
+                            resource_id: Some(input.workload_id.clone()),
+                            resource_type: Some(crate::state::WORKLOAD_RESOURCE_TYPE.to_string()),
+                            // The model publishes no numeric Service Quotas code for this
+                            // quota, so it is named by what it meters; the service code is
+                            // this service's own signing name.
+                            quota_code: "MilestonesPerWorkload".to_string(),
+                            service_code: crate::state::ARN_NAMESPACE.to_string(),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // A milestone records the workload BY VALUE, so this copy is the workload as
+            // it stood against the profile version it is about to leave: a later read of
+            // the milestone reports that review, not the upgraded one.
+            let Some(before_upgrade) = store.workloads.get(&input.workload_id).cloned() else {
+                return Err(UpgradeProfileVersionErrorModeled::ResourceNotFoundException(
+                    crate::state::workload_not_found(&input.workload_id),
+                )
+                .into());
+            };
+            store
+                .milestones
+                .entry(input.workload_id.clone())
+                .or_default()
+                .insert(
+                    milestone_number,
+                    crate::state::MilestoneRecord {
+                        milestone_number,
+                        milestone_name,
+                        recorded_at: now,
+                        workload: before_upgrade,
+                    },
+                );
+        }
+
+        // The move itself: the association is re-pinned at the version the profile is at.
+        // A workload already reviewed against that version has nothing to move — the state
+        // the request asks for already holds — so it is answered without writing, which is
+        // what keeps a retry that carries no token from touching the workload a second
+        // time.
+        let workload = store.workloads.get_mut(&input.workload_id).ok_or_else(|| {
+            UpgradeProfileVersionErrorModeled::ResourceNotFoundException(
+                crate::state::workload_not_found(&input.workload_id),
+            )
+        })?;
+        let mut upgraded = false;
+        for associated in workload
+            .profiles
+            .iter_mut()
+            .filter(|associated| associated.profile_arn == input.profile_arn)
+        {
+            if associated.profile_version != latest_version {
+                associated.profile_version = latest_version.clone();
+                upgraded = true;
+            }
+        }
+        if upgraded {
+            // The associations are a member of the workload (`Workload$Profiles`), so
+            // changing one changes the workload, and `Workload$UpdatedAt` — "the date and
+            // time recorded" — is what every read of the workload reports that change by.
+            workload.updated_at = now;
+        }
+
+        // Written through the ledger's bounded `remember`, which holds the remembered
+        // tokens at `MAX_REMEMBERED_REQUEST_TOKENS` by forgetting the oldest: the token is
+        // caller-chosen, so the ledger cannot be allowed to grow with the stream of them.
+        if let Some(client_request_token) = input.client_request_token {
+            store.upgrade_profile_version_tokens.remember(
+                client_request_token,
+                crate::state::UpgradeProfileVersionToken {
+                    workload_id: input.workload_id,
+                    profile_arn: input.profile_arn,
+                    fingerprint,
+                },
+            );
+        }
+
+        Ok(UpgradeProfileVersionOutput)
     }
 }

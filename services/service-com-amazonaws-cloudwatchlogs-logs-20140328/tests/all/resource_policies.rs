@@ -809,3 +809,217 @@ async fn put_refuses_requests_it_cannot_store() {
         "case policyScope EVERYTHING: the scope is ACCOUNT or RESOURCE"
     );
 }
+
+/// A policy scoped by `resourceArn` is identified by the resource it is attached to, so
+/// `policyName` is optional for it: the put is accepted with no name at all, the stored
+/// policy is readable back, updatable at its revision and deletable without one, and the
+/// response reports only the name the request supplied. The account scope, where the name
+/// is the policy's whole identity, keeps requiring it.
+#[tokio::test]
+async fn resource_scoped_put_takes_an_optional_policy_name() {
+    let logs = Logs::new();
+
+    // Rows differ in the `policyName` the request carries (none, blank, whitespace-only,
+    // an explicit name), in which of the group's two ARN forms names the resource, and in
+    // the service principal the document grants — including the log-delivery principal a
+    // cross-service delivery grant names.
+    let rows: &[(&str, Option<&str>, bool, &str)] = &[
+        (
+            "no-name-wildcard-arn",
+            None,
+            true,
+            "delivery.logs.amazonaws.com",
+        ),
+        ("no-name-plain-arn", None, false, "route53.amazonaws.com"),
+        ("blank-name", Some(""), true, "es.amazonaws.com"),
+        (
+            "whitespace-name",
+            Some("   "),
+            false,
+            "vpc-flow-logs.amazonaws.com",
+        ),
+        (
+            "explicit-name",
+            Some("named-policy"),
+            true,
+            "delivery.logs.amazonaws.com",
+        ),
+    ];
+
+    for &(case, requested_name, name_the_wildcard_form, principal) in rows {
+        let group = format!("optional-name-{case}");
+        let (wildcard_arn, plain_arn) = group_with_arns(&logs, &group).await;
+        let requested_arn = if name_the_wildcard_form {
+            wildcard_arn.as_str()
+        } else {
+            plain_arn.as_str()
+        };
+        let document = policy_document(principal, &["logs:CreateLogStream", "logs:PutLogEvents"]);
+        let mut body = json!({"policyDocument": document, "resourceArn": requested_arn});
+        if let Some(name) = requested_name {
+            body["policyName"] = json!(name);
+        }
+        // A name that is only blank space identifies nothing, so it is a name the
+        // request did not supply.
+        let stored_name = requested_name.filter(|name| !name.trim().is_empty());
+
+        let put = logs.ok("PutResourcePolicy", &body).await;
+        let revision = member(&put, "revisionId")
+            .unwrap_or_else(|| {
+                panic!("case {case}: a resource-scoped put returns a revisionId, got {put}")
+            })
+            .to_string();
+        let returned = put
+            .get("resourcePolicy")
+            .unwrap_or_else(|| panic!("case {case}: the put returns the policy, got {put}"));
+        assert_eq!(
+            member(returned, "policyScope"),
+            Some("RESOURCE"),
+            "case {case}: expected policyScope RESOURCE, got {returned}"
+        );
+        assert_eq!(
+            member(returned, "resourceArn"),
+            Some(plain_arn.as_str()),
+            "case {case}: expected the attachment reported as {plain_arn}, got {returned}"
+        );
+        assert_eq!(
+            member(returned, "policyDocument"),
+            Some(document.as_str()),
+            "case {case}: expected the document echoed verbatim, got {returned}"
+        );
+        assert_eq!(
+            member(returned, "policyName"),
+            stored_name,
+            "case {case}: expected policyName {stored_name:?}, got {returned}"
+        );
+
+        // Readable back through the listing, under either ARN form of the resource.
+        for arn in [requested_arn, plain_arn.as_str()] {
+            let page = logs
+                .ok("DescribeResourcePolicies", &json!({"resourceArn": arn}))
+                .await;
+            let found = policies(&page);
+            assert_eq!(
+                found.len(),
+                1,
+                "case {case} at {arn}: expected exactly the policy attached to the resource, got {page}"
+            );
+            assert_eq!(
+                member(&found[0], "policyName"),
+                stored_name,
+                "case {case} at {arn}: expected policyName {stored_name:?}, got {}",
+                found[0]
+            );
+            assert_eq!(
+                member(&found[0], "revisionId"),
+                Some(revision.as_str()),
+                "case {case} at {arn}: expected revision {revision}, got {}",
+                found[0]
+            );
+        }
+
+        // A delete that names a policy the attachment does not carry names nothing
+        // attached to this resource.
+        let unmatched_name = "some-other-policy";
+        assert_ne!(
+            Some(unmatched_name),
+            stored_name,
+            "case {case}: the test's unmatched name must not be the stored one"
+        );
+        assert_eq!(
+            logs.err(
+                "DeleteResourcePolicy",
+                &json!({
+                    "policyName": unmatched_name,
+                    "resourceArn": plain_arn,
+                    "expectedRevisionId": revision,
+                }),
+            )
+            .await,
+            "ResourceNotFoundException",
+            "case {case}: expected a delete naming {unmatched_name} to find nothing"
+        );
+
+        // The resource, not the name, is the identity: an update presenting the current
+        // revision replaces the one policy the group holds, whatever name it carries.
+        let updated_document = policy_document(principal, &["logs:PutLogEvents"]);
+        let update = logs
+            .ok(
+                "PutResourcePolicy",
+                &json!({
+                    "policyDocument": updated_document,
+                    "resourceArn": plain_arn,
+                    "expectedRevisionId": revision,
+                }),
+            )
+            .await;
+        let updated_revision = member(&update, "revisionId")
+            .unwrap_or_else(|| panic!("case {case}: the update returns a revisionId, got {update}"))
+            .to_string();
+        assert_ne!(
+            updated_revision, revision,
+            "case {case}: expected the update to move the revision on, got {updated_revision}"
+        );
+        let page = logs
+            .ok("DescribeResourcePolicies", &json!({"resourceArn": plain_arn}))
+            .await;
+        let found = policies(&page);
+        assert_eq!(
+            found.len(),
+            1,
+            "case {case}: expected one policy per log group after the update, got {page}"
+        );
+        assert_eq!(
+            member(&found[0], "policyDocument"),
+            Some(updated_document.as_str()),
+            "case {case}: expected the updated document, got {}",
+            found[0]
+        );
+        assert_eq!(
+            member(&found[0], "policyName"),
+            None,
+            "case {case}: expected an update that names no policy to store no name, got {}",
+            found[0]
+        );
+
+        // And the delete needs no name either: the ARN and the revision identify it. A
+        // blank name is no name there too.
+        let mut delete = json!({"resourceArn": plain_arn, "expectedRevisionId": updated_revision});
+        if name_the_wildcard_form {
+            delete["policyName"] = json!("   ");
+        }
+        logs.ok("DeleteResourcePolicy", &delete).await;
+        let page = logs
+            .ok("DescribeResourcePolicies", &json!({"resourceArn": plain_arn}))
+            .await;
+        assert_eq!(
+            policies(&page).len(),
+            0,
+            "case {case}: expected the attachment gone after the delete, got {page}"
+        );
+    }
+
+    // Without a resource, the name is the policy's whole identity, so it is still
+    // required — of the put and of the delete alike.
+    let document = policy_document("route53.amazonaws.com", &["logs:PutLogEvents"]);
+    for blank in [None, Some(""), Some("   ")] {
+        let mut body = json!({"policyDocument": document});
+        if let Some(name) = blank {
+            body["policyName"] = json!(name);
+        }
+        assert_eq!(
+            logs.err("PutResourcePolicy", &body).await,
+            "InvalidParameterException",
+            "case account scope {blank:?}: an account-scoped policy is identified by its name"
+        );
+        let mut delete = json!({});
+        if let Some(name) = blank {
+            delete["policyName"] = json!(name);
+        }
+        assert_eq!(
+            logs.err("DeleteResourcePolicy", &delete).await,
+            "InvalidParameterException",
+            "case account delete {blank:?}: an account-scoped delete names the policy"
+        );
+    }
+}

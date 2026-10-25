@@ -217,57 +217,33 @@ pub const REQUEST_HISTORY_WINDOW: Duration = Duration::from_secs(90 * 24 * 60 * 
 pub const MAX_PAGE_SIZE: usize = 100;
 
 /// The page size a listing of this service applies when the caller names no
+/// `MaxResults`: the WHOLE listing, in one page.
+///
+/// `MaxResults` bounds what a CALLER may ask for and NOT what a listing serves a
+/// caller that asks for no page size. Its documentation — the same paragraph on every
+/// paginated input of this service — fixes no value: "If you do not include this
+/// parameter, it defaults to a value appropriate to the operation. If additional items
+/// exist beyond those included in the current response, the `NextToken` response
+/// element is present" (`smithy_query(query="doc", shape="ListServiceQuotasRequest",
+/// member="MaxResults")`). What fixes it is OBSERVED behaviour: a recorded listing
+/// called with no `MaxResults` answers with its whole set in a single body and no
+/// `NextToken` — a service's default-quota set whole (dozens of `ServiceQuota`
+/// records for one service, eleven for another), and the integrated-service inventory
+/// `ListServices` enumerates whole, past [`MAX_PAGE_SIZE`] entries, which is more than
+/// the largest page a caller may ask for. So the value appropriate to a listing of
+/// this service is the listing itself, no "additional items exist beyond those
+/// included", and a `NextToken` follows only a page a CALLER cut short with
 /// `MaxResults`.
 ///
-/// `MaxResults`'s own documentation — the same paragraph on every paginated input of
-/// this service — is what makes this a service-side page size rather than "no
-/// limit": "If you do not include this parameter, it defaults to a value appropriate
-/// to the operation. If additional items exist beyond those included in the current
-/// response, the `NextToken` response element is present" (`smithy_query(query="doc",
-/// shape="ListServiceQuotasRequest", member="MaxResults")`), and its note adds that
-/// "An API operation can return fewer results than the maximum even when there are
-/// more results available". So an unasked listing comes back one PAGE at a time, with
-/// a `NextToken` for as long as rows remain, and a caller that wants the whole
-/// listing walks it — which is what every AWS SDK paginator does.
+/// It is `usize::MAX` rather than any listing's length because it is a page LIMIT and
+/// the listings grow as more services, quotas and requests are seeded or made: no
+/// limit means "the whole listing, however long it is".
 ///
-/// The number itself is CHOSEN: the documentation names a default per operation but
-/// not its value, and a recorded `NextToken` is opaque, so nothing published fixes
-/// it. WHY TEN, rather than any other number inside the model's `MaxResults` range:
-///
-/// * it has to be well below the shortest listing this service publishes that is
-///   worth paging, or the `NextToken` path is dead for every caller that names no
-///   `MaxResults` — at [`MAX_PAGE_SIZE`] (100) a service's quota set would come back
-///   whole and no unasked listing would ever report a next page;
-/// * it has to be large enough to be a page rather than a trickle, so a client that
-///   reads one page sees a useful slice of the listing;
-/// * ten is the smallest round decade that satisfies both, and being a round decade
-///   is all the justification there is — the value is a page size, not data, so a
-///   client that cares reads `MaxResults` and the token instead of assuming one.
-///
-/// It is ONE number for every listing whose own unasked page size nothing published
-/// distinguishes. Two listings of this service are NOT governed by it, because their
-/// own page size IS known: `GetQuotaUtilizationReport` keeps the default of 1,000 its
-/// model states outright ([`UTILIZATION_REPORT_PAGE_SIZE`]), and `ListServices` serves
-/// the integrated-service inventory whole ([`SERVICE_CATALOG_UNASKED_PAGE_SIZE`]).
-pub const UNASKED_PAGE_SIZE: usize = 10;
-
-/// The page size `ListServices` applies when the caller names no `MaxResults`: the
-/// WHOLE integrated-service inventory, in one page.
-///
-/// Unlike the quota listings, this listing's unasked page size is OBSERVED rather
-/// than chosen: the recorded answer to `ListServices` with an empty body carries the
-/// integrated-service list in a single body, past 100 entries — more than the largest
-/// page a caller may ask for ([`MAX_PAGE_SIZE`], the ceiling of the model's
-/// `MaxResults` @range 1..100). So `MaxResults` bounds what a CALLER may ask for and
-/// not what this listing returns unasked, and the inventory — the documented way to
-/// discover a `ServiceCode` before any other call — comes back whole, with no
-/// `NextToken`, to a caller that names no page size. A caller that DOES name
-/// `MaxResults` still gets that page size and a `NextToken` while entries remain.
-///
-/// It is `usize::MAX` rather than the catalog's length because it is a page LIMIT and
-/// the catalog grows as more services are seeded: no limit means "the whole listing,
-/// however long it is".
-pub const SERVICE_CATALOG_UNASKED_PAGE_SIZE: usize = usize::MAX;
+/// It is ONE limit for every listing this service paginates. The one listing NOT
+/// governed by it is the one whose own page size IS published:
+/// `GetQuotaUtilizationReport` keeps the default of 1,000 its model states outright
+/// ([`UTILIZATION_REPORT_PAGE_SIZE`]).
+pub const UNASKED_PAGE_SIZE: usize = usize::MAX;
 
 /// `ReportStatus` member `PENDING`: the status a report carries from the call that
 /// initiates it until its generation starts.
@@ -1753,13 +1729,11 @@ pub struct InvalidPageToken;
 /// alphabet, so it matches the modelled `NextToken` pattern
 /// `^[a-zA-Z0-9/+]*={0,2}$` and tells a caller nothing it should be reading.
 ///
-/// A caller that names NO `MaxResults` is served [`UNASKED_PAGE_SIZE`] items, with a
-/// `NextToken` for as long as items remain: `MaxResults` "defaults to a value
-/// appropriate to the operation", so an unasked listing is a PAGE and not the whole
-/// listing. A listing whose own unasked page size is known goes through
-/// [`paginate_bounded`] with it instead (`GetQuotaUtilizationReport` with the 1,000
-/// its model declares, `ListServices` with the whole inventory the recorded answer
-/// carries).
+/// A caller that names NO `MaxResults` is served [`UNASKED_PAGE_SIZE`] items — the
+/// WHOLE listing, in one page with no `NextToken`: `MaxResults` bounds what a caller
+/// may ask for, not what a listing serves when none is asked for. A listing whose own
+/// unasked page size IS published goes through [`paginate_bounded`] with it instead
+/// (`GetQuotaUtilizationReport`, with the 1,000 its model declares).
 pub fn paginate<T>(
     listing: &str,
     all: Vec<T>,
@@ -1780,15 +1754,13 @@ pub fn paginate<T>(
 ///
 /// `caller_page_limit` is the ceiling a caller's `MaxResults` is clamped to, and
 /// `unasked_page_limit` the page size a caller that names no `MaxResults` gets, so
-/// each listing pages at the bounds ITS contract fixes: the quota listings carry
-/// `MaxResults` (1..100) whose default is documented only as "a value appropriate to
-/// the operation", so they take [`UNASKED_PAGE_SIZE`] through [`paginate`];
-/// `GetQuotaUtilizationReport` carries
-/// `MaxResultsUtilization` (1..1000) and documents 1,000 as both the default and the
-/// maximum, which is also the most records `QuotaUtilizationInfoList` may hold, so
-/// its pages are bounded either way; and `ListServices` serves its unasked page from
-/// [`SERVICE_CATALOG_UNASKED_PAGE_SIZE`], the whole inventory, while still clamping
-/// an asked `MaxResults` to [`MAX_PAGE_SIZE`].
+/// each listing pages at the bounds ITS contract fixes: the listings carrying
+/// `MaxResults` (1..100), whose default is documented only as "a value appropriate to
+/// the operation" and observed to be the whole listing, take [`UNASKED_PAGE_SIZE`]
+/// through [`paginate`] while clamping an asked `MaxResults` to [`MAX_PAGE_SIZE`];
+/// `GetQuotaUtilizationReport` carries `MaxResultsUtilization` (1..1000) and documents
+/// 1,000 as both the default and the maximum, which is also the most records
+/// `QuotaUtilizationInfoList` may hold, so its pages are bounded either way.
 pub fn paginate_bounded<T>(
     listing: &str,
     all: Vec<T>,

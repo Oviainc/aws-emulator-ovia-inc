@@ -8,8 +8,10 @@
 //! and no other key — without changing it, so a repeated call with no tag write in
 //! between answers the same and the resource reads back unchanged. A resource that
 //! carries no tags lists the empty set; an `arn` that names no resource of this
-//! service is refused with the modelled 404 (HTTP 404), and one that is not a
-//! connection ARN at all is refused as invalid input (HTTP 400), never with a 501.
+//! service is refused with HTTP 400 — the client fault for an in-scope ARN naming
+//! nothing, the validation fault for one outside the scope the request addresses —
+//! and one that is not a connection ARN at all is refused as invalid input (HTTP
+//! 400), never with a 501.
 //!
 //! Every assertion is about that rule over a TABLE of inputs whose rows differ in
 //! the number of tags (0, 1, 3, 20), the length of the keys and values (each
@@ -339,9 +341,12 @@ async fn list_tags_for_resource_reports_only_the_resource_its_arn_names() {
 }
 
 /// RULE: "no tags" and "no resource" are different answers — an `arn` that names no
-/// resource of this store is the modelled `ResourceNotFoundException` (HTTP 404),
-/// and an `arn` that is not an Interconnect connection ARN at all is refused as
-/// invalid input (HTTP 400). Neither is ever a 501 or an empty listing.
+/// resource is refused with HTTP 400, and the two ways it can name none carry
+/// DIFFERENT codes: an ARN outside the partition, Region and account this request
+/// addresses is `InterconnectValidationException`, while an in-scope ARN that names
+/// no connection is `InterconnectClientException`. An `arn` that is not an
+/// Interconnect connection ARN at all is likewise invalid input (HTTP 400). None of
+/// them is ever a 404, a 501 or an empty listing.
 #[tokio::test]
 async fn list_tags_for_resource_refuses_an_arn_that_names_no_connection() {
     let emulator = Emulator::new();
@@ -352,10 +357,9 @@ async fn list_tags_for_resource_refuses_an_arn_that_names_no_connection() {
     let live = create_with_tags(&emulator, &placements[0], 800, &tags).await;
     let live_arn = text(&live, "arn");
 
-    // Well-formed connection ARNs that name something this store does not hold: an
-    // unallocated id under either prefix, another account, another region, another
-    // partition — each a different resource than the one the store holds.
-    let elsewhere = vec![
+    // In-scope, well-formed connection ARNs that name nothing this account holds:
+    // an unallocated id under either prefix. The client fault.
+    let unallocated = vec![
         (
             "an id that was never allocated",
             format!("arn:aws:interconnect:{REGION}:{ACCOUNT_ID}:connection/mcc-00000000"),
@@ -364,6 +368,28 @@ async fn list_tags_for_resource_refuses_an_arn_that_names_no_connection() {
             "the other id prefix, never allocated",
             format!("arn:aws:interconnect:{REGION}:{ACCOUNT_ID}:connection/lmcc-zzzzzzzz"),
         ),
+    ];
+    for (name, arn) in unallocated {
+        let (status, body) = list_tags(&emulator, &arn).await;
+        assert_eq!(
+            status, 400,
+            "case {name:?}: expected HTTP 400 for an in-scope ARN naming no connection, got {status} with {body:?}"
+        );
+        assert!(
+            code(&body).contains("InterconnectClientException"),
+            "case {name:?}: expected InterconnectClientException, got {body:?}"
+        );
+        assert!(
+            message(&body).contains(&arn),
+            "case {name:?}: expected the refusal to name the requested ARN, got {:?}",
+            message(&body)
+        );
+    }
+
+    // ARNs outside the scope this request addresses — another account, another
+    // Region, another partition — are faults in the REQUEST, and carry a code a
+    // client can tell apart from "no such connection".
+    let out_of_scope = vec![
         (
             "another account",
             live_arn.replace(ACCOUNT_ID, "123456789012"),
@@ -374,15 +400,15 @@ async fn list_tags_for_resource_refuses_an_arn_that_names_no_connection() {
             live_arn.replace("arn:aws:", "arn:aws-cn:"),
         ),
     ];
-    for (name, arn) in elsewhere {
+    for (name, arn) in out_of_scope {
         let (status, body) = list_tags(&emulator, &arn).await;
         assert_eq!(
-            status, 404,
-            "case {name:?}: expected the modelled 404 for an ARN naming no connection, got {status} with {body:?}"
+            status, 400,
+            "case {name:?}: expected HTTP 400 for an out-of-scope ARN, got {status} with {body:?}"
         );
         assert!(
-            code(&body).contains("ResourceNotFoundException"),
-            "case {name:?}: expected ResourceNotFoundException, got {body:?}"
+            code(&body).contains("InterconnectValidationException"),
+            "case {name:?}: expected InterconnectValidationException, got {body:?}"
         );
         assert!(
             message(&body).contains(&arn),
@@ -427,7 +453,8 @@ async fn list_tags_for_resource_refuses_an_arn_that_names_no_connection() {
 
 /// RULE: a resource has a tag set for as long as it exists — a connection that is
 /// still `deleting` lists its tags, and once the clock has settled it into the
-/// terminal `deleted` state the resource is gone and listing its tags is a 404.
+/// terminal `deleted` state the resource is gone and listing its tags is refused as
+/// the client fault for an in-scope ARN that names no connection.
 #[tokio::test]
 async fn list_tags_for_resource_follows_the_resource_out_of_existence() {
     let emulator = Emulator::new();
@@ -470,11 +497,11 @@ async fn list_tags_for_resource_follows_the_resource_out_of_existence() {
 
     let (status, body) = list_tags(&emulator, &arn).await;
     assert_eq!(
-        status, 404,
-        "case \"after the delete settles\": expected the modelled 404 for a deleted resource, got {status} with {body:?}"
+        status, 400,
+        "case \"after the delete settles\": expected HTTP 400 for a deleted resource, got {status} with {body:?}"
     );
     assert!(
-        code(&body).contains("ResourceNotFoundException"),
-        "case \"after the delete settles\": expected ResourceNotFoundException, got {body:?}"
+        code(&body).contains("InterconnectClientException"),
+        "case \"after the delete settles\": expected InterconnectClientException, got {body:?}"
     );
 }

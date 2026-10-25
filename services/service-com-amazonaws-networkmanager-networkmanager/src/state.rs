@@ -14,7 +14,8 @@
 //! with an id, an ARN and tags. A global network also owns its
 //! CORE network — the Cloud WAN managed network
 //! whose segments and edges are a function of the core network policy document it holds.
-//! A core network in turn owns its ATTACHMENTS: each joins one resource to the edge
+//! A core network edge can PEER with a resource of another service (a transit gateway),
+//! and a core network in turn owns its ATTACHMENTS: each joins one resource to the edge
 //! locations that policy configures — one of them for every kind but a Direct Connect
 //! gateway attachment, which spans several — and a Connect attachment is carried over
 //! another attachment (its transport) rather than over a resource of its own, and a
@@ -72,6 +73,9 @@ pub const STATE_PENDING: &str = "PENDING";
 pub const STATE_AVAILABLE: &str = "AVAILABLE";
 /// See [`STATE_PENDING`].
 pub const STATE_DELETING: &str = "DELETING";
+/// See [`STATE_PENDING`]. The state a resource of one of those kinds is in between the
+/// update that reconfigures it and the instant that reconfiguration is applied.
+pub const STATE_UPDATING: &str = "UPDATING";
 
 /// The state a freshly created CORE network is in. `CoreNetworkState` is a different enum
 /// from the three above — CREATING, UPDATING, AVAILABLE, DELETING (`smithy_query
@@ -133,6 +137,12 @@ pub const CUSTOMER_GATEWAY_ASSOCIATION_KIND: &str = "customer-gateway-associatio
 /// (`smithy_query shape=CoreNetworkId`), which the 17 hex digits of
 /// [`ComAmazonawsNetworkmanagerNetworkmanagerState::next_id`] satisfy.
 pub const CORE_NETWORK_KIND: &str = "core-network";
+/// See [`GLOBAL_NETWORK_KIND`]. The model constrains this one's id itself too:
+/// `PeeringId` carries `pattern ^peering-([0-9a-f]{8,17})$` (`smithy_query
+/// shape=PeeringId`), which the 17 hex digits of
+/// [`ComAmazonawsNetworkmanagerNetworkmanagerState::next_id`] satisfy. It is also the
+/// `peering` entry of [`NETWORK_RESOURCE_TYPES`].
+pub const PEERING_KIND: &str = "peering";
 /// The resource kind a refusal names when the resource addressed is ONE policy of a core
 /// network rather than the core network itself. A policy version is not a resource this
 /// service mints an id or an ARN for — the model identifies it by its owning
@@ -162,12 +172,6 @@ pub const PREFIX_LIST_ASSOCIATION_KIND: &str = "prefix-list-association";
 /// `RouteAnalysisId` (`smithy_query shape=RouteAnalysis`) — so this name serves the id
 /// prefix (`route-analysis-<hex>`) and the `ResourceType` a not-found refusal reports.
 pub const ROUTE_ANALYSIS_KIND: &str = "route-analysis";
-/// See [`GLOBAL_NETWORK_KIND`]. A PEERING joins a core network to a resource of another
-/// service — a transit gateway, the one `PeeringType` the model carries (`smithy_query
-/// shape=PeeringType`) — so one name serves the id prefix (`peering-<hex>`, which the
-/// model's own `^peering-([0-9a-f]{8,17})$` on `PeeringId` constrains), the ARN resource
-/// type (`peering/<id>`) and the `peering` entry of [`NETWORK_RESOURCE_TYPES`].
-pub const PEERING_KIND: &str = "peering";
 
 /// The one value `PeeringType` enumerates (`smithy_query shape=PeeringType`, mirrored in
 /// `ops::types::PEERING_TYPE_VALUES`): "The type of peering. This will be
@@ -293,7 +297,7 @@ pub const FIELD_GLOBAL_NETWORK_ID: &str = "globalNetworkId";
 /// See [`FIELD_GLOBAL_NETWORK_ID`].
 pub const FIELD_SITE_ID: &str = "siteId";
 /// See [`FIELD_GLOBAL_NETWORK_ID`]: the same lowerCamelCase spelling of the request
-/// member, for the references and values an attachment create carries.
+/// member, for the references and values an attachment or peering create carries.
 pub const FIELD_CORE_NETWORK_ID: &str = "coreNetworkId";
 /// See [`FIELD_CORE_NETWORK_ID`].
 pub const FIELD_TRANSPORT_ATTACHMENT_ID: &str = "transportAttachmentId";
@@ -611,6 +615,37 @@ pub const MAX_CONNECTIONS_PER_GLOBAL_NETWORK: usize = 100;
 /// (len 0..256) does not express, so it is checked by the handler instead.
 pub const MAX_DEVICE_DESCRIPTOR_CHARS: usize = 128;
 
+/// The documented maximum length, in characters, of a link's `Type` and `Provider`, and
+/// the characters the documentation forbids in them: "Constraints: Maximum length of 128
+/// characters. Cannot include the following characters: | \ ^" (`smithy_query query="doc"
+/// shape="CreateLinkRequest" member="Provider"`, the same sentence for `Type` and for
+/// both members of `UpdateLinkRequest`) — neither of which the modelled
+/// `ConstrainedString` (len 0..256, pattern `^[\s\S]*$`) expresses, so they are checked
+/// by [`link_descriptor_problem`] instead.
+pub const MAX_LINK_DESCRIPTOR_CHARS: usize = 128;
+/// See [`MAX_LINK_DESCRIPTOR_CHARS`].
+pub const FORBIDDEN_LINK_DESCRIPTOR_CHARS: [char; 3] = ['|', '\\', '^'];
+
+/// Check one free-form link descriptor against the two constraints
+/// [`MAX_LINK_DESCRIPTOR_CHARS`] documents.
+///
+/// Answers `None` when `value` satisfies both, otherwise the member-level reason the
+/// refusal reports. Shared by every operation that takes those descriptors, so a value a
+/// create refuses an update refuses too.
+pub fn link_descriptor_problem(value: &str) -> Option<String> {
+    let max = MAX_LINK_DESCRIPTOR_CHARS;
+    let length = value.chars().count();
+    if length > max {
+        return Some(format!("must be at most {max} characters, but is {length}"));
+    }
+    value
+        .chars()
+        .find(|candidate| FORBIDDEN_LINK_DESCRIPTOR_CHARS.contains(candidate))
+        .map(|found| {
+            format!("must not include any of the characters | \\ ^, but includes {found:?}")
+        })
+}
+
 /// How many core networks one global network may hold.
 ///
 /// Unlike the three bounds above this one is the SERVICE's number, not a chosen bound:
@@ -902,16 +937,28 @@ pub struct LinkRecord {
     pub created_at: SystemTime,
     /// The instant the `PENDING` -> `AVAILABLE` transition the clock owes becomes due.
     pub available_at: SystemTime,
+    /// The instant the `UPDATING` -> `AVAILABLE` transition the clock owes becomes due,
+    /// set by the update that reconfigured the link and `None` while no update has ever
+    /// touched it. See [`LinkRecord::state_at`].
+    pub updating_until: Option<SystemTime>,
     pub tags: Vec<Tag>,
 }
 
 impl LinkRecord {
     /// This link's lifecycle state as of `now`.
+    ///
+    /// Both transitions are a function of the clock, so reading one never writes: a link
+    /// is `UPDATING` from an update until that reconfiguration is applied, `PENDING` until
+    /// the create settles, and `AVAILABLE` once neither is outstanding. An update
+    /// OUTSTANDING is what the link reports even when the create has not settled yet,
+    /// since that update is the later of the two requests the link is still working on.
     pub fn state_at(&self, now: SystemTime) -> &'static str {
-        if now >= self.available_at {
-            STATE_AVAILABLE
-        } else {
+        if self.updating_until.is_some_and(|due| now < due) {
+            STATE_UPDATING
+        } else if now < self.available_at {
             STATE_PENDING
+        } else {
+            STATE_AVAILABLE
         }
     }
 
@@ -1636,10 +1683,10 @@ pub fn check_edge_location_list(
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for location in requested {
         if !topology.is_some_and(|topology| topology.has_edge_location(location)) {
-            return Err(field_rejection(
+            return Err(no_such_edge(
                 FIELD_EDGE_LOCATIONS,
-                VALIDATION_REASON_OTHER,
-                format!("core network {core_network_id} configures no edge location in {location}"),
+                core_network_id,
+                location,
             ));
         }
         if !seen.insert(location.as_str()) {
@@ -1924,7 +1971,7 @@ pub struct AttachmentRecord {
 
 /// What one attachment kind adds to the shared [`AttachmentRecord`] envelope: the members
 /// its own wrapper shape carries beside `Attachment` (`smithy_query
-/// shape=VpcAttachment,ConnectAttachment,SiteToSiteVpnAttachment,DirectConnectGatewayAttachment`),
+/// shape=VpcAttachment,ConnectAttachment,SiteToSiteVpnAttachment,TransitGatewayRouteTableAttachment,DirectConnectGatewayAttachment`),
 /// plus the one envelope member only a single kind fills
 /// ([`Self::DirectConnectGateway`]).
 #[derive(Debug, Clone)]
@@ -2076,6 +2123,10 @@ impl AttachmentRecord {
     }
 
     /// The modelled `Attachment` envelope of this record, as of `now`.
+    ///
+    /// `EdgeLocations` is absent because "this is returned only for Direct Connect gateway
+    /// attachments. All other attachment types retrun EdgeLocation" (`smithy_query
+    /// query="doc" shape="Attachment" member="EdgeLocations"`).
     pub fn to_attachment(&self, now: SystemTime) -> Attachment {
         self.to_attachment_at(self.state_at(now), self.updated_at(now))
     }
@@ -2932,6 +2983,13 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     pub connections: BTreeMap<String, ConnectionRecord>,
     /// Core networks by `CoreNetworkId`, each carrying its owning `GlobalNetworkId`.
     pub core_networks: BTreeMap<String, CoreNetworkRecord>,
+    /// Peerings by `PeeringId`, each carrying the `CoreNetworkId` it joins to a resource
+    /// of another service ([`PeeringRecord`]). A `BTreeMap`, so the store has one stable
+    /// order like every other map here.
+    ///
+    /// Bounded by [`MAX_PEERINGS_PER_CORE_NETWORK`] per core network, so repeated creates
+    /// cannot grow it without end.
+    pub peerings: BTreeMap<String, PeeringRecord>,
     /// Attachments by `AttachmentId`, of every kind, each carrying the `CoreNetworkId` it
     /// belongs to. A `BTreeMap`, so listing order is stable and a pagination token can
     /// name a key offset into it.
@@ -2941,13 +2999,6 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// network-resource inventory and the core-network delete refusal all count
     /// attachments without caring which kind each is.
     pub attachments: BTreeMap<String, AttachmentRecord>,
-    /// Peerings by `PeeringId`, each carrying the `CoreNetworkId` it joins to a resource
-    /// of another service ([`PeeringRecord`]). A `BTreeMap`, so the store has one stable
-    /// order like every other map here.
-    ///
-    /// Bounded by [`MAX_PEERINGS_PER_CORE_NETWORK`] per core network, so repeated creates
-    /// cannot grow it without end.
-    pub peerings: BTreeMap<String, PeeringRecord>,
     /// Prefix list associations by [`prefix_list_association_key`], each tying one stored
     /// core network to one managed prefix list of Amazon VPC. A `BTreeMap`, so listing
     /// order is stable and a pagination token can name a key offset into it.
@@ -3074,9 +3125,33 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
         record
     }
 
-    /// The ARN of a resource of this service: `arn:aws:networkmanager::<account>:<kind>/<id>`.
+    /// The ARN of a resource of this service that stands on its own — one whose identity
+    /// needs no parent to be unique: `arn:aws:networkmanager::<account>:<kind>/<id>`.
+    ///
+    /// That is the form for the kinds this service identifies account-wide: a global
+    /// network ([`GLOBAL_NETWORK_KIND`]), a core network ([`CORE_NETWORK_KIND`]) and an
+    /// attachment ([`ATTACHMENT_KIND`]). A resource that exists only INSIDE a global
+    /// network is named by [`Self::scoped_resource_arn`] instead.
     pub fn resource_arn(kind: &str, id: &str) -> String {
         ::engine::emulator_arn(ARN_NAMESPACE, ARN_REGION, &format!("{kind}/{id}"))
+    }
+
+    /// The ARN of a resource of this service that exists only inside a SCOPE — for every
+    /// such kind here, the global network that owns it:
+    /// `arn:aws:networkmanager::<account>:<kind>/<scope-id>/<id>`.
+    ///
+    /// The owner's id is part of the name because the resource has no identity outside it:
+    /// a site ([`SITE_KIND`]), a link ([`LINK_KIND`]), a device ([`DEVICE_KIND`]) and a
+    /// connection ([`CONNECTION_KIND`]) are each addressed through the global network that
+    /// holds them, so their ARN names that global network ahead of their own id — which
+    /// stays the LAST path segment, and is what [`parse_resource_arn`] reads back as the id
+    /// a lookup keys on.
+    pub fn scoped_resource_arn(kind: &str, scope_id: &str, id: &str) -> String {
+        ::engine::emulator_arn(
+            ARN_NAMESPACE,
+            ARN_REGION,
+            &format!("{kind}/{scope_id}/{id}"),
+        )
     }
 
     /// How many sites `global_network_id` owns, for the per-global-network quota.
@@ -3283,8 +3358,8 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             DEVICE_KIND => self.device_count_of(global_network_id),
             CONNECTION_KIND => self.connection_count_of(global_network_id),
             CORE_NETWORK_KIND => self.core_network_count_of(global_network_id),
-            ATTACHMENT_KIND => self.attachment_count_of_global_network(global_network_id),
             PEERING_KIND => self.peering_count_of_global_network(global_network_id),
+            ATTACHMENT_KIND => self.attachment_count_of_global_network(global_network_id),
             CONNECT_PEER_KIND => self.connect_peer_count_of_global_network(global_network_id),
             _ => 0,
         };
@@ -3783,27 +3858,38 @@ fn resource_definition(
 }
 
 /// The resource an ARN of this service names: the ARN resource type (which is also the
-/// resource-id prefix this service mints, see [`GLOBAL_NETWORK_KIND`]) and the id.
+/// resource-id prefix this service mints, see [`GLOBAL_NETWORK_KIND`]), the id, and —
+/// for a kind that exists only inside a parent — the id of that parent.
 #[derive(Debug, Clone, Copy)]
 pub struct ArnParts<'a> {
     /// The ARN resource type, e.g. `global-network`.
     pub kind: &'a str,
-    /// The resource id inside that type.
+    /// The resource id inside that type: the LAST path segment of the ARN.
     pub id: &'a str,
+    /// The id the ARN names ahead of `id`, for a resource whose name carries its owner
+    /// (see [`ComAmazonawsNetworkmanagerNetworkmanagerState::scoped_resource_arn`]);
+    /// `None` for an ARN whose resource path is just `<kind>/<id>`.
+    pub scope: Option<&'a str>,
 }
 
 /// Split a Network Manager resource ARN into its kind and id.
 ///
-/// Every ARN this service mints reads `arn:<partition>:networkmanager::<account>:<kind>/<id>`
-/// (see [`ComAmazonawsNetworkmanagerNetworkmanagerState::resource_arn`]). Answers `None`
-/// when the string is not an ARN of this service in that `<kind>/<id>` form at all — the
-/// caller refuses that as a `ValidationException` on the ARN member, which is a different
-/// answer from a well-formed ARN naming a resource that does not exist.
+/// Every ARN this service mints reads
+/// `arn:<partition>:networkmanager::<account>:<kind>/<id>`, or
+/// `arn:<partition>:networkmanager::<account>:<kind>/<owner-id>/<id>` for a kind that
+/// exists only inside an owning resource (see
+/// [`ComAmazonawsNetworkmanagerNetworkmanagerState::scoped_resource_arn`]). The resource's
+/// own id is the LAST path segment either way, which is the id a lookup keys on and the
+/// `ResourceId` a refusal reports. Answers `None` when the string is not an ARN of this
+/// service in one of those forms at all — the caller refuses that as a
+/// `ValidationException` on the ARN member, which is a different answer from a well-formed
+/// ARN naming a resource that does not exist.
 ///
-/// Only the form is judged here, not which account, partition or region the ARN carries:
-/// an ARN of this service that names another account's resource, or carries a region this
-/// global service does not use, parses and then matches no stored record, so the caller
-/// answers it as NOT FOUND rather than as a malformed request.
+/// Only the form is judged here, not which account, partition or region the ARN carries,
+/// nor whether the owner it names really owns the resource: an ARN of this service that
+/// names another account's resource, carries a region this global service does not use, or
+/// names the wrong owner, parses and then matches no stored record, so the caller answers
+/// it as NOT FOUND rather than as a malformed request.
 pub fn parse_resource_arn(arn: &str) -> Option<ArnParts<'_>> {
     let mut fields = arn.splitn(6, ':');
     if fields.next()? != "arn" {
@@ -3821,11 +3907,17 @@ pub fn parse_resource_arn(arn: &str) -> Option<ArnParts<'_>> {
     if fields.next()?.is_empty() {
         return None;
     }
-    let (kind, id) = fields.next()?.split_once('/')?;
-    if kind.is_empty() || id.is_empty() {
+    let (kind, path) = fields.next()?.split_once('/')?;
+    // The resource's own id is the last path segment; anything ahead of it names the
+    // resource that owns it.
+    let (scope, id) = match path.split_once('/') {
+        Some((scope, id)) => (Some(scope), id),
+        None => (None, path),
+    };
+    if kind.is_empty() || id.is_empty() || scope.is_some_and(str::is_empty) || id.contains('/') {
         return None;
     }
-    Some(ArnParts { kind, id })
+    Some(ArnParts { kind, id, scope })
 }
 
 /// The `Reason` a `ValidationException` of this service carries when one input MEMBER is
@@ -3986,14 +4078,23 @@ fn parse_foreign_arn<'a>(
     if found_kind != kind || !is_id(id) {
         return None;
     }
+    // A resource of another service is identified account-wide here: none of the forms this
+    // walk serves names an owning resource ahead of the id, so the resource path is just
+    // `<kind>/<id>` and the scope [`ArnParts`] carries is `None`.
     Some(ArnParts {
         kind: found_kind,
         id,
+        scope: None,
     })
 }
 
-/// The ARN namespace of the managed prefix list a core network's prefix-list association
-/// names: an Amazon VPC (EC2) resource, not one of this service.
+/// The ARN namespace of the resources of ANOTHER service this service's Cloud WAN
+/// operations take as INPUT: a transit gateway, one of its route tables and a managed
+/// prefix list are all Amazon VPC (EC2) resources, so their ARNs read
+/// `arn:<partition>:ec2:<region>:<account>:<type>/<id>` — the form the members' own
+/// documentation gives as an example ("arn:aws:ec2:us-west-2:123456789012:transit-gateway-route-table/tgw-rtb-9876543210123456",
+/// `smithy_query query="doc" shape="CreateTransitGatewayRouteTableAttachmentRequest"
+/// member="TransitGatewayRouteTableArn"`). This service mints nothing for them.
 const EC2_NAMESPACE: &str = "ec2";
 /// The ARN resource type of a managed prefix list, and the prefix of its id — the `pl-` of
 /// `prefix-list/pl-0123456789abcdef1`.
@@ -4475,6 +4576,27 @@ pub fn tag_problem_rejection(problem: TagProblem) -> ValidationException {
 pub fn too_many_tags_message(resulting: usize) -> String {
     format!(
         "a resource may carry at most {MAX_TAGS_PER_RESOURCE} tags, but the request would leave {resulting}"
+    )
+}
+
+/// The modelled `ValidationException` (HTTP 400) a create answers when the core network it
+/// must hang off configures no edge in the Region the resource it names lives in.
+///
+/// A peering and an attachment both sit at a core network EDGE, and a core network's edges
+/// are the ones its policy document configures
+/// ([`PolicyTopology::has_edge_location`]), so a request naming a Region that document
+/// does not configure is refused rather than attached to an edge that does not exist. The
+/// `Reason` is [`VALIDATION_REASON_OTHER`]: the member satisfies every modelled
+/// constraint, it is the stored policy that configures no such edge.
+pub fn no_such_edge(
+    member: &str,
+    core_network_id: &str,
+    edge_location: &str,
+) -> ValidationException {
+    field_rejection(
+        member,
+        VALIDATION_REASON_OTHER,
+        format!("core network {core_network_id} configures no edge location in {edge_location}"),
     )
 }
 
@@ -5654,8 +5776,8 @@ pub fn same_vpc_options(left: Option<&VpcOptions>, right: Option<&VpcOptions>) -
 }
 
 /// The Region segment of an EC2 resource ARN
-/// (`arn:<partition>:ec2:<region>:<account>:<type>/<id>`), or `None` when it carries no
-/// non-empty one.
+/// (`arn:<partition>:ec2:<region>:<account>:<type>/<id>`), or `None` when it names no
+/// Region an endpoint could carry.
 ///
 /// A VPC attachment's edge location is not a request member: it is the Region the VPC is
 /// in, which only the VPC's ARN names; the same holds for a site-to-site VPN attachment

@@ -229,13 +229,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             ));
         }
-        if definition.routes.len() > crate::state::MAX_ROUTES_PER_API {
+        if definition.routes_exceed_quota {
             return Err(too_many_requests(
                 "Route",
                 format!(
-                    "The API definition declares {} routes; the maximum number of routes \
-                     for an API is {}.",
-                    definition.routes.len(),
+                    "The API definition declares more routes than the maximum number of \
+                     routes for an API ({}).",
                     crate::state::MAX_ROUTES_PER_API
                 ),
             ));
@@ -387,10 +386,22 @@ fn too_many_requests(limit_type: &str, message: String) -> ImportApiError {
 ///
 /// CHOSEN: far past the definition of an api holding this service's per-api route and
 /// integration quotas, and small enough that the tree the reader builds stays bounded by
-/// a constant rather than by what a caller sends. Bounding the BODY is what bounds the
-/// reader's work: `serde_json` reads the document under its own recursion limit, so a
-/// parsed definition is linear in the bytes it was written in and cannot amplify them.
+/// a constant rather than by what a caller sends. Bounding the BODY alone is NOT enough,
+/// because the base path is prefixed onto EVERY path the document declares: that is what
+/// [`MAX_BASE_PATH_CHARS`] and the route-quota stop in the read loop bound, so the read
+/// is linear in the bytes the body was written in and cannot amplify them.
 const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
+
+/// The most characters the base path an import prefixes onto every route's path may run
+/// to.
+///
+/// CHOSEN, not a modelled constraint: the prefix is repeated into the route key of EVERY
+/// operation the document declares, so a body of [`MAX_DEFINITION_BYTES`] split between
+/// one very long base path and many minimal path items would otherwise read into a tree
+/// far larger than the body. A thousand characters is past any base path an api is served
+/// under, and with the route-quota stop below it keeps the read's allocation bounded by a
+/// constant.
+pub const MAX_BASE_PATH_CHARS: usize = 1024;
 
 /// The most messages one response reports in `Warnings` or `ImportInfo`, so a response
 /// stays bounded however many paths a definition declares. The page this service serves
@@ -726,6 +737,11 @@ impl ImportedIntegration {
             // The caller's own definition asked for this integration, so API Gateway does
             // not manage it (`Integration$ApiGatewayManaged`).
             api_gateway_managed: false,
+            // An OpenAPI definition declares no integration responses — they are a
+            // WebSocket-only child resource and an imported api is an HTTP one — so an
+            // imported integration holds none.
+            integration_responses: BTreeMap::new(),
+            integration_response_id_seed: 0,
         }
     }
 }
@@ -754,8 +770,14 @@ pub struct ImportedApi {
     /// [`ENDPOINT_CONFIGURATION_EXTENSION`]'s `disableExecuteApiEndpoint`; `false` when
     /// the document names none, which is the member's documented default.
     pub disable_execute_api_endpoint: bool,
-    /// The routes the document's paths declare, in the order they are declared.
+    /// The routes the document's paths declare, in the order they are declared. Never
+    /// longer than [`crate::state::MAX_ROUTES_PER_API`]: the read stops at the quota and
+    /// reports it through [`Self::routes_exceed_quota`].
     pub routes: Vec<ImportedRoute>,
+    /// Does the document declare MORE routes than one api may hold? The read stops at
+    /// the quota rather than collecting every operation a body can declare, so this is
+    /// what the import refuses on.
+    pub routes_exceed_quota: bool,
     /// What the import could not carry over — reported in `Warnings`, and what
     /// `FailOnWarnings` rolls the import back for.
     pub warnings: Vec<String>,
@@ -767,9 +789,10 @@ pub struct ImportedApi {
 /// Read an OpenAPI definition out of an `ImportApi`/`ReimportApi` `Body`.
 ///
 /// "The OpenAPI definition" (`ImportApi$Body`) is read in its JSON spelling, through
-/// `serde_json` under its own recursion limit, so the parse is bounded by
-/// [`MAX_DEFINITION_BYTES`] and cannot amplify what the body carries. A body in any OTHER
-/// spelling (the YAML one API Gateway also accepts) is REFUSED rather than guessed at:
+/// `serde_json` under its own recursion limit, bounded by [`MAX_DEFINITION_BYTES`], by
+/// [`MAX_BASE_PATH_CHARS`] on the prefix every route's path carries, and by this
+/// service's own route quota, so the read cannot amplify what the body carries. A body in
+/// any OTHER spelling (the YAML one API Gateway also accepts) is REFUSED rather than guessed at:
 /// reading it needs a YAML parser this crate does not carry, and a refusal naming the
 /// spelling is the honest answer — never a partial import a caller would have to
 /// second-guess.
@@ -843,6 +866,7 @@ fn read_definition(document: &Node, basepath: BasePathMode) -> Result<ImportedAp
             .flatten()
             .unwrap_or(false),
         routes: Vec::new(),
+        routes_exceed_quota: false,
         warnings: Vec::new(),
         // Reported in the document's own member order, so the same definition always
         // reports the same `ImportInfo`.
@@ -856,8 +880,10 @@ fn read_definition(document: &Node, basepath: BasePathMode) -> Result<ImportedAp
     };
 
     // What every route's path is prefixed with, once the request's `Basepath` is applied
-    // to the base path the definition declares.
+    // to the base path the definition declares. Bounded here, because it is repeated into
+    // every route's path below (see [`MAX_BASE_PATH_CHARS`]).
     let prefix = route_prefix(document, basepath);
+    bound_chars("the base path", &prefix, MAX_BASE_PATH_CHARS)?;
 
     // `paths` is optional from OpenAPI 3.1 on, and a document without it describes an api
     // with no routes rather than a malformed definition.
@@ -875,7 +901,7 @@ fn read_definition(document: &Node, basepath: BasePathMode) -> Result<ImportedAp
     // and a later collision — which only the base path modes can create — is warned
     // about rather than written twice.
     let mut claimed: BTreeSet<String> = BTreeSet::new();
-    for (path, item) in paths {
+    'paths: for (path, item) in paths {
         if !path.starts_with('/') {
             return Err(format!(
                 "Unable to parse API definition: path '{path}' must start with '/'"
@@ -909,6 +935,14 @@ fn read_definition(document: &Node, basepath: BasePathMode) -> Result<ImportedAp
                 // nothing and warns about nothing.
                 continue;
             };
+            // Stop at the api's own route quota instead of reading every operation the
+            // body declares: the import is refused for exceeding it either way, and
+            // stopping here is what keeps the read's work bounded by the quota rather
+            // than by the number of paths a caller can pack into one body.
+            if definition.routes.len() >= crate::state::MAX_ROUTES_PER_API {
+                definition.routes_exceed_quota = true;
+                break 'paths;
+            }
             let route_key = format!("{method} {route_path}");
             if !claimed.insert(route_key.clone()) {
                 warn(
