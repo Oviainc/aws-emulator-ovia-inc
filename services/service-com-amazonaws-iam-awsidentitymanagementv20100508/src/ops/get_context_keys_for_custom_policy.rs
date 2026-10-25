@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetContextKeysForCustomPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetContextKeysForCustomPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetContextKeysForCustomPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +142,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetContextKeysForCustomPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetContextKeysForCustomPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetContextKeysForCustomPolicy"))
+        // "The policies are supplied as a list of one or more strings": every document
+        // this operation reports on is named by the request, so neither the store nor
+        // the request metadata is reached — unlike `GetContextKeysForPrincipalPolicy`,
+        // which has an entity to look up.
+        let _ = (ctx, &self.engine);
+
+        // Each entry has to BE an IAM JSON policy document — "each document is
+        // specified as a string containing the complete, valid JSON text of an IAM
+        // policy" — which `policyDocumentType`'s own pattern does not ask for, so one
+        // that is not is an "invalid … value … supplied for an input parameter". The
+        // rule is the shared one every operation taking a policy document applies
+        // (`crate::state::is_policy_document`), and the refusal names the member that
+        // broke it, the way `GetContextKeysForPrincipalPolicy` does for the same list.
+        if let Some(position) = input
+            .policy_input_list
+            .iter()
+            .position(|document| !crate::state::is_policy_document(document))
+        {
+            return Err(
+                GetContextKeysForCustomPolicyErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "Syntax errors in policy: PolicyInputList member {} must be a \
+                             JSON object carrying a Statement element",
+                            position + 1
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Gets a list of all of the context keys referenced in the input policies":
+        // the keys the supplied documents reference, as ONE set, read by the shared
+        // reader `GetContextKeysForPrincipalPolicy` reports with. A read — it reports
+        // what the request carries and writes nothing.
+        Ok(GetContextKeysForCustomPolicyOutput {
+            context_key_names: Some(crate::state::context_keys_in_policies(
+                input.policy_input_list.iter().map(String::as_str),
+            )),
+        })
     }
 }
