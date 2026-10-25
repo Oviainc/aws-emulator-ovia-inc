@@ -2035,9 +2035,13 @@ async fn a_service_assigned_resource_id_is_unique_per_resource_and_stable() {
 }
 
 /// A template past a documented per-template quota is not one CloudFormation accepts, so
-/// this service reports no part of it rather than a truncated subset.
+/// the request submitting it is REFUSED — the quota is one of the ceilings
+/// `DescribeAccountLimits` advertises for the account (`StackOutputsLimit`), and an
+/// advertised ceiling a write is not held to is no ceiling (`account_limits.rs` is where
+/// that link is pinned). A template at the quota is accepted and reports every output it
+/// declares.
 #[tokio::test]
-async fn a_template_past_a_documented_quota_reports_no_outputs() {
+async fn a_template_past_a_documented_quota_is_refused() {
     let router = router();
     let cases: Vec<(&str, usize, bool)> = vec![
         // The published bound and one past it.
@@ -2049,7 +2053,7 @@ async fn a_template_past_a_documented_quota_reports_no_outputs() {
         ),
     ];
 
-    for (case, count, reported) in cases {
+    for (case, count, accepted) in cases {
         let outputs: serde_json::Map<String, serde_json::Value> = (0..count)
             .map(|index| {
                 (
@@ -2061,6 +2065,18 @@ async fn a_template_past_a_documented_quota_reports_no_outputs() {
         let template = serde_json::json!({"Outputs": outputs}).to_string();
         let name = format!("quota-{count}");
         let (status_code, body) = create_stack(&router, &name, &template, &[]).await;
+        if !accepted {
+            assert_eq!(
+                status_code, 400,
+                "case {case:?}: expected the create refused, got {status_code} {body}"
+            );
+            assert_eq!(
+                xml_text(&body, "Code").as_deref(),
+                Some("ValidationError"),
+                "case {case:?}: expected ValidationError, got {body}"
+            );
+            continue;
+        }
         assert_eq!(
             status_code, 200,
             "case {case:?}: expected CreateStack to succeed, got {status_code} {body}"
@@ -2068,9 +2084,9 @@ async fn a_template_past_a_documented_quota_reports_no_outputs() {
         wait_for_the_transition().await;
         let (_, body) = describe_stack(&router, &name).await;
         assert_eq!(
-            !wire_outputs(&body).is_empty(),
-            reported,
-            "case {case:?}: expected outputs reported = {reported}, got {} of them",
+            wire_outputs(&body).len(),
+            count,
+            "case {case:?}: expected {count} outputs reported, got {} of them",
             wire_outputs(&body).len()
         );
     }
