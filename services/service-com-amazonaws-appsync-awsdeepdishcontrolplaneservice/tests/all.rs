@@ -15,6 +15,8 @@
 mod api_cache;
 #[path = "all/data_source_service_role.rs"]
 mod data_source_service_role;
+#[path = "all/data_source_update.rs"]
+mod data_source_update;
 #[path = "all/data_sources.rs"]
 mod data_sources;
 #[path = "all/environment_variables.rs"]

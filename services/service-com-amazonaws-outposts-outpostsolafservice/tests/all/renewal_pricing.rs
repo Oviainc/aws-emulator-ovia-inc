@@ -6,188 +6,141 @@
 //!
 //! The rules under test, each stated once and then exercised over a SET of inputs:
 //!
-//! 1. `GetRenewalPricing` reports the renewal pricing RECORDED for the Outpost the
-//!    identifier names — every priced subscription option of that Outpost, in the
-//!    order it is held, field for field — and `PricingResult` is `PRICED` exactly
-//!    when there is at least one such option and `UNABLE_TO_PRICE` when there is
-//!    none. It invents nothing: a price the emulator never recorded is reported by
-//!    no member.
-//! 2. Both forms the modelled `OutpostIdentifier` pattern
+//! 1. `GetRenewalPricing` prices a renewal of the subscription behind the Outpost the
+//!    identifier names: one `SUBSCRIPTION` pricing option per payment option and
+//!    payment term the model declares — three of each, so the nine the modelled
+//!    `PricingOptionList` maximum allows — each priced from the EC2 capacity the
+//!    Outpost's own orders subscribe to, with the term's whole cost split into the
+//!    option's upfront share and equal monthly instalments for the rest.
+//!    `PricingResult` is `PRICED` exactly when there is at least one such option.
+//! 2. An Outpost with nothing subscribed has no subscription a renewal of could be
+//!    priced, and is answered `UNABLE_TO_PRICE` with no option at all: one nobody has
+//!    ordered hardware for, one whose order was cancelled, one whose order names a
+//!    catalog item this service publishes no configuration for, and one whose order
+//!    carries no line item of its own.
+//! 3. Both forms the modelled `OutpostIdentifier` pattern
 //!    `^(arn:…:outpost/)?op-[a-f0-9]{17}$` accepts — the bare id and the full
 //!    Outpost ARN — name the same Outpost, and the pricing read is a REPORT:
-//!    repeating it answers the same thing, and it changes neither the recorded
-//!    pricing nor the Outpost.
-//! 3. An identifier that names no Outpost (including one whose Outpost was deleted)
+//!    repeating it answers the same thing, and it changes neither the orders it
+//!    prices nor the Outpost.
+//! 4. An identifier that names no Outpost (including one whose Outpost was deleted)
 //!    is 404 `NotFoundException` with the identifier echo of the value AS SUPPLIED;
 //!    one that is no Outpost identifier at all is 400 `ValidationException`.
 //!
-//! Where the recorded options come from: a renewal price is a figure from AWS's own
-//! price list for the hardware an Outpost's order installed, so nothing this
-//! emulator computes — the order `CreateOrder` accepts carries no price for the same
-//! reason a quote carries none, and `CreateRenewal` and
-//! `GetOutpostBillingInformation`, the other operations an Outpost's priced
-//! subscriptions would arrive with, are still 501 scaffold stubs with issues of their
-//! own. Each
-//! row therefore RECORDS its options on the stored Outpost through the same store
-//! seam [`crate::quote_lifecycle`] ages a quote through, and then asks over the
-//! wire: what the read answers about what is recorded is the whole of rule 1. The
-//! figures below are the rows' own data; the emulator is never expected to produce a
-//! number of its own.
+//! Where the priced capacity comes from: the hardware under subscription on an
+//! Outpost is what its orders bought — the catalog items its line items name, times
+//! the quantity of each — so every row here places real orders over the wire and then
+//! asks for the pricing. The per-vCPU rate, the term lengths and the upfront shares
+//! the service prices by are the service's own published rule, named here through the
+//! constants that state it, so what each row asserts is the arithmetic over a set of
+//! subscriptions rather than one remembered figure.
 
 use serde_json::{json, Value};
 
 use service_com_amazonaws_outposts_outpostsolafservice::ops::types::{
-    PricingOption, SubscriptionPricingDetails, PAYMENT_OPTION_VALUES, PAYMENT_TERM_VALUES,
+    PAYMENT_OPTION_VALUES, PAYMENT_TERM_VALUES,
 };
 use service_com_amazonaws_outposts_outpostsolafservice::state::{
-    PRICING_RESULT_PRICED, PRICING_RESULT_UNABLE_TO_PRICE,
+    CURRENCY_USD, PAYMENT_OPTION_UPFRONT_SHARE, PAYMENT_TERM_MONTHS, PRICING_RESULT_PRICED,
+    PRICING_RESULT_UNABLE_TO_PRICE, QUOTE_PRICING_TYPE_SUBSCRIPTION, RENEWAL_PRICE_PER_VCPU_MONTH,
 };
 
+use crate::quote_lifecycle::{create_quote, request as quote_request};
 use crate::site_and_outpost_lifecycle::{
     refusal, segment, settle, text, Outposts, Refusal, ABSENT_OUTPOST_ID, ABSENT_SITE_ID,
     OUTPOST_ARN_PREFIX,
 };
 
-/// The one value the modelled `QuotePricingType` enum declares, which a
-/// `PricingOption$PricingType` carries (see
-/// `ops::types::shared_types::QUOTE_PRICING_TYPE_VALUES`).
-const SUBSCRIPTION: &str = "SUBSCRIPTION";
+/// A `SkuCode` of the modelled form (`^OR-[A-Z0-9]{7}$`) that this service publishes
+/// no configuration under — a catalog item id a line item may name and the catalog
+/// has no hardware facts for. The rows that use it assert it really is unpublished.
+const UNPUBLISHED_SKU: &str = "OR-0000001";
 
-/// The one value the modelled `CurrencyCode` enum declares — "currently only
-/// `USD` is supported", as the model documents
-/// `SubscriptionPricingDetails$Currency`.
-const USD: &str = "USD";
+/// How close a reported price has to be to the one the rule computes: the cent it is
+/// quoted to, which is also the precision the service rounds to.
+const CENT: f64 = 0.01;
 
-/// One priced subscription option, as a row records it on an Outpost and as the
-/// wire must report it back.
-#[derive(Debug, Clone)]
-struct PricedOption {
-    payment_option: &'static str,
-    payment_term: &'static str,
-    /// Every price member is `NullableFloat` and optional, so a row can record an
-    /// option that carries one price, both, or neither.
-    upfront: Option<f32>,
-    monthly: Option<f32>,
-    currency: Option<&'static str>,
-}
-
-impl PricedOption {
-    /// The `PricingOption` this row records on the Outpost's own record.
-    fn recorded(&self) -> PricingOption {
-        PricingOption {
-            pricing_type: Some(SUBSCRIPTION.to_string()),
-            subscription_pricing_details: Some(SubscriptionPricingDetails {
-                payment_option: Some(self.payment_option.to_string()),
-                payment_term: Some(self.payment_term.to_string()),
-                upfront_price: self.upfront,
-                monthly_recurring_price: self.monthly,
-                currency: self.currency.map(str::to_string),
-            }),
-        }
-    }
-}
-
-/// A row's option, spelled out.
-fn option(
-    payment_option: &'static str,
-    payment_term: &'static str,
-    upfront: Option<f32>,
-    monthly: Option<f32>,
-    currency: Option<&'static str>,
-) -> PricedOption {
-    PricedOption {
-        payment_option,
-        payment_term,
-        upfront,
-        monthly,
-        currency,
-    }
-}
-
-/// Every `PaymentOption` × `PaymentTerm` combination the model declares: 3 × 3 = 9
-/// options, which is exactly the modelled `PricingOptionList` maximum
-/// (`length(0..9)`). The two value lists are the generated
-/// `PAYMENT_OPTION_VALUES` / `PAYMENT_TERM_VALUES`, read off the model's enums, so
-/// this row covers values no other row cites.
-fn every_combination() -> Vec<PricedOption> {
-    let mut options = Vec::new();
-    for (index, payment_option) in PAYMENT_OPTION_VALUES.iter().enumerate() {
-        for (step, payment_term) in PAYMENT_TERM_VALUES.iter().enumerate() {
-            // Distinct, exactly representable figures, so an option reported out of
-            // order or dropped shows up as a mismatch rather than a coincidence.
-            let upfront = (index * 3 + step) as f32 * 1024.0;
-            options.push(option(
-                payment_option,
-                payment_term,
-                Some(upfront),
-                Some(upfront / 32.0),
-                Some(USD),
-            ));
-        }
-    }
-    options
-}
+/// The `OrderStatus` of a cancelled order, the one status in which an order no longer
+/// subscribes the hardware it bought.
+const ORDER_CANCELLED: &str = "CANCELLED";
 
 /// The route `GetRenewalPricing` binds, for one identifier form.
 fn route(identifier: &str) -> String {
     format!("/outpost/{}/renewal-pricing", segment(identifier))
 }
 
-/// A price member of a reported option, as a number — absent when the wire omits
-/// it, which is how a client sees a price nothing recorded.
-fn price(details: &Value, member: &str, case: &str) -> Option<f64> {
-    details.get(member).map(|value| {
-        value
-            .as_f64()
-            .unwrap_or_else(|| panic!("case {case:?}: {member} {value} is not a number"))
-    })
+/// One order a case places on its Outpost: the `(catalog item, quantity)` line items
+/// it carries, the payment option it was bought under, and whether it was cancelled
+/// after being placed.
+#[derive(Debug, Clone)]
+struct OrderSpec {
+    items: Vec<(String, i64)>,
+    payment_option: &'static str,
+    cancelled: bool,
 }
 
-/// Rule 1's option half: one reported option against the one a row recorded.
-fn assert_reported(actual: &Value, expected: &PricedOption, case: &str, index: usize) {
-    let case = &format!("{case} (option {index})");
-    assert_eq!(
-        actual.get("PricingType").and_then(Value::as_str),
-        Some(SUBSCRIPTION),
-        "case {case:?}: expected PricingType {SUBSCRIPTION:?}, got {actual}"
-    );
-    let details = actual
-        .get("SubscriptionPricingDetails")
-        .unwrap_or_else(|| panic!("case {case:?}: expected SubscriptionPricingDetails, got {actual}"));
-    assert_eq!(
-        details.get("PaymentOption").and_then(Value::as_str),
-        Some(expected.payment_option),
-        "case {case:?}: expected PaymentOption {:?}, got {details}",
-        expected.payment_option
-    );
-    assert_eq!(
-        details.get("PaymentTerm").and_then(Value::as_str),
-        Some(expected.payment_term),
-        "case {case:?}: expected PaymentTerm {:?}, got {details}",
-        expected.payment_term
-    );
-    assert_eq!(
-        details.get("Currency").and_then(Value::as_str),
-        expected.currency,
-        "case {case:?}: expected Currency {:?}, got {details}",
-        expected.currency
-    );
-    for (member, recorded) in [
-        ("UpfrontPrice", expected.upfront),
-        ("MonthlyRecurringPrice", expected.monthly),
-    ] {
-        let actual = price(details, member, case);
-        assert_eq!(
-            actual,
-            recorded.map(f64::from),
-            "case {case:?}: expected {member} {:?}, got {actual:?}",
-            recorded.map(f64::from)
-        );
+/// An order of `items`, live, bought under `payment_option` — which is the option
+/// THAT order was bought under and so says nothing about which options a renewal of
+/// it can be bought under.
+fn order(payment_option: &'static str, items: &[(String, i64)]) -> OrderSpec {
+    OrderSpec {
+        items: items.to_vec(),
+        payment_option,
+        cancelled: false,
     }
 }
 
-/// An Outpost to record pricing on, as its `OutpostId`. An Outpost belongs to a
-/// site, so the site comes first — the same order a real workflow takes.
+/// The same order, cancelled after it was placed.
+fn cancelled(mut spec: OrderSpec) -> OrderSpec {
+    spec.cancelled = true;
+    spec
+}
+
+/// The catalog of orderable hardware configurations this service publishes, as
+/// `(CatalogItemId, vCPUs of EC2 capacity)` pairs.
+///
+/// The SKUs are the ones `ListCatalogItems` publishes over the wire. The capacity is
+/// read through the store seam [`crate::quote_lifecycle`] ages a quote through,
+/// because the modelled `CatalogItem` reports capacity per instance family rather
+/// than one total — it is the catalog's own published figure either way, never a
+/// number this suite picked.
+async fn published_catalog(outposts: &Outposts) -> Vec<(String, i64)> {
+    let listed = outposts
+        .ok("GET", "/catalog/items?MaxResults=1000", None)
+        .await;
+    let items = listed["CatalogItems"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected CatalogItems, got {listed}"))
+        .clone();
+    let held = outposts.store().lock().catalog_items.clone();
+    let mut catalog: Vec<(String, i64)> = items
+        .iter()
+        .map(|item| {
+            let sku = text(item, "CatalogItemId");
+            let capacity = held
+                .iter()
+                .find(|record| record.item.catalog_item_id.as_deref() == Some(sku.as_str()))
+                .unwrap_or_else(|| panic!("the published catalog holds {sku}"))
+                .capacity_vcpus;
+            (sku, i64::from(capacity))
+        })
+        .collect();
+    assert!(
+        catalog.len() >= 2,
+        "the published catalog has to offer more than one configuration for these rows to span \
+         it, got {catalog:?}"
+    );
+    assert!(
+        catalog.iter().all(|(sku, capacity)| *capacity > 0 && sku != UNPUBLISHED_SKU),
+        "every published configuration carries capacity, and none of them is the unpublished \
+         SKU {UNPUBLISHED_SKU}: got {catalog:?}"
+    );
+    catalog.sort_by_key(|(_, capacity)| *capacity);
+    catalog
+}
+
+/// One site and one Outpost on it, as that Outpost's `OutpostId`. An Outpost belongs
+/// to a site, so the site comes first — the same order a real workflow takes.
 async fn an_outpost(outposts: &Outposts, name: &str) -> String {
     let site = outposts
         .create_site(&json!({ "Name": format!("{name}-site") }))
@@ -198,85 +151,287 @@ async fn an_outpost(outposts: &Outposts, name: &str) -> String {
     text(&outpost, "OutpostId")
 }
 
-/// Record `options` as the renewal pricing of the stored Outpost. See this module's
-/// header for why a row records them through the store.
-fn record(outposts: &Outposts, outpost_id: &str, options: &[PricedOption], case: &str) {
+/// Put a stored order in `CANCELLED` through the store seam
+/// [`crate::quote_lifecycle`] ages a quote through: `CancelOrder` is still a 501
+/// scaffold stub with an issue of its own, and a case about what a cancelled order no
+/// longer subscribes must not wait on that.
+fn cancel_order(outposts: &Outposts, order_id: &str, case: &str) {
     let store = outposts.store();
     let mut store = store.lock();
     let record = store
-        .outposts
-        .get_mut(outpost_id)
-        .unwrap_or_else(|| panic!("case {case:?}: the create persisted the Outpost"));
-    record.renewal_pricing = options.iter().map(PricedOption::recorded).collect();
+        .orders
+        .get_mut(order_id)
+        .unwrap_or_else(|| panic!("case {case:?}: the create persisted order {order_id}"));
+    record.order.status = Some(ORDER_CANCELLED.to_string());
 }
 
-/// Rules 1 + 2: the read answers every option recorded for the Outpost, with the
-/// `PricingResult` that says whether it could be priced, through either identifier
-/// form.
-///
-/// The rows differ along everything the rule generalises over: how many options are
-/// recorded (none, one, two, the modelled maximum of nine), which payment option and
-/// term each carries, and which of the optional price and currency members were
-/// recorded at all (both prices, only the monthly one, neither, a zero price, no
-/// currency).
-#[tokio::test]
-async fn renewal_pricing_reports_every_option_recorded_for_the_outpost() {
-    let outposts = Outposts::new();
-    let cases: Vec<(&str, Vec<PricedOption>)> = vec![
-        ("no option recorded", Vec::new()),
-        (
-            "one option, both prices",
-            vec![option(
-                "ALL_UPFRONT",
-                "THREE_YEARS",
-                Some(123_456.0),
-                Some(4_725.25),
-                Some(USD),
-            )],
-        ),
-        (
-            "one option with no upfront payment, a zero upfront price",
-            vec![option(
-                "NO_UPFRONT",
-                "ONE_YEAR",
-                Some(0.0),
-                Some(9_999.5),
-                Some(USD),
-            )],
-        ),
-        (
-            "one option whose prices were not recorded",
-            vec![option("PARTIAL_UPFRONT", "FIVE_YEARS", None, None, None)],
-        ),
-        (
-            "two options on the same term, one of them without a currency",
-            vec![
-                option(
-                    "PARTIAL_UPFRONT",
-                    "FIVE_YEARS",
-                    Some(250_000.0),
-                    Some(1_500.0),
-                    Some(USD),
+/// Place every order a case describes on `outpost_id`, over the wire.
+async fn place_orders(outposts: &Outposts, outpost_id: &str, specs: &[OrderSpec], case: &str) {
+    for spec in specs {
+        let mut body = json!({
+            "OutpostIdentifier": outpost_id,
+            "PaymentOption": spec.payment_option,
+        });
+        if spec.items.is_empty() {
+            // An order has to name either its line items or the quote to take them
+            // from; one taken from a quote carries no line item of its own.
+            let quote = create_quote(
+                outposts,
+                &quote_request(
+                    "US",
+                    json!([{ "QuoteCapacityType": "EC2", "Unit": "instances", "Quantity": 4.0 }]),
+                    json!({ "OutpostIdentifier": outpost_id }),
                 ),
-                option("NO_UPFRONT", "FIVE_YEARS", None, Some(7_250.75), None),
+            )
+            .await;
+            body["QuoteIdentifier"] = json!(text(&quote, "QuoteId"));
+        } else {
+            body["LineItems"] = Value::Array(
+                spec.items
+                    .iter()
+                    .map(|(sku, quantity)| json!({ "CatalogItemId": sku, "Quantity": quantity }))
+                    .collect(),
+            );
+        }
+        let placed = outposts.ok("POST", "/orders", Some(&body)).await;
+        let order_id = text(&placed["Order"], "OrderId");
+        if spec.cancelled {
+            cancel_order(outposts, &order_id, case);
+        }
+    }
+}
+
+/// The capacity, in vCPUs, the orders a case placed subscribe on its Outpost: every
+/// live order's line items, each item's published capacity times the quantity
+/// ordered. A catalog item the service publishes nothing for subscribes nothing.
+fn subscribed_capacity(specs: &[OrderSpec], catalog: &[(String, i64)]) -> i64 {
+    specs
+        .iter()
+        .filter(|spec| !spec.cancelled)
+        .flat_map(|spec| spec.items.iter())
+        .map(|(sku, quantity)| {
+            let capacity = catalog
+                .iter()
+                .find(|(published, _)| published == sku)
+                .map_or(0, |(_, capacity)| *capacity);
+            capacity * quantity
+        })
+        .sum()
+}
+
+/// How many months a term runs for, from the rule the service prices by.
+fn months(payment_term: &str) -> f64 {
+    let (_, months) = PAYMENT_TERM_MONTHS
+        .iter()
+        .find(|(term, _)| *term == payment_term)
+        .unwrap_or_else(|| panic!("the rule gives {payment_term} a length in months"));
+    f64::from(*months)
+}
+
+/// The share of a term's cost a payment option pays up front, from the same rule.
+fn upfront_share(payment_option: &str) -> f64 {
+    let (_, share) = PAYMENT_OPTION_UPFRONT_SHARE
+        .iter()
+        .find(|(option, _)| *option == payment_option)
+        .unwrap_or_else(|| panic!("the rule gives {payment_option} an upfront share"));
+    f64::from(*share)
+}
+
+/// A price member of a reported option, as a number — `None` when the wire omits it.
+fn price(details: &Value, member: &str, case: &str) -> Option<f64> {
+    details.get(member).map(|value| {
+        value
+            .as_f64()
+            .unwrap_or_else(|| panic!("case {case:?}: {member} {value} is not a number"))
+    })
+}
+
+/// Require `actual` to be `expected` to the cent.
+fn assert_price(actual: Option<f64>, expected: f64, member: &str, case: &str) {
+    let actual =
+        actual.unwrap_or_else(|| panic!("case {case:?}: expected {member} {expected}, got none"));
+    assert!(
+        (actual - expected).abs() <= CENT.max(expected.abs() * 1e-6),
+        "case {case:?}: expected {member} {expected}, got {actual}"
+    );
+}
+
+/// Rule 1, over one answer: every option the renewal of `capacity` vCPUs of
+/// subscribed hardware can be bought under, priced by the service's own rule.
+fn assert_priced(reply: &Value, capacity: i64, case: &str) {
+    assert_eq!(
+        text(reply, "PricingResult"),
+        PRICING_RESULT_PRICED,
+        "case {case:?}: {capacity} vCPUs are subscribed, so the renewal is priced, got {reply}"
+    );
+    let reported = reply
+        .get("PricingOptions")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("case {case:?}: expected PricingOptions, got {reply}"));
+    // Every (payment option, payment term) combination the model declares, in the
+    // order the model declares the two value sets in.
+    let expected: Vec<(&str, &str)> = PAYMENT_OPTION_VALUES
+        .iter()
+        .flat_map(|option| PAYMENT_TERM_VALUES.iter().map(move |term| (*option, *term)))
+        .collect();
+    assert_eq!(
+        reported.len(),
+        expected.len(),
+        "case {case:?}: expected one option per payment option and term ({}), got {reply}",
+        expected.len()
+    );
+    let monthly_rate = capacity as f64 * f64::from(RENEWAL_PRICE_PER_VCPU_MONTH);
+    for (index, (actual, (payment_option, payment_term))) in
+        reported.iter().zip(&expected).enumerate()
+    {
+        let case = &format!("{case} (option {index}: {payment_option} {payment_term})");
+        assert_eq!(
+            actual.get("PricingType").and_then(Value::as_str),
+            Some(QUOTE_PRICING_TYPE_SUBSCRIPTION),
+            "case {case:?}: expected PricingType {QUOTE_PRICING_TYPE_SUBSCRIPTION:?}, got {actual}"
+        );
+        let details = actual
+            .get("SubscriptionPricingDetails")
+            .unwrap_or_else(|| panic!("case {case:?}: expected the pricing details, got {actual}"));
+        assert_eq!(
+            details.get("PaymentOption").and_then(Value::as_str),
+            Some(*payment_option),
+            "case {case:?}: expected PaymentOption {payment_option:?}, got {details}"
+        );
+        assert_eq!(
+            details.get("PaymentTerm").and_then(Value::as_str),
+            Some(*payment_term),
+            "case {case:?}: expected PaymentTerm {payment_term:?}, got {details}"
+        );
+        assert_eq!(
+            details.get("Currency").and_then(Value::as_str),
+            Some(CURRENCY_USD),
+            "case {case:?}: expected Currency {CURRENCY_USD:?}, got {details}"
+        );
+        let months = months(payment_term);
+        let share = upfront_share(payment_option);
+        let term_cost = monthly_rate * months;
+        assert_price(
+            price(details, "UpfrontPrice", case),
+            term_cost * share,
+            "UpfrontPrice",
+            case,
+        );
+        assert_price(
+            price(details, "MonthlyRecurringPrice", case),
+            monthly_rate * (1.0 - share),
+            "MonthlyRecurringPrice",
+            case,
+        );
+        // The invariant behind the split, whatever the rate is: what the subscriber
+        // pays over the whole term is the term's cost, under every payment option of
+        // that term.
+        let paid = price(details, "UpfrontPrice", case).unwrap_or_default()
+            + price(details, "MonthlyRecurringPrice", case).unwrap_or_default() * months;
+        assert!(
+            (paid - term_cost).abs() <= CENT * months,
+            "case {case:?}: upfront plus {months} monthly instalments must be the term's cost \
+             {term_cost}, got {paid}"
+        );
+    }
+}
+
+/// Rule 2, over one answer: nothing is subscribed, so there is nothing to price.
+fn assert_unable_to_price(reply: &Value, case: &str) {
+    assert_eq!(
+        text(reply, "PricingResult"),
+        PRICING_RESULT_UNABLE_TO_PRICE,
+        "case {case:?}: nothing is subscribed on this Outpost, so it cannot be priced, got {reply}"
+    );
+    assert_eq!(
+        reply.get("PricingOptions"),
+        Some(&json!([])),
+        "case {case:?}: an Outpost with nothing subscribed reports no option, got {reply}"
+    );
+}
+
+/// Rules 1 + 2 + 3: the pricing answers one option per payment option and term,
+/// priced from the hardware the Outpost's orders subscribe to, through either
+/// identifier form.
+///
+/// The rows differ along everything the rule generalises over: which configuration
+/// was ordered (every one the catalog publishes, from the smallest to the largest),
+/// how many units of it, how many line items an order carries, how many orders the
+/// Outpost holds, whether an order was cancelled, whether it names a catalog item the
+/// service publishes nothing for, whether it carries line items at all, and which
+/// payment option it was itself bought under.
+#[tokio::test]
+async fn renewal_pricing_prices_the_subscription_the_outposts_orders_hold() {
+    let outposts = Outposts::new();
+    let catalog = published_catalog(&outposts).await;
+    let (smallest, smallest_capacity) = catalog.first().cloned().expect("the catalog is not empty");
+    let (largest, _) = catalog.last().cloned().expect("the catalog is not empty");
+
+    let mut cases: Vec<(String, Vec<OrderSpec>)> = vec![
+        ("no order at all".to_string(), Vec::new()),
+        (
+            "two units of the largest configuration".to_string(),
+            vec![order("NO_UPFRONT", &[(largest.clone(), 2)])],
+        ),
+        (
+            "two configurations in one order".to_string(),
+            vec![order(
+                "PARTIAL_UPFRONT",
+                &[(smallest.clone(), 1), (largest.clone(), 3)],
+            )],
+        ),
+        (
+            "two orders on the same Outpost".to_string(),
+            vec![
+                order("ALL_UPFRONT", &[(smallest.clone(), 1)]),
+                order("NO_UPFRONT", &[(largest.clone(), 1)]),
             ],
         ),
         (
-            "every payment option and term, the modelled nine-option maximum",
-            every_combination(),
+            "an order of a catalog item the service publishes nothing for".to_string(),
+            vec![order("ALL_UPFRONT", &[(UNPUBLISHED_SKU.to_string(), 4)])],
+        ),
+        (
+            "a published configuration beside an unpublished SKU".to_string(),
+            vec![order(
+                "ALL_UPFRONT",
+                &[
+                    (smallest.clone(), 1),
+                    (UNPUBLISHED_SKU.to_string(), 7),
+                ],
+            )],
+        ),
+        (
+            "the only order was cancelled".to_string(),
+            vec![cancelled(order("NO_UPFRONT", &[(largest.clone(), 2)]))],
+        ),
+        (
+            "a cancelled order beside a live one".to_string(),
+            vec![
+                cancelled(order("NO_UPFRONT", &[(largest.clone(), 2)])),
+                order("ALL_UPFRONT", &[(smallest.clone(), 1)]),
+            ],
+        ),
+        (
+            "an order taken from a quote, with no line item of its own".to_string(),
+            vec![order("ALL_UPFRONT", &[])],
         ),
     ];
+    // Every configuration the catalog publishes, one unit of it: the rows above name
+    // only the smallest and the largest, and the rule holds for each entry.
+    for (sku, _) in &catalog {
+        cases.push((
+            format!("one unit of {sku}"),
+            vec![order("PARTIAL_UPFRONT", &[(sku.clone(), 1)])],
+        ));
+    }
 
-    for (case, options) in &cases {
+    for (case, specs) in &cases {
         let outpost_id = an_outpost(&outposts, "renewal-pricing").await;
-        record(&outposts, &outpost_id, options, case);
+        place_orders(&outposts, &outpost_id, specs, case).await;
+        let capacity = subscribed_capacity(specs, &catalog);
 
-        let expected_result = if options.is_empty() {
-            PRICING_RESULT_UNABLE_TO_PRICE
-        } else {
-            PRICING_RESULT_PRICED
-        };
-        // Rule 2's identifier half: the bare id and the full Outpost ARN name the
+        // Rule 3's identifier half: the bare id and the full Outpost ARN name the
         // same Outpost, so both answer the same pricing.
         for identifier in [
             outpost_id.clone(),
@@ -284,60 +439,137 @@ async fn renewal_pricing_reports_every_option_recorded_for_the_outpost() {
         ] {
             let case = &format!("{case} read by {identifier}");
             let reply = outposts.ok("GET", &route(&identifier), None).await;
-            assert_eq!(
-                text(&reply, "PricingResult"),
-                expected_result,
-                "case {case:?}: {} option(s) recorded, so expected PricingResult \
-                 {expected_result:?}, got {reply}",
-                options.len()
-            );
-            let reported = reply
-                .get("PricingOptions")
-                .and_then(Value::as_array)
-                .unwrap_or_else(|| panic!("case {case:?}: expected PricingOptions, got {reply}"));
-            assert_eq!(
-                reported.len(),
-                options.len(),
-                "case {case:?}: expected {} option(s), got {reply}",
-                options.len()
-            );
-            for (index, (actual, expected)) in reported.iter().zip(options).enumerate() {
-                assert_reported(actual, expected, case, index);
+            if capacity == 0 {
+                assert_unable_to_price(&reply, case);
+            } else {
+                assert_priced(&reply, capacity, case);
             }
+        }
+    }
+
+    // The smallest configuration is the one the rows above price one unit of, so the
+    // catalog's own figure is what the pricing has to follow from.
+    assert!(
+        smallest_capacity > 0,
+        "the smallest published configuration carries capacity, got {smallest_capacity}"
+    );
+}
+
+/// Rule 1's scaling half: the price follows the subscribed capacity — twice the
+/// hardware is twice the money, under every payment option and term — and a longer
+/// term costs more over the term than a shorter one.
+#[tokio::test]
+async fn pricing_follows_the_subscribed_capacity_and_the_term() {
+    let outposts = Outposts::new();
+    let catalog = published_catalog(&outposts).await;
+    let (sku, _) = catalog.last().cloned().expect("the catalog is not empty");
+
+    let mut answers = Vec::new();
+    for quantity in [1_i64, 2, 4] {
+        let case = format!("{quantity} unit(s) of {sku}");
+        let outpost_id = an_outpost(&outposts, "scaling").await;
+        place_orders(
+            &outposts,
+            &outpost_id,
+            &[order("ALL_UPFRONT", &[(sku.clone(), quantity)])],
+            &case,
+        )
+        .await;
+        let reply = outposts.ok("GET", &route(&outpost_id), None).await;
+        answers.push((quantity, case, reply));
+    }
+
+    let (base_quantity, base_case, base) = &answers[0];
+    for (quantity, case, reply) in &answers {
+        let factor = *quantity as f64 / *base_quantity as f64;
+        for member in ["UpfrontPrice", "MonthlyRecurringPrice"] {
+            for index in 0..PAYMENT_OPTION_VALUES.len() * PAYMENT_TERM_VALUES.len() {
+                let one = price(&base["PricingOptions"][index]["SubscriptionPricingDetails"], member, base_case)
+                    .unwrap_or_default();
+                let scaled =
+                    price(&reply["PricingOptions"][index]["SubscriptionPricingDetails"], member, case)
+                        .unwrap_or_default();
+                assert!(
+                    (scaled - one * factor).abs() <= CENT.max(one * factor * 1e-6),
+                    "case {case:?} (option {index}): {quantity} units cost {factor} times what \
+                     {base_quantity} does, so expected {member} {}, got {scaled}",
+                    one * factor
+                );
+            }
+        }
+    }
+
+    // The same subscription over a longer term costs more over that term: the
+    // ordering the terms' own lengths put them in.
+    let options = base["PricingOptions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {base_case:?}: expected PricingOptions, got {base}"));
+    for payment_option in PAYMENT_OPTION_VALUES {
+        let mut costs: Vec<(f64, f64)> = options
+            .iter()
+            .filter_map(|option| {
+                let details = option.get("SubscriptionPricingDetails")?;
+                if details.get("PaymentOption").and_then(Value::as_str) != Some(payment_option) {
+                    return None;
+                }
+                let payment_term = details.get("PaymentTerm").and_then(Value::as_str)?;
+                let months = months(payment_term);
+                let paid = price(details, "UpfrontPrice", base_case).unwrap_or_default()
+                    + price(details, "MonthlyRecurringPrice", base_case).unwrap_or_default()
+                        * months;
+                Some((months, paid))
+            })
+            .collect();
+        costs.sort_by(|left, right| left.0.total_cmp(&right.0));
+        assert_eq!(
+            costs.len(),
+            PAYMENT_TERM_VALUES.len(),
+            "case {payment_option:?}: expected one option per payment term, got {costs:?}"
+        );
+        for pair in costs.windows(2) {
+            assert!(
+                pair[1].1 > pair[0].1,
+                "case {payment_option:?}: a {} month term must cost more over the term than a {} \
+                 month one, got {:?}",
+                pair[1].0,
+                pair[0].0,
+                pair
+            );
         }
     }
 }
 
-/// Rule 2's report half: asking for an Outpost's renewal pricing changes nothing —
-/// not the pricing it answers, not the Outpost, not another Outpost's pricing.
+/// Rule 3's report half: asking for an Outpost's renewal pricing changes nothing —
+/// not the pricing it answers, not the orders it priced, not the Outpost, not another
+/// Outpost's pricing.
 #[tokio::test]
 async fn reading_renewal_pricing_changes_nothing_a_later_call_sees() {
     let outposts = Outposts::new();
+    let catalog = published_catalog(&outposts).await;
+    let (sku, _) = catalog.last().cloned().expect("the catalog is not empty");
     let priced = an_outpost(&outposts, "priced").await;
     let unpriced = an_outpost(&outposts, "unpriced").await;
-    let options = every_combination();
-    record(&outposts, &priced, &options, "priced");
+    place_orders(
+        &outposts,
+        &priced,
+        &[order("PARTIAL_UPFRONT", &[(sku.clone(), 2)])],
+        "priced",
+    )
+    .await;
 
-    // Past the Outpost lifecycle transition the clock owes a just-created Outpost,
-    // so the Outpost snapshots below differ only if THIS read changed one.
+    // Past the Outpost lifecycle transition the clock owes a just-created Outpost and
+    // the order transition it owes a just-placed order, so the snapshots below differ
+    // only if THIS read changed one.
     settle();
     let before = outposts.get_outpost(&priced).await;
+    let orders_before = outposts.store().lock().orders.clone();
 
     let mut answers = Vec::new();
     for pass in ["first read", "second read", "third read"] {
         answers.push((pass, outposts.ok("GET", &route(&priced), None).await));
-        // Another Outpost's pricing is its own: reading one never fills in another.
+        // Another Outpost's pricing is its own: reading one never prices another.
         let other = outposts.ok("GET", &route(&unpriced), None).await;
-        assert_eq!(
-            text(&other, "PricingResult"),
-            PRICING_RESULT_UNABLE_TO_PRICE,
-            "case {pass:?}: an Outpost with no recorded option cannot be priced, got {other}"
-        );
-        assert_eq!(
-            other.get("PricingOptions"),
-            Some(&json!([])),
-            "case {pass:?}: an Outpost with no recorded option reports no option, got {other}"
-        );
+        assert_unable_to_price(&other, pass);
     }
     let (_, first) = &answers[0];
     for (pass, answer) in &answers {
@@ -352,17 +584,15 @@ async fn reading_renewal_pricing_changes_nothing_a_later_call_sees() {
         after, before,
         "reading renewal pricing must not change the Outpost itself"
     );
-    let held = outposts.store().lock().outposts[&priced].renewal_pricing.len();
+    let orders_after = outposts.store().lock().orders.clone();
     assert_eq!(
-        held,
-        options.len(),
-        "reading renewal pricing must leave the recorded options alone: expected {} held, got \
-         {held}",
-        options.len()
+        format!("{orders_after:?}"),
+        format!("{orders_before:?}"),
+        "reading renewal pricing must leave the orders it priced alone"
     );
 }
 
-/// Rule 3: an identifier that names no Outpost is 404 `NotFoundException`; one that
+/// Rule 4: an identifier that names no Outpost is 404 `NotFoundException`; one that
 /// is no Outpost identifier at all is 400 `ValidationException`, from the boundary.
 ///
 /// The rows span both identifier forms, an identifier of another resource kind, and
@@ -371,15 +601,18 @@ async fn reading_renewal_pricing_changes_nothing_a_later_call_sees() {
 #[tokio::test]
 async fn an_absent_outpost_is_not_found_and_a_malformed_identifier_is_refused() {
     let outposts = Outposts::new();
-    // An Outpost that existed, was recorded pricing, and was then deleted: its
-    // pricing went with it, so the route answers as it does for one that never was.
+    // An Outpost that existed, had hardware ordered for it, and was then deleted: the
+    // route answers as it does for one that never was.
+    let catalog = published_catalog(&outposts).await;
+    let (sku, _) = catalog.first().cloned().expect("the catalog is not empty");
     let deleted = an_outpost(&outposts, "deleted").await;
-    record(
+    place_orders(
         &outposts,
         &deleted,
-        &[option("ALL_UPFRONT", "ONE_YEAR", Some(1_024.0), None, Some(USD))],
+        &[order("ALL_UPFRONT", &[(sku, 1)])],
         "deleted",
-    );
+    )
+    .await;
     outposts
         .ok("DELETE", &format!("/outposts/{deleted}"), None)
         .await;
@@ -453,7 +686,7 @@ async fn an_absent_outpost_is_not_found_and_a_malformed_identifier_is_refused() 
     outposts.expect_refusals(&cases).await;
 }
 
-/// Rule 3's message half: a not-found refusal is the identifier ECHO
+/// Rule 4's message half: a not-found refusal is the identifier ECHO
 /// `outpostIdentifier=<value as supplied>` — the ARN form reads its ARN back, not
 /// the bare id the service resolved it to.
 #[tokio::test]

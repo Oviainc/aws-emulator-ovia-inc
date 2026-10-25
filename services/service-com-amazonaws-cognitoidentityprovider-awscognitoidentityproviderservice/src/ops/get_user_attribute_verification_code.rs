@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetUserAttributeVerificationCode
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetUserAttributeVerificationCode`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Sends a verification code for ONE attribute of the user an access token
+//! identifies, and reports where that code went.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetUserAttributeVerificationCode::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The access token names the pool and the user (this operation models neither), the
+//! attribute decides whether a code can be addressed at all and over which medium, and
+//! the attribute's STORED value is the destination the code is issued to and the
+//! response reports.
 //!
 //! ## Shape of an operation
 //!
@@ -220,20 +218,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetUserAttributeVerificationCode` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetUserAttributeVerificationCodeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetUserAttributeVerificationCode"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        // An access token's lifetime is read against the clock, so an expired token is
+        // refused whether or not anything has swept it.
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        // This operation models no `UserPoolId` and no `Username`: the access token is
+        // what names the pool and the user whose attribute a code is sent for.
+        let (pool, user) = guard
+            .signed_in_user(&input.access_token, now)
+            .map_err(token_rejected)?;
+        let user_pool_id = pool.id.clone();
+        // The username as STORED, which a case-insensitive pool may case differently
+        // from the one the token's sign-in named.
+        let username = user.username.clone();
+
+        // A code is a message, so it needs an address to be sent to: only an attribute
+        // that IS such an address can carry one, and which attribute it is decides the
+        // medium the message travels over (`crate::state::delivery_medium`, the same
+        // rule `UpdateUserAttributes` reports a pending value's delivery by).
+        let attribute_name = input.attribute_name.clone();
+        let Some(delivery_medium) = crate::state::delivery_medium(&attribute_name) else {
+            return Err(invalid_parameter(format!(
+                "Invalid AttributeName: {attribute_name} is not an attribute a verification \
+                 code can be sent for"
+            )));
+        };
+        // The destination is the attribute's STORED value, so a user holding no value
+        // for it has nowhere for a code to be sent.
+        let Some(destination) = user
+            .attributes
+            .get(&attribute_name)
+            .filter(|value| !value.is_empty())
+            .cloned()
+        else {
+            return Err(invalid_parameter(format!(
+                "Invalid AttributeName: the user has no {attribute_name} to send a code to"
+            )));
+        };
+
+        // `ClientMetadata` is "input for any custom workflows that this action
+        // triggers" — Lambda triggers, which this emulator invokes none of, so the map
+        // is accepted and nothing reads it.
+
+        // Sending the code is what this operation DOES, so the code it issued is
+        // recorded against the attribute it was issued for; a later code for the same
+        // attribute replaces this one.
+        let stored = crate::state::AttributeVerification {
+            code: crate::state::new_verification_code(),
+            destination,
+            delivery_medium: delivery_medium.to_string(),
+            issued_at: now,
+        };
+        let user = guard
+            .pool_mut(&user_pool_id)
+            .and_then(|pool| pool.user_mut(&username))
+            .ok_or_else(internal_error)?;
+        user.pending_attribute_verifications
+            .insert(attribute_name.clone(), stored.clone());
+
+        // Rendered from the record just stored, through the delivery-details rule every
+        // operation that reports a sent code shares: the destination is the stored
+        // attribute value, reported masked, and the medium the one that value is
+        // reached over.
+        Ok(GetUserAttributeVerificationCodeOutput {
+            code_delivery_details: crate::state::code_delivery_details(
+                &attribute_name,
+                &stored.destination,
+            ),
+        })
     }
+}
+
+/// This operation's answer to an `AccessToken` that names no signed-in user.
+///
+/// Every rejection of the token itself answers `NotAuthorizedException`, which "is
+/// thrown when a user isn't authorized" (this service's model), while a token whose
+/// pool or user has since been deleted answers the error for the resource that is
+/// gone. No message names a stored value.
+fn token_rejected(
+    rejection: crate::state::TokenRejection,
+) -> GetUserAttributeVerificationCodeError {
+    match rejection {
+        crate::state::TokenRejection::NotAnAccessToken => not_authorized("Invalid Access Token"),
+        crate::state::TokenRejection::Expired => not_authorized("Access Token has expired"),
+        crate::state::TokenRejection::PoolGone => {
+            GetUserAttributeVerificationCodeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    // The caller named no pool — the token did — so this message names
+                    // none either.
+                    message: Some("User pool does not exist.".to_string()),
+                },
+            )
+            .into()
+        }
+        crate::state::TokenRejection::UserGone => {
+            GetUserAttributeVerificationCodeErrorModeled::UserNotFoundException(
+                UserNotFoundException {
+                    message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into()
+        }
+    }
+}
+
+/// This operation's `NotAuthorizedException`, carrying `message`.
+fn not_authorized(message: &str) -> GetUserAttributeVerificationCodeError {
+    GetUserAttributeVerificationCodeErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException`, carrying `message`.
+fn invalid_parameter(message: String) -> GetUserAttributeVerificationCodeError {
+    GetUserAttributeVerificationCodeErrorModeled::InvalidParameterException(
+        InvalidParameterException {
+            message: Some(message),
+            // `reasonCode` is AWS's own classification of the bad parameter and this
+            // service's model documents no value for it, so nothing is invented here.
+            reason_code: None,
+        },
+    )
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> GetUserAttributeVerificationCodeError {
+    GetUserAttributeVerificationCodeErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

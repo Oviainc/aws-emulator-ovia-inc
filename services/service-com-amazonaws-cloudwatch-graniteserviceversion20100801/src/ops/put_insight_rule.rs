@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutInsightRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutInsightRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutInsightRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or updates a Contributor Insights rule in this service's store. Implemented
+//! here, and the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -103,9 +96,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatch-graniteservi
 // here — hence the `PutInsightRuleError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#PutInsightRule")]
+//
+// `InternalServiceFault` — "Request processing has failed due to some unknown error,
+// exception, or failure." — is widened in through `extra_errors`: this SERVICE models the
+// shape (and other operations declare it), but this operation's own `errors` list omits it,
+// and an unreachable shared store has to be reportable as the server failure it is rather
+// than as a parameter fault the caller could act on.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#PutInsightRule",
+    extra_errors = ["InternalServiceFault"]
+)]
 #[derive(Debug)]
 pub enum PutInsightRuleErrorModeled {
+    InternalServiceFault(InternalServiceFault),
     InvalidParameterValueException(InvalidParameterValueException),
     LimitExceededException(LimitExceededException),
     MissingRequiredParameterException(MissingRequiredParameterException),
@@ -162,18 +165,274 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutInsightRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutInsightRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutInsightRule"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutInsightRuleErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some(
+                    "the CloudWatch Contributor Insights rule store is unavailable".into(),
+                ),
+            })
+        })?;
+
+        // Every rule below is prose the model carries no constraint for, so the request
+        // reaches this handler having satisfied the modelled ones already: `RuleName`'s
+        // 1..128 length and `^[\x20-\x7E]+$` pattern, `RuleDefinition`'s 1..8192 length and
+        // `^[\x00-\x7F]+$` pattern, and `RuleState`'s 1..32 length. None is re-checked here.
+        let rule_state = rule_state_of(input.rule_state.as_deref())?;
+        validate_definition(&input.rule_definition)?;
+        validate_tags(input.tags.as_deref())?;
+
+        let mut store = state.lock();
+        let existing = store.insight_rules.get(&input.rule_name);
+        if existing.is_none() && store.insight_rules.len() >= crate::state::MAX_INSIGHT_RULES {
+            return Err(PutInsightRuleErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this emulator holds at most {} Contributor Insights rules",
+                        crate::state::MAX_INSIGHT_RULES
+                    )),
+                },
+            )
+            .into());
+        }
+        // "If you are using this operation to update an existing Contributor Insights rule,
+        // any tags you specify in this parameter are ignored. To change the tags of an
+        // existing rule, use TagResource." (`PutInsightRuleInput$Tags`)
+        let tags = existing.map_or_else(
+            || input.tags.clone().unwrap_or_default(),
+            |stored| stored.tags.clone(),
+        );
+
+        store.insight_rules.insert(
+            input.rule_name.clone(),
+            crate::state::StoredInsightRule {
+                // Stored as the shape its reader returns, so every member this operation
+                // accepts round-trips through `DescribeInsightRules` unchanged.
+                rule: InsightRule {
+                    name: input.rule_name.clone(),
+                    state: rule_state,
+                    // "For rules that you create, this is always `{"Name":
+                    // "CloudWatchLogRule", "Version": 1}`" (`InsightRule$Schema`), and such
+                    // a rule is not one Amazon Web Services manages
+                    // (`InsightRule$ManagedRule`).
+                    schema: crate::state::INSIGHT_RULE_SCHEMA.to_string(),
+                    definition: input.rule_definition.clone(),
+                    managed_rule: Some(false),
+                    // "The default is false" (`PutInsightRuleInput$ApplyOnTransformedLogs`).
+                    apply_on_transformed_logs: Some(
+                        input.apply_on_transformed_logs.unwrap_or(false),
+                    ),
+                },
+                tags,
+            },
+        );
+
+        Ok(PutInsightRuleOutput {})
     }
+}
+
+/// Refuse the request with this operation's modelled `InvalidParameterValueException`
+/// (HTTP 400): "The value of an input parameter is bad or out-of-range."
+fn invalid_parameter_value(message: String) -> PutInsightRuleError {
+    PutInsightRuleErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The state the rule takes: the request's own `RuleState` when it carries one, and
+/// otherwise the enabled state a freshly created rule collects in.
+///
+/// "The state of the rule. Valid values are ENABLED and DISABLED."
+/// (`PutInsightRuleInput$RuleState`) — a two-value set the model expresses only as a 1..32
+/// string, so any other value is refused here.
+fn rule_state_of(rule_state: Option<&str>) -> Result<String, PutInsightRuleError> {
+    let Some(requested) = rule_state else {
+        return Ok(crate::state::INSIGHT_RULE_ENABLED.to_string());
+    };
+    for valid in [
+        crate::state::INSIGHT_RULE_ENABLED,
+        crate::state::INSIGHT_RULE_DISABLED,
+    ] {
+        if requested == valid {
+            return Ok(valid.to_string());
+        }
+    }
+    Err(invalid_parameter_value(format!(
+        "The value {requested} for parameter RuleState is not valid: valid values are {} and {}",
+        crate::state::INSIGHT_RULE_ENABLED,
+        crate::state::INSIGHT_RULE_DISABLED
+    )))
+}
+
+/// "You can associate as many as 50 tags with a rule." (`PutInsightRuleInput$Tags`) — the
+/// bound and its sentence live in `crate::state`, so this operation and `PutMetricStream`
+/// refuse an over-tagged resource by one rule.
+fn validate_tags(tags: Option<&[Tag]>) -> Result<(), PutInsightRuleError> {
+    match crate::state::tag_count_error("Contributor Insights rule", tags) {
+        None => Ok(()),
+        Some(message) => Err(invalid_parameter_value(message)),
+    }
+}
+
+/// The log formats a rule can be written against: "LogFormat" in the Contributor Insights
+/// rule syntax takes `JSON` or `CLF`.
+const LOG_FORMATS: [&str; 2] = ["JSON", "CLF"];
+
+/// What a rule aggregates contributor data on: the count of occurrences, or the sum over the
+/// field `ValueOf` names. `GetInsightRuleReport` reports the same choice back as its
+/// `AggregationStatistic`.
+const AGGREGATE_ON_COUNT: &str = "Count";
+
+/// The aggregation that sums the field a contribution's `ValueOf` names.
+const AGGREGATE_ON_SUM: &str = "Sum";
+
+/// The two aggregations a rule definition may name.
+const AGGREGATE_ON: [&str; 2] = [AGGREGATE_ON_COUNT, AGGREGATE_ON_SUM];
+
+/// The contribution's `Keys` are "an array of up to four log fields used as dimensions to
+/// classify contributors" in the Contributor Insights rule syntax.
+const MAX_CONTRIBUTION_KEYS: usize = 4;
+
+/// A contribution carries up to four filters, which narrow the log events the rule
+/// evaluates (Contributor Insights rule syntax).
+const MAX_CONTRIBUTION_FILTERS: usize = 4;
+
+/// Refuse a `RuleDefinition` that is not a Contributor Insights rule.
+///
+/// "The definition of the rule, as a JSON object. The definition contains the keywords used
+/// to define contributors, the value to aggregate on if this rule returns a sum instead of a
+/// count, and the filters. For details on the valid syntax, see Contributor Insights Rule
+/// Syntax." (`PutInsightRuleInput$RuleDefinition`) — the model constrains the member only as
+/// a 1..8192 ASCII string, so the syntax itself is checked here: the rule schema, the log
+/// groups the rule reads, the log format, and the contribution it aggregates. Members the
+/// syntax does not define are left alone, so a definition carrying more than the rule needs
+/// is still a rule.
+fn validate_definition(definition: &str) -> Result<(), PutInsightRuleError> {
+    let parsed: ::serde_json::Value = ::serde_json::from_str(definition)
+        .map_err(|_| invalid_parameter_value(definition_error("it is not a JSON object")))?;
+    let rule = parsed
+        .as_object()
+        .ok_or_else(|| invalid_parameter_value(definition_error("it is not a JSON object")))?;
+
+    // "For rules that you create, this is always {"Name": "CloudWatchLogRule", "Version": 1}"
+    // (`InsightRule$Schema`) — so both members are required to be exactly that, which is what
+    // lets the stored rule report that schema back.
+    let schema = rule
+        .get("Schema")
+        .and_then(::serde_json::Value::as_object)
+        .filter(|schema| {
+            schema.get("Name").and_then(::serde_json::Value::as_str) == Some("CloudWatchLogRule")
+                && schema.get("Version").and_then(::serde_json::Value::as_u64) == Some(1)
+        });
+    if schema.is_none() {
+        return Err(invalid_parameter_value(definition_error(
+            "its Schema is not the CloudWatchLogRule schema, version 1",
+        )));
+    }
+
+    // The log groups the rule evaluates, named either by name or by ARN. A rule that selects
+    // no log group has no log events to find contributors in.
+    let selects_log_groups = ["LogGroupNames", "LogGroupARNArray"]
+        .into_iter()
+        .any(|member| {
+            rule.get(member)
+                .and_then(::serde_json::Value::as_array)
+                .is_some_and(|names| {
+                    !names.is_empty() && names.iter().all(::serde_json::Value::is_string)
+                })
+        });
+    if !selects_log_groups {
+        return Err(invalid_parameter_value(definition_error(
+            "it names no log group in LogGroupNames or LogGroupARNArray",
+        )));
+    }
+
+    let log_format = rule
+        .get("LogFormat")
+        .and_then(::serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !LOG_FORMATS.contains(&log_format) {
+        return Err(invalid_parameter_value(definition_error(&format!(
+            "its LogFormat is not one of {}",
+            LOG_FORMATS.join(" or ")
+        ))));
+    }
+
+    let contribution = rule.get("Contribution");
+    validate_contribution(contribution)?;
+
+    // Whether the rule aggregates contributor data by count of occurrences or by the sum of
+    // the field `ValueOf` names. Omitted, the rule counts; summing is what makes that field
+    // load-bearing, so a rule that sums without naming it has nothing to sum.
+    if let Some(aggregate_on) = rule.get("AggregateOn") {
+        let named = aggregate_on.as_str().unwrap_or_default();
+        if !AGGREGATE_ON.contains(&named) {
+            return Err(invalid_parameter_value(definition_error(&format!(
+                "its AggregateOn is not one of {}",
+                AGGREGATE_ON.join(" or ")
+            ))));
+        }
+        let sums = named == AGGREGATE_ON_SUM;
+        let names_a_value = contribution
+            .and_then(::serde_json::Value::as_object)
+            .and_then(|object| object.get("ValueOf"))
+            .and_then(::serde_json::Value::as_str)
+            .is_some_and(|value_of| !value_of.is_empty());
+        if sums && !names_a_value {
+            return Err(invalid_parameter_value(definition_error(
+                "it aggregates on Sum without naming the field to sum in its Contribution's \
+                 ValueOf",
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Refuse a `Contribution` that classifies no contributor.
+///
+/// A contribution carries the `Keys` a contributor is identified by, the field `ValueOf`
+/// names, and the `Filters` that narrow the log events, so a contribution without a key
+/// identifies nothing to attribute a contribution to.
+fn validate_contribution(
+    contribution: Option<&::serde_json::Value>,
+) -> Result<(), PutInsightRuleError> {
+    let contribution = contribution.and_then(::serde_json::Value::as_object);
+    let keys = contribution
+        .and_then(|object| object.get("Keys"))
+        .and_then(::serde_json::Value::as_array);
+    let Some(keys) =
+        keys.filter(|keys| !keys.is_empty() && keys.iter().all(::serde_json::Value::is_string))
+    else {
+        return Err(invalid_parameter_value(definition_error(
+            "its Contribution names no Keys",
+        )));
+    };
+    if keys.len() > MAX_CONTRIBUTION_KEYS {
+        return Err(invalid_parameter_value(definition_error(&format!(
+            "its Contribution names more than {MAX_CONTRIBUTION_KEYS} Keys"
+        ))));
+    }
+
+    if let Some(filters) = contribution.and_then(|object| object.get("Filters")) {
+        let Some(filters) = filters.as_array() else {
+            return Err(invalid_parameter_value(definition_error(
+                "its Contribution's Filters is not an array",
+            )));
+        };
+        if filters.len() > MAX_CONTRIBUTION_FILTERS {
+            return Err(invalid_parameter_value(definition_error(&format!(
+                "its Contribution names more than {MAX_CONTRIBUTION_FILTERS} Filters"
+            ))));
+        }
+    }
+
+    Ok(())
+}
+
+/// How a refusal of the rule definition reads: which part of the syntax is wrong. The
+/// definition itself is not echoed — it can be 8192 characters long.
+fn definition_error(because: &str) -> String {
+    format!("The value for parameter RuleDefinition is not valid: {because}")
 }

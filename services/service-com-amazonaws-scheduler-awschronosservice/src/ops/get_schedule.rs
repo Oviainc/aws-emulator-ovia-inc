@@ -197,10 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.schedules.get(&(group_name.clone(), input.name.clone())) else {
             return Err(GetScheduleErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Schedule {} does not exist in schedule group {group_name}.",
-                        input.name
-                    ),
+                    message: crate::state::schedule_does_not_exist(&input.name),
                 },
             )
             .into());

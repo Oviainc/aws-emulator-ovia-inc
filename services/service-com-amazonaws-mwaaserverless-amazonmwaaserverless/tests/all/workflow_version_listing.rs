@@ -11,7 +11,9 @@
 //! and exactly one of them is flagged `IsLatestVersion`, since an update "creates a new
 //! version with the updated configuration and disables scheduling on all previous
 //! versions" (`smithy_query(query="operation", operation="UpdateWorkflow")`). A workflow
-//! the store does not hold is the service's lookup miss rather than an empty page, and
+//! this endpoint does not hold contributes no version, so the listing answers an empty
+//! page rather than an error shape its modelled error set does not declare (the suite
+//! `child_listing_error_set` carries that rule across both child-resource listings), and
 //! the listing persists nothing.
 //!
 //! The tables span what the rule generalises over: how many versions a workflow holds,
@@ -23,14 +25,8 @@ use std::time::Duration;
 
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::WORKFLOW_DELETED_AFTER;
 
-use crate::missing_resource_lookups::{ghost_arns, LOOKUP_MISS_STATUS, WORKFLOW_MISSING};
+use crate::missing_resource_lookups::ghost_arns;
 use crate::workflow_lifecycle::{role_arn, Harness};
-
-/// The wire error code a lookup miss carries.
-const LOOKUP_MISS_TYPE: &str = "ResourceNotFoundException";
-
-/// The `ResourceType` a refusal reports for an absent workflow.
-const WORKFLOW_RESOURCE_TYPE: &str = "workflow";
 
 /// The members a version summary and a `GetWorkflow` read of that SAME version must
 /// agree on, because both answer from the one stored snapshot. From
@@ -487,7 +483,7 @@ async fn a_listed_summary_reports_the_configuration_that_version_froze() {
 }
 
 #[tokio::test]
-async fn a_workflow_the_store_does_not_hold_is_a_lookup_miss_not_an_empty_page() {
+async fn a_workflow_the_store_does_not_hold_is_an_empty_page() {
     let harness = Harness::new("us-west-2");
 
     // A workflow that existed and was torn down is as absent as one that never did.
@@ -505,52 +501,33 @@ async fn a_workflow_the_store_does_not_hold_is_a_lookup_miss_not_an_empty_page()
     arns.push(deleted.clone());
 
     for arn in &arns {
-        // The refusal does not depend on the other members: with and without a page size.
+        // The answer does not depend on the other members: with and without a page size.
         for (case, size) in [("plain", None), ("with a page size", Some(1_i64))] {
             let label = format!("{case}/{arn}");
             let (status, answered) = list(&harness, arn, size, None).await;
             assert_eq!(
-                status, LOOKUP_MISS_STATUS,
-                "case {label:?}: expected HTTP {LOOKUP_MISS_STATUS}, got {status} {answered:?}"
-            );
-            assert!(
-                answered["__type"]
-                    .as_str()
-                    .is_some_and(|kind| kind.contains(LOOKUP_MISS_TYPE)),
-                "case {label:?}: expected a {LOOKUP_MISS_TYPE}, got {:?}",
-                answered["__type"]
+                status, 200,
+                "case {label:?}: expected HTTP 200 for a workflow this endpoint does not \
+                 hold, got {status} {answered:?}"
             );
             assert_eq!(
-                answered["Message"].as_str(),
-                Some(WORKFLOW_MISSING),
-                "case {label:?}: expected the entity-level message for an absent workflow, \
-                 got {:?}",
-                answered["Message"]
-            );
-            assert_eq!(
-                answered["ResourceId"].as_str(),
-                Some(arn.as_str()),
-                "case {label:?}: ResourceId must name what was looked up, got {:?}",
-                answered["ResourceId"]
-            );
-            assert_eq!(
-                answered["ResourceType"].as_str(),
-                Some(WORKFLOW_RESOURCE_TYPE),
-                "case {label:?}: ResourceType must name the entity, got {:?}",
-                answered["ResourceType"]
-            );
-            assert!(
-                answered["WorkflowVersions"].is_null(),
-                "case {label:?}: a refusal reports no page, got {:?}",
+                answered["WorkflowVersions"].as_array().map(Vec::len),
+                Some(0),
+                "case {label:?}: expected an empty page, got {:?}",
                 answered["WorkflowVersions"]
+            );
+            assert!(
+                answered["NextToken"].is_null(),
+                "case {label:?}: an empty page ends the walk, got {:?}",
+                answered["NextToken"]
             );
         }
     }
 
-    // A refused listing creates nothing: the torn-down workflow stays gone.
+    // The listing creates nothing: the torn-down workflow stays gone.
     assert!(
         harness.stored_versions(&deleted).is_empty(),
-        "a refused listing must not resurrect a deleted workflow's versions, got {:?}",
+        "listing an absent workflow must not resurrect its versions, got {:?}",
         harness.stored_versions(&deleted)
     );
 }
