@@ -347,8 +347,9 @@ async fn assert_round_trip(
 }
 
 /// An instant a response reports, as seconds since the epoch, whichever wire form the
-/// `Iso8601DateTime` timestamp is written in.
-fn instant(case: &str, label: &str, value: Option<&Value>) -> f64 {
+/// `Iso8601DateTime` timestamp is written in. `pub(crate)` because more than one suite in
+/// this target asserts against an experiment definition's write instants.
+pub(crate) fn instant(case: &str, label: &str, value: Option<&Value>) -> f64 {
     match value {
         Some(Value::String(written)) => DateTime::from_str(written, Format::DateTime)
             .unwrap_or_else(|error| {

@@ -89,6 +89,19 @@ pub const EXPERIMENT_DEFINITION_ACTIVE: &str = "ACTIVE";
 /// See [`EXPERIMENT_DEFINITION_IDLE`].
 pub const EXPERIMENT_DEFINITION_ARCHIVED: &str = "ARCHIVED";
 
+/// `DeleteType` values a `DeleteExperimentDefinition` request may ask for, from
+/// `DELETE_TYPE_VALUES` in `crate::ops::types` (the model's `DeleteType` enum:
+/// `ARCHIVE` | `DESTROY`).
+///
+/// Archiving preserves the definition's record and moves it to
+/// [`EXPERIMENT_DEFINITION_ARCHIVED`]; destroying removes the record outright. The
+/// member is optional and carries no modelled default, and the operation is documented
+/// as deleting the definition with archiving as the alternative a caller asks for, so a
+/// request naming no type is a [`DELETE_TYPE_DESTROY`].
+pub const DELETE_TYPE_ARCHIVE: &str = "ARCHIVE";
+/// See [`DELETE_TYPE_ARCHIVE`].
+pub const DELETE_TYPE_DESTROY: &str = "DESTROY";
+
 /// `GrowthType` values, from `GROWTH_TYPE_VALUES` in `crate::ops::types`.
 pub const GROWTH_LINEAR: &str = "LINEAR";
 /// See [`GROWTH_LINEAR`].
@@ -1847,6 +1860,30 @@ pub fn configuration_profile_not_found(
         &[
             ("Application Id", application_id),
             ("Configuration Profile Id", configuration_profile_id),
+        ],
+        AccountClause::Reported,
+        NOT_FOUND_FULL_STOP,
+    )
+}
+
+/// `Message` for an experiment definition the named application does not hold.
+///
+/// The experiment operations address both resources by an `Identifier` member — the
+/// resource's "ID or name" — so this refusal labels each value by the member it came
+/// from and echoes it as the caller wrote it, rather than as an `Id` like the refusals
+/// of the operations whose members are ids.
+pub fn experiment_definition_not_found(
+    application_identifier: &str,
+    experiment_definition_identifier: &str,
+) -> String {
+    not_found_message(
+        "Experiment Definition",
+        &[
+            ("Application Identifier", application_identifier),
+            (
+                "Experiment Definition Identifier",
+                experiment_definition_identifier,
+            ),
         ],
         AccountClause::Reported,
         NOT_FOUND_FULL_STOP,
