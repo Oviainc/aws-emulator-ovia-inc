@@ -212,6 +212,32 @@ pub fn realtime_log_config_identifier_required() -> InvalidArgument {
 pub const REALTIME_LOG_CONFIG_IDENTIFIER_REQUIRED_MESSAGE: &str =
     "The parameter Name/ARN must be provided.";
 
+/// The modelled `InvalidArgument` (HTTP 400) for a DISTRIBUTION LISTING that names neither
+/// identifier, so it addresses no real-time log configuration at all: "You can specify the
+/// real-time log configuration by its name or its Amazon Resource Name (ARN). You must
+/// provide at least one."
+///
+/// The CONDITION is the one [`realtime_log_config_identifier_required`] states, and the
+/// constraint stated is the same; what differs is the SENTENCE the service answers it with
+/// on this surface ([`REALTIME_LOG_CONFIG_LISTING_IDENTIFIER_REQUIRED_MESSAGE`]), so each
+/// operation's refusal reads as the service's own does rather than one being reworded to
+/// match the other.
+pub fn realtime_log_config_listing_identifier_required() -> InvalidArgument {
+    InvalidArgument {
+        message: Some(REALTIME_LOG_CONFIG_LISTING_IDENTIFIER_REQUIRED_MESSAGE.to_string()),
+    }
+}
+
+/// The message a distribution listing naming neither identifier is refused with, on the
+/// wire.
+///
+/// The value is the WIRE text — what the recorded service answers this code with on the
+/// distribution-listing surface, which is the shorter of the two forms the two surfaces
+/// word this one constraint in. It names the two parameters rather than the request, so
+/// every refusal of this condition reads the same.
+pub const REALTIME_LOG_CONFIG_LISTING_IDENTIFIER_REQUIRED_MESSAGE: &str =
+    "Name or ARN must be provided.";
+
 /// The ARN of a real-time log configuration. CloudFront is a GLOBAL service, so the ARN's
 /// region segment is empty: `arn:aws:cloudfront::<account>:realtime-log-config/<Name>`.
 /// The resource part is the configuration's name, which is the identifier a cache
