@@ -269,9 +269,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(load_balancer) = guard.load_balancers.get(&candidate.load_balancer_arn) else {
             return Err(CreateListenerErrorModeled::LoadBalancerNotFoundException(
                 LoadBalancerNotFoundException {
-                    message: Some(format!(
-                        "Load balancer '{}' not found",
-                        candidate.load_balancer_arn
+                    message: Some(crate::state::load_balancer_not_found_message(
+                        &candidate.load_balancer_arn,
                     )),
                 },
             )

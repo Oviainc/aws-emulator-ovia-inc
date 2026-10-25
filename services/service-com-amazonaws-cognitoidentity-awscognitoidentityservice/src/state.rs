@@ -115,6 +115,19 @@ const COGNITO_USER_POOL_PROVIDER_PREFIX: &str = "cognito-idp.";
 pub const UNSUPPORTED_LOGIN_PROVIDER_MESSAGE: &str =
     "Token is not from a supported provider of this identity pool.";
 
+/// The message a `NotAuthorizedException` carries for a request naming a developer-identity
+/// mapping the identity pool does not hold: a developer user identifier it has indexed
+/// against no identity, under a developer provider that is not the pool's own, or in a pool
+/// that names no developer provider at all.
+///
+/// Resolving a developer user identifier is an authorization question rather than the
+/// lookup of a resource the caller already names: the identifier is a LOGIN of the pool, so
+/// a request carrying one the pool holds no mapping for is answered as access the caller
+/// does not have. One fixed sentence, naming neither the identifier nor any identity, so
+/// nothing is disclosed about what the pool holds for it — and shared, so every operation
+/// that resolves one answers alike.
+pub const DEVELOPER_IDENTIFIER_FORBIDDEN_MESSAGE: &str = "You do not have access to this identity";
+
 /// The most tags one identity pool can carry, from the model's own doc for `TagResource`:
 /// "An identity pool can have as many as 50 tags"
 /// (`smithy_query(query="doc",shape="TagResource")`). An AWS-published ceiling on the
@@ -465,6 +478,23 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
             ),
             identity_id.to_string(),
         );
+    }
+
+    /// Forget the link between `(provider, login)` in this pool and whatever identity it
+    /// resolved to, and report that identity — the inverse of [`Self::link_login`], so a
+    /// later call presenting the same login resolves nothing and is seen as new. `None`
+    /// when this pool indexed no such login at all.
+    pub fn unlink_login(
+        &mut self,
+        identity_pool_id: &str,
+        provider: &str,
+        login: &str,
+    ) -> Option<String> {
+        self.login_index.remove(&(
+            identity_pool_id.to_string(),
+            provider.to_string(),
+            login.to_string(),
+        ))
     }
 
     /// Whether indexing `logins` for this pool would take it past

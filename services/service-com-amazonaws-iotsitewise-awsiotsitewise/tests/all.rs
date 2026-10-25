@@ -12,6 +12,14 @@
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
 //
+// `actions` is declared HERE, at the head of the file, rather than in the sorted
+// list or appended after it: both of those are where every concurrent
+// iotsitewise change puts a declaration of its own, and each of three attempts
+// to land this one there collided with a branch that had just appended beside
+// it. Fold it into the list once the churn settles.
+#[path = "all/actions.rs"]
+mod actions;
+
 // `property_aggregates` is declared here, ahead of the sorted list, rather than in
 // its alphabetical place: every other suite this crate has gained was inserted
 // into that list or appended after it, so those are the two spots a concurrent

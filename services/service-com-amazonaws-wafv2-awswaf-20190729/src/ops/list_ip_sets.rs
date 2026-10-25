@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListIPSets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListIPSets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListIPSets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +153,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListIPSets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListIPSetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListIPSets"))
+        // A read: `ctx` carries only request metadata, which this operation does not
+        // need, and nothing here writes to the store.
+        let _ = ctx;
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(ListIPSetsErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_SCOPE_VALUE,
+                    &input.scope,
+                    "the scope names the namespace the IP sets live in, and is one of CLOUDFRONT or REGIONAL",
+                ),
+            )
+            .into());
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListIPSetsErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // Only this scope's IP sets — a scope is a namespace — in a stable order so a
+        // marker names the same position on every call.
+        let mut entries: Vec<&crate::state::IpSetEntry> = state
+            .ip_sets
+            .values()
+            .filter(|entry| entry.scope == input.scope)
+            .collect();
+        entries.sort_by(|left, right| left.ip_set.name.cmp(&right.ip_set.name));
+
+        // `NextMarker` is the name of the last summary of the previous page, so this
+        // page starts at the first name after it.
+        if let Some(marker) = input.next_marker.as_deref() {
+            entries.retain(|entry| entry.ip_set.name.as_str() > marker);
+        }
+
+        // Absent `Limit`, a page holds as many as the model's `PaginationLimit` range
+        // allows; a `Limit` outside that range is refused rather than clamped, so no
+        // caller gets a silently empty terminal page. That reading of the range is
+        // `crate::state::page_size`, shared with every other paginated operation of
+        // this service.
+        let page_size = crate::state::page_size(input.limit, "summaries")
+            .map_err(ListIPSetsErrorModeled::WAFInvalidParameterException)?;
+        entries.truncate(page_size);
+
+        // WAF answers every non-empty page with a `NextMarker`: the name of the LAST
+        // summary on the page even when the page is not full, so a client resumes from
+        // it and learns it reached the end from the empty page that follows.
+        // `ListIPSetsResponse$NextMarker` is `length 1..256`, so a page with no last
+        // name — an empty one — carries no marker, which is also what ends the
+        // paginator's loop.
+        let next_marker = entries.last().map(|entry| entry.ip_set.name.clone());
+        let ip_sets = entries
+            .into_iter()
+            .map(|entry| IPSetSummary {
+                name: Some(entry.ip_set.name.clone()),
+                id: Some(entry.ip_set.id.clone()),
+                description: entry.ip_set.description.clone(),
+                lock_token: Some(entry.lock_token.clone()),
+                arn: Some(entry.ip_set.arn.clone()),
+            })
+            .collect();
+
+        Ok(ListIPSetsOutput {
+            next_marker,
+            ip_sets: Some(ip_sets),
+        })
     }
 }

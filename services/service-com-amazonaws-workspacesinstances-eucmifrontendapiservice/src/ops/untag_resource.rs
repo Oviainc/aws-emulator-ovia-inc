@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +135,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // A regional resource is mutable only through the Region it was created in,
+        // which travels in the request's credential scope.
+        let region = crate::state::request_region(ctx.parts());
+        // A key in the reserved `aws:` namespace names a tag AWS generates, not one a
+        // caller may set OR take away, so the request is refused BEFORE the store is
+        // reached: the resource's tag set is left exactly as it was, including under
+        // the ordinary keys the same request named.
+        crate::state::reject_reserved_tag_keys("TagKeys", input.tag_keys.iter().map(String::as_str))
+            .map_err(UntagResourceErrorModeled::ValidationException)?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the WorkSpaces Instances store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // The same clock-due settle, and the same Region scope, every other
+        // single-instance operation looks a record up through: an instance of another
+        // Region, or one whose teardown retention has elapsed, is not here to untag.
+        let Some(record) = state.settled_mut(
+            &region,
+            &input.workspace_instance_id,
+            std::time::Instant::now(),
+        ) else {
+            return Err(crate::state::instance_not_found_error(
+                &input.workspace_instance_id,
+                UntagResourceErrorModeled::ResourceNotFoundException,
+            ));
+        };
+
+        // Untagging is REMOVAL BY KEY from what is stored, so it is idempotent: a key
+        // the resource does not carry is nothing to remove and leaves the rest of the
+        // request's keys to go, and the value a key was stored with plays no part in
+        // whether it goes. Every other tag the record holds stays put.
+        for key in &input.tag_keys {
+            record.tags.remove(key);
+        }
+
+        Ok(UntagResourceOutput {})
     }
 }

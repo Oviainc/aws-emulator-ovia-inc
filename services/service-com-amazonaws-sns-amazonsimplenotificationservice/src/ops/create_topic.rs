@@ -249,19 +249,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if let Some(policy) = input.data_protection_policy.as_deref() {
-            if policy.len() > state::MAX_DATA_PROTECTION_POLICY_LEN {
-                return Err(CreateTopicErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(format!(
-                            "Invalid parameter: DataProtectionPolicy - at most {} characters: {}",
-                            state::MAX_DATA_PROTECTION_POLICY_LEN,
-                            policy.len()
-                        )),
-                    },
-                )
-                .into());
-            }
+        // The document's one documented bound, held through the shared rule every
+        // write of a topic's data protection policy uses, so this create and
+        // `PutDataProtectionPolicy` cannot disagree about which documents fit.
+        if let Some(message) = input
+            .data_protection_policy
+            .as_deref()
+            .and_then(state::data_protection_policy_refusal)
+        {
+            return Err(CreateTopicErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
         }
         let fifo_requested = attributes
             .get(FIFO_TOPIC_ATTRIBUTE)

@@ -38,6 +38,7 @@ use service_com_amazonaws_taxsettings_taxsettings::state::{
     STATUS_PENDING, SUPPLEMENTAL_TAX_REGISTRATIONS_PAGE_BOUNDS, SUPPLEMENTAL_TRN_COUNTRIES,
 };
 
+use crate::declared_member_defaults::address_as_stored;
 use crate::tax_registration_lifecycle::{call, emulator, emulator_with_engine, Answer};
 
 /// Hold every stored supplemental TRN's validation open, so a listing reports
@@ -365,10 +366,18 @@ async fn a_stored_supplemental_trn_reads_back_through_the_listing() {
             });
         let submitted = case.entry.as_object().expect("the entry is an object");
         for (member, value) in submitted {
+            // `address` is reported with the defaults the model declares for
+            // `addressLine1` and `city` materialised; every other member is
+            // reported verbatim.
+            let expected = if member == "address" {
+                address_as_stored(value)
+            } else {
+                value.clone()
+            };
             assert_eq!(
                 reported.get(member),
-                Some(value),
-                "case {:?}: the listing must report {member:?} as submitted, got {:?}",
+                Some(&expected),
+                "case {:?}: the listing must report {member:?} as {expected:?}, got {:?}",
                 case.name,
                 reported.get(member)
             );
@@ -488,10 +497,16 @@ async fn rewriting_a_supplemental_trn_updates_it_under_the_same_authority_id() {
             .find(|item| item.get("authorityId").and_then(Value::as_str) == Some(&second_id))
             .unwrap_or_else(|| panic!("case {case:?}: no record under {second_id:?}: {listed:?}"));
         for (member, value) in second.as_object().expect("the entry is an object") {
+            let expected = if member == "address" {
+                address_as_stored(value)
+            } else {
+                value.clone()
+            };
             assert_eq!(
                 reported.get(member),
-                Some(value),
-                "case {case:?}: the listing must report the last write's {member:?}, got {:?}",
+                Some(&expected),
+                "case {case:?}: the listing must report the last write's {member:?} as \
+                 {expected:?}, got {:?}",
                 reported.get(member)
             );
         }

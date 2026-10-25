@@ -236,6 +236,11 @@ mod agent_profile_updates;
 #[path = "all/agent_recommendations.rs"]
 mod agent_recommendations;
 
+// Declared last rather than among the `profile_*` suites, for the reason the notes above
+// give: an insertion into a crowded run of this list is what repeatedly refused to merge.
+#[path = "all/profile_share_deletion.rs"]
+mod profile_share_deletion;
+
 // Declared last for the same reason as the declarations above.
 #[path = "all/agent_recommendation_paging.rs"]
 mod agent_recommendation_paging;

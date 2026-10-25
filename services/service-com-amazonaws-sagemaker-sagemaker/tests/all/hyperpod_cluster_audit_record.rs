@@ -222,7 +222,11 @@ const REGION: &str = "us-east-1";
 /// `CreateCluster` can only ever owe the transition 300 ms, which makes "not due yet" a
 /// race on a loaded host; a seeded due instant makes it a fact, so the negative assertion
 /// below always runs.
-fn seed_not_due(emulator: &Emulator, name: &str) -> String {
+///
+/// `pub(crate)` because `hyperpod_cluster_deletion` needs the same fact — a cluster the
+/// clock cannot have moved out of `Creating` — to assert what `DeleteCluster` answers for
+/// one, rather than seeding a second copy of this record.
+pub(crate) fn seed_not_due(emulator: &Emulator, name: &str) -> String {
     let id = state::mint_cluster_id();
     let arn = state::resource_arn(REGION, "cluster", &id);
     let now = SystemTime::now();
@@ -250,6 +254,8 @@ fn seed_not_due(emulator: &Emulator, name: &str) -> String {
             tags: Vec::new(),
             creation_time: now,
             in_service_at: now + FAR_FROM_DUE,
+            // No delete has been asked for, so the clock owes this cluster no release.
+            removal_due_at: None,
             // A cluster holds the nodes `BatchAddClusterNodes` added to it; a seeded one
             // has none, the same as one `CreateCluster` just made.
             nodes: std::collections::BTreeMap::new(),

@@ -215,6 +215,17 @@ pub fn unknown_instance_group_message(instance_group_id: &str) -> String {
     format!("Instance group id {}", not_valid_message(instance_group_id))
 }
 
+/// How `RemoveAutoScalingPolicy` refuses an instance group that carries no automatic
+/// scaling policy for it to remove.
+///
+/// "Removes an automatic scaling policy from a specified instance group"
+/// (`RemoveAutoScalingPolicy` doc, Smithy model): there is no policy to remove from a
+/// group carrying none, and Amazon EMR refuses that call — HTTP 400, with the group the
+/// caller named quoted in the message — rather than answering an empty success.
+pub fn no_auto_scaling_policy_message(instance_group_id: &str) -> String {
+    format!("Auto Scaling policy was not found for instance group '{instance_group_id}'.")
+}
+
 /// Refuse an `AutoScalingPolicy` this emulator cannot hold as submitted.
 ///
 /// `MinCapacity` is "the lower boundary of Amazon EC2 units" and `MaxCapacity` "the
@@ -2012,6 +2023,23 @@ impl InstanceGroupRecord {
     pub fn attach_auto_scaling_policy(&mut self, policy: AutoScalingPolicy, now: SystemTime) {
         self.config.auto_scaling_policy = Some(policy);
         self.policy_attaching_due_at = Some(now + TRANSITION_SPAN);
+    }
+
+    /// Take the automatic scaling policy off this group, reporting whether it carried
+    /// one.
+    ///
+    /// "Removes an automatic scaling policy from a specified instance group"
+    /// (`RemoveAutoScalingPolicy` doc, Smithy model): the group carries no policy from
+    /// here on, so the attach the clock may still have owed it goes with it. `false` says
+    /// the group carried no policy, which is what leaves the caller nothing to remove —
+    /// and in that case the record is left exactly as it was, so a refused call writes
+    /// nothing at all.
+    pub fn remove_auto_scaling_policy(&mut self) -> bool {
+        if self.config.auto_scaling_policy.take().is_none() {
+            return false;
+        }
+        self.policy_attaching_due_at = None;
+        true
     }
 
     /// Materialise the transitions the clock already made due, and nothing else: a group

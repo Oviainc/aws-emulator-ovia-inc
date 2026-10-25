@@ -100,6 +100,12 @@ const COMPOSITION_QUOTA_RESOURCE: &str = "composition";
 /// "exactly one of these", so it is refused here, in the construction
 /// `crate::state::mutually_exclusive_members_message` words every such refusal of this
 /// service with.
+///
+/// The same set bounds the LIST: `Composition$destinations` documents that a composition
+/// "can contain either one destination (`channel` or `s3`) or two (one `channel` and one
+/// `s3`)", so at most one element may name each of these members. `@uniqueItems` does not
+/// say that — it only rejects two IDENTICAL elements — so two distinct configurations of
+/// one kind are refused here too.
 const DESTINATION_TARGET_MEMBERS: [&str; 2] = ["channel", "s3"];
 
 /// The two members of `LayoutConfiguration`, exactly one of which configures the one
@@ -210,25 +216,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Each destination publishes to exactly one place. The path names the list
-        // position the way this service's other list refusals do.
+        // Each destination publishes to exactly one place, and the composition publishes
+        // to at most one place of each kind. The path names the list position the way
+        // this service's other list refusals do.
+        let mut per_kind = [0usize; DESTINATION_TARGET_MEMBERS.len()];
         for (index, destination) in input.destinations.iter().enumerate() {
+            let named = [destination.channel.is_some(), destination.s3.is_some()];
             let supplied: Vec<&str> = DESTINATION_TARGET_MEMBERS
                 .iter()
-                .zip([destination.channel.is_some(), destination.s3.is_some()])
+                .zip(named)
                 .filter_map(|(member, given)| given.then_some(*member))
                 .collect();
-            if supplied.len() == 1 {
-                continue;
+            if supplied.len() != 1 {
+                return Err(crate::state::validation_failed(
+                    StartCompositionErrorModeled::ValidationException,
+                    crate::state::exactly_one_member_message(
+                        &format!("{}.destinations.{}.member", Self::NAME, index + 1),
+                        &supplied,
+                        &DESTINATION_TARGET_MEMBERS,
+                    ),
+                ));
             }
-            return Err(crate::state::validation_failed(
-                StartCompositionErrorModeled::ValidationException,
-                crate::state::exactly_one_member_message(
-                    &format!("{}.destinations.{}.member", Self::NAME, index + 1),
-                    &supplied,
-                    &DESTINATION_TARGET_MEMBERS,
-                ),
-            ));
+            for (count, given) in per_kind.iter_mut().zip(named) {
+                if given {
+                    *count += 1;
+                }
+            }
+        }
+
+        // The list admits at most ONE element per kind of place, which `@uniqueItems`
+        // cannot say: it only rejects two IDENTICAL elements, so two distinct
+        // configurations of the same kind reach here (see
+        // [`DESTINATION_TARGET_MEMBERS`]). Refused before anything is minted or
+        // persisted, so a refused request starts no composition carrying a shape the
+        // model documents as impossible.
+        for (member, count) in DESTINATION_TARGET_MEMBERS.iter().zip(per_kind) {
+            if count > 1 {
+                return Err(crate::state::validation_failed(
+                    StartCompositionErrorModeled::ValidationException,
+                    crate::state::at_most_one_element_per_choice_message(
+                        Self::NAME,
+                        "destinations",
+                        member,
+                        count,
+                    ),
+                ));
+            }
         }
 
         // A tag key in the reserved `aws:` namespace is AWS's own to write (see

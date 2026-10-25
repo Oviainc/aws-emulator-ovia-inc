@@ -158,7 +158,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !guard.load_balancers.contains_key(load_balancer_arn) {
                 return Err(DescribeTargetGroupsErrorModeled::LoadBalancerNotFoundException(
                     LoadBalancerNotFoundException {
-                        message: Some(format!("Load balancer '{load_balancer_arn}' not found")),
+                        message: Some(crate::state::load_balancer_not_found_message(
+                            load_balancer_arn,
+                        )),
                     },
                 )
                 .into());

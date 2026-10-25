@@ -21,6 +21,12 @@
 //!    emulator's account is `AccessDenied` (403).
 //! 4. Each bucket carries its own configuration: setting one bucket's leaves every other
 //!    bucket's alone, including a bucket still on the default.
+//! 5. The read answers the container the model names for its output — root element
+//!    `RequestPaymentConfiguration` with `Payer` inside it — for a defaulted bucket as
+//!    much as for a configured one.
+//! 6. The configuration is a subresource OF the bucket and lives exactly as long as the
+//!    bucket record: while the name holds no bucket the read is `NoSuchBucket`, and a
+//!    bucket re-created under that name is back on the default.
 
 use std::sync::Arc;
 
@@ -355,6 +361,133 @@ async fn the_request_payment_subresource_refuses_an_absent_bucket_and_a_foreign_
             "case {operation:?} with the emulator's own account as expected owner: expected \
              HTTP 200, got {} with body {}",
             owned.status, owned.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_read_answers_the_modelled_request_payment_container() {
+    let router = router();
+    let bucket = "harvest-archive";
+    create_bucket(&router, bucket).await;
+
+    // The document S3 answers a request payment read with: the output structure carries
+    // `xmlName: RequestPaymentConfiguration`
+    // (`smithy_query(query="shape",shape="GetBucketRequestPaymentOutput")`), so the root
+    // element is that container and `Payer` is its child — for a bucket still on the
+    // default as much as for one every published `Payer` was put on.
+    let mut cases: Vec<(&str, &str)> = vec![("never configured", DEFAULT_PAYER)];
+    for payer in PAYER_VALUES {
+        cases.push(("put", payer));
+    }
+
+    for (label, expected) in cases {
+        if label == "put" {
+            let put = send(
+                &router,
+                "PUT",
+                &format!("/{bucket}?requestPayment"),
+                &configuration(expected),
+                &[],
+            )
+            .await;
+            assert_eq!(
+                put.status, 200,
+                "case {label:?}/{expected:?}: the put must be accepted, got {} with body {}",
+                put.status, put.body
+            );
+        }
+
+        let read = send(&router, "GET", &format!("/{bucket}?requestPayment"), "", &[]).await;
+        assert_eq!(
+            read.status, 200,
+            "case {label:?}/{expected:?}: expected HTTP 200, got {} with body {}",
+            read.status, read.body
+        );
+        assert!(
+            read.body.contains("<RequestPaymentConfiguration"),
+            "case {label:?}/{expected:?}: expected the RequestPaymentConfiguration container, \
+             got body {}",
+            read.body
+        );
+        assert!(
+            read.body.contains(&format!("<Payer>{expected}</Payer>")),
+            "case {label:?}/{expected:?}: expected Payer {expected:?} inside the container, got \
+             body {}",
+            read.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_bucket_recreated_after_a_delete_is_back_on_the_default_payer() {
+    let router = router();
+    // The configuration is a subresource OF the bucket, so it lives exactly as long as the
+    // bucket record does: a name re-created after its bucket was deleted carries no
+    // configuration at all and so reports the default again. One row per published
+    // `Payer`, so the rule is not pinned to the non-default value alone.
+    for payer in PAYER_VALUES {
+        let bucket = "archive-recreated";
+        create_bucket(&router, bucket).await;
+
+        let put = send(
+            &router,
+            "PUT",
+            &format!("/{bucket}?requestPayment"),
+            &configuration(payer),
+            &[],
+        )
+        .await;
+        assert_eq!(
+            put.status, 200,
+            "case {payer:?}: the put must be accepted, got {} with body {}",
+            put.status, put.body
+        );
+        let recorded = send(&router, "GET", &format!("/{bucket}?requestPayment"), "", &[]).await;
+        assert_eq!(
+            recorded.element("Payer").as_deref(),
+            Some(*payer),
+            "case {payer:?}: expected the put to be readable first, got body {}",
+            recorded.body
+        );
+
+        let deleted = send(&router, "DELETE", &format!("/{bucket}"), "", &[]).await;
+        assert_eq!(
+            deleted.status, 204,
+            "case {payer:?}: the empty bucket must be deletable, got {} with body {}",
+            deleted.status, deleted.body
+        );
+
+        // While the name holds no bucket, the subresource is `NoSuchBucket` rather than a
+        // configuration left behind.
+        let gone = send(&router, "GET", &format!("/{bucket}?requestPayment"), "", &[]).await;
+        assert_eq!(
+            gone.error_code(),
+            "NoSuchBucket",
+            "case {payer:?}: expected NoSuchBucket after the delete, got {} with body {}",
+            gone.status, gone.body
+        );
+
+        create_bucket(&router, bucket).await;
+        let fresh = send(&router, "GET", &format!("/{bucket}?requestPayment"), "", &[]).await;
+        assert_eq!(
+            fresh.status, 200,
+            "case {payer:?}: expected HTTP 200 on the re-created bucket, got {} with body {}",
+            fresh.status, fresh.body
+        );
+        assert_eq!(
+            fresh.element("Payer").as_deref(),
+            Some(DEFAULT_PAYER),
+            "case {payer:?}: expected the re-created bucket to report {DEFAULT_PAYER:?}, got \
+             body {}",
+            fresh.body
+        );
+
+        let cleanup = send(&router, "DELETE", &format!("/{bucket}"), "", &[]).await;
+        assert_eq!(
+            cleanup.status, 204,
+            "case {payer:?}: the bucket must be deletable again, got {} with body {}",
+            cleanup.status, cleanup.body
         );
     }
 }

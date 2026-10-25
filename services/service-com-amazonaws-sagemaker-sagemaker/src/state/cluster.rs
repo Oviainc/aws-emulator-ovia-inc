@@ -23,6 +23,7 @@
 //! owed.
 
 use crate::state::{Cluster, ComAmazonawsSagemakerSagemakerState, STATUS_IN_SERVICE};
+use std::time::SystemTime;
 use crate::ops::types::{
     ClusterAutoPatchConfigDetails, ClusterAutoScalingConfigOutput, ClusterInstanceGroupDetails,
     ClusterInstanceRequirementDetails, ClusterKubernetesConfigDetails,
@@ -53,13 +54,20 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// `crate::state::name_from_arn_or_name`, because a cluster ARN's last segment is
     /// the minted id and not the store key — so an ARN naming another region, account or
     /// partition does not resolve here.
+    ///
+    /// A cluster whose deletion the clock already completed resolves to nothing, as it
+    /// does from every other cluster lookup: past that instant the cluster is gone
+    /// whether or not the record has been released yet ([`Cluster::is_released`]).
     pub fn cluster_key(&self, name_or_arn: &str) -> Option<String> {
-        if self.clusters.contains_key(name_or_arn) {
-            return Some(name_or_arn.to_string());
-        }
+        let now = SystemTime::now();
         self.clusters
-            .values()
-            .find(|cluster| cluster.arn == name_or_arn)
+            .get(name_or_arn)
+            .or_else(|| {
+                self.clusters
+                    .values()
+                    .find(|cluster| cluster.arn == name_or_arn)
+            })
+            .filter(|cluster| !cluster.is_released(now))
             .map(|cluster| cluster.name.clone())
     }
 }

@@ -7,7 +7,9 @@
 //! `Budget.LastUpdatedTime` with the time of the call. The name is unique within an
 //! account, so a second create for the same pair is a `DuplicateRecordException`, and a
 //! set of notifications or subscribers above the limits a budget can hold is a
-//! `CreationLimitExceededException`.
+//! `CreationLimitExceededException`. A `ResourceTags` list naming one key twice is an
+//! `InvalidParameterException`, since "each key must be unique for the resource"
+//! ([`crate::state::duplicate_tag_key_violation`]).
 //!
 //! ## Shape of an operation
 //!
@@ -248,6 +250,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
+        // "Each tag consists of a key and a value, and each key must be unique for the
+        // resource" (`ResourceTags`) — the tag set this create ESTABLISHES on the budget
+        // is held to the same rule a later `TagResource` is, so a list naming one key
+        // twice states no value for it and is refused
+        // ([`crate::state::duplicate_tag_key_violation`]). Checked before anything is
+        // stored, so nothing is persisted by a refused create.
+        let supplied_tags = input.resource_tags.as_deref().unwrap_or_default();
+        if let Some(message) = crate::state::duplicate_tag_key_violation(supplied_tags) {
+            return Err(CreateBudgetErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let key = (input.account_id.clone(), input.budget.budget_name.clone());
         let now = ::std::time::SystemTime::now();
         // Every write this call makes is made under the store's lock, and the lock is
@@ -348,8 +366,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             alerts
         };
 
+        // Published over the framework's IN-PROCESS callback into this same emulator
+        // ([`crate::state::alerts::deliver`]). A subscriber's address is an SNS topic ARN
+        // the publish is ROUTED to inside this process, never a host this code dials or a
+        // resolver looks up, so the only destination a caller-supplied address can reach
+        // is a topic this emulator itself holds — SNS answers that the topic does not
+        // exist for any other — and nothing here opens a socket or leaves the machine.
         crate::state::alerts::deliver(ctx, &alerts).await;
-
 
         Ok(CreateBudgetOutput {})
     }

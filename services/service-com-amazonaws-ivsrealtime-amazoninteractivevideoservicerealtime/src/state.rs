@@ -3781,6 +3781,29 @@ pub fn exactly_one_member_message(
     )
 }
 
+/// How this service states a LIST whose documented shape admits at most one element
+/// naming each of a set of alternatives, but whose request named one alternative more
+/// than once: it names the list member, the alternative that repeated and how many
+/// elements named it, in the construction every other member refusal of this service
+/// uses (`<Operation>.<member> …`).
+///
+/// The element-level companion of [`exactly_one_member_message`]: that one refuses an
+/// element that names the wrong NUMBER of alternatives, this one refuses a list that
+/// names one alternative too MANY times. `choice` is the repeated alternative, named as
+/// the model names the member that selects it, and `found` the number of elements that
+/// selected it.
+pub fn at_most_one_element_per_choice_message(
+    operation: &str,
+    member: &str,
+    choice: &str,
+    found: usize,
+) -> String {
+    format!(
+        "{operation}.{member} is required to have at most one element naming {choice}, \
+         found {found}"
+    )
+}
+
 /// What one start request asked for, as one comparable value.
 ///
 /// `@idempotencyToken` makes a retry of ONE request answer with what the first call

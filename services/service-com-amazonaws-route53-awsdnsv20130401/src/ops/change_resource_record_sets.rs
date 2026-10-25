@@ -354,6 +354,20 @@ fn cname_conflict(
 /// replaces a simple record set with a group, or a group with a simple record
 /// set, is accepted whatever order its changes are written in, while one that
 /// would leave the two mixed is not.
+///
+/// The refusal is stated from the record set the CHANGE WROTE, because the two
+/// directions of the mix are two different things to put right, and each is
+/// reported in its own wording — as the `CNAME` rule above is. A record set
+/// with a routing policy written where one name and type are already answered
+/// simply conflicts with what is there, so the refusal names its type and the
+/// zone it was refused in. A SIMPLE record set written where a routing group
+/// already answers cannot come into being at all: the group's members are what
+/// is already at that name and type, and a simple record set has no identifier
+/// to join them with, so the refusal states that other record sets exist at the
+/// name and type instead — and because it is about the name and type and not
+/// about one sibling, it names neither a `SetIdentifier` nor the zone, which is
+/// what tells it from the duplicate refusal of a change that names a record set
+/// already there.
 fn routing_conflict(
     stored: &BTreeMap<RecordKey, ResourceRecordSet>,
     staged: &BTreeMap<RecordKey, Option<ResourceRecordSet>>,
@@ -370,13 +384,21 @@ fn routing_conflict(
             grouped = true;
         }
     }
-    (simple && grouped).then(|| {
-        format!(
-            "RRSet of type {} with DNS name {} is not permitted as it conflicts with other \
-             records with the same DNS name and type in zone {zone_name}",
-            record.r#type, record.name
-        )
-    })
+    if !(simple && grouped) {
+        return None;
+    }
+    if set_identifier_of(record).is_none() {
+        return Some(format!(
+            "RRSet with DNS name {}, type {} cannot be created as other RRSets exist with the \
+             same name and type.",
+            record.name, record.r#type
+        ));
+    }
+    Some(format!(
+        "RRSet of type {} with DNS name {} is not permitted as it conflicts with other records \
+         with the same DNS name and type in zone {zone_name}",
+        record.r#type, record.name
+    ))
 }
 
 /// The member that gives a record set a routing policy other than simple, if it
