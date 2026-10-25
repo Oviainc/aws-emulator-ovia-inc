@@ -212,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         let arn = entry.ip_set.arn.clone();
-        if let Some(referrer) = state.web_acl_referencing_ip_set(&arn) {
+        if let Some(referrer) = state.web_acl_referencing(&arn) {
             let referrer_name = referrer.web_acl.name.clone();
             crate::state::audit(
                 "DeleteIPSet",

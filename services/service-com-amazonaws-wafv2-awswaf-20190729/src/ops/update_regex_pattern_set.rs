@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRegexPatternSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRegexPatternSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRegexPatternSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -202,18 +193,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRegexPatternSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRegexPatternSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRegexPatternSet"))
+        // `ctx` carries only request metadata, which this operation does not need: an
+        // update never re-mints the ARN, so it needs no region.
+        let _ = ctx;
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(UpdateRegexPatternSetErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_SCOPE_VALUE,
+                    &input.scope,
+                    "the scope names the namespace the regex pattern set lives in, and is one of CLOUDFRONT or REGIONAL",
+                ),
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateRegexPatternSetErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // One lock spans the whole read-check-write below, so updates that race with
+        // the SAME token are serialized: the first rotates the token, and the next
+        // then finds the token it carries stale.
+        let mut state = state.lock();
+
+        let Some(entry) = state.regex_pattern_set_mut(&input.scope, &input.name, &input.id) else {
+            crate::state::audit(
+                "UpdateRegexPatternSet",
+                &input.scope,
+                &input.name,
+                &input.id,
+                "WAFNonexistentItemException",
+            );
+            return Err(UpdateRegexPatternSetErrorModeled::WAFNonexistentItemException(
+                crate::state::nonexistent_item_exception(),
+            )
+            .into());
+        };
+        // Checked BEFORE anything is written, so a stale token leaves the stored
+        // pattern set exactly as it was.
+        if entry.lock_token != input.lock_token {
+            crate::state::audit(
+                "UpdateRegexPatternSet",
+                &input.scope,
+                &input.name,
+                &input.id,
+                "WAFOptimisticLockException",
+            );
+            return Err(UpdateRegexPatternSetErrorModeled::WAFOptimisticLockException(
+                crate::state::optimistic_lock_exception(),
+            )
+            .into());
+        }
+
+        // "This operation completely replaces the mutable specifications that you
+        // already have for the regex pattern set with the ones that you provide to
+        // this call": `RegularExpressionList` becomes exactly the submitted list, in
+        // the submitted order and byte for byte, and `Description` — which the request
+        // may omit — is CLEARED rather than kept, because an update is a
+        // whole-resource overwrite and not a merge. `Name`, `Id` and `ARN` are
+        // immutable ("you cannot change the name after you create the set").
+        entry.regex_pattern_set.regular_expression_list = Some(input.regular_expression_list);
+        entry.regex_pattern_set.description = crate::state::stored_description(input.description);
+
+        // The token rotates on every successful mutation, so the one the caller just
+        // used stops working.
+        let next_lock_token = crate::state::new_uuid();
+        entry.lock_token = next_lock_token.clone();
+        crate::state::audit(
+            "UpdateRegexPatternSet",
+            &input.scope,
+            &input.name,
+            &input.id,
+            "updated",
+        );
+
+        Ok(UpdateRegexPatternSetOutput {
+            next_lock_token: Some(next_lock_token),
+        })
     }
 }
