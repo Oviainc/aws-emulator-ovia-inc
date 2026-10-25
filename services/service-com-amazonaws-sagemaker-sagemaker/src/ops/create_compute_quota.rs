@@ -171,10 +171,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ClusterArn` is a request parameter and this operation models no not-found
         // error, so the refusal is a 400 `ValidationException`.
         if store.cluster_by_arn(&input.cluster_arn).is_none() {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Specified cluster not found: {}.",
-                input.cluster_arn
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::CLUSTER_NOT_FOUND,
+            ));
         }
         // A name already in use is a conflict, never an overwrite: this operation models
         // `ConflictException` for exactly that. The scope is the CLUSTER the `ClusterArn`

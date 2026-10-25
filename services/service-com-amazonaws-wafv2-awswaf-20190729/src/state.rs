@@ -22,8 +22,9 @@ use ::aws_smithy_schema_server::constraints::{
 };
 
 use crate::ops::types::{
-    IPSet, LabelSummary, ManagedProductDescriptor, OnSourceDDoSProtectionConfig, RegexPatternSet,
-    Rule, RuleGroup, Statement, Tag, WAFAssociatedItemException, WAFDuplicateItemException,
+    BlockAction, ChallengeAction, CountAction, IPSet, LabelSummary, ManagedProductDescriptor,
+    OnSourceDDoSProtectionConfig, RegexPatternSet, Rule, RuleAction, RuleGroup, RuleSummary,
+    Statement, Tag, WAFAssociatedItemException, WAFDuplicateItemException,
     WAFFeatureNotIncludedInPricingPlanException, WAFInvalidParameterException,
     WAFLimitsExceededException, WAFNonexistentItemException, WAFOptimisticLockException, WebACL,
 };
@@ -948,6 +949,16 @@ pub struct ManagedRuleGroupDescriptor {
     /// catalogued group offers at least its initial version (see
     /// [`MANAGED_RULE_GROUP_CATALOGUE`]).
     pub versions: &'static [ManagedRuleGroupRelease],
+    /// The rules this group runs, in the order its vendor lists them.
+    ///
+    /// `DescribeManagedRuleGroup` "provides high-level information for a managed
+    /// rule group, including descriptions of the rules" (the operation's own doc),
+    /// and `RuleSummary` is "high-level information about a Rule, returned by
+    /// operations like DescribeManagedRuleGroup" — a name and the action the rule
+    /// takes. Like [`Self::versions`] those are the VENDOR's, not anything this
+    /// account holds: nothing creates, changes or removes a rule of a published
+    /// group, so they sit in the catalogue beside the capacity.
+    pub rules: &'static [PublishedManagedRule],
 }
 
 impl ManagedRuleGroupDescriptor {
@@ -991,13 +1002,159 @@ impl ManagedRuleGroupDescriptor {
             product_link: None,
             product_title: Some(self.product_title.to_string()),
             product_description: Some(self.product_description.to_string()),
-            sns_topic_arn: Some(::engine::emulator_arn(
-                "sns",
-                arn_region(scope, request_region),
-                self.name,
-            )),
+            sns_topic_arn: Some(self.sns_topic_arn(scope, request_region)),
             is_versioning_supported: self.is_versioning_supported,
             is_advanced_managed_rule_set: self.is_advanced_managed_rule_set,
+        }
+    }
+
+    /// The ARN of the notification topic for this group: the topic "used to provide
+    /// notification of changes to the managed rule group"
+    /// (`ManagedProductDescriptor$SnsTopicArn`, and
+    /// `DescribeManagedRuleGroupResponse$SnsTopicArn` documents the same thing), so
+    /// one topic per group and the SAME ARN whichever call reports it.
+    ///
+    /// Minted through the emulator's own ARN builder, in the region the group's
+    /// `scope` is reached through, like every other ARN this service answers.
+    pub fn sns_topic_arn(&self, scope: &str, request_region: &str) -> String {
+        ::engine::emulator_arn("sns", arn_region(scope, request_region), self.name)
+    }
+
+    /// The version of this group `requested` names, or the vendor's default when a
+    /// request names none — and `None` when the vendor offers no such version.
+    ///
+    /// `DescribeManagedRuleGroup$VersionName` is "the version of the rule group…
+    /// If you don't provide this, WAF uses the vendor's default version", so a
+    /// request naming nothing describes [`Self::current_default_version`], and the
+    /// versions a request may name are exactly the ones
+    /// `ListAvailableManagedRuleGroupVersions` lists for the group.
+    pub fn offered_version(&self, requested: Option<&str>) -> Option<&'static str> {
+        match requested {
+            None => self.current_default_version(),
+            Some(requested) => self
+                .versions
+                .iter()
+                .find(|release| release.name == requested)
+                .map(|release| release.name),
+        }
+    }
+
+    /// This group's rules as a describe reports them: a name and the action the
+    /// vendor's rule takes (see [`Self::rules`]).
+    pub fn rule_summaries(&self) -> Vec<RuleSummary> {
+        self.rules
+            .iter()
+            .map(|rule| RuleSummary {
+                name: Some(rule.name.to_string()),
+                action: Some(rule.action.rule_action()),
+            })
+            .collect()
+    }
+
+    /// The labels this group's rules ADD to matching requests, deduplicated and in
+    /// a stable order — the managed-group counterpart of
+    /// [`rule_group_available_labels`], sharing its [`label_summaries`]
+    /// projection, and the same reading of `AvailableLabels`: each entry is the
+    /// label as the rule specifies it ([`PublishedManagedRule::label`]), with the
+    /// prefix every one of them acquires at match time reported separately as
+    /// [`Self::managed_label_namespace`].
+    ///
+    /// Only the labels this catalogue CITES for a rule are reported: a vendor
+    /// publishes its label texts separately from its rule list, so a group whose
+    /// labels this catalogue cannot cite reports none rather than a text nobody
+    /// published (see [`PublishedManagedRule::published_label`]).
+    pub fn available_labels(&self) -> Vec<LabelSummary> {
+        label_summaries(self.rules.iter().filter_map(|rule| rule.label()))
+    }
+
+    /// `awswaf:managed:<vendor>:<rule group name>:` — the prefix every label added
+    /// by a rule in this group carries.
+    ///
+    /// `DescribeManagedRuleGroupResponse$LabelNamespace` states the syntax:
+    /// "The syntax for the label namespace prefix for a managed rule group is the
+    /// following: `awswaf:managed:<vendor>:<rule group name>`:". A customer-owned
+    /// entity's namespace is built the same way from its own identity, by
+    /// [`label_namespace`]; a managed group is identified by its vendor and name
+    /// rather than by this account, which is the only difference.
+    pub fn managed_label_namespace(&self) -> String {
+        format!("awswaf:managed:{}:{}:", self.vendor_name, self.name)
+    }
+}
+
+/// One rule of a published managed rule group: its name and the action its vendor
+/// has it take.
+///
+/// Flat and `Copy` like [`ManagedRuleGroupRelease`], because it is published data
+/// rather than stored state: a caller cannot add, change or remove one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishedManagedRule {
+    /// The rule's name (`RuleSummary$Name`, an `EntityName`: `length 1..128`,
+    /// pattern `^[\w\-]+$`), as the WAF Developer Guide's rule list for the group
+    /// publishes it.
+    pub name: &'static str,
+    /// The action the vendor's rule takes on a request it matches
+    /// (`RuleSummary$Action`), as the same list publishes it.
+    pub action: PublishedRuleAction,
+    /// The label this rule adds to a request it matches, where this catalogue
+    /// cites the published text; `None` where it cannot.
+    ///
+    /// A vendor publishes its label texts separately from its rule list, and a
+    /// label may read nothing like the rule that adds it, so a label is cited
+    /// here only where the published text is known — never derived from the
+    /// rule's name, which would report a text nobody published.
+    pub published_label: Option<&'static str>,
+}
+
+impl PublishedManagedRule {
+    /// The label this rule adds to a request it matches, as the rule specifies
+    /// it, or `None` where this catalogue cites none for it.
+    ///
+    /// `LabelSummary` reports "the label as the rule specified it", and a fully
+    /// qualified label "is made up of the label namespace from the rule group …
+    /// and the label from the rule, separated by a colon"
+    /// (`DescribeManagedRuleGroupResponse$LabelNamespace`) — so a cited label
+    /// under [`ManagedRuleGroupDescriptor::managed_label_namespace`] is what a
+    /// matching request carries. Stable per rule and per call: it is
+    /// [`Self::published_label`] and nothing else.
+    pub fn label(&self) -> Option<&'static str> {
+        self.published_label
+    }
+}
+
+/// The action a published managed rule takes on a request it matches.
+///
+/// Only the actions the published rule lists use: `RuleAction` models six, but a
+/// vendor's rule list states `Block`, `Count` or `Challenge` for its rules, and a
+/// variant this catalogue cannot cite a rule for would be an action nobody
+/// publishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishedRuleAction {
+    /// Block the request (`RuleAction$Block`).
+    Block,
+    /// Count the request (`RuleAction$Count`).
+    Count,
+    /// Run a silent challenge against the request (`RuleAction$Challenge`).
+    Challenge,
+}
+
+impl PublishedRuleAction {
+    /// This action as the modelled `RuleAction`: the one member the action names,
+    /// with no custom response or request handling, which a vendor's own rule
+    /// carries none of.
+    pub fn rule_action(self) -> RuleAction {
+        match self {
+            Self::Block => RuleAction {
+                block: Some(BlockAction::default()),
+                ..RuleAction::default()
+            },
+            Self::Count => RuleAction {
+                count: Some(CountAction::default()),
+                ..RuleAction::default()
+            },
+            Self::Challenge => RuleAction {
+                challenge: Some(ChallengeAction::default()),
+                ..RuleAction::default()
+            },
         }
     }
 }
@@ -1076,12 +1233,14 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
         "Provides protection against exploitation of a wide range of \
          vulnerabilities, including high risk and commonly occurring \
          vulnerabilities described in OWASP publications.",
+        COMMON_RULE_SET_RULES,
     ),
     descriptor(
         "AWSManagedRulesAdminProtectionRuleSet",
         100,
         "Admin protection",
         "Blocks external access to exposed administrative pages.",
+        ADMIN_PROTECTION_RULES,
     ),
     descriptor(
         "AWSManagedRulesKnownBadInputsRuleSet",
@@ -1089,6 +1248,7 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
         "Known bad inputs",
         "Blocks request patterns that are known to be invalid and are associated \
          with exploitation or discovery of vulnerabilities.",
+        KNOWN_BAD_INPUTS_RULES,
     ),
     descriptor(
         "AWSManagedRulesSQLiRuleSet",
@@ -1096,6 +1256,7 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
         "SQL database",
         "Blocks request patterns associated with the exploitation of SQL \
          databases, like SQL injection attacks.",
+        SQL_DATABASE_RULES,
     ),
     descriptor(
         "AWSManagedRulesLinuxRuleSet",
@@ -1104,6 +1265,7 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
         "Blocks request patterns associated with the exploitation of \
          vulnerabilities specific to Linux, including Linux-specific local file \
          inclusion attacks.",
+        LINUX_RULES,
     ),
     descriptor(
         "AWSManagedRulesUnixRuleSet",
@@ -1111,6 +1273,7 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
         "POSIX operating system",
         "Blocks request patterns associated with the exploitation of \
          vulnerabilities specific to POSIX and POSIX-like operating systems.",
+        UNIX_RULES,
     ),
     descriptor(
         "AWSManagedRulesWindowsRuleSet",
@@ -1119,6 +1282,7 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
         "Blocks request patterns associated with the exploitation of \
          vulnerabilities specific to Windows, like remote execution of PowerShell \
          commands.",
+        WINDOWS_RULES,
     ),
     descriptor(
         "AWSManagedRulesPHPRuleSet",
@@ -1127,6 +1291,7 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
         "Blocks request patterns associated with the exploitation of \
          vulnerabilities specific to the use of the PHP programming language, \
          including the injection of unsafe PHP functions.",
+        PHP_RULES,
     ),
     descriptor(
         "AWSManagedRulesWordPressRuleSet",
@@ -1134,6 +1299,7 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
         "WordPress application",
         "Blocks request patterns associated with the exploitation of \
          vulnerabilities specific to WordPress sites.",
+        WORDPRESS_RULES,
     ),
     descriptor(
         "AWSManagedRulesAmazonIpReputationList",
@@ -1141,6 +1307,7 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
         "Amazon IP reputation list",
         "Blocks requests from sources that Amazon threat intelligence associates \
          with bots or other threats.",
+        IP_REPUTATION_RULES,
     ),
     descriptor(
         "AWSManagedRulesAnonymousIpList",
@@ -1148,6 +1315,7 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
         "Anonymous IP list",
         "Blocks requests from services that permit the obfuscation of viewer \
          identity, such as VPNs, proxies, Tor nodes and hosting providers.",
+        ANONYMOUS_IP_RULES,
     ),
     versioned(
         "AWSManagedRulesBotControlRuleSet",
@@ -1157,6 +1325,7 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
         "Provides visibility into and control over bot traffic, including common \
          desirable bots and the targeted detection of self-identifying and \
          evasive bots.",
+        BOT_CONTROL_RULES,
     ),
     versioned(
         "AWSManagedRulesATPRuleSet",
@@ -1165,6 +1334,7 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
         "Account takeover prevention",
         "Detects and manages requests that are part of malicious account takeover \
          attempts against your login pages.",
+        ATP_RULES,
     ),
     versioned(
         "AWSManagedRulesACFPRuleSet",
@@ -1173,6 +1343,7 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
         "Account creation fraud prevention",
         "Detects and manages requests that are part of malicious account creation \
          attempts against your account registration pages.",
+        ACFP_RULES,
     ),
     versioned(
         "AWSManagedRulesAntiDDoSRuleSet",
@@ -1181,6 +1352,7 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
         "Anti-DDoS",
         "Detects and manages requests that are part of a distributed \
          denial-of-service event against your protected resources.",
+        ANTI_DDOS_RULES,
     ),
 ];
 
@@ -1242,6 +1414,7 @@ const fn descriptor(
     capacity: i64,
     product_title: &'static str,
     product_description: &'static str,
+    rules: &'static [PublishedManagedRule],
 ) -> ManagedRuleGroupDescriptor {
     ManagedRuleGroupDescriptor {
         vendor_name: AWS_MANAGED_RULE_GROUP_VENDOR,
@@ -1252,6 +1425,7 @@ const fn descriptor(
         is_versioning_supported: false,
         is_advanced_managed_rule_set: false,
         versions: INITIAL_VERSION_ONLY,
+        rules,
     }
 }
 
@@ -1267,6 +1441,7 @@ const fn versioned(
     versions: &'static [ManagedRuleGroupRelease],
     product_title: &'static str,
     product_description: &'static str,
+    rules: &'static [PublishedManagedRule],
 ) -> ManagedRuleGroupDescriptor {
     ManagedRuleGroupDescriptor {
         vendor_name: AWS_MANAGED_RULE_GROUP_VENDOR,
@@ -1277,8 +1452,205 @@ const fn versioned(
         is_versioning_supported: true,
         is_advanced_managed_rule_set: true,
         versions,
+        rules,
     }
 }
+
+/// One rule of a published group, named `name`, that BLOCKS what it matches.
+const fn block(name: &'static str) -> PublishedManagedRule {
+    PublishedManagedRule {
+        name,
+        action: PublishedRuleAction::Block,
+        published_label: None,
+    }
+}
+
+/// One rule of a published group, named `name`, that COUNTS what it matches. See
+/// [`block`].
+const fn count(name: &'static str) -> PublishedManagedRule {
+    PublishedManagedRule {
+        name,
+        action: PublishedRuleAction::Count,
+        published_label: None,
+    }
+}
+
+/// One rule of a published group, named `name`, that CHALLENGES what it matches.
+/// See [`block`].
+const fn challenge(name: &'static str) -> PublishedManagedRule {
+    PublishedManagedRule {
+        name,
+        action: PublishedRuleAction::Challenge,
+        published_label: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The rules each published group runs
+// ---------------------------------------------------------------------------
+//
+// One list per catalogue entry, in the order the WAF Developer Guide's rule list
+// for that group gives them: each rule's name and the action that list states for
+// it (`RuleSummary` is "high-level information about a Rule, returned by
+// operations like DescribeManagedRuleGroup" — a name and an action, and nothing
+// about how the rule matches, which no WAFv2 response reports for a vendor's
+// group). They are the VENDOR's rules, so they live here beside the group's
+// capacity and versions rather than in the state struct, and nothing a caller does
+// changes one.
+
+/// The rules of `AWSManagedRulesCommonRuleSet`.
+const COMMON_RULE_SET_RULES: &[PublishedManagedRule] = &[
+    block("NoUserAgent_HEADER"),
+    block("UserAgent_BadBots_HEADER"),
+    block("SizeRestrictions_QUERYSTRING"),
+    block("SizeRestrictions_Cookie_HEADER"),
+    block("SizeRestrictions_BODY"),
+    block("SizeRestrictions_URIPATH"),
+    block("EC2MetaDataSSRF_BODY"),
+    block("EC2MetaDataSSRF_COOKIE"),
+    block("EC2MetaDataSSRF_URIPATH"),
+    block("EC2MetaDataSSRF_QUERYARGUMENTS"),
+    block("GenericLFI_QUERYARGUMENTS"),
+    block("GenericLFI_URIPATH"),
+    block("GenericLFI_BODY"),
+    block("RestrictedExtensions_URIPATH"),
+    block("RestrictedExtensions_QUERYARGUMENTS"),
+    block("GenericRFI_QUERYARGUMENTS"),
+    block("GenericRFI_BODY"),
+    block("GenericRFI_URIPATH"),
+    block("CrossSiteScripting_COOKIE"),
+    block("CrossSiteScripting_QUERYARGUMENTS"),
+    block("CrossSiteScripting_BODY"),
+    block("CrossSiteScripting_URIPATH"),
+];
+
+/// The rules of `AWSManagedRulesAdminProtectionRuleSet`.
+const ADMIN_PROTECTION_RULES: &[PublishedManagedRule] = &[block("AdminProtection_URIPATH")];
+
+/// The rules of `AWSManagedRulesKnownBadInputsRuleSet`.
+const KNOWN_BAD_INPUTS_RULES: &[PublishedManagedRule] = &[
+    block("JavaDeserializationRCE_HEADER"),
+    block("JavaDeserializationRCE_BODY"),
+    block("JavaDeserializationRCE_URIPATH"),
+    block("JavaDeserializationRCE_QUERYSTRING"),
+    block("Host_localhost_HEADER"),
+    block("PROPFIND_METHOD"),
+    block("ExploitablePaths_URIPATH"),
+    block("Log4JRCE_HEADER"),
+    block("Log4JRCE_QUERYSTRING"),
+    block("Log4JRCE_BODY"),
+    block("Log4JRCE_URIPATH"),
+];
+
+/// The rules of `AWSManagedRulesSQLiRuleSet`.
+const SQL_DATABASE_RULES: &[PublishedManagedRule] = &[
+    block("SQLi_QUERYARGUMENTS"),
+    block("SQLiExtendedPatterns_QUERYARGUMENTS"),
+    block("SQLi_BODY"),
+    block("SQLiExtendedPatterns_BODY"),
+    block("SQLi_COOKIE"),
+    block("SQLi_URIPATH"),
+];
+
+/// The rules of `AWSManagedRulesLinuxRuleSet`.
+const LINUX_RULES: &[PublishedManagedRule] = &[
+    block("LFI_URIPATH"),
+    block("LFI_QUERYSTRING"),
+    block("LFI_HEADER"),
+];
+
+/// The rules of `AWSManagedRulesUnixRuleSet`.
+const UNIX_RULES: &[PublishedManagedRule] = &[
+    block("UNIXShellCommandsVariables_QUERYARGUMENTS"),
+    block("UNIXShellCommandsVariables_BODY"),
+];
+
+/// The rules of `AWSManagedRulesWindowsRuleSet`.
+const WINDOWS_RULES: &[PublishedManagedRule] = &[
+    block("WindowsShellCommandsVariables_QUERYARGUMENTS"),
+    block("WindowsShellCommandsVariables_BODY"),
+    block("PowerShellCommandsVariables_QUERYARGUMENTS"),
+    block("PowerShellCommandsVariables_BODY"),
+];
+
+/// The rules of `AWSManagedRulesPHPRuleSet`.
+const PHP_RULES: &[PublishedManagedRule] = &[
+    block("PHPHighRiskMethodsVariables_HEADER"),
+    block("PHPHighRiskMethodsVariables_QUERYSTRING"),
+    block("PHPHighRiskMethodsVariables_BODY"),
+];
+
+/// The rules of `AWSManagedRulesWordPressRuleSet`.
+const WORDPRESS_RULES: &[PublishedManagedRule] = &[
+    block("WordPressExploitableCommands_QUERYSTRING"),
+    block("WordPressExploitablePaths_URIPATH"),
+];
+
+/// The rules of `AWSManagedRulesAmazonIpReputationList`.
+const IP_REPUTATION_RULES: &[PublishedManagedRule] = &[
+    block("AWSManagedIPReputationList"),
+    block("AWSManagedReconnaissanceList"),
+    block("AWSManagedIPDDoSList"),
+];
+
+/// The rules of `AWSManagedRulesAnonymousIpList`.
+const ANONYMOUS_IP_RULES: &[PublishedManagedRule] =
+    &[block("AnonymousIPList"), block("HostingProviderIPList")];
+
+/// The rules of `AWSManagedRulesBotControlRuleSet`, whose bot-category rules count
+/// the traffic they recognise and whose bot-signal rules block it.
+const BOT_CONTROL_RULES: &[PublishedManagedRule] = &[
+    count("CategoryAdvertising"),
+    count("CategoryArchiver"),
+    count("CategoryContentFetcher"),
+    count("CategoryEmailClient"),
+    count("CategoryHttpLibrary"),
+    count("CategoryLinkChecker"),
+    count("CategoryMiscellaneous"),
+    count("CategoryMonitoring"),
+    block("CategoryScrapingFramework"),
+    count("CategorySearchEngine"),
+    count("CategorySecurity"),
+    count("CategorySeo"),
+    count("CategorySocialMedia"),
+    block("SignalAutomatedBrowser"),
+    count("SignalKnownBotDataCenter"),
+    block("SignalNonBrowserUserAgent"),
+];
+
+/// The rules of `AWSManagedRulesATPRuleSet`.
+const ATP_RULES: &[PublishedManagedRule] = &[
+    count("AllRequests"),
+    block("UnsupportedCognitoIDP"),
+    block("AttributeCompromisedCredentials"),
+    block("AttributeUsernameTraversal"),
+    block("AttributePasswordTraversal"),
+    block("VolumetricIpHigh"),
+    block("VolumetricSession"),
+    block("SignalMissingCredential"),
+    block("TokenRejected"),
+];
+
+/// The rules of `AWSManagedRulesACFPRuleSet`.
+const ACFP_RULES: &[PublishedManagedRule] = &[
+    count("AllRequests"),
+    block("UnsupportedCognitoIDP"),
+    block("AttributeCompromisedCredentials"),
+    block("AttributeUsernameTraversal"),
+    block("AttributePasswordTraversal"),
+    block("VolumetricIpHigh"),
+    block("VolumetricSession"),
+    block("VolumetricPhoneNumberHigh"),
+    block("SignalMissingCredential"),
+    block("TokenRejected"),
+];
+
+/// The rules of `AWSManagedRulesAntiDDoSRuleSet`, which challenge the traffic they
+/// recognise rather than blocking it outright.
+const ANTI_DDOS_RULES: &[PublishedManagedRule] = &[
+    challenge("ChallengeDDoSRequests"),
+    challenge("ChallengeAllDuringEvent"),
+];
 
 /// One version of a group, named `name` and last updated at `last_update` (see
 /// [`ManagedRuleGroupRelease::last_update`]).
@@ -2175,12 +2547,25 @@ pub fn apply_web_acl_defaults(
 /// one of them acquires at match time is reported separately, as
 /// [`label_namespace`].
 pub fn rule_group_available_labels(rules: &[Rule]) -> Vec<LabelSummary> {
-    let names: ::std::collections::BTreeSet<&str> = rules
-        .iter()
-        .flat_map(|rule| rule.rule_labels.as_deref().unwrap_or_default())
-        .map(|label| label.name.as_str())
-        .collect();
-    names
+    label_summaries(
+        rules
+            .iter()
+            .flat_map(|rule| rule.rule_labels.as_deref().unwrap_or_default())
+            .map(|label| label.name.as_str()),
+    )
+}
+
+/// `names` as `LabelSummary` entries, deduplicated and in a stable order.
+///
+/// One projection for every list of labels this service reports —
+/// [`rule_group_available_labels`] over a stored rule tree,
+/// [`rule_group_consumed_labels`] over the label-match keys in one, and
+/// [`ManagedRuleGroupDescriptor::available_labels`] over a published group's rules
+/// — so the deduplication and the order are decided in one place whatever the
+/// labels were read from.
+fn label_summaries<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<LabelSummary> {
+    let unique: ::std::collections::BTreeSet<&str> = names.into_iter().collect();
+    unique
         .into_iter()
         .map(|name| LabelSummary {
             name: Some(name.to_string()),
@@ -2198,17 +2583,15 @@ pub fn rule_group_available_labels(rules: &[Rule]) -> Vec<LabelSummary> {
 /// and from the whole statement tree, because a `LabelMatchStatement` can sit
 /// inside any nesting [`nested_statements`] enumerates.
 pub fn rule_group_consumed_labels(rules: &[Rule]) -> Vec<LabelSummary> {
-    let mut keys: ::std::collections::BTreeSet<String> = ::std::collections::BTreeSet::new();
+    let mut keys: Vec<&str> = Vec::new();
     let mut pending: Vec<&Statement> = rules.iter().map(|rule| &rule.statement).collect();
     while let Some(statement) = pending.pop() {
         if let Some(label_match) = statement.label_match_statement.as_ref() {
-            keys.insert(label_match.key.clone());
+            keys.push(label_match.key.as_str());
         }
         pending.extend(nested_statements(statement));
     }
-    keys.into_iter()
-        .map(|key| LabelSummary { name: Some(key) })
-        .collect()
+    label_summaries(keys)
 }
 
 /// Materialise, on a rule group about to be stored, every member WAF derives or
@@ -2296,6 +2679,10 @@ pub const FIELD_RULE_GROUP: &str = "RULE_GROUP";
 /// The `ParameterExceptionField` value naming a `RuleGroupReferenceStatement`. See
 /// [`FIELD_RESOURCE_ARN`].
 pub const FIELD_RULE_GROUP_REFERENCE_STATEMENT: &str = "RULE_GROUP_REFERENCE_STATEMENT";
+
+/// The `ParameterExceptionField` value naming a managed rule group, as the enum
+/// spells it (`MANAGED_RULE_SET`). See [`FIELD_RESOURCE_ARN`].
+pub const FIELD_MANAGED_RULE_SET: &str = "MANAGED_RULE_SET";
 
 /// The `ParameterExceptionField` value naming a managed-rule-group statement
 /// (`MANAGED_RULE_SET_STATEMENT`, as the enum spells it). See

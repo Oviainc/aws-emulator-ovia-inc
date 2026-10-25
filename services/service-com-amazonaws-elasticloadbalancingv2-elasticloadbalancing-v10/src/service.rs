@@ -57,6 +57,14 @@
 //! code, the message and the whole success path with the framework renderers that own
 //! them.
 
+//! One fact about this service's wire identity is read from OUTSIDE this crate: the API
+//! version an awsQuery envelope must name to be served out of this model on the endpoint
+//! it SHARES with the Classic Elastic Load Balancing model. [`shared_endpoint`] publishes
+//! it, so the front door that owns that shared name — and this crate's own suites — read
+//! it rather than restating the literal.
+
+pub mod shared_endpoint;
+
 use service_common::query_error_envelope::{
     RequestIdEnvelopeDefinition, RequestIdEnvelopeOperation,
 };

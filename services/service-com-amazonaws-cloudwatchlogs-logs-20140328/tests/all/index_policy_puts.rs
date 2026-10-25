@@ -67,7 +67,7 @@ const INDEX_POLICY_CLASS: &str = "STANDARD";
 
 /// A field index policy document whose `FieldsV2` object names each `(field, type)` pair.
 /// Source: `PutIndexPolicy$policyDocument` — "FieldsV2 to specify the type for each field".
-fn fields_v2_document(entries: &[(&str, &str)]) -> String {
+pub(crate) fn fields_v2_document(entries: &[(&str, &str)]) -> String {
     let mut fields = serde_json::Map::new();
     for (field, index_type) in entries {
         fields.insert((*field).to_string(), json!({"type": index_type}));
@@ -108,7 +108,7 @@ fn distinct_fields(count: usize) -> Vec<String> {
 }
 
 /// A field index policy document naming `count` distinct fields.
-fn document_with_fields(count: usize) -> String {
+pub(crate) fn document_with_fields(count: usize) -> String {
     let fields = distinct_fields(count);
     let borrowed: Vec<&str> = fields.iter().map(String::as_str).collect();
     field_index_document(&borrowed)
@@ -138,7 +138,7 @@ async fn put(logs: &Logs, identifier: &str, document: &str) -> Value {
 }
 
 /// One string member of a reported `IndexPolicy`.
-fn member(policy: &Value, key: &str) -> String {
+pub(crate) fn member(policy: &Value, key: &str) -> String {
     policy
         .get(key)
         .and_then(Value::as_str)
@@ -156,7 +156,7 @@ fn last_update_time(policy: &Value) -> i64 {
 
 /// The one index policy `DescribeIndexPolicies` reports for a log group, or `None` when
 /// none applies to it.
-async fn described_one(logs: &Logs, identifier: &str) -> Option<Value> {
+pub(crate) async fn described_one(logs: &Logs, identifier: &str) -> Option<Value> {
     let page = logs
         .ok(
             "DescribeIndexPolicies",

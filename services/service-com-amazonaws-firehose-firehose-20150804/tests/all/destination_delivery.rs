@@ -952,6 +952,23 @@ const HOSTILE_QUERIES: &[(&str, &str)] = &[
         "a string repeated a billion times",
         "{dept:(.dept*1000000000)}",
     ),
+    // The other two operators that grow a value out of proportion to the record: in jq `/`
+    // over two strings SPLITS one into an array of its pieces, and `-` over two arrays
+    // subtracts one from the other by comparing every pair of their elements.
+    (
+        "a record split into an array of its pieces",
+        "{dept:((.dept/\"\")|length|tostring)}",
+    ),
+    (
+        "an array subtracted from another elementwise",
+        "{dept:(([.dept]-[.dept])|length|tostring)}",
+    ),
+    // Assignment embeds a value into a field of itself, and it chains, so a handful of
+    // tokens multiplies the record many times over.
+    (
+        "a value multiplied by a chain of assignments",
+        "{dept:.dept}|.a=.|.b=.|.c=.",
+    ),
     // A chain of constructions, which is how a program grows a value without an operator
     // that grows one: each stage holding two copies of its input doubles it.
     (

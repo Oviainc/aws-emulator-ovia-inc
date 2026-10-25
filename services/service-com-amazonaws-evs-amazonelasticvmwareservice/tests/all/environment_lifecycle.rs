@@ -170,6 +170,25 @@ pub(crate) const SERVICE_ACCESS_SUBNET_CIDR: &str = "10.0.240.0/24";
 /// EC2's own zone list reports for it.
 pub(crate) const ZONE: &str = "us-west-2a";
 
+/// The ARN form of the modelled `SecretIdentifier`, whose pattern's other alternative —
+/// a bare name over `[a-zA-Z0-9/_+=.@!-]` — admits no colon.
+pub(crate) const SECRET_ARN_PREFIX: &str = "arn:aws:secretsmanager:";
+
+/// The ARN a connector reports for the credential secret a request named by
+/// `secret_identifier`: the identifier itself when it already is an ARN, and otherwise
+/// the ARN of that name in the Region the test client addresses and this account.
+///
+/// `Connector$secretArn` is "The Amazon Resource Name (ARN) of" the secret while
+/// `secretIdentifier` is "The ARN or name of" it, so the ARN is what every suite that
+/// reads a connector expects; `tests/all/connector_secret_arn.rs` owns that rule and
+/// covers the secrets the account really holds, whose ARN Secrets Manager minted.
+pub(crate) fn secret_arn_of(secret_identifier: &str) -> String {
+    if secret_identifier.starts_with("arn:") {
+        return secret_identifier.to_string();
+    }
+    format!("{SECRET_ARN_PREFIX}{REGION}:{ACCOUNT}:secret:{secret_identifier}")
+}
+
 /// The emulator a test drives: one shared engine, this service mounted on it.
 pub(crate) fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());

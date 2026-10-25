@@ -31,3 +31,12 @@ botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling
 Boot the lambda emulator
 Call DeleteFunctionConcurrency and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Update
+The handler HAS since landed, in the fix for
+`issues/things-that-now-work/20261025T022656Z-lambda-ten-read-representation-and-data-plane-divergences.md`:
+one of that issue's recorded units calls `DeleteFunctionConcurrency` and was blocked on this
+501, so the handler was implemented there (it clears the function's reserved concurrency and
+answers 204, refusing a qualified name as `Get`/`PutFunctionConcurrency` do) and this file's
+`//! SCAFFOLDED, NOT IMPLEMENTED:` census line was deleted. What is left for this issue is its
+own unit, `lambda.delete-reserved-concurrency`, and a test that pins the operation's own rules.

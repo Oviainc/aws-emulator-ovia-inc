@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateConsumableResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateConsumableResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateConsumableResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the request's `quantity` to the total quantity of one stored consumable
+//! resource ([`crate::state`]) the way `operation` says — `SET` makes it the new total,
+//! `ADD` increases it, `REMOVE` reduces it — and answers that resource's name, its ARN and
+//! the total the update left it at. The whole read-modify-write happens under this store's
+//! lock, so two overlapping updates serialize instead of one reading a stale total, and
+//! `DescribeConsumableResource` reads the result back.
+//!
+//! A request carrying a `clientToken` is remembered: an identical repeat of it answers
+//! what the first one answered and applies nothing further.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +158,179 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateConsumableResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateConsumableResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state as batch;
+
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(UpdateConsumableResourceErrorModeled::ServerException(
+                batch::unreachable_state(),
+            )
+            .into());
+        };
+        let region = batch::request_region(ctx);
+        let now = batch::now_millis();
+        // ONE critical section for the whole read-modify-write below: the total a request
+        // computes is the total it writes, so two overlapping updates cannot lose each
+        // other's arithmetic.
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        // The request's own members first, so a malformed request reports the member that
+        // is wrong rather than a lookup that resolves to nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateConsumableResource"))
+        // `operation`: "Must be one of: SET ... ADD ... REMOVE". A plain `String` in the
+        // model, so the list is applied here. A request that names none states no
+        // arithmetic to do, so its `quantity` is the new total — the reading `quantity`'s
+        // own doc gives ("the operation parameter determines whether the value specified
+        // here will be the new total quantity, or the amount by which the total quantity
+        // will be increased or reduced").
+        let operation = input
+            .operation
+            .as_deref()
+            .unwrap_or(batch::UPDATE_OPERATION_SET);
+        if !batch::CONSUMABLE_RESOURCE_UPDATE_OPERATIONS.contains(&operation) {
+            return Err(UpdateConsumableResourceErrorModeled::ClientException(
+                batch::client_exception(format!(
+                    "operation {operation} is not one of {}",
+                    batch::CONSUMABLE_RESOURCE_UPDATE_OPERATIONS.join(", ")
+                )),
+            )
+            .into());
+        }
+        // `quantity`: "Must be a non-negative value." Also a plain `Long`, so the
+        // framework admits a negative one and the rule is applied here.
+        if let Some(quantity) = input.quantity {
+            if quantity < 0 {
+                return Err(UpdateConsumableResourceErrorModeled::ClientException(
+                    batch::client_exception(format!(
+                        "quantity must be non-negative, not {quantity}"
+                    )),
+                )
+                .into());
+            }
+        }
+
+        // `clientToken`: "If this parameter is specified and two update requests with
+        // identical payloads and clientTokens are received, these requests are considered
+        // the same request. Both requests will succeed, but the update will only happen
+        // once." The identical repeat therefore answers the response the first request
+        // computed and applies no arithmetic; a token carrying a DIFFERENT payload is
+        // refused, because the service cannot honour one token for two updates (the rule
+        // `SubmitServiceJob`'s own token already follows here).
+        let digest = request_digest(&input);
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(applied) = state.consumable_resource_update_for_token(token, now) {
+                if applied.request_digest == digest {
+                    return Ok(UpdateConsumableResourceOutput {
+                        consumable_resource_name: applied.consumable_resource_name.clone(),
+                        consumable_resource_arn: applied.consumable_resource_arn.clone(),
+                        total_quantity: Some(applied.total_quantity),
+                    });
+                }
+                return Err(UpdateConsumableResourceErrorModeled::ClientException(
+                    batch::client_exception(format!(
+                        "clientToken {token} was already used for a different \
+                         UpdateConsumableResource request"
+                    )),
+                )
+                .into());
+            }
+        }
+
+        // "The name or ARN of the consumable resource to be updated": resolved both ways,
+        // and an identifier that resolves to nothing is refused with the resolver's own
+        // sentence rather than creating anything.
+        let Some(stored) = state.consumable_resource(&input.consumable_resource) else {
+            return Err(UpdateConsumableResourceErrorModeled::ClientException(
+                batch::does_not_exist_exception(&batch::resolved_arn(
+                    &input.consumable_resource,
+                    |name| batch::consumable_resource_arn(&region, name),
+                )),
+            )
+            .into());
+        };
+        let name = stored.name.clone();
+        let arn = stored.arn.clone();
+        let current = stored.total_quantity;
+
+        // The arithmetic the `operation` member documents. A request that names no
+        // `quantity` asks for no change, whatever the operation.
+        let new_total = match input.quantity {
+            None => current,
+            Some(quantity) => match operation {
+                batch::UPDATE_OPERATION_ADD => {
+                    // A total past what a `Long` holds could not be reported through
+                    // `totalQuantity` at all, so the increase is refused instead.
+                    let Some(sum) = current.checked_add(quantity) else {
+                        return Err(UpdateConsumableResourceErrorModeled::ClientException(
+                            batch::client_exception(format!(
+                                "quantity {quantity} would take the totalQuantity of \
+                                 {name} past {}",
+                                i64::MAX
+                            )),
+                        )
+                        .into());
+                    };
+                    sum
+                }
+                batch::UPDATE_OPERATION_REMOVE => {
+                    // A consumable resource's `totalQuantity` is non-negative (the
+                    // member's doc: "Must be non-negative"), so a reduction past what the
+                    // resource holds is refused and the stored total is left as it was.
+                    if quantity > current {
+                        return Err(UpdateConsumableResourceErrorModeled::ClientException(
+                            batch::client_exception(format!(
+                                "quantity {quantity} is more than the totalQuantity \
+                                 {current} of {name}"
+                            )),
+                        )
+                        .into());
+                    }
+                    current - quantity
+                }
+                // `SET`, and the default above: the request's quantity IS the new total.
+                _ => quantity,
+            },
+        };
+
+        // The resolver above found this record under THIS lock and nothing has released
+        // it since, so the write lands; `if let` rather than an unwrap because a handler
+        // never panics on a request.
+        if let Some(resource) = state.consumable_resources.get_mut(&name) {
+            resource.total_quantity = new_total;
+        }
+        if let Some(token) = input.client_token.as_deref() {
+            state.remember_consumable_resource_update(
+                token,
+                batch::ConsumableResourceUpdate {
+                    request_digest: digest,
+                    consumable_resource_name: name.clone(),
+                    consumable_resource_arn: arn.clone(),
+                    total_quantity: new_total,
+                    applied_at: now,
+                },
+            );
+        }
+
+        Ok(UpdateConsumableResourceOutput {
+            consumable_resource_name: name,
+            consumable_resource_arn: arn,
+            total_quantity: Some(new_total),
+        })
     }
+}
+
+/// A digest of everything an `UpdateConsumableResource` request asks for, so an identical
+/// repeat of a `clientToken` can be told apart from the same token carrying a different
+/// payload ("two update requests with identical payloads and clientTokens").
+///
+/// The digest itself is [`crate::state::request_members_digest`]; what this builds is the
+/// member list. The members are taken EXACTLY as the request gave them — an absent
+/// `operation` is not the same payload as one naming `SET` — because what the doc compares
+/// is the payloads.
+fn request_digest(input: &UpdateConsumableResourceInput) -> String {
+    crate::state::request_members_digest([
+        input.consumable_resource.clone(),
+        format!("{:?}", input.operation),
+        format!("{:?}", input.quantity),
+    ])
 }
