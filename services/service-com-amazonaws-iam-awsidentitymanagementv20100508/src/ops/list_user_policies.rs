@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListUserPolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListUserPolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListUserPolicies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -163,20 +154,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // `ctx` carries request metadata only; this read is driven entirely by its
+        // input and the store.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListUserPolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListUserPoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListUserPolicies"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListUserPoliciesErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // IAM entity names "are not distinguished by case", so the case-folded name
+        // is the identity under which the account holds the user and the policies
+        // embedded in it.
+        let user_key = crate::state::name_key(&input.user_name);
+        // One scope per USER, so a marker issued while paging one user's inline
+        // policies names no position in another user's set — nor among that user's
+        // attached managed policies.
+        let scope = crate::state::user_policies_marker_scope(&user_key);
+        // The page resumes strictly after the POSITION in the key order the marker
+        // names, so a token this service's encoding cannot have produced is refused
+        // rather than silently read as "start from the beginning". A token that
+        // decodes but names a policy deleted since the previous page is NOT an
+        // error: pagination resumes from the position, and the deleted policy is
+        // simply no longer in the range.
+        let resume_after = match &input.marker {
+            Some(marker) => match crate::state::decode_marker(&scope, marker) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "Invalid Marker: the value is not a marker this service issued for \
+                         this user's inline policies",
+                    ))
+                }
+            },
+            None => None,
+        };
+        // `maxItemsType` is range 1..1000 and the boundary validator has already
+        // refused anything outside it, so the only choice left here is the default
+        // for an absent `MaxItems`. `.max(1)` is what makes the cast lossless.
+        let page_size = input
+            .max_items
+            .unwrap_or(crate::state::DEFAULT_MAX_ITEMS)
+            .max(1) as usize;
+
+        // A read: it reports the names the account holds and writes nothing.
+        let store = state.lock();
+        if !store.users.contains_key(&user_key) {
+            return Err(ListUserPoliciesErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The user with name {} cannot be found.",
+                        input.user_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut policy_names = Vec::new();
+        let mut is_truncated = false;
+        let mut last_key = None;
+        // A user holding no inline policy has no entry in the map at all, which is
+        // the documented empty list rather than a failure.
+        if let Some(policies) = store.user_inline_policies.get(&user_key) {
+            let tail = policies.range::<str, _>((
+                match &resume_after {
+                    Some(key) => ::std::ops::Bound::Excluded(key.as_str()),
+                    None => ::std::ops::Bound::Unbounded,
+                },
+                ::std::ops::Bound::Unbounded,
+            ));
+            for (key, policy) in tail {
+                if policy_names.len() == page_size {
+                    // There is at least one more embedded policy, so the caller
+                    // needs another page to see it.
+                    is_truncated = true;
+                    break;
+                }
+                // The name the account holds, in the case the last put chose — not
+                // the case this request happened to spell it with.
+                policy_names.push(policy.policy_name.clone());
+                last_key = Some(key.clone());
+            }
+        }
+
+        Ok(ListUserPoliciesOutput {
+            policy_names,
+            is_truncated,
+            marker: is_truncated
+                .then(|| {
+                    last_key
+                        .as_deref()
+                        .map(|key| crate::state::encode_marker(&scope, key))
+                })
+                .flatten(),
+        })
     }
 }
