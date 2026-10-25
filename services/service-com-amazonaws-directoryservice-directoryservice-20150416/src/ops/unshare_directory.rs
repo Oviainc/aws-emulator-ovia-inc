@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UnshareDirectory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UnshareDirectory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UnshareDirectory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stops the sharing of a Managed Microsoft AD directory with one consumer account:
+//! the stored share enters the modelled transient `Deleting` status, the clock finishes
+//! the teardown, and the consumer's own `SharedDirectoryId` is reported back.
+//! Implemented here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +143,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UnshareDirectory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UnshareDirectoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UnshareDirectory"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // `UnshareTarget` is the "identifier that contains details about the directory
+        // consumer account with whom the directory is being unshared", and its `Type`
+        // says what kind of identifier `Id` is. The modelled `TargetType` enum declares
+        // exactly one kind, `ACCOUNT`, so `Id` has to be an Amazon Web Services account
+        // id — the same twelve digits `ShareDirectory` recorded the consumer account as,
+        // which is why both operations ask one function
+        // ([`crate::state::is_account_id`]). An `Id` that cannot be one of those names no
+        // account a directory could have been shared with, which is the modelled refusal
+        // for exactly that.
+        let consumer_account_id = input.unshare_target.id.clone();
+        if !crate::state::is_account_id(&consumer_account_id) {
+            return Err(UnshareDirectoryErrorModeled::InvalidTargetException(
+                crate::state::refusal(format!(
+                    "UnshareTarget.Id '{id}' is not an Amazon Web Services account id; a \
+                     {target_type} target is identified by its twelve-digit account id",
+                    id = input.unshare_target.id,
+                    target_type = input.unshare_target.r#type
+                )),
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        // The share hangs off the directory the request names, so an id naming no stored
+        // directory is refused with the modelled "specified entity could not be found"
+        // and changes nothing.
+        if !store.directories.contains_key(&input.directory_id) {
+            return Err(UnshareDirectoryErrorModeled::EntityDoesNotExistException(
+                crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
+            )
+            .into());
+        }
+
+        // "Stops the directory sharing between the directory owner and consumer
+        // accounts": what this call stops is the ONE share pairing that directory with
+        // that consumer account. No such pairing — never shared, or a teardown that has
+        // already fallen due — is the modelled "specified directory has not been shared
+        // with this Amazon Web Services account", whatever status the directory's other
+        // shares are in.
+        let Some(share) = store.share_mut(&input.directory_id, &consumer_account_id) else {
+            return Err(UnshareDirectoryErrorModeled::DirectoryNotSharedException(
+                crate::state::refusal(crate::state::directory_not_shared(
+                    &input.directory_id,
+                    &consumer_account_id,
+                )),
+            )
+            .into());
+        };
+
+        // The call answers while the shared directory in the consumer account is still
+        // being torn down, so the share is recorded in the modelled transient `Deleting`
+        // status and the clock is what finishes the job: a caller reading straight
+        // afterwards still sees the teardown, and once it falls due the share is gone from
+        // this service and the pairing can be shared again. A repeat of the unshare is
+        // therefore not a refusal while the teardown is outstanding: it names a share that
+        // is still being deleted, and reports the same id without moving the due instant.
+        let shared_directory_id = share.shared_directory_id.clone();
+        if share.share_status != crate::state::SHARE_STATUS_DELETING {
+            share.share_status = crate::state::SHARE_STATUS_DELETING.to_string();
+            share.share_status_due_at = Some(now + crate::state::TRANSITION_SPAN);
+            share.last_updated = now;
+        }
+
+        // The operation reports the consumer account's own handle on the directory, the
+        // id `ShareDirectory` minted for this pairing: `DescribeSharedDirectories` is what
+        // reports the share itself.
+        Ok(UnshareDirectoryOutput {
+            shared_directory_id: Some(shared_directory_id),
+        })
     }
 }

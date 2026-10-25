@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDomains
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDomains`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDomains::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a page of the domain recordsets this account holds, each answered from the
+//! ONE record `CreateDomain` stored and its entries as the recordset operations left
+//! them — in the store's own total order by domain name, with `nextPageToken` naming
+//! the first recordset of the page after it while any remain.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +161,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDomains` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDomainsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDomains"))
+        // Lightsail serves the domain APIs from the N. Virginia endpoint ALONE,
+        // so the Region the request was signed for decides whether this call is
+        // served at all — the account's zones are not listable through any other
+        // Region's endpoint. Checked through the crate's one owner of that rule,
+        // before anything is read.
+        if let Some(message) = crate::state::domain_region_refusal(ctx.parts()) {
+            return Err(invalid(message));
+        }
+
+        // Past that guard nothing this listing reports depends on the request's
+        // own metadata: a DNS zone is held by name alone and lives in the one
+        // Region the domain API is served from, so a served request selects
+        // every recordset this store holds.
+
+        // `pageToken` is the name the previous page stopped before, so a page is
+        // the stored recordsets from that name onward in the store's own total
+        // order. Using the name rather than an index means a recordset deleted
+        // between two pages cannot make the walk skip or repeat another one.
+        let page_token = input.page_token.unwrap_or_default();
+
+        crate::state::with_state(&*self.engine, |store| {
+            let mut domains = Vec::new();
+            let mut next_page_token = None;
+            for (name, domain) in store.domains.range(page_token..) {
+                if domains.len() == crate::state::DOMAIN_PAGE_SIZE {
+                    next_page_token = Some(name.clone());
+                    break;
+                }
+                domains.push(domain.view());
+            }
+            GetDomainsOutput {
+                // An account with no recordsets reports an empty list, not an
+                // absent one: the caller asked what it holds, and the answer is
+                // "nothing".
+                domains: Some(domains),
+                next_page_token,
+            }
+        })
+        .ok_or_else(unavailable)
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not serve: the modelled `InvalidInputException`, whose message states the
+/// rule the request broke.
+fn invalid(message: String) -> GetDomainsError {
+    GetDomainsErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetDomainsError {
+    GetDomainsErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail domain store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

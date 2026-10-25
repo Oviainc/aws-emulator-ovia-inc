@@ -6767,8 +6767,9 @@ pub const INVALID_CONFIG_ID_STATUS: u16 = 400;
 ///
 /// The LENGTH is shared; the CODE a refusal carries is each family's own, since AWS answers
 /// an over-long id per family ([`INVALID_CONFIG_ID_CODE`] for an S3 Intelligent-Tiering id,
-/// [`INVALID_ARGUMENT_CODE`] for a metrics id, whose rule also constrains the character
-/// set).
+/// and [`MALFORMED_XML_CODE`] for a metrics id, whose rule also constrains the character set
+/// and whose operation publishes no error of its own for a document it cannot take, so the
+/// document is refused for not validating against the published schema).
 pub const MAX_CONFIGURATION_ID_CHARS: usize = 64;
 
 /// The code S3 answers a `GetBucketReplication` for a bucket that has no replication

@@ -359,6 +359,14 @@ pub const MAX_TAGS_PER_DATASTORE: usize = 50;
 /// `ValidationException` it models.
 pub const MAX_TAGS_PER_PROFILE: usize = 50;
 
+/// How a refusal names a FHIR data store — the kind of resource, never the
+/// identifier of one, which this service's error texts do not quote back.
+pub const DATASTORE_NOUN: &str = "data store";
+
+/// How a refusal names a data transformation profile, beside
+/// [`DATASTORE_NOUN`].
+pub const PROFILE_NOUN: &str = "data transformation profile";
+
 /// The release-version segment a data store's FHIR endpoint publishes, and so
 /// the third segment of every path on that endpoint
 /// (`/datastore/{DatastoreId}/r4/...`).
@@ -1568,6 +1576,57 @@ impl ComAmazonawsHealthlakeHealthlakeState {
         }
     }
 
+    /// The tag map a tagging MUTATION may write to for `arn`, or the fixed
+    /// not-found sentence of the resource that ARN names.
+    ///
+    /// A tag write CHANGES the resource its `ResourceARN` names, so it reaches
+    /// only a resource this service still holds. Two things decide that, and
+    /// both are decided here rather than in each tagging handler, so `TagResource`
+    /// and `UntagResource` cannot disagree about which records take a write:
+    ///
+    /// * the stored record's own ARN has to equal the one the caller handed in,
+    ///   so an ARN naming another partition, region or account resolves to
+    ///   nothing even when its id segment happens to match a local one; and
+    /// * a data store that has reached the terminal [`DatastoreStatus::Deleted`]
+    ///   status is not held any more in the sense a mutation needs: the record
+    ///   lingers for [`DELETED_RETENTION`] only so a reader can observe the
+    ///   deletion, and every operation that would CHANGE such a data store
+    ///   answers for it as gone. A data transformation profile carries no
+    ///   lifecycle status, so the ARN match is all there is to decide for it.
+    ///
+    /// Call [`Self::settle_lifecycle`] first, so the status this reads is the one
+    /// the clock already owes.
+    pub fn tags_for_mutation(&mut self, arn: &str) -> Result<MutableTags<'_>, &'static str> {
+        match tagged_resource_from_arn(arn) {
+            Some(TaggedResource::Datastore(id)) => self
+                .datastores
+                .get_mut(id)
+                .filter(|datastore| datastore.arn == arn)
+                .filter(|datastore| datastore.status != DatastoreStatus::Deleted)
+                .map(|datastore| MutableTags {
+                    tags: &mut datastore.tags,
+                    max_tags: MAX_TAGS_PER_DATASTORE,
+                    noun: DATASTORE_NOUN,
+                })
+                .ok_or(DATASTORE_NOT_FOUND_MESSAGE),
+            Some(TaggedResource::Profile(id)) => self
+                .profiles
+                .get_mut(id)
+                .filter(|profile| profile.arn == arn)
+                .map(|profile| MutableTags {
+                    tags: &mut profile.tags,
+                    max_tags: MAX_TAGS_PER_PROFILE,
+                    noun: PROFILE_NOUN,
+                })
+                .ok_or(PROFILE_NOT_FOUND_MESSAGE),
+            // Unreachable through the wire — the modelled `AmazonResourceName`
+            // pattern is enforced before a handler runs — but an ARN of neither
+            // resource form names no resource, so it is answered the same way a
+            // missing one is.
+            None => Err(DATASTORE_NOT_FOUND_MESSAGE),
+        }
+    }
+
     /// Reap every terminal record NOW, whatever its retention: the answer to a
     /// full store, taken before a create is refused, so a caller that deletes
     /// what it created can always create again.
@@ -2075,6 +2134,19 @@ pub enum TaggedResource<'a> {
     Datastore(&'a str),
     /// A data transformation profile, by `ProfileId`.
     Profile(&'a str),
+}
+
+/// What a tagging MUTATION writes through: the tag map of the resource an
+/// `AmazonResourceName` named, the cap that bounds the resulting set, and the
+/// noun a refusal names that kind of resource by.
+///
+/// Handed out by [`ComAmazonawsHealthlakeHealthlakeState::tags_for_mutation`],
+/// which is where a resource that takes no mutation is refused instead.
+#[derive(Debug)]
+pub struct MutableTags<'a> {
+    pub tags: &'a mut BTreeMap<String, String>,
+    pub max_tags: usize,
+    pub noun: &'static str,
 }
 
 /// The resource a HealthLake `AmazonResourceName` names, or `None` when the ARN
