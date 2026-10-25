@@ -37,6 +37,8 @@ mod list_keyspaces;
 mod list_types;
 #[path = "all/multi_region_table_replicas.rs"]
 mod multi_region_table_replicas;
+#[path = "all/regional_partitioning.rs"]
+mod regional_partitioning;
 #[path = "all/replication_region_catalog.rs"]
 mod replication_region_catalog;
 #[path = "all/resource_tagging.rs"]

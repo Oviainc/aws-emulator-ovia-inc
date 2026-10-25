@@ -174,14 +174,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
 
         let mut store = state.lock();
-        // The service-managed keyspaces are part of the account before any call.
-        store.ensure_service_managed_catalog(&region);
         // Reporting, not mutating: `settle` only materialises the status changes the clock
         // had already made due at this instant, so this report shows what any caller would
         // have seen now whether or not anybody read the keyspace.
         store.settle(::std::time::SystemTime::now());
 
-        let Some(keyspace) = store.keyspaces.get(&input.keyspace_name) else {
+        // The keyspace this Region holds under the name: one created in it, or the
+        // service-managed keyspace of that name, which every Region holds. A keyspace
+        // created in another Region is not a resource of this one.
+        let Some(keyspace) = store.keyspace(&region, &input.keyspace_name) else {
             return Err(GetKeyspaceErrorModeled::ResourceNotFoundException(
                 crate::state::keyspace_not_found(&region, &input.keyspace_name),
             )
@@ -204,7 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Services Region was added": one entry per Region the keyspace is replicated
             // in, carrying the keyspace's own status in that Region.
             replication_group_statuses: multi_region.then(|| {
-                let progress = tables_replication_progress(keyspace);
+                let progress = tables_replication_progress(&keyspace);
                 keyspace
                     .replication_regions
                     .iter()
