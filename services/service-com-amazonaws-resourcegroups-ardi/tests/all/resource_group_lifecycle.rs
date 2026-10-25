@@ -133,6 +133,18 @@ impl Emulator {
     }
 }
 
+/// A `CreateGroup` request for `name` whose service configuration lets the group
+/// hold static memberships.
+///
+/// `GroupResources` can only be used with a group configured as one of the three
+/// types its documentation names (`smithy_query(query="doc",shape="GroupResources")`),
+/// so every suite that adds a static membership creates its group this way; the
+/// whole catalog, and the refusal for a group outside it, is the sibling
+/// `group_resources_supported_configuration` suite.
+pub(crate) fn static_group(name: &str) -> Value {
+    json!({ "Name": name, "Configuration": [{ "Type": "AWS::EC2::HostManagement" }] })
+}
+
 /// The error code (`__type`) a failure response carries.
 pub(crate) fn error_code(body: &Value) -> &str {
     body.get("__type").and_then(Value::as_str).unwrap_or("<none>")
@@ -720,7 +732,7 @@ async fn modelled_constraint_violations_are_refused_as_bad_request() {
 #[tokio::test]
 async fn membership_reports_the_recorded_arns_with_the_resource_type_derived_from_each() {
     let emulator = Emulator::new();
-    emulator.ok("/groups", &json!({ "Name": "members" })).await;
+    emulator.ok("/groups", &static_group("members")).await;
 
     // (ARN, the CloudFormation-style type name it names, if any)
     let cases: Vec<(&str, Option<&str>)> = vec![
@@ -858,7 +870,7 @@ async fn membership_reports_the_recorded_arns_with_the_resource_type_derived_fro
     emulator
         .ok("/delete-group", &json!({ "Group": "members" }))
         .await;
-    emulator.ok("/groups", &json!({ "Name": "members" })).await;
+    emulator.ok("/groups", &static_group("members")).await;
     let listed = emulator
         .ok("/list-group-resources", &json!({ "Group": "members" }))
         .await;
@@ -874,7 +886,7 @@ async fn membership_reports_the_recorded_arns_with_the_resource_type_derived_fro
 #[tokio::test]
 async fn a_resource_type_filter_selects_only_the_memberships_of_that_type() {
     let emulator = Emulator::new();
-    emulator.ok("/groups", &json!({ "Name": "filtered" })).await;
+    emulator.ok("/groups", &static_group("filtered")).await;
     let instance_a = "arn:aws:ec2:us-east-1:000000000000:instance/i-000000000000000a";
     let instance_b = "arn:aws:ec2:us-east-1:000000000000:instance/i-000000000000000b";
     let volume = "arn:aws:ec2:us-east-1:000000000000:volume/vol-000000000000000a";
@@ -1075,7 +1087,7 @@ async fn paging_walks_every_group_exactly_once_for_every_page_size() {
 #[tokio::test]
 async fn paging_walks_every_membership_exactly_once_for_every_page_size() {
     let emulator = Emulator::new();
-    emulator.ok("/groups", &json!({ "Name": "paged" })).await;
+    emulator.ok("/groups", &static_group("paged")).await;
     let arns: Vec<String> = (1..=6)
         .map(|i| format!("arn:aws:ec2:us-east-1:{ACCOUNT}:instance/i-00000000000000{i:02}"))
         .collect();
@@ -1138,7 +1150,7 @@ async fn paging_walks_every_membership_exactly_once_for_every_page_size() {
 async fn a_pagination_token_is_only_accepted_by_the_listing_that_issued_it() {
     let emulator = Emulator::new();
     for name in ["token-a", "token-b"] {
-        emulator.ok("/groups", &json!({ "Name": name })).await;
+        emulator.ok("/groups", &static_group(name)).await;
     }
     let arns = [
         format!("arn:aws:ec2:us-east-1:{ACCOUNT}:instance/i-000000000000000a"),
@@ -1270,7 +1282,7 @@ async fn an_absent_max_results_pages_at_the_modelled_maximum() {
 
     // The same default applies to a membership listing: 60 members, added ten at a
     // time because `ResourceArns` is modelled 1..10.
-    emulator.ok("/groups", &json!({ "Name": "many-members" })).await;
+    emulator.ok("/groups", &static_group("many-members")).await;
     let mut arns: Vec<String> = (1..=60)
         .map(|i| format!("arn:aws:ec2:us-east-1:{ACCOUNT}:instance/i-{i:017}"))
         .collect();
@@ -1478,7 +1490,7 @@ async fn state_changing_operations_emit_one_audit_record_each() {
     // Each setup call must SUCCEED, or the assertions below would fail as "no record
     // emitted" when the real cause was a refused request.
     for (path, body) in [
-        ("/groups", json!({ "Name": "audited" })),
+        ("/groups", static_group("audited")),
         (
             "/group-resources",
             json!({ "Group": "audited", "ResourceArns": [arn] }),
@@ -1589,7 +1601,7 @@ async fn state_changing_operations_emit_one_audit_record_each() {
 #[tokio::test]
 async fn the_arn_partition_production_decides_which_resource_arns_are_accepted() {
     let emulator = Emulator::new();
-    emulator.ok("/groups", &json!({ "Name": "partitions" })).await;
+    emulator.ok("/groups", &static_group("partitions")).await;
 
     // (label, ARN, the status the partition must produce)
     let cases = [
@@ -1669,7 +1681,7 @@ async fn memberships_belong_to_the_group_they_were_added_to() {
     let one = "arn:aws:ec2:us-east-1:000000000000:instance/i-000000000000000a";
     let two = "arn:aws:ec2:us-east-1:000000000000:instance/i-000000000000000b";
     for (name, arn) in [("left", one), ("right", two)] {
-        emulator.ok("/groups", &json!({ "Name": name })).await;
+        emulator.ok("/groups", &static_group(name)).await;
         emulator
             .ok(
                 "/group-resources",
