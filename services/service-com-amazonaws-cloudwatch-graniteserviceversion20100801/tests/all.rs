@@ -41,5 +41,7 @@ mod metrics_and_alarms;
 mod query_form_metrics;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/sns_action_queue_policy.rs"]
+mod sns_action_queue_policy;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

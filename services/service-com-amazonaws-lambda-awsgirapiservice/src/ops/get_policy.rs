@@ -12,7 +12,10 @@
 //!
 //! A function, version or alias that has no policy at all is a
 //! `ResourceNotFoundException`: there is no document to report, and an empty one would
-//! claim a policy exists.
+//! claim a policy exists. That refusal carries
+//! [`crate::state::RESOURCE_NOT_FOUND_MESSAGE`] — the fixed sentence naming no resource —
+//! while a `FunctionName` that resolves to nothing keeps the resource-identifying form
+//! `crate::state::resolve_function` builds, so a caller can tell the two apart.
 //!
 //! ## Shape of an operation
 //!
@@ -190,12 +193,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         })?;
 
-        let resource = record.versioned_arn(&version);
+        // The function, version or alias resolved, so what is missing is the POLICY, not
+        // the resource the request named: the refusal is the fixed sentence that names no
+        // resource, leaving the resource-identifying form to a request that resolves to
+        // nothing. A caller reconciling grants can then tell "no such function" from
+        // "this function holds no policy yet".
         let Some(policy) = record.policies.get(&version) else {
             return Err(GetPolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     r#type: None,
-                    message: Some(format!("The resource you requested does not exist. Resource: {resource}")),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

@@ -55,6 +55,10 @@ pub(crate) struct Answer {
     pub(crate) body_bytes: Vec<u8>,
     /// The `Content-Type` the answer carried, empty when it carried none.
     pub(crate) content_type: String,
+    /// The `Content-Encoding` the answer carried, empty when it carried none — the
+    /// compression a blob payload is in (`GetImageSetMetadata`'s
+    /// `imageSetMetadataBlob`).
+    pub(crate) content_encoding: String,
     /// The wire error code (`x-amzn-errortype`, else the body's `__type`), with any
     /// `namespace#` prefix stripped. Empty on a success.
     pub(crate) error_code: String,
@@ -133,6 +137,12 @@ impl Emulator {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_string();
+        let content_encoding = response
+            .headers()
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
         let header_code = response
             .headers()
             .get("x-amzn-errortype")
@@ -162,6 +172,7 @@ impl Emulator {
             body,
             body_bytes: response.body().to_vec(),
             content_type,
+            content_encoding,
             error_code,
         }
     }

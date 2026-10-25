@@ -19,6 +19,8 @@ mod export_jobs;
 mod export_listing;
 #[path = "all/export_listing_order.rs"]
 mod export_listing_order;
+#[path = "all/job_identifier_syntax.rs"]
+mod job_identifier_syntax;
 #[path = "all/owed_status_due_instants.rs"]
 mod owed_status_due_instants;
 #[path = "all/resource_tags.rs"]

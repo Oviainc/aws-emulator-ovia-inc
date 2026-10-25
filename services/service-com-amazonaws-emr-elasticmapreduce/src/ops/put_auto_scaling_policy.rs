@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAutoScalingPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAutoScalingPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAutoScalingPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches an automatic scaling policy to one instance group of a cluster, or replaces
+//! the one already attached: the request's policy is persisted on that group's record,
+//! where `ListInstanceGroups` reads it back, and the response projects the PERSISTED
+//! policy — `ATTACHING` until the clock makes the attach due, then `ATTACHED`. A cluster
+//! the service holds no record for, a group that cluster does not carry, a group whose
+//! role nothing scales, and a policy whose capacity boundaries cannot hold together are
+//! all REFUSED (400 `ValidationException`) rather than silently accepted.
 //!
 //! ## Shape of an operation
 //!
@@ -87,9 +86,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-emr-elasticmapreduce.js
 // here — hence the `PutAutoScalingPolicyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.emr#PutAutoScalingPolicy")]
+// `InternalServerException` is widened in through `extra_errors`: this SERVICE models it
+// ("This exception occurs when there is an internal failure in the Amazon EMR service.")
+// and `DescribeCluster` declares it, but this operation's own `errors` list is empty —
+// so without the widening an unreachable shared store would have no modelled failure to
+// answer with.
+#[smithy_macros::operation_error(
+    "com.amazonaws.emr#PutAutoScalingPolicy",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum PutAutoScalingPolicyErrorModeled {
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -143,18 +151,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAutoScalingPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAutoScalingPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state::instance_group_type;
+
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutAutoScalingPolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the EMR cluster store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // The attach this call starts is itself clock-owed, and the group's own
+        // provisioning span is what the policy's state is reported beside, so every
+        // transition already due is materialised before this one is recorded.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAutoScalingPolicy"))
+        // This operation models no client error, so a request it must refuse is answered
+        // with the 400 `ValidationException` channel rather than a 501 or an empty 200.
+        let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::unknown_cluster_message(&input.cluster_id),
+            ));
+        };
+        let cluster_arn = cluster.arn.clone();
+
+        let Some(group) = cluster.group_mut(&input.instance_group_id) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::unknown_instance_group_message(&input.instance_group_id),
+            ));
+        };
+
+        // "Creates or updates an automatic scaling policy for a core instance group or
+        // task instance group" (this operation's doc): the role of a group IS its type,
+        // and the group that runs the primary node scales with nothing.
+        if !instance_group_type::AUTO_SCALABLE.contains(&group.config.instance_role.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "An automatic scaling policy is supported for an instance group of type \
+                 {} or {}, and instance group '{}' is of type '{}'.",
+                instance_group_type::CORE,
+                instance_group_type::TASK,
+                input.instance_group_id,
+                group.config.instance_role,
+            )));
+        }
+
+        // A policy the model accepts but the service cannot hold to (a lower capacity
+        // boundary above the upper one) is refused, not stored.
+        if let Err(message) = crate::state::validate_auto_scaling_policy(&input.auto_scaling_policy)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        // What the response reports is the PERSISTED policy, projected out of the record
+        // the write produced — never the request's own shape.
+        group.attach_auto_scaling_policy(input.auto_scaling_policy, now);
+        let auto_scaling_policy = group.to_auto_scaling_policy();
+        drop(store);
+
+        Ok(PutAutoScalingPolicyOutput {
+            cluster_id: Some(input.cluster_id),
+            instance_group_id: Some(input.instance_group_id),
+            auto_scaling_policy,
+            cluster_arn: Some(cluster_arn),
+        })
     }
 }
+

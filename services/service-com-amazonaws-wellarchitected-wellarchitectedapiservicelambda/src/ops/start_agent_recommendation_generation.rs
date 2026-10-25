@@ -239,7 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 StartAgentRecommendationGenerationErrorModeled::ValidationException(
                     crate::state::member_constraint_exception(
-                        PROFILE_ARN_MEMBER,
+                        crate::state::PROFILE_ARN_MEMBER,
                         &format!(
                             "Member must name an agent profile of account {}, got {}",
                             ::engine::emulator_account_id(),
@@ -367,11 +367,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(output)
     }
 }
-
-/// The modelled input member a profile-resolution finding names
-/// (`StartAgentRecommendationGenerationRequest$profileArn`), as
-/// `ValidationExceptionField$Name` reports it.
-const PROFILE_ARN_MEMBER: &str = "profileArn";
 
 /// The member a recommendation-type finding names
 /// (`StartAgentRecommendationGenerationRequest$types`).

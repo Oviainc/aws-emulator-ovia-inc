@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePackageVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePackageVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePackageVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates one version of a software package in place: every member the request
+//! supplies replaces the stored one, a member it leaves out keeps the value the record
+//! already holds, and `action` assigns the status the package version lifecycle moves
+//! to — so `GetPackageVersion` reads back exactly what this call changed and nothing
+//! else.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +157,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePackageVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePackageVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePackageVersion"))
+        // No region is read here: the version's ARN was minted by the create, and this
+        // call changes none of its identity.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdatePackageVersionErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // `action` is "the status that the package version should be assigned", so the
+        // status it names is resolved before anything is written. A value outside the
+        // modelled enum is refused by the boundary validator before this handler runs;
+        // the refusal below is what keeps an unnamed action from silently assigning
+        // nothing were one ever to reach here.
+        let assigned_status = match input.action.as_deref() {
+            None => None,
+            Some(action) => Some(
+                crate::state::package_version_status_for_action(action).ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::validation(format!(
+                        "Value '{action}' at 'action' failed to satisfy constraint: \
+                         Member must satisfy enum value set: [{}]",
+                        super::types::PACKAGE_VERSION_ACTION_VALUES.join(", ")
+                    ))
+                })?,
+            ),
+        };
+
+        let mut store = state.lock();
+
+        // A version is the pair `(packageName, versionName)`, so a pair the catalog does
+        // not hold has nothing to update: the modelled `ResourceNotFoundException`
+        // (HTTP 404, "The specified resource does not exist"), never a 200 that wrote
+        // nothing.
+        let version = store
+            .packages
+            .get_mut(&input.package_name)
+            .and_then(|package| package.versions.get_mut(&input.version_name))
+            .ok_or_else(|| {
+                UpdatePackageVersionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Version {} of package {} does not exist",
+                            input.version_name, input.package_name
+                        )),
+                    },
+                )
+            })?;
+
+        // "Attributes can be updated only when the package version is in a draft state"
+        // (`UpdatePackageVersionRequest$attributes`) — the draft state being the one a
+        // create enters, [`crate::state::NEW_PACKAGE_VERSION_STATUS`]. Supplying them
+        // for a version that has moved on conflicts with the status the version holds,
+        // which is what this operation's `ConflictException` (HTTP 409, "The request
+        // conflicts with the current state of the resource") names, and the record is
+        // left exactly as it was. The status is read BEFORE the action is applied, so
+        // the state the request arrived at is what decides.
+        if input.attributes.is_some() && version.status != crate::state::NEW_PACKAGE_VERSION_STATUS
+        {
+            return Err(UpdatePackageVersionErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Attributes can be updated only when the package version is in a \
+                         draft state; version {} of package {} is {}",
+                        version.version_name, version.package_name, version.status
+                    )),
+                    resource_id: Some(version.version_name.clone()),
+                },
+            )
+            .into());
+        }
+
+        // Each supplied member replaces the stored value and an absent one leaves it
+        // alone: this operation updates the fields of a version that already exists, so
+        // it is never a re-create of the record. `attributes` is a map whose keys are
+        // its entries' identities, so the map given REPLACES the stored one rather than
+        // merging into it — which is how a request carrying no entries at all leaves the
+        // version with no attributes.
+        if let Some(description) = input.description {
+            version.description = Some(description);
+        }
+        if let Some(attributes) = input.attributes {
+            version.attributes = attributes.into_iter().collect();
+        }
+        if let Some(artifact) = input.artifact {
+            version.artifact = Some(artifact);
+        }
+        if let Some(recipe) = input.recipe {
+            version.recipe = Some(recipe);
+        }
+        if let Some(status) = assigned_status {
+            version.status = status.to_string();
+        }
+        // "The date when the package version was last updated": this call is that
+        // update, so the stamp moves while the creation date stays where the create put
+        // it.
+        version.last_modified_date = ::std::time::SystemTime::now();
+
+        // `UpdatePackageVersionResponse` binds no members, so a successful update
+        // answers 200 with nothing in it; what it changed is read back through
+        // `GetPackageVersion`.
+        Ok(UpdatePackageVersionOutput {})
     }
 }

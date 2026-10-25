@@ -71,3 +71,5 @@ mod state_roundtrip;
 mod subscriber_creation;
 #[path = "all/subscriber_notification_reads.rs"]
 mod subscriber_notification_reads;
+#[path = "all/subscriber_set_identity.rs"]
+mod subscriber_set_identity;

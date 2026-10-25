@@ -15,6 +15,8 @@
 mod api_cache;
 #[path = "all/api_cache_create_rules.rs"]
 mod api_cache_create_rules;
+#[path = "all/api_key_update.rs"]
+mod api_key_update;
 #[path = "all/data_source_service_role.rs"]
 mod data_source_service_role;
 #[path = "all/data_source_update.rs"]

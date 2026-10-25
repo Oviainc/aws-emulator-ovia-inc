@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/api_key_listing.rs"]
 mod api_key_listing;
+#[path = "all/api_key_minting.rs"]
+mod api_key_minting;
 #[path = "all/check_capacity.rs"]
 mod check_capacity;
 #[path = "all/exception_messages.rs"]

@@ -277,21 +277,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `PreferredDayTimeMaintenanceConfiguration$Time` is "the preferred time for
         // maintenance operations" — a time of day, in the 24-hour `HH:MM` form this service
-        // documents for the same preference on a flow (see
-        // `crate::state::maintenance_time_of_day`). A string that names no time of day names
-        // no preference either, and the maintenance window StartRouterInput schedules is
-        // derived from it, so the create refuses it here rather than storing a preference no
-        // window can be scheduled inside.
-        if let Some(MaintenanceConfiguration::PreferredDayTime(preference)) =
-            input.maintenance_configuration.as_ref()
+        // documents for the same preference on a flow. A string that names no time of day
+        // names no preference either, and the maintenance window StartRouterInput schedules
+        // is derived from it, so the create refuses it here rather than storing a preference
+        // no window can be scheduled inside. The rule and its sentence live in
+        // `crate::state`, so every operation that takes a maintenance configuration refuses
+        // the same preference the same way.
+        if let Some(rejection) = input
+            .maintenance_configuration
+            .as_ref()
+            .and_then(crate::state::maintenance_configuration_rejection)
         {
-            if crate::state::maintenance_time_of_day(&preference.time).is_none() {
-                return Err(bad_request(format!(
-                    "MaintenanceConfiguration PreferredDayTime Time {:?} is not a time of \
-                     day. Use 24-hour HH:MM format, for example 02:00.",
-                    preference.time
-                )));
-            }
+            return Err(bad_request(rejection));
         }
 
         let now = ::std::time::SystemTime::now();
