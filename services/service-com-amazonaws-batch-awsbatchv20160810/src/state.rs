@@ -37,7 +37,10 @@
 //! SageMaker AI, so a service job `SubmitServiceJob` accepted walks the same
 //! clock-owed chain (`SUBMITTED` -> `RUNNABLE`) and then ends in the modelled failure
 //! state with [`NO_SERVICE_JOB_RUNTIME_REASON`], with no `scheduledAt`, `startedAt`,
-//! attempt or capacity usage invented for it.
+//! attempt or capacity usage invented for it. A service job the service environments of
+//! its queue publish no room for is never placed at all, so it RESTS in `RUNNABLE` until
+//! a later call publishes the capacity it asked for
+//! ([`ComAmazonawsBatchAwsbatchv20160810State::rearm_resting_service_jobs`]).
 //!
 //! # Every job state change is published to EventBridge
 //!
@@ -128,6 +131,32 @@ pub mod limits {
     /// same eviction-before-refusal rule
     /// ([`super::ComAmazonawsBatchAwsbatchv20160810State::insert_service_job`]).
     pub const MAX_SERVICE_JOBS: usize = 500;
+
+    /// How many bytes of `SubmitServiceJob$serviceRequestPayload` this service stores for
+    /// one service job. An EMULATOR bound (AWS publishes none for the member): the payload
+    /// is a caller-supplied string kept on the record and read once to derive what capacity
+    /// the job asks for ([`super::requested_capacity`]), so a submit past this answers the
+    /// modelled `ClientException` rather than letting one request decide how much is stored
+    /// and parsed. 1 MiB, which is far more than a SageMaker training request needs.
+    pub const MAX_SERVICE_REQUEST_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+    /// How many instance groups of one service job's request are weighed against a service
+    /// environment's capacity ([`super::requested_capacity`]). An EMULATOR bound: the
+    /// request chooses how many groups it names, so the derived demand is capped here
+    /// instead, which is what keeps the admission check constant-sized per record.
+    pub const MAX_REQUESTED_INSTANCE_GROUPS: usize = 16;
+
+    /// How many `capacityLimits` entries ONE service environment publishes. An EMULATOR
+    /// bound (AWS publishes no quota and the model declares no length): the list is filled
+    /// by `CreateServiceEnvironment`/`UpdateServiceEnvironment` and is walked whenever a
+    /// service job is weighed against the environment, so a request past this answers the
+    /// modelled `ClientException`.
+    pub const MAX_SERVICE_ENVIRONMENT_CAPACITY_LIMITS: usize = 20;
+
+    /// How many `serviceEnvironmentOrder` entries ONE job queue carries, bounded for the
+    /// same reason as the capacity limits above: the list is caller-filled and is walked
+    /// when a service job of the queue is placed.
+    pub const MAX_SERVICE_ENVIRONMENT_ORDER_ENTRIES: usize = 10;
 
     /// Scheduling policies kept at once. An EMULATOR bound (AWS publishes no quota for
     /// this resource): `CreateSchedulingPolicy` fills the store and anyone can repeat it,
@@ -1305,6 +1334,11 @@ pub struct ServiceJob {
     pub quota_share_name: Option<String>,
     pub scheduling_priority: Option<i32>,
     pub service_request_payload: Option<String>,
+    /// What capacity this job asks for, derived from `service_request_payload` ONCE, when
+    /// the submit was accepted ([`requested_capacity`]): what the scheduler weighs against
+    /// the capacity the queue's service environments publish, so no later call re-reads the
+    /// payload. Empty for a request that states no capacity this service can measure.
+    pub requested_capacity: Vec<InstanceDemand>,
     pub retry_strategy: Option<ServiceJobRetryStrategy>,
     pub timeout_config: Option<ServiceJobTimeout>,
     pub preemption_configuration: Option<ServiceJobPreemptionConfiguration>,
@@ -1323,6 +1357,158 @@ pub struct ServiceJob {
 /// Whether a `ServiceJobStatus` is one a service job never leaves.
 pub fn is_terminal_service_job_status(status: &str) -> bool {
     matches!(status, SERVICE_JOB_SUCCEEDED | SERVICE_JOB_FAILED)
+}
+
+/// The `CapacityLimit$capacityUnit` that counts INSTANCES whatever their type.
+///
+/// The member's own doc: "For `SAGEMAKER_TRAINING` jobs in a quota management enabled
+/// service environment, specify the instance type (for example, `ml.m5.large`). Otherwise,
+/// use `NUM_INSTANCES`" — so a limit's unit is either an instance type or this.
+pub const CAPACITY_UNIT_NUM_INSTANCES: &str = "NUM_INSTANCES";
+
+/// Whether a caller-filled list this service STORES and later walks fits the maximum it is
+/// kept to; the refusal detail naming the member, what it holds and the maximum otherwise.
+///
+/// Every list below is walked on a path a later request drives (a service job weighed
+/// against the capacity its queue's environments publish), so each one is kept to a maximum
+/// rather than letting one request decide how much work a later one costs.
+pub fn validate_stored_list_length(
+    member: &str,
+    held: usize,
+    maximum: usize,
+) -> Result<(), String> {
+    if held > maximum {
+        return Err(format!(
+            "{member} names {held} entries: at most {maximum} are stored"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `payload` fits [`limits::MAX_SERVICE_REQUEST_PAYLOAD_BYTES`], the refusal detail
+/// naming its size and the maximum otherwise.
+pub fn validate_service_request_payload(payload: &str) -> Result<(), String> {
+    if payload.len() > limits::MAX_SERVICE_REQUEST_PAYLOAD_BYTES {
+        return Err(format!(
+            "serviceRequestPayload is {} bytes: at most {} are stored",
+            payload.len(),
+            limits::MAX_SERVICE_REQUEST_PAYLOAD_BYTES
+        ));
+    }
+    Ok(())
+}
+
+/// How many instances of one kind a service job's request asks for: the instance type the
+/// group wants (when the request states one) and how many instances of it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstanceDemand {
+    pub instance_type: Option<String>,
+    pub instances: i32,
+}
+
+/// How much capacity ONE service job asks for: one entry per instance group its request
+/// names, derived ONCE when the submit is accepted and kept on the record
+/// ([`ServiceJob::requested_capacity`]), so no later call re-reads the payload.
+///
+/// `SubmitServiceJob$serviceRequestPayload` is "the request, in JSON, for the service that
+/// the `SubmitServiceJob` operation is queueing", and for a `SAGEMAKER_TRAINING` job that
+/// request is a SageMaker training request: the instances it needs are its `ResourceConfig`
+/// (`InstanceType`/`InstanceCount`, and an `InstanceGroups` entry per group of a
+/// heterogeneous cluster). A payload that states no `ResourceConfig` — or that is not an
+/// object at all — asks for no capacity this service can measure, which is the EMPTY
+/// demand: nothing to weigh against a limit.
+///
+/// At most [`limits::MAX_REQUESTED_INSTANCE_GROUPS`] groups are read, so the work and the
+/// list this returns are bounded by a constant rather than by how many groups one request
+/// names.
+pub fn requested_capacity(payload: &str) -> Vec<InstanceDemand> {
+    let Ok(request) = ::serde_json::from_str::<::serde_json::Value>(payload) else {
+        return Vec::new();
+    };
+    let Some(resources) = request.get("ResourceConfig") else {
+        return Vec::new();
+    };
+    let mut requested: Vec<InstanceDemand> = resources
+        .get("InstanceGroups")
+        .and_then(|groups| groups.as_array())
+        .map(|groups| {
+            groups
+                .iter()
+                .filter_map(instance_demand)
+                .take(limits::MAX_REQUESTED_INSTANCE_GROUPS)
+                .collect()
+        })
+        .unwrap_or_default();
+    if requested.len() < limits::MAX_REQUESTED_INSTANCE_GROUPS {
+        requested.extend(instance_demand(resources));
+    }
+    requested
+}
+
+/// The instances one `ResourceConfig` (or one of its `InstanceGroups` entries) asks for;
+/// `None` when it states no `InstanceCount`.
+fn instance_demand(resources: &::serde_json::Value) -> Option<InstanceDemand> {
+    let instances = i32::try_from(resources.get("InstanceCount")?.as_i64()?).ok()?;
+    let instance_type = resources
+        .get("InstanceType")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    Some(InstanceDemand {
+        instance_type,
+        instances,
+    })
+}
+
+/// Whether the capacity `limits` publish admits everything `requested` asks for
+/// ([`requested_capacity`]).
+///
+/// A limit admits an entry when it is measured in the entry's own instance type and its
+/// `maxCapacity` covers that entry, or it is measured in [`CAPACITY_UNIT_NUM_INSTANCES`]
+/// and its `maxCapacity` covers the instances the whole request needs. A limit that states
+/// no unit or no maximum publishes no bound, so it refuses nothing, and so does an
+/// environment that publishes no limits at all; limits that publish nothing about an
+/// entry's instance type cannot admit it.
+///
+/// The limits are folded into one maximum per unit FIRST, so the answer costs one pass over
+/// each of the two lists rather than a pass over the limits per requested entry, and both
+/// lists are themselves bounded ([`limits::MAX_SERVICE_ENVIRONMENT_CAPACITY_LIMITS`],
+/// [`limits::MAX_REQUESTED_INSTANCE_GROUPS`]).
+pub fn capacity_admits(limits: &[CapacityLimit], requested: &[InstanceDemand]) -> bool {
+    if limits.is_empty() || requested.is_empty() {
+        return true;
+    }
+    // The largest maximum published per unit, and whether any limit publishes no bound at
+    // all (no unit or no maximum), which admits anything.
+    let mut unbounded = false;
+    let mut by_unit: BTreeMap<&str, i32> = BTreeMap::new();
+    for limit in limits {
+        match (limit.capacity_unit.as_deref(), limit.max_capacity) {
+            (Some(unit), Some(maximum)) => {
+                let held = by_unit.entry(unit).or_insert(maximum);
+                *held = (*held).max(maximum);
+            }
+            _ => unbounded = true,
+        }
+    }
+    if unbounded {
+        return true;
+    }
+    // Saturating, because the counts come from a caller's payload: a request naming many
+    // huge instance groups must not overflow the sum it is weighed with.
+    let total: i32 = requested
+        .iter()
+        .fold(0_i32, |running, demand| {
+            running.saturating_add(demand.instances)
+        });
+    let instances_published = by_unit.get(CAPACITY_UNIT_NUM_INSTANCES).copied();
+    requested.iter().all(|demand| {
+        instances_published.is_some_and(|maximum| maximum >= total)
+            || demand.instance_type.as_deref().is_some_and(|wanted| {
+                by_unit
+                    .get(wanted)
+                    .is_some_and(|maximum| *maximum >= demand.instances)
+            })
+    })
 }
 
 /// What a job's dependencies allow right now.
@@ -1398,11 +1584,24 @@ pub fn client_exception_message(detail: &str, request_id: &str) -> String {
 /// The ARN comes from the REQUEST ([`resolved_arn`]) — the resource is not stored, so it
 /// has no ARN of its own — and nothing else is stated: the identifier the caller gave is
 /// what fills the sentence. Recorded in exactly this form for `UpdateComputeEnvironment`,
-/// `DescribeConsumableResource` and `DescribeServiceJob`; the job-queue resolver
-/// (`UpdateJobQueue`, `DeleteJobQueue`) and the quota-share one terminate the same
-/// sentence with a period, so those call sites add it.
+/// `DescribeConsumableResource` and `DescribeServiceJob`; the resolvers that terminate the
+/// same sentence with a period take [`does_not_exist_sentence`] instead.
 pub fn does_not_exist_message(arn: &str) -> String {
     format!("{arn} does not exist")
+}
+
+/// [`does_not_exist_message`] as the resolvers that TERMINATE the sentence word it: the
+/// same sentence, closed with a period.
+///
+/// The job-queue resolver (`UpdateJobQueue`), the quota-share one (`DescribeQuotaShare`),
+/// the scheduling-policy one (`UpdateSchedulingPolicy`) and the queue reference a
+/// `CreateQuotaShare` only refers to are each recorded ending the sentence this way, so the
+/// period is built here once instead of at every call site. What fills the sentence is
+/// still the call site's: the resolvers that act ON a resource name the ARN they resolved
+/// it to ([`resolved_arn`]), while a call that only REFERS to one echoes the reference the
+/// request gave.
+pub fn does_not_exist_sentence(arn: &str) -> String {
+    format!("{}.", does_not_exist_message(arn))
 }
 
 /// A [`does_not_exist_message`] refusal: the modelled `ClientException` (HTTP 400) for an
@@ -2008,21 +2207,44 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
 
     /// Advance the service jobs the clock owes a transition at `now`.
     ///
-    /// A service job's work is dispatched to another service, which nothing here runs, so
-    /// the chain is the same shape as a job's and just as short: `SUBMITTED` ->
-    /// `RUNNABLE` -> `FAILED` with [`NO_SERVICE_JOB_RUNTIME_REASON`], each step
-    /// [`JOB_PHASE_MILLIS`] after the one before it. A record owes at most those two
-    /// moves, and the store is capped by [`limits::MAX_SERVICE_JOBS`], so the work one
-    /// call does is bounded. Nothing is invented on the way: a job that was never
-    /// dispatched gets no `scheduledAt`, `startedAt` or attempt.
+    /// A service job the service accepted is `SUBMITTED`, and one span later the scheduler
+    /// has looked at it: a job whose requested capacity the service environments of its
+    /// queue publish room for becomes `RUNNABLE` and is then owed its next move, while one
+    /// that CANNOT be placed becomes `RUNNABLE` and RESTS there — it owes nothing, because
+    /// no capacity is coming until a later call publishes it
+    /// ([`Self::service_job_is_placeable`], [`Self::rearm_resting_service_jobs`]).
+    ///
+    /// A placeable job's work is dispatched to another service, which nothing here runs, so
+    /// its chain ends one span later in `FAILED` with [`NO_SERVICE_JOB_RUNTIME_REASON`]. A
+    /// record therefore owes at most two moves, and the store is capped by
+    /// [`limits::MAX_SERVICE_JOBS`], so the work one call does is bounded. Nothing is
+    /// invented on the way: a job that was never dispatched gets no `scheduledAt`,
+    /// `startedAt` or attempt.
     fn advance_service_jobs(&mut self, now: i64) {
+        // Whether a job can be placed is read from the queue and its service environments,
+        // so it is decided for every job the clock owes a move BEFORE anything is written.
+        let unplaceable: BTreeSet<String> = self
+            .service_jobs
+            .values()
+            .filter(|job| {
+                job.next_phase_due_at.is_some_and(|due| due <= now)
+                    && !self.service_job_is_placeable(job)
+            })
+            .map(|job| job.job_id.clone())
+            .collect();
         for job in self.service_jobs.values_mut() {
             while let Some(due) = job.next_phase_due_at.filter(|due| *due <= now) {
+                let placeable = !unplaceable.contains(&job.job_id);
                 match job.status.as_str() {
                     SERVICE_JOB_SUBMITTED => {
                         job.status = SERVICE_JOB_RUNNABLE.to_string();
-                        job.next_phase_due_at = Some(due + JOB_PHASE_MILLIS);
+                        job.next_phase_due_at =
+                            placeable.then_some(due + JOB_PHASE_MILLIS);
                     }
+                    // A job that cannot be placed stays where it is: `RUNNABLE` is where a
+                    // service job waits for capacity, and nothing terminal may be reported
+                    // for work the scheduler never handed on.
+                    SERVICE_JOB_RUNNABLE if !placeable => job.next_phase_due_at = None,
                     SERVICE_JOB_RUNNABLE => {
                         job.status = SERVICE_JOB_FAILED.to_string();
                         job.status_reason = Some(NO_SERVICE_JOB_RUNTIME_REASON.to_string());
@@ -2033,6 +2255,67 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                     // record into, so nothing is owed from it.
                     _ => job.next_phase_due_at = None,
                 }
+            }
+        }
+    }
+
+    /// Whether the service environments behind `job`'s queue publish room for the capacity
+    /// its request asks for ([`ServiceJob::requested_capacity`], [`capacity_admits`]).
+    ///
+    /// A service job is placed into ONE of the service environments its queue orders, so it
+    /// is placeable as soon as any of them admits the whole request. A demand nothing here
+    /// can measure (a payload stating no `ResourceConfig`), a queue or an environment this
+    /// store no longer holds, and an environment that publishes no capacity limits all
+    /// state no bound, so none of them holds a job back.
+    ///
+    /// The demand was derived when the submit was accepted and is read off the record, so
+    /// this costs one walk of two bounded lists
+    /// ([`limits::MAX_SERVICE_ENVIRONMENT_ORDER_ENTRIES`],
+    /// [`limits::MAX_SERVICE_ENVIRONMENT_CAPACITY_LIMITS`]) and never re-reads a payload.
+    fn service_job_is_placeable(&self, job: &ServiceJob) -> bool {
+        if job.requested_capacity.is_empty() {
+            return true;
+        }
+        let Some(queue) = self.job_queue(&job.job_queue_arn) else {
+            return true;
+        };
+        let Some(order) = queue
+            .service_environment_order
+            .as_ref()
+            .filter(|order| !order.is_empty())
+        else {
+            return true;
+        };
+        order.iter().any(|entry| {
+            self.service_environment(&entry.service_environment)
+                .is_none_or(|environment| {
+                    capacity_admits(&environment.capacity_limits, &job.requested_capacity)
+                })
+        })
+    }
+
+    /// Owe the next move again to every service job resting in `RUNNABLE` that the capacity
+    /// a call has just published now admits ([`Self::service_job_is_placeable`]).
+    ///
+    /// A resting job owes nothing while its queue's service environments cannot hold it, so
+    /// the call that publishes the capacity it needs — one that raises an environment's own
+    /// `capacityLimits` (`UpdateServiceEnvironment`), or one that gives the queue a
+    /// different `serviceEnvironmentOrder` (`UpdateJobQueue`) — is what makes its next move
+    /// due, one span later, like every other transition this service owes.
+    pub fn rearm_resting_service_jobs(&mut self, now: i64) {
+        let resting: Vec<String> = self
+            .service_jobs
+            .values()
+            .filter(|job| {
+                job.status == SERVICE_JOB_RUNNABLE
+                    && job.next_phase_due_at.is_none()
+                    && self.service_job_is_placeable(job)
+            })
+            .map(|job| job.job_id.clone())
+            .collect();
+        for id in resting {
+            if let Some(job) = self.service_jobs.get_mut(&id) {
+                job.next_phase_due_at = Some(now + JOB_PHASE_MILLIS);
             }
         }
     }
@@ -2658,14 +2941,29 @@ pub fn is_scheduling_policy_reference(region: &str, value: &str) -> bool {
 /// checked here by every operation that accepts a quota-share policy.
 pub const QUOTA_SHARE_IDLE_RESOURCE_ASSIGNMENT_STRATEGIES: [&str; 1] = ["FIFO"];
 
-/// What an update that would change a scheduling policy's KIND is refused with.
+/// The name of the member a fair-share scheduling policy is carried on, which is the name
+/// AWS Batch uses for that policy KIND in the refusal of a type change
+/// ([`policy_kind_change_message`]).
+pub const FAIRSHARE_POLICY_KIND: &str = "fairsharePolicy";
+
+/// The name of the member a quota-share scheduling policy is carried on — the other kind
+/// a scheduling policy can have ([`FAIRSHARE_POLICY_KIND`]).
+pub const QUOTA_SHARE_POLICY_KIND: &str = "quotaSharePolicy";
+
+/// What an update that would change a scheduling policy's KIND is refused with: the kind
+/// the stored policy has, the kind the request asked for, and what to do instead.
 ///
 /// "Once set during creation, a fairsharePolicy cannot be removed or changed to a
 /// quotaSharePolicy" (`UpdateSchedulingPolicy$fairsharePolicy`), and the mirror sentence on
-/// `$quotaSharePolicy`: the kind a policy was created with is the kind it keeps.
-pub const POLICY_KIND_IS_FIXED: &str =
-    "A scheduling policy's fairsharePolicy or quotaSharePolicy cannot be changed to the other \
-     once it is set";
+/// `$quotaSharePolicy`: the kind a policy was created with is the kind it keeps, and the
+/// only way to the other kind is a new policy. The refusal is built from the request, so it
+/// states WHICH direction was refused rather than the rule in the abstract.
+pub fn policy_kind_change_message(from: &str, to: &str) -> String {
+    format!(
+        "Cannot change scheduling policy type from {from} to {to}. Create a new scheduling \
+         policy instead."
+    )
+}
 
 /// The refusal detail when a request carries a policy of neither kind or of both.
 ///
@@ -2732,13 +3030,14 @@ pub fn validate_fairshare_policy(policy: &FairsharePolicy) -> Result<(), String>
     }
     let distribution = policy.share_distribution.as_deref().unwrap_or_default();
     // The ENTRY COUNT is bounded before any work proportional to it: the list comes
-    // straight from the request, so a longer one is refused rather than walked.
-    if distribution.len() > MAX_SHARE_DISTRIBUTION_ENTRIES {
-        return Err(format!(
-            "fairsharePolicy shareDistribution accepts at most {MAX_SHARE_DISTRIBUTION_ENTRIES} share identifiers, not {}",
-            distribution.len()
-        ));
-    }
+    // straight from the request, so a longer one is refused rather than walked. The same
+    // sentence every other stored list is kept to ([`validate_stored_list_length`]), so the
+    // wording cannot drift between them.
+    validate_stored_list_length(
+        "fairsharePolicy shareDistribution",
+        distribution.len(),
+        MAX_SHARE_DISTRIBUTION_ENTRIES,
+    )?;
     for share in distribution {
         if !is_valid_share_identifier(&share.share_identifier) {
             return Err(format!(

@@ -178,12 +178,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let Some(share) = state.quota_shares.get(&input.quota_share_arn) else {
             // The resolver's refusal, in the envelope the quota-share refusals carry and
-            // terminated the way the job-queue resolver's is
-            // ([`batch::does_not_exist_message`]).
+            // terminated the way the resolvers that close the sentence do
+            // ([`batch::does_not_exist_sentence`]).
             return Err(DescribeQuotaShareErrorModeled::ClientException(
-                batch::client_exception_enveloped(format!(
-                    "{}.",
-                    batch::does_not_exist_message(&input.quota_share_arn)
+                batch::client_exception_enveloped(batch::does_not_exist_sentence(
+                    &input.quota_share_arn,
                 )),
             )
             .into());
