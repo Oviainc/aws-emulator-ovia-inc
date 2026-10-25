@@ -298,6 +298,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // And the growth INSIDE one authorizer: `IdentitySourceList` carries no modelled
+        // length constraint, and every request the api's authorization step serves reads
+        // the whole list, so the list one call stores is bounded here.
+        if input.identity_source.len() > crate::state::MAX_IDENTITY_SOURCES_PER_AUTHORIZER {
+            return Err(CreateAuthorizerErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    limit_type: Some("IdentitySource".to_string()),
+                    message: Some(format!(
+                        "The maximum number of identity sources ({}) for an authorizer has \
+                         been reached.",
+                        crate::state::MAX_IDENTITY_SOURCES_PER_AUTHORIZER
+                    )),
+                },
+            )
+            .into());
+        }
+
         let authorizer_id = api.mint_authorizer_id();
         let record = crate::state::Authorizer {
             authorizer_id: authorizer_id.clone(),
