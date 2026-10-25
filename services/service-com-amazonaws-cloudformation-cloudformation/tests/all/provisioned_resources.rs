@@ -584,8 +584,8 @@ async fn a_refused_resource_fails_the_deployment() {
     let (status, reason) = deploy(&router, "refused-stack", &template).await;
     assert_eq!(
         status.as_deref(),
-        Some("CREATE_FAILED"),
-        "expected the create to fail, got {status:?} ({reason:?})"
+        Some("ROLLBACK_COMPLETE"),
+        "expected the failed create to be rolled back, got {status:?} ({reason:?})"
     );
     let reason = reason.unwrap_or_default();
     assert!(
@@ -686,8 +686,8 @@ async fn a_declaration_missing_a_required_property_fails_the_deployment() {
     let (status, reason) = deploy(&router, "trustless-stack", &template).await;
     assert_eq!(
         status.as_deref(),
-        Some("CREATE_FAILED"),
-        "expected the create to fail, got {status:?} ({reason:?})"
+        Some("ROLLBACK_COMPLETE"),
+        "expected the failed create to be rolled back, got {status:?} ({reason:?})"
     );
     let reason = reason.unwrap_or_default();
     assert!(

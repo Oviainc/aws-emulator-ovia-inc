@@ -614,6 +614,48 @@ pub async fn delete(
     outcome
 }
 
+/// How many times the UNWIND of a failed operation asks the owning services to delete
+/// what that operation had already made.
+///
+/// A service that answers a create while the resource is still coming up refuses to
+/// delete it until it is up (Amazon Data Firehose answers `DeleteDeliveryStream` for a
+/// stream it is still creating with "cannot be deleted in CREATING state"), and
+/// CloudFormation's rollback is what waits for that: `ROLLBACK_IN_PROGRESS` is a status a
+/// stack sits in until the resources are gone. The wait is BOUNDED — these attempts, one
+/// [`UNWIND_RETRY_DELAY`] apart — so a service that refuses the delete for any other
+/// reason is reported rather than waited on forever.
+const UNWIND_ATTEMPTS: usize = 6;
+
+/// How long the unwind waits before asking again. Chosen: shorter than the status spans
+/// the services this emulator calls give a resource that is coming up, so the first
+/// attempt after one of those elapses carries the delete through.
+const UNWIND_RETRY_DELAY: ::std::time::Duration = ::std::time::Duration::from_millis(200);
+
+/// Delete what a FAILED create had already made, for the stack operation that is rolling
+/// back — [`delete`], re-asked while an owning service has not let a resource go yet.
+///
+/// The resources still carrying `materialised` are the ones left to delete, which is what
+/// each re-ask narrows to, so nothing is asked for twice. [`Deleted::failure`] is what the
+/// LAST attempt answered: a refusal that outlives the bound above is the rollback's own
+/// failure, reported on the stack rather than passed off as a rollback that removed what
+/// it did not.
+pub async fn unwind(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resources: &[StoredResource],
+) -> Deleted {
+    let mut outcome = delete(ctx, region, resources).await;
+    for _ in 1..UNWIND_ATTEMPTS {
+        if outcome.failure.is_none() {
+            break;
+        }
+        ::tokio::time::sleep(UNWIND_RETRY_DELAY).await;
+        let remaining = ::std::mem::take(&mut outcome.resources);
+        outcome = delete(ctx, region, &remaining).await;
+    }
+    outcome
+}
+
 /// A refusal another service answered with: its error CODE and its message, kept apart so
 /// a caller branches on the code (as a client does) and never on text a request can
 /// influence.
