@@ -210,8 +210,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (record_id, encrypted) = match ingested {
             Ok(stored) => stored,
             Err(crate::state::StreamRefusal::NoSuchStream) => return Err(no_such_stream()),
-            Err(crate::state::StreamRefusal::NotActive(status)) => {
-                return Err(stream_not_active(&input.delivery_stream_name, status))
+            Err(crate::state::StreamRefusal::NotActive) => {
+                return Err(stream_not_active(&input.delivery_stream_name))
             }
             Err(crate::state::StreamRefusal::SourceNotCloudWatchLogs) => {
                 return Err(not_from_cloudwatch_logs(&input.delivery_stream_name))
@@ -259,12 +259,12 @@ fn no_such_stream() -> PutRecordError {
 ///
 /// The model does not say WHICH exception a put to a non-`ACTIVE` stream raises; of the
 /// ones this operation declares, `ResourceNotFoundException` is the client error for a
-/// stream that is not available to the caller, so the status is named in the message.
-fn stream_not_active(name: &str, status: &str) -> PutRecordError {
+/// stream that is not available to the caller. The sentence is the data plane's own
+/// template — `crate::service::not_active_message` — so this refusal is worded the same
+/// way wherever it is raised.
+fn stream_not_active(name: &str) -> PutRecordError {
     PutRecordErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!(
-            "Firehose stream {name} is in status {status}; it accepts data only in status ACTIVE"
-        )),
+        message: Some(crate::service::not_active_message(name)),
     })
     .into()
 }
