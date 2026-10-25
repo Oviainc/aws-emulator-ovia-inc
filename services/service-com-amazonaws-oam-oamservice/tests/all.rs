@@ -17,6 +17,8 @@ mod list_links;
 mod list_sinks;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
+#[path = "all/refusal_classes.rs"]
+mod refusal_classes;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/sink_policy.rs"]
@@ -25,3 +27,5 @@ mod sink_policy;
 mod sinks_and_links;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_link.rs"]
+mod update_link;

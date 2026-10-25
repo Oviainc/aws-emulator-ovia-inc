@@ -5,8 +5,9 @@
 //! `DeviceSummary`, in `managedDeviceId` order, narrowed to one `jobId` when the
 //! request names one: `@paginated(items: devices)`, so a page is cut at
 //! `maxResults` and `nextToken` carries the device id the next page resumes at.
-//! A Region this account has activated no device in holds an empty inventory, and
-//! an empty inventory is an empty page.
+//! A Region this account has activated no device in is refused by the account/region
+//! device precondition (`AccessDeniedException`, HTTP 403) before any filter is
+//! looked at.
 //!
 //! ## Shape of an operation
 //!
@@ -162,6 +163,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         store.settle(now);
+
+        // The account/region device precondition, FIRST: a Region this account has
+        // activated no device in has no inventory for this operation to report, so
+        // the call is refused rather than answered with an empty page — ahead of the
+        // `nextToken` and `jobId` the request carries, which is why a filter value
+        // this service would otherwise refuse cannot change the answer.
+        if !store.has_devices_in(&region) {
+            return Err(ListDevicesErrorModeled::AccessDeniedException(
+                crate::state::no_devices_in_region(),
+            )
+            .into());
+        }
 
         // The token carries the device id the next page resumes at; a value this
         // service never issued is refused rather than silently serving page one.

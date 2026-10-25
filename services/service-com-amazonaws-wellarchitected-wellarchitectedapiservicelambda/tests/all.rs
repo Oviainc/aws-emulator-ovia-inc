@@ -75,6 +75,9 @@ mod lens_review_improvements;
 #[path = "all/lens_review_listing.rs"]
 mod lens_review_listing;
 
+#[path = "all/lens_review_notes.rs"]
+mod lens_review_notes;
+
 #[path = "all/lens_review_rollup.rs"]
 mod lens_review_rollup;
 

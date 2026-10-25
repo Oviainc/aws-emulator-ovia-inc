@@ -67,6 +67,8 @@ mod object_and_policy;
 mod object_and_tagging_roundtrip;
 #[path = "all/object_batch_deletion.rs"]
 mod object_batch_deletion;
+#[path = "all/object_copy.rs"]
+mod object_copy;
 #[path = "all/object_default_encryption.rs"]
 mod object_default_encryption;
 #[path = "all/object_encryption.rs"]

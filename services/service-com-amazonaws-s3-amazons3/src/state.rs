@@ -3962,6 +3962,13 @@ pub const ENTITY_TOO_LARGE_CODE: &str = "EntityTooLarge";
 /// 412 (`PutObjectRequest$IfMatch`: "If the ETag values do not match, the operation
 /// returns a 412 Precondition Failed error").
 pub const PRECONDITION_FAILED_CODE: &str = "PreconditionFailed";
+/// See [`PRECONDITION_FAILED_CODE`] — the text Amazon S3 "Error responses" publishes for
+/// that code in its list of error codes.
+pub const PRECONDITION_FAILED_MESSAGE: &str =
+    "At least one of the pre-conditions you specified did not hold";
+/// The HTTP status [`PRECONDITION_FAILED_CODE`] is rendered with: 412, from the same
+/// list ("412 Precondition Failed").
+pub const PRECONDITION_FAILED_STATUS: u16 = 412;
 /// The code S3 answers a read of a bucket that has no ownership controls associated with
 /// it, with HTTP 404 — the case `GetBucketOwnershipControls`'s own documentation describes
 /// ("A bucket doesn't have OwnershipControls settings in the following cases: … You've

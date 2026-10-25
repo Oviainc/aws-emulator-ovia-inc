@@ -2,13 +2,18 @@
 
 //! @op RevokePermissions
 //!
-//! Takes the named permissions back out of the one grant record
+//! Takes the named permissions back out of the grant records
 //! [`crate::state::grant_key`] identifies in
 //! [`crate::state::ComAmazonawsLakeformationAwslakeformationState`]'s `permission_grants`,
-//! and drops the record when nothing is left of it. A revoke of a permission the
+//! and drops a record when nothing is left of it. A revoke of a permission the
 //! grantee does not hold — including a grant that was never made — takes nothing away
 //! and is refused with the modelled `InvalidInputException`, so a caller is never told a
 //! permission it still holds was removed.
+//!
+//! A revoke reaches every SCOPE the matching grant wrote at: naming a TABLE takes back
+//! both the table's own record and the column-scoped record `GrantPermissions` wrote for
+//! its column-level permissions, because the two calls are split the same way (see
+//! [`crate::state::scoped_grant_records`]).
 //!
 //! One grant is not a record: a Data Catalog DATABASE is created carrying the account's
 //! "use only IAM access control" default — `ALL` to `IAM_ALLOWED_PRINCIPALS` — which no
@@ -211,6 +216,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The same scope rule the grant path applies: `TableWithColumnsResource` "is only
+        // used when granting a SELECT permission" (the shape's own documentation), so a
+        // request that addresses COLUMNS and names a permission that is not column-scoped
+        // names a scope that permission has no meaning at — on the way in as well as on
+        // the way out, so the two paths agree on what a column-scoped request may say.
+        if let Some(violation) = crate::state::column_scope_violation(
+            &input.resource,
+            &permissions,
+            &permissions_with_grant_option,
+        ) {
+            return Err(invalid(violation));
+        }
+
         let resource = crate::state::normalize_resource(&input.resource, &catalog_id);
         let condition = input
             .condition
@@ -218,6 +236,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|condition| condition.expression.clone())
             .filter(|expression| !expression.is_empty());
         let key = crate::state::grant_key(&catalog_id, principal, &resource, condition.as_deref());
+
+        // A revoke takes away what the matching GRANT wrote, so it is split the same way:
+        // a table's column-scoped permissions were recorded against that table's
+        // `TableWithColumns` key, and naming the TABLE has to reach them (see
+        // [`crate::state::scoped_grant_records`]). For every other resource this is the
+        // one record `key` already names.
+        let scoped: Vec<(String, Vec<String>, Vec<String>)> = crate::state::scoped_grant_records(
+            &input.resource,
+            &permissions,
+            &permissions_with_grant_option,
+        )
+        .into_iter()
+        .map(|(scoped_resource, permissions, permissions_with_grant_option)| {
+            let scoped_resource = crate::state::normalize_resource(&scoped_resource, &catalog_id);
+            (
+                crate::state::grant_key(
+                    &catalog_id,
+                    principal,
+                    &scoped_resource,
+                    condition.as_deref(),
+                ),
+                permissions,
+                permissions_with_grant_option,
+            )
+        })
+        .collect();
 
         // Everything the grantee does not hold, whether because the grant does not exist
         // at all or because it never carried these permissions: both are "there is
@@ -232,22 +276,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let default_grant =
             crate::state::default_database_grant(&resource, principal, condition.as_deref())
                 .filter(|_| !store.revoked_default_grants.contains(&key));
-        let held = store.permission_grants.get(&key);
-        let mut held_permissions: Vec<String> = held
-            .map(|grant| grant.permissions.clone())
-            .unwrap_or_default();
-        if let Some(default) = &default_grant {
-            held_permissions.extend(default.iter().cloned());
+        let mut missing: Vec<String> = Vec::new();
+        for (scoped_key, permissions, permissions_with_grant_option) in &scoped {
+            let held = store.permission_grants.get(scoped_key);
+            let mut held_permissions: Vec<String> = held
+                .map(|grant| grant.permissions.clone())
+                .unwrap_or_default();
+            // The default grant belongs to the resource the request named, which is a
+            // database — a resource that never splits, so it is this one record.
+            if scoped_key == &key {
+                if let Some(default) = &default_grant {
+                    held_permissions.extend(default.iter().cloned());
+                }
+            }
+            // The default grant carries no grant option, so only a record can hold one.
+            let held_with_grant_option: Vec<String> = held
+                .map(|grant| grant.permissions_with_grant_option.clone())
+                .unwrap_or_default();
+            missing.extend(crate::state::missing_permissions(
+                &held_permissions,
+                permissions,
+            ));
+            missing.extend(crate::state::missing_permissions(
+                &held_with_grant_option,
+                permissions_with_grant_option,
+            ));
         }
-        // The default grant carries no grant option, so only a record can hold one.
-        let held_with_grant_option: Vec<String> = held
-            .map(|grant| grant.permissions_with_grant_option.clone())
-            .unwrap_or_default();
-        let mut missing = crate::state::missing_permissions(&held_permissions, &permissions);
-        missing.extend(crate::state::missing_permissions(
-            &held_with_grant_option,
-            &permissions_with_grant_option,
-        ));
         if !missing.is_empty() {
             // The message AWS answers this with, as the recorded trace shows it: fixed
             // prose (the doubled "does not" is the real service's own wording) followed
@@ -281,31 +335,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.revoked_default_grants.insert(key.clone());
         }
 
-        let mut emptied = true;
-        if let Some(grant) = store.permission_grants.get_mut(&key) {
-            crate::state::remove_permissions(&mut grant.permissions, &permissions);
-            crate::state::remove_permissions(
-                &mut grant.permissions_with_grant_option,
-                &permissions_with_grant_option,
-            );
-            // A record with nothing left in either set is no longer a grant: drop it, so a
-            // later `ListPermissions` reports no entry rather than an entry with no
-            // permissions.
-            emptied = grant.permissions.is_empty() && grant.permissions_with_grant_option.is_empty();
-            if emptied {
-                store.permission_grants.remove(&key);
+        // Counted per record, symmetrically with the grant path's
+        // `records_inserted` / `records_updated`: a revoke can trim one scope and empty
+        // another, and a revoke of a default grant trims no record at all.
+        let mut removed = 0_usize;
+        let mut reduced = 0_usize;
+        for (scoped_key, permissions, permissions_with_grant_option) in &scoped {
+            if let Some(grant) = store.permission_grants.get_mut(scoped_key) {
+                crate::state::remove_permissions(&mut grant.permissions, permissions);
+                crate::state::remove_permissions(
+                    &mut grant.permissions_with_grant_option,
+                    permissions_with_grant_option,
+                );
+                // A record with nothing left in either set is no longer a grant: drop it,
+                // so a later `ListPermissions` reports no entry rather than an entry with
+                // no permissions.
+                if grant.permissions.is_empty() && grant.permissions_with_grant_option.is_empty() {
+                    store.permission_grants.remove(scoped_key);
+                    removed += 1;
+                } else {
+                    reduced += 1;
+                }
             }
         }
 
-        // The audit record for a state change: who, what, where, outcome. No secret and
-        // no credential material — the access key id identifies the caller the way the
-        // real service's trail does.
+        // The audit record for a state change: who, what, where, and what each scope did.
+        // No secret and no credential material — the access key id identifies the caller
+        // the way the real service's trail does.
         tracing::info!(
             operation = "RevokePermissions",
             akid = %akid,
             catalog_id = %catalog_id,
             principal = %principal,
-            outcome = if emptied { "revoked" } else { "reduced" },
+            records_removed = removed,
+            records_reduced = reduced,
+            default_grant_revoked = revokes_default,
             "Lake Formation permissions revoked"
         );
 

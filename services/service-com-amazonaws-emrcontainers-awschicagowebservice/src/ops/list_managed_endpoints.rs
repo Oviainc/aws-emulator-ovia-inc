@@ -218,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let mut state = store.lock();
         // Reporting, but it materialises what the clock already owed: an endpoint's
         // CREATING -> ACTIVE step was due at that instant whether or not anybody listed.
@@ -226,10 +226,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // This operation models no not-found error, so an unknown virtual cluster is
         // refused as an invalid request. A cluster that exists in any state still lists
-        // its endpoints, including a terminated one.
-        if !state
-            .virtual_clusters
-            .contains_key(&input.virtual_cluster_id)
+        // its endpoints, including a terminated one — but only at the endpoint of the
+        // region it was created in.
+        if state
+            .virtual_cluster(&region, &input.virtual_cluster_id)
+            .is_none()
         {
             return Err(ListManagedEndpointsErrorModeled::ValidationException(
                 ValidationException {

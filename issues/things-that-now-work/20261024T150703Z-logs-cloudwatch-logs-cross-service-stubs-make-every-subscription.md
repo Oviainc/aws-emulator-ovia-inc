@@ -88,3 +88,9 @@ Cause 4: GetLogGroupFields(logGroupName='a-name-that-does-not-exist') — 400 Re
 Cause 5: cfn CreateStack with Resources {Protected: AWS::Logs::LogGroup with LogGroupName/RetentionInDays/DataProtectionPolicy, Control: AWS::Logs::LogGroup, PStream: AWS::Logs::LogStream}; wait for CREATE_COMPLETE; GetDataProtectionPolicy(logGroupIdentifier=<Protected>) — 400 ResourceNotFoundException.
 Cause 6: PutBearerTokenAuthentication against a log group that does not exist — message lacks the trailing period.
 Cause 7: PutAccountPolicy two METRIC_EXTRACTION_POLICY policies with overlapping selectionCriteria — second is refused with a non-AWS message.
+
+## Resolution
+
+Causes 1, 2, 3, 4, 6 and 7 are fixed — cause 1 by the kinesis bootstrap that implemented `CreateStream` before this fix, cause 2 by implementing cloudwatch `GetMetricData`, cause 3 by implementing `UpdateAnomaly` and the reader it is proved through (`ListAnomalies`), cause 4 by dropping `GetLogGroupFields`' log-group existence pre-check, cause 6 by wording every missing-log-group refusal with this service's one missing-resource sentence, and cause 7 by naming the conflicting policy in the criteria-overlap refusal.
+
+Cause 5 is NOT fixed here and stays open elsewhere: provisioning `AWS::Logs::LogGroup` / `AWS::Logs::LogStream` is a change to the CloudFormation crate's per-type provisioner registry (`services/service-com-amazonaws-cloudformation-cloudformation/src/state/provisioner.rs`) and to that crate's own suites, which currently pin the declared-only treatment of those types. It is tracked by `issues/things-that-do-not-work/20261023T113357Z-cloudformation-reports-create-complete-for-logs-cloudwatch-ecs.md`, the open issue this report names for the same pattern.

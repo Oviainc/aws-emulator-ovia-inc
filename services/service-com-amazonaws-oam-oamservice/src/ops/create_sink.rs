@@ -170,28 +170,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // "Each account can contain one sink per Region" (this operation's own
-        // documentation), so a second create in a region that already holds a sink is
-        // refused rather than quietly creating another one: with the name already in
-        // use that is the inconsistent-state refusal, and with any other name it is
-        // the quota refusal.
-        if let Some(existing) = store.sink_in_region(&region) {
-            if existing.name == input.name {
-                return Err(CreateSinkErrorModeled::ConflictException(ConflictException {
-                    message: Some(format!(
-                        "a sink named '{}' already exists in this account and Region",
-                        input.name
-                    )),
-                    ..Default::default()
-                })
-                .into());
-            }
+        // documentation): the one slot a Region holds is what a create consumes, so a
+        // Region that already holds a sink refuses the create whatever `Name` it asks
+        // for — the decision is the account/Region quota, never the name. Deleting the
+        // stored sink frees the slot again.
+        if store.sink_in_region(&region).is_some() {
             return Err(CreateSinkErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
-                    message: Some(
-                        "this account already contains a sink in this Region, and each account \
-                         can contain one sink per Region"
-                            .to_string(),
-                    ),
+                    message: Some(crate::state::sink_quota_message()),
                     ..Default::default()
                 },
             )

@@ -1,13 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-lakeformation-awslakeformation service.
+//!
+//! Two stores live here: the LF-tag definitions (`lf_tags`) and the Lake Formation
+//! permission records (`permissions`) that `GrantPermissions` writes and
+//! `ListPermissions` reads back.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    Condition, DataCellsFilter, DataLakePrincipal, LFTag, PrincipalResourcePermissions, Resource,
+    ColumnWildcard, Condition, DataCellsFilter, DataLakePrincipal, LFTag,
+    PrincipalResourcePermissions, Resource, TableWithColumnsResource,
 };
+
+/// The Glue Data Catalog's own store, in the same shared engine.
+///
+/// Lake Formation grants permissions ON Data Catalog resources, which Glue owns, so the
+/// databases and tables a grant may name are read from Glue's store rather than kept a
+/// second time here — the same seam AmplifyBackend's `ListS3Buckets` uses to read S3's
+/// buckets. See [`missing_grant_entity`].
+use ::service_com_amazonaws_glue_awsglue::state as glue_state;
 
 /// One registered data-lake location: the resource ARN Lake Formation manages, the IAM
 /// role it uses to reach it, and the registration flags the caller set.
@@ -192,6 +205,13 @@ impl ComAmazonawsLakeformationAwslakeformationState {
     /// [`MAX_LF_TAGS_TOTAL`] bounds.
     pub fn total_lf_tags(&self) -> usize {
         self.lf_tags.values().map(BTreeMap::len).sum()
+    }
+
+    /// Whether `catalog_id` holds an LF-tag under `tag_key`.
+    pub fn holds_lf_tag(&self, catalog_id: &str, tag_key: &str) -> bool {
+        self.lf_tags
+            .get(catalog_id)
+            .is_some_and(|catalog| catalog.contains_key(tag_key))
     }
 }
 
@@ -433,13 +453,16 @@ pub const DEFAULT_IAM_ACCESS_CONTROL_PERMISSION: &str = "ALL";
 /// `RevokePermissions` is the only call that can take the default away, and what it leaves
 /// behind is recorded in `revoked_default_grants`, which answers every later call.
 ///
-/// Two consequences of having no view of the Data Catalog, both deliberate:
+/// Two consequences of this rendering, both deliberate:
 ///
-/// * Every database NAME carries the default, including one that was never created, so a
-///   revoke against a database that does not exist answers 200 where the real service
-///   answers `EntityNotFoundException`. Refusing that would need the catalog's list of
-///   databases, which is the glue service's state; a later change that can read it should
-///   check existence here.
+/// * Every database NAME carries the default, including one the Data Catalog does not
+///   hold, so a revoke against a database that does not exist answers 200 where the real
+///   service refuses the request. [`missing_grant_entity`] is what can now tell the two
+///   apart — `GrantPermissions` refuses on it — but `RevokePermissions` does NOT apply it:
+///   a revoke is refused by what the grantee HOLDS, and the recorded trace shows that
+///   refusal naming the permissions it does not have. Refusing a revoke on the entity
+///   instead would need a recorded unit to pin which of the two the real service answers
+///   first.
 /// * `ListPermissions` does not report default grants, which is what its own documentation
 ///   says it does: "This operation returns only those permissions that have been explicitly
 ///   granted" (`smithy_query(query="doc",shape="ListPermissions")`). A default grant is
@@ -528,17 +551,21 @@ pub fn resolve_catalog_id(requested: Option<&str>) -> String {
 
 /// The values of `values`, in first-seen order, with duplicates dropped.
 ///
-/// An LF-tag's values are a SET of the values the key may take, so a repeated value in
-/// one request, or a value already stored, must not appear twice in the stored tag.
+/// An LF-tag's values are a SET of the values the key may take, and so are a grant's
+/// permissions, so a repeated value in one request, or a value already stored, must not
+/// appear twice in the stored record.
+///
+/// The membership test is a `BTreeSet`, so the cost grows with `n log n` whatever the
+/// number of distinct values — which matters wherever the list is request-supplied with
+/// no modelled length constraint, as `PermissionList` is.
 pub fn dedup_values<'a, I>(values: I) -> Vec<String>
 where
     I: IntoIterator<Item = &'a String>,
 {
-    // A linear scan of the output, not a hash set: `TagValueList` is `len 1..50`, so the
-    // input is at most 50 values and first-seen order is what must be preserved.
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
     let mut out: Vec<String> = Vec::new();
     for value in values {
-        if !out.iter().any(|existing| existing == value) {
+        if seen.insert(value.as_str()) {
             out.push(value.clone());
         }
     }
@@ -697,21 +724,43 @@ pub fn normalize_resource(resource: &Resource, catalog_id: &str) -> Resource {
         }
     }
 
+    /// Folds a database or table name the way the Data Catalog stores it.
+    ///
+    /// "For Hive compatibility, this is folded to lowercase when it is stored"
+    /// (`DatabaseInput$Name` and `TableInput$Name`), so two spellings of one name are one
+    /// entity — and so must be one grant, keyed and reported on the stored name.
+    fn fold(name: &mut String) {
+        *name = glue_state::fold_name(name);
+    }
+
     let mut normalized = resource.clone();
     if let Some(database) = normalized.database.as_mut() {
         default_catalog(&mut database.catalog_id, catalog_id);
+        fold(&mut database.name);
     }
     if let Some(table) = normalized.table.as_mut() {
         default_catalog(&mut table.catalog_id, catalog_id);
+        fold(&mut table.database_name);
+        if let Some(name) = table.name.as_mut() {
+            fold(name);
+        }
     }
     if let Some(table) = normalized.table_with_columns.as_mut() {
         default_catalog(&mut table.catalog_id, catalog_id);
+        fold(&mut table.database_name);
+        fold(&mut table.name);
     }
     if let Some(location) = normalized.data_location.as_mut() {
         default_catalog(&mut location.catalog_id, catalog_id);
     }
     if let Some(cells) = normalized.data_cells_filter.as_mut() {
         default_catalog(&mut cells.table_catalog_id, catalog_id);
+        if let Some(database_name) = cells.database_name.as_mut() {
+            fold(database_name);
+        }
+        if let Some(table_name) = cells.table_name.as_mut() {
+            fold(table_name);
+        }
     }
     if let Some(tag) = normalized.lf_tag.as_mut() {
         default_catalog(&mut tag.catalog_id, catalog_id);
@@ -911,23 +960,48 @@ pub fn resource_filter_matches(filter: &Resource, stored: &Resource, include_rel
     false
 }
 
+/// The most permissions one grant or revoke request can name, in either list.
+///
+/// Grounded in the model, and INHERENT rather than enforced: each member of
+/// `PermissionList` targets the `Permission` enum, whose values are
+/// [`crate::ops::types::PERMISSION_VALUES`], and the framework's boundary validator
+/// refuses a value the enum does not carry with `ValidationException` before a handler
+/// runs (pinned by `permissions.rs::a_permission_the_model_does_not_carry_is_refused_on_both_write_paths`).
+/// So once a handler has de-duplicated a list with [`dedup_values`], it can hold at most
+/// this many entries, whatever `PermissionList`'s own lack of a length constraint admits
+/// on the wire. That is what bounds the set walks below.
+///
+/// Nothing reads this constant at run time, and nothing should: the bound is a consequence
+/// of the enum, so there is no handler-side refusal to fire on it and no allocation to
+/// clamp with it. It names the number the walks rely on, and one test asserts it.
+pub const MAX_PERMISSIONS_PER_GRANT: usize = crate::ops::types::PERMISSION_VALUES.len();
+
 /// Adds `added` to `held`, keeping it a set in first-granted order.
+///
+/// The membership test is a `BTreeSet`, so the cost grows with `n log n` rather than with
+/// `held` times `added`: both lists are request-supplied, de-duplicated by the caller and
+/// so bounded by [`MAX_PERMISSIONS_PER_GRANT`].
 pub fn merge_permissions(held: &mut Vec<String>, added: &[String]) {
+    let mut present: BTreeSet<&str> = held.iter().map(String::as_str).collect();
+    let mut appended: Vec<String> = Vec::new();
     for permission in added {
-        if !held.iter().any(|existing| existing == permission) {
-            held.push(permission.clone());
+        if present.insert(permission.as_str()) {
+            appended.push(permission.clone());
         }
     }
+    held.extend(appended);
 }
 
 /// The entries of `requested` that `held` does not carry, in first-named order: what a
 /// revoke cannot take away because it was never granted.
+///
+/// Set-based for the same reason as [`merge_permissions`].
 pub fn missing_permissions(held: &[String], requested: &[String]) -> Vec<String> {
+    let present: BTreeSet<&str> = held.iter().map(String::as_str).collect();
+    let mut named: BTreeSet<&str> = BTreeSet::new();
     let mut missing: Vec<String> = Vec::new();
     for permission in requested {
-        if !held.iter().any(|existing| existing == permission)
-            && !missing.iter().any(|existing| existing == permission)
-        {
+        if !present.contains(permission.as_str()) && named.insert(permission.as_str()) {
             missing.push(permission.clone());
         }
     }
@@ -935,8 +1009,11 @@ pub fn missing_permissions(held: &[String], requested: &[String]) -> Vec<String>
 }
 
 /// Drops every entry of `removed` from `held`.
+///
+/// Set-based for the same reason as [`merge_permissions`].
 pub fn remove_permissions(held: &mut Vec<String>, removed: &[String]) {
-    held.retain(|permission| !removed.iter().any(|dropped| dropped == permission));
+    let dropped: BTreeSet<&str> = removed.iter().map(String::as_str).collect();
+    held.retain(|permission| !dropped.contains(permission.as_str()));
 }
 
 /// The field separator inside a continuation token's plaintext.
@@ -1013,6 +1090,246 @@ pub fn decode_permissions_page_token(token: &str) -> Option<String> {
     }
     Some(grant_key.to_string())
 }
+
+/// The table permissions Lake Formation records at COLUMN scope.
+///
+/// `SELECT` is the permission Lake Formation scopes to columns — it is what
+/// `TableWithColumnsResource`'s `ColumnNames` / `ColumnWildcard` exist to narrow, and the
+/// reason `ListPermissions$Resource` documents that a table read "returns the table and
+/// the table w columns": the column-scoped part of a table grant is a record of its own.
+/// Every other `Permission` applies to the table as a whole.
+///
+/// The model names no such set, so this constant is where the set is widened if another
+/// permission is ever observed reported at column scope: the recorded behaviour this set
+/// is grounded in is a `SELECT` + `DESCRIBE` grant on a table splitting into a table
+/// entry carrying `DESCRIBE` and a column-wildcard entry carrying `SELECT`.
+/// `ALL` is deliberately NOT in this set: Lake Formation's `ALL` ("Super") is the
+/// permission on the resource as a whole, and the recorded split that grounds this set
+/// shows only `SELECT` moving to a column-wildcard entry, so a grant naming `ALL` on a
+/// table is recorded as the table's own record. Widen the set here — and only on
+/// recorded evidence — if `ALL` is ever observed reported at column scope too.
+pub const COLUMN_SCOPED_TABLE_PERMISSIONS: [&str; 1] = ["SELECT"];
+
+/// The permission a grant made DIRECTLY on `TableWithColumns` names that cannot be granted
+/// at column scope, as the message for `InvalidInputException` — `None` when every
+/// permission it names can.
+///
+/// `TableWithColumnsResource` "is only used when granting a SELECT permission"
+/// (`smithy_query(query="doc",shape="TableWithColumnsResource")`), so a request that
+/// addresses columns and asks for a permission that is not column-scoped
+/// ([`COLUMN_SCOPED_TABLE_PERMISSIONS`]) names a scope that permission has no meaning at
+/// and is refused rather than recorded there. This bites only a request that NAMES
+/// `TableWithColumns`: a grant on the table itself is split by
+/// [`scoped_grant_records`], which is what puts the table-scoped permissions on the table.
+///
+/// `RevokePermissions` applies it too, so the two write paths agree on what a
+/// column-scoped request may say. The model's sentence is about GRANTING, so the revoke
+/// side is an extension of it rather than a quotation — one that changes no error class:
+/// before it, such a revoke was refused as a permission "the grantee does not have",
+/// which is the same modelled `InvalidInputException`.
+pub fn column_scope_violation(
+    resource: &Resource,
+    permissions: &[String],
+    permissions_with_grant_option: &[String],
+) -> Option<String> {
+    resource.table_with_columns.as_ref()?;
+    for (member, named) in [
+        ("Permissions", permissions),
+        ("PermissionsWithGrantOption", permissions_with_grant_option),
+    ] {
+        if let Some(permission) = named
+            .iter()
+            .find(|permission| !COLUMN_SCOPED_TABLE_PERMISSIONS.contains(&permission.as_str()))
+        {
+            return Some(format!(
+                "{member} names {permission}, which cannot be granted on a TableWithColumns \
+                 resource: that resource is only used when granting a SELECT permission"
+            ));
+        }
+    }
+    None
+}
+
+/// The records one grant request writes: one per resource SCOPE the requested permissions
+/// apply at.
+///
+/// A grant on a table named by `Name` splits, because Lake Formation holds that table's
+/// column-scoped permissions ([`COLUMN_SCOPED_TABLE_PERMISSIONS`]) as a
+/// `TableWithColumns` record over every column — the "table w columns" entry
+/// `ListPermissions$Resource` documents — and the rest as the table's own record. Every
+/// other resource takes the permissions as asked: there is no narrower scope to move them
+/// to, and a `TableWildcard` grant names no single table a `TableWithColumns` record
+/// could be about.
+pub fn scoped_grant_records(
+    resource: &Resource,
+    permissions: &[String],
+    permissions_with_grant_option: &[String],
+) -> Vec<(Resource, Vec<String>, Vec<String>)> {
+    let scoped = |permissions: &[String], on_columns: bool| -> Vec<String> {
+        permissions
+            .iter()
+            .filter(|permission| {
+                COLUMN_SCOPED_TABLE_PERMISSIONS.contains(&permission.as_str()) == on_columns
+            })
+            .cloned()
+            .collect()
+    };
+
+    // Only a table named by `Name` has a narrower scope to split into.
+    let Some(table) = resource
+        .table
+        .as_ref()
+        .filter(|table| table.name.as_deref().is_some_and(|name| !name.is_empty()))
+    else {
+        return vec![(
+            resource.clone(),
+            permissions.to_vec(),
+            permissions_with_grant_option.to_vec(),
+        )];
+    };
+
+    let on_table = (
+        scoped(permissions, false),
+        scoped(permissions_with_grant_option, false),
+    );
+    let on_columns = (
+        scoped(permissions, true),
+        scoped(permissions_with_grant_option, true),
+    );
+
+    let mut records = Vec::new();
+    if !on_table.0.is_empty() || !on_table.1.is_empty() {
+        records.push((resource.clone(), on_table.0, on_table.1));
+    }
+    if !on_columns.0.is_empty() || !on_columns.1.is_empty() {
+        records.push((
+            Resource {
+                table_with_columns: Some(TableWithColumnsResource {
+                    catalog_id: table.catalog_id.clone(),
+                    database_name: table.database_name.clone(),
+                    name: table.name.clone().unwrap_or_default(),
+                    column_names: None,
+                    // Every column of the table, with none excluded.
+                    column_wildcard: Some(ColumnWildcard {
+                        excluded_column_names: None,
+                    }),
+                }),
+                ..Resource::default()
+            },
+            on_columns.0,
+            on_columns.1,
+        ));
+    }
+    records
+}
+
+/// The refusal message for the Data Catalog entity a grant names that this emulator does
+/// not hold — `None` when every entity it names exists.
+///
+/// The message is one of the two per-kind constants below, so the refusal says WHICH kind
+/// of Data Catalog entity could not be resolved and nothing about the request beyond that.
+///
+/// Lake Formation grants permissions ON Data Catalog resources, so a grant naming a
+/// database or table the catalog does not hold names nothing and is refused. The
+/// databases and tables belong to GLUE, so they are read from Glue's own store in the
+/// shared engine rather than kept a second time here — the same seam AmplifyBackend's
+/// `ListS3Buckets` uses to read S3's buckets.
+///
+/// `default_catalog` is the Data Catalog the REQUEST addresses, which a resource member
+/// that names no `CatalogId` of its own belongs to.
+///
+/// Call this BEFORE locking this service's store: it takes Glue's lock itself, and never
+/// holds the two at the same time.
+///
+/// Only the catalog's own entities are checked. A resource kind this emulator keeps no
+/// store of what EXISTS (a data location, a cell filter, a named tag expression, an RLS
+/// policy) cannot be reported absent, so nothing is claimed about it: a refusal has to be
+/// grounded in what a store says, never assumed. The same holds for a Data Catalog this
+/// emulator holds nothing for — an id naming a catalog in another account, or one no Glue
+/// in this process serves (Glue's own [`glue_state::is_known_catalog`] is that
+/// predicate): nothing is known about its contents, so no grant on it is refused. An
+/// EMPTY catalog this emulator DOES hold is a different matter: it holds no database, so
+/// a grant on one is refused — exactly as Glue's own `GetDatabase` answers
+/// `EntityNotFoundException` there. `TableWithColumns` column names are not checked
+/// either — a table may be stored with no `StorageDescriptor`, so the catalog does not
+/// always know its columns.
+pub fn missing_grant_entity<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    resource: &Resource,
+    default_catalog: &str,
+) -> Option<String> {
+    let in_catalog = |named: Option<&String>| -> String {
+        match named.map(String::as_str).filter(|id| !id.is_empty()) {
+            Some(id) => id.to_string(),
+            None => default_catalog.to_string(),
+        }
+    };
+
+    // The Data Catalog entity a database, table or table-with-columns resource names.
+    let (catalog_id, database_name, table_name) = if let Some(database) = &resource.database {
+        (
+            in_catalog(database.catalog_id.as_ref()),
+            database.name.clone(),
+            None,
+        )
+    } else if let Some(table) = &resource.table {
+        (
+            in_catalog(table.catalog_id.as_ref()),
+            table.database_name.clone(),
+            // A `TableWildcard` grant is about every table the database holds, so only
+            // the database has to exist.
+            table.name.clone().filter(|name| !name.is_empty()),
+        )
+    } else if let Some(table) = &resource.table_with_columns {
+        (
+            in_catalog(table.catalog_id.as_ref()),
+            table.database_name.clone(),
+            Some(table.name.clone()),
+        )
+    } else {
+        return None;
+    };
+
+    // A catalog id this emulator holds NO Data Catalog under answers nothing: it names
+    // one in another account (reachable on the real service only through a Data Catalog
+    // resource policy), and a grant is refused only by what a catalog this emulator HOLDS
+    // says. `is_known_catalog` is Glue's own predicate for that, so an EMPTY catalog is a
+    // catalog that holds nothing — not one nothing is known about.
+    if !glue_state::is_known_catalog(&catalog_id) {
+        return None;
+    }
+    // The account's catalog, as GLUE holds it. `service_state` answers `Some` for any
+    // `InMemoryEngine` — the engine initialises absent state with `Default`
+    // (`vendor/engine/src/lib.rs`) — so an engine serving no Glue answers an EMPTY
+    // catalog, which holds no database: a grant on one is refused there too, exactly as
+    // Glue's own `GetDatabase` would be. The `?` below is for an engine that is not an
+    // `InMemoryEngine` at all, where no store can be reached and nothing is known.
+    let catalog = glue_state::service_state(engine)?;
+    let catalog = catalog.lock();
+    let Some(database) = catalog.database(&catalog_id, &database_name) else {
+        return Some(DATABASE_NOT_FOUND.to_string());
+    };
+    let table_name = table_name?;
+    (!database
+        .tables
+        .contains_key(&glue_state::fold_name(&table_name)))
+    .then(|| TABLE_NOT_FOUND.to_string())
+}
+
+/// The refusal message for a grant whose `Resource` names a database the Data Catalog
+/// does not hold — including a table resource whose `DatabaseName` cannot be resolved,
+/// because the database is what is looked up first.
+///
+/// The refusal that matters on the wire is the HTTP 400 and the `InvalidInputException`
+/// code (see [`missing_grant_entity`]'s callers); the real service's message for this
+/// condition names only the KIND of entity it could not resolve, never the name the
+/// request asked for, and this constant is that message.
+pub const DATABASE_NOT_FOUND: &str = "Database not found.";
+
+/// The refusal message for a grant whose `Resource` names a table the Data Catalog does
+/// not hold in a database it DOES hold. The per-kind counterpart of
+/// [`DATABASE_NOT_FOUND`].
+pub const TABLE_NOT_FOUND: &str = "Table not found.";
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

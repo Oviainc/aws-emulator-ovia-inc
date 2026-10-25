@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/completed_deletion.rs"]
 mod completed_deletion;
+#[path = "all/delete_feed_policy.rs"]
+mod delete_feed_policy;
 #[path = "all/dictionary_lifecycle.rs"]
 mod dictionary_lifecycle;
 #[path = "all/dictionary_listing.rs"]

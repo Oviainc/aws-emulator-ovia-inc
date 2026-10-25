@@ -7,7 +7,7 @@
 //! (`CreateMilestone`, `GetMilestone`, `ListMilestones`), the review templates
 //! (`CreateReviewTemplate`, `GetReviewTemplate`, `ListReviewTemplates`,
 //! `DeleteReviewTemplate`), the lens reviews of a workload (`GetLensReview`,
-//! `ListLensReviews`), the answers of
+//! `ListLensReviews`, `UpdateLensReview`), the answers of
 //! a workload's lens reviews (`GetAnswer`, `ListAnswers`, `UpdateAnswer`), the
 //! improvement plan of one of those lens
 //! reviews (`ListLensReviewImprovements`) and the answers of a review template's lens
@@ -74,8 +74,8 @@ use crate::ops::types::{
     AgentProfileSummary, AggregationConfiguration, Choice, ChoiceAnswer, ConflictException,
     ContextContent,
     ContextSummary,
-    GoalSummary, LensSummary, Milestone,
-    MilestoneSummary,
+    GoalSummary, JiraSelectedQuestionConfiguration, LensReview, LensSummary, Milestone,
+    MilestoneSummary, PillarReviewSummary,
     Profile, ProfileQuestion, Progress,
     ResourceNotFoundException,
     ReviewTemplate, ReviewTemplateAnswer, ReviewTemplateLensReview,
@@ -1672,6 +1672,87 @@ const TAGGABLE_RESOURCE_KINDS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// What a caller has WRITTEN to ONE lens review of a workload: the review's own notes,
+/// the notes of each pillar of the lens under review, and the Jira question selection
+/// recorded against it.
+///
+/// A lens review of a workload is not a resource of its own — it exists exactly while
+/// that lens is associated with the workload ([`WorkloadRecord::reviews_lens`]) — so what
+/// this record holds is only what a caller has written to it. Everything else a lens
+/// review reports — the lens's name, version and status, its pillars and its risk roll-up
+/// — is DERIVED from the lens content and the workload's stored answers by
+/// [`WorkloadRecord::to_lens_review`].
+///
+/// The mirror of [`ReviewTemplateLensReviewRecord`], which holds the same notes for a review
+/// TEMPLATE's lens review, with two differences the two shapes make: a workload's review
+/// also carries a Jira question selection (`LensReview$JiraConfiguration`), and it carries
+/// no `UpdatedAt` of its own, because a workload's lens review is part of the workload
+/// record — so the instant the workload last changed is the instant its reviews last
+/// changed ([`WorkloadRecord::updated_at`]), which is also what a milestone freezes.
+#[derive(Debug, Clone, Default)]
+pub struct LensReviewRecord {
+    /// `LensReview$Notes`, absent until a caller writes it.
+    pub notes: Option<String>,
+    /// `PillarReviewSummary$Notes` per `PillarId`, holding only the pillars a caller has
+    /// written notes for.
+    pub pillar_notes: BTreeMap<String, String>,
+    /// `LensReview$JiraConfiguration`: the pillars and questions of this review a caller
+    /// has selected, absent until one is written.
+    pub jira_configuration: Option<JiraSelectedQuestionConfiguration>,
+}
+
+/// The pillars ONE lens review reports a summary for, each with the `PillarName` the lens
+/// content gives it where this emulator holds that content.
+///
+/// The pillars the lens is organized into come first, in the lens's own order
+/// ([`lens_pillars`]); then any pillar the review records notes for that the lens content
+/// does not name, in `PillarId` order and with no `PillarName`, so notes a caller wrote
+/// are always readable back. For a lens this emulator holds content for the second group
+/// is empty — an update refuses a `PillarNotes` key that lens does not define — and for a
+/// lens it holds none for the first group is, because such a lens is organized into no
+/// pillars HERE while the real lens is.
+///
+/// Shared by a workload's lens review and a review template's: both are reviews of the
+/// same lens content and report their pillars the same way, so the rule lives once.
+pub fn lens_review_pillars(
+    lens: &str,
+    pillar_notes: Option<&BTreeMap<String, String>>,
+) -> Vec<(String, Option<&'static str>)> {
+    let defined = lens_pillars(lens);
+    let mut pillars: Vec<(String, Option<&'static str>)> = defined
+        .iter()
+        .map(|(pillar_id, pillar_name, _)| ((*pillar_id).to_string(), Some(*pillar_name)))
+        .collect();
+    if let Some(written) = pillar_notes {
+        // The notes are held in a `BTreeMap`, so the extra pillars come out in `PillarId`
+        // order.
+        pillars.extend(
+            written
+                .keys()
+                .filter(|pillar_id| {
+                    !defined
+                        .iter()
+                        .any(|(defined_id, _, _)| defined_id == pillar_id)
+                })
+                .map(|pillar_id| (pillar_id.clone(), None)),
+        );
+    }
+    pillars
+}
+
+/// The `PillarId`s the lens content this emulator holds organizes a lens into, EMPTY for a
+/// lens it holds no content for — which is therefore organized into no pillars here, so a
+/// caller's pillar identifier has nothing to be judged against.
+///
+/// The one place an operation that takes a `PillarId` of a lens under review resolves the
+/// pillar set to judge it against.
+pub fn defined_pillar_ids(lens: &str) -> BTreeSet<&'static str> {
+    lens_pillars(lens)
+        .iter()
+        .map(|(pillar_id, _, _)| *pillar_id)
+        .collect()
+}
+
 /// One stored workload. Every member of the modelled `Workload` output that a request
 /// can set is persisted here, and the members the SERVICE computes — the risk roll-up
 /// and the defaulted discovery configuration — are derived from this record by the two
@@ -1707,6 +1788,13 @@ pub struct WorkloadRecord {
     /// own because a milestone records the workload BY VALUE: freezing the workload
     /// freezes the answers it had, which is what a milestone read reports.
     pub answers: BTreeMap<String, BTreeMap<String, AnswerRecord>>,
+    /// What a caller has written to this workload's lens reviews, by lens ALIAS (as
+    /// [`lens_alias`] resolves it, so one entry however the request named the lens). A
+    /// lens whose review nothing has been written to carries no entry.
+    ///
+    /// Held on the WORKLOAD for the reason the answers above are: a milestone records the
+    /// workload by value, so freezing the workload freezes what its reviews said.
+    pub lens_review_records: BTreeMap<String, LensReviewRecord>,
     /// The profiles associated with this workload, in association order.
     ///
     /// The association lives on the WORKLOAD rather than in a map of its own for the
@@ -1903,6 +1991,104 @@ impl WorkloadRecord {
                 .or_insert(1);
         }
         counts
+    }
+
+    /// What a caller has written to ONE of this workload's lens reviews, if anything has
+    /// been.
+    ///
+    /// `lens` is a lens as a request names it — an alias or an ARN — and resolves through
+    /// [`lens_alias`], so the same record is found by either name.
+    pub fn lens_review_record(&self, lens: &str) -> Option<&LensReviewRecord> {
+        self.lens_review_records.get(lens_alias(lens))
+    }
+
+    /// [`Self::lens_review_record`] for a caller about to WRITE it, created empty on the
+    /// first write: the lens review itself exists as soon as the lens is associated with
+    /// the workload, and this record is only how the store remembers what was written to
+    /// it.
+    pub fn lens_review_record_mut(&mut self, lens: &str) -> &mut LensReviewRecord {
+        self.lens_review_records
+            .entry(lens_alias(lens).to_string())
+            .or_default()
+    }
+
+    /// The pillars ONE lens review of this workload reports a summary for, through the
+    /// one place that rule lives ([`lens_review_pillars`]).
+    pub fn lens_review_pillars(&self, lens: &str) -> Vec<(String, Option<&'static str>)> {
+        lens_review_pillars(
+            lens,
+            self.lens_review_record(lens)
+                .map(|written| &written.pillar_notes),
+        )
+    }
+
+    /// The `LensReview` shape `GetLensReview` and `UpdateLensReview` return for ONE lens
+    /// associated with this workload.
+    ///
+    /// `lens` is the lens AS THE REQUEST NAMED IT — `LensAlias` is "either the lens alias
+    /// … or the lens ARN" (`LensAlias` doc) and this shape models no member to resolve one
+    /// spelling into the other — and `lens_arn` is the ARN that lens is reported by
+    /// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::lens_arn_of`]).
+    ///
+    /// Everything but what a caller wrote to the review ([`LensReviewRecord`]) is DERIVED
+    /// on every read: the lens's own name, version and status from the lens content this
+    /// emulator holds ([`lens_metadata`], absent for a lens it holds none for), one pillar
+    /// summary per pillar of the lens ([`Self::lens_review_pillars`]) and the risk
+    /// roll-ups of the lens's and each pillar's questions from this workload's stored
+    /// answers — so a review moves when an answer does.
+    pub fn to_lens_review(&self, lens: &str, lens_arn: String) -> LensReview {
+        let metadata = lens_metadata(lens);
+        let written = self.lens_review_record(lens);
+        LensReview {
+            lens_alias: Some(lens.to_string()),
+            lens_arn: Some(lens_arn),
+            lens_version: metadata.map(|metadata| metadata.version.to_string()),
+            lens_name: metadata.map(|metadata| metadata.name.to_string()),
+            lens_status: metadata.map(|metadata| metadata.status.to_string()),
+            pillar_review_summaries: Some(
+                self.lens_review_pillars(lens)
+                    .into_iter()
+                    .map(|(pillar_id, pillar_name)| PillarReviewSummary {
+                        notes: written
+                            .and_then(|written| written.pillar_notes.get(&pillar_id).cloned()),
+                        risk_counts: Some(risk_counts_to_map(
+                            &self.pillar_risk_counts(lens, &pillar_id),
+                        )),
+                        // The risk counts restricted to the questions a PROFILE
+                        // prioritises are not projected for a pillar: which questions
+                        // those are is decided by the profile template this emulator does
+                        // not carry (see [`DEFAULT_QUESTION_TYPE`]), so no question of any
+                        // workload is prioritized.
+                        prioritized_risk_counts: None,
+                        pillar_id: Some(pillar_id),
+                        pillar_name: pillar_name.map(str::to_string),
+                    })
+                    .collect(),
+            ),
+            // The Jira question selection recorded against this review, absent until a
+            // caller records one.
+            jira_configuration: written.and_then(|written| written.jira_configuration.clone()),
+            // "The date and time when the lens review was last updated": a review's
+            // content — the answers recorded against it and its notes — is part of the
+            // workload record, so the instant the workload last changed is the instant its
+            // reviews last changed. A milestone read reports the instant the RECORDED
+            // workload carried, which is what that milestone froze.
+            updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
+            notes: written.and_then(|written| written.notes.clone()),
+            // The roll-up over THIS lens's questions alone, derived from the stored
+            // answers on every read: it moves when an answer does.
+            risk_counts: Some(risk_counts_to_map(&self.lens_risk_counts(lens))),
+            // Neither operation that returns this shape is `@paginated`, and both report
+            // every pillar of the lens in one answer, so there is never a further page to
+            // fetch.
+            next_token: None,
+            // "The profiles associated with the workload" — the same list the workload
+            // itself reports, projected from the one place ([`Self::profiles_projection`]),
+            // so a review and a read of the workload cannot disagree about which profile
+            // it is reviewed against.
+            profiles: self.profiles_projection(),
+            prioritized_risk_counts: None,
+        }
     }
 
     /// This workload's discovery configuration, with the members the service defaults
@@ -2286,39 +2472,15 @@ impl ReviewTemplateRecord {
         self.lens_review_record(lens)?.lens_version.as_deref()
     }
 
-    /// The pillars ONE lens review of this template reports a summary for, each with the
-    /// `PillarName` the lens content gives it where this emulator holds that content.
-    ///
-    /// The pillars the lens is organized into come first, in the lens's own order
-    /// ([`lens_pillars`]); then any pillar this template records notes for that the lens
-    /// content does not name, in `PillarId` order and with no `PillarName`, so notes a
-    /// caller wrote are always readable back. For a lens this emulator holds content for
-    /// the second group is empty — `UpdateReviewTemplateLensReview` refuses a
-    /// `PillarNotes` key that lens does not define — and for a lens it holds none for the
-    /// first group is, because such a lens is organized into no pillars HERE while the
-    /// real lens is.
+    /// The pillars ONE lens review of this template reports a summary for, through the
+    /// one place that rule lives ([`lens_review_pillars`]) — the same rule a WORKLOAD's
+    /// lens review follows ([`WorkloadRecord::lens_review_pillars`]).
     pub fn lens_review_pillars(&self, lens: &str) -> Vec<(String, Option<&'static str>)> {
-        let defined = lens_pillars(lens);
-        let mut pillars: Vec<(String, Option<&'static str>)> = defined
-            .iter()
-            .map(|(pillar_id, pillar_name, _)| ((*pillar_id).to_string(), Some(*pillar_name)))
-            .collect();
-        if let Some(written) = self.lens_review_record(lens) {
-            // `pillar_notes` is a `BTreeMap`, so the extra pillars come out in
-            // `PillarId` order.
-            pillars.extend(
-                written
-                    .pillar_notes
-                    .keys()
-                    .filter(|pillar_id| {
-                        !defined
-                            .iter()
-                            .any(|(defined_id, _, _)| defined_id == pillar_id)
-                    })
-                    .map(|pillar_id| (pillar_id.clone(), None)),
-            );
-        }
-        pillars
+        lens_review_pillars(
+            lens,
+            self.lens_review_record(lens)
+                .map(|written| &written.pillar_notes),
+        )
     }
 
     /// The `ReviewTemplateLensReview` shape `GetReviewTemplateLensReview` and
@@ -5878,6 +6040,96 @@ pub fn undefined_choice_refusal(
         }
     }
     None
+}
+
+/// The member a refused `PillarNotes` key is reported under, in either operation that
+/// records the notes of a lens review (`UpdateLensReviewInput$PillarNotes`,
+/// `UpdateReviewTemplateLensReviewInput$PillarNotes`).
+pub const PILLAR_NOTES_MEMBER: &str = "PillarNotes";
+
+/// The member a refused Jira question selection is reported under
+/// (`UpdateLensReviewInput$JiraConfiguration`). A finding about ONE selected pillar names
+/// the path that reaches it (`JiraConfiguration.SelectedPillars.<PillarId>`), so a caller
+/// is told WHICH selection to fix.
+pub const JIRA_CONFIGURATION_MEMBER: &str = "JiraConfiguration";
+
+/// The refusal for a `PillarId` a request supplies that names no pillar of the lens under
+/// review, if any of them does.
+///
+/// A pillar of a lens is what that lens's content names, so an identifier naming a pillar
+/// the lens does NOT define belongs to no pillar of that lens review and is refused rather
+/// than stored. Only a lens this emulator holds content for has a pillar set to judge an
+/// identifier against ([`defined_pillar_ids`]); for a lens it holds none for there is
+/// nothing to judge, so the value is taken as given rather than refused for a pillar the
+/// real lens may well define.
+///
+/// `member` is the member the finding names, and the offending ids are sorted and
+/// deduplicated, so the refusal does not depend on the order the request listed them in.
+/// Shared by every operation that takes a `PillarId` of a lens under review, so they
+/// cannot word it differently.
+pub fn undefined_pillar_refusal<'id>(
+    member: &str,
+    lens: &str,
+    pillar_ids: impl Iterator<Item = &'id str>,
+) -> Option<crate::ops::types::ValidationException> {
+    let defined = defined_pillar_ids(lens);
+    if defined.is_empty() {
+        return None;
+    }
+    let mut undefined: Vec<&str> = pillar_ids
+        .filter(|pillar_id| !defined.contains(pillar_id))
+        .collect();
+    if undefined.is_empty() {
+        return None;
+    }
+    undefined.sort_unstable();
+    undefined.dedup();
+    Some(member_constraint_exception(
+        member,
+        &format!(
+            "every pillar must be a pillar of lens {lens}, which {} is not",
+            undefined.join(", ")
+        ),
+    ))
+}
+
+/// The refusal for a `QuestionId` a request supplies that names no question ONE pillar of
+/// the lens under review asks, if any of them does.
+///
+/// The questions of a pillar are what that lens's content names, so an identifier naming a
+/// question of another pillar — or of none — belongs to no question of that pillar's
+/// review. As with [`undefined_pillar_refusal`], a lens this emulator holds no content for
+/// asks nothing here ([`lens_questions`]), so there is no question set to judge an
+/// identifier against and the value is taken as given.
+pub fn undefined_pillar_question_refusal<'id>(
+    member: &str,
+    lens: &str,
+    pillar_id: &str,
+    question_ids: impl Iterator<Item = &'id str>,
+) -> Option<crate::ops::types::ValidationException> {
+    let asked = lens_questions(lens);
+    if asked.is_empty() {
+        return None;
+    }
+    let mut undefined: Vec<&str> = question_ids
+        .filter(|question_id| {
+            !asked
+                .iter()
+                .any(|question| question.pillar_id == pillar_id && &question.question_id == question_id)
+        })
+        .collect();
+    if undefined.is_empty() {
+        return None;
+    }
+    undefined.sort_unstable();
+    undefined.dedup();
+    Some(member_constraint_exception(
+        member,
+        &format!(
+            "every question must be a question pillar {pillar_id} of lens {lens} asks, which {} is not",
+            undefined.join(", ")
+        ),
+    ))
 }
 
 /// The tag this service opens an exception message with: the failure class in square

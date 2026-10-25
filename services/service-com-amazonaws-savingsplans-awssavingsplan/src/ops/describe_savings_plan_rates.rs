@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSavingsPlanRates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSavingsPlanRates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSavingsPlanRates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rate card of ONE purchased Savings Plan: every usage line item the plan's
+//! own commitment covers ([`crate::state::SavingsPlanRecord::prices`]), priced
+//! at the line item's on-demand price less the discount the plan's type, term
+//! and payment option earn — the same ladder the offering it was bought from is
+//! priced by, so a plan's rate for a line item is that offering's rate for it.
+//!
+//! A plan that this store has never sold is a 404 `ResourceNotFoundException`:
+//! the operation reports the rates of a specific, EXISTING plan, so there is no
+//! rate card to compute for an id no purchase minted.
+//!
+//! Every supplied filter narrows the card — a filter names either a line item's
+//! own billing dimension or one of the properties it is priced along — and
+//! `maxResults`/`nextToken` page it, in the catalog's own stable order.
 //!
 //! ## Shape of an operation
 //!
@@ -146,20 +151,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSavingsPlanRates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSavingsPlanRatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSavingsPlanRates"))
+        /// Which paginator minted a token: see [`crate::state::encode_page_token`].
+        const PAGE_KIND: &str = "planRates";
+
+        let offset = match input.next_token.as_deref() {
+            Some(token) => crate::state::decode_page_token(PAGE_KIND, token).ok_or_else(|| {
+                validation("nextToken is not a token this operation issued".to_string())
+            })?,
+            None => 0,
+        };
+        // `maxResults` is optional here (1..1000), and an absent one is "no page
+        // size asked for": the rate card is computed from a catalog the service
+        // owns, so a caller that names no size gets the service's own page,
+        // resumable through `nextToken`, rather than the whole card.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .filter(|max| *max > 0)
+            .unwrap_or(crate::state::DEFAULT_OFFERINGS_PAGE_SIZE);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeSavingsPlanRatesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the savingsplans store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        let (page, next) = {
+            let store = state.lock();
+            // The rates belong to a plan this store sold; an id it never minted
+            // has no rate card, which is the 404 this operation models.
+            let plan = store.plan(&input.savings_plan_id).ok_or_else(|| {
+                DescribeSavingsPlanRatesErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("no Savings Plan with id '{}'", input.savings_plan_id),
+                    },
+                )
+            })?;
+            // The card is walked LAZILY and only one page of it is priced: a
+            // line item past the page is never projected, so the work and the
+            // allocation one request can ask for are the page it asked for. One
+            // line item past the page is taken to learn whether the walk has
+            // more to return, and dropped without being reported.
+            let mut window: Vec<SavingsPlanRate> = crate::state::rate_line_items()
+                .iter()
+                .filter(|item| plan.prices(item) && admits(&input, item))
+                .skip(offset)
+                .take(page_size.saturating_add(1))
+                .map(|item| project(plan, item))
+                .collect();
+            let more_remain = window.len() > page_size;
+            window.truncate(page_size);
+            // `nextToken` "is null when there are no more results to return",
+            // so a cursor comes back only while the walk has more to serve.
+            let next = more_remain.then(|| offset.saturating_add(window.len()));
+            (window, next)
+        };
+
+        Ok(DescribeSavingsPlanRatesOutput {
+            savings_plan_id: Some(input.savings_plan_id.clone()),
+            search_results: Some(page),
+            next_token: next.map(|offset| crate::state::encode_page_token(PAGE_KIND, offset)),
+        })
+    }
+}
+
+/// A 400 `ValidationException` carrying `message`.
+fn validation(message: String) -> DescribeSavingsPlanRatesError {
+    DescribeSavingsPlanRatesErrorModeled::ValidationException(ValidationException { message })
+        .into()
+}
+
+/// Whether every filter the request supplied admits `item`. A filter that names
+/// nothing constrains nothing.
+fn admits(input: &DescribeSavingsPlanRatesInput, item: &crate::state::RateLineItem) -> bool {
+    input.filters.iter().flatten().all(|filter| {
+        filter
+            .name
+            .as_deref()
+            .is_none_or(|name| item.matches_filter(name, filter.values.as_ref()))
+    })
+}
+
+/// Project one line item of a plan's rate card onto the wire shape: the line
+/// item's own billing dimensions and the properties it is priced along, at the
+/// rate THIS plan charges for it.
+fn project(
+    plan: &crate::state::SavingsPlanRecord,
+    item: &crate::state::RateLineItem,
+) -> SavingsPlanRate {
+    SavingsPlanRate {
+        rate: Some(crate::state::format_amount(
+            plan.rate_units(item.on_demand_units),
+        )),
+        currency: Some(plan.currency.clone()),
+        unit: Some(item.unit.clone()),
+        product_type: Some(item.product_type.clone()),
+        service_code: Some(item.service_code.clone()),
+        usage_type: Some(item.usage_type.clone()),
+        operation: Some(item.operation.clone()),
+        properties: Some(
+            item.properties
+                .iter()
+                .map(|(name, value)| SavingsPlanRateProperty {
+                    name: Some(name.clone()),
+                    value: Some(value.clone()),
+                })
+                .collect(),
+        ),
     }
 }
