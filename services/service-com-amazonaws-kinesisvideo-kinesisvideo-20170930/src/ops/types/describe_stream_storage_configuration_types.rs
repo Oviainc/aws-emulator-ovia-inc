@@ -26,3 +26,25 @@ pub struct DescribeStreamStorageConfigurationOutput {
     pub stream_storage_configuration: Option<StreamStorageConfiguration>,
 }
 
+/// How a [`DescribeStreamStorageConfigurationOutput`] reaches the wire: as a
+/// [`Report`], under the same rule as every other read of this service — every modelled
+/// output member is present, and one the service has no value for is JSON `null` rather
+/// than an absent key. A stored stream has all three, so this read fills no null today;
+/// the record is what keeps that a property of the response rather than of the handler.
+impl ReportedOutput for DescribeStreamStorageConfigurationOutput {
+    fn output_schema() -> &'static ::aws_smithy_schema::Schema {
+        &Self::SCHEMA
+    }
+
+    fn has_no_value(&self, member: &::aws_smithy_schema::Schema) -> bool {
+        match member.member_name() {
+            Some("StreamName") => self.stream_name.is_none(),
+            Some("StreamARN") => self.stream_arn.is_none(),
+            Some("StreamStorageConfiguration") => self.stream_storage_configuration.is_none(),
+            // A member added to the model is written by the record itself; it is
+            // reported as absent only once this match names it.
+            _ => false,
+        }
+    }
+}
+

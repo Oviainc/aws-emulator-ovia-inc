@@ -22,12 +22,12 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::state::{
-    MESSAGE_MOVE_CANCELLATION_SPAN, MESSAGE_MOVE_TASK_START_DELAY,
+    MAX_MESSAGES_PER_QUEUE, MESSAGE_MOVE_CANCELLATION_SPAN, MESSAGE_MOVE_TASK_START_DELAY,
 };
 
 use super::support::{
     attribute_count as count, call, create_ok, dead_letter_queue, emulator, error_code,
-    expected_arn, ok, receive_until, send_all,
+    expected_arn, message_counts, ok, receive_until, send_all,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -576,5 +576,97 @@ async fn a_cancelled_task_frees_its_source_queue_for_another_task() {
     assert!(
         !second.is_empty() && second != handle,
         "case a start after the task was cancelled: expected a new TaskHandle, got {again}"
+    );
+}
+
+/// A cancellation puts messages back into the source queue, so it is bounded by what that
+/// queue may hold like every other path that adds messages to one: a queue refilled to its
+/// allowance while the task ran takes none of them back, and the messages it cannot take
+/// keep their place in the destination queue rather than being dropped — the pair still
+/// holds every message between them.
+#[tokio::test]
+async fn a_cancel_cannot_push_the_source_queue_past_what_it_may_hold() {
+    let router = emulator();
+    // Enough messages, at the slowest rate the member admits (one per second), that the
+    // task still owes several of them however long the refill below takes: a row where
+    // the whole schedule had elapsed would assert the same thing without exercising the
+    // bound at all.
+    let moving: Vec<String> = (0..10).map(|number| format!("moving #{number}")).collect();
+    let (dead_letter_url, _, destination_url, handle, _) =
+        start_task(&router, "cancel-bounded", &moving, Some(1), true).await;
+
+    // Refill the dead-letter queue to the whole allowance this store holds per queue
+    // while the task runs, in batches of the ten entries a batch send accepts.
+    let batch = 10;
+    for first in (0..MAX_MESSAGES_PER_QUEUE).step_by(batch) {
+        let entries: Vec<Value> = (first..first + batch)
+            .map(|number| json!({"Id": format!("e{number}"), "MessageBody": format!("fill #{number}")}))
+            .collect();
+        ok(
+            &router,
+            "SendMessageBatch",
+            json!({"QueueUrl": dead_letter_url, "Entries": entries}),
+        )
+        .await;
+    }
+    let filled = count(&router, &dead_letter_url, "ApproximateNumberOfMessages").await;
+    let allowance = i64::try_from(MAX_MESSAGES_PER_QUEUE).expect("a small count");
+    assert_eq!(
+        filled, allowance,
+        "case the refill: expected the dead-letter queue at its whole allowance of {allowance}, \
+         got {filled}"
+    );
+
+    let parsed = ok(
+        &router,
+        "CancelMessageMoveTask",
+        json!({"TaskHandle": handle}),
+    )
+    .await;
+    let moved = parsed["ApproximateNumberOfMessagesMoved"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("case the cancel: no ApproximateNumberOfMessagesMoved in {parsed}"));
+    let owed = i64::try_from(moving.len()).expect("a small count") - moved;
+    assert!(
+        owed > 0,
+        "case the cancel: expected the task to still owe messages for the source queue to \
+         refuse, with {moved} of {} already moved",
+        moving.len()
+    );
+
+    // Every message either queue holds is counted — visible, in flight or delayed — so
+    // none can hide from the allowance or from the total.
+    let mut totals = Vec::new();
+    for (which, url) in [
+        ("the source queue", &dead_letter_url),
+        ("the destination queue", &destination_url),
+    ] {
+        let (visible, delayed, in_flight) = message_counts(&router, url).await;
+        let total = visible + in_flight + delayed;
+        assert!(
+            total <= allowance,
+            "case {which}: expected at most the allowance of {allowance} messages, got {total} \
+             ({visible} available, {delayed} delayed, {in_flight} in flight)"
+        );
+        totals.push(total);
+    }
+    let held: i64 = totals.iter().sum();
+    let expected = allowance + i64::try_from(moving.len()).expect("a small count");
+    assert_eq!(
+        held, expected,
+        "case the pair of queues: expected every one of {expected} messages still held, got \
+         {totals:?}"
+    );
+    let stayed = receive_bodies(
+        &router,
+        &destination_url,
+        moving.len(),
+        Instant::now() + DEADLINE,
+    )
+    .await;
+    assert_eq!(
+        stayed, moving,
+        "case the destination queue: expected it to keep every message, including the {owed} the \
+         source queue could not take back, got {stayed:?}"
     );
 }

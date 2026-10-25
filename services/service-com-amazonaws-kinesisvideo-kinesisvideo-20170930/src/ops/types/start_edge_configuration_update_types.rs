@@ -31,3 +31,28 @@ pub struct StartEdgeConfigurationUpdateOutput {
     pub edge_config: Option<EdgeConfig>,
 }
 
+/// How a [`StartEdgeConfigurationUpdateOutput`] reaches the wire: as a [`Report`], so
+/// EVERY modelled output member is present and one the service has no value for is JSON
+/// `null` rather than an absent key. `FailedStatusDetails` is that member — the sync
+/// this call starts has not failed.
+impl ReportedOutput for StartEdgeConfigurationUpdateOutput {
+    fn output_schema() -> &'static ::aws_smithy_schema::Schema {
+        &Self::SCHEMA
+    }
+
+    fn has_no_value(&self, member: &::aws_smithy_schema::Schema) -> bool {
+        match member.member_name() {
+            Some("StreamName") => self.stream_name.is_none(),
+            Some("StreamARN") => self.stream_arn.is_none(),
+            Some("CreationTime") => self.creation_time.is_none(),
+            Some("LastUpdatedTime") => self.last_updated_time.is_none(),
+            Some("SyncStatus") => self.sync_status.is_none(),
+            Some("FailedStatusDetails") => self.failed_status_details.is_none(),
+            Some("EdgeConfig") => self.edge_config.is_none(),
+            // A member added to the model is written by the record itself; it is
+            // reported as absent only once this match names it.
+            _ => false,
+        }
+    }
+}
+

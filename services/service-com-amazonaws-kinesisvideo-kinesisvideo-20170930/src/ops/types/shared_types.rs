@@ -213,6 +213,56 @@ pub struct NoDataRetentionException {
     pub message: Option<String>,
 }
 
+/// A response record that puts EVERY modelled output member on the wire.
+///
+/// This is the one property of this service's responses that the generated serializer
+/// cannot express alone: it SKIPS an `Option` member holding `None`, so a member the
+/// service has no value for would be an absent key, while AWS answers with the key
+/// present and JSON `null` — `{"NextToken": null, "Tags": {…}}` rather than
+/// `{"Tags": {…}}`. A client dereferencing such a member would get `undefined` instead
+/// of `null`, which is exactly the distinction an SDK caller branches on.
+///
+/// The member list is the output shape's own [`::aws_smithy_schema::Schema`] and the
+/// valued members are written by that shape's own generated `SerializableStruct`, so
+/// neither the member names nor their wire forms are restated here.
+#[derive(Debug, Clone)]
+pub struct Report<T>(T);
+
+impl<T: ReportedOutput> Report<T> {
+    /// This response, as the operation computed it.
+    pub fn of(output: T) -> Self {
+        Self(output)
+    }
+}
+
+/// What [`Report`] needs of an output shape: the member list to write, and which of
+/// those members the record holds no value for.
+pub trait ReportedOutput: ::aws_smithy_schema::serde::SerializableStruct {
+    /// The output shape's own schema, whose members are the full wire member list.
+    fn output_schema() -> &'static ::aws_smithy_schema::Schema;
+
+    /// Whether this record holds no value for `member`, so the wire form of that
+    /// member is JSON `null`.
+    fn has_no_value(&self, member: &::aws_smithy_schema::Schema) -> bool;
+}
+
+impl<T: ReportedOutput> ::aws_smithy_schema::serde::SerializableStruct for Report<T> {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // The members the record HAS values for, exactly as the model says.
+        self.0.serialize_members(serializer)?;
+        // Then the ones it has no value for, as JSON `null`.
+        for member in T::output_schema().members() {
+            if self.0.has_no_value(member) {
+                serializer.write_null(member)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The values `APIName` accepts on the wire.
 pub const A_P_I_NAME_VALUES: &[&str] = &["GET_CLIP", "GET_DASH_STREAMING_SESSION_URL", "GET_HLS_STREAMING_SESSION_URL", "GET_IMAGES", "GET_MEDIA", "GET_MEDIA_FOR_FRAGMENT_LIST", "LIST_FRAGMENTS", "PUT_MEDIA"];
 

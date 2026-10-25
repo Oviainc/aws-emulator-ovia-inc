@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeNotificationConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeNotificationConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeNotificationConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the notification configuration of the stored stream a
+//! `StreamName`/`StreamARN` pair names — absent while the stream has none. Reporting
+//! only: the single write it performs is
+//! [`crate::state::ComAmazonawsKinesisvideoKinesisvideo20170930State::settle_clock`],
+//! which materialises status moves the clock already owed.
 //!
 //! ## Shape of an operation
 //!
@@ -139,7 +135,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for DescribeNotificationConfiguration<Eng>
 {
     type Input = DescribeNotificationConfigurationInput;
-    type Output = DescribeNotificationConfigurationOutput;
+    type Output = Report<DescribeNotificationConfigurationOutput>;
     type Error = DescribeNotificationConfigurationError;
 
     const NAME: &'static str = "DescribeNotificationConfiguration";
@@ -152,18 +148,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeNotificationConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeNotificationConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeNotificationConfiguration"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeNotificationConfigurationErrorModeled::ClientLimitExceededException(
+                    ClientLimitExceededException {
+                        message: Some(
+                            "The stream store is unavailable. Try again later.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        store.settle_clock();
+
+        let stream = store
+            .resolve(input.stream_name.as_deref(), input.stream_arn.as_deref())
+            .map_err(lookup_error)?;
+
+        // A stream nobody has configured notifications for reports NO configuration,
+        // which is a 200 carrying the member as JSON `null` (see [`Report`]) rather
+        // than a failure: the configuration is a property of the stream, and the stream
+        // was found.
+        Ok(Report::of(DescribeNotificationConfigurationOutput {
+            notification_configuration: stream.notification_configuration.clone(),
+        }))
     }
+}
+
+/// State the failure to resolve a `StreamName`/`StreamARN` pair as this service's
+/// own modeled error: absent or contradictory identifiers are a bad argument (400),
+/// a well-formed identifier for no stored stream is a missing resource (404).
+fn lookup_error(error: crate::state::LookupError) -> DescribeNotificationConfigurationError {
+    match error {
+        crate::state::LookupError::NoIdentifier => {
+            DescribeNotificationConfigurationErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(crate::state::STREAM_IDENTIFIER_REQUIRED_MESSAGE.to_string()),
+                },
+            )
+        }
+        crate::state::LookupError::Mismatch => {
+            DescribeNotificationConfigurationErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(crate::state::STREAM_IDENTIFIER_MISMATCH_MESSAGE.to_string()),
+                },
+            )
+        }
+        crate::state::LookupError::NotFound => {
+            DescribeNotificationConfigurationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::STREAM_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+        }
+    }
+    .into()
 }

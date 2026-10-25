@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(|_| {
                 DeleteStreamError::from(DeleteStreamErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some("The specified stream does not exist.".to_string()),
+                        message: Some(crate::state::STREAM_NOT_FOUND_MESSAGE.to_string()),
                     },
                 ))
             })?;

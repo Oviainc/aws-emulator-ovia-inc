@@ -27,6 +27,30 @@ pub struct DescribeMappedResourceConfigurationOutput {
     pub next_token: Option<String>,
 }
 
+/// How a [`DescribeMappedResourceConfigurationOutput`] reaches the wire: as a
+/// [`Report`], so EVERY modelled output member is present and one the listing has no
+/// value for is JSON `null` rather than an absent key. `NextToken` is that member here
+/// — the only page of this listing issues no resume token, and AWS answers
+/// `{"MappedResourceConfigurationList": [], "NextToken": null}` for a stream nothing is
+/// mapped to.
+impl ReportedOutput for DescribeMappedResourceConfigurationOutput {
+    fn output_schema() -> &'static ::aws_smithy_schema::Schema {
+        &Self::SCHEMA
+    }
+
+    fn has_no_value(&self, member: &::aws_smithy_schema::Schema) -> bool {
+        match member.member_name() {
+            Some("MappedResourceConfigurationList") => {
+                self.mapped_resource_configuration_list.is_none()
+            }
+            Some("NextToken") => self.next_token.is_none(),
+            // A member added to the model is written by the record itself; it is
+            // reported as absent only once this match names it.
+            _ => false,
+        }
+    }
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.kinesisvideo#MappedResourceConfigurationListItem")]
 #[derive(Debug, Clone, Default)]
 pub struct MappedResourceConfigurationListItem {

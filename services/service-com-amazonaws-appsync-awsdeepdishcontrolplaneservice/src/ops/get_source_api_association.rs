@@ -198,6 +198,13 @@ fn refuse(refusal: crate::state::AssociationLookupRefusal) -> GetSourceApiAssoci
                 message: Some(message),
             })
         }
+        // The association the pair names does not exist, which this READ reports as the
+        // absent resource it is, naming no identifier of the request.
+        crate::state::AssociationLookupRefusal::AssociationNotFound(_) => {
+            GetSourceApiAssociationErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::ASSOCIATION_NOT_FOUND_MESSAGE.to_string()),
+            })
+        }
     }
     .into()
 }

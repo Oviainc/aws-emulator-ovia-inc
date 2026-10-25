@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     Challenge, ChallengeMetadata, ChallengeMetadataSummary, Connector, ConnectorSummary,
-    IntuneConfiguration, MobileDeviceManagement, OpenIdConfiguration,
+    MobileDeviceManagement, OpenIdConfiguration,
 };
 
 /// The signing name, endpoint prefix and ARN namespace of this service, from the model's
@@ -670,22 +670,53 @@ pub fn connector_endpoint(
     }
 }
 
-/// The OIDC parameters an Intune connector publishes for the caller to copy into their
-/// Microsoft Entra app registration.
+/// The audience an Intune connector publishes.
 ///
-/// The model documents what each member is FOR but not the strings AWS mints, so each is
-/// derived from the connector record: the issuer is the connector's own SCEP URL, the
-/// subject its ARN, and the audience the Entra application the token is for, as the
-/// request's `IntuneConfiguration` named it.
-pub fn open_id_configuration(
-    connector_arn: &str,
-    endpoint: &str,
-    intune: &IntuneConfiguration,
-) -> OpenIdConfiguration {
+/// It is the single audience Microsoft Entra workload identity federation accepts in a
+/// token presented for token exchange, so it is a property of the federation this
+/// integration configures rather than of any one connector: every Intune connector
+/// publishes it, and nothing a caller sends can change it.
+pub const OIDC_AUDIENCE: &str = "api://AzureADTokenExchange";
+
+/// Host label of the OIDC issuer this service publishes, in front of the service's own
+/// regional domain — the identity plane an Entra federated credential trusts, which is a
+/// different host from the connector's SCEP data plane ([`connector_endpoint`]).
+const OIDC_HOST_LABEL: &str = "oidc";
+
+/// The issuer URL an Intune connector publishes.
+///
+/// An OIDC issuer URL, so it is an HTTPS origin under this service's own regional domain
+/// whose discovery document and keys a relying party fetches. It is reached by the Entra
+/// tenant over the public internet, so it never carries the connector's VPC endpoint: the
+/// access path chosen for the SCEP data plane says nothing about where the issuer serves.
+/// The connector is named by the issuer's path, so two connectors publish two issuers,
+/// each with its own key namespace, and the URL is stable for the life of the connector.
+pub fn oidc_issuer(region: &str, connector_id: &str) -> String {
+    format!(
+        "https://{OIDC_HOST_LABEL}.{ARN_SERVICE}.{region}.{PUBLIC_DNS_SUFFIX}/{connector_id}"
+    )
+}
+
+/// The subject an Intune connector publishes: the identifier this service mints for the
+/// connector INSIDE its issuer's namespace, so it names a resource of the issuer rather
+/// than repeating an ARN, and is distinct for two connectors.
+pub fn oidc_subject(connector_id: &str) -> String {
+    format!("connector/{connector_id}")
+}
+
+/// The OIDC parameters an Intune connector publishes for the caller to copy into their
+/// Microsoft Entra app registration's federated credential.
+///
+/// All three are minted by the service: the issuer and the subject from the connector's own
+/// identity and Region ([`oidc_issuer`], [`oidc_subject`]), the audience from the
+/// federation protocol ([`OIDC_AUDIENCE`]). None of them is taken from the request — an
+/// `IntuneConfiguration` carries the caller's Entra tenant id and primary domain, which
+/// are what the caller already has and are neither an OIDC audience nor an issuer.
+pub fn open_id_configuration(region: &str, connector_id: &str) -> OpenIdConfiguration {
     OpenIdConfiguration {
-        issuer: Some(endpoint.to_string()),
-        subject: Some(connector_arn.to_string()),
-        audience: Some(intune.azure_application_id.clone()),
+        issuer: Some(oidc_issuer(region, connector_id)),
+        subject: Some(oidc_subject(connector_id)),
+        audience: Some(OIDC_AUDIENCE.to_string()),
     }
 }
 

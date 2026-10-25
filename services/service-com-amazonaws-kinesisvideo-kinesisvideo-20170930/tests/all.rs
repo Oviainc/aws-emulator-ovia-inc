@@ -17,6 +17,8 @@ mod route_claims;
 mod signaling_channel_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stream_configuration.rs"]
+mod stream_configuration;
 #[path = "all/stream_lifecycle.rs"]
 mod stream_lifecycle;
 #[path = "all/stream_tags.rs"]

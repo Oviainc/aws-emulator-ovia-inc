@@ -7,6 +7,14 @@
 //! them, every other attribute keeps the value it had, and the queue's
 //! `LastModifiedTimestamp` moves to now.
 //!
+//! A change the new values make the clock owe is applied here rather than left for the
+//! next reader: a `DelaySeconds` change is retroactive for a FIFO queue and not for a
+//! standard one ([`crate::state::Queue::reapply_delay_seconds`]), and a shortened
+//! `MessageRetentionPeriod` expires the messages already older than it
+//! ([`crate::state::Queue::materialise_due`]). Messages already in flight keep the
+//! visibility timeout they were received under, so a `VisibilityTimeout` change spares
+//! them — nothing here touches a message's own `invisible_until`.
+//!
 //! The operation's `Attributes` documentation lists exactly the attributes it accepts
 //! — [`crate::state::SETTABLE_ATTRIBUTES`] minus the one marked `create_only`, because
 //! of `FifoQueue`'s "You can provide this attribute only during queue creation. You
@@ -235,7 +243,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for (attribute, value) in &input.attributes {
             queue.attributes.insert(attribute.clone(), value.clone());
         }
-        queue.last_modified_at = ::std::time::SystemTime::now();
+        let now = ::std::time::SystemTime::now();
+        queue.last_modified_at = now;
+        // What the new values make the clock owe, applied at once rather than left for
+        // the next reader to discover: a `DelaySeconds` change is retroactive on a FIFO
+        // queue and not on a standard one, and a shortened `MessageRetentionPeriod`
+        // expires every message already older than it.
+        if input.attributes.contains_key(state::DELAY_SECONDS) {
+            queue.reapply_delay_seconds();
+        }
+        queue.materialise_due(now);
 
         Ok(SetQueueAttributesOutput)
     }

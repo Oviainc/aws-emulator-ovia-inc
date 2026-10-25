@@ -1263,11 +1263,15 @@ pub fn decode_next_token(token: &str) -> Option<usize> {
 
 /// One page of `items`, plus the token for the page after it.
 ///
-/// `max_results` is the modelled `@paginated` page size (already range-checked at
-/// the boundary); absent means "every remaining item". `next_token` is the token a
-/// previous page returned. `None` is returned when `next_token` does not decode, or
-/// decodes to an offset this list never had a page at — which the caller reports as
-/// `InvalidNextTokenException`.
+/// `max_results` is the EFFECTIVE page size: the modelled `@paginated` page size
+/// (already range-checked at the boundary), resolved by the calling handler against
+/// whatever default its own `MaxResults` member documents. An operation whose model
+/// documents a default page size resolves an absent `MaxResults` to that default before
+/// calling, so the page it serves is one AWS can produce; only an operation whose model
+/// documents no default passes `None` here, which means "every remaining item".
+/// `next_token` is the token a previous page returned. `None` is returned when
+/// `next_token` does not decode, or decodes to an offset this list never had a page at —
+/// which the caller reports as `InvalidNextTokenException`.
 pub fn page<T: Clone>(
     items: &[T],
     max_results: Option<i32>,
