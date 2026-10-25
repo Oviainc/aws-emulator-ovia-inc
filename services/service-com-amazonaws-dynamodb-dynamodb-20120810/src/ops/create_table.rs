@@ -444,6 +444,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stream,
             items: ::std::collections::BTreeMap::new(),
             stored_bytes: 0,
+            // A new table has consumed none of the capacity it is provisioned for, so
+            // its first write has the whole documented burst behind it.
+            write_budget: crate::state::CapacityBudget::new(now),
             // A new table has been metered once, at zero: `ItemCount`/`TableSizeBytes` are
             // refreshed "approximately every six hours", not by the writes that follow.
             reported_counters: crate::state::MeteredCounters::new(now),
