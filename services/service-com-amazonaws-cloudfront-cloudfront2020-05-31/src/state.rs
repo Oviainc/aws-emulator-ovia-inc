@@ -2422,6 +2422,24 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         self.cache_policies.get(id)
     }
 
+    /// The distribution that attaches the cache policy `id` to one of its cache
+    /// behaviours, or `None` when no stored distribution does.
+    ///
+    /// `CachePolicyInUse` is documented as "Cannot delete the cache policy because it is
+    /// attached to one or more cache behaviors", and a behaviour attaches a policy through
+    /// its `CachePolicyId` — so what makes a policy in use is a stored behaviour naming it,
+    /// which is the rule [`references_cache_policy`] states for the whole configuration.
+    /// The scan reads the STORED configurations rather than a second index beside them, so
+    /// it cannot drift out of step with what a read of those distributions reports; both
+    /// collections are bounded ([`MAX_DISTRIBUTIONS`] distributions, each with a bounded
+    /// behaviour list). A behaviour that attaches no policy carries no `CachePolicyId` at
+    /// all rather than an empty one, so an id matches only a behaviour that really names it.
+    pub fn distribution_using_cache_policy(&self, id: &str) -> Option<&StoredDistribution> {
+        self.distributions
+            .values()
+            .find(|distribution| references_cache_policy(&distribution.config, id))
+    }
+
     /// The public key `id` names, or `None` when the store holds none.
     pub fn public_key(&self, id: &str) -> Option<&StoredPublicKey> {
         self.public_keys.get(id)
@@ -3267,12 +3285,91 @@ pub fn distribution_page<F>(
 where
     F: FnMut(&StoredDistribution) -> bool,
 {
+    let (items, is_truncated, last_id) = distribution_page_walk(
+        distributions,
+        marker,
+        page_size,
+        &mut matches,
+        StoredDistribution::to_summary,
+    );
+
+    crate::ops::types::DistributionList {
+        marker: marker.unwrap_or_default().to_string(),
+        next_marker: if is_truncated { last_id } else { None },
+        max_items,
+        is_truncated,
+        quantity: i32::try_from(items.len()).unwrap_or(i32::MAX),
+        items: if items.is_empty() { None } else { Some(items) },
+    }
+}
+
+/// ONE page of the IDS of the stored distributions `matches` selects, as the
+/// `DistributionIdList` every CloudFront "distributions associated with this resource"
+/// listing answers with.
+///
+/// The SAME page contract as [`distribution_page`] — the marker is the distribution id the
+/// previous page ended at, `NextMarker` and `IsTruncated` arrive exactly when selected
+/// distributions remain, and `Quantity` states the length of `Items` — over the same walk,
+/// so an id listing and a summary listing can never disagree about which distributions a
+/// filter selects or about the order they are served in. Only the projection differs:
+/// `DistributionIdList$Items` "contains the distribution IDs in the list".
+///
+/// Where a `DistributionList` drops its `Items` element on an empty page, an id list keeps
+/// it: the recorded service answers a filter nothing matches with the element present and
+/// empty, so a caller reads the ids of every page the same way rather than having to tell an
+/// empty page from a missing member.
+pub fn distribution_id_page<F>(
+    distributions: &BTreeMap<String, StoredDistribution>,
+    marker: Option<&str>,
+    max_items: i32,
+    page_size: usize,
+    mut matches: F,
+) -> crate::ops::types::DistributionIdList
+where
+    F: FnMut(&StoredDistribution) -> bool,
+{
+    let (items, is_truncated, last_id) = distribution_page_walk(
+        distributions,
+        marker,
+        page_size,
+        &mut matches,
+        |stored| stored.id.clone(),
+    );
+
+    crate::ops::types::DistributionIdList {
+        marker: marker.unwrap_or_default().to_string(),
+        next_marker: if is_truncated { last_id } else { None },
+        max_items,
+        is_truncated,
+        quantity: i32::try_from(items.len()).unwrap_or(i32::MAX),
+        items: Some(items),
+    }
+}
+
+/// The one page walk behind every CloudFront distribution listing: what `project` reads
+/// from each selected record, whether selected distributions remain after the page, and the
+/// distribution id this page ended at.
+///
+/// The store is ordered by id, so `marker` is a range bound rather than a scan and walking
+/// the pages enumerates every selected distribution exactly once, in id order.
+fn distribution_page_walk<'a, T, F, M>(
+    distributions: &'a BTreeMap<String, StoredDistribution>,
+    marker: Option<&str>,
+    page_size: usize,
+    matches: &mut F,
+    mut project: M,
+) -> (Vec<T>, bool, Option<String>)
+where
+    F: FnMut(&StoredDistribution) -> bool,
+    M: FnMut(&'a StoredDistribution) -> T,
+{
     let start = match marker {
         Some(marker) => std::ops::Bound::Excluded(marker),
         None => std::ops::Bound::Unbounded,
     };
-    let mut items: Vec<DistributionSummary> = Vec::new();
+    let mut items: Vec<T> = Vec::new();
     let mut is_truncated = false;
+    let mut last: Option<&'a StoredDistribution> = None;
     for (_, stored) in distributions.range::<str, _>((start, std::ops::Bound::Unbounded)) {
         if !matches(stored) {
             continue;
@@ -3281,21 +3378,42 @@ where
             is_truncated = true;
             break;
         }
-        items.push(stored.to_summary());
+        items.push(project(stored));
+        last = Some(stored);
     }
-
-    crate::ops::types::DistributionList {
-        marker: marker.unwrap_or_default().to_string(),
-        next_marker: if is_truncated {
-            items.last().map(|summary| summary.id.clone())
-        } else {
-            None
-        },
-        max_items,
+    // The id is taken once, from the record the page ended at, rather than cloned per item.
+    (
+        items,
         is_truncated,
-        quantity: i32::try_from(items.len()).unwrap_or(i32::MAX),
-        items: if items.is_empty() { None } else { Some(items) },
-    }
+        last.map(|stored| stored.id.clone()),
+    )
+}
+
+/// Whether `config` associates any of its cache behaviours with the cache policy
+/// `cache_policy_id` names.
+///
+/// A cache policy is attached to a distribution by a cache behaviour's `CachePolicyId`, and
+/// a distribution's behaviours are its DEFAULT cache behaviour together with its ordered
+/// ones — both declare the member, so both are walked here and a distribution is associated
+/// with the policy as soon as ONE of them names it.
+pub fn references_cache_policy(config: &DistributionConfig, cache_policy_id: &str) -> bool {
+    behavior_cache_policy_ids(config).any(|id| id == cache_policy_id)
+}
+
+/// The cache policy id every cache behaviour of `config` names — the default behaviour
+/// first, then each ordered one — skipping the behaviours that name none.
+fn behavior_cache_policy_ids(config: &DistributionConfig) -> impl Iterator<Item = &str> + '_ {
+    std::iter::once(config.default_cache_behavior.cache_policy_id.as_deref())
+        .chain(
+            config
+                .cache_behaviors
+                .as_ref()
+                .and_then(|behaviors| behaviors.items.as_deref())
+                .unwrap_or_default()
+                .iter()
+                .map(|behavior| behavior.cache_policy_id.as_deref()),
+        )
+        .flatten()
 }
 
 /// `methods` in [`EMITTED_METHOD_ORDER`], as a permutation of what was submitted: each
@@ -5587,8 +5705,32 @@ pub fn no_such_cache_policy() -> NoSuchCachePolicy {
     }
 }
 
-/// `NoSuchCachePolicy`'s message, as the model documents the shape.
-pub const NO_SUCH_CACHE_POLICY_MESSAGE: &str = "The cache policy does not exist.";
+/// `NoSuchCachePolicy`'s message, in the form CloudFront answers a `NoSuch…` with for a
+/// named resource — "The specified <resource> does not exist.", as
+/// [`NO_SUCH_DISTRIBUTION_MESSAGE`] and [`NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE`] carry it.
+/// The recorded service answers this code with that sentence — which is what a replay of
+/// the cache policy surface holds it to — and the shape's own documentation states it in its
+/// shorter form.
+pub const NO_SUCH_CACHE_POLICY_MESSAGE: &str = "The specified cache policy does not exist.";
+
+/// The modelled `CachePolicyInUse` (HTTP 409) for a delete of a policy a cache behaviour
+/// still attaches.
+///
+/// The sentence is a property of the CONDITION rather than of the request — the policy is
+/// associated with a cache behaviour, and the caller is told to disassociate it first — so
+/// nothing from the request or from the store belongs in it, and every refusal of this
+/// condition reads the same.
+pub fn cache_policy_in_use() -> crate::ops::types::CachePolicyInUse {
+    crate::ops::types::CachePolicyInUse {
+        message: Some(CACHE_POLICY_IN_USE_MESSAGE.to_string()),
+    }
+}
+
+/// `CachePolicyInUse`'s message: what CloudFront answers a delete of a cache policy that a
+/// cache behaviour still associates.
+pub const CACHE_POLICY_IN_USE_MESSAGE: &str =
+    "The specified cache policy is currently associated with a cache behavior. Please \
+     disassociate the policy before deleting.";
 
 /// The modelled `CachePolicyAlreadyExists` (HTTP 409) for a policy name that is already
 /// taken — "A cache policy with this name already exists. You must provide a unique name.
