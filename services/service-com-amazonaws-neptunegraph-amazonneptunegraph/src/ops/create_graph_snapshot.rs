@@ -235,16 +235,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same name conflicts with a stored snapshot of the same Region, while the
         // same name in another Region is another snapshot. Checked before the source
         // graph's status so a duplicate name is reported as the name conflict it is,
-        // whatever the graph is doing.
-        if let Some(existing) = store.snapshot_id_named(&input.snapshot_name, &region) {
+        // whatever the graph is doing. The refusal is worded from the requested name
+        // alone by the one builder every name-uniqueness check in this service reaches
+        // (`crate::state::snapshot_name_conflict`), so it discloses nothing about the
+        // snapshot that holds the name.
+        if store
+            .snapshot_id_named(&input.snapshot_name, &region)
+            .is_some()
+        {
             return Err(CreateGraphSnapshotErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "a snapshot named '{}' already exists with id {existing}",
-                        input.snapshot_name
-                    ),
-                    reason: None,
-                },
+                crate::state::snapshot_name_conflict(&input.snapshot_name),
             )
             .into());
         }

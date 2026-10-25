@@ -64,6 +64,15 @@ fn lookup_requests(id: &str) -> Vec<(&'static str, Value)> {
                 "entitlementType": "WINDOWS_SERVER",
             }),
         ),
+        (
+            "DeleteEntitlement",
+            json!({
+                "environmentId": id,
+                "connectorId": "cnctr-0123456789",
+                "entitlementType": "WINDOWS_SERVER",
+                "vmIds": ["vm-1"],
+            }),
+        ),
         ("DeleteEnvironment", json!({ "environmentId": id })),
     ]
 }

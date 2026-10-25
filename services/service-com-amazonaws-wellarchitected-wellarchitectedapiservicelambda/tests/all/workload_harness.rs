@@ -433,6 +433,22 @@ impl Client {
         self.send("GET", &uri, None).await
     }
 
+    /// `DeleteProfile`: `DELETE /profiles/{ProfileArn}?ClientRequestToken=…`. The ARN is a
+    /// non-greedy `@httpLabel` and the token an `@httpQuery` member, so both travel
+    /// percent-encoded exactly as an SDK sends them.
+    pub(crate) async fn delete_profile(&self, profile_arn: &str, token: &str) -> Answer {
+        self.send(
+            "DELETE",
+            &format!(
+                "/profiles/{}?ClientRequestToken={}",
+                encode_path_segment(profile_arn),
+                encode_path_segment(token)
+            ),
+            None,
+        )
+        .await
+    }
+
     /// `ListProfiles`: `GET /profileSummaries`, with every filter and paging member bound
     /// to the query string. `query` is passed as sent, empty for a request that names
     /// none.

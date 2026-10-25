@@ -284,24 +284,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         };
 
-        // The page size served: a request that names none is served this
-        // service's default rather than every job, an explicit zero is refused
-        // the way every listing of this service refuses it, and whatever is
+        // The page size served, under the rule every paginated operation of this
+        // service shares (`crate::state::page_size`): a request that names none
+        // is served this service's default rather than every job, an explicit
+        // zero is refused the way every listing of this service whose
+        // `maxResults` documents a minimum of 1 refuses it, and whatever is
         // asked for the service serves at most `crate::state::MAX_PAGE_SIZE` —
-        // so the page this call BUILDS is bounded by this code and not only by
+        // so the page this call BUILDS is bounded by that code and not only by
         // the boundary validator.
-        let page_size = match input.max_results {
-            None => crate::state::DEFAULT_PAGE_SIZE,
-            Some(requested) if requested < 1 => {
-                return Err(invalid(
-                    "maxResults must be at least 1; omit it for the default of 25".to_string(),
-                )
-                .into())
-            }
-            Some(requested) => usize::try_from(requested)
-                .unwrap_or(crate::state::MAX_PAGE_SIZE)
-                .min(crate::state::MAX_PAGE_SIZE),
-        };
+        let page_size = crate::state::page_size(
+            input.max_results,
+            crate::state::PageSizeRule::minimum_one(crate::state::DEFAULT_PAGE_SIZE),
+        )
+        .map_err(invalid)?;
 
         // The clock, not this call, is what moves a job on: its outcome was due
         // at `settles_at`, so reporting the stored state without materialising

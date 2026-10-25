@@ -22,7 +22,7 @@ use crate::ops::types::{
     MatchmakingConfiguration, MatchmakingRuleSet, MatchmakingTicket, PlacedPlayerSession, Player,
     PlayerGatewayConfiguration, PlayerLatency, PlayerLatencyPolicy, PlayerSession,
     PriorityConfiguration, PriorityConfigurationOverride, ResourceCreationLimitPolicy,
-    RoutingStrategy, RuntimeConfiguration, S3Location, Script, Tag,
+    RoutingStrategy, RuntimeConfiguration, S3Location, Script, Tag, VpcPeeringAuthorization,
 };
 
 /// `ComputeType` values the model declares (`smithy_query shape=ComputeType`).
@@ -1374,6 +1374,53 @@ impl GameSessionPlacementRecord {
     }
 }
 
+/// How long a VPC peering authorization stays valid for after it was issued.
+///
+/// `VpcPeeringAuthorization$ExpirationTime`'s own doc states the span: "Time stamp
+/// indicating when this authorization expires (24 hours after issuance)", and
+/// `CreateVpcPeeringAuthorization`'s doc repeats it — "The authorization remains valid
+/// for 24 hours unless it is canceled." So this duration is DOCUMENTED, not chosen.
+pub const VPC_PEERING_AUTHORIZATION_VALIDITY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// An authorization to peer a VPC with the VPC of an Amazon GameLift Servers fleet, as
+/// `CreateVpcPeeringAuthorization` persisted it — the one projection every read of the
+/// authorization is served from.
+///
+/// `VpcPeeringAuthorization`'s doc: "Represents an authorization for a VPC peering
+/// connection between the VPC for an Amazon GameLift Servers fleet and another VPC on an
+/// account you have access to." The pair it is issued for — the account that manages the
+/// fleets, and the VPC to be peered with them — is what identifies it, so that pair is
+/// the record's key in [`ComAmazonawsGameliftGameliftState::vpc_peering_authorizations`].
+#[derive(Debug, Clone)]
+pub struct VpcPeeringAuthorizationRecord {
+    /// The account "that you use to manage your Amazon GameLift Servers fleet", as the
+    /// request named it.
+    pub game_lift_aws_account_id: String,
+    /// "The authorization's peer VPC Amazon Web Services account ID": the account the
+    /// call was made from, which owns the VPC being authorized — the doc directs the
+    /// caller to "call this operation from the Amazon Web Services account with the VPC
+    /// that you want to peer".
+    pub peer_vpc_aws_account_id: String,
+    pub peer_vpc_id: String,
+    pub creation_time: SystemTime,
+    /// When the authorization stops being valid: [`VPC_PEERING_AUTHORIZATION_VALIDITY`]
+    /// after it was issued.
+    pub expiration_time: SystemTime,
+}
+
+impl VpcPeeringAuthorizationRecord {
+    /// This authorization as the modelled `VpcPeeringAuthorization`.
+    pub fn to_modelled(&self) -> VpcPeeringAuthorization {
+        VpcPeeringAuthorization {
+            game_lift_aws_account_id: Some(self.game_lift_aws_account_id.clone()),
+            peer_vpc_aws_account_id: Some(self.peer_vpc_aws_account_id.clone()),
+            peer_vpc_id: Some(self.peer_vpc_id.clone()),
+            creation_time: Some(to_date_time(self.creation_time)),
+            expiration_time: Some(to_date_time(self.expiration_time)),
+        }
+    }
+}
+
 /// Whether `body` is a FlexMatch rule set, or the reason it is not — which both
 /// `CreateMatchmakingRuleSet` and `ValidateMatchmakingRuleSet` answer with the modelled
 /// `InvalidRequestException`.
@@ -1516,6 +1563,12 @@ pub struct ComAmazonawsGameliftGameliftState {
     pub game_sessions: HashMap<String, GameSessionRecord>,
     /// Player sessions by `PlayerSessionId`.
     pub player_sessions: HashMap<String, PlayerSessionRecord>,
+    /// VPC peering authorizations by the pair they are issued for: the account that
+    /// manages the Amazon GameLift Servers fleets, and the VPC to be peered with them.
+    /// Re-issuing an authorization for a pair that already holds one replaces it, since
+    /// an authorization is what "must exist and be valid for the peering connection to be
+    /// established" for exactly that pair.
+    pub vpc_peering_authorizations: HashMap<(String, String), VpcPeeringAuthorizationRecord>,
     /// `IdempotencyToken` (or caller-supplied `GameSessionId`) to the game session the
     /// request that first carried it created, keyed by the fleet it was created on:
     /// `IdempotentParameterMismatchException`'s doc scopes the custom string to one
@@ -1606,6 +1659,12 @@ impl ComAmazonawsGameliftGameliftState {
 
         self.tick_matchmaking_tickets(now);
         self.tick_game_session_placements(now);
+
+        // An authorization that has reached its expiry is no longer one: it "must exist
+        // and be valid for the peering connection to be established", and it expires 24
+        // hours after issuance unless it is canceled first, so the clock alone retires it.
+        self.vpc_peering_authorizations
+            .retain(|_, authorization| now < authorization.expiration_time);
     }
 
     /// Move every matchmaking ticket the clock has carried forward.
@@ -2058,6 +2117,23 @@ impl ComAmazonawsGameliftGameliftState {
                 .then_with(|| left.name.cmp(&right.name))
         });
         configurations
+    }
+
+    /// Every stored VPC peering authorization, oldest first, so two reads of the
+    /// collection can only agree on its order.
+    pub fn vpc_peering_authorizations_in_order(&self) -> Vec<&VpcPeeringAuthorizationRecord> {
+        let mut authorizations: Vec<&VpcPeeringAuthorizationRecord> =
+            self.vpc_peering_authorizations.values().collect();
+        authorizations.sort_by(|left, right| {
+            left.creation_time
+                .cmp(&right.creation_time)
+                .then_with(|| left.peer_vpc_id.cmp(&right.peer_vpc_id))
+                .then_with(|| {
+                    left.game_lift_aws_account_id
+                        .cmp(&right.game_lift_aws_account_id)
+                })
+        });
+        authorizations
     }
 
     /// Every stored custom location, oldest first, so a paginated walk is stable.
