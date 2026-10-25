@@ -27,8 +27,8 @@ hex = { workspace = true }
 # system-generated universally unique identifier (UUID) for the action" (`Action$ActionId`).
 uuid = { version = "1", features = ["v4"] }
 # `arn`: the ONE parse of a caller-supplied resource ARN, shared with every other
-# service — the topic an SNS subscriber's `Address` names is read through it rather
-# than split here.
+# service — the topic an SNS subscriber's `Address` names, and the account a budget
+# action's `ExecutionRoleArn` names, are read through it rather than split here.
 service-common = { path = "../common" }
 # The AWS SDK for Amazon SNS, driven over the in-process callback
 # (`OperationContext::callback`): a notification in the `ALARM` state publishes its

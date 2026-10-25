@@ -23,6 +23,10 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Wraps the opaque `ListLFTags` continuation token so a caller round-trips it as bytes.
 hex = { workspace = true }
+# The Glue Data Catalog's own store: `GrantPermissions` grants permissions ON databases
+# and tables, which Glue owns, so their existence is read from Glue's state in the shared
+# engine rather than kept a second time here.
+service-com-amazonaws-glue-awsglue = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

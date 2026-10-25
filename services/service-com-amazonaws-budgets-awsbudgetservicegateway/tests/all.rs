@@ -17,6 +17,8 @@ mod account_notification_listing;
 mod account_scoping;
 #[path = "all/budget_action_execution.rs"]
 mod budget_action_execution;
+#[path = "all/budget_action_execution_role.rs"]
+mod budget_action_execution_role;
 #[path = "all/budget_action_history.rs"]
 mod budget_action_history;
 #[path = "all/budget_action_lifecycle.rs"]
