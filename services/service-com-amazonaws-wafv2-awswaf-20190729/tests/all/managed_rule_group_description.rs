@@ -24,7 +24,8 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_wafv2_awswaf_20190729::state::{
-    self, ManagedRuleGroupDescriptor, PublishedRuleAction, MANAGED_RULE_GROUP_CATALOGUE,
+    self, ManagedRuleGroupDescriptor, ManagedVersionState, PublishedRuleAction,
+    MANAGED_RULE_GROUP_CATALOGUE,
 };
 
 use crate::managed_rule_groups::managed_statement;
@@ -284,17 +285,22 @@ async fn every_offered_version_can_be_described_and_a_request_naming_none_gets_t
     );
 }
 
-/// A version its vendor does not offer is nothing WAF can describe, so the call is
-/// refused with the modelled `WAFInvalidParameterException` naming the managed rule
-/// group and carrying the rejected version — and the refusal describes nothing.
+/// A version its vendor does not publish at all is nothing WAF can describe, so the
+/// call is refused with the modelled `WAFInvalidParameterException` naming the
+/// managed rule group and carrying the rejected version — and the refusal describes
+/// nothing. A version the vendor published and has since RETIRED is a different
+/// class, answered by `WAFExpiredManagedRuleGroupVersionException` (see
+/// [`crate::managed_rule_group_version_expiry`]), so no row here names one.
 ///
 /// The rows differ in HOW the version is wrong: a name no vendor publishes, an
-/// offered name in the wrong case, a name offered for another group but not this
-/// one, and a name that is merely a prefix of an offered one.
+/// offered name in the wrong case, a name offered for another group but neither
+/// offered nor retired for this one, and a name that is merely a prefix of an
+/// offered one.
 #[tokio::test]
 async fn a_version_the_vendor_does_not_offer_cannot_be_described() {
     // A group that offers exactly one version, and a version another group offers
-    // but this one does not: the catalogue publishes both kinds of entry.
+    // but this one neither offers nor has retired: the catalogue publishes both
+    // kinds of entry.
     let single = MANAGED_RULE_GROUP_CATALOGUE
         .iter()
         .find(|group| group.versions.len() == 1)
@@ -303,8 +309,8 @@ async fn a_version_the_vendor_does_not_offer_cannot_be_described() {
         .iter()
         .flat_map(|group| group.versions.iter())
         .map(|release| release.name)
-        .find(|name| single.offered_version(Some(name)).is_none())
-        .expect("another group offers a version this one does not");
+        .find(|name| single.version_state(name) == ManagedVersionState::Unknown)
+        .expect("another group offers a version this one never published");
     let offered = single
         .current_default_version()
         .expect("the group offers a version");

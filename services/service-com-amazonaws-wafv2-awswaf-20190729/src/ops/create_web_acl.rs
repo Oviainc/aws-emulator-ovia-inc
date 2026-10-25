@@ -304,6 +304,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A `ManagedRuleGroupStatement$Version` is resolved when the rule is saved,
+        // so a rule pinning a version the publishing vendor has retired is refused
+        // with the modelled `WAFExpiredManagedRuleGroupVersionException` and NOTHING
+        // is stored: no web ACL is created, so no listing shows the name the refused
+        // request asked for.
+        if let Some(expired) = crate::state::expired_managed_rule_group_version(
+            input.rules.as_deref().unwrap_or_default(),
+        ) {
+            // The version that has expired is in the refusal's own sentence, which
+            // WAF words with it; the audit record keeps the same diagnostic.
+            crate::state::audit(
+                "CreateWebACL",
+                &input.scope,
+                &input.name,
+                "",
+                &format!(
+                    "WAFExpiredManagedRuleGroupVersionException: {}",
+                    expired.message.clone().unwrap_or_default()
+                ),
+            );
+            return Err(
+                CreateWebACLErrorModeled::WAFExpiredManagedRuleGroupVersionException(expired)
+                    .into(),
+            );
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateWebACLErrorModeled::WAFInternalErrorException(
                 WAFInternalErrorException {
