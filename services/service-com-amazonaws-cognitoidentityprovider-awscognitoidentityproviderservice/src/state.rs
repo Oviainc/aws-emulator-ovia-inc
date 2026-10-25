@@ -182,6 +182,18 @@ pub fn terms_exists_message(terms_name: &str, client_id: &str) -> String {
     format!("Terms with name {terms_name} already exists for Client {client_id}.")
 }
 
+/// The message a `ResourceNotFoundException` carries when an app client holds no
+/// terms documents under the requested `TermsName`.
+///
+/// A set of terms documents is looked up by app client and name together
+/// (`DescribeTermsByClient` resolves documents "identified by the app client ID,
+/// user pool ID, and terms name" in this service's model), so the refusal names
+/// the same two things the lookup used — the mirror of
+/// [`terms_exists_message`], which reports that pair already taken.
+pub fn terms_not_found_for_client_message(terms_name: &str, client_id: &str) -> String {
+    format!("Terms with name {terms_name} does not exist for Client {client_id}.")
+}
+
 // ---------------------------------------------------------------------------
 // Password policy rejection wording
 //
