@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEventSourceMapping
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEventSourceMapping`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEventSourceMapping::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the ONE event source mapping the `UUID` names and answers the
+//! `EventSourceMappingConfiguration` read back out of what it stored.
+//!
+//! Every member the request carries replaces the stored value and every member it omits
+//! leaves the stored value alone, so a call that states only `Enabled` pauses or resumes
+//! the mapping without touching its batching, filtering or destination settings. A
+//! `FunctionName` re-targets the mapping onto the function (and, when the name qualifies
+//! one, the version or alias) it names, which has to resolve to a function this emulator
+//! holds.
+//!
+//! The operation answers 202 Accepted, so the change is NOT in effect when the call
+//! returns: the mapping moves into `Updating` — one of the states
+//! `EventSourceMappingConfiguration$State` enumerates — and the move to the state its
+//! `Enabled` setting asks for is owed by the CLOCK (see
+//! [`crate::state::EventSourceMappingRecord::begin_update`]). Nothing sleeps for it.
+//!
+//! That window is what makes a mapping UNAVAILABLE to a second write:
+//! `ResourceInUseException` is "The operation conflicts with the resource's availability.
+//! For example, you tried to update an event source mapping in the CREATING state, or you
+//! tried to delete an event source mapping currently UPDATING" — so an update that
+//! arrives while the mapping is still settling (whether from its create or from an
+//! earlier update), or while its deletion is still owed, is refused with that modelled
+//! error rather than applied on top. Two concurrent updates of one mapping therefore have
+//! exactly one winner, and the loser is told to retry.
 //!
 //! ## Shape of an operation
 //!
@@ -343,18 +359,234 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEventSourceMapping` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEventSourceMappingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEventSourceMapping"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(service_error("Lambda state is not reachable on this engine"));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+        // The store is first brought up to whatever the clock already made due, so a
+        // mapping whose own removal was already owed is gone before this call looks for
+        // it, and a window the clock has already closed is not read as still open.
+        store.materialize_all(now);
+
+        {
+            let Some(record) = store.event_source_mappings.get(&input.uuid) else {
+                // A mapping is addressed by its own identifier, which the request already
+                // carries, so the refusal is the fixed sentence rather than the resource
+                // named back — the same sentence every other operation on a mapping
+                // refuses an unheld `UUID` with.
+                return Err(not_found(
+                    crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+                ));
+            };
+            // "The operation conflicts with the resource's availability": a mapping that
+            // is still settling, or whose removal is still owed, is not available to take
+            // another change. See the module docs.
+            if record.is_deleting() || record.is_settling() {
+                return Err(resource_in_use(format!(
+                    "The operation cannot be performed at this time. The event source \
+                     mapping {uuid} is currently in the following state: {state}",
+                    uuid = record.uuid,
+                    state = record.state
+                )));
+            }
+        }
+
+        // A `FunctionName` re-targets the mapping, so it has to resolve to a function
+        // this store holds — in any of its documented forms, qualified or not.
+        let retarget = match input.function_name.as_deref() {
+            None => None,
+            Some(function_name) => {
+                let (function, version) =
+                    crate::state::resolve_function(&mut store, function_name, None, &region, now)
+                        .map_err(|failure| match failure {
+                            crate::state::ResolveFailure::Malformed(message) => {
+                                invalid_parameter(message)
+                            }
+                            crate::state::ResolveFailure::NotFound(message) => not_found(message),
+                        })?;
+                Some((
+                    function.config.name.clone(),
+                    function.versioned_arn(&version),
+                    // `$LATEST` is the function itself rather than one version or alias
+                    // of it, so a reference to it is an unqualified reference.
+                    (version != crate::state::VERSION_LATEST).then_some(version),
+                ))
+            }
+        };
+
+        let Some(record) = store.event_source_mappings.get_mut(&input.uuid) else {
+            return Err(service_error(
+                "Lambda lost the event source mapping between resolving it and updating it",
+            ));
+        };
+
+        if let Some((function_name, function_arn, function_qualifier)) = retarget {
+            record.function_name = function_name;
+            record.function_arn = function_arn;
+            record.function_qualifier = function_qualifier;
+        }
+        // Every member the request states replaces the stored value; every member it
+        // omits leaves the stored value alone.
+        if let Some(enabled) = input.enabled {
+            record.enabled = enabled;
+        }
+        if let Some(batch_size) = input.batch_size {
+            record.batch_size = batch_size;
+        }
+        if input.filter_criteria.is_some() {
+            record.filter_criteria = input.filter_criteria.clone();
+        }
+        if input.kms_key_arn.is_some() {
+            record.kms_key_arn = input.kms_key_arn.clone();
+        }
+        if input.metrics_config.is_some() {
+            record.metrics_config = input.metrics_config.clone();
+        }
+        if input.logging_config.is_some() {
+            record.logging_config = input.logging_config.clone();
+        }
+        if input.scaling_config.is_some() {
+            record.scaling_config = input.scaling_config.clone();
+        }
+        if input.maximum_batching_window_in_seconds.is_some() {
+            record.maximum_batching_window_in_seconds = input.maximum_batching_window_in_seconds;
+        }
+        if input.parallelization_factor.is_some() {
+            record.parallelization_factor = input.parallelization_factor;
+        }
+        if input.destination_config.is_some() {
+            record.destination_config = input.destination_config.clone();
+        }
+        if input.maximum_record_age_in_seconds.is_some() {
+            record.maximum_record_age_in_seconds = input.maximum_record_age_in_seconds;
+        }
+        if input.bisect_batch_on_function_error.is_some() {
+            record.bisect_batch_on_function_error = input.bisect_batch_on_function_error;
+        }
+        if input.maximum_retry_attempts.is_some() {
+            record.maximum_retry_attempts = input.maximum_retry_attempts;
+        }
+        if input.tumbling_window_in_seconds.is_some() {
+            record.tumbling_window_in_seconds = input.tumbling_window_in_seconds;
+        }
+        if input.source_access_configurations.is_some() {
+            record.source_access_configurations = input.source_access_configurations.clone();
+        }
+        if input.function_response_types.is_some() {
+            record.function_response_types = input.function_response_types.clone();
+        }
+        if input.amazon_managed_kafka_event_source_config.is_some() {
+            record.amazon_managed_kafka_event_source_config =
+                input.amazon_managed_kafka_event_source_config.clone();
+        }
+        if input.self_managed_kafka_event_source_config.is_some() {
+            record.self_managed_kafka_event_source_config =
+                input.self_managed_kafka_event_source_config.clone();
+        }
+        if input.document_db_event_source_config.is_some() {
+            record.document_db_event_source_config = input.document_db_event_source_config.clone();
+        }
+        if input.provisioned_poller_config.is_some() {
+            record.provisioned_poller_config = input.provisioned_poller_config.clone();
+        }
+
+        // The change is accepted rather than applied: the mapping is `Updating` until the
+        // clock makes the move out of it due. See the module docs.
+        record.begin_update(now);
+
+        // Answered by reading the stored record back, so `GetEventSourceMapping` reports
+        // exactly what this call persisted.
+        Ok(event_source_mapping_configuration(record.reported()))
     }
+}
+
+/// The one `EventSourceMappingConfiguration` the model declares, in this operation's own
+/// generated shape of it.
+///
+/// [`crate::state::EventSourceMappingRecord::reported`] builds the shared one (generated
+/// as `CreateEventSourceMappingOutput`) that every operation reporting a mapping answers
+/// with, so the members are carried across one for one rather than rebuilt from state a
+/// second time.
+fn event_source_mapping_configuration(
+    configuration: CreateEventSourceMappingOutput,
+) -> UpdateEventSourceMappingOutput {
+    UpdateEventSourceMappingOutput {
+        uuid: configuration.uuid,
+        starting_position: configuration.starting_position,
+        starting_position_timestamp: configuration.starting_position_timestamp,
+        batch_size: configuration.batch_size,
+        maximum_batching_window_in_seconds: configuration.maximum_batching_window_in_seconds,
+        parallelization_factor: configuration.parallelization_factor,
+        event_source_arn: configuration.event_source_arn,
+        filter_criteria: configuration.filter_criteria,
+        filter_criteria_error: configuration.filter_criteria_error,
+        kms_key_arn: configuration.kms_key_arn,
+        metrics_config: configuration.metrics_config,
+        logging_config: configuration.logging_config,
+        scaling_config: configuration.scaling_config,
+        function_arn: configuration.function_arn,
+        last_modified: configuration.last_modified,
+        last_processing_result: configuration.last_processing_result,
+        state: configuration.state,
+        state_transition_reason: configuration.state_transition_reason,
+        destination_config: configuration.destination_config,
+        topics: configuration.topics,
+        queues: configuration.queues,
+        source_access_configurations: configuration.source_access_configurations,
+        self_managed_event_source: configuration.self_managed_event_source,
+        maximum_record_age_in_seconds: configuration.maximum_record_age_in_seconds,
+        bisect_batch_on_function_error: configuration.bisect_batch_on_function_error,
+        maximum_retry_attempts: configuration.maximum_retry_attempts,
+        tumbling_window_in_seconds: configuration.tumbling_window_in_seconds,
+        function_response_types: configuration.function_response_types,
+        amazon_managed_kafka_event_source_config: configuration
+            .amazon_managed_kafka_event_source_config,
+        self_managed_kafka_event_source_config: configuration
+            .self_managed_kafka_event_source_config,
+        document_db_event_source_config: configuration.document_db_event_source_config,
+        event_source_mapping_arn: configuration.event_source_mapping_arn,
+        provisioned_poller_config: configuration.provisioned_poller_config,
+    }
+}
+
+/// The modelled 400 for a `FunctionName` that is not one of the documented name forms.
+fn invalid_parameter(message: String) -> UpdateEventSourceMappingError {
+    UpdateEventSourceMappingErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled 404 for a `UUID` that names no mapping, or a `FunctionName` that names no
+/// function this emulator holds.
+fn not_found(message: String) -> UpdateEventSourceMappingError {
+    UpdateEventSourceMappingErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled refusal for a mapping that is not available to take this change.
+fn resource_in_use(message: String) -> UpdateEventSourceMappingError {
+    UpdateEventSourceMappingErrorModeled::ResourceInUseException(ResourceInUseException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled 500 for a failure of the store itself.
+fn service_error(message: &str) -> UpdateEventSourceMappingError {
+    UpdateEventSourceMappingErrorModeled::ServiceException(ServiceException {
+        r#type: None,
+        message: Some(message.to_string()),
+    })
+    .into()
 }

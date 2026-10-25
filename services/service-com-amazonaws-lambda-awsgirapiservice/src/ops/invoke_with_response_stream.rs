@@ -1,0 +1,491 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! @op InvokeWithResponseStream
+//!
+//! Invokes a function and answers its response as an event stream: `POST
+//! /2021-11-15/functions/{FunctionName}/response-streaming-invocations`, whose output
+//! binds the `@streaming` union `InvokeWithResponseStreamResponseEvent` (`PayloadChunk`
+//! and the terminating `InvokeComplete`) as its `@httpPayload`.
+//!
+//! This operation is HAND-AUTHORED rather than scaffolded. The op-stub generator declined
+//! it ("a `@streaming` event-stream output member, which needs wire framing the generator
+//! does not emit", `src/ops/SKIPPED_STUBS.md`), and the `#[smithy_service]` expansion also
+//! declines any operation whose output binds a `@streaming` union — the generated
+//! `ErasedOperation` shim on [`InvokeWithResponseStream`] therefore answers the
+//! framework's "modeled but not served" signal and is never what serves a request. What
+//! serves it is [`ResponseStreamEntry`], the hand-written entry
+//! `crate::service::EmulatedService::override_operation` returns, which the router
+//! consults BEFORE the generated routing table. The table entry still matters: the router
+//! reads the MODEL's auth schemes off it, so this operation is SigV4-signed exactly as the
+//! model says.
+//!
+//! ## What this emulator can answer
+//!
+//! Everything up to the invocation itself is computed from [`crate::state`]: the request is
+//! read through the model's own HTTP bindings and checked against the model's constraints,
+//! the `FunctionName`/`Qualifier` pair is resolved to a stored function and version — a
+//! name that names none is the modelled `ResourceNotFoundException` (404), naming the
+//! resource the invocation ADDRESSED (the function at the version it would have run,
+//! `$LATEST` when the request named no qualifier), not a platform gap — and a function that
+//! is still being provisioned is the modelled
+//! `ResourceConflictException` (409), the window `CreateFunction` documents as "During this
+//! time, you can't invoke or modify the function".
+//!
+//! `InvocationType=DryRun` is then the WHOLE operation: "Validate parameter values and
+//! verify that the user or role has permission to invoke the function" runs nothing, and
+//! the model's own `StatusCode` documentation states what it answers — "For the
+//! `RequestResponse` invocation type, this status code is 200. For the `DryRun` invocation
+//! type, this status code is 204."
+//!
+//! `InvocationType=RequestResponse` means "run the deployment package and stream what its
+//! handler writes". This emulator has no in-process runtime that can run a deployment
+//! package (the same gap `crate::ops::invoke` states for the same reason), and a chunk
+//! sequence, a trailer error code or a log tail invented for a handler that never ran would
+//! be indistinguishable from a real one — so that path is refused, naming the function and
+//! version it resolved. The event-stream framing a real run would need is
+//! `service_common::event_stream`, which is where this operation will reach for it; nothing
+//! is framed for work nothing performed.
+//!
+//! ## Modeled contract for `InvokeWithResponseStream`
+//!
+//! From this service's Smithy model
+//! (`smithy_query(query="operation", operation="InvokeWithResponseStream",
+//! model_path="services/service-com-amazonaws-lambda-awsgirapiservice/smithy-model/com-amazonaws-lambda-awsgirapiservice.json")`):
+//!
+//! * **Route:** `POST /2021-11-15/functions/{FunctionName}/response-streaming-invocations
+//!   -> 200`
+//! * **Input:** `FunctionName` (`NamespacedFunctionName`, `@httpLabel`, **required**),
+//!   `InvocationType` (`ResponseStreamingInvocationType`, `@httpHeader
+//!   X-Amz-Invocation-Type`, one of `RequestResponse | DryRun`), `LogType`
+//!   (`@httpHeader X-Amz-Log-Type`), `ClientContext` (`@httpHeader
+//!   X-Amz-Client-Context`), `Qualifier`
+//!   (`NumericLatestPublishedOrAliasQualifier`, `@httpQuery Qualifier`), `Payload`
+//!   (blob, `@httpPayload`, sensitive), `TenantId` (`@httpHeader X-Amz-Tenant-Id`)
+//! * **Output:** `StatusCode` (`@httpResponseCode`), `ExecutedVersion` (`@httpHeader
+//!   X-Amz-Executed-Version`), `EventStream` (`@streaming` union, `@httpPayload`),
+//!   `ResponseStreamContentType` (`@httpHeader Content-Type`)
+//! * **Errors:** the 40 the operation declares, carried on
+//!   [`InvokeWithResponseStreamErrorModeled`] below with the status the model gives each.
+
+#[allow(unused_imports)]
+use super::types::*;
+
+use std::sync::Arc;
+
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
+use aws_smithy_types::body::SdkBody;
+use service_common::event_stream::{error_response, EventStreamOperation};
+use smithy_server_runtime::{BoxFuture, OperationContext, ServerHttpProtocol, Service};
+
+// `#[operation_error]` below expands to an invocation of the LOCAL declarative
+// `smithy!` macro, which this line is what emits into the module.
+smithy_macros::smithy_model!("smithy-model/com-amazonaws-lambda-awsgirapiservice.json");
+
+// The operation's MODELED errors, every one the model declares for it. The scaffold's
+// `NotImplemented` cannot live here — `#[operation_error]` accepts only variants the model
+// declares — hence the `InvokeWithResponseStreamError` alias below.
+#[smithy_macros::operation_error("com.amazonaws.lambda#InvokeWithResponseStream")]
+#[derive(Debug)]
+pub enum InvokeWithResponseStreamErrorModeled {
+    CodeArtifactUserDeletedException(CodeArtifactUserDeletedException),
+    CodeArtifactUserFailedException(CodeArtifactUserFailedException),
+    CodeArtifactUserPendingException(CodeArtifactUserPendingException),
+    EC2AccessDeniedException(EC2AccessDeniedException),
+    EC2ThrottledException(EC2ThrottledException),
+    EC2UnexpectedException(EC2UnexpectedException),
+    EFSIOException(EFSIOException),
+    EFSMountConnectivityException(EFSMountConnectivityException),
+    EFSMountFailureException(EFSMountFailureException),
+    EFSMountTimeoutException(EFSMountTimeoutException),
+    ENILimitReachedException(ENILimitReachedException),
+    InvalidParameterValueException(InvalidParameterValueException),
+    InvalidRequestContentException(InvalidRequestContentException),
+    InvalidRuntimeException(InvalidRuntimeException),
+    InvalidSecurityGroupIDException(InvalidSecurityGroupIDException),
+    InvalidSubnetIDException(InvalidSubnetIDException),
+    InvalidZipFileException(InvalidZipFileException),
+    KMSAccessDeniedException(KMSAccessDeniedException),
+    KMSDisabledException(KMSDisabledException),
+    KMSInvalidStateException(KMSInvalidStateException),
+    KMSNotFoundException(KMSNotFoundException),
+    NoPublishedVersionException(NoPublishedVersionException),
+    RecursiveInvocationException(RecursiveInvocationException),
+    RequestTooLargeException(RequestTooLargeException),
+    ResourceConflictException(ResourceConflictException),
+    ResourceNotFoundException(ResourceNotFoundException),
+    ResourceNotReadyException(ResourceNotReadyException),
+    S3FilesMountConnectivityException(S3FilesMountConnectivityException),
+    S3FilesMountFailureException(S3FilesMountFailureException),
+    S3FilesMountTimeoutException(S3FilesMountTimeoutException),
+    SerializedRequestEntityTooLargeException(SerializedRequestEntityTooLargeException),
+    ServiceException(ServiceException),
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
+    SnapStartException(SnapStartException),
+    SnapStartNotReadyException(SnapStartNotReadyException),
+    SnapStartRegenerationFailureException(SnapStartRegenerationFailureException),
+    SnapStartTimeoutException(SnapStartTimeoutException),
+    SubnetIPAddressLimitReachedException(SubnetIPAddressLimitReachedException),
+    TooManyRequestsException(TooManyRequestsException),
+    UnsupportedMediaTypeException(UnsupportedMediaTypeException),
+}
+
+/// This operation's error channel. Wrapping the modeled enum is what lets it refuse a bad
+/// request the model has no error for (`Scaffolded::validation`) and state the one path it
+/// cannot serve as not implemented rather than as a modelled failure.
+pub type InvokeWithResponseStreamError =
+    crate::scaffolded::Scaffolded<InvokeWithResponseStreamErrorModeled>;
+
+/// Lets `?` and `.into()` lift a modeled failure into the error channel.
+impl From<InvokeWithResponseStreamErrorModeled> for InvokeWithResponseStreamError {
+    fn from(modeled: InvokeWithResponseStreamErrorModeled) -> Self {
+        crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// The `InvokeWithResponseStream` operation.
+///
+/// Owns the shared engine (the constructor seam). The generated `ErasedOperation` shim
+/// on this type declines, because the operation's output binds a `@streaming` union;
+/// [`ResponseStreamEntry`] is what the service returns from `override_operation`, and it
+/// delegates to [`Self::serve_request`] here.
+pub struct InvokeWithResponseStream<Eng> {
+    engine: Arc<Eng>,
+}
+
+impl<Eng> InvokeWithResponseStream<Eng> {
+    /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
+    /// construction-time dependency, so engine access is guaranteed by the time any
+    /// request runs. Called by the generated `ServiceDefinition::new(engine)`.
+    pub fn new(engine: Arc<Eng>) -> Self {
+        Self { engine }
+    }
+}
+
+/// The hand-written entry that actually serves the request; see the module docs.
+pub struct ResponseStreamEntry<Eng> {
+    op: InvokeWithResponseStream<Eng>,
+}
+
+impl<Eng> ResponseStreamEntry<Eng> {
+    /// Construct the entry from the shared engine — the same seam every operation uses,
+    /// so this entry and every other operation read ONE store.
+    pub fn new(engine: Arc<Eng>) -> Self {
+        Self {
+            op: InvokeWithResponseStream::new(engine),
+        }
+    }
+}
+
+impl<Eng: Send + Sync + 'static> EventStreamOperation for ResponseStreamEntry<Eng> {
+    fn serve<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // The author's `override_protocol` wins over the model-derived one, the same
+            // resolution the centralized sequence applies.
+            let protocol = svc
+                .override_protocol()
+                .unwrap_or_else(|| svc.definition().protocol());
+            self.op.serve_request(protocol, req, ctx)
+        })
+    }
+}
+
+impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
+    /// Serve one request, rendering a failure in this service's own envelope — the same
+    /// envelope every other operation's modelled error is rendered in, so a client reads
+    /// one error shape from the whole service.
+    ///
+    /// The request is also RECORDED, which this operation does itself because it does not
+    /// run through the centralized sequence that records it for every other one. The
+    /// record is value-free: the signing name, the operation, the access-key id the
+    /// request presented (the public half of a credential, never a secret) and the status
+    /// answered — never a payload, a header value or a credential secret.
+    fn serve_request(
+        &self,
+        protocol: &dyn ServerHttpProtocol,
+        req: &RtRequest,
+        ctx: &OperationContext<'_>,
+    ) -> RtResponse {
+        let response = match self.invoke(protocol, req, ctx) {
+            Ok(response) => response,
+            Err(error) => error_response(protocol, &error),
+        };
+        tracing::info!(
+            service = ctx.identity().signing_name(),
+            operation = OPERATION_NAME,
+            access_key_id = ::engine::extract_akid(&ctx.parts().headers),
+            status = response.status().as_u16(),
+            "served a response-streaming invocation"
+        );
+        response
+    }
+
+    /// The invocation itself: read the request through the model's bindings, resolve the
+    /// function out of the store, and answer what this emulator can compute.
+    fn invoke(
+        &self,
+        protocol: &dyn ServerHttpProtocol,
+        req: &RtRequest,
+        ctx: &OperationContext<'_>,
+    ) -> Result<RtResponse, InvokeWithResponseStreamError> {
+        // Read through the service's own protocol and check against the model, so the
+        // `@httpLabel`, `@httpQuery`, `@httpHeader` and `@httpPayload` bindings and every
+        // constraint this request is held to are the model's. A refusal is worded the way
+        // the framework's own boundary words one, and answered with the same 400
+        // `ValidationException` code it answers with.
+        let input: InvokeWithResponseStreamInput = service_common::event_stream::deserialize_request(
+            protocol,
+            req,
+            INVOKE_WITH_RESPONSE_STREAM_INPUT_SCHEMA,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(service_error("Lambda state is not reachable on this engine"));
+        };
+
+        // "By default, Lambda invokes your function synchronously (i.e. the
+        // InvocationType is RequestResponse)" — the one default `Invoke` documents for
+        // the same member, and the constraint walk above has already held the value to
+        // the model's `ResponseStreamingInvocationType` value set.
+        let invocation_type = input
+            .invocation_type
+            .clone()
+            .unwrap_or_else(|| INVOCATION_TYPE_REQUEST_RESPONSE.to_string());
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+
+        // The resource an INVOCATION addresses is a function AT a version: `Qualifier`
+        // "specif[ies] a version or alias to invoke a published version of the function",
+        // and an invocation that names none runs the unpublished version, which is what
+        // the output's `ExecutedVersion` reports as `$LATEST`. So the refusal for a pair
+        // that resolves to nothing names that qualified resource, built from the request.
+        let reference =
+            crate::state::parse_function_reference(&input.function_name).ok_or_else(|| {
+                invalid_parameter(format!(
+                    "1 validation error detected: Value '{}' at 'functionName' failed to \
+                     satisfy constraint: Member must satisfy one of the documented name \
+                     formats (name, name:qualifier, partial ARN or function ARN)",
+                    input.function_name
+                ))
+            })?;
+        let addressed_version = reference
+            .qualifier
+            .clone()
+            .or_else(|| input.qualifier.clone())
+            .unwrap_or_else(|| crate::state::VERSION_LATEST.to_string());
+        let addressed_arn = format!(
+            "{}:{addressed_version}",
+            crate::state::function_arn(&region, &reference.name)
+        );
+
+        let mut store = state.lock();
+        let (record, version) = crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            input.qualifier.as_deref(),
+            &region,
+            now,
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => invalid_parameter(message),
+            crate::state::ResolveFailure::NotFound(_) => {
+                not_found(format!("Function not found: {addressed_arn}"))
+            }
+        })?;
+
+        // "During this time, you can't invoke or modify the function" (`CreateFunction`),
+        // so an invocation that arrives inside the provisioning window is refused rather
+        // than served.
+        if record.state != crate::state::STATE_ACTIVE {
+            return Err(resource_conflict(format!(
+                "The operation cannot be performed at this time. The function is currently \
+                 in the following state: {}",
+                record.state
+            )));
+        }
+
+        let payload = input.payload.as_deref().unwrap_or_default();
+        // "For synchronous invocations, the maximum payload size is 6 MB" (`Invoke`): a
+        // response-streaming invocation is a synchronous one, and the request half of it
+        // is bounded the same way.
+        if payload.len() > MAX_SYNCHRONOUS_PAYLOAD_BYTES {
+            return Err(request_too_large(format!(
+                "Request must be smaller than {MAX_SYNCHRONOUS_PAYLOAD_BYTES} bytes for the \
+                 {invocation_type} invocation type"
+            )));
+        }
+        // "The JSON that you want to provide to your Lambda function as input": a body
+        // that is not JSON is refused with the modelled 400, and an absent or empty one is
+        // the documented no-event invocation.
+        if !payload.is_empty() && ::serde_json::from_slice::<::serde_json::Value>(payload).is_err()
+        {
+            return Err(invalid_request_content(
+                "Could not parse request body into json".to_string(),
+            ));
+        }
+
+        let function_arn = record.versioned_arn(&version);
+        let runtime = record
+            .config_of(&version)
+            .and_then(|config| config.runtime.clone())
+            .unwrap_or_else(|| record.config.package_type.clone());
+
+        if invocation_type == INVOCATION_TYPE_DRY_RUN {
+            // "DryRun – Validate parameter values and verify that the user or role has
+            // permission to invoke the function." Nothing runs for a dry run even on the
+            // real service, so the validation above IS the operation, and the model's own
+            // `StatusCode` documentation states the status it answers.
+            return Ok(dry_run_response(&version));
+        }
+
+        // Running the deployment package is what this path means, and this emulator has no
+        // in-process runtime for one; see the module docs.
+        Err(crate::scaffolded::Scaffolded::NotImplemented(
+            crate::scaffolded::NotImplemented {
+                message: format!(
+                    "InvokeWithResponseStream resolved {function_arn} at version {version}, but \
+                     running its {runtime} deployment package is not implemented in this \
+                     emulator: there is no in-process runtime for it, so no response chunk, \
+                     trailer error code or log tail is streamed that the function did not \
+                     produce. InvocationType=DryRun validates an invocation without running \
+                     the function."
+                ),
+            },
+        ))
+    }
+}
+
+/// Whether `req` is the request this operation serves: `POST
+/// /2021-11-15/functions/{FunctionName}/response-streaming-invocations`.
+///
+/// This is the route match `crate::service::EmulatedService::override_operation` applies,
+/// kept beside the handler so the two cannot disagree about which requests this claims.
+/// The METHOD is part of it, so another method addressed to the same path falls through to
+/// the generated routing table rather than being claimed here.
+#[must_use]
+pub fn addresses_response_streaming_invocations(req: &RtRequest) -> bool {
+    // An HTTP method is a case-sensitive token, so the real service would not route a
+    // lowercase `post` here either.
+    if req.method() != "POST" {
+        return false;
+    }
+    let mut segments = service_common::request_path(req.uri()).split('/');
+    // A path always starts with `/`, so the first split segment is empty.
+    if segments.next() != Some("") {
+        return false;
+    }
+    if segments.next() != Some(API_DATE) || segments.next() != Some("functions") {
+        return false;
+    }
+    // The `{FunctionName}` label, which the handler reads through the model's own binding.
+    let Some(label) = segments.next() else {
+        return false;
+    };
+    !label.is_empty()
+        && segments.next() == Some(RESPONSE_STREAMING_INVOCATIONS)
+        && segments.next().is_none()
+}
+
+/// The API-date segment of this operation's route.
+const API_DATE: &str = "2021-11-15";
+
+/// This operation's name, as the model spells it and as the audit record names it.
+const OPERATION_NAME: &str = "InvokeWithResponseStream";
+
+/// The last segment of this operation's route.
+const RESPONSE_STREAMING_INVOCATIONS: &str = "response-streaming-invocations";
+
+/// `ResponseStreamingInvocationType` values, from the model's enum
+/// (`RequestResponse | DryRun`).
+const INVOCATION_TYPE_REQUEST_RESPONSE: &str = "RequestResponse";
+/// See [`INVOCATION_TYPE_REQUEST_RESPONSE`].
+const INVOCATION_TYPE_DRY_RUN: &str = "DryRun";
+
+/// The `StatusCode` a `DryRun` invocation answers with, which the model's own `StatusCode`
+/// documentation states: "For the DryRun invocation type, this status code is 204."
+const DRY_RUN_STATUS: u16 = 204;
+
+/// "For synchronous invocations, the maximum payload size is 6 MB" (the model's own
+/// `Invoke` documentation).
+const MAX_SYNCHRONOUS_PAYLOAD_BYTES: usize = 6 * 1024 * 1024;
+
+/// The answer to a `DryRun`: the documented status, no event stream, and the version the
+/// invocation resolved to on the output's own `@httpHeader` binding
+/// (`ExecutedVersion`/`X-Amz-Executed-Version`).
+///
+/// The body is EMPTY rather than an event stream with no events in it: nothing ran, so
+/// there is no chunk sequence to frame, and the documented 204 carries no body at all.
+fn dry_run_response(version: &str) -> RtResponse {
+    let mut response = RtResponse::new(
+        StatusCode::try_from(DRY_RUN_STATUS).expect("the documented dry-run status is valid"),
+        SdkBody::empty(),
+    );
+    response
+        .headers_mut()
+        .insert("x-amz-executed-version", version.to_string());
+    response
+}
+
+/// The modelled 400 for a `FunctionName`/`Qualifier` pair that names no single resource.
+fn invalid_parameter(message: String) -> InvokeWithResponseStreamError {
+    InvokeWithResponseStreamErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled 404 for a name and qualifier that name no function or no such version.
+fn not_found(message: String) -> InvokeWithResponseStreamError {
+    InvokeWithResponseStreamErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled 409 for an invocation of a function that is not ready to take one.
+fn resource_conflict(message: String) -> InvokeWithResponseStreamError {
+    InvokeWithResponseStreamErrorModeled::ResourceConflictException(ResourceConflictException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled 413 for a payload past the documented synchronous limit.
+fn request_too_large(message: String) -> InvokeWithResponseStreamError {
+    InvokeWithResponseStreamErrorModeled::RequestTooLargeException(RequestTooLargeException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled 400 for a request body that is not the JSON event the function takes.
+fn invalid_request_content(message: String) -> InvokeWithResponseStreamError {
+    InvokeWithResponseStreamErrorModeled::InvalidRequestContentException(
+        InvalidRequestContentException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled 500 for a failure of the store itself.
+fn service_error(message: &str) -> InvokeWithResponseStreamError {
+    InvokeWithResponseStreamErrorModeled::ServiceException(ServiceException {
+        r#type: None,
+        message: Some(message.to_string()),
+    })
+    .into()
+}

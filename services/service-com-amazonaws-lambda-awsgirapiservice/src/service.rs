@@ -67,6 +67,7 @@
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_types::body::SdkBody;
+use service_common::event_stream::EventStreamRoute;
 use service_common::shared_path::SharedPathArn;
 use smithy_server_runtime::{
     http, BoxFuture, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
@@ -173,6 +174,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// SAME shared engine the generated entry threads into every operation — not a
     /// second copy of the store.
     downloads: Downloads<Eng>,
+    /// Serves `InvokeWithResponseStream`, whose `@streaming`-union output the generated
+    /// routing-table entry declines; from the same shared engine, for the same reason.
+    response_stream: EventStreamRoute<
+        crate::ops::invoke_with_response_stream::ResponseStreamEntry<Eng>,
+    >,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -182,6 +188,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            response_stream: EventStreamRoute(
+                crate::ops::invoke_with_response_stream::ResponseStreamEntry::new(Arc::clone(
+                    &engine,
+                )),
+            ),
             downloads: Downloads { engine },
         }
     }
@@ -403,6 +414,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // the router's answer for an unrouted request.
         if names_download_host(req) {
             return Some(&self.downloads as &dyn ErasedOperation);
+        }
+        // And `InvokeWithResponseStream`: its output binds a `@streaming` union, which
+        // the generated routing-table entry declines (that entry is still what the router
+        // reads the model's auth schemes off, so the operation stays signed exactly as the
+        // model declares). The match is the operation's own route, applied by the function
+        // that lives beside the handler, so routing and handling cannot disagree about
+        // which requests it claims.
+        if crate::ops::invoke_with_response_stream::addresses_response_streaming_invocations(req) {
+            return Some(&self.response_stream as &dyn ErasedOperation);
         }
         None
     }

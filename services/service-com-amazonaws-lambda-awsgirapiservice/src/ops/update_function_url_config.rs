@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFunctionUrlConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFunctionUrlConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFunctionUrlConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the ONE function URL configuration of the qualifier the request names — the
+//! function's unpublished version or one of its aliases — and answers the configuration
+//! read back out of what it stored.
+//!
+//! Every member the request carries replaces the stored value and every member it omits
+//! leaves the stored value alone; the URL ADDRESS is not one of them, because it was
+//! minted when the configuration was created and `DeleteFunctionUrlConfig` is what
+//! documents the only way it changes ("Creating a new function URL results in a different
+//! URL address"). `LastModifiedTime` is "When the function URL configuration was last
+//! updated", so this call stamps it while `CreationTime` keeps the instant the create
+//! stamped.
+//!
+//! A qualifier that holds no function URL configuration is nothing to update — including
+//! one whose configuration has been deleted — so the call is refused with the modelled
+//! `ResourceNotFoundException` (404), exactly as a read of it is: a client has to be able
+//! to tell a configuration that is gone from an API that is unavailable.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +194,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFunctionUrlConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFunctionUrlConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFunctionUrlConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(service_error("Lambda state is not reachable on this engine"));
+        };
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // Only the unpublished version and an alias can carry a function URL, so only
+        // those can have one updated; see `state::is_function_url_qualifier`.
+        if let Some(named) =
+            crate::state::named_qualifier(&input.function_name, input.qualifier.as_deref())
+        {
+            if !crate::state::is_function_url_qualifier(&named) {
+                return Err(invalid_parameter(
+                    crate::state::function_url_qualifier_message(&named),
+                ));
+            }
+        }
+
+        let mut store = state.lock();
+        let (record, version) = crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            input.qualifier.as_deref(),
+            &region,
+            now,
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => invalid_parameter(message),
+            crate::state::ResolveFailure::NotFound(message) => not_found(message),
+        })?;
+
+        let resource = record.versioned_arn(&version);
+        let function_region = record.region.clone();
+        let Some(config) = record.url_configs.get_mut(&version) else {
+            return Err(not_found(
+                crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+            ));
+        };
+
+        // Every member the request states replaces the stored value; every member it
+        // omits leaves the stored value alone.
+        if let Some(auth_type) = input.auth_type.clone() {
+            config.auth_type = auth_type;
+        }
+        if input.cors.is_some() {
+            config.cors = input.cors.clone();
+        }
+        if let Some(invoke_mode) = input.invoke_mode.clone() {
+            config.invoke_mode = invoke_mode;
+        }
+        // "When the function URL configuration was last updated": that is this call.
+        config.last_modified_time = crate::state::iso8601(now);
+
+        // Answered by reading the stored configuration back, so a later
+        // `GetFunctionUrlConfig` reports exactly what this call persisted — the same URL
+        // address included, which an update never re-mints.
+        Ok(UpdateFunctionUrlConfigOutput {
+            function_url: config.url(&function_region),
+            function_arn: resource,
+            auth_type: config.auth_type.clone(),
+            cors: config.cors.clone(),
+            creation_time: config.creation_time.clone(),
+            last_modified_time: config.last_modified_time.clone(),
+            invoke_mode: Some(config.invoke_mode.clone()),
+        })
     }
+}
+
+/// The modelled 400 for a `FunctionName` that is not one of the documented name forms,
+/// or a qualifier no function URL can be attached to.
+fn invalid_parameter(message: String) -> UpdateFunctionUrlConfigError {
+    UpdateFunctionUrlConfigErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled 404 for a function, a qualifier of one, or a function URL configuration
+/// this emulator does not hold.
+fn not_found(message: String) -> UpdateFunctionUrlConfigError {
+    UpdateFunctionUrlConfigErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled 500 for a failure of the store itself.
+fn service_error(message: &str) -> UpdateFunctionUrlConfigError {
+    UpdateFunctionUrlConfigErrorModeled::ServiceException(ServiceException {
+        r#type: None,
+        message: Some(message.to_string()),
+    })
+    .into()
 }
