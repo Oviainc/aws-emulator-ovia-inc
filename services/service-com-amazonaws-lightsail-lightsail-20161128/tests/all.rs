@@ -77,6 +77,8 @@ mod disk_snapshot_listing;
 mod distribution_cdn;
 #[path = "all/distribution_certificate_attachment.rs"]
 mod distribution_certificate_attachment;
+#[path = "all/distribution_create_certificate_validation.rs"]
+mod distribution_create_certificate_validation;
 #[path = "all/distribution_listing.rs"]
 mod distribution_listing;
 #[path = "all/distribution_metric_data.rs"]
