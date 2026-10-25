@@ -46,6 +46,7 @@
 //! [`MAX_DELETED_STACKS_RETAINED`] completed deletions (the oldest deletion is reclaimed
 //! past that, which is this emulator's stand-in for CloudFormation's 90-day retention of
 //! deleted-stack summaries), [`MAX_EVENTS_PER_STACK`] events per stack (oldest-first),
+//! [`MAX_SIGNALS_PER_STACK`] recorded resource signals per stack (oldest-first),
 //! [`TEMPLATE_BODY_MAX_BYTES`] per stored template body (the documented `TemplateBody`
 //! maximum, which the model carries no `@length` for), [`MAX_CHANGE_SETS_PER_STACK`]
 //! change sets per stack and [`MAX_CHANGE_SETS`] across the store (past either
@@ -327,6 +328,14 @@ pub const MAX_DELETED_STACKS_RETAINED: usize = 200;
 /// by count. Chosen: far more than the handful of events any client workflow reads.
 pub const MAX_EVENTS_PER_STACK: usize = 1_000;
 
+/// The most resource signals one stack retains, oldest evicted first.
+///
+/// `SignalResource` is a write a client drives: "each signal requires a different unique
+/// ID" (`SignalResourceInput$UniqueId`), so the number of DISTINCT signals one stack can
+/// be sent is unbounded and the store bounds what it keeps. Chosen: far more than the
+/// signals any creation policy waits for.
+pub const MAX_SIGNALS_PER_STACK: usize = 1_000;
+
 /// The most bytes of template body this service stores.
 ///
 /// `CreateStackInput$TemplateBody`: "Structure that contains the template body with a
@@ -467,6 +476,22 @@ pub mod resource_status {
     pub const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
     pub const UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
     pub const DELETE_COMPLETE: &str = "DELETE_COMPLETE";
+    /// The status a resource the stack's create is still waiting on reports — the one a
+    /// signal it receives while that create is in flight is recorded under.
+    pub const CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
+    /// The status of a resource whose creation a FAILURE signal ended.
+    pub const CREATE_FAILED: &str = "CREATE_FAILED";
+    /// [`CREATE_IN_PROGRESS`]'s counterpart while the stack's UPDATE is in flight.
+    pub const UPDATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
+    /// The status of a resource whose update a FAILURE signal ended.
+    pub const UPDATE_FAILED: &str = "UPDATE_FAILED";
+}
+
+/// `ResourceSignalStatus` values (the model's `ResourceSignalStatus` enum): "The status of
+/// the signal, which is either success or failure" (`SignalResourceInput$Status`).
+pub mod resource_signal_status {
+    pub const SUCCESS: &str = "SUCCESS";
+    pub const FAILURE: &str = "FAILURE";
 }
 
 /// `ChangeSetStatus` values this service puts a change set into (all from the model's
@@ -719,6 +744,23 @@ pub struct StoredEvent {
     pub client_request_token: Option<String>,
 }
 
+/// One resource signal `SignalResource` recorded against a stack.
+///
+/// Kept per `UniqueId`, because that is what identifies a signal: "If you send multiple
+/// signals to a single resource (such as signaling a wait condition), each signal requires
+/// a different unique ID" (`SignalResourceInput$UniqueId`) — so the same unique id sent
+/// again is the SAME signal rather than a second one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredResourceSignal {
+    /// The logical id the signal names, whether or not the stack's template declares a
+    /// resource under it: CloudFormation takes the signal either way.
+    pub logical_resource_id: String,
+    pub unique_id: String,
+    /// `SUCCESS` or `FAILURE` ([`resource_signal_status`]).
+    pub status: String,
+    pub received_at: SystemTime,
+}
+
 /// The terminal status a stack operation is headed for, and the instant it is due.
 #[derive(Debug, Clone)]
 pub struct PendingStatus {
@@ -811,6 +853,13 @@ pub struct StoredStack {
     pub deletion_time: Option<SystemTime>,
     pub client_request_token: Option<String>,
     pub events: ::std::collections::VecDeque<StoredEvent>,
+    /// The resource signals this stack has been sent (`SignalResource`), in arrival
+    /// order, one per `UniqueId` per logical resource and bounded at
+    /// [`MAX_SIGNALS_PER_STACK`]. A signal is kept whatever the stack was doing when it
+    /// arrived: CloudFormation accepts a signal for any of a stack's resources, and only
+    /// a resource whose declaration waits on resource signals
+    /// ([`template::waits_for_resource_signals`]) has an operation that acts on one.
+    pub signals: ::std::collections::VecDeque<StoredResourceSignal>,
     /// `Stack$DriftInformation`'s `StackDriftStatus`: the stack-level result the last
     /// drift detection that COMPLETED against this stack left ([`drift`]).
     /// [`DRIFT_STATUS_NOT_CHECKED`] until one has, since "NOT_CHECKED: CloudFormation
@@ -865,6 +914,7 @@ impl StoredStack {
             deletion_time: None,
             client_request_token: None,
             events: ::std::collections::VecDeque::new(),
+            signals: ::std::collections::VecDeque::new(),
             drift_status: DRIFT_STATUS_NOT_CHECKED.to_string(),
             drift_last_check: None,
         }
@@ -1117,6 +1167,40 @@ impl StoredStack {
         operation_id: Option<String>,
         client_request_token: Option<String>,
     ) {
+        let logical_resource_id = self.stack_name.clone();
+        let physical_resource_id = Some(self.stack_id.clone());
+        self.record_resource_event(
+            at,
+            &logical_resource_id,
+            physical_resource_id,
+            STACK_RESOURCE_TYPE,
+            resource_status,
+            resource_status_reason,
+            operation_id,
+            client_request_token,
+        );
+    }
+
+    /// Append an event about ONE of the stack's resources, which is what
+    /// `DescribeStackEvents` reports beside the stack's own events ("all stack related
+    /// events"): the resource's logical and physical ids and its type, with the status it
+    /// is in and the reason it is in it.
+    ///
+    /// [`Self::record_event`] is the stack-level case of this writer (the stack's own
+    /// resource), so the [`MAX_EVENTS_PER_STACK`] bound and the oldest-first eviction live
+    /// here once.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_resource_event(
+        &mut self,
+        at: SystemTime,
+        logical_resource_id: &str,
+        physical_resource_id: Option<String>,
+        resource_type: &str,
+        resource_status: &str,
+        resource_status_reason: Option<String>,
+        operation_id: Option<String>,
+        client_request_token: Option<String>,
+    ) {
         // Oldest-first eviction off the FRONT of a deque, so the bound costs O(1) rather
         // than a shift of the whole log.
         while self.events.len() >= MAX_EVENTS_PER_STACK {
@@ -1127,14 +1211,47 @@ impl StoredStack {
             stack_id: self.stack_id.clone(),
             stack_name: self.stack_name.clone(),
             operation_id,
-            logical_resource_id: self.stack_name.clone(),
-            physical_resource_id: Some(self.stack_id.clone()),
-            resource_type: STACK_RESOURCE_TYPE.to_string(),
+            logical_resource_id: logical_resource_id.to_string(),
+            physical_resource_id,
+            resource_type: resource_type.to_string(),
             timestamp: at,
             resource_status: resource_status.to_string(),
             resource_status_reason,
             client_request_token,
         });
+    }
+
+    /// Record a signal `SignalResource` sent one of this stack's resources, and answer
+    /// whether it is one the stack had not already been sent.
+    ///
+    /// Keyed by the signalled resource and the signal's `UniqueId`, so re-sending a signal
+    /// under a unique id already recorded is the same signal and not a second one — which
+    /// is what lets a client retry the call. The log is bounded at
+    /// [`MAX_SIGNALS_PER_STACK`], oldest reclaimed first.
+    pub fn record_signal(
+        &mut self,
+        logical_resource_id: &str,
+        unique_id: &str,
+        status: &str,
+        at: SystemTime,
+    ) -> bool {
+        if let Some(recorded) = self.signals.iter_mut().find(|signal| {
+            signal.logical_resource_id == logical_resource_id && signal.unique_id == unique_id
+        }) {
+            recorded.status = status.to_string();
+            recorded.received_at = at;
+            return false;
+        }
+        while self.signals.len() >= MAX_SIGNALS_PER_STACK {
+            self.signals.pop_front();
+        }
+        self.signals.push_back(StoredResourceSignal {
+            logical_resource_id: logical_resource_id.to_string(),
+            unique_id: unique_id.to_string(),
+            status: status.to_string(),
+            received_at: at,
+        });
+        true
     }
 
     /// Record the operation now acting on this stack, which is the one

@@ -113,6 +113,9 @@ mod milestone_listing;
 #[path = "all/milestone_name_uniqueness.rs"]
 mod milestone_name_uniqueness;
 
+#[path = "all/no_op_updates.rs"]
+mod no_op_updates;
+
 #[path = "all/official_lens_catalog.rs"]
 mod official_lens_catalog;
 

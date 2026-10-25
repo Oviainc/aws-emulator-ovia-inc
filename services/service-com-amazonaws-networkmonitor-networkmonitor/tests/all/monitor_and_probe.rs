@@ -67,6 +67,15 @@ pub(crate) fn source_arn() -> String {
     format!("arn:aws:ec2:{REGION}:{ACCOUNT}:subnet/subnet-0123456789abcdef0")
 }
 
+/// A subnet ARN distinct per `index`, in the same form as [`source_arn`].
+///
+/// A monitor holds only so many probes in ONE source subnet, so a case that is
+/// not about that limit gives each of its probes a subnet of its own and is
+/// never refused for the company its probes keep.
+pub(crate) fn source_arn_of(index: usize) -> String {
+    format!("arn:aws:ec2:{REGION}:{ACCOUNT}:subnet/subnet-0123456789abcd{index:03}")
+}
+
 pub(crate) fn router() -> MultiServiceRouter {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -557,8 +566,13 @@ async fn a_probe_is_stored_and_its_address_family_follows_the_destination() {
     assert_eq!(status, 200, "setup: CreateMonitor should succeed");
 
     let mut minted: BTreeSet<String> = BTreeSet::new();
-    for (case, probe, expected_status, expected_family, expected_code) in cases {
-        let probe = probe.replace("SOURCE", &source_arn());
+    for (index, (case, probe, expected_status, expected_family, expected_code)) in
+        cases.iter().enumerate()
+    {
+        // One subnet per case: this table is about the address family and the
+        // port and packet-size bounds, not about how many probes one subnet of
+        // a monitor may hold.
+        let probe = probe.replace("SOURCE", &source_arn_of(index));
         let body = format!(r#"{{"probe":{probe}}}"#);
         let (status, created) = create_probe(&router, "probe-host", &body).await;
         assert_eq!(

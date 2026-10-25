@@ -145,11 +145,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
-        let not_found = |resource_kind: &str| {
+        let not_found = |message: &str| {
             DeleteIndexPolicyError::from(
                 DeleteIndexPolicyErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::resource_not_found_message(resource_kind)),
+                        message: Some(message.to_string()),
                     },
                 ),
             )
@@ -162,14 +162,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let group = store
             .log_groups
             .get_mut(&log_group_name)
-            .ok_or_else(|| not_found("log group"))?;
+            .ok_or_else(|| not_found(&crate::state::resource_not_found_message("log group")))?;
 
         // "Deletes a log-group level field index policy that was applied to a single log
         // group": the policy is the resource this operation deletes, so a group holding none
         // of its own has nothing for it to delete — an account-level policy that applies to
         // the group is not one this operation can remove.
+        // The request identifies the policy by nothing of its own — only by the group it
+        // is attached to — so the refusal states nothing about it beyond that the resource
+        // is not there.
         if group.index_policy.take().is_none() {
-            return Err(not_found("index policy"));
+            return Err(not_found(
+                crate::state::UNIDENTIFIED_RESOURCE_NOT_FOUND_MESSAGE,
+            ));
         }
 
         Ok(DeleteIndexPolicyOutput {})

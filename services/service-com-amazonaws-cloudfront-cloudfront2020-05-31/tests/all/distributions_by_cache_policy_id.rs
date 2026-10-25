@@ -132,7 +132,10 @@ fn listed_ids(list: &Node) -> Vec<String> {
 }
 
 /// `DELETE /2020-05-31/cache-policy/{Id}` under the version token `if_match`.
-async fn delete_policy(
+///
+/// `pub(crate)` so a sibling suite that deletes a cache policy goes over the same wire path
+/// rather than growing a copy of this.
+pub(crate) async fn delete_policy(
     router: &MultiServiceRouter,
     policy_id: &str,
     if_match: Option<&str>,
