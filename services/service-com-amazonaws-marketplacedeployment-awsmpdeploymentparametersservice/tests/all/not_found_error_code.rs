@@ -258,9 +258,10 @@ async fn the_not_found_code_does_not_displace_the_stored_record_or_the_other_err
         "a success carries no x-amzn-errortype, got {header:?}"
     );
 
-    // A stored ARN with a tag value outside the modelled `TagValue` bounds is still
-    // the modelled `ValidationException`: only the not-found code changed.
-    let refused = json!({ "tags": { "owner": "not a tag value" } });
+    // A stored ARN with a tag key outside the tagging limits (a key must carry at
+    // least one character) is still the modelled `ValidationException`: only the
+    // not-found code changed.
+    let refused = json!({ "tags": { "": "v" } });
     let (status, body, _) = call_reading_header(
         &router,
         "POST",
@@ -270,7 +271,7 @@ async fn the_not_found_code_does_not_displace_the_stored_record_or_the_other_err
     .await;
     assert_eq!(
         status, 400,
-        "a tag value outside the modelled bounds must be 400, got {status} {body:?}"
+        "a tag key outside the tagging limits must be 400, got {status} {body:?}"
     );
     assert_eq!(
         error_code(&body),

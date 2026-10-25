@@ -6,6 +6,16 @@
 //! `resourceArn` the `@httpLabel` names, so a key already present takes the new
 //! value and every other stored key is left alone.
 //!
+//! This operation's `tags` target the tag map the model leaves UNCONSTRAINED
+//! (`map<String,String>`: no `@length` and no `@pattern` on either side), so the set
+//! is held to AWS's own tagging limits alone — a non-empty key, the key and value
+//! character bounds and the per-resource cap `crate::state::merge_tags` keeps, and no
+//! key in the namespace AWS reserves — and every other UTF-8 key and value is stored
+//! as sent, a space, a letter outside ASCII and an empty value included. The
+//! character class the model states for its CONSTRAINED tag map is a constraint of
+//! that shape and of the member targeting it, not of this one
+//! (`crate::state::TagConstraints`).
+//!
 //! The label is judged as an INPUT first (`crate::state::validate_resource_arn`): a
 //! value that is not a resource ARN of this service's vendor names nothing this API
 //! can address, so it is refused as a bad request (HTTP 400, error code
@@ -193,9 +203,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::state::parameter_not_found());
         };
 
-        // The merge is computed before anything is stored, so a request the service
-        // could not report back leaves the record untouched.
-        let merged = match crate::state::merge_tags(&record.tags, &input.tags.unwrap_or_default()) {
+        // The merge is computed before anything is stored, so a refused request
+        // leaves the record untouched.
+        //
+        // This operation's `tags` member targets the map the model leaves
+        // UNCONSTRAINED, so the set is held to AWS's own tagging limits alone and any
+        // other UTF-8 key and value is stored as sent: the key/value character class
+        // the model states belongs to the constrained map another member targets, and
+        // applying it here would refuse ordinary AWS tags.
+        let merged = match crate::state::merge_tags(
+            &record.tags,
+            &input.tags.unwrap_or_default(),
+            crate::state::TagConstraints::Unconstrained,
+        ) {
             Ok(merged) => merged,
             Err(why) => {
                 return Err(TagResourceErrorModeled::ValidationException(why).into());
