@@ -208,19 +208,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // `commitSpecifier` names a commit or a branch; absent, it is the
-        // repository's default branch.
+        // `commitSpecifier` names a commit or a branch; absent, it is `HEAD` —
+        // which resolves to the repository's default branch — so the refusal below
+        // names the reference that was resolved rather than an empty specifier.
         let specifier = input
             .commit_specifier
             .clone()
-            .or_else(|| repository.default_branch.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|| crate::state::DEFAULT_COMMIT_SPECIFIER.to_string());
         let commit = repository.resolve_commit(&specifier).ok_or_else(|| {
             GetFolderErrorModeled::CommitDoesNotExistException(CommitDoesNotExistException {
-                message: Some(format!(
-                    "the commit {specifier} does not exist in the repository {}",
-                    input.repository_name
-                )),
+                message: Some(crate::state::commit_does_not_exist_message(&specifier)),
             })
         })?;
 
@@ -311,15 +308,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The git tree object name of this folder's own tree, which for the
             // root folder is the commit's tree id.
             tree_id: Some(tree_id_of(&entries)?),
-            // Each list is reported "if any": a kind of entry this folder holds
-            // none of is left out rather than sent as an empty list.
-            sub_folders: (!sub_folders.is_empty()).then_some(sub_folders),
-            files: (!files.is_empty()).then_some(files),
-            symbolic_links: (!symbolic_links.is_empty()).then_some(symbolic_links),
+            // Every list this operation enumerates is PRESENT on the answer, empty
+            // where the folder holds no entry of that kind: the member is part of
+            // the response shape, so a caller may index it unconditionally instead
+            // of having to tell an empty folder from a missing member.
+            sub_folders: Some(sub_folders),
+            files: Some(files),
+            symbolic_links: Some(symbolic_links),
             // A submodule is a gitlink entry in a tree. Nothing this service can be
             // asked to write creates one — `PutFile` writes a blob, and a commit's
-            // snapshot holds only blobs — so no stored commit holds one.
-            sub_modules: None,
+            // snapshot holds only blobs — so no stored commit holds one, and the
+            // list is empty rather than absent.
+            sub_modules: Some(Vec::new()),
         })
     }
 }
