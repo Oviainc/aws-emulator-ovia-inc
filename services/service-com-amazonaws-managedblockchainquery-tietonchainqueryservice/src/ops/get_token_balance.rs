@@ -11,6 +11,12 @@
 //! (`crate::state::derived::normalize_address`), so the two spellings of one Ethereum
 //! account read one balance.
 //!
+//! The balance is QUOTED at the subdivision its token publishes
+//! (`crate::state::NetworkLedger::amount_decimals`): the currency's own precision for a
+//! native token, and the `decimals` the token's contract publishes — the number
+//! `GetAssetContract` reports for that contract — for a token a contract issues. So it
+//! reads in the same unit as the event values it is derived from.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

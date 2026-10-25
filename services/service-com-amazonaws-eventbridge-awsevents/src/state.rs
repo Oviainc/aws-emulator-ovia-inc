@@ -364,11 +364,20 @@ pub struct PolicyStatement {
 pub struct EventBus {
     pub name: String,
     pub description: Option<String>,
-    pub created: SystemTime,
-    /// When the bus was last changed. Equal to [`Self::created`] until an
-    /// operation that changes the bus runs, so `LastModifiedTime` is never
-    /// earlier than `CreationTime`.
-    pub last_modified: SystemTime,
+    /// When the call that brought this bus into existence ran — the instant
+    /// `CreationTime` reports, and `None` for a bus no call created.
+    ///
+    /// The account's `default` bus is not created by anybody: it "receives
+    /// events from Amazon Web Services services" and is there before the first
+    /// request, so there is no creation instant to report for it and
+    /// `CreationTime` stays absent. Every bus `CreateEventBus` wrote carries
+    /// the instant that call ran.
+    pub created: Option<SystemTime>,
+    /// When the bus was last changed: `None` until something changes it, then
+    /// the instant of that change. Starts equal to [`Self::created`] for a bus a
+    /// call created, so `LastModifiedTime` is never earlier than
+    /// `CreationTime`.
+    pub last_modified: Option<SystemTime>,
     /// The customer managed key this bus encrypts events with, as the ARN of the
     /// KMS resource the write named ([`kms_key_identifier`]). "If you do not
     /// specify a customer managed key identifier, EventBridge uses an Amazon Web
@@ -396,9 +405,13 @@ pub struct EventBus {
 }
 
 impl EventBus {
-    /// A bus named `name`, created at `created`: the account's `default` bus, and
-    /// the starting point `CreateEventBus` fills in from its request.
-    pub fn new(name: &str, created: SystemTime) -> Self {
+    /// A bus named `name`, created at `created` — the starting point
+    /// `CreateEventBus` fills in from its request.
+    ///
+    /// `created` is `None` for a bus no call created (the account's `default`
+    /// bus), and that bus therefore reports neither timestamp until something
+    /// changes it.
+    pub fn new(name: &str, created: Option<SystemTime>) -> Self {
         Self {
             name: name.to_string(),
             description: None,
@@ -433,6 +446,24 @@ impl EventBus {
                 })
             })
             .collect()
+    }
+
+    /// The `CreationTime` this bus reports: absent for a bus no call created, so
+    /// a reader can tell the account's implicit bus from one a principal made.
+    pub fn creation_time(&self) -> Option<::aws_smithy_types::DateTime> {
+        self.created.map(to_wire_timestamp)
+    }
+
+    /// The `LastModifiedTime` this bus reports: absent while nothing has set it
+    /// (see [`Self::created`]).
+    pub fn last_modified_time(&self) -> Option<::aws_smithy_types::DateTime> {
+        self.last_modified.map(to_wire_timestamp)
+    }
+
+    /// Record that this bus was changed at `at`, which is what
+    /// `LastModifiedTime` reports from then on.
+    pub fn touch(&mut self, at: SystemTime) {
+        self.last_modified = Some(at);
     }
 }
 
@@ -1706,13 +1737,16 @@ pub struct ComAmazonawsEventbridgeAwseventsState {
 /// The store comes up holding the account's `default` event bus: that bus
 /// exists before any call is made, so the whole rule slice works without
 /// `CreateEventBus`.
+///
+/// No call created it, so it holds no creation instant ([`EventBus::created`]):
+/// the moment this store was built is not a creation anybody performed and is
+/// never reported as one.
 impl Default for ComAmazonawsEventbridgeAwseventsState {
     fn default() -> Self {
-        let created = SystemTime::now();
         let mut buses = BTreeMap::new();
         buses.insert(
             DEFAULT_EVENT_BUS_NAME.to_string(),
-            EventBus::new(DEFAULT_EVENT_BUS_NAME, created),
+            EventBus::new(DEFAULT_EVENT_BUS_NAME, None),
         );
         Self {
             buses,
@@ -3087,9 +3121,19 @@ pub fn missing_entry_member(
     .find_map(|(member, provided)| (!provided).then_some(member))
 }
 
+/// What a refusal states about an input member this service will not accept:
+/// the member it is about and the reason it is not accepted.
+///
+/// The FORM every parameter-validation refusal of this service uses, whether it
+/// leaves as a top-level error or on a batch entry's own row, so a caller reads
+/// the same shape for every rejected member.
+pub fn parameter_violation(member: &str, reason: &str) -> String {
+    format!("Parameter {member} is not valid. Reason: {reason}")
+}
+
 /// What a refusal states for an entry member the entry does not provide.
 pub fn required_member_violation(member: &str) -> String {
-    format!("Parameter {member} is not valid. Reason: {member} is a required argument.")
+    parameter_violation(member, &format!("{member} is a required argument."))
 }
 
 /// Largest `DetailType` one published event entry may carry, in characters.

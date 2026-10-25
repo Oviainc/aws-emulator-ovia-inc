@@ -362,16 +362,18 @@ pub const MAX_BASE_PATH_CHARS: usize = 1024;
 const MAX_REPORTED_MESSAGES: usize = crate::state::MAX_PAGE_SIZE;
 
 /// The most characters the api's `Name` may carry, from the shape the member targets
-/// (`StringWithLengthBetween1And128`).
-const MAX_NAME_CHARS: usize = 128;
+/// (`StringWithLengthBetween1And128`) — the upper bound of the window
+/// [`crate::state::API_NAME_LEN`] states, which `CreateApi` and `UpdateApi` hold the
+/// same member to.
+const MAX_NAME_CHARS: usize = crate::state::API_NAME_LEN.1;
 
 /// The most characters the api's `Description` may carry
 /// (`StringWithLengthBetween0And1024`).
-const MAX_DESCRIPTION_CHARS: usize = 1024;
+const MAX_DESCRIPTION_CHARS: usize = crate::state::API_DESCRIPTION_LEN.1;
 
 /// The most characters the api's `Version` may carry
 /// (`StringWithLengthBetween1And64`).
-const MAX_VERSION_CHARS: usize = 64;
+const MAX_VERSION_CHARS: usize = crate::state::API_VERSION_LEN.1;
 
 /// The keys of an OpenAPI Path Item Object that name an operation this import turns into
 /// a route, mapped to the HTTP method the route key carries.

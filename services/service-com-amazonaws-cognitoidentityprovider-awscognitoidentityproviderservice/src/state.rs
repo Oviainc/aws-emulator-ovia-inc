@@ -18,15 +18,17 @@ use crate::ops::types::{
     AnalyticsConfigurationType, AttributeType, AuthenticationResultType,
     CodeDeliveryDetailsType, CustomDomainConfigType,
     DeviceConfigurationType, DeviceSecretVerifierConfigType, DeviceType, DomainDescriptionType,
-    EmailConfigurationType, GroupType, IdentityProviderType, IssuerConfigurationType,
+    EmailConfigurationType, EmailMfaConfigType, GroupType, IdentityProviderType,
+    IssuerConfigurationType,
     KeyConfigurationType, LambdaConfigType, MFAOptionType, NewDeviceMetadataType,
     NumberAttributeConstraintsType, PasswordPolicyType, RefreshTokenRotationType,
     ResourceServerScopeType, ResourceServerType, RoutingType,
-    SchemaAttributeType, SignInPolicyType, SmsConfigurationType, StringAttributeConstraintsType,
+    SchemaAttributeType, SignInPolicyType, SmsConfigurationType, SmsMfaConfigType,
+    SoftwareTokenMfaConfigType, StringAttributeConstraintsType,
     TermsType, TokenValidityUnitsType, UserAttributeUpdateSettingsType, UserImportJobType,
     UserPoolAddOnsType,
     UserPoolClientType, UserPoolDescriptionType, UserPoolPolicyType, UserPoolType, UserType,
-    UsernameConfigurationType, VerificationMessageTemplateType,
+    UsernameConfigurationType, VerificationMessageTemplateType, WebAuthnConfigurationType,
 };
 
 /// The region a request that carries no SigV4 credential scope falls back to, so
@@ -106,8 +108,9 @@ const DEFAULT_USER_POOL_TIER: &str = "ESSENTIALS";
 
 /// `UserPoolMfaType` is `OFF` for a pool that configures no MFA
 /// (`MfaConfiguration`: "Sets multi-factor authentication (MFA) to be on, off, or
-/// optional" in this service's model).
-const DEFAULT_MFA_CONFIGURATION: &str = "OFF";
+/// optional" in this service's model). It is also the mode in which no MFA factor
+/// has to be deliverable, which a handler that configures factors asks about.
+pub const MFA_OFF: &str = "OFF";
 
 /// Deletion protection is opt-in: "When active, `DeletionProtection` prevents
 /// accidental deletion of your user pool" (this service's model), so a pool that
@@ -829,6 +832,19 @@ pub struct UserPool {
     pub issuer_configuration: Option<IssuerConfigurationType>,
     pub acr_configuration: Option<HashMap<String, AcrLevelConfigType>>,
     pub sms_authentication_message: Option<String>,
+    /// This pool's TOTP MFA configuration: "Settings for time-based one-time
+    /// password (TOTP) multi-factor authentication (MFA) in a user pool"
+    /// (`SoftwareTokenMfaConfigType`). `None` until a call configures TOTP, so
+    /// a pool that never did reports no TOTP configuration.
+    pub software_token_mfa_configuration: Option<SoftwareTokenMfaConfigType>,
+    /// This pool's email-message MFA configuration: the subject and body of the
+    /// message template sign-in and MFA codes are delivered with
+    /// (`EmailMfaConfigType`). `None` until a call configures it.
+    pub email_mfa_configuration: Option<EmailMfaConfigType>,
+    /// This pool's passkey configuration: relying-party id, user-verification
+    /// requirement and whether a passkey satisfies MFA
+    /// (`WebAuthnConfigurationType`). `None` until a call configures it.
+    pub web_authn_configuration: Option<WebAuthnConfigurationType>,
     pub tags: HashMap<String, String>,
     /// This pool's Amazon Cognito prefix domain, once one is created:
     /// `UserPoolType.Domain` is "The domain prefix, if the user pool has a
@@ -878,6 +894,23 @@ pub struct UserPool {
     /// Minted with the pool and kept for its lifetime, so two sign-ins of the
     /// same pool report the same group key.
     pub device_group_key: String,
+}
+
+/// A user pool's MFA and passkey configuration, as the two operations that
+/// report it render it: `MfaConfiguration` beside the configuration of each
+/// factor the pool offers.
+///
+/// Built by [`UserPool::to_mfa_config`] from what the pool holds. It exists
+/// because `GetUserPoolMfaConfig` and `SetUserPoolMfaConfig` model these same
+/// five members in two distinct generated output structs, which would otherwise
+/// assemble the stored configuration twice.
+#[derive(Debug, Clone)]
+pub struct MfaConfig {
+    pub sms_mfa_configuration: Option<SmsMfaConfigType>,
+    pub software_token_mfa_configuration: Option<SoftwareTokenMfaConfigType>,
+    pub email_mfa_configuration: Option<EmailMfaConfigType>,
+    pub mfa_configuration: String,
+    pub web_authn_configuration: Option<WebAuthnConfigurationType>,
 }
 
 impl UserPool {
@@ -1313,6 +1346,41 @@ impl UserPool {
         self.terms
             .values()
             .find(|stored| stored.client_id == client_id && stored.terms_name == terms_name)
+    }
+
+    /// The modelled view of this pool's MFA and passkey configuration, rendered
+    /// from what is stored.
+    ///
+    /// `GetUserPoolMfaConfig` and `SetUserPoolMfaConfig` model the same five
+    /// members in two generated output structs, so the stored configuration is
+    /// assembled once here and each handler maps it into its own output.
+    pub fn to_mfa_config(&self) -> MfaConfig {
+        MfaConfig {
+            sms_mfa_configuration: self.to_sms_mfa_config(),
+            software_token_mfa_configuration: self.software_token_mfa_configuration.clone(),
+            email_mfa_configuration: self.email_mfa_configuration.clone(),
+            mfa_configuration: self.mfa_configuration.clone(),
+            web_authn_configuration: self.web_authn_configuration.clone(),
+        }
+    }
+
+    /// The modelled view of this pool's SMS MFA configuration, rendered from the
+    /// pool's own SMS settings.
+    ///
+    /// `SmsMfaConfigType` is a view over them rather than a second copy: "You
+    /// can set `SmsConfiguration` in `CreateUserPool` and `UpdateUserPool`, or
+    /// in `SetUserPoolMfaConfig`" (`SmsMfaConfigType.SmsConfiguration` in this
+    /// service's model), and `SmsAuthenticationMessage` is a member of both this
+    /// structure and the pool itself. `None` when the pool holds neither, so a
+    /// pool with no SMS settings reports no SMS MFA configuration.
+    pub fn to_sms_mfa_config(&self) -> Option<SmsMfaConfigType> {
+        if self.sms_configuration.is_none() && self.sms_authentication_message.is_none() {
+            return None;
+        }
+        Some(SmsMfaConfigType {
+            sms_authentication_message: self.sms_authentication_message.clone(),
+            sms_configuration: self.sms_configuration.clone(),
+        })
     }
 
     /// The modelled view of this pool, rendered from what is stored.
@@ -2639,7 +2707,7 @@ pub fn effective_user_pool_tier(requested: Option<String>) -> String {
 
 /// The MFA mode a request leaves unset: MFA is `OFF`.
 pub fn effective_mfa_configuration(requested: Option<String>) -> String {
-    requested.unwrap_or_else(|| DEFAULT_MFA_CONFIGURATION.to_string())
+    requested.unwrap_or_else(|| MFA_OFF.to_string())
 }
 
 /// The deletion-protection mode a request leaves unset: `INACTIVE`.
@@ -3074,6 +3142,9 @@ pub fn new_user_pool(name: String, region: &str, now: SystemTime) -> UserPool {
         issuer_configuration: None,
         acr_configuration: None,
         sms_authentication_message: None,
+        software_token_mfa_configuration: None,
+        email_mfa_configuration: None,
+        web_authn_configuration: None,
         tags: HashMap::new(),
         domain: None,
         custom_domain: None,

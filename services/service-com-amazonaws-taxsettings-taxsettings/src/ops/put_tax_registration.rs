@@ -65,7 +65,11 @@
 //! documentation states for `taxRegistrationEntry` — "Kenya You must specify the
 //! `personType` in the `kenyaAdditionalInfo` field of the
 //! `additionalTaxInformation` object", and the equivalent sentence for every
-//! other country the documentation names. They live in
+//! other country the documentation names — together with the per-country
+//! requirements the model states on the entry's own MEMBERS instead, which are
+//! rules of the same kind: the state, region or province an address held in
+//! certain jurisdictions must name, and the resale a Canadian provincial sales
+//! tax claim must confirm. They live in
 //! [`crate::state::COUNTRY_RULES`], one row per documented sentence, and are
 //! applied BEFORE the state write, so an entry AWS refuses is refused here with
 //! the modelled `ValidationException` and nothing is persisted. They are in

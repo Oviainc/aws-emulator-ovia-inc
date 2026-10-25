@@ -23,6 +23,8 @@ mod catalog_projections;
 mod column_statistics_task_runs;
 #[path = "all/connection_updates.rs"]
 mod connection_updates;
+#[path = "all/crawler_updates.rs"]
+mod crawler_updates;
 #[path = "all/crawlers.rs"]
 mod crawlers;
 #[path = "all/custom_entity_types.rs"]

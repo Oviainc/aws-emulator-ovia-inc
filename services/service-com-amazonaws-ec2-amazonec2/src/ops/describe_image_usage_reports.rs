@@ -7,9 +7,11 @@
 //!
 //! The answer is COMPUTED FROM THE STORE: `CreateImageUsageReport` is what adds a report
 //! and `DeleteImageUsageReport` what removes one, so a fresh account reports an empty set
-//! rather than a refusal. `ReportIds` names this operation's own resource, so an id the
-//! account holds no report for is refused with `InvalidImageUsageReportId.NotFound` the way
-//! `DeleteImageUsageReport` refuses one; `ImageIds` only NARROWS ("the IDs of the images
+//! rather than a refusal. `ReportIds` names this operation's own resource, so something that
+//! is not a report id at all is refused with `InvalidImageUsageReportId.Malformed` before
+//! any lookup and a well-formed id the account holds no report for with
+//! `InvalidImageUsageReportId.NotFound`, the two answers `DeleteImageUsageReport` gives the
+//! same id; `ImageIds` only NARROWS ("the IDs of the images
 //! for filtering the reports. If specified, only reports containing these images are
 //! returned"), so a well-formed AMI id no report names selects nothing, while something
 //! that is not an AMI id at all is refused with `InvalidAMIID.Malformed` before any lookup,
@@ -168,7 +170,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
             MAX_FILTERS, MAX_PAGE_SIZE, MAX_RESOURCE_IDS, MatchBudget, decode_page_token,
-            encode_page_token, image_id_is_well_formed, invalid_ami_id_malformed,
+            encode_page_token, image_id_is_well_formed, image_usage_report_id_is_well_formed,
+            invalid_ami_id_malformed, invalid_image_usage_report_id_malformed,
             invalid_image_usage_report_id_not_found, invalid_pagination_token_for,
             require_service_state,
         };
@@ -271,10 +274,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             named_images.insert(image_id.as_str());
         }
-        let named_reports: ::std::collections::BTreeSet<&str> = requested_reports
-            .iter()
-            .map(::std::string::String::as_str)
-            .collect();
+        let mut named_reports: ::std::collections::BTreeSet<&str> =
+            ::std::collections::BTreeSet::new();
+        // "The IDs of the image usage reports" (`ReportIds`): something that is not a report
+        // id at all is refused as malformed before any lookup, the same way this operation
+        // answers a malformed AMI id above and `DeleteImageUsageReport` answers a malformed
+        // report id — one id space, one reading of it.
+        for report_id in &requested_reports {
+            if !image_usage_report_id_is_well_formed(report_id) {
+                return Err(invalid_image_usage_report_id_malformed(report_id));
+            }
+            named_reports.insert(report_id.as_str());
+        }
 
         let state = require_service_state(&*self.engine)?;
         let mut store = state.lock();

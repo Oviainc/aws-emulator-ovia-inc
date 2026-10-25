@@ -236,6 +236,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let is_http = input.protocol_type == crate::state::HTTP_PROTOCOL_TYPE;
 
+        // Each string member of the api this request describes falls in the length
+        // window the shape it targets documents, and none of those shapes carries an
+        // `@length` trait, so the boundary validator does not enforce it and this does
+        // (`crate::state::validate_member_length`). Checked BEFORE anything is minted,
+        // so a refused create stores nothing — the same bounds `ImportApi` holds a
+        // definition's api to.
+        for (member, value, window) in [
+            (
+                "Name",
+                Some(input.name.as_str()),
+                crate::state::API_NAME_LEN,
+            ),
+            (
+                "Description",
+                input.description.as_deref(),
+                crate::state::API_DESCRIPTION_LEN,
+            ),
+            (
+                "Version",
+                input.version.as_deref(),
+                crate::state::API_VERSION_LEN,
+            ),
+        ] {
+            if let Some(value) = value {
+                crate::state::validate_member_length(member, value, window)
+                    .map_err(|message| bad_request(&message))?;
+            }
+        }
+
         // `RouteSelectionExpression` "is required for WebSocket APIs" and defaults to
         // `$request.method $request.path` for HTTP APIs
         // (`CreateApi$RouteSelectionExpression`). The modelled `Api` shape requires the

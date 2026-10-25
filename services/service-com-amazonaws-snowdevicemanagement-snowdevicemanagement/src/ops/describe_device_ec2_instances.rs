@@ -9,6 +9,13 @@
 //! the modelled `ResourceNotFoundException`, the same as every other id-addressed
 //! operation of this service answers.
 //!
+//! The cache is STATE and not a fixture: the entries it holds are what the device
+//! last reported, so an instance state that names work in flight is carried to the
+//! state that work ends in, and a device that answered a `reboot` reports its whole
+//! instance set afresh. Both are owed by the clock, so this operation materialises
+//! them (`crate::state::...::settle`) before it computes its answer and reports
+//! nothing it would not have reported had nobody called.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -162,6 +169,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
+        // Every change the clock already owes, the instance caches included: a
+        // report states what was true at this instant, which is not what was true
+        // when the device was activated.
         store.settle(now);
 
         // The account/region device precondition, FIRST: a Region this account has

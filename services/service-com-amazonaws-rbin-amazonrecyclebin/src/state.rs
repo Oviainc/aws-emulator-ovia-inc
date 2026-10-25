@@ -373,10 +373,6 @@ pub const VALIDATION_REASON_INVALID_PAGE_TOKEN: &str = "INVALID_PAGE_TOKEN";
 /// Source: smithy_query(query="shape", shape="ConflictExceptionReason").
 pub const CONFLICT_REASON_INVALID_RULE_STATE: &str = "INVALID_RULE_STATE";
 
-/// `ResourceNotFoundExceptionReason`'s sole value.
-/// Source: smithy_query(query="shape", shape="ResourceNotFoundExceptionReason").
-pub const NOT_FOUND_REASON_RULE_NOT_FOUND: &str = "RULE_NOT_FOUND";
-
 /// The modelled 404 for a retention rule the request addressed and this Region does
 /// not hold — one that was never created, or one already deleted.
 ///
@@ -385,15 +381,19 @@ pub const NOT_FOUND_REASON_RULE_NOT_FOUND: &str = "RULE_NOT_FOUND";
 /// The message is composed from it, so a rule that does not exist reads the same way
 /// whichever operation reports it.
 ///
-/// `Reason` is the fault class the model names for this condition. The service holds one
-/// kind of resource, a retention rule, so the single value
-/// `ResourceNotFoundExceptionReason` declares describes every 404 this service can
-/// raise, and a caller that branches on the member reads it on the only path that can
-/// set it.
+/// `Reason` is left UNSET. It is an optional member of `ResourceNotFoundException`
+/// (smithy_query(query="shape", shape="ResourceNotFoundException") — only `Message` and
+/// `Reason`, neither required), and the service does not populate it when an addressed
+/// rule does not exist: the body carries `Message` alone. A declared enum value is a
+/// statement about what the member may hold, not that the member is sent, so nothing is
+/// synthesized here — a caller that branches on `Reason` being present must see it
+/// absent on this path. The other reason members this service DOES send
+/// (`ConflictException`, `ValidationException`, `ServiceQuotaExceededException`) are
+/// each populated by their own constructor below.
 pub fn rule_not_found(addressed: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!("Recycle Bin Rule '{addressed}' does not exist.")),
-        reason: Some(NOT_FOUND_REASON_RULE_NOT_FOUND.to_string()),
+        reason: None,
     }
 }
 

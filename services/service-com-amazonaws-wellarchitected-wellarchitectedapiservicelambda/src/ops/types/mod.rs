@@ -49,6 +49,7 @@ pub mod get_agent_recommendation_generation_types;
 pub mod get_agent_recommendation_types;
 pub mod get_answer_types;
 pub mod get_consolidated_report_types;
+pub mod get_global_settings_types;
 pub mod get_lens_review_report_types;
 pub mod get_lens_review_types;
 pub mod get_lens_types;
@@ -180,6 +181,8 @@ pub use get_agent_recommendation_types::*;
 pub use get_answer_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_consolidated_report_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use get_global_settings_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_lens_review_report_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

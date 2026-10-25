@@ -18,6 +18,19 @@ use std::time::SystemTime;
 use crate::ops::types::{KeySchemaElement, StreamSpecification};
 use crate::state::{RequestError, TableStream};
 
+/// A table's stream must not look readable before the table itself serves item
+/// writes: a consumer that waits for the stream's shards and then writes an item
+/// would otherwise reach a table still `CREATING`. The streams registry publishes a
+/// stream's shards when its enable falls due, so that span has to be at least this
+/// service's own `CREATING` -> `ACTIVE` span, and this is where the two are held
+/// together rather than left to agree by accident.
+const _: () = assert!(
+    crate::state::STATUS_TRANSITION.as_nanos()
+        <= ::service_com_amazonaws_dynamodbstreams_dynamodbstreams_20120810::state::STREAM_ENABLE_DELAY
+            .as_nanos(),
+    "a table must reach ACTIVE no later than its stream reports ENABLED"
+);
+
 /// The `StreamViewType` the specification asks for, refused when the pair cannot
 /// hold together.
 ///

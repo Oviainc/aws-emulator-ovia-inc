@@ -1097,10 +1097,12 @@ async fn associating_through_an_unregistered_directory_is_a_not_found() {
 
 /// RULE: a license server endpoint is computed from, and persisted in, state — it is
 /// created against the registration the request names, reported with the members state
-/// holds (never an invented address or health status), and a deletion puts it in the
+/// holds (an address only once there is a host to reach), and a deletion puts it in the
 /// `DELETING` status it keeps reporting (`DeleteLicenseServerEndpoint` is `@idempotent`,
 /// so a repeat delete answers with the same endpoint rather than failing closed; the
-/// lifecycle itself is pinned by `license_server_endpoint_deletion.rs`).
+/// lifecycle itself is pinned by `license_server_endpoint_deletion.rs`, and what the
+/// `LicenseServers` behind an endpoint report by
+/// `license_servers_behind_an_endpoint.rs`).
 #[tokio::test]
 async fn license_server_endpoints_round_trip_and_deletion_removes_them() {
     let h = harness();
@@ -1193,11 +1195,40 @@ async fn license_server_endpoints_round_trip_and_deletion_removes_them() {
             endpoint.get("CreationTime").is_some(),
             "case {case:?}: the creation instant must be reported, got {endpoint:?}"
         );
-        // Nothing provisions a license server, so nothing is reported about one.
-        for absent in ["ServerEndpoint", "LicenseServers"] {
+        // The endpoint never reached `PROVISIONED`, so there is no host to reach yet:
+        // neither the endpoint's own address nor an address for the license server behind
+        // it is reported, and that server's health is not applicable. The server itself IS
+        // reported — the registration names one subnet, so the endpoint was provisioned
+        // with one host in it.
+        assert!(
+            endpoint.get("ServerEndpoint").is_none(),
+            "case {case:?}: ServerEndpoint must be absent rather than invented, got {endpoint:?}"
+        );
+        let servers = endpoint["LicenseServers"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: LicenseServers is reported, got {endpoint:?}"))
+            .clone();
+        assert_eq!(
+            servers.len(),
+            1,
+            "case {case:?}: the registration names one subnet, so the endpoint has one \
+             license server, got {endpoint:?}"
+        );
+        assert_eq!(
+            servers[0].get("ProvisioningStatus").and_then(Value::as_str),
+            Some("DELETING"),
+            "case {case:?}: a license server is torn down with its endpoint, got {servers:?}"
+        );
+        assert_eq!(
+            servers[0].get("HealthStatus").and_then(Value::as_str),
+            Some("NOT_APPLICABLE"),
+            "case {case:?}: a server that is not serving has no health verdict, got {servers:?}"
+        );
+        for absent in ["Ipv4Address", "Ipv6Address"] {
             assert!(
-                endpoint.get(absent).is_none(),
-                "case {case:?}: {absent} must be absent rather than invented, got {endpoint:?}"
+                servers[0].get(absent).is_none(),
+                "case {case:?}: {absent} must be absent while there is no host to reach, \
+                 got {servers:?}"
             );
         }
 

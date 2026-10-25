@@ -212,8 +212,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 arn: Some(crate::state::event_bus_arn(&region, &bus.name)),
                 description: bus.description.clone(),
                 policy: bus.policy.document(),
-                creation_time: Some(crate::state::to_wire_timestamp(bus.created)),
-                last_modified_time: Some(crate::state::to_wire_timestamp(bus.last_modified)),
+                // Absent for a bus no call created (the account's `default`
+                // bus), which is what tells it apart from the buses in the
+                // same list that a principal made.
+                creation_time: bus.creation_time(),
+                last_modified_time: bus.last_modified_time(),
                 // Set only for a bus "created on behalf of your account by an
                 // Amazon Web Services service"; nothing here creates one.
                 managed_by: None,

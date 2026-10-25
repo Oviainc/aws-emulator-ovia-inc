@@ -87,5 +87,7 @@ mod user_attribute_verification_code;
 mod user_import_job_lifecycle;
 #[path = "all/user_pool_domain.rs"]
 mod user_pool_domain;
+#[path = "all/user_pool_mfa_config.rs"]
+mod user_pool_mfa_config;
 #[path = "all/verification_code_pipeline.rs"]
 mod verification_code_pipeline;

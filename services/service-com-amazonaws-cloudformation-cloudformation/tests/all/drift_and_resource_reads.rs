@@ -31,47 +31,21 @@
 //! Everything goes over the wire each service speaks — awsQuery for CloudFormation, REST
 //! for Amazon S3 — through the one router `stack_lifecycle.rs` builds.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::json;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::provisioned_resources::s3;
 use crate::stack_lifecycle::{
-    acknowledging_iam, call, create_stack, describe_stack, member, router,
-    wait_for_the_transition, xml_text, ACCOUNT_ID, REGION,
+    call, deploy, describe_stack, member, router, wait_for_the_detection, xml_text, ACCOUNT_ID,
+    REGION,
 };
 use crate::stack_resources::is_iso8601_instant;
 use service_com_amazonaws_cloudformation_cloudformation::state::{
     drift_detection_status, resource_drift_status, DRIFT_DETECTION_DELAY, DRIFT_STATUS_DRIFTED,
     DRIFT_STATUS_IN_SYNC, DRIFT_STATUS_NOT_CHECKED,
 };
-
-/// Wait past the instant a drift detection's own result becomes due.
-async fn wait_for_the_detection() {
-    tokio::time::sleep(DRIFT_DETECTION_DELAY + Duration::from_millis(250)).await;
-}
-
-/// Deploy a template and wait past the instant its create settles.
-async fn deploy(router: &MultiServiceRouter, name: &str, template: &str) {
-    // A row's template may declare an IAM resource, so the deployment acknowledges them.
-    let (status, body) = create_stack(router, name, template, &acknowledging_iam(&[])).await;
-    assert_eq!(
-        status, 200,
-        "CreateStack({name}) answered {status} with {body}"
-    );
-    wait_for_the_transition().await;
-    let (status, body) = describe_stack(router, name).await;
-    assert_eq!(
-        status, 200,
-        "DescribeStacks({name}) answered {status} with {body}"
-    );
-    assert_eq!(
-        xml_text(&body, "StackStatus").as_deref(),
-        Some("CREATE_COMPLETE"),
-        "case {name:?}: expected the create to complete, got {body}"
-    );
-}
 
 /// Start a drift detection on one stack, optionally filtered to some logical ids, and
 /// answer the `StackDriftDetectionId` it hands back.

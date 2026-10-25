@@ -110,6 +110,20 @@ pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "The pagination token is no longer 
 pub const MARKED_FOR_DELETION_MESSAGE: &str =
     "You can't perform this operation on the secret because it was marked for deletion.";
 
+/// The `InvalidParameterException` message `StopReplicationToReplica` refuses a
+/// `SecretId` with that, in the Region the request is signed for, names a secret
+/// which is NOT a replica — a replication primary, or a standalone secret that
+/// has no replicas at all.
+///
+/// Secrets Manager words this refusal as ONE fixed sentence naming the class of
+/// secret the call is not permitted on, and nothing else: no secret name, ARN or
+/// Region from the request or from the store is interpolated into it, and nothing
+/// is appended about where the call should instead have been made (a standalone
+/// secret has no replica Region to redirect a caller to). Every secret refused
+/// for not being a replica here — holding replicas or not — carries exactly this
+/// text.
+pub const NOT_A_REPLICA_MESSAGE: &str = "Operation not permitted on a primary/standalone secret.";
+
 /// The `InvalidParameterException` message for a `RecoveryWindowInDays` outside
 /// the documented range, stating that constraint: "The number of days from 7 to
 /// 30 that Secrets Manager waits before permanently deleting the secret."

@@ -130,6 +130,33 @@ pub(crate) fn gateway_count(engine: &Arc<engine::InMemoryEngine>) -> usize {
         .gateway_count()
 }
 
+/// How many hypervisors the store holds — the one place the sibling suites read it from,
+/// for the same reason as [`gateway_count`].
+pub(crate) fn hypervisor_count(engine: &Arc<engine::InMemoryEngine>) -> usize {
+    service_state(&**engine)
+        .expect("the in-memory engine must expose this state")
+        .lock()
+        .hypervisor_count()
+}
+
+/// The ARNs the STORE holds a hypervisor record for `host` under, read out of the records
+/// rather than off the wire.
+///
+/// A set, because `Host` is not a key: any number of records may carry one host, so every
+/// suite that asks this question asks it of all of them.
+pub(crate) fn hypervisor_arns_for_host(
+    engine: &Arc<engine::InMemoryEngine>,
+    host: &str,
+) -> BTreeSet<String> {
+    service_state(&**engine)
+        .expect("the in-memory engine must expose this state")
+        .lock()
+        .hypervisors_for_host(host)
+        .iter()
+        .map(|record| record.arn.clone())
+        .collect()
+}
+
 /// The router every test dispatches through.
 pub(crate) fn build_router(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();

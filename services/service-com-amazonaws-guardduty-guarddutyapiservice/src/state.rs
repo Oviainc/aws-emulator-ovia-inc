@@ -416,21 +416,36 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// endpoint serves for `detector_id`, recording the instant of the write as the
     /// `UpdatedAt` of each finding it moves.
     ///
-    /// `None` means that endpoint does not hold the detector, which is the caller's
-    /// cue to refuse the request: nothing is written and the clock is not advanced,
-    /// because the detector is resolved BEFORE [`Self::tick_millis`] runs.
+    /// This is the WHOLE rule both directions of the archive write follow — resolve
+    /// the detector, resolve every named finding against it, then write — with the
+    /// direction carried by `archived`, so neither direction can drift from the
+    /// other.
+    ///
+    /// `Err` carries the message the request is refused with, already classified by
+    /// [`detector_id_rejection`] / [`finding_id_rejection`]: an endpoint that holds
+    /// no such detector, or a batch naming a finding id that detector does not hold.
+    /// Every id is resolved BEFORE anything is written, and the detector is resolved
+    /// before [`Self::tick_millis`] runs, so a refused request moves nothing and
+    /// advances nothing.
     pub fn set_findings_archived_in(
         &mut self,
         region: &str,
         detector_id: &str,
         finding_ids: &[String],
         archived: bool,
-    ) -> Option<()> {
-        self.detector_in(region, detector_id)?;
+    ) -> Result<(), String> {
+        let Some(detector) = self.detector_in(region, detector_id) else {
+            return Err(detector_id_rejection(detector_id));
+        };
+        if let Some(unheld) = detector.first_unheld_finding_id(finding_ids) {
+            return Err(finding_id_rejection(unheld));
+        }
         let now = self.tick_millis();
-        self.detector_in_mut(region, detector_id)?
-            .set_findings_archived(finding_ids, archived, now);
-        Some(())
+        let Some(detector) = self.detector_in_mut(region, detector_id) else {
+            return Err(detector_id_rejection(detector_id));
+        };
+        detector.set_findings_archived(finding_ids, archived, now);
+        Ok(())
     }
 
     /// The ids of the detectors `region`'s endpoint serves, in a total order.

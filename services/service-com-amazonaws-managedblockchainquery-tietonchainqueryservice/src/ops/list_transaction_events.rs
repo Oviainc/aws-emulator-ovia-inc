@@ -196,8 +196,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stores them in, so the position is stable across pages.
         let all: Vec<(String, TransactionEvent)> = state
             .ledger(&input.network)
-            .and_then(|ledger| selector.resolve(ledger))
-            .map(crate::state::StoredTransaction::events)
+            .and_then(|ledger| {
+                // The ledger is handed to the projection because the unit a value is
+                // quoted in is published by the token's own contract, which the ledger
+                // holds (`state::NetworkLedger::amount_decimals`).
+                selector
+                    .resolve(ledger)
+                    .map(|transaction| transaction.events(ledger))
+            })
             .unwrap_or_default()
             .into_iter()
             .enumerate()

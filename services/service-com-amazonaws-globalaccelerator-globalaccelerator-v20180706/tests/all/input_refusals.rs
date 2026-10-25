@@ -550,7 +550,7 @@ async fn a_refusal_names_the_resource_the_request_identified() {
         .await;
         assert_eq!(
             (status, error_code(&parsed).as_str()),
-            (404, "AcceleratorNotFoundException"),
+            (400, "AcceleratorNotFoundException"),
             "case {case}: expected the modelled not-found after the delete, \
              got {status} {parsed}"
         );
@@ -624,8 +624,9 @@ async fn a_not_found_refusal_names_the_arn_the_request_carried() {
     for (case, operation, body, expected) in cases {
         let (status, parsed) = call(&router, operation, body).await;
         assert_eq!(
-            status, 404,
-            "case {case}: expected the modelled 404, got {status} {parsed}"
+            status, 400,
+            "case {case}: expected the status this service answers a missing resource \
+             with, got {status} {parsed}"
         );
         let message = error_message(&parsed);
         assert_eq!(

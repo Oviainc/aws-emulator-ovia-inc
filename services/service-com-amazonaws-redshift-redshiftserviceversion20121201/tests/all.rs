@@ -35,6 +35,8 @@ mod cluster_versions;
 mod default_cluster_parameters;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/event_subscriptions.rs"]
+mod event_subscriptions;
 #[path = "all/existence_preconditions.rs"]
 mod existence_preconditions;
 #[path = "all/hsm_configurations.rs"]

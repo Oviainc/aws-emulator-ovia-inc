@@ -133,10 +133,15 @@ pub mod paths {
     pub const TEMPLATE_LINKED_PRINCIPAL: &str = "/definition/templateLinked/principal";
     /// The entity a template-linked definition binds `?resource` to.
     pub const TEMPLATE_LINKED_RESOURCE: &str = "/definition/templateLinked/resource";
-    /// `CreatePolicyTemplate`/`UpdatePolicyTemplate`'s Cedar template text, which
-    /// those operations carry as a top-level member rather than inside a
-    /// definition.
-    pub const TEMPLATE_STATEMENT: &str = "/statement";
+    /// `CreatePolicyTemplate`/`UpdatePolicyTemplate`'s Cedar template text.
+    ///
+    /// A `ValidationExceptionField$path` is "the path to the specific element
+    /// that Verified Permissions found to be not valid", and the element a
+    /// template operation's `statement` is, is the TEMPLATE's statement: the
+    /// recorded refusal of a static policy submitted to `CreatePolicyTemplate`
+    /// anchors it under the template the call describes, not at the request
+    /// member's own top-level position.
+    pub const TEMPLATE_STATEMENT: &str = "/template/statement";
     /// `PutSchema`'s Cedar schema JSON.
     pub const SCHEMA_CEDAR_JSON: &str = "/definition/cedarJson";
     /// The `policyStoreId` every operation in this service takes.
@@ -177,19 +182,43 @@ pub mod paths {
     pub const REQUESTS: &str = "/requests";
 }
 
-/// The modelled `ResourceNotFoundException` for a reference that names no live
-/// resource: the constant [`crate::state::RESOURCE_NOT_FOUND_MESSAGE`], with the
+/// The modelled `ResourceNotFoundException` an AUTHORIZATION call answers for a
+/// reference that names no live resource: the message NAMES the missing
+/// resource's kind and the id the request referenced it by
+/// ([`crate::state::resource_not_found_naming`]), with the same `resourceId` and
+/// `resourceType` the control-plane form below reports.
+///
+/// Deciding an authorization request is the other half of this API and words its
+/// own refusal; which half an operation belongs to is what chooses between this
+/// builder and [`resource_not_found`]. Reached through
+/// [`crate::state::ReferencedResource::not_found_naming_the_resource`], so the
+/// kind and the id come from the one reader of the request member and no handler
+/// shapes the sentence itself.
+pub fn resource_not_found_naming_the_resource(
+    resource_id: &str,
+    resource_type: &str,
+) -> self::types::ResourceNotFoundException {
+    self::types::ResourceNotFoundException {
+        message: crate::state::resource_not_found_naming(resource_type, resource_id),
+        resource_id: resource_id.to_string(),
+        resource_type: resource_type.to_string(),
+    }
+}
+
+/// The modelled `ResourceNotFoundException` a CONTROL-PLANE call answers for a
+/// reference that names no live resource: the constant
+/// [`crate::state::RESOURCE_NOT_FOUND_MESSAGE`], with the
 /// identity of what was not found in the members that model it.
 ///
 /// The exception models that identity in its own required members — `resourceId`
 /// is "The unique ID of the resource referenced in the failed request" and
 /// `resourceType` is "The resource type of the resource referenced in the failed
 /// request" (`smithy_query(query="shape", shape="ResourceNotFoundException")`) —
-/// so the identifier has a modelled home and the message stays a fixed sentence.
-/// A message formatted from the request would both duplicate those members in
-/// unparseable prose and leak the looked-up value (an id, a name, a whole ARN
-/// including the account id) into logs. This is the ONE place that builds the
-/// shape, so every not-found path of this service answers the same text.
+/// so the identifier has a modelled home and the control plane's message stays a
+/// fixed sentence, which is what its recordings answer. This is the ONE place
+/// that builds the shape for those calls, so every one of them answers the same
+/// text; the authorization calls build it through
+/// [`resource_not_found_naming_the_resource`].
 ///
 /// `resource_id` is the id of the missing resource (for a request that named it
 /// by ARN, [`crate::state::resource_id_from_arn`] of that ARN) and

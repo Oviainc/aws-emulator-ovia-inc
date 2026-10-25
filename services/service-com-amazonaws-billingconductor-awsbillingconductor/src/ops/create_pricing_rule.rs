@@ -362,6 +362,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             creation_time_millis: now,
             last_modified_time_millis: now,
+            // The rule starts with ONE generation — the one this call creates, in force
+            // from the billing period this call is made in — so there is nothing it has
+            // superseded yet.
+            superseded_versions: Vec::new(),
         };
         state.pricing_rules.insert(arn.clone(), record);
         state.pricing_rule_names.insert(input.name, arn.clone());

@@ -99,6 +99,8 @@ mod object_listing_and_deletion;
 mod object_listing_encoding;
 #[path = "all/object_retention.rs"]
 mod object_retention;
+#[path = "all/object_restore.rs"]
+mod object_restore;
 #[path = "all/object_storage.rs"]
 mod object_storage;
 #[path = "all/object_tagging.rs"]

@@ -25,9 +25,9 @@ use crate::ops::types::{
     BlockAction, ChallengeAction, CountAction, IPSet, LabelSummary, ManagedProductDescriptor,
     OnSourceDDoSProtectionConfig, RegexPatternSet, Rule, RuleAction, RuleGroup, RuleSummary,
     Statement, Tag, WAFAssociatedItemException, WAFDuplicateItemException,
-    WAFFeatureNotIncludedInPricingPlanException, WAFInvalidOperationException,
-    WAFInvalidParameterException, WAFInvalidPermissionPolicyException, WAFLimitsExceededException,
-    WAFNonexistentItemException, WAFOptimisticLockException, WebACL,
+    WAFExpiredManagedRuleGroupVersionException, WAFFeatureNotIncludedInPricingPlanException,
+    WAFInvalidOperationException, WAFInvalidParameterException, WAFInvalidPermissionPolicyException,
+    WAFLimitsExceededException, WAFNonexistentItemException, WAFOptimisticLockException, WebACL,
 };
 
 /// The `Scope` values the model declares
@@ -181,6 +181,29 @@ pub const INVALID_OPERATION_MESSAGE: &str = "The operation isn't valid.";
 pub fn invalid_operation_exception() -> WAFInvalidOperationException {
     WAFInvalidOperationException {
         message: Some(INVALID_OPERATION_MESSAGE.to_string()),
+    }
+}
+
+/// `WAFExpiredManagedRuleGroupVersionException` as WAF returns it: the sentence
+/// naming the version that has expired, the managed rule group it is a version of
+/// and the vendor that published it.
+///
+/// The one refusal of this service whose sentence is a TEMPLATE rather than a
+/// constant: WAF words this one with the three values the call named — "You're
+/// trying to use an expired version (`<VersionName>`) of `<RuleGroupName>` by
+/// `<VendorName>`." — so its fixed text is reproduced exactly and its variable
+/// parts come from the request and the published catalogue. Every other exception
+/// type of this slice carries the one sentence its type always carries (see
+/// [`DUPLICATE_ITEM_MESSAGE`]).
+pub fn expired_managed_rule_group_version_exception(
+    vendor_name: &str,
+    name: &str,
+    version: &str,
+) -> WAFExpiredManagedRuleGroupVersionException {
+    WAFExpiredManagedRuleGroupVersionException {
+        message: Some(format!(
+            "You're trying to use an expired version ({version}) of {name} by {vendor_name}."
+        )),
     }
 }
 
@@ -1078,11 +1101,12 @@ pub struct ManagedRuleGroupDescriptor {
     /// the managed rule group"), from the same published list as
     /// [`Self::product_title`].
     pub product_description: &'static str,
-    /// Whether the vendor offers this group in NAMED versions a web ACL can pin
-    /// (`ManagedProductDescriptor$IsVersioningSupported`), which is the same thing
-    /// as the guide publishing a version history for it — so this is `true` for
-    /// exactly the entries [`versioned`] builds (see [`BOT_CONTROL_VERSIONS`]) and
-    /// `false` for the ones that carry only [`INITIAL_VERSION_ONLY`].
+    /// Whether the vendor offers this group in NAMED versions a web ACL can choose
+    /// between (`ManagedProductDescriptor$IsVersioningSupported`), which is the same
+    /// thing as the guide publishing a version history for it — so this is `true`
+    /// for exactly the entries [`versioned`] builds (see [`BOT_CONTROL_VERSIONS`])
+    /// and `false` for the ones whose vendor keeps a single version on offer
+    /// ([`CURRENT_VERSION_ONLY`]) and retires the one it supersedes.
     pub is_versioning_supported: bool,
     /// Whether the group provides "an advanced set of protections, such as the
     /// the Amazon Web Services Managed Rules rule groups that are used for WAF
@@ -1100,6 +1124,22 @@ pub struct ManagedRuleGroupDescriptor {
     /// catalogued group offers at least its initial version (see
     /// [`MANAGED_RULE_GROUP_CATALOGUE`]).
     pub versions: &'static [ManagedRuleGroupRelease],
+    /// The versions of this group its vendor has RETIRED, oldest first: ones it
+    /// published and has since stopped offering.
+    ///
+    /// A version is offered for a while and then expires:
+    /// `DescribeManagedRuleGroup$VersionName` is "the version of the rule group.
+    /// You can only use a version that is not scheduled for expiration", and a
+    /// request naming one that has expired is answered with
+    /// `WAFExpiredManagedRuleGroupVersionException` — "you can retrieve the
+    /// available versions for the managed rule group by calling
+    /// `ListAvailableManagedRuleGroupVersions`" (that error's own doc), which
+    /// lists [`Self::versions`] alone. So an expired version is pruned from what
+    /// the vendor OFFERS while staying KNOWN to the describe: a request naming one
+    /// is refused as expired rather than as a version nobody published, which is
+    /// what tells a version-pinning caller to roll forward. A group whose vendor
+    /// has retired none carries an empty list.
+    pub expired_versions: &'static [ManagedRuleGroupRelease],
     /// The rules this group runs, in the order its vendor lists them.
     ///
     /// `DescribeManagedRuleGroup` "provides high-level information for a managed
@@ -1178,7 +1218,9 @@ impl ManagedRuleGroupDescriptor {
     /// If you don't provide this, WAF uses the vendor's default version", so a
     /// request naming nothing describes [`Self::current_default_version`], and the
     /// versions a request may name are exactly the ones
-    /// `ListAvailableManagedRuleGroupVersions` lists for the group.
+    /// `ListAvailableManagedRuleGroupVersions` lists for the group — so a version
+    /// its vendor has retired is not one of them, and is told apart from a version
+    /// nobody published by [`Self::version_state`].
     pub fn offered_version(&self, requested: Option<&str>) -> Option<&'static str> {
         match requested {
             None => self.current_default_version(),
@@ -1187,6 +1229,31 @@ impl ManagedRuleGroupDescriptor {
                 .iter()
                 .find(|release| release.name == requested)
                 .map(|release| release.name),
+        }
+    }
+
+    /// What this group's vendor publishes about the version `requested` names:
+    /// whether it is on offer, published and since expired, or nothing the vendor
+    /// ever published.
+    ///
+    /// Those are the three states a version name can be in for a published group,
+    /// and the model gives each its own answer: an offered one is described and can
+    /// be pinned, an expired one is the modelled
+    /// `WAFExpiredManagedRuleGroupVersionException` ("the specified version for the
+    /// managed rule group has expired"), and one no vendor published is neither.
+    /// Matched exactly, like the `(VendorName, Name)` pair itself: a
+    /// `VersionKeyString` is the vendor's own name for the version.
+    pub fn version_state(&self, requested: &str) -> ManagedVersionState {
+        if self.versions.iter().any(|release| release.name == requested) {
+            ManagedVersionState::Offered
+        } else if self
+            .expired_versions
+            .iter()
+            .any(|release| release.name == requested)
+        {
+            ManagedVersionState::Expired
+        } else {
+            ManagedVersionState::Unknown
         }
     }
 
@@ -1230,6 +1297,29 @@ impl ManagedRuleGroupDescriptor {
     pub fn managed_label_namespace(&self) -> String {
         format!("awswaf:managed:{}:{}:", self.vendor_name, self.name)
     }
+}
+
+/// The state one version name is in for a published managed rule group, as its
+/// vendor publishes it.
+///
+/// Three states, because the model answers each differently: a version on offer is
+/// described and can be pinned, an expired one is the modelled
+/// `WAFExpiredManagedRuleGroupVersionException`, and a name no version of the group
+/// ever carried is neither of those. See
+/// [`ManagedRuleGroupDescriptor::version_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedVersionState {
+    /// The vendor OFFERS this version: it is one of
+    /// [`ManagedRuleGroupDescriptor::versions`], so
+    /// `ListAvailableManagedRuleGroupVersions` lists it, a describe reports it and
+    /// a `ManagedRuleGroupStatement` may pin it.
+    Offered,
+    /// The vendor published this version and has since retired it: it is one of
+    /// [`ManagedRuleGroupDescriptor::expired_versions`], so it is no longer listed
+    /// and every call that resolves it is refused as expired.
+    Expired,
+    /// No version of this group ever carried this name.
+    Unknown,
 }
 
 /// One rule of a published managed rule group: its name and the action its vendor
@@ -1472,6 +1562,7 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
         "AWSManagedRulesBotControlRuleSet",
         50,
         BOT_CONTROL_VERSIONS,
+        NO_RETIRED_VERSIONS,
         "Bot Control",
         "Provides visibility into and control over bot traffic, including common \
          desirable bots and the targeted detection of self-identifying and \
@@ -1482,6 +1573,7 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
         "AWSManagedRulesATPRuleSet",
         50,
         ATP_VERSIONS,
+        ATP_RETIRED_VERSIONS,
         "Account takeover prevention",
         "Detects and manages requests that are part of malicious account takeover \
          attempts against your login pages.",
@@ -1491,6 +1583,7 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
         "AWSManagedRulesACFPRuleSet",
         50,
         ACFP_VERSIONS,
+        NO_RETIRED_VERSIONS,
         "Account creation fraud prevention",
         "Detects and manages requests that are part of malicious account creation \
          attempts against your account registration pages.",
@@ -1500,6 +1593,7 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
         "AWSManagedRulesAntiDDoSRuleSet",
         50,
         ANTI_DDOS_VERSIONS,
+        NO_RETIRED_VERSIONS,
         "Anti-DDoS",
         "Detects and manages requests that are part of a distributed \
          denial-of-service event against your protected resources.",
@@ -1507,20 +1601,40 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
     ),
 ];
 
-/// The versions offered of a group the WAF Developer Guide publishes no version
-/// HISTORY for: its initial version alone.
+/// The version a group the WAF Developer Guide publishes no version HISTORY for
+/// offers: its current one, and no other.
 ///
 /// A managed rule group is offered WITH versions — a recorded
 /// `ListAvailableManagedRuleGroupVersions` response for the core rule set carries
 /// at least one, and `ManagedRuleGroupStatement$Version` lets a web ACL pin one of
 /// any group — so every catalogue entry offers at least this, and a group the guide
-/// lists further versions for carries them instead (see [`BOT_CONTROL_VERSIONS`]).
-/// The guide publishes no version NAMES or dates for the groups that carry this
-/// one, so both are what THIS catalogue publishes for them rather than anything
-/// observed from the real service: one initial version, stable per group and per
-/// call, which is what keeps every published group pinnable and listable.
-const INITIAL_VERSION_ONLY: &[ManagedRuleGroupRelease] =
+/// lists several concurrent versions for carries them instead (see
+/// [`BOT_CONTROL_VERSIONS`]). The guide publishes no version NAMES or dates for the
+/// groups that carry this one, so both are what THIS catalogue publishes for them
+/// rather than anything observed from the real service: one version on offer,
+/// stable per group and per call, which is what keeps every published group
+/// pinnable and listable, with the one it superseded retired
+/// ([`RETIRED_INITIAL_VERSION`]).
+const CURRENT_VERSION_ONLY: &[ManagedRuleGroupRelease] =
+    &[release("Version_1.1", "2021-03-23T00:00:00Z")];
+
+/// The versions such a group's vendor has RETIRED: the initial version
+/// [`CURRENT_VERSION_ONLY`] superseded, which the vendor no longer offers.
+///
+/// A vendor keeps publishing new versions of a group and expires the ones they
+/// supersede, which is why `ManagedRuleGroupStatement$Version` is pinned "until you
+/// change it" and why the model gives the save path and the describe their own
+/// `WAFExpiredManagedRuleGroupVersionException`. A group that keeps one version on
+/// offer therefore has its previous one here: known, so a request that pins it is
+/// told it has expired, and unlisted, so a caller rolls forward to what
+/// `ListAvailableManagedRuleGroupVersions` does offer. Like the names and dates in
+/// [`CURRENT_VERSION_ONLY`], this history is what this catalogue publishes.
+const RETIRED_INITIAL_VERSION: &[ManagedRuleGroupRelease] =
     &[release("Version_1.0", "2019-11-25T00:00:00Z")];
+
+/// The retired versions of a group whose vendor has expired none of what it
+/// published: every version it ever named is still on offer.
+const NO_RETIRED_VERSIONS: &[ManagedRuleGroupRelease] = &[];
 
 /// The versions offered of `AWSManagedRulesBotControlRuleSet`, oldest first.
 ///
@@ -1536,12 +1650,18 @@ const BOT_CONTROL_VERSIONS: &[ManagedRuleGroupRelease] = &[
     release("Version_3.0", "2023-10-24T00:00:00Z"),
 ];
 
-/// The versions offered of `AWSManagedRulesATPRuleSet`. See
-/// [`BOT_CONTROL_VERSIONS`].
-const ATP_VERSIONS: &[ManagedRuleGroupRelease] = &[
+/// The versions offered of `AWSManagedRulesATPRuleSet`: the one its vendor has not
+/// retired. See [`BOT_CONTROL_VERSIONS`] and [`ATP_RETIRED_VERSIONS`].
+const ATP_VERSIONS: &[ManagedRuleGroupRelease] =
+    &[release("Version_3.0", "2023-11-14T00:00:00Z")];
+
+/// The versions of `AWSManagedRulesATPRuleSet` its vendor has RETIRED, oldest
+/// first: the two that [`ATP_VERSIONS`] superseded. See
+/// [`RETIRED_INITIAL_VERSION`] for why a superseded version is published rather
+/// than dropped.
+const ATP_RETIRED_VERSIONS: &[ManagedRuleGroupRelease] = &[
     release("Version_1.0", "2022-06-14T00:00:00Z"),
     release("Version_2.0", "2023-05-03T00:00:00Z"),
-    release("Version_3.0", "2023-11-14T00:00:00Z"),
 ];
 
 /// The versions offered of `AWSManagedRulesACFPRuleSet`. See
@@ -1557,8 +1677,9 @@ const ANTI_DDOS_VERSIONS: &[ManagedRuleGroupRelease] =
     &[release("Version_1.0", "2025-05-14T00:00:00Z")];
 
 /// One [`MANAGED_RULE_GROUP_CATALOGUE`] entry, of the AWS vendor, offered with
-/// [`INITIAL_VERSION_ONLY`]: a group the guide publishes no version history for,
-/// so it supports no named versions and is not one of the
+/// [`CURRENT_VERSION_ONLY`] and carrying [`RETIRED_INITIAL_VERSION`]: a group the
+/// guide publishes no version history for, so its vendor keeps one version on offer
+/// at a time — it supports no choice of named versions and is not one of the
 /// intelligent-threat-mitigation groups either (see [`versioned`]).
 const fn descriptor(
     name: &'static str,
@@ -1575,12 +1696,14 @@ const fn descriptor(
         product_description,
         is_versioning_supported: false,
         is_advanced_managed_rule_set: false,
-        versions: INITIAL_VERSION_ONLY,
+        versions: CURRENT_VERSION_ONLY,
+        expired_versions: RETIRED_INITIAL_VERSION,
         rules,
     }
 }
 
-/// [`descriptor`] for a group whose vendor offers `versions` of it, oldest first.
+/// [`descriptor`] for a group whose vendor offers `versions` of it, oldest first,
+/// and has retired `expired_versions` of it, also oldest first.
 ///
 /// Those are the intelligent-threat-mitigation groups: the guide publishes a
 /// version history for exactly them, and they are the ones it describes as the
@@ -1590,6 +1713,7 @@ const fn versioned(
     name: &'static str,
     capacity: i64,
     versions: &'static [ManagedRuleGroupRelease],
+    expired_versions: &'static [ManagedRuleGroupRelease],
     product_title: &'static str,
     product_description: &'static str,
     rules: &'static [PublishedManagedRule],
@@ -1603,6 +1727,7 @@ const fn versioned(
         is_versioning_supported: true,
         is_advanced_managed_rule_set: true,
         versions,
+        expired_versions,
         rules,
     }
 }
@@ -1822,6 +1947,53 @@ pub fn managed_rule_group(
     MANAGED_RULE_GROUP_CATALOGUE
         .iter()
         .find(|group| group.vendor_name == vendor_name && group.name == name)
+}
+
+/// The refusal a rule list earns by PINNING a managed rule group version its
+/// vendor has retired, if one of its rules pins one.
+///
+/// `ManagedRuleGroupStatement$Version` is "the version of the managed rule group to
+/// use. If you specify this, the version setting is fixed until you change it", and
+/// WAF resolves it when the rule is SAVED — the same moment every reference
+/// [`ComAmazonawsWafv2Awswaf20190729State::unresolvable_rule_reference`] resolves at
+/// — so a rule pinning a version the publishing vendor no longer offers
+/// ([`ManagedVersionState::Expired`]) is refused with the modelled
+/// `WAFExpiredManagedRuleGroupVersionException` and nothing is stored, rather than
+/// kept as though the pin were live. A version the group never published is NOT
+/// this refusal, and neither is a statement naming no version at all: that one runs
+/// "the vendor's default version" (the member's own doc), which is by definition
+/// offered.
+///
+/// Walked with an explicit worklist, like [`misplaced_rule_group_statement`]: the
+/// tree is supplied by the request.
+pub fn expired_managed_rule_group_version(
+    rules: &[Rule],
+) -> Option<WAFExpiredManagedRuleGroupVersionException> {
+    let mut pending: Vec<&Statement> = rules.iter().map(|rule| &rule.statement).collect();
+    while let Some(statement) = pending.pop() {
+        if let Some((managed, version)) = statement
+            .managed_rule_group_statement
+            .as_ref()
+            .and_then(|managed| {
+                managed
+                    .version
+                    .as_deref()
+                    .map(|version| (&**managed, version))
+            })
+            .filter(|(managed, version)| {
+                managed_rule_group(&managed.vendor_name, &managed.name)
+                    .is_some_and(|group| group.version_state(version) == ManagedVersionState::Expired)
+            })
+        {
+            return Some(expired_managed_rule_group_version_exception(
+                &managed.vendor_name,
+                &managed.name,
+                version,
+            ));
+        }
+        pending.extend(nested_statements(statement));
+    }
+    None
 }
 
 /// The statements nested directly inside `statement`, in no particular order.

@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
-use crate::ops::types::MessageAttributeValue;
+use crate::ops::types::{MessageAttributeValue, Subscription};
 
 /// The region an ARN carries when the request names none.
 ///
@@ -776,6 +776,28 @@ pub struct SubscriptionRecord {
     /// The subscriber has not confirmed yet, so SNS delivers nothing to it.
     pub pending_confirmation: bool,
     pub created_at: SystemTime,
+}
+
+/// One subscription as a LISTING reports it: the wire shape every paginated
+/// subscription listing carries, built from the stored record.
+///
+/// Shared by every listing, because what a subscription looks like in a list does not
+/// depend on which listing selected it — a topic's own subscriptions or the whole
+/// account's. A subscription that is not confirmed yet has no ARN SNS publishes, so
+/// the listing carries [`PENDING_CONFIRMATION_LISTED`] in its place until the
+/// subscriber calls `ConfirmSubscription`.
+pub fn listed_subscription(sub: &SubscriptionRecord) -> Subscription {
+    Subscription {
+        subscription_arn: Some(if sub.pending_confirmation {
+            PENDING_CONFIRMATION_LISTED.to_string()
+        } else {
+            sub.arn.clone()
+        }),
+        owner: Some(sub.owner.clone()),
+        protocol: Some(sub.protocol.clone()),
+        endpoint: sub.endpoint.clone(),
+        topic_arn: Some(sub.topic_arn.clone()),
+    }
 }
 
 /// The subscription attribute a caller-set message filter lives under.
@@ -1879,6 +1901,23 @@ impl ComAmazonawsSnsAmazonsimplenotificationserviceState {
         found
     }
 
+    /// Every subscription of this account, oldest first (ARN breaking a tie), so a
+    /// listing and its pagination token are stable across calls — see
+    /// [`Self::subscriptions_of`].
+    ///
+    /// Selects on nothing but the record's existence: a subscription whose endpoint
+    /// names a resource that is not there is still a subscription of the account, and
+    /// is listed like any other.
+    pub fn subscriptions_in_order(&self) -> Vec<&SubscriptionRecord> {
+        let mut found: Vec<&SubscriptionRecord> = self.subscriptions.values().collect();
+        found.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.arn.cmp(&b.arn))
+        });
+        found
+    }
+
     /// Every topic, oldest first (ARN breaking a tie) — see [`Self::subscriptions_of`].
     pub fn topics_in_order(&self) -> Vec<&TopicRecord> {
         let mut found: Vec<&TopicRecord> = self.topics.values().collect();
@@ -2404,15 +2443,25 @@ pub fn arn_resource<'a>(arn: &'a str, service: &str) -> Option<&'a str> {
 /// One page of `items` starting at `token`, plus the token of the page after it.
 ///
 /// `token` is the opaque `NextToken` a previous page returned — the index of the
-/// first item of this page. `None` is returned for a token that is not one this
-/// function produced, which each caller reports as its own modelled error.
+/// first item of this page, spelled exactly as this function mints it. `None` is
+/// returned for a token that is not one this function produced (another spelling of a
+/// number included, since the token is opaque and only this spelling is handed out),
+/// which each caller reports as its own modelled error.
 pub fn paginate<T>(
     items: Vec<T>,
     token: Option<&str>,
     page_size: usize,
 ) -> Option<(Vec<T>, Option<String>)> {
     let start: usize = match token {
-        Some(token) => token.parse().ok()?,
+        Some(token) => {
+            let start: usize = token.parse().ok()?;
+            // A token this function minted reads back as the same text: a signed,
+            // zero-padded or otherwise respelled number is not one it handed out.
+            if token != start.to_string() {
+                return None;
+            }
+            start
+        }
         None => 0,
     };
     if start > items.len() {

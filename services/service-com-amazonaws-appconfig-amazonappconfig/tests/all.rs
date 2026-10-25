@@ -57,6 +57,8 @@ mod list_configuration_profiles;
 mod list_deployment_strategies;
 #[path = "all/list_environments.rs"]
 mod list_environments;
+#[path = "all/list_experiment_run_events.rs"]
+mod list_experiment_run_events;
 #[path = "all/list_extension_associations.rs"]
 mod list_extension_associations;
 #[path = "all/list_extensions.rs"]
@@ -89,3 +91,5 @@ mod update_experiment_definition;
 mod update_experiment_run;
 #[path = "all/update_extension.rs"]
 mod update_extension;
+#[path = "all/update_extension_association.rs"]
+mod update_extension_association;

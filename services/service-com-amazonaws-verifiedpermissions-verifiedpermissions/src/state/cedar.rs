@@ -131,6 +131,14 @@ pub fn parse_policy_template(statement: &str) -> Result<(), InvalidInput> {
 /// `id` is the Cedar policy id the template carries in a `PolicySet` — the
 /// linking caller needs a known one to link against; `None` takes Cedar's own
 /// generated id, which is what a diagnostic about the text then names.
+///
+/// A refusal carries the PARSER's own diagnostic and nothing else. Verified
+/// Permissions IS Cedar, and what it reports for text Cedar will not parse is
+/// Cedar's own sentence — the recorded refusal of a static policy submitted to
+/// `CreatePolicyTemplate` is exactly the diagnostic this parser produces — so
+/// wrapping it in prose of this emulator's own would report a message the service
+/// does not word that way. The size bound above is this emulator's own check
+/// rather than a parse, so it states itself.
 fn parse_template(
     id: Option<cedar_policy::PolicyId>,
     statement: &str,
@@ -142,8 +150,7 @@ fn parse_template(
             statement.len()
         ));
     }
-    cedar_policy::Template::parse(id, statement)
-        .map_err(|e| format!("the policy template statement is not valid Cedar: {e}"))
+    cedar_policy::Template::parse(id, statement).map_err(|e| e.to_string())
 }
 
 /// Validate one POLICY TEMPLATE's Cedar text against a policy store's schema, as
@@ -254,19 +261,16 @@ pub fn check_statement_size(statement: &str) -> Result<(), InvalidInput> {
 }
 
 /// Parse one Cedar static policy and read its effect and scope off the parsed
-/// form. `Err` names [`paths::STATIC_STATEMENT`] and carries the parser's
-/// diagnostics, for a `ValidationException`.
+/// form. `Err` names [`paths::STATIC_STATEMENT`] and carries the parser's own
+/// diagnostic unwrapped, for a `ValidationException` — the same rule
+/// [`parse_template`] states.
 ///
 /// Refuses a statement past [`MAX_STATEMENT_BYTES`] BEFORE handing it to the
 /// parser, so an over-long payload costs a length check rather than a parse.
 pub fn parse_static_policy(statement: &str) -> Result<StaticScope, InvalidInput> {
     check_statement_size(statement)?;
-    let policy = cedar_policy::Policy::parse(None, statement).map_err(|e| {
-        InvalidInput::new(
-            paths::STATIC_STATEMENT,
-            format!("the policy statement is not valid Cedar: {e}"),
-        )
-    })?;
+    let policy = cedar_policy::Policy::parse(None, statement)
+        .map_err(|e| InvalidInput::new(paths::STATIC_STATEMENT, e.to_string()))?;
 
     Ok(scope_of(&policy))
 }
@@ -372,12 +376,8 @@ pub fn validate_static_policy(schema_json: &str, statement: &str) -> Result<(), 
              validated against it: {e}"
         ))
     })?;
-    let policy = cedar_policy::Policy::parse(None, statement).map_err(|e| {
-        InvalidInput::new(
-            paths::STATIC_STATEMENT,
-            format!("the policy statement is not valid Cedar: {e}"),
-        )
-    })?;
+    let policy = cedar_policy::Policy::parse(None, statement)
+        .map_err(|e| InvalidInput::new(paths::STATIC_STATEMENT, e.to_string()))?;
     let mut set = cedar_policy::PolicySet::new();
     set.add(policy).map_err(|e| {
         InvalidInput::new(

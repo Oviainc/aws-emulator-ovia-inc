@@ -35,6 +35,8 @@ mod list_rule_groups;
 mod managed_products;
 #[path = "all/managed_rule_group_description.rs"]
 mod managed_rule_group_description;
+#[path = "all/managed_rule_group_version_expiry.rs"]
+mod managed_rule_group_version_expiry;
 #[path = "all/managed_rule_group_versions.rs"]
 mod managed_rule_group_versions;
 #[path = "all/managed_rule_groups.rs"]

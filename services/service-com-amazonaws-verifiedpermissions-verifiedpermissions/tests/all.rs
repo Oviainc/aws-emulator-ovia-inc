@@ -43,6 +43,8 @@ mod policy_templates;
 mod policy_update;
 #[path = "all/policy_validation.rs"]
 mod policy_validation;
+#[path = "all/response_fidelity.rs"]
+mod response_fidelity;
 #[path = "all/schema.rs"]
 mod schema;
 #[path = "all/schema_lifecycle.rs"]

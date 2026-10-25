@@ -242,19 +242,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // "The version of the rule group … If you don't provide this, WAF uses the
-        // vendor's default version" (`VersionName`'s own doc), and the versions a
-        // request may name are the ones its vendor offers — the same list
-        // `ListAvailableManagedRuleGroupVersions` answers. A version no vendor
-        // offers is not something WAF can describe, so it is refused with the
-        // modelled `WAFInvalidParameterException` naming the managed rule group and
-        // carrying the rejected version; a request naming none describes the
-        // vendor's default, and a group its vendor offers no version of reports no
-        // version rather than a refusal naming nothing.
+        // "The version of the rule group … You can only use a version that is not
+        // scheduled for expiration. If you don't provide this, WAF uses the
+        // vendor's default version" (`VersionName`'s own doc). A vendor offers a
+        // version for a while and then retires it, so a named version is in one of
+        // three states (`crate::state::ManagedVersionState`): one still on offer —
+        // the same list `ListAvailableManagedRuleGroupVersions` answers — is
+        // described; one its vendor has retired is the modelled
+        // `WAFExpiredManagedRuleGroupVersionException`, which is what tells a
+        // version-pinning caller to roll forward to a version still offered; and a
+        // name no version of the group ever carried is nothing WAF can describe, so
+        // it is refused with the modelled `WAFInvalidParameterException` naming the
+        // managed rule group and carrying the rejected version. A request naming
+        // none describes the vendor's default, and a group its vendor offers no
+        // version of reports no version rather than a refusal naming nothing.
         let version_name = match input.version_name.as_deref() {
             None => group.current_default_version(),
-            Some(requested) => {
-                let Some(offered) = group.offered_version(Some(requested)) else {
+            Some(requested) => match group.version_state(requested) {
+                crate::state::ManagedVersionState::Offered => {
+                    group.offered_version(Some(requested))
+                }
+                crate::state::ManagedVersionState::Expired => {
+                    return Err(
+                        DescribeManagedRuleGroupErrorModeled::WAFExpiredManagedRuleGroupVersionException(
+                            crate::state::expired_managed_rule_group_version_exception(
+                                &input.vendor_name,
+                                &input.name,
+                                requested,
+                            ),
+                        )
+                        .into(),
+                    );
+                }
+                crate::state::ManagedVersionState::Unknown => {
                     return Err(
                         DescribeManagedRuleGroupErrorModeled::WAFInvalidParameterException(
                             crate::state::invalid_parameter_exception(
@@ -267,9 +287,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         )
                         .into(),
                     );
-                };
-                Some(offered)
-            }
+                }
+            },
         };
 
         let region = crate::state::request_region(ctx.parts());

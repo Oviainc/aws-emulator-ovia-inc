@@ -25,8 +25,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     Action, AppliedExtension, DeletionProtectionSettings, DeploymentEvent,
-    ExperimentDefinitionSnapshot, ExperimentRunResult, Monitor, Parameter, Treatment,
-    TreatmentInput, TreatmentOverrides, Validator, VendedMetricsSettings,
+    ExperimentDefinitionSnapshot, ExperimentRunEvent, ExperimentRunResult, Monitor, Parameter,
+    Treatment, TreatmentInput, TreatmentOverrides, Validator, VendedMetricsSettings,
 };
 
 pub mod feature_flags;
@@ -121,6 +121,18 @@ pub const GROWTH_EXPONENTIAL: &str = "EXPONENTIAL";
 /// The `ReplicateTo` value meaning the strategy is saved nowhere but AppConfig, from
 /// `REPLICATE_TO_VALUES` in `crate::ops::types`.
 pub const REPLICATE_TO_NONE: &str = "NONE";
+
+/// `ExperimentRunEventType` values this service records on an experiment run's timeline,
+/// from `EXPERIMENT_RUN_EVENT_TYPE_VALUES` in `crate::ops::types` (the model's
+/// `ExperimentRunEventType` enum: `RUN_STARTED` | `EXPOSURE_UPDATED` |
+/// `OVERRIDES_UPDATED` | `RUN_STOPPED`).
+///
+/// Each value names an action a CALL on the run performs, so an entry of that type is on
+/// the timeline only where the call that performs it ran. `RUN_STARTED` is the entry the
+/// start of the run writes; the other three belong to the calls that change a run's
+/// exposure or overrides and to the one that stops it, and are recorded by those
+/// operations, each of which spells its own value where it writes its entry.
+pub const EVENT_RUN_STARTED: &str = "RUN_STARTED";
 
 /// `DeploymentEventType` values this service records, from
 /// `DEPLOYMENT_EVENT_TYPE_VALUES` in `crate::ops::types`.
@@ -462,6 +474,51 @@ pub fn parameter_rejection(parameters: &HashMap<String, Parameter>) -> Option<St
     })
 }
 
+/// Why the `supplied` parameter VALUES are not a set this service will store against an
+/// extension version declaring `declared`, or `None` when they are.
+///
+/// Both halves of the rule come from the declaration rather than from the request: a name
+/// the version does not declare "is not a parameter of this extension", and "a parameter
+/// value must be specified in the extension association" for every parameter the version
+/// marks required (`smithy_query(query="shape",shape="Parameter")`). Every operation that
+/// writes an association's `ParameterValueMap` refuses through this one function, so the
+/// create side and the update side cannot drift apart, and each half reads the names
+/// sorted so a request breaking the rule twice is refused with the same wording whichever
+/// order the map happened to iterate in.
+pub fn parameter_value_rejection(
+    declared: &HashMap<String, Parameter>,
+    supplied: &HashMap<String, String>,
+    extension_name: &str,
+    version_number: i32,
+) -> Option<String> {
+    let mut names: Vec<&str> = supplied.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    if let Some(unknown) = names
+        .into_iter()
+        .find(|name| !declared.contains_key(*name))
+    {
+        return Some(format!(
+            "Extension {extension_name} version {version_number} declares no parameter \
+             named {unknown}."
+        ));
+    }
+    let mut required: Vec<&str> = declared
+        .iter()
+        .filter(|(_, parameter)| parameter.required)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    required.sort_unstable();
+    required
+        .into_iter()
+        .find(|name| !supplied.contains_key(*name))
+        .map(|missing| {
+            format!(
+                "Parameter {missing} is required by extension {extension_name} version \
+                 {version_number}."
+            )
+        })
+}
+
 /// A resource one of this service's tag operations can address, as the resource portion
 /// of its ARN names it.
 ///
@@ -617,6 +674,15 @@ const DESCRIPTION_ROLLBACK_STARTED: &str = "Deployment rollback started";
 const DESCRIPTION_ROLLBACK_COMPLETED: &str = "Deployment rollback completed";
 /// See [`DESCRIPTION_DEPLOYMENT_STARTED`].
 const DESCRIPTION_REVERT_COMPLETED: &str = "Deployment reverted";
+
+/// The description of each `ExperimentRunEvent` this service records.
+///
+/// The model documents the member only as "A description of the event"
+/// (`smithy_query(query="doc",shape="ExperimentRunEvent",member="Description")`), so each
+/// text follows the form of this service's deployment event descriptions
+/// ([`DESCRIPTION_DEPLOYMENT_STARTED`]): the action the entry records, with no trailing
+/// stop.
+const DESCRIPTION_RUN_STARTED: &str = "Experiment run started";
 
 /// How long after it completed a deployment may still be reverted: "AppConfig only
 /// allows a revert within 72 hours of deployment completion", from the model's own
@@ -1001,7 +1067,8 @@ impl ExperimentDefinition {
 /// record was last written; `ended_at` is set only once the run is over, which is also
 /// what moves `status` to [`EXPERIMENT_RUN_DONE`]. A run that is RUNNING stays running
 /// until a call ends it — nothing about it is owed by the clock, so there is nothing to
-/// materialize. `definition_snapshot` is the definition as it stood when the run started.
+/// materialize. `definition_snapshot` is the definition as it stood when the run started,
+/// and `event_log` is the timeline of what has been done to the run since.
 #[derive(Debug, Clone)]
 pub struct ExperimentRun {
     /// The run number, unique within the definition and counted from 1.
@@ -1023,6 +1090,11 @@ pub struct ExperimentRun {
     pub ended_at: Option<SystemTime>,
     pub definition_snapshot: ExperimentDefinitionSnapshot,
     pub tags: HashMap<String, String>,
+    /// This run's timeline, in the order the entries happened: one entry per action a
+    /// call performed on the run, appended as that call performed it. Nothing on it is
+    /// owed by the clock — a run moves only when a call moves it — so the log is written
+    /// only by the calls that act on the run and is never recomputed by a reader.
+    pub event_log: Vec<ExperimentRunEvent>,
 }
 
 impl ExperimentRun {
@@ -1030,6 +1102,48 @@ impl ExperimentRun {
     /// definition conflicts with it.
     pub fn is_active(&self) -> bool {
         self.status == EXPERIMENT_RUN_RUNNING
+    }
+
+    /// Record the first entry on this run's timeline: a caller started the run.
+    ///
+    /// It occurred when the run started, and reports the exposure and the overrides the
+    /// run began with — `ExperimentRunEvent` reports both "at the time of the event"
+    /// (`smithy_query(query="shape",shape="ExperimentRunEvent")`), which for this entry is
+    /// what the start wrote.
+    pub fn record_start_event(&mut self) {
+        self.event_log.push(experiment_run_event(
+            EVENT_RUN_STARTED,
+            TRIGGERED_BY_USER,
+            DESCRIPTION_RUN_STARTED.to_string(),
+            self.started_at,
+            self.exposure_percentage,
+            self.treatment_overrides.clone(),
+        ));
+    }
+}
+
+/// One experiment run event, as the model's `ExperimentRunEvent` shape.
+///
+/// `AssociatedDeployment` is deliberately unset, not overlooked: it names the deployment
+/// an event is associated with, and nothing in this service deploys a configuration on an
+/// experiment run's behalf, so any ARN here would name a deployment no `GetDeployment`
+/// could report.
+fn experiment_run_event(
+    event_type: &str,
+    triggered_by: &str,
+    description: String,
+    occurred_at: SystemTime,
+    exposure_percentage: Option<f32>,
+    treatment_overrides: Option<TreatmentOverrides>,
+) -> ExperimentRunEvent {
+    ExperimentRunEvent {
+        description: Some(description),
+        associated_deployment: None,
+        event_type: Some(event_type.to_string()),
+        occurred_at: Some(to_date_time(occurred_at)),
+        triggered_by: Some(triggered_by.to_string()),
+        exposure_percentage,
+        treatment_overrides,
     }
 }
 
@@ -2785,6 +2899,19 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
         self.extension_associations.get(association_id)
     }
 
+    /// The extension association `association_id` names, for a caller that EDITS it in
+    /// place rather than creating another one.
+    ///
+    /// `UpdateExtensionAssociation` is the caller this exists for: the association keeps
+    /// the id and ARN its create minted, the extension version it binds and the resource
+    /// it is bound to, so only the members an update carries change.
+    pub fn extension_association_mut(
+        &mut self,
+        association_id: &str,
+    ) -> Option<&mut ExtensionAssociation> {
+        self.extension_associations.get_mut(association_id)
+    }
+
     /// Every extension association this account created, for a reader that must report
     /// them without reaching into the map. The order is the map's, which is no order at
     /// all: a listing orders what it reports itself.
@@ -3230,6 +3357,10 @@ pub const LISTING_HOSTED_CONFIGURATION_VERSIONS: &str = "ListHostedConfiguration
 /// The `kind` a `ListExtensionAssociations` cursor is stamped with, so a token minted by
 /// another listing cannot resume this one. See [`paginate`].
 pub const LISTING_EXTENSION_ASSOCIATIONS: &str = "ListExtensionAssociations";
+
+/// The `kind` a `ListExperimentRunEvents` cursor is stamped with, so a token minted by
+/// another listing cannot resume this one. See [`paginate`].
+pub const LISTING_EXPERIMENT_RUN_EVENTS: &str = "ListExperimentRunEvents";
 
 /// One page of a list operation: the items on it, and the token that resumes the walk
 /// after them (`None` on the last page).

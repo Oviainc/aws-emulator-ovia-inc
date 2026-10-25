@@ -33,7 +33,10 @@ use backup_gateway::state::{
     service_state, HYPERVISOR_NOT_FOUND, HYPERVISOR_ONLINE, HYPERVISOR_PENDING,
 };
 
-use crate::gateway_lifecycle::{build_engine, build_router, call, create, Reply, REGION};
+use crate::gateway_lifecycle::{
+    build_engine, build_router, call, create, hypervisor_arns_for_host, hypervisor_count, Reply,
+    REGION,
+};
 
 /// An ARN of this service naming `resource_type`/`id`, in the region the harness signs
 /// for.
@@ -142,27 +145,6 @@ fn persisted_host(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> String {
         .hypervisor(arn)
         .map(|record| record.host.clone())
         .unwrap_or_else(|| panic!("no hypervisor stored under {arn}"))
-}
-
-/// The ARNs the STORE holds a record for `host` under, read out of the records rather
-/// than off the wire. A set, because `Host` is not a key: any number of records may
-/// carry one host.
-fn persisted_arns_for_host(engine: &Arc<engine::InMemoryEngine>, host: &str) -> BTreeSet<String> {
-    service_state(&**engine)
-        .expect("the in-memory engine must expose this state")
-        .lock()
-        .hypervisors_for_host(host)
-        .iter()
-        .map(|record| record.arn.clone())
-        .collect()
-}
-
-/// How many hypervisors the store holds.
-fn persisted_hypervisor_count(engine: &Arc<engine::InMemoryEngine>) -> usize {
-    service_state(&**engine)
-        .expect("the in-memory engine must expose this state")
-        .lock()
-        .hypervisor_count()
 }
 
 /// The whole stored record, rendered — used to assert that an update's `@sensitive`
@@ -513,13 +495,13 @@ async fn an_update_onto_a_host_another_hypervisor_holds_is_written() {
             );
             // One host, two records, and no record minted or dropped by the update.
             assert_eq!(
-                persisted_arns_for_host(&engine, hosts[holder]),
+                hypervisor_arns_for_host(&engine, hosts[holder]),
                 BTreeSet::from([arns[taker].clone(), arns[holder].clone()]),
                 "case {case:?}: both records must be stored for host {:?}",
                 hosts[holder]
             );
             assert_eq!(
-                persisted_hypervisor_count(&engine),
+                hypervisor_count(&engine),
                 hosts.len(),
                 "case {case:?}: an update must neither mint nor drop a record"
             );

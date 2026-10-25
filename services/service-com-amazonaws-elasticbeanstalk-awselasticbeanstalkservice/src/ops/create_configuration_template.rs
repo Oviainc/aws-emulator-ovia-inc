@@ -418,15 +418,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // absent rather than carrying a made-up value — a CUSTOM platform
         // version, in particular, has no solution stack name this service can
         // derive.
-        let resolved_stack = crate::state::configuration_platform(
+        let resolved_stack = crate::state::named_platform_version(
             &region,
             solution_stack_name.as_deref(),
             platform_arn.as_deref(),
         );
-        let platform_arn =
-            platform_arn.or_else(|| resolved_stack.map(|stack| stack.platform_arn(&region)));
+        let platform_arn = platform_arn
+            .or_else(|| resolved_stack.as_ref().map(|stack| stack.platform_arn(&region)));
         let solution_stack_name =
-            solution_stack_name.or_else(|| resolved_stack.map(|stack| stack.name()));
+            solution_stack_name.or_else(|| resolved_stack.as_ref().map(|stack| stack.name()));
 
         // "If specified, these values override the values obtained from the
         // solution stack or the source configuration." The result is bounded the

@@ -216,10 +216,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // a value for on the calls that supply one: the buyer's
             // `rejectionReason` (`RejectAgreementCancellationRequest`) and the
             // seller's `cancellationReason`
-            // (`CancelAgreementCancellationRequest`). Both are still scaffolds
-            // with issues of their own, so no stored request carries a message
-            // and the member is reported absent rather than invented.
-            status_message: None,
+            // (`CancelAgreementCancellationRequest`). The rejecting call stores
+            // its reason on the record, so this reports what that call wrote
+            // and nothing is invented for a request no call has supplied a
+            // message for.
+            status_message: stored.status_message.clone(),
             created_at: Some(::aws_smithy_types::DateTime::from(stored.created_at)),
             updated_at: Some(::aws_smithy_types::DateTime::from(stored.updated_at)),
         })
