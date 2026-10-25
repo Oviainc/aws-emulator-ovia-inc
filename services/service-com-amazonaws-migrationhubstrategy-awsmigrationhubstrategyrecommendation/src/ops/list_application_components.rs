@@ -4,8 +4,11 @@
 //!
 //! Reports this account's application components — the processes and databases the
 //! portfolio holds ([`crate::state::ApplicationComponentRecord`]) — filtered, ordered and
-//! paged as the request asks. It is a REPORT: it writes nothing, so two identical calls
-//! answer the same thing and a later caller sees exactly what this one did.
+//! paged as the request asks. It is a REPORT: the only write it makes is materialising
+//! what the clock already owed this portfolio (the completion of an assessment that was
+//! due at this same instant, and the analysis that completion stands for), so two
+//! identical calls answer the same thing and a later caller sees exactly what this one
+//! did.
 //!
 //! ## Shape of an operation
 //!
@@ -220,13 +223,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(refusal)?;
 
-        // A read: the store is only looked at here, so running ListApplicationComponents
-        // changes nothing a later caller sees — nothing in this emulator analyses a
-        // component's source code or database, so no status of one is owed by the clock.
-        // The components are those of the Region this request was signed for: a Region
-        // nothing was brought into reads as empty and gets no partition minted for it.
+        // A read: the only write it makes is materialising what the clock already owed
+        // this portfolio — an assessment whose completion was due at this same instant
+        // even if nobody had called, and the analysis that completion stands for — so the
+        // list reports the recommendations the clock has reached. The components are those
+        // of the Region this request was signed for: a Region nothing was brought into
+        // reads as empty and gets no partition minted for it.
         let region = crate::state::request_region(ctx.parts());
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        if let Some(portfolio) = store.region_mut(&region) {
+            portfolio.settle_all(now);
+        }
         let selected: Vec<&ApplicationComponentRecord> = store
             .region(&region)
             .application_components

@@ -57,6 +57,8 @@ mod sandbox_sessions;
 mod source_credentials;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_fleet.rs"]
+mod update_fleet;
 #[path = "all/update_project.rs"]
 mod update_project;
 #[path = "all/webhook_lifecycle.rs"]

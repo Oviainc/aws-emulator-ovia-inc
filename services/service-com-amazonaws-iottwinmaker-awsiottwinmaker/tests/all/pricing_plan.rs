@@ -21,10 +21,13 @@
 //!   it does not change what a later caller sees.
 //!
 //! A stored plan is seeded through the service's own store (the same store the
-//! handlers read) so one case can pin a plan with exact instants and a tier,
-//! which `UpdatePricingPlan` does not mint; the plans `UpdatePricingPlan` does
-//! write are driven over HTTP in `pricing_plan_update.rs`, and the entity
-//! counts here are built with real `CreateEntity`/`DeleteEntity` calls.
+//! handlers read) so one case can pin a plan with exact instants, and the
+//! account is given the billable entities whose count the plan's tier belongs
+//! to, since a stored tier out of step with that count is not a state the
+//! service stays in — it moves the tier itself
+//! (`pricing_plan_tier_and_pending.rs`). The plans `UpdatePricingPlan` writes
+//! are driven over HTTP in `pricing_plan_update.rs`, and the entity counts here
+//! are built with real `CreateEntity`/`DeleteEntity` calls.
 
 use std::time::{Duration, SystemTime};
 
@@ -36,7 +39,7 @@ use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
     PricingPlanRecord, PRICING_MODE_BASIC, UPDATE_REASON_DEFAULT,
 };
 
-use crate::harness::{Emulator, REGION};
+use crate::harness::{entity_count_in_tier, seed_entities, Emulator, REGION};
 
 /// An instant a whole number of seconds after the epoch, so a seeded plan's
 /// timestamps are exact on the wire rather than compared with a tolerance.
@@ -237,23 +240,28 @@ async fn the_reported_plan_is_the_stored_plan() {
     let ten_bundles: Vec<String> = (0..10).map(|i| format!("bundle-{i}")).collect();
     let ten_bundles: Vec<&str> = ten_bundles.iter().map(String::as_str).collect();
 
-    let cases: Vec<(&str, PricingPlanRecord, Option<PricingPlanRecord>)> = vec![
+    // Each row carries the billable entity count the account holds, which is
+    // the count the plan is reported with AND the count its tier is the band
+    // of: a bundled plan the service has not had to move the tier of.
+    let cases: Vec<(&str, PricingPlanRecord, Option<PricingPlanRecord>, usize)> = vec![
         (
             "the default plan, explicitly stored",
             PricingPlanRecord::default_plan(at(1_700_000_000)),
             None,
+            0,
         ),
         (
-            "standard, one bundle, no tier",
+            "standard, one bundle, in the smallest band",
             plan(
                 "STANDARD",
                 "PRICING_MODE_UPDATE",
                 &["twinmaker-basic"],
-                None,
+                Some("TIER_1"),
                 1_700_000_100,
                 1_700_000_050,
             ),
             None,
+            0,
         ),
         (
             "tiered bundle, three bundles, TIER_3",
@@ -266,6 +274,7 @@ async fn the_reported_plan_is_the_stored_plan() {
                 1_700_099_999,
             ),
             None,
+            entity_count_in_tier("TIER_3"),
         ),
         (
             "tiered bundle at the modelled maximum of ten bundles",
@@ -278,6 +287,7 @@ async fn the_reported_plan_is_the_stored_plan() {
                 1_799_999_000,
             ),
             None,
+            entity_count_in_tier("TIER_4"),
         ),
         (
             "a pending change away from a tiered bundle",
@@ -289,14 +299,16 @@ async fn the_reported_plan_is_the_stored_plan() {
                 1_700_200_000,
                 1_700_200_000,
             ),
+            // Not in force until its own instant, which is still ahead.
             Some(plan(
                 "STANDARD",
                 "PRICING_MODE_UPDATE",
                 &[],
                 None,
-                1_700_300_000,
+                1_900_000_000,
                 1_700_250_000,
             )),
+            0,
         ),
         (
             "a pending change into a bundle, from a bundle-less plan",
@@ -309,12 +321,15 @@ async fn the_reported_plan_is_the_stored_plan() {
                 1_900_000_000,
                 1_850_000_000,
             )),
+            0,
         ),
     ];
 
-    for (case, current, pending) in cases {
+    for (case, current, pending, entities) in cases {
         let emulator = Emulator::new();
+        seed_entities(&emulator, entities).await;
         seed(&emulator, &current, pending.as_ref());
+        let expected_count = i64::try_from(entities).expect("a count fits a Long");
 
         let resp = emulator.get_pricing_plan().await;
         assert_eq!(
@@ -326,7 +341,7 @@ async fn the_reported_plan_is_the_stored_plan() {
             "currentPricingPlan",
             resp.member("currentPricingPlan"),
             &current,
-            0,
+            expected_count,
         );
         match &pending {
             None => assert!(
@@ -339,7 +354,7 @@ async fn the_reported_plan_is_the_stored_plan() {
                 "pendingPricingPlan",
                 resp.member("pendingPricingPlan"),
                 pending,
-                0,
+                expected_count,
             ),
         }
     }
@@ -376,6 +391,10 @@ async fn every_modelled_enum_value_round_trips() {
     for tier in PRICING_TIER_VALUES {
         let case = format!("tier {tier}");
         let emulator = Emulator::new();
+        // The account holds a count the tier is the band of, so the stored tier
+        // is one the service has nothing to move.
+        let entities = entity_count_in_tier(tier);
+        seed_entities(&emulator, entities).await;
         let stored = plan(
             "TIERED_BUNDLE",
             "PRICING_TIER_UPDATE",
@@ -395,7 +414,7 @@ async fn every_modelled_enum_value_round_trips() {
             "currentPricingPlan",
             resp.member("currentPricingPlan"),
             &stored,
-            0,
+            i64::try_from(entities).expect("a count fits a Long"),
         );
     }
 }
@@ -407,12 +426,13 @@ async fn every_modelled_enum_value_round_trips() {
 async fn the_billable_entity_count_follows_the_stored_entities() {
     let emulator = Emulator::new();
     // A stored plan with known instants, so the walk below can also show that
-    // counting entities leaves the PLAN itself untouched.
+    // counting entities leaves the PLAN itself untouched. Its tier is the band
+    // every count in the walk falls in, so the service has no tier to move.
     let stored = plan(
         "STANDARD",
         "ENTITY_COUNT_UPDATE",
         &["twinmaker-basic"],
-        None,
+        Some("TIER_1"),
         1_700_000_000,
         1_700_000_000,
     );

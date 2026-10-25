@@ -83,16 +83,37 @@ pub async fn call_with_content_type(
         body.push('=');
         body.push_str(&form_value(value));
     }
+    call_raw(router, region, &[], &body).await
+}
+
+/// One POST whose body is `body` exactly as written, with `headers` beside the content type
+/// and the credential scope every call carries. Answers the status, the response's
+/// `content-type` and the body.
+///
+/// The one request builder [`call_with_content_type`] itself goes through, so a suite that
+/// has to send a body no parameter list can express — one naming no `Action` at all, or one
+/// declaring a transfer framing — builds it here rather than assembling a second request of
+/// its own.
+pub async fn call_raw(
+    router: &MultiServiceRouter,
+    region: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (u16, Option<String>, String) {
     let authorization = format!(
         "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260101/{region}/ec2/aws4_request, \
          SignedHeaders=host;x-amz-date, Signature=0123456789abcdef"
     );
-    let request = http::Request::builder()
+    let mut builder = http::Request::builder()
         .method("POST")
         .uri(format!("https://ec2.{region}.amazonaws.com/"))
         .header("content-type", "application/x-www-form-urlencoded")
-        .header("authorization", authorization)
-        .body(bytes::Bytes::from(body))
+        .header("authorization", authorization);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder
+        .body(bytes::Bytes::from(body.to_string()))
         .expect("a well-formed ec2Query request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();

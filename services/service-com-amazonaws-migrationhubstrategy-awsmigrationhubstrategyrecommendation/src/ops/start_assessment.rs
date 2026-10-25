@@ -259,7 +259,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             id: id.clone(),
             // Data collection is not done the instant the call returns; the clock owes
             // the assessment `COMPLETE` once the completion span has passed, and
-            // `StopAssessment` can still stop it until then.
+            // `StopAssessment` can still stop it until then. Reaching `COMPLETE` is what
+            // records the analysis on the portfolio this assessment covers
+            // (`RegionState::finish_assessment`), so an assessment that is stopped before
+            // then recommends nothing.
             status: crate::state::ASSESSMENT_IN_PROGRESS.to_string(),
             assessment_targets,
             assessment_data_source_type: input.assessment_data_source_type,

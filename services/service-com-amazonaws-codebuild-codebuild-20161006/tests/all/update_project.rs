@@ -87,7 +87,7 @@ async fn fetch_project(router: &MultiServiceRouter, name: &str) -> Value {
 }
 
 /// A timestamp member as the seconds-since-epoch number the protocol puts on the wire.
-fn instant(project: &Value, member: &str) -> f64 {
+pub(crate) fn instant(project: &Value, member: &str) -> f64 {
     project[member]
         .as_f64()
         .unwrap_or_else(|| panic!("{member} must be a timestamp, got {project}"))
@@ -95,7 +95,7 @@ fn instant(project: &Value, member: &str) -> f64 {
 
 /// Every member either record carries, so "nothing else changed" also catches a member
 /// that APPEARED or vanished.
-fn all_members(before: &Value, after: &Value) -> Vec<String> {
+pub(crate) fn all_members(before: &Value, after: &Value) -> Vec<String> {
     let mut members: Vec<String> = before
         .as_object()
         .map(|held| held.keys().cloned().collect())

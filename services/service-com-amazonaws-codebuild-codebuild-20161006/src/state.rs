@@ -5,7 +5,7 @@
 //! Every implemented CodeBuild operation computes its answer from the records
 //! here: `CreateProject` writes a [`Project`] and `UpdateProjectVisibility`
 //! rewrites that project's visibility, `CreateFleet` writes a
-//! [`StoredFleet`], `CreateWebhook` writes that
+//! [`StoredFleet`] and `UpdateFleet` rewrites one, `CreateWebhook` writes that
 //! project's [`crate::ops::types::Webhook`], `StartBuild` writes a
 //! [`StoredBuild`], `StartBuildBatch` writes a [`StoredBuildBatch`],
 //! `StartSandbox` writes a [`StoredSandbox`] and `StopSandbox` ends one,
@@ -151,27 +151,94 @@ pub fn capacity_below_floor_message() -> String {
     format!("Capacity must be greater or equal to {MIN_FLEET_CAPACITY}")
 }
 
-/// How long after `CreateFleet` the clock owes a fleet's transition out of
-/// `CREATING`.
+/// How long after the call that starts provisioning a fleet's capacity
+/// (`CreateFleet`, or an `UpdateFleet` that re-provisions it) the clock owes that
+/// fleet's transition into [`FLEET_STATUS_ACTIVE`].
 ///
 /// AWS does not document how long provisioning reserved capacity takes, so this
 /// span is CHOSEN, inside the 250-750 ms band this project fixes for an emulated
 /// transition. It is deliberately not zero: a caller that reads the fleet
-/// straight after creating it still observes `CREATING`. The due instant is
-/// stored, never slept on.
+/// straight after creating or updating it still observes the transient status.
+/// The due instant is stored, never slept on.
 pub const FLEET_SETTLE_MILLIS: i64 = 500;
 
 /// `FleetStatusCode` for a fleet whose capacity is still being provisioned.
 pub const FLEET_STATUS_CREATING: &str = "CREATING";
 
+/// `FleetStatusCode` for a fleet whose settings are being applied to its
+/// capacity — "the compute fleet is being updated" (`FleetStatus$statusCode`).
+pub const FLEET_STATUS_UPDATING: &str = "UPDATING";
+
 /// `FleetStatusCode` for a fleet that finished provisioning and can take builds.
 pub const FLEET_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The `FleetStatusCode` values that describe capacity work still in flight, and
+/// so the ones the clock owes a move into [`FLEET_STATUS_ACTIVE`] from: the model
+/// documents `CREATING` as "the compute fleet is being created" and `UPDATING` as
+/// "the compute fleet is being updated" (`FleetStatus$statusCode`).
+pub const FLEET_PROVISIONING_STATUSES: [&str; 2] = [FLEET_STATUS_CREATING, FLEET_STATUS_UPDATING];
 
 /// The `ComputeType` values AWS documents as requiring `computeConfiguration`:
 /// "This is only required if `computeType` is set to `ATTRIBUTE_BASED_COMPUTE` or
 /// `CUSTOM_INSTANCE_TYPE`" (`Fleet$computeConfiguration`).
 pub const COMPUTE_TYPES_NEEDING_CONFIGURATION: [&str; 2] =
     ["ATTRIBUTE_BASED_COMPUTE", "CUSTOM_INSTANCE_TYPE"];
+
+/// Why the compute-fleet configuration described by these settings is not a valid
+/// fleet, as the modelled `InvalidInputException` words it — or `None` when it is
+/// valid.
+///
+/// The settings are the ones the fleet CARRIES once the request has been applied,
+/// so `CreateFleet` asks about the fleet it would mint and `UpdateFleet` about the
+/// merge of the request onto the stored fleet: one rule, one wording, whichever
+/// call arrived. A setting the caller never gave and the fleet does not hold is
+/// `None` and constrains nothing.
+///
+/// The three rules, in the order they are reported:
+///
+/// * every `FleetCapacity` member counts machines, so none may fall below
+///   [`MIN_FLEET_CAPACITY`] ([`capacity_below_floor_message`]);
+/// * `maxCapacity` is the ceiling auto-scaling may grow the fleet to, so it
+///   cannot sit below the capacity the fleet is provisioned at — that range is
+///   empty. INFERRED from what the two members mean, not quoted;
+/// * `computeConfiguration` is required exactly for the compute types whose
+///   machine is described by attributes rather than named by the compute type
+///   ([`COMPUTE_TYPES_NEEDING_CONFIGURATION`]).
+pub fn fleet_configuration_violation(
+    base_capacity: Option<i32>,
+    max_capacity: Option<i32>,
+    compute_type: Option<&str>,
+    has_compute_configuration: bool,
+) -> Option<String> {
+    if [base_capacity, max_capacity]
+        .into_iter()
+        .flatten()
+        .any(|capacity| capacity < MIN_FLEET_CAPACITY)
+    {
+        return Some(capacity_below_floor_message());
+    }
+
+    if let (Some(base), Some(max)) = (base_capacity, max_capacity) {
+        if max < base {
+            return Some(format!(
+                "Invalid input: scalingConfiguration.maxCapacity must be at least \
+                 baseCapacity ({base}), got {max}"
+            ));
+        }
+    }
+
+    match compute_type {
+        Some(compute_type)
+            if COMPUTE_TYPES_NEEDING_CONFIGURATION.contains(&compute_type)
+                && !has_compute_configuration =>
+        {
+            Some(format!(
+                "Invalid input: computeConfiguration is required when computeType is {compute_type}"
+            ))
+        }
+        _ => None,
+    }
+}
 
 /// Report groups this emulator holds for the account.
 ///
@@ -647,13 +714,13 @@ pub struct StoredFleet {
     /// The record every reader hands back.
     pub fleet: Fleet,
     /// Epoch millis the fleet was created at. Kept as the integer a list or sort
-    /// operation works on, the way [`StoredProject`]'s is; `ListFleets` and
-    /// `UpdateFleet`, which read and move it, are still scaffolded.
+    /// operation works on, the way [`StoredProject`]'s is.
     pub created_millis: i64,
-    /// Epoch millis the fleet was last changed at — written by `UpdateFleet`,
-    /// which is still scaffolded, so for now it is the creation instant.
+    /// Epoch millis the fleet was last changed at — the creation instant until
+    /// `UpdateFleet` changes the fleet's settings, and that call's instant after.
     pub last_modified_millis: i64,
-    /// Epoch millis at which this fleet's move to `ACTIVE` became due.
+    /// Epoch millis at which this fleet's move to `ACTIVE` became due — set by
+    /// the call that started provisioning its capacity.
     pub active_due_millis: i64,
 }
 
@@ -1263,20 +1330,48 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
     /// the one asked for, so an ARN for another partition, region, account,
     /// resource type or fleet id can never resolve to a local record.
     pub fn settled_fleet(&mut self, identifier: &str, now_millis: i64) -> Option<&StoredFleet> {
+        self.settled_fleet_mut(identifier, now_millis).map(|stored| &*stored)
+    }
+
+    /// [`Self::settled_fleet`], for the operation that goes on to CHANGE the fleet
+    /// it read: `UpdateFleet` settles the transition the clock already owed before
+    /// it merges its request onto the record, so an update never writes back a
+    /// status the clock had moved past.
+    pub fn settled_fleet_mut(
+        &mut self,
+        identifier: &str,
+        now_millis: i64,
+    ) -> Option<&mut StoredFleet> {
+        let key = self.fleet_key(identifier)?;
+        let stored = self.fleets.get_mut(&key)?;
+        stored.settle(now_millis);
+        Some(stored)
+    }
+
+    /// The `fleets` key of the fleet `identifier` addresses, if this account
+    /// holds it — the one place a fleet identifier is resolved, so every
+    /// fleet-addressing operation resolves it the same way.
+    ///
+    /// An identifier that is not an ARN is a fleet name, which is what the store
+    /// is keyed by. An ARN is resolved the way [`Self::report_group_by_arn`]
+    /// resolves a report group's — the name comes out of the ARN's resource
+    /// segment for the map lookup, and the candidate is kept only if its STORED
+    /// ARN is exactly the one asked for, so an ARN for another partition,
+    /// region, account, resource type or fleet id can never resolve to a local
+    /// record.
+    pub fn fleet_key(&self, identifier: &str) -> Option<String> {
         let by_arn = identifier.starts_with("arn:");
         let name = if by_arn {
             // `fleet/<name>:<uuid>`: the name is what the store is keyed by.
             identifier.rsplit_once(":fleet/")?.1.split_once(':')?.0
         } else {
             identifier
-        }
-        .to_string();
-        let stored = self.fleets.get_mut(&name)?;
+        };
+        let stored = self.fleets.get(name)?;
         if by_arn && stored.fleet.arn.as_deref() != Some(identifier) {
             return None;
         }
-        stored.settle(now_millis);
-        Some(stored)
+        Some(name.to_string())
     }
 
     /// Read a build, first materialising the transition the clock already owes
@@ -1547,7 +1642,7 @@ impl StoredFleet {
             .status
             .as_ref()
             .and_then(|status| status.status_code.as_deref())
-            == Some(FLEET_STATUS_CREATING);
+            .is_some_and(|code| FLEET_PROVISIONING_STATUSES.contains(&code));
         if !provisioning {
             return;
         }
@@ -2220,6 +2315,8 @@ pub enum AuditOutcome {
     ReportGroupDeleted,
     /// A compute fleet was minted and stored.
     FleetCreated,
+    /// A compute fleet's settings were changed and stored.
+    FleetUpdated,
     /// The request was refused as invalid (400 `InvalidInputException`).
     ValidationRefused,
     /// A resource of that name already exists (400
@@ -2248,6 +2345,7 @@ impl AuditOutcome {
             Self::ReportGroupCreated => "report-group-created",
             Self::ReportGroupDeleted => "report-group-deleted",
             Self::FleetCreated => "fleet-created",
+            Self::FleetUpdated => "fleet-updated",
             Self::ValidationRefused => "validation-refused",
             Self::AlreadyExists => "already-exists",
             Self::QuotaExceeded => "quota-exceeded",

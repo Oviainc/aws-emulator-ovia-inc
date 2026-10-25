@@ -11,14 +11,19 @@
 //! and the `bundleNames` the request carries, not a patch over the plan in
 //! force.
 //!
-//! The change takes effect at once, so the `currentPricingPlan` this call
-//! answers is the plan it just recorded, with `effectiveDateTime` and
-//! `updateDateTime` both at the instant of the call. A change that had been
-//! accepted but had not taken effect is superseded, so `pendingPricingPlan` is
-//! absent from a successful response — see
-//! [`crate::state::ComAmazonawsIottwinmakerAwsiottwinmakerState::set_pricing_plan`],
-//! which also records the `updateReason` and says why `pricingTier` is left
-//! unset.
+//! WHEN the change takes effect is the service's to decide, not the caller's: a
+//! change that buys the account at least what it had takes effect at once and is
+//! answered as `currentPricingPlan`, while leaving a bundled plan for the
+//! pay-as-you-go mode is billed from the start of the next cycle, so it is
+//! answered as `pendingPricingPlan` with a later `effectiveDateTime` and
+//! `currentPricingPlan` keeps reporting the plan still in force. A pending change
+//! that has not come due is superseded by the next change (`updateReason`
+//! `OVERWRITTEN`), and one that HAS come due becomes the plan in force before
+//! this change is read against it — see
+//! [`crate::state::RegionalState::set_pricing_plan`] and
+//! [`crate::state::RegionalState::settle_pricing_plan`], which also record the
+//! `updateReason` and the `pricingTier` the account's billable entity count
+//! places a bundled plan in.
 //!
 //! `billableEntityCount` is reported on the plan the same way `GetPricingPlan`
 //! reports it: DERIVED from the entities the service holds
@@ -255,19 +260,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One count for both reported plans, derived from the stored entities:
         // `billableEntityCount` describes the ACCOUNT, not the plan.
         let billable_entity_count = state.billable_entity_count();
-        let current_pricing_plan = state
-            .set_pricing_plan(
-                input.pricing_mode,
-                bundle_names,
-                ::std::time::SystemTime::now(),
-            )
-            .as_pricing_plan(billable_entity_count);
+        state.set_pricing_plan(
+            input.pricing_mode,
+            bundle_names,
+            ::std::time::SystemTime::now(),
+        );
 
         Ok(UpdatePricingPlanOutput {
-            current_pricing_plan,
-            // Reported from the store rather than assumed absent: the member is
-            // whatever change the store still holds as not yet in force, which
-            // after a change that takes effect at once is nothing.
+            // Both members are read back off the store the change was written
+            // to, so the call answers exactly what a `GetPricingPlan` right
+            // after it would: the plan in force, and the change not in force
+            // yet when this one is to land later.
+            current_pricing_plan: state.pricing_plan.as_pricing_plan(billable_entity_count),
             pending_pricing_plan: state
                 .pending_pricing_plan
                 .as_ref()

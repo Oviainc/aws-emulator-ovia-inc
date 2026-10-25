@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResponseHeadersPolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResponseHeadersPolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResponseHeadersPolicies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the response headers policies this account can use, one page at a time: the
+//! policies AWS created, which every account holds under the identifiers AWS publishes
+//! ([`crate::state::MANAGED_RESPONSE_HEADERS_POLICIES`]), together with the ones this
+//! account created. The page is cut at `MaxItems` (bounded by this emulator's own ceiling),
+//! the order is one total order over policy ids across both sources, and `Marker` names the
+//! policy the previous page ended at, so walking the pages enumerates every policy exactly
+//! once.
+//!
+//! `Type` filters the page by which of the two created a policy: a request naming one kind
+//! is served that kind alone, and one naming none is served both.
+//!
+//! A reporting operation: it reads the stored records and the published catalog, and writes
+//! nothing beyond what the clock already owed the rest of this service's state.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +89,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+/// `ResponseHeadersPolicySummary$Type` for a policy this account created, one of the two
+/// values the model's `ResponseHeadersPolicyType` enum admits.
+const TYPE_CUSTOM: &str = crate::state::RESPONSE_HEADERS_POLICY_TYPE_CUSTOM;
+
+/// The other value the same enum admits, which the policies AWS published report.
+const TYPE_MANAGED: &str = crate::state::RESPONSE_HEADERS_POLICY_TYPE_MANAGED;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -154,18 +168,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResponseHeadersPolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResponseHeadersPoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResponseHeadersPolicies"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        // "You can optionally specify the maximum number of items to receive in the
+        // response" — a page holds at least one item, so a non-positive size names no page
+        // at all. The size served is bounded above by this emulator's own page ceiling, the
+        // same one every listing of this service is bounded by.
+        let max_items = input.max_items.unwrap_or(crate::state::MAX_ITEMS);
+        let Some(page_size) = crate::state::page_size(input.max_items) else {
+            return Err(ListResponseHeadersPoliciesErrorModeled::InvalidArgument(
+                crate::state::invalid_max_items(),
+            )
+            .into());
+        };
+
+        // "A filter to get only the specified kind of response headers policies": a request
+        // that names a kind is served that kind alone, and one that names none is served
+        // both. The model's `ResponseHeadersPolicyType` admits exactly these two values, so
+        // a value outside them never reaches this handler.
+        let kind = input.r#type.as_deref();
+        let serves_managed = kind != Some(TYPE_CUSTOM);
+        let serves_custom = kind != Some(TYPE_MANAGED);
+
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes the rest of this service's state, so
+        // one read never leaves another resource reporting a stale status.
+        store.settle(SystemTime::now());
+
+        // "set this field's value to the value of NextMarker from the current page's
+        // response": the marker is a response headers policy id this service handed out. A
+        // value that is not one was never a resume point (`InvalidArgument`), and one that
+        // is but names no policy — neither a stored one nor a published one — is a policy
+        // that does not exist, which is the reason this listing models
+        // `NoSuchResponseHeadersPolicy`.
+        if let Some(marker) = input.marker.as_deref() {
+            if !crate::state::is_minted_uuid(marker) {
+                return Err(ListResponseHeadersPoliciesErrorModeled::InvalidArgument(
+                    crate::state::invalid_response_headers_policy_marker(),
+                )
+                .into());
+            }
+            if store.readable_response_headers_policy(marker).is_none() {
+                return Err(
+                    ListResponseHeadersPoliciesErrorModeled::NoSuchResponseHeadersPolicy(
+                        crate::state::no_such_response_headers_policy(),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The policies this request is about, in ONE total order over ids: the published
+        // catalog and the account's own records are two sources of the same resource kind,
+        // so they are ordered together rather than concatenated — which is what lets
+        // `Marker` resume at an id whichever source it came from.
+        let mut candidates: Vec<ResponseHeadersPolicySummary> = Vec::new();
+        if serves_managed {
+            candidates.extend(
+                crate::state::MANAGED_RESPONSE_HEADERS_POLICIES
+                    .iter()
+                    .map(|managed| ResponseHeadersPolicySummary {
+                        r#type: TYPE_MANAGED.to_string(),
+                        response_headers_policy: managed.to_response_headers_policy(),
+                    }),
+            );
+        }
+        if serves_custom {
+            candidates.extend(store.response_headers_policies.values().map(|stored| {
+                ResponseHeadersPolicySummary {
+                    // Read from the stored record, never from the request being served.
+                    r#type: TYPE_CUSTOM.to_string(),
+                    response_headers_policy: stored.to_response_headers_policy(),
+                }
+            }));
+        }
+        candidates.sort_by(|left, right| {
+            left.response_headers_policy
+                .id
+                .cmp(&right.response_headers_policy.id)
+        });
+
+        // `Marker` names where the previous page ENDED, so this page starts after it:
+        // walking the pages enumerates every policy exactly once.
+        let mut items: Vec<ResponseHeadersPolicySummary> = Vec::new();
+        let mut more_remain = false;
+        for summary in candidates {
+            if input
+                .marker
+                .as_deref()
+                .is_some_and(|marker| summary.response_headers_policy.id.as_str() <= marker)
+            {
+                continue;
+            }
+            if items.len() >= page_size {
+                more_remain = true;
+                break;
+            }
+            items.push(summary);
+        }
+
+        Ok(ListResponseHeadersPoliciesOutput {
+            response_headers_policy_list: Some(ResponseHeadersPolicyList {
+                // "If there are more items in the list than are in this response, this
+                // element is present. It contains the value that you should use in the
+                // Marker field of a subsequent request": present exactly when policies
+                // remain, carrying the id this page ended at.
+                next_marker: if more_remain {
+                    items
+                        .last()
+                        .map(|summary| summary.response_headers_policy.id.clone())
+                } else {
+                    None
+                },
+                // "The maximum number of response headers policies requested" — what the
+                // request asked for, or the default this service pages at.
+                max_items,
+                // "The number of response headers policies returned": the length of this
+                // page.
+                quantity: i32::try_from(items.len()).unwrap_or(i32::MAX),
+                // A page that lists nothing carries no `Items` element at all, rather than
+                // an empty one — as every other listing of this service answers.
+                items: if items.is_empty() { None } else { Some(items) },
+            }),
+        })
     }
 }

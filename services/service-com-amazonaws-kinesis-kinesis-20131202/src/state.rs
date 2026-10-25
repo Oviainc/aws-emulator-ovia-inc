@@ -577,6 +577,19 @@ pub fn stream_not_active_message(identifier: &str, status: &str) -> String {
     )
 }
 
+/// How an assignment that would leave a resource carrying more tags than one may carry is
+/// refused: the ceiling ([`MAX_STREAM_TAGS`]) is on what the resource carries once the
+/// request is served, so the refusal states the count the assignment would reach.
+///
+/// ONE sentence for the one rule: `AddTagsToStream` and `TagResource` are two ways into the
+/// SAME stored tag set, so they refuse the ceiling identically rather than each wording it.
+pub fn tag_ceiling_exceeded_message(resulting: usize) -> String {
+    format!(
+        "assigning these tags would leave the resource carrying {resulting} tags, past the \
+         {MAX_STREAM_TAGS} tags one resource may carry"
+    )
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.

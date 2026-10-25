@@ -25,6 +25,8 @@ mod error_envelope;
 mod health_check_creation;
 #[path = "all/health_check_listing.rs"]
 mod health_check_listing;
+#[path = "all/health_check_update_contention.rs"]
+mod health_check_update_contention;
 #[path = "all/health_check_updates.rs"]
 mod health_check_updates;
 #[path = "all/health_checks.rs"]

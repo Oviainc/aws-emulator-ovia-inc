@@ -35,7 +35,8 @@
 //! goals recorded against one (`CreateAgentGoal`, `GetAgentGoal`, `UpdateAgentGoal`,
 //! `DeleteAgentGoal`) are backed the same way,
 //! each goal keyed under the profile it belongs to. The contexts recorded against a
-//! profile (`CreateAgentContext`, `GetAgentContext`, `ListAgentContexts`) are held
+//! profile (`CreateAgentContext`, `GetAgentContext`, `ListAgentContexts`,
+//! `UpdateAgentContext`) are held
 //! exactly like the goals, keyed under the profile they belong to. The recommendation
 //! generations of a profile (`StartAgentRecommendationGeneration`,
 //! `GetAgentRecommendationGeneration`, `ListAgentRecommendationGenerations`) are held the
@@ -4489,8 +4490,8 @@ pub struct AgentContextRecord {
 
 impl AgentContextRecord {
     /// The `ContextSummary` projection every context operation answers with
-    /// (`CreateAgentContext`, `ListAgentContexts`, and — once they are implemented —
-    /// `GetAgentContext` and `UpdateAgentContext`), so one place decides how a stored
+    /// (`CreateAgentContext`, `ListAgentContexts`, `GetAgentContext` and
+    /// `UpdateAgentContext`), so one place decides how a stored
     /// context is reported.
     ///
     /// `applicationType` and `criticality` are DERIVED from the stored content rather
@@ -4894,6 +4895,20 @@ pub struct CreateAgentContextToken {
     pub fingerprint: String,
 }
 
+/// What an `UpdateAgentContext` idempotency token resolves to: the context the original
+/// request updated, the profile it belongs to, and that request's parameter fingerprint.
+///
+/// Held exactly as [`UpdateAgentGoalToken`] is, and for the same reason: the update mints
+/// no value, so what the token is for is keeping a retry from acting a SECOND time — the
+/// replay answers the context as the original request left it instead of stamping
+/// `lastModifiedAt` again.
+#[derive(Debug, Clone)]
+pub struct UpdateAgentContextToken {
+    pub profile_arn: String,
+    pub context_id: String,
+    pub fingerprint: String,
+}
+
 /// The account-level settings `UpdateGlobalSettings` records and `GetGlobalSettings`
 /// reports — "Global settings for all workloads"
 /// (`smithy_query(query="doc", shape="GetGlobalSettings")`). There is one set per
@@ -5109,6 +5124,10 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// `CreateAgentContext`'s `clientToken` -> what the original request created. Caller
     /// input keys it, so it is a BOUNDED [`TokenLedger`].
     pub create_agent_context_tokens: TokenLedger<CreateAgentContextToken>,
+    /// `UpdateAgentContext`'s `clientToken` -> the context the original request updated.
+    /// Held exactly as the create ledger above is, and bounded for the same reason:
+    /// caller input keys it, so write it through [`TokenLedger::remember`].
+    pub update_agent_context_tokens: TokenLedger<UpdateAgentContextToken>,
     /// Every recommendation generation `StartAgentRecommendationGeneration` has accepted,
     /// keyed by the agent profile's ARN then by the generation's `UUID`. A `BTreeMap`
     /// because generation-id order is the stable order a listing pages over, exactly as
@@ -5366,6 +5385,15 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// one.
     pub fn agent_context(&self, profile_arn: &str, id: &str) -> Option<&AgentContextRecord> {
         self.agent_contexts.get(profile_arn)?.get(id)
+    }
+
+    /// [`Self::agent_context`] for a caller that is about to write to the context.
+    pub fn agent_context_mut(
+        &mut self,
+        profile_arn: &str,
+        id: &str,
+    ) -> Option<&mut AgentContextRecord> {
+        self.agent_contexts.get_mut(profile_arn)?.get_mut(id)
     }
 
     /// How many contexts the agent profile `profile_arn` names currently holds — what
@@ -5949,6 +5977,8 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
             .retain(|token| token.profile_arn != profile_arn);
         self.agent_contexts.remove(profile_arn);
         self.create_agent_context_tokens
+            .retain(|token| token.profile_arn != profile_arn);
+        self.update_agent_context_tokens
             .retain(|token| token.profile_arn != profile_arn);
         self.agent_generations.remove(profile_arn);
         // The recommendations those generations produced go with them: a recommendation is
