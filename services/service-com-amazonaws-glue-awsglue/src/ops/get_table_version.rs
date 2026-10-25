@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTableVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTableVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTableVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! A pure read over one table's version history: it answers the `Table` projection the
+//! addressed version was written with, beside the `VersionId` that names it. A stored
+//! table's LIVE definition is itself the version its `VersionId` names, and every
+//! earlier version is the definition the write that replaced it archived
+//! (`crate::state::TableEntry::archived_versions`) — so a table that has never been
+//! updated has exactly one version, and it reports what `GetTable` reports.
+//!
+//! A request that names NO `VersionId` addresses the table's current version. An absent
+//! database or table, and a `VersionId` the addressed table's history does not hold, are
+//! `EntityNotFoundException`; a `VersionId` that spells no integer is
+//! `InvalidInputException`, because that is not a version id at all ("A VersionID is a
+//! string representation of an integer"). `AuditContext` is input-only Lake Formation
+//! audit metadata that does not change this operation's answer.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +164,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTableVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTableVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTableVersion"))
+        let _ = ctx;
+        // `AuditContext` is "a structure containing the Lake Formation audit context":
+        // metadata about the caller's request for Lake Formation's audit log, not a
+        // selector over what is read — it names no version and filters no part of the
+        // definition returned — so it does not change this answer.
+        let _ = &input.audit_context;
+
+        // "A VersionID is a string representation of an integer. Each version is
+        // incremented by 1", so an id that spells no integer is not a version id at
+        // all: the request is refused as invalid input rather than answered as a miss.
+        // A request that names NO version addresses the table's current version.
+        let requested = match input.version_id.as_deref() {
+            None => None,
+            Some(version_id) => match crate::state::parse_version_counter(version_id) {
+                Some(counter) => Some(counter),
+                None => {
+                    return Err(GetTableVersionErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(format!(
+                                "VersionId {version_id} is not a string representation of an \
+                                 integer"
+                            )),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetTableVersionErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let store = state.lock();
+        let Some(database) = store.database(&catalog_id, &input.database_name) else {
+            return Err(GetTableVersionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::database_not_found(
+                        &input.database_name,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        let Some(entry) = database
+            .tables
+            .get(&crate::state::fold_name(&input.table_name))
+        else {
+            return Err(GetTableVersionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::TABLE_ENTITY_NOT_FOUND.to_string()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // The table holds its own versions: the live definition is the version its
+        // `VersionId` names, and every earlier one is the definition the write that
+        // replaced it archived. An id outside that history names no version of this
+        // table.
+        let Some(table_version) = entry.table_version(requested, &database.database_id) else {
+            return Err(GetTableVersionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::table_version_not_found(
+                        input.version_id.as_deref().unwrap_or_default(),
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        Ok(GetTableVersionOutput {
+            table_version: Some(table_version),
+        })
     }
 }

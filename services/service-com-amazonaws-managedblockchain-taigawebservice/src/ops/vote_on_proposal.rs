@@ -194,8 +194,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The facts the rules below read, copied out here so the write path can take the
         // single mutable borrow it needs. `OutstandingVoteCount` is "the number of members
         // minus the sum of YES votes and NO votes", so the membership at THIS instant is
-        // what the threshold is measured against.
-        let members = network.members_in(&region).count();
+        // what the threshold is measured against — a member whose removal has started
+        // excluded, since it "can no longer participate on the network"
+        // (`Member$Status`).
+        let members = network.participating_members(&region).count();
         let voting_policy = network.voting_policy.clone();
         let proposal_status = proposal.status.clone();
         let proposal_open = proposal.is_open();

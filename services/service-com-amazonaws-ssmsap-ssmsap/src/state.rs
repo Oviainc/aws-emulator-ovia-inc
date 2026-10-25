@@ -31,6 +31,11 @@
 //! ([`RegionState::configuration_check_operations_for`]) — in that Region alone, like
 //! every other record.
 //!
+//! WHICH checks there are to run is the service's own catalogue rather than an account's
+//! record: [`configuration_check_definitions`] is the set `ListConfigurationCheckDefinitions`
+//! reports and the set [`configuration_checks_to_run`] starts when a request names no
+//! check, so the two cannot disagree about what this service supports.
+//!
 //! The record is the stored half; the wire half (`Application`, `ApplicationSummary`,
 //! `Operation`, `ConfigurationCheckOperation`) is PROJECTED from it by
 //! [`StoredApplication::view`] / [`StoredApplication::summary`] /
@@ -78,9 +83,10 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     Application, ApplicationCredential, ApplicationSummary, AssociatedHost, Component,
-    ConfigurationCheckOperation, ConflictException, DatabaseSummary, Filter,
-    InternalServerException, Operation, OperationEvent, Resource, ResourceNotFoundException,
-    RuleResult, SubCheckResult, ValidationException, CONFIGURATION_CHECK_TYPE_VALUES,
+    ConfigurationCheckDefinition, ConfigurationCheckOperation, ConflictException, DatabaseSummary,
+    Filter, InternalServerException, Operation, OperationEvent, Resource,
+    ResourceNotFoundException, RuleResult, SubCheckResult, ValidationException,
+    APPLICATION_TYPE_VALUES, CONFIGURATION_CHECK_TYPE_VALUES,
 };
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
@@ -257,9 +263,10 @@ pub const MAX_REGIONS: usize = 64;
 /// operation can still resolve it.
 pub const MAX_RETAINED_OPERATIONS: usize = 10_000;
 
-/// The page size `ListApplications` uses when the caller names no `MaxResults`, and
-/// the ceiling it clamps a requested page to: the model's own `MaxResults` range is
-/// 1..50, so 50 is both the largest page the API allows and the default page.
+/// The page size every listing of this service takes when the caller names no
+/// `MaxResults`, and the ceiling each clamps a requested page to: every one of them
+/// declares the same `MaxResults` range of 1..50, so 50 is both the largest page the API
+/// allows and the default page.
 pub const MAX_PAGE_SIZE: i32 = 50;
 
 /// The `Version` of a rendered resource policy document: the current IAM policy
@@ -1146,6 +1153,55 @@ pub fn configuration_checks_to_run(requested: Option<&[String]>) -> Vec<String> 
         }
     }
     checks
+}
+
+/// The configuration check catalogue this service supports, in the order a listing
+/// reports and pages it: ONE definition per value of the model's `ConfigurationCheckType`
+/// enum (see [`crate::ops::types::CONFIGURATION_CHECK_TYPE_VALUES`]), each paired with
+/// the key the listing is ordered and paged by — its own `Id`.
+///
+/// The catalogue is the SERVICE's, not an account's: it is the same set
+/// [`configuration_checks_to_run`] runs when a request names no check, so the checks
+/// reported here are exactly the checks `StartConfigurationChecks` will start and a check
+/// added to the model is reported without this function changing.
+///
+/// `ApplicableApplicationTypes` is "the list of SSMSAP application types that this
+/// configuration check can be evaluated against". Every catalogued check is started
+/// against a registered application whatever its `ApplicationType`
+/// ([`configuration_checks_to_run`] narrows by nothing else), so each definition reports
+/// every value of the model's `ApplicationType` enum
+/// ([`crate::ops::types::APPLICATION_TYPE_VALUES`]) — the types a start of that check is
+/// accepted for.
+///
+/// `Name` and `Description` are the catalogue's PROSE for the check, which neither the
+/// model nor this emulator holds (the enum is three opaque identifiers with no
+/// documentation), so they are reported ABSENT rather than invented — the same choice
+/// [`StoredConfigurationCheckOperation::view`] makes for the same two values.
+pub fn configuration_check_definitions() -> Vec<(String, ConfigurationCheckDefinition)> {
+    let applicable: Vec<String> = APPLICATION_TYPE_VALUES
+        .iter()
+        .map(|application_type| (*application_type).to_string())
+        .collect();
+    let mut definitions: Vec<(String, ConfigurationCheckDefinition)> =
+        CONFIGURATION_CHECK_TYPE_VALUES
+            .iter()
+            .map(|check| {
+                (
+                    (*check).to_string(),
+                    ConfigurationCheckDefinition {
+                        id: Some((*check).to_string()),
+                        name: None,
+                        description: None,
+                        applicable_application_types: Some(applicable.clone()),
+                    },
+                )
+            })
+            .collect();
+    // Id order, for the reason [`StoredSubCheckResult::rule_results_in_id_order`] gives:
+    // the call that hands out a `NextToken` and the call that resumes from it have to
+    // walk the catalogue in the same order, however the model happens to list it.
+    definitions.sort_by(|(left, _), (right, _)| left.cmp(right));
+    definitions
 }
 
 /// Everything Systems Manager for SAP holds in ONE Region: the applications registered

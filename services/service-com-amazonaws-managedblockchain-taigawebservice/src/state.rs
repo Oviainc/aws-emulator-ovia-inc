@@ -217,11 +217,85 @@ pub const STATUS_CREATING: &str = "CREATING";
 pub const STATUS_AVAILABLE: &str = "AVAILABLE";
 
 /// The `NetworkStatus` / `MemberStatus` / `NodeStatus` value of a record the service has
-/// begun removing ("`DELETING` - The Amazon Web Services account is in the process of
-/// deleting …"). No record is ever STORED in it here — a delete removes the record
-/// outright — but it is one of the transient statuses [`is_transient_status`] names, so a
-/// record that does carry it is judged by the same rule.
+/// begun removing ("`DELETING` - The member and all associated resources are in the
+/// process of being deleted" — `Member$Status`; "`DELETING` - The node is in the process
+/// of being deleted" — `Node$Status`).
+///
+/// A delete STARTS that removal rather than completing it: the record is stored in this
+/// status, stays readable and listable, and the clock owes it [`STATUS_DELETED`] a
+/// [`DELETION_SPAN`] later. It is one of the transient statuses [`is_transient_status`]
+/// names, so an operation that cannot be completed on a record being removed refuses it
+/// by the same rule.
 pub const STATUS_DELETING: &str = "DELETING";
+
+/// The terminal `NetworkStatus` / `MemberStatus` / `NodeStatus` of a record whose removal
+/// has finished ("`DELETED` - The member can no longer participate on the network and all
+/// associated resources are deleted" — `Member$Status`; "`DELETED` - The node can no
+/// longer participate on the network" — `Node$Status`). The record remains readable in
+/// it: nothing moves out of it again.
+pub const STATUS_DELETED: &str = "DELETED";
+
+/// How long a network, member or node the service has begun deleting stays
+/// [`STATUS_DELETING`] before the clock owes it [`STATUS_DELETED`].
+///
+/// `DELETING` is a non-terminal status a delete puts the record in, so reaching `DELETED`
+/// is a transition the clock owes. No AWS documentation fixes how long a deletion takes,
+/// so the span is this emulator's own choice — the same one [`TRANSITION_SPAN`] makes for
+/// the other direction, and likewise deliberately non-zero, so a caller reading the
+/// record straight after the delete still observes `DELETING`. The instant it comes due
+/// is stored on the record and materialised by that record's `settle` — nothing sleeps.
+pub const DELETION_SPAN: Duration = TRANSITION_SPAN;
+
+/// Whether `status` is one a delete has already put the record in: a removal under way
+/// ([`STATUS_DELETING`]) or finished ([`STATUS_DELETED`]).
+///
+/// A record in either "can no longer participate on the network" (`Member$Status` /
+/// `Node$Status`), so it is readable and listable but counts as a member or node of the
+/// network no longer — which is what the membership counts and name checks read.
+pub fn deletion_begun(status: &str) -> bool {
+    status == STATUS_DELETING || status == STATUS_DELETED
+}
+
+/// Start the removal of a record carrying `status` and `deleted_at`, which reports
+/// `in_progress` while the removal runs and is owed [`STATUS_DELETED`] `span` later.
+///
+/// `in_progress` is the status enum's own in-progress value — [`STATUS_DELETING`] for a
+/// network, member or node, [`ACCESSOR_STATUS_PENDING_DELETION`] for an accessor — so
+/// every two-stage deletion this service serves is armed here.
+///
+/// A record already in that status with its transition armed has nothing left to start,
+/// so a repeated delete leaves the status and the due instant exactly as the first one set
+/// them: the transition is never re-armed. A record whose removal has already finished is
+/// terminal and is left alone.
+fn begin_deletion_of(
+    status: &mut String,
+    deleted_at: &mut Option<SystemTime>,
+    in_progress: &str,
+    span: Duration,
+    now: SystemTime,
+) {
+    if status == STATUS_DELETED {
+        return;
+    }
+    if status == in_progress && deleted_at.is_some() {
+        return;
+    }
+    *status = in_progress.to_string();
+    *deleted_at = Some(now + span);
+}
+
+/// Materialise the `in_progress` -> [`STATUS_DELETED`] transition the clock already owes a
+/// record carrying `status` and `deleted_at`.
+fn settle_deletion_of(
+    status: &mut String,
+    deleted_at: Option<SystemTime>,
+    in_progress: &str,
+    now: SystemTime,
+) {
+    if status == in_progress && deleted_at.is_some_and(|due| now >= due) {
+        *status = STATUS_DELETED.to_string();
+    }
+}
 
 /// The statuses in which a resource exists but is not in service: the service has not
 /// finished creating it, or has already begun taking it out.
@@ -363,8 +437,9 @@ pub const ACCESSOR_STATUS_AVAILABLE: &str = STATUS_AVAILABLE;
 pub const ACCESSOR_STATUS_PENDING_DELETION: &str = "PENDING_DELETION";
 
 /// The terminal `AccessorStatus`: the accessor's deletion has finished, so neither it
-/// nor its billing token can be used any more.
-pub const ACCESSOR_STATUS_DELETED: &str = "DELETED";
+/// nor its billing token can be used any more. The literal is the same text
+/// [`STATUS_DELETED`] carries, which is why it is defined in terms of it.
+pub const ACCESSOR_STATUS_DELETED: &str = STATUS_DELETED;
 
 /// How long a deleted accessor stays `PENDING_DELETION` before the clock owes it
 /// `DELETED`.
@@ -444,16 +519,23 @@ pub const ACCESSOR_MAX_RESULTS: i32 = 50;
 /// here is NOT a fidelity claim about the published quota: it is the emulator's own
 /// ceiling, set generously so no realistic workflow meets it, so that a caller looping
 /// on create cannot grow this process's memory without bound.
+///
+/// A delete STARTS a removal and leaves the record readable in its terminal deleted
+/// status (see [`STATUS_DELETED`]), so a record that has been deleted still occupies its
+/// slot here — the same as a `DELETED` accessor against [`MAX_ACCESSORS`]. That is what
+/// keeps the ceiling a memory bound; it also means a caller looping on create-then-delete
+/// reaches it, which is the ceiling doing its job rather than a quota statement.
 pub const MAX_NETWORKS: usize = 1_000;
 
 /// How many nodes this emulator will hold on one network, for the same reason as
-/// [`MAX_NETWORKS`]; `CreateNode` models `ResourceLimitExceededException` for it.
+/// [`MAX_NETWORKS`], and counting deleted records for the same reason too; `CreateNode`
+/// models `ResourceLimitExceededException` for it.
 pub const MAX_NODES_PER_NETWORK: usize = 1_000;
 
 /// How many members this emulator will hold on one network, for the same reason as
-/// [`MAX_NETWORKS`]: a member record carries owned strings and a tag map, so the map a
-/// create inserts into needs a ceiling of its own or a caller looping on member creates
-/// grows this process's memory without bound. Enforced by
+/// [`MAX_NETWORKS`] (deleted records included): a member record carries owned strings and
+/// a tag map, so the map a create inserts into needs a ceiling of its own or a caller
+/// looping on member creates grows this process's memory without bound. Enforced by
 /// [`StoredNetwork::insert_member`], the only path that adds a member to a network. The
 /// number is NOT a fidelity claim about the published per-network member quota, which the
 /// real service refuses with the same `ResourceLimitExceededException` this ceiling
@@ -535,6 +617,9 @@ pub struct StoredNetwork {
     pub status: String,
     /// When `CREATING` -> `AVAILABLE` falls due. See [`TRANSITION_SPAN`].
     pub available_at: SystemTime,
+    /// When `DELETING` -> `DELETED` falls due. `None` until a delete starts the removal.
+    /// See [`DELETION_SPAN`].
+    pub deleted_at: Option<SystemTime>,
     pub creation_date: SystemTime,
     pub tags: BTreeMap<String, String>,
     pub arn: String,
@@ -579,19 +664,45 @@ impl StoredNetwork {
         if self.status == STATUS_CREATING && now >= self.available_at {
             self.status = STATUS_AVAILABLE.to_string();
         }
+        settle_deletion_of(&mut self.status, self.deleted_at, STATUS_DELETING, now);
         for member in self.members.values_mut() {
-            if member.status == STATUS_CREATING && now >= member.available_at {
-                member.status = STATUS_AVAILABLE.to_string();
-            }
+            member.settle(now);
         }
         for node in self.nodes.values_mut() {
-            if node.status == STATUS_CREATING && now >= node.available_at {
-                node.status = STATUS_AVAILABLE.to_string();
-            }
+            node.settle(now);
         }
         for proposal in self.proposals.values_mut() {
             proposal.settle(now);
         }
+    }
+
+    /// Start this network's removal: it reports `DELETING` until the clock owes it
+    /// `DELETED` — `NetworkStatus` declares both — and stays readable throughout.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        begin_deletion_of(
+            &mut self.status,
+            &mut self.deleted_at,
+            STATUS_DELETING,
+            DELETION_SPAN,
+            now,
+        );
+    }
+
+    /// Whether this network's removal has started ([`deletion_begun`]).
+    pub fn is_being_deleted(&self) -> bool {
+        deletion_begun(&self.status)
+    }
+
+    /// This network's members that still participate in it: the ones whose removal has
+    /// not started, since a member being removed "can no longer participate on the
+    /// network" (`Member$Status`). This is the membership every count and name check
+    /// reads, while the removed records stay readable and listable.
+    pub fn participating_members<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = &'a StoredMember> + 'a {
+        self.members_in(region)
+            .filter(|member| !member.is_being_deleted())
     }
 
     /// Whether a request addressed to `region` reaches this network.
@@ -683,11 +794,15 @@ impl StoredNetwork {
     /// Every network the account created counts (it is reported only in its own Region, so
     /// a network reached here at all is one of that Region's); one of AWS's standing public
     /// networks counts only once the account holds a member or a node on it IN that Region,
-    /// because until then the account merely *can read* it there.
+    /// because until then the account merely *can read* it there. A member or node whose
+    /// removal has started does not count: it "can no longer participate on the network"
+    /// (`Member$Status` / `Node$Status`).
     pub fn account_participates(&self, region: &str) -> bool {
         !self.aws_owned
-            || self.members_in(region).next().is_some()
-            || self.nodes_in(region).next().is_some()
+            || self.participating_members(region).next().is_some()
+            || self
+                .nodes_in(region)
+                .any(|node| !node.is_being_deleted())
     }
 
     /// The modelled `NetworkFrameworkAttributes` for this record: the framework's own
@@ -759,6 +874,9 @@ pub struct StoredMember {
     pub status: String,
     /// When `CREATING` -> `AVAILABLE` falls due. See [`TRANSITION_SPAN`].
     pub available_at: SystemTime,
+    /// When `DELETING` -> `DELETED` falls due. `None` until a delete starts the removal.
+    /// See [`DELETION_SPAN`].
+    pub deleted_at: Option<SystemTime>,
     pub creation_date: SystemTime,
     pub tags: BTreeMap<String, String>,
     pub arn: String,
@@ -767,6 +885,33 @@ pub struct StoredMember {
 }
 
 impl StoredMember {
+    /// Materialise the status transitions the clock already owes this member: a creation
+    /// that has run its course reports `AVAILABLE`, a removal that has reports `DELETED`.
+    fn settle(&mut self, now: SystemTime) {
+        if self.status == STATUS_CREATING && now >= self.available_at {
+            self.status = STATUS_AVAILABLE.to_string();
+        }
+        settle_deletion_of(&mut self.status, self.deleted_at, STATUS_DELETING, now);
+    }
+
+    /// Start this member's removal: "The member and all associated resources are in the
+    /// process of being deleted" (`Member$Status`'s `DELETING`), so the record stays
+    /// readable in that status until the clock owes it `DELETED`.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        begin_deletion_of(
+            &mut self.status,
+            &mut self.deleted_at,
+            STATUS_DELETING,
+            DELETION_SPAN,
+            now,
+        );
+    }
+
+    /// Whether this member's removal has started ([`deletion_begun`]).
+    pub fn is_being_deleted(&self) -> bool {
+        deletion_begun(&self.status)
+    }
+
     /// Whether a request addressed to `region` reaches this member: a member belongs to
     /// the Region the call that created it was signed for, which is the Region its stored
     /// ARN names.
@@ -902,6 +1047,9 @@ pub struct StoredNode {
     pub status: String,
     /// When `CREATING` -> `AVAILABLE` falls due. See [`TRANSITION_SPAN`].
     pub available_at: SystemTime,
+    /// When `DELETING` -> `DELETED` falls due. `None` until a delete starts the removal.
+    /// See [`DELETION_SPAN`].
+    pub deleted_at: Option<SystemTime>,
     pub creation_date: SystemTime,
     pub tags: BTreeMap<String, String>,
     pub arn: String,
@@ -911,6 +1059,33 @@ pub struct StoredNode {
 }
 
 impl StoredNode {
+    /// Materialise the status transitions the clock already owes this node: a creation
+    /// that has run its course reports `AVAILABLE`, a removal that has reports `DELETED`.
+    fn settle(&mut self, now: SystemTime) {
+        if self.status == STATUS_CREATING && now >= self.available_at {
+            self.status = STATUS_AVAILABLE.to_string();
+        }
+        settle_deletion_of(&mut self.status, self.deleted_at, STATUS_DELETING, now);
+    }
+
+    /// Start this node's removal: "`DELETING` - The node is in the process of being
+    /// deleted" (`Node$Status`), so the record stays readable in that status until the
+    /// clock owes it `DELETED`.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        begin_deletion_of(
+            &mut self.status,
+            &mut self.deleted_at,
+            STATUS_DELETING,
+            DELETION_SPAN,
+            now,
+        );
+    }
+
+    /// Whether this node's removal has started ([`deletion_begun`]).
+    pub fn is_being_deleted(&self) -> bool {
+        deletion_begun(&self.status)
+    }
+
     /// Whether a request addressed to `region` reaches this node: a node belongs to the
     /// Region its `CreateNode` was signed for, which is the Region its stored ARN names.
     pub fn in_region(&self, region: &str) -> bool {
@@ -1042,9 +1217,18 @@ impl StoredProposal {
     /// `network` is the network this proposal belongs to: the proposing member's name and
     /// the outstanding-vote count are read from its current membership, which is what
     /// `Proposal$OutstandingVoteCount` describes — "the number of members minus the sum of
-    /// `YES` votes and `NO` votes".
+    /// `YES` votes and `NO` votes". A member whose removal has started is not counted: it
+    /// "can no longer participate on the network" (`Member$Status`), so it has no vote
+    /// left to cast.
     pub fn to_proposal(&self, network: &StoredNetwork) -> Proposal {
-        let members = i32::try_from(network.members.len()).unwrap_or(i32::MAX);
+        let members = i32::try_from(
+            network
+                .members
+                .values()
+                .filter(|member| !member.is_being_deleted())
+                .count(),
+        )
+        .unwrap_or(i32::MAX);
         let cast = i32::try_from(self.votes.len()).unwrap_or(i32::MAX);
         Proposal {
             proposal_id: Some(self.id.clone()),
@@ -1157,13 +1341,16 @@ impl StoredAccessor {
     ///
     /// An accessor already `PENDING_DELETION` or `DELETED` has nothing left to start, so
     /// a repeated delete leaves the status and the due instant exactly as the first one
-    /// set them.
+    /// set them. The two-stage shape is the one every delete in this service takes, so it
+    /// is armed by the same helper, with this status enum's own in-progress value.
     pub fn begin_deletion(&mut self, now: SystemTime) {
-        if self.status != ACCESSOR_STATUS_AVAILABLE {
-            return;
-        }
-        self.status = ACCESSOR_STATUS_PENDING_DELETION.to_string();
-        self.deleted_at = Some(now + ACCESSOR_DELETION_SPAN);
+        begin_deletion_of(
+            &mut self.status,
+            &mut self.deleted_at,
+            ACCESSOR_STATUS_PENDING_DELETION,
+            ACCESSOR_DELETION_SPAN,
+            now,
+        );
     }
 
     /// Materialise the status transition the clock already owes this accessor: a deletion
@@ -1172,11 +1359,12 @@ impl StoredAccessor {
     /// Like [`StoredNetwork::settle`] this is the only write a reporting operation makes:
     /// the change was owed at this instant whether or not anybody called.
     fn settle(&mut self, now: SystemTime) {
-        if self.status == ACCESSOR_STATUS_PENDING_DELETION
-            && self.deleted_at.is_some_and(|deleted_at| now >= deleted_at)
-        {
-            self.status = ACCESSOR_STATUS_DELETED.to_string();
-        }
+        settle_deletion_of(
+            &mut self.status,
+            self.deleted_at,
+            ACCESSOR_STATUS_PENDING_DELETION,
+            now,
+        );
     }
 
     /// The modelled `Accessor` for this record, as `GetAccessor` returns it.
@@ -1413,6 +1601,8 @@ impl Default for ComAmazonawsManagedblockchainTaigawebserviceState {
                     // so the clock owes it no transition.
                     status: STATUS_AVAILABLE.to_string(),
                     available_at: genesis,
+                    // A standing public network is not deleted by any call.
+                    deleted_at: None,
                     creation_date: genesis,
                     tags: BTreeMap::new(),
                     arn: network_arn(DEFAULT_REGION, public.id),
@@ -1479,15 +1669,6 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
         self.networks
             .values()
             .filter(move |network| network.in_region(region))
-    }
-
-    /// Drop the network `network_id` names in `region`, answering whether it was there to
-    /// drop: a network of another Region is not this request's to delete.
-    pub fn remove_network(&mut self, region: &str, network_id: &str) -> bool {
-        if self.network(region, network_id).is_none() {
-            return false;
-        }
-        self.networks.remove(network_id).is_some()
     }
 
     /// The accessor `accessor_id` names, as a request addressed to `region` sees it.
@@ -1737,21 +1918,34 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
         }
     }
 
-    /// Whether any resource `created` names is still stored.
+    /// Whether any resource `created` names is still stored AND has not begun being
+    /// deleted.
+    ///
+    /// A record whose removal has started stays readable so a caller can watch it reach
+    /// `DELETED`, but it is no longer a resource a replayed create token could hand back:
+    /// the ledger must not outlive the resources it describes, so such a record does not
+    /// keep its token alive.
     fn holds_any(&self, created: &CreatedIds) -> bool {
-        let network_held = created
-            .network_id
-            .as_deref()
-            .is_some_and(|id| self.networks.contains_key(id));
-        let member_held = created.member_id.as_deref().is_some_and(|id| {
+        let network_held = created.network_id.as_deref().is_some_and(|id| {
             self.networks
-                .values()
-                .any(|network| network.members.contains_key(id))
+                .get(id)
+                .is_some_and(|network| !network.is_being_deleted())
+        });
+        let member_held = created.member_id.as_deref().is_some_and(|id| {
+            self.networks.values().any(|network| {
+                network
+                    .members
+                    .get(id)
+                    .is_some_and(|member| !member.is_being_deleted())
+            })
         });
         let node_held = created.node_id.as_deref().is_some_and(|id| {
-            self.networks
-                .values()
-                .any(|network| network.nodes.contains_key(id))
+            self.networks.values().any(|network| {
+                network
+                    .nodes
+                    .get(id)
+                    .is_some_and(|node| !node.is_being_deleted())
+            })
         });
         let proposal_held = created.proposal_id.as_deref().is_some_and(|id| {
             self.networks
@@ -1929,6 +2123,11 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
     /// `ProposalActions` … couldn't be completed because of an error. The `ACTION_FAILED`
     /// status occurs even if only one ProposalAction fails and other actions are
     /// successful", so the remaining actions are still attempted.
+    ///
+    /// A member id the list repeats names the one member, already being removed, so it is
+    /// carried out once: the removals are taken as the SET of members they name, which is
+    /// also what keeps the work bounded by the network's membership rather than by the
+    /// length of a caller-written list.
     pub fn carry_out_proposal_actions(
         &mut self,
         network_id: &str,
@@ -1945,43 +2144,78 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
                 carried_out = false;
             }
         }
-        for removal in actions.removals.iter().flatten() {
-            if !self.remove_member(region, network_id, &removal.member_id) {
+        let removals: ::std::collections::BTreeSet<&str> = actions
+            .removals
+            .iter()
+            .flatten()
+            .map(|removal| removal.member_id.as_str())
+            .collect();
+        for member_id in removals {
+            if !self.begin_member_deletion(region, network_id, member_id, now) {
                 carried_out = false;
             }
         }
+        // Once for the call, not once per removal: the ledger must not outlive the
+        // resources it describes, and one sweep answers that for every removal this
+        // proposal carried out — the same sweep `DeleteMember` makes after its own.
+        self.forget_dangling_tokens();
         carried_out
     }
 
-    /// Remove `member_id` from `network_id`: "The member and all associated resources are
-    /// deleted from the network" (`RemoveAction`), so the member's nodes go with it, and
-    /// the idempotency record of each node's create goes with the node (the same reason
-    /// [`Self::forget_node_token`] is called when a node is deleted outright).
+    /// Start the removal of `member_id` from `network_id`: "The member and all associated
+    /// resources are deleted from the network" (`RemoveAction`), so the member's nodes go
+    /// with it.
+    ///
+    /// The removal is ASYNCHRONOUS, as `MemberStatus` and `NodeStatus` describe it: the
+    /// member and its nodes report `DELETING` ("in the process of being deleted"), stay
+    /// readable and listable, and the clock owes each of them `DELETED` a
+    /// [`DELETION_SPAN`] later. A network left without a member that still participates
+    /// goes the same way ("If `MemberId` is the last member in a network specified by the
+    /// last Amazon Web Services account, the network is deleted also" \u2014 `DeleteMember`),
+    /// reporting the `DELETING` and `DELETED` of `NetworkStatus`.
     ///
     /// Answers whether the member was there to remove: `false` when the network or the
     /// member names nothing a request addressed to `region` reaches, which is an action
     /// that could not be carried out.
-    pub fn remove_member(&mut self, region: &str, network_id: &str, member_id: &str) -> bool {
+    ///
+    /// The idempotency ledger is swept by the CALL that started the removal — once, after
+    /// its removals — rather than here, so no caller-written list of removals multiplies
+    /// the sweep.
+    pub fn begin_member_deletion(
+        &mut self,
+        region: &str,
+        network_id: &str,
+        member_id: &str,
+        now: SystemTime,
+    ) -> bool {
         let Some(network) = self.network_mut(region, network_id) else {
             return false;
         };
-        if network.member(region, member_id).is_none() {
+        let Some(member) = network.member_mut(region, member_id) else {
             return false;
+        };
+        member.begin_deletion(now);
+        // "All associated resources" are deleted with the member, and a node's own
+        // removal is the same two-stage one.
+        for node in network.nodes.values_mut() {
+            if node.member_id.as_deref() == Some(member_id) {
+                node.begin_deletion(now);
+            }
         }
-        if network.members.remove(member_id).is_none() {
-            return false;
-        }
-        let orphaned: Vec<String> = network
-            .nodes
-            .iter()
-            .filter(|(_, node)| node.member_id.as_deref() == Some(member_id))
-            .map(|(id, _)| id.clone())
-            .collect();
-        for node_id in &orphaned {
-            network.nodes.remove(node_id);
-        }
-        for node_id in &orphaned {
-            self.forget_node_token(node_id);
+        // "If MemberId is the last member in a network specified by the last Amazon Web
+        // Services account, the network is deleted also" (`DeleteMember`): a network none
+        // of whose members still participates — in ANY Region, since one network's
+        // members are reached through the Region each was created in — has lost that last
+        // member. One of AWS's standing public networks is not an account resource and no
+        // call deletes it, so losing the members an account held on it leaves it standing
+        // for every other caller.
+        if !network.aws_owned
+            && network
+                .members
+                .values()
+                .all(|member| member.is_being_deleted())
+        {
+            network.begin_deletion(now);
         }
         true
     }

@@ -67,6 +67,8 @@ mod update_user_pool;
 mod update_user_pool_client;
 #[path = "all/user_attribute_verification_code.rs"]
 mod user_attribute_verification_code;
+#[path = "all/user_import_job_lifecycle.rs"]
+mod user_import_job_lifecycle;
 #[path = "all/user_pool_domain.rs"]
 mod user_pool_domain;
 #[path = "all/verification_code_pipeline.rs"]

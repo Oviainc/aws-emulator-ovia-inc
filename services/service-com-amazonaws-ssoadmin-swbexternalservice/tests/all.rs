@@ -85,6 +85,8 @@ mod managed_policies;
 mod managed_policies_in_permission_set;
 #[path = "all/permission_set_update.rs"]
 mod permission_set_update;
+#[path = "all/permission_sets_provisioned_to_account.rs"]
+mod permission_sets_provisioned_to_account;
 #[path = "all/permissions_boundary.rs"]
 mod permissions_boundary;
 #[path = "all/permissions_boundary_delete.rs"]

@@ -65,5 +65,7 @@ mod site_and_outpost_projection;
 mod state_roundtrip;
 #[path = "all/supported_instance_types.rs"]
 mod supported_instance_types;
+#[path = "all/tagging_resource_arn.rs"]
+mod tagging_resource_arn;
 #[path = "all/update_persistence.rs"]
 mod update_persistence;

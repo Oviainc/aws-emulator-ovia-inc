@@ -23,7 +23,7 @@ use crate::ops::types::{
     NumberAttributeConstraintsType, PasswordPolicyType, RefreshTokenRotationType,
     ResourceServerScopeType, ResourceServerType, RoutingType,
     SchemaAttributeType, SignInPolicyType, SmsConfigurationType, StringAttributeConstraintsType,
-    TokenValidityUnitsType, UserAttributeUpdateSettingsType, UserPoolAddOnsType,
+    TokenValidityUnitsType, UserAttributeUpdateSettingsType, UserImportJobType, UserPoolAddOnsType,
     UserPoolClientType, UserPoolDescriptionType, UserPoolPolicyType, UserPoolType, UserType,
     UsernameConfigurationType, VerificationMessageTemplateType,
 };
@@ -254,6 +254,63 @@ pub const DOMAIN_STATUS_ACTIVE: &str = "ACTIVE";
 pub const DOMAIN_ACTIVATION_SPAN: Duration = Duration::from_millis(500);
 
 // ---------------------------------------------------------------------------
+// User import jobs
+//
+// A job's `Status` is COMPUTED from what is stored plus the clock, so a read
+// renders the status the job is in at that instant and writes nothing.
+// Each value below is one of the modelled
+// [`crate::ops::types::USER_IMPORT_JOB_STATUS_TYPE_VALUES`].
+// ---------------------------------------------------------------------------
+
+/// "`Created` - The job was created but not started"
+/// (`UserImportJobType.Status`).
+pub const JOB_STATUS_CREATED: &str = "Created";
+
+/// "`Pending` - A transition state. You have started the job, but it has not
+/// begun importing users yet" (`UserImportJobType.Status`).
+pub const JOB_STATUS_PENDING: &str = "Pending";
+
+/// "`InProgress` - The job has started, and users are being imported"
+/// (`UserImportJobType.Status`).
+pub const JOB_STATUS_IN_PROGRESS: &str = "InProgress";
+
+/// "`Stopping` - You have stopped the job, but the job has not stopped
+/// importing users yet" (`UserImportJobType.Status`).
+pub const JOB_STATUS_STOPPING: &str = "Stopping";
+
+/// "`Stopped` - You have stopped the job, and the job has stopped importing
+/// users" (`UserImportJobType.Status`).
+pub const JOB_STATUS_STOPPED: &str = "Stopped";
+
+/// "`Expired` - You created a job, but did not start the job within 24-48
+/// hours" (`UserImportJobType.Status`).
+pub const JOB_STATUS_EXPIRED: &str = "Expired";
+
+/// How long a started job stays `Pending` before the clock owes it
+/// `InProgress`.
+///
+/// A chosen span, not a documented duration: `UserImportJobType.Status`
+/// documents `Pending` as "A transition state. You have started the job, but it
+/// has not begun importing users yet", so a job is NOT importing when
+/// `StartUserImportJob` returns. Never zero, so a caller reading the job right
+/// after starting it still sees the transient status.
+pub const JOB_START_SPAN: Duration = Duration::from_millis(500);
+
+/// How long a stopped job stays `Stopping` before the clock owes it `Stopped`.
+///
+/// A chosen span, not a documented duration: `Stopping` is "You have stopped the
+/// job, but the job has not stopped importing users yet"
+/// (`UserImportJobType.Status`), so the stop is not complete when
+/// `StopUserImportJob` returns.
+pub const JOB_STOP_SPAN: Duration = Duration::from_millis(500);
+
+/// How long a created job can go unstarted before the clock owes it `Expired`:
+/// "You created a job, but did not start the job within 24-48 hours ... the job
+/// can't be started" (`UserImportJobType.Status`), whose earliest documented
+/// bound is 24 hours.
+pub const JOB_EXPIRY_SPAN: Duration = Duration::from_secs(24 * 60 * 60);
+
+// ---------------------------------------------------------------------------
 // Store bounds
 //
 // This state lives in the emulator's memory, so every store a caller can grow
@@ -286,6 +343,12 @@ pub const MAX_RESOURCE_SERVERS_PER_POOL: usize = 1_000;
 
 /// The most identity providers one user pool holds.
 pub const MAX_IDENTITY_PROVIDERS_PER_POOL: usize = 1_000;
+
+/// The most user import jobs one user pool holds: `UserImportJobsListType`, the
+/// list `ListUserImportJobs` answers a pool's jobs in, is modelled with a
+/// maximum length of 50, so a pool holds no more jobs than one listing can
+/// report.
+pub const MAX_USER_IMPORT_JOBS_PER_POOL: usize = 50;
 
 /// The most custom (and developer-only) attributes one user pool's schema
 /// holds: Amazon Cognito's quota for custom attributes per user pool is 50 and
@@ -763,6 +826,11 @@ pub struct UserPool {
     /// ordered so a read of several is stable. `ProviderNameType` carries no
     /// case-insensitivity trait, so a name is matched exactly as it was created.
     pub identity_providers: BTreeMap<String, IdentityProvider>,
+    /// This pool's user import jobs keyed by their minted `JobId`, ordered so a
+    /// read of several is stable: "Import jobs are retained in user pool
+    /// configuration so that you can stage, stop, start, review, and delete
+    /// them" (`ListUserImportJobs`).
+    pub user_import_jobs: BTreeMap<String, UserImportJob>,
     /// The key pair this pool's tokens are signed with and whose public half
     /// its key set publishes, minted with the pool and kept for its lifetime,
     /// so every token the pool ever issued stays verifiable against the key set
@@ -2050,6 +2118,146 @@ impl ResourceServer {
     }
 }
 
+/// One stored user import job of a user pool: what `CreateUserImportJob` stored
+/// and every later read of it renders.
+///
+/// The job's `Status` is not stored: it is COMPUTED from the instants below and
+/// the clock ([`UserImportJob::status`]), so a read never has to move it.
+#[derive(Debug, Clone)]
+pub struct UserImportJob {
+    pub job_id: String,
+    pub job_name: String,
+    pub user_pool_id: String,
+    /// The role "that has permission to log import-job results to Amazon
+    /// CloudWatch Logs" (`CreateUserImportJob.CloudWatchLogsRoleArn`), kept
+    /// exactly as it was submitted.
+    pub cloud_watch_logs_role_arn: String,
+    /// The hashing algorithm the CSV's password hashes were made with, absent on
+    /// a job created without one: the model documents no default.
+    pub password_hashing_algorithm: Option<String>,
+    /// Where a client uploads this job's CSV file, as it was minted when the job
+    /// was created, so every read of the job reports the same locator. Absent
+    /// when the create named no endpoint to build one from.
+    pub pre_signed_url: Option<String>,
+    pub creation_date: SystemTime,
+    /// When `StartUserImportJob` accepted this job, absent until it does.
+    pub start_date: Option<SystemTime>,
+    /// The instant the clock owes this job's `Pending` -> `InProgress` move.
+    /// Stored, never slept on: a read computes the status from it.
+    pub in_progress_at: Option<SystemTime>,
+    /// The instant the clock owes this job's `Stopping` -> `Stopped` move,
+    /// absent until `StopUserImportJob` accepted it.
+    pub stopped_at: Option<SystemTime>,
+}
+
+impl UserImportJob {
+    /// A new job of `user_pool_id`, `Created` until it is started or the clock
+    /// makes its expiry due.
+    pub fn new(
+        job_id: String,
+        job_name: String,
+        user_pool_id: String,
+        cloud_watch_logs_role_arn: String,
+        password_hashing_algorithm: Option<String>,
+        pre_signed_url: Option<String>,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            job_id,
+            job_name,
+            user_pool_id,
+            cloud_watch_logs_role_arn,
+            password_hashing_algorithm,
+            pre_signed_url,
+            creation_date: now,
+            start_date: None,
+            in_progress_at: None,
+            stopped_at: None,
+        }
+    }
+
+    /// This job's `UserImportJobStatusType` as of `now`, computed from the
+    /// stored instants: a stopped job is `Stopping` until the clock has made its
+    /// stop due and `Stopped` from then on, a started one `Pending` until the
+    /// clock has made the import due and `InProgress` from then on, and one that
+    /// was never started `Created` until its expiry is due.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if let Some(stopped_at) = self.stopped_at {
+            return if now >= stopped_at {
+                JOB_STATUS_STOPPED
+            } else {
+                JOB_STATUS_STOPPING
+            };
+        }
+        if let Some(in_progress_at) = self.in_progress_at {
+            return if now >= in_progress_at {
+                JOB_STATUS_IN_PROGRESS
+            } else {
+                JOB_STATUS_PENDING
+            };
+        }
+        if now >= self.creation_date + JOB_EXPIRY_SPAN {
+            JOB_STATUS_EXPIRED
+        } else {
+            JOB_STATUS_CREATED
+        }
+    }
+
+    /// Whether this job is importing users as of `now` — `Pending` or
+    /// `InProgress` — which is the state a stop acts on.
+    pub fn is_running(&self, now: SystemTime) -> bool {
+        matches!(
+            self.status(now),
+            JOB_STATUS_PENDING | JOB_STATUS_IN_PROGRESS
+        )
+    }
+
+    /// Record that the import was started at `now`, which makes the job
+    /// `Pending` and the `InProgress` move due one [`JOB_START_SPAN`] later.
+    pub fn start(&mut self, now: SystemTime) {
+        self.start_date = Some(now);
+        self.in_progress_at = Some(now + JOB_START_SPAN);
+    }
+
+    /// Record that the stop was asked for at `now`, which makes the job
+    /// `Stopping` and the `Stopped` move due one [`JOB_STOP_SPAN`] later.
+    pub fn stop(&mut self, now: SystemTime) {
+        self.stopped_at = Some(now + JOB_STOP_SPAN);
+    }
+
+    /// The modelled view of this job as of `now`, rendered from what is stored.
+    pub fn to_user_import_job_type(&self, now: SystemTime) -> UserImportJobType {
+        let status = self.status(now);
+        UserImportJobType {
+            job_name: Some(self.job_name.clone()),
+            job_id: Some(self.job_id.clone()),
+            user_pool_id: Some(self.user_pool_id.clone()),
+            // The locator the job was minted with, reported exactly as it is
+            // stored, so a later read of the job names the same target.
+            pre_signed_url: self.pre_signed_url.clone(),
+            creation_date: Some(to_date_time(self.creation_date)),
+            start_date: self.start_date.map(to_date_time),
+            // "The date when the user import job was completed"
+            // (`UserImportJobType.CompletionDate`): the instant the job stopped
+            // importing users, reported once the clock has made that move due.
+            completion_date: self
+                .stopped_at
+                .filter(|_| status == JOB_STATUS_STOPPED)
+                .map(to_date_time),
+            status: Some(status.to_string()),
+            cloud_watch_logs_role_arn: Some(self.cloud_watch_logs_role_arn.clone()),
+            // No CSV was imported, so the three counters stay at the zero the
+            // model defaults them to, and `CompletionMessage` — "The message
+            // returned when the user import job is completed" — is not invented.
+            imported_users: 0,
+            skipped_users: 0,
+            failed_users: 0,
+            completion_message: None,
+            password_hashing_algorithm: self.password_hashing_algorithm.clone(),
+        }
+    }
+}
+
 /// One stored third-party identity provider of a user pool: what
 /// `CreateIdentityProvider` stored and every later read of it renders.
 #[derive(Debug, Clone)]
@@ -2615,6 +2823,7 @@ pub fn new_user_pool(name: String, region: &str, now: SystemTime) -> UserPool {
         groups: BTreeMap::new(),
         resource_servers: BTreeMap::new(),
         identity_providers: BTreeMap::new(),
+        user_import_jobs: BTreeMap::new(),
         // A pool's token-signing key exists from the moment the pool does, as
         // on AWS, so its key set is publishable before anything signs in. One
         // scalar multiplication, so creating a pool waits on nothing.
@@ -2659,6 +2868,41 @@ fn new_pool_id(region: &str) -> String {
 /// domain is `d` followed by 13 lowercase alphanumerics.
 fn new_cloud_front_domain() -> String {
     format!("d{}.cloudfront.net", random_token(13))
+}
+
+/// A fresh `JobId` for a user import job: `import-` followed by a v4 UUID,
+/// which satisfies the modelled pattern `^import-[0-9a-zA-Z-]+$` and length
+/// 1..55.
+pub fn new_user_import_job_id() -> String {
+    format!("import-{}", new_uuid())
+}
+
+/// Where a client uploads the CSV file of the import job `job_id`:
+/// `UserImportJobType.PreSignedUrl`, "The pre-signed URL target for uploading
+/// the CSV file".
+///
+/// AWS answers an Amazon S3 pre-signed URL here. This emulator provisions no
+/// object store, so the URL names THIS job's CSV on the endpoint THIS REQUEST
+/// ARRIVED AT: no operation of this service serves it, and nothing reads it back
+/// as content. It is a locator built from the request's own host and the stored
+/// ids, never a stand-in for a CSV that was uploaded — and a request that names
+/// no host of its own gets no locator at all rather than a baked-in one, which
+/// would point a following client's upload at the real service.
+///
+/// `host` is taken only when it LOOKS like a `host[:port]`, so a caller cannot
+/// get a string of its own into the value this service reports.
+pub fn user_import_csv_upload_url(host: &str, user_pool_id: &str, job_id: &str) -> Option<String> {
+    is_host_shaped(host).then(|| format!("https://{host}/user-import-jobs/{user_pool_id}/{job_id}"))
+}
+
+/// Whether `host` is a non-empty `host[:port]` of the characters a hostname
+/// carries.
+fn is_host_shaped(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 255
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b':'))
 }
 
 /// A fresh `ClientId`: 26 characters, satisfying the modelled `^[\w+]+$`.

@@ -214,7 +214,9 @@ struct PublishCase {
     code_sha256: Option<String>,
     /// The `Content.ResolvedS3Object` the answer must report.
     resolved_s3_object: Option<Value>,
-    /// The `Description` the answer must report.
+    /// The `Description` the answer must report. `Some(json!(""))` for a request that
+    /// carried none: the member is part of every layer version AWS reports from the
+    /// version's own read, as the empty string when it was omitted.
     description: Option<Value>,
     /// The `LicenseInfo` the answer must report.
     license_info: Option<Value>,
@@ -269,7 +271,7 @@ async fn publish_layer_version_stores_the_archive_and_reports_it() {
             code_size: i64::try_from(small.len()).unwrap_or_default(),
             code_sha256: Some(expected_code_sha256(&small)),
             resolved_s3_object: None,
-            description: None,
+            description: Some(json!("")),
             license_info: None,
             compatible_runtimes: None,
             compatible_architectures: None,
@@ -306,7 +308,7 @@ async fn publish_layer_version_stores_the_archive_and_reports_it() {
             code_size: i64::try_from(small.len()).unwrap_or_default(),
             code_sha256: Some(expected_code_sha256(&small)),
             resolved_s3_object: None,
-            description: None,
+            description: Some(json!("")),
             license_info: Some(json!("https://opensource.org/licenses/MIT")),
             compatible_runtimes: Some(json!(fifteen_runtimes)),
             compatible_architectures: Some(json!(["x86_64", "arm64"])),
@@ -349,7 +351,7 @@ async fn publish_layer_version_stores_the_archive_and_reports_it() {
                 "S3Key": "helpers.zip",
                 "S3ObjectVersion": "3HL4kqtJlcpXroDTDmJ",
             })),
-            description: None,
+            description: Some(json!("")),
             license_info: None,
             compatible_runtimes: Some(json!(["provided.al2"])),
             compatible_architectures: None,

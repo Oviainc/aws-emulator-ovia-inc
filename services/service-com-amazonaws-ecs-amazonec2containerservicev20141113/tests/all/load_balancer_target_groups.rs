@@ -30,6 +30,11 @@
 //! model_path="services/service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10/smithy-model/com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10.json")`:
 //! `instance`, `ip`, `lambda`, `alb`), and the network modes are the ECS model's
 //! `NetworkMode` enum (`bridge`, `host`, `awsvpc`, `none`).
+//!
+//! The pairing is decided by the REVISION's network mode alone, so it is independent of
+//! how the service's tasks are PLACED: the last suite here crosses it with the placement
+//! the request asks for (a `launchType`, or a `capacityProviderStrategy`), where the
+//! tables above name no placement member at all.
 
 use std::sync::Arc;
 
@@ -870,4 +875,255 @@ async fn update_service_holds_the_new_pairing_to_the_same_rule() {
         stored_arn, ip_group,
         "case {case:?}: expected the stored attachment to name {ip_group}, got {stored_arn}"
     );
+}
+
+/// The task-level `cpu` and `memory` a Fargate-compatible revision declares (each member's
+/// own doc: "This field is required for Fargate"), at a legal Fargate size.
+const FARGATE_CPU: &str = "256";
+const FARGATE_MEMORY: &str = "512";
+
+/// How a request may ask for a service's tasks to be PLACED — the dimension the pairing
+/// above must be independent of.
+///
+/// `CreateService$launchType` (`LaunchType`: `EC2 | EXTERNAL | FARGATE |
+/// MANAGED_INSTANCES`) and `CreateService$capacityProviderStrategy` are the two members
+/// that carry it; `MANAGED_INSTANCES` is reachable only through the latter ("If you want to
+/// use Amazon ECS Managed Instances, you must use the capacityProviderStrategy request
+/// parameter and omit the launchType request parameter"), and naming both at once is
+/// refused outright ("If a capacityProviderStrategy is specified, the launchType parameter
+/// must be omitted"), so a row names exactly one. No row names `MANAGED_INSTANCES`: its
+/// capacity provider is created by `CreateCapacityProvider` with a `managedInstancesProvider`,
+/// which this slice does not model yet, and the pairing a row would check is the one the
+/// `awsvpc` rows below already cross.
+#[derive(Debug)]
+enum Placement {
+    /// A `launchType` the request names outright.
+    LaunchType(&'static str),
+    /// A `capacityProviderStrategy` naming one capacity provider of the cluster.
+    CapacityProvider(&'static str),
+}
+
+impl Placement {
+    /// Add the member this placement is asked for by to a `CreateService` body.
+    fn apply(&self, body: &mut Value) {
+        match self {
+            Self::LaunchType(launch_type) => body["launchType"] = json!(launch_type),
+            Self::CapacityProvider(provider) => {
+                body["capacityProviderStrategy"] =
+                    json!([{ "capacityProvider": provider, "weight": 1 }]);
+            }
+        }
+    }
+}
+
+/// Register one `awsvpc` revision of `family` that every placement below may legally run:
+/// Fargate requires `awsvpc` plus task-level `cpu` and `memory`, and the revision declares
+/// the launch types it is validated against ("Amazon ECS validates the task definition
+/// parameters with those supported by the launch type"), so the SAME revision is placed on
+/// Fargate, on EC2 and through a Fargate capacity provider.
+async fn register_fargate_definition(
+    router: &MultiServiceRouter,
+    family: &str,
+    case: &str,
+) -> String {
+    let mut web = container("web", "public.ecr.aws/nginx/nginx:latest");
+    web["portMappings"] = json!([{ "containerPort": 80, "protocol": "tcp" }]);
+    let body = ok(
+        router,
+        "RegisterTaskDefinition",
+        json!({
+            "family": family,
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["EC2", "FARGATE"],
+            "cpu": FARGATE_CPU,
+            "memory": FARGATE_MEMORY,
+            "containerDefinitions": [web],
+        }),
+        case,
+    )
+    .await;
+    string(&body["taskDefinition"], "taskDefinitionArn", case)
+}
+
+/// One row of the placement table: how the tasks are placed, the revision's network mode,
+/// the target group's type, and whether the service is created.
+struct PlacementRow {
+    case: &'static str,
+    placement: Placement,
+    network_mode: &'static str,
+    target_type: &'static str,
+    created: bool,
+}
+
+#[tokio::test]
+async fn the_pairing_holds_whatever_placement_the_request_asks_for() {
+    let router = emulator();
+    let cluster = "lb-placement";
+    // The Fargate capacity providers are ASSOCIATED with the cluster, since a
+    // `capacityProviderStrategy` may only name a provider the cluster holds. The cluster
+    // gets no `defaultCapacityProviderStrategy`: every row names its own placement.
+    ok(
+        &router,
+        "CreateCluster",
+        json!({ "clusterName": cluster, "capacityProviders": ["FARGATE", "FARGATE_SPOT"] }),
+        "the cluster every row creates its service in",
+    )
+    .await;
+
+    // The rows cross the placement dimension with both halves of the pairing: one
+    // `awsvpc` revision placed four ways against an `ip` and an `instance` group, and a
+    // `bridge` revision placed on the launch types its tasks can take, where the required
+    // type is the other one. The table above covers the request that names NO placement.
+    let rows: [PlacementRow; 9] = [
+        PlacementRow {
+            // The pairing of the recorded request this suite's rule was filed from.
+            case: "FARGATE launch type, awsvpc revision, instance target group",
+            placement: Placement::LaunchType("FARGATE"),
+            network_mode: "awsvpc",
+            target_type: "instance",
+            created: false,
+        },
+        PlacementRow {
+            case: "FARGATE launch type, awsvpc revision, ip target group",
+            placement: Placement::LaunchType("FARGATE"),
+            network_mode: "awsvpc",
+            target_type: "ip",
+            created: true,
+        },
+        PlacementRow {
+            case: "EC2 launch type, awsvpc revision, instance target group",
+            placement: Placement::LaunchType("EC2"),
+            network_mode: "awsvpc",
+            target_type: "instance",
+            created: false,
+        },
+        PlacementRow {
+            case: "EC2 launch type, awsvpc revision, ip target group",
+            placement: Placement::LaunchType("EC2"),
+            network_mode: "awsvpc",
+            target_type: "ip",
+            created: true,
+        },
+        PlacementRow {
+            case: "a FARGATE capacity-provider strategy, awsvpc revision, instance target \
+                   group",
+            placement: Placement::CapacityProvider("FARGATE"),
+            network_mode: "awsvpc",
+            target_type: "instance",
+            created: false,
+        },
+        PlacementRow {
+            case: "a FARGATE capacity-provider strategy, awsvpc revision, ip target group",
+            placement: Placement::CapacityProvider("FARGATE"),
+            network_mode: "awsvpc",
+            target_type: "ip",
+            created: true,
+        },
+        PlacementRow {
+            case: "a FARGATE_SPOT capacity-provider strategy, awsvpc revision, instance \
+                   target group",
+            placement: Placement::CapacityProvider("FARGATE_SPOT"),
+            network_mode: "awsvpc",
+            target_type: "instance",
+            created: false,
+        },
+        PlacementRow {
+            case: "EXTERNAL launch type, bridge revision, ip target group",
+            placement: Placement::LaunchType("EXTERNAL"),
+            network_mode: "bridge",
+            target_type: "ip",
+            created: false,
+        },
+        PlacementRow {
+            case: "EXTERNAL launch type, bridge revision, instance target group",
+            placement: Placement::LaunchType("EXTERNAL"),
+            network_mode: "bridge",
+            target_type: "instance",
+            created: true,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let group_name = format!("place-tg-{index}");
+        let target_group =
+            create_target_group(&router, &group_name, row.target_type, case).await;
+        let family = format!("place-family-{index}");
+        let definition = match row.network_mode {
+            "awsvpc" => register_fargate_definition(&router, &family, case).await,
+            mode => register_definition(&router, &family, mode, case).await,
+        };
+        let service_name = format!("place-svc-{index}");
+        let mut body = create_body(
+            cluster,
+            &service_name,
+            &definition,
+            row.network_mode,
+            attachment(&target_group),
+        );
+        row.placement.apply(&mut body);
+
+        if row.created {
+            let created = ok(&router, "CreateService", body, case).await;
+            let stored = stored_load_balancers(&router, cluster, &service_name, case).await;
+            assert_eq!(
+                stored.len(),
+                1,
+                "case {case:?}: expected the stored service to hold its one attachment, \
+                 got {stored:?}"
+            );
+            let stored_arn = string(&stored[0], "targetGroupArn", case);
+            assert_eq!(
+                stored_arn, target_group,
+                "case {case:?}: expected the stored attachment to name {target_group}, got \
+                 {stored_arn}"
+            );
+            // The service runs on the placement the row asked for, so the accept is this
+            // row's placement and not another one.
+            let service = &created["service"];
+            match row.placement {
+                Placement::LaunchType(launch_type) => {
+                    let reported = string(service, "launchType", case);
+                    assert_eq!(
+                        reported, launch_type,
+                        "case {case:?}: expected the service to report launchType \
+                         {launch_type}, got {reported}"
+                    );
+                }
+                Placement::CapacityProvider(provider) => {
+                    let strategy = list(service, "capacityProviderStrategy", case);
+                    let reported = strategy
+                        .first()
+                        .map(|entry| string(entry, "capacityProvider", case));
+                    assert_eq!(
+                        reported.as_deref(),
+                        Some(provider),
+                        "case {case:?}: expected the service to report the strategy on \
+                         {provider}, got {strategy:?}"
+                    );
+                }
+            }
+        } else {
+            let (code, message) = refusal(&router, "CreateService", body, case).await;
+            assert_eq!(
+                code, "InvalidParameterException",
+                "case {case:?}: expected the modelled InvalidParameterException, got {code} \
+                 with {message:?}"
+            );
+            // The refusal is the PAIRING one — it names the group, the target type it has
+            // and the network mode it cannot carry — and not one about the placement, which
+            // is legal in every row here.
+            for expected in [target_group.as_str(), row.target_type, row.network_mode] {
+                assert!(
+                    message.contains(expected),
+                    "case {case:?}: expected the refusal to name {expected:?}, got {message:?}"
+                );
+            }
+            assert!(
+                !service_exists(&router, cluster, &service_name, case).await,
+                "case {case:?}: the refused service must not be persisted, but \
+                 DescribeServices reports {service_name}"
+            );
+        }
+    }
 }
