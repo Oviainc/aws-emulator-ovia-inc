@@ -12,11 +12,19 @@
 //! request's members are examined, rather than receiving `Items`.
 //!
 //! What it reports is the organisation's resource inventory
-//! ([`crate::state::ComAmazonawsFmsAwsfms20180101State::discovered_resources`]),
-//! filtered by the member account and the resource type the request names and
-//! served in bounded pages. The emulator has no member accounts to discover
-//! resources from, so that inventory is EMPTY unless something put a resource in
-//! it: an empty `Items` is the honest answer, never an invented resource.
+//! ([`crate::state::discovered_resources`]), filtered by the member account and
+//! the resource type the request names and served in bounded pages.
+//!
+//! That inventory is DISCOVERED, not registered: Firewall Manager holds no copy
+//! of the organisation's resources, so it is read from the stores of the
+//! emulated services that OWN each kind of resource through the one shared
+//! engine — a VPC from Amazon EC2's store, a firewall from Network Firewall's,
+//! and so on for every type [`crate::state::DISCOVERABLE_RESOURCE_TYPES`]
+//! names. A resource created through one of those services is therefore
+//! discoverable with no propagation step, and one deleted there stops being
+//! discovered. An account that owns nothing, and a resource type no emulated
+//! service holds, both answer an EMPTY `Items`: the honest answer, never an
+//! invented resource.
 //!
 //! ## Shape of an operation
 //!
@@ -186,9 +194,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx.parts());
-        let store = state.lock();
-        // The authorization gate, BEFORE the request's members are examined.
-        crate::state::require_administrator(&store, &region)?;
+        {
+            // The authorization gate, BEFORE the request's members are examined.
+            // Its guard is released as soon as it has answered: the inventory is
+            // read from OTHER services' stores, and this service holds no lock of
+            // its own while it does that (see
+            // `crate::state::discovered_resources`).
+            let store = state.lock();
+            crate::state::require_administrator(&store, &region)?;
+        }
 
         // "Only one account is supported per request" — `MemberAccountIds`' own
         // documentation. The modelled list carries no length constraint, so the
@@ -225,16 +239,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        // The inventory is keyed by resource URI, so the page boundary is a key
-        // in a total order: resume at the first URI at or after the token's.
+        // What the services that own this resource type hold for this account in
+        // this Region, keyed by resource URI — so the page boundary is a key in a
+        // total order: resume at the first URI at or after the token's.
+        let inventory = crate::state::discovered_resources(
+            &*self.engine,
+            &region,
+            account,
+            &input.resource_type,
+        );
         let lower = start.unwrap_or_default();
-        let mut remaining = store
-            .discovered_resources
-            .range(lower..)
-            .filter(|(_, resource)| {
-                resource.account_id.as_deref() == Some(account.as_str())
-                    && resource.r#type.as_deref() == Some(input.resource_type.as_str())
-            });
+        let mut remaining = inventory.range(lower..);
 
         // Bounded whether or not the caller asked for a bound, and clamped rather
         // than only capped, for the reasons `ListPolicies` states.

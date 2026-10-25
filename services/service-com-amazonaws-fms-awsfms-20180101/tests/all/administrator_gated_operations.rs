@@ -23,16 +23,16 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
-use service_com_amazonaws_fms_awsfms_20180101::ops::types::{
-    App, AppsListData, DiscoveredResource, ProtocolsListData,
-};
+use service_com_amazonaws_fms_awsfms_20180101::ops::types::{App, AppsListData, ProtocolsListData};
 use service_com_amazonaws_fms_awsfms_20180101::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 // The wire harness lives in one place for this test target: `policy_lifecycle`
 // owns it, `member_accounts` reuses it, and so does this suite — so the two
 // cannot drift in how a request is signed or an error envelope is read.
-use crate::policy_lifecycle::{call, call_in, emulator_with_engine, error_code, ACCOUNT, REGION};
+use crate::policy_lifecycle::{
+    call, call_in, emulator, emulator_with_engine, error_code, ACCOUNT, REGION,
+};
 
 /// A second Region, to assert the gate's answer does not depend on which Region
 /// the request addresses.
@@ -1265,141 +1265,20 @@ async fn the_lists_are_read_and_deleted_from_state() {
     });
 }
 
-/// `ListDiscoveredResources` reports the organisation's inventory filtered by the
-/// member account and the resource type asked for, in bounded pages; with
-/// nothing discovered it reports an empty list, never an invented resource.
+/// `ListDiscoveredResources` refuses a request it cannot serve: a
+/// `MemberAccountIds` that does not name exactly one account, and a `NextToken`
+/// this service did not mint.
+///
+/// WHAT the inventory reports, and that it is read from the stores of the
+/// services that own the organisation's resources, is the subject of the
+/// `discovered_resources` suite.
 #[tokio::test]
-async fn list_discovered_resources_filters_and_pages_the_inventory() {
-    let (router, engine) = emulator_with_engine();
+async fn list_discovered_resources_refuses_what_it_cannot_serve() {
+    let router = emulator();
     associate_admin(&router).await;
 
-    // Nothing has been discovered: an empty page, and no token to follow.
-    let (status, body) = call(
-        &router,
-        "ListDiscoveredResources",
-        &json!({ "MemberAccountIds": [ACCOUNT], "ResourceType": "AWS::EC2::Instance" }),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "expected ListDiscoveredResources to answer 200, got {status} with {body}"
-    );
-    assert_eq!(
-        body["Items"],
-        json!([]),
-        "an empty inventory must report no items, got {body}"
-    );
-    assert!(
-        body["NextToken"].is_null(),
-        "an empty page carries no NextToken, got {body}"
-    );
-
-    // Seeded inventory: two accounts, two resource types, so each filter has
-    // something to exclude.
+    // A second account id, so the one-account rule has a second value to send.
     let member = "222233334444";
-    let seeded = [
-        (ACCOUNT, "AWS::EC2::Instance", "i-000000000000000a"),
-        (ACCOUNT, "AWS::EC2::Instance", "i-000000000000000b"),
-        (ACCOUNT, "AWS::EC2::Instance", "i-000000000000000c"),
-        (ACCOUNT, "AWS::EC2::VPC", "vpc-00000000000000aa"),
-        (member, "AWS::EC2::Instance", "i-000000000000000d"),
-    ];
-    with_store(&engine, |store| {
-        for (account, resource_type, name) in &seeded {
-            let prefix = if *resource_type == "AWS::EC2::VPC" {
-                "vpc"
-            } else {
-                "instance"
-            };
-            let uri = format!("arn:aws:ec2:{REGION}:{account}:{prefix}/{name}");
-            store.discovered_resources.insert(
-                uri.clone(),
-                DiscoveredResource {
-                    uri: Some(uri),
-                    account_id: Some((*account).to_string()),
-                    r#type: Some((*resource_type).to_string()),
-                    name: Some((*name).to_string()),
-                },
-            );
-        }
-    });
-
-    // Each (account, type) pair reports exactly the seeded resources that match.
-    for (account, resource_type) in [
-        (ACCOUNT, "AWS::EC2::Instance"),
-        (ACCOUNT, "AWS::EC2::VPC"),
-        (member, "AWS::EC2::Instance"),
-        (member, "AWS::EC2::VPC"),
-    ] {
-        let expected = seeded
-            .iter()
-            .filter(|(seeded_account, seeded_type, _)| {
-                *seeded_account == account && *seeded_type == resource_type
-            })
-            .count();
-        let (status, body) = call(
-            &router,
-            "ListDiscoveredResources",
-            &json!({ "MemberAccountIds": [account], "ResourceType": resource_type }),
-        )
-        .await;
-        let items = body["Items"].as_array().cloned().unwrap_or_default();
-        assert_eq!(
-            (status, items.len()),
-            (200, expected),
-            "case {account}/{resource_type}: expected {expected} items, got {status} with {body}"
-        );
-        for item in &items {
-            assert_eq!(
-                (item["AccountId"].as_str(), item["Type"].as_str()),
-                (Some(account), Some(resource_type)),
-                "case {account}/{resource_type}: an item outside the filter was reported: {item}"
-            );
-        }
-    }
-
-    // `MaxResults` bounds the page, and the token walks the rest exactly once.
-    let mut seen: Vec<String> = Vec::new();
-    let mut token: Option<String> = None;
-    for page in 0..4 {
-        let mut request = json!({
-            "MemberAccountIds": [ACCOUNT],
-            "ResourceType": "AWS::EC2::Instance",
-            "MaxResults": 1,
-        });
-        if let Some(token) = token.as_deref() {
-            request["NextToken"] = json!(token);
-        }
-        let (status, body) = call(&router, "ListDiscoveredResources", &request).await;
-        let items = body["Items"].as_array().cloned().unwrap_or_default();
-        assert_eq!(
-            (status, items.len()),
-            (200, 1),
-            "page {page}: expected a one-item page, got {status} with {body}"
-        );
-        seen.push(items[0]["URI"].as_str().unwrap_or_default().to_string());
-        token = body["NextToken"].as_str().map(str::to_string);
-        if token.is_none() {
-            break;
-        }
-    }
-    assert_eq!(
-        seen.len(),
-        3,
-        "paging must report each of this account's instances once, got {seen:?}"
-    );
-    assert!(
-        token.is_none(),
-        "the last page must carry no NextToken, got {token:?}"
-    );
-    let mut unique = seen.clone();
-    unique.sort();
-    unique.dedup();
-    assert_eq!(
-        unique.len(),
-        seen.len(),
-        "paging must not repeat a resource, got {seen:?}"
-    );
 
     // A token this service did not mint, and more than one account, are refused.
     let (status, body) = call(

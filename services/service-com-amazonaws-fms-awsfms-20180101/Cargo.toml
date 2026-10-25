@@ -25,6 +25,24 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Hex-encodes those identifiers and the opaque ListPolicies pagination token.
 hex = { workspace = true }
+# The stores of the services that OWN the organisation's resources:
+# `ListDiscoveredResources` DISCOVERS the inventory it reports from them through
+# the shared engine (`state::discovered_resources`) rather than keeping a second
+# copy of a resource here, so a VPC, firewall, load balancer, distribution or
+# stage created over those services' own APIs is discoverable and associable with
+# no propagation step. One crate per resource type the catalogue
+# (`state::DISCOVERABLE_RESOURCE_TYPES`) covers.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
+service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7 = { workspace = true }
+service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10 = { workspace = true }
+service-com-amazonaws-cloudfront-cloudfront2020-05-31 = { workspace = true }
+service-com-amazonaws-apigateway-backplanecontrolservice = { workspace = true }
+service-com-amazonaws-networkfirewall-networkfirewall-20201112 = { workspace = true }
+
+[dev-dependencies]
+# Percent-encodes the form values the ec2Query / awsQuery test calls carry,
+# instead of hand-writing that encoder in the test suite.
+percent-encoding = "2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -15,10 +15,10 @@
 //! association's account id and the policy's own `SecurityServiceType`; a
 //! policy of any other type is refused, and nothing is written.
 //!
-//! The attack inventory the operation reports is seeded through the store (as
-//! the `ListDiscoveredResources` suite seeds its inventory): Shield Advanced
-//! detects attacks and this emulator stands in for no attack detector, so the
-//! only honest source of an attack is one somebody put in the store.
+//! The attack inventory the operation reports is seeded through the store:
+//! Shield Advanced detects attacks and this emulator stands in for no attack
+//! detector, so the only honest source of an attack is one somebody put in the
+//! store.
 //!
 //! The tables below are the class the rule ranges over: the attack rows differ
 //! in account, in start instant (including two within the same second), in
