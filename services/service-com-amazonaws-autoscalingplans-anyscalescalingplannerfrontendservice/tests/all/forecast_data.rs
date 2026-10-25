@@ -70,7 +70,9 @@ const STORED_PLAN: &str = "forecast plan";
 const ABSENT_PLAN: &str = "no such plan";
 
 /// The only scaling-plan version the model documents as valid.
-const ONLY_VERSION: i64 = 1;
+///
+/// `pub(crate)` so a suite driving the same operation names the same version.
+pub(crate) const ONLY_VERSION: i64 = 1;
 
 /// How far from a documented bound a row is placed when the verdict depends on the
 /// SERVING clock: the service reads its own `now` a few milliseconds after this test
@@ -96,7 +98,7 @@ const ASG_RESOURCE: Resource<'static> = (
 /// `TimestampType` is carried as epoch SECONDS and a caller may send either a whole count
 /// (`i64`) or a fractional one (`f64`): both reach the same handler, so both are driven
 /// through this one request builder.
-fn forecast_request<T: Into<Value>>(
+pub(crate) fn forecast_request<T: Into<Value>>(
     plan: &str,
     version: i64,
     resource: Resource<'_>,
@@ -119,7 +121,10 @@ fn forecast_request<T: Into<Value>>(
 }
 
 /// A forecast request for the Auto Scaling group resource, over `[start, end)`.
-fn asg_request<T: Into<Value>>(
+///
+/// `pub(crate)` so every suite driving this operation builds its request here rather
+/// than beside this one.
+pub(crate) fn asg_request<T: Into<Value>>(
     plan: &str,
     version: i64,
     data_type: &str,
@@ -150,7 +155,9 @@ async fn with_stored_plan() -> Emulator {
 /// Asserted in two parts, because they are two different claims: the member is PRESENT
 /// and carries the modelled list shape (an array), and separately — at each call site —
 /// how many data points that list holds.
-fn datapoints(body: &Value) -> &Vec<Value> {
+///
+/// `pub(crate)` so every suite reads the member the same way.
+pub(crate) fn datapoints(body: &Value) -> &Vec<Value> {
     assert!(
         !body["Datapoints"].is_null(),
         "the required Datapoints member must be present, got {body}"
@@ -181,7 +188,7 @@ enum Verdict {
 /// Every width row below places its two endpoints at a KNOWN offset inside an hour, so a
 /// row that used to be accepted only because both endpoints fell in hour-aligned periods
 /// seven days apart is exercised whatever time the test happens to run at.
-fn current_hour_start() -> i64 {
+pub(crate) fn current_hour_start() -> i64 {
     now_secs().div_euclid(HOUR) * HOUR
 }
 
@@ -448,11 +455,16 @@ async fn a_start_further_back_than_the_documented_span_is_refused() {
 }
 
 /// Milliseconds in a second, for the rows that place a window endpoint INSIDE a second.
-const MILLIS_PER_SECOND: i64 = 1_000;
+///
+/// `pub(crate)` so every suite placing an endpoint inside a second measures it the same
+/// way.
+pub(crate) const MILLIS_PER_SECOND: i64 = 1_000;
 
 /// `millis` since the epoch as the fractional epoch seconds an `awsJson1_1` timestamp is
 /// carried as: the finest precision a caller can ask a window with over this protocol.
-fn epoch_seconds(millis: i64) -> f64 {
+///
+/// `pub(crate)` for the same reason: one owner for the sub-second conversion.
+pub(crate) fn epoch_seconds(millis: i64) -> f64 {
     millis as f64 / MILLIS_PER_SECOND as f64
 }
 

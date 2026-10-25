@@ -19,6 +19,10 @@
 // else appends to.
 #[path = "all/kinesisvideo_signing_name_routing.rs"]
 mod kinesisvideo_signing_name_routing;
+// Declared beside the entry above, at the head, for the same reason: the appended tail
+// and the sorted `s…` span are both regions concurrent suites land in.
+#[path = "all/ses_family_signing_name_routing.rs"]
+mod ses_family_signing_name_routing;
 // At the head for the same reason, and moved here out of the `c…` span of the sorted
 // list: that span is where the cloudformation/cloudtrail suites land, so a line beside
 // them lost repeated squash merges to branches that touched it in the same window.

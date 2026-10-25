@@ -91,6 +91,8 @@ mod role_tag_removal;
 mod role_tags;
 #[path = "all/role_trust_policy.rs"]
 mod role_trust_policy;
+#[path = "all/saml_provider_deletion.rs"]
+mod saml_provider_deletion;
 #[path = "all/saml_provider_listing.rs"]
 mod saml_provider_listing;
 #[path = "all/saml_provider_tag_updates.rs"]

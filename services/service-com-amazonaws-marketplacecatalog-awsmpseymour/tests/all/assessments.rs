@@ -617,7 +617,8 @@ async fn an_unknown_id_is_a_client_refusal_with_no_side_effect() {
     }
 
     // Nothing above created, cancelled or minted anything: the one stored change set is
-    // still the only one, still readable, and the catalog still holds no assessment.
+    // still the only one, still readable, and the catalog still holds no assessment —
+    // the fixture change set submitted no delivery option for a framework to evaluate.
     let listed = call(
         &router,
         "POST",
@@ -660,18 +661,20 @@ async fn an_unknown_id_is_a_client_refusal_with_no_side_effect() {
     assert_eq!(
         assessments.body.pointer("/AssessmentSummaryList"),
         Some(&json!([])),
-        "no call above creates an assessment, so the list stays empty, got {:?}",
+        "no call above submits a delivery option to a framework, so the list stays \
+         empty, got {:?}",
         assessments.body
     );
 }
 
 /// An emulator whose store already holds `records`.
 ///
-/// An assessment is the RESULT of a framework evaluation, which no operation of this
-/// service performs and this emulator runs none of, so there is no API that creates
-/// one: a test that needs assessments to read seeds the store directly, the way
-/// `service-com-amazonaws-marketplaceentitlementservice-…`'s own suite seeds its
-/// entitlements. Everything asserted after that goes through the router.
+/// An assessment is the RESULT of a framework evaluation, which a change set submits a
+/// product's delivery options to (`assessment_production.rs` drives that path end to
+/// end). The record-level rules below are about reporting a record whatever it holds —
+/// a framework, a target or a delivery option this catalog's own evaluation would never
+/// pair — so they seed the store directly. Everything asserted after that goes through
+/// the router.
 fn emulator_holding(records: Vec<AssessmentRecord>) -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     {

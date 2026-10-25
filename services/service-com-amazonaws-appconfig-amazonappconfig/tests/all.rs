@@ -95,3 +95,5 @@ mod update_experiment_run;
 mod update_extension;
 #[path = "all/update_extension_association.rs"]
 mod update_extension_association;
+#[path = "all/update_extension_visibility.rs"]
+mod update_extension_visibility;

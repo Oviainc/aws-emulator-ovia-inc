@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateContact
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateContact`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateContact::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds a contact to the stored contact list the request names, with the topic
+//! preferences and attribute data it carried. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +68,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::ContactRecord;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -146,18 +141,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateContact` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateContactErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateContact"))
+        // Request metadata is not needed: the contact is keyed by its list and address
+        // within the one emulated account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the scaffold's
+            // 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateContact without the shared emulator state",
+            ));
+        };
+
+        let list_name = input.contact_list_name;
+        let address = input.email_address;
+        // The same key an email identity is stored under: the domain of an address is
+        // compared without regard to case, its local part exactly as supplied.
+        let key = crate::state::identity_key(&address);
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        let Some(list) = store.contact_lists.get_mut(&list_name) else {
+            return Err(CreateContactErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::contact_list_not_found(&list_name)),
+            })
+            .into());
+        };
+        if list.contacts.contains_key(&key) {
+            return Err(CreateContactErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(format!(
+                        "Contact with email address: {address} already exists in list: \
+                         {list_name}."
+                    )),
+                },
+            )
+            .into());
+        }
+        // One record is stored per accepted contact, so the list is capped: see
+        // `MAX_CONTACTS_PER_LIST` for why the bound exists. `CreateContact` binds no
+        // `LimitExceededException`, so the bound is reported with the terminal input
+        // error it does bind, naming the limit it is past.
+        if list.contacts.len() >= crate::state::MAX_CONTACTS_PER_LIST {
+            return Err(CreateContactErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "List with name: {list_name} already holds the maximum of {} contacts.",
+                    crate::state::MAX_CONTACTS_PER_LIST
+                )),
+            })
+            .into());
+        }
+        // "The contact's preferences for being opted-in to or opted-out of topics": a
+        // preference can only be stated for a topic the list publishes, since that is
+        // what a topic name names.
+        let preferences = input.topic_preferences.unwrap_or_default();
+        if let Some(unknown) = preferences
+            .iter()
+            .find(|preference| !list.publishes_topic(&preference.topic_name))
+        {
+            let topic_name = &unknown.topic_name;
+            return Err(CreateContactErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "Topic with name: {topic_name} doesn't exist in list: {list_name}."
+                )),
+            })
+            .into());
+        }
+
+        let mut record = ContactRecord::new(&address, now);
+        record.topic_preferences = preferences;
+        record.unsubscribe_all = input.unsubscribe_all;
+        record.attributes_data = input.attributes_data;
+        list.contacts.insert(key, record);
+        // The list itself now holds one more contact, which is a change to the list.
+        list.last_updated_at = now;
+
+        // `CreateContactResponse` carries no members: the stored contact is read back
+        // with `GetContact`.
+        Ok(CreateContactOutput {})
     }
 }

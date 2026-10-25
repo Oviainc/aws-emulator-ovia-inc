@@ -5128,6 +5128,13 @@ pub const RESOURCE_TYPE_IDLE: &str = "Idle";
 /// catalog row carries.
 pub const RESOURCE_TYPE_LICENSE: &str = "License";
 
+/// The `ResourceType` a Lambda function export job carries, which
+/// `ExportLambdaFunctionRecommendations` exports recommendations for
+/// (`crate::ops::types::RESOURCE_TYPE_VALUES`). The `ResourceType` domain, not the
+/// `RecommendationSourceType` one of the same spelling ([`SOURCE_TYPE_LAMBDA_FUNCTION`]) a
+/// findings catalog row carries.
+pub const RESOURCE_TYPE_LAMBDA_FUNCTION: &str = "LambdaFunction";
+
 /// How long each step of an export job's lifecycle takes: a created job stays `Queued` for
 /// this long, then runs `InProgress` for this long, then is `Complete`.
 ///

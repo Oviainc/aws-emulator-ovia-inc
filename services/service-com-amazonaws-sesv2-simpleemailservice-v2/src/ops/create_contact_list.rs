@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateContactList
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateContactList`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateContactList::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores a contact list under the name the request names, with the topics, description
+//! and tags it carried. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -71,6 +64,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::ContactListRecord;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -143,18 +137,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateContactList` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateContactListErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateContactList"))
+        // Request metadata is not needed: the list is keyed by name within the one
+        // emulated account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to write to. That is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateContactList without the shared emulator state",
+            ));
+        };
+
+        let name = input.contact_list_name;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        if store.contact_lists.contains_key(&name) {
+            return Err(CreateContactListErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(format!("List with name: {name} already exists.")),
+                },
+            )
+            .into());
+        }
+
+        if store.contact_lists.len() >= crate::state::MAX_CONTACT_LISTS {
+            return Err(CreateContactListErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The account already holds the maximum of {} contact lists.",
+                        crate::state::MAX_CONTACT_LISTS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut record = ContactListRecord::new(&name, now);
+        // "An interest group, theme, or label within a list. A contact list can have
+        // multiple topics." Kept in the order supplied: `Topics` is a list, so a
+        // contact's default preferences are reported in the order the list declares.
+        record.topics = input.topics.unwrap_or_default();
+        record.description = input.description;
+        record.tags = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+        store.contact_lists.insert(name, record);
+
+        // `CreateContactListResponse` carries no members: the stored list is read back
+        // with `GetContactList`.
+        Ok(CreateContactListOutput {})
     }
 }

@@ -45,6 +45,18 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// This service's endpoint prefix, as its model gives it
+/// (`smithy_query(query="service_info")`: `awsService.endpointPrefix` `mail-manager`) —
+/// the name a host-addressed request resolves to, beside the SigV4 signing name (`ses`)
+/// the generated identity carries.
+pub const ENDPOINT_PREFIX: &str = "mail-manager";
+
+/// This service's Smithy shape id, whose LOCAL name (`MailManagerSvc`) is what an
+/// `awsJson1_0` `X-Amz-Target` prefix and an `rpcv2Cbor` URI name it by
+/// (`smithy_query(query="service_info")`: service `MailManagerSvc`, protocols
+/// `awsJson1_0` and `rpcv2Cbor`).
+const SERVICE_SHAPE_ID: &str = "com.amazonaws.mailmanager#MailManagerSvc";
+
 /// The `com-amazonaws-mailmanager-mailmanagersvc` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,13 +86,31 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service signs as `ses` — a signing name it SHARES with three other
+        // emulated services: SES v1 (`awsQuery`, endpoint `email`), SESv2 and Pinpoint
+        // Email (`restJson1`, endpoint `email`). The router resolves a request's routing
+        // key from the SigV4 credential scope first, so all four see the SAME key, and
+        // claiming on the signing name alone makes all four claim every request — which
+        // the router answers `500 AmbiguousService` for, a code no AWS model carries.
+        //
+        // This is the RPC member of that family, and its path space is its protocols'
+        // own (`POST /` for `awsJson1_0`, `/service/…` for `rpcv2Cbor`) — which SES v1
+        // posts to as well — so a path test alone cannot tell the two apart. The shared
+        // claim rule is therefore applied with this service's shape id: a request
+        // addressed in an RPC form is claimed only when that form NAMES this service,
+        // and one addressed in no RPC form at all is left to the peer whose URI space it
+        // addresses. The routing key may name either of the two names this one endpoint
+        // answers on.
+        [self.entry.identity().signing_name(), ENDPOINT_PREFIX]
+            .iter()
+            .any(|route_key| {
+                service_common::claims_request(
+                    parts,
+                    route_key,
+                    crate::ROUTE_PATH_SEGMENTS,
+                    Some(SERVICE_SHAPE_ID),
+                )
+            })
     }
 
     fn override_operation(

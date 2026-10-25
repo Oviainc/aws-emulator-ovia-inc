@@ -17,6 +17,8 @@ mod anomaly_feedback;
 mod findings_report_account_summary;
 #[path = "all/findings_reports_listing.rs"]
 mod findings_reports_listing;
+#[path = "all/interval_resolution.rs"]
+mod interval_resolution;
 #[path = "all/interval_validation.rs"]
 mod interval_validation;
 #[path = "all/not_found_surfaces.rs"]

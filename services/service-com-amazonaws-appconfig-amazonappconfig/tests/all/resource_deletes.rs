@@ -143,8 +143,9 @@ async fn get_extension(
 
 /// `DELETE /extensions/{ExtensionIdentifier}[?version=..]` — `DeleteExtension` binds its
 /// version to the `version` query parameter, not to `GetExtension`'s `version_number`
-/// (`smithy_query(query="operation",operation="DeleteExtension")`).
-async fn delete_extension(
+/// (`smithy_query(query="operation",operation="DeleteExtension")`). `pub(crate)` because
+/// more than one suite deletes an extension version through the same front door.
+pub(crate) async fn delete_extension(
     router: &MultiServiceRouter,
     identifier: &str,
     version_number: Option<i32>,

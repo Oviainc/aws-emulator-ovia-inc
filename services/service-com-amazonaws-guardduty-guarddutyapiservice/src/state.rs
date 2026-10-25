@@ -1638,9 +1638,14 @@ pub const RELATIONSHIP_REMOVED: &str = "Removed";
 /// [`RELATIONSHIP_CREATED`] for where the values come from.
 pub const RELATIONSHIP_INVITED: &str = "Invited";
 
+/// The relationship status of a member account that is being MONITORED:
 /// `Master.RelationshipStatus` once the member account has accepted the
-/// invitation and is being monitored. See [`RELATIONSHIP_CREATED`] for where the
-/// values come from.
+/// invitation, and `Member.RelationshipStatus` once `StartMonitoringMembers` has
+/// turned monitoring back on for an account `StopMonitoringMembers` had stopped —
+/// "use this operation to restart monitoring of accounts that you stopped
+/// monitoring with the StopMonitoringMembers operation"
+/// (`smithy_query(query="doc",shape="StartMonitoringMembers")`). See
+/// [`RELATIONSHIP_CREATED`] for where the values come from.
 pub const RELATIONSHIP_ENABLED: &str = "Enabled";
 
 /// `Member.RelationshipStatus` for a member account the administrator has stopped
@@ -2318,8 +2323,10 @@ pub struct MemberRecord {
     /// `Member.RelationshipStatus`: [`RELATIONSHIP_CREATED`],
     /// [`RELATIONSHIP_INVITED`] once `InviteMembers` has sent the account an
     /// invitation, [`RELATIONSHIP_DISABLED`] once `StopMonitoringMembers` has
-    /// stopped monitoring the account, or [`RELATIONSHIP_REMOVED`] once
-    /// `DisassociateMembers` has ended the association.
+    /// stopped monitoring the account, [`RELATIONSHIP_ENABLED`] once
+    /// `StartMonitoringMembers` has turned monitoring back on for it, or
+    /// [`RELATIONSHIP_REMOVED`] once `DisassociateMembers` has ended the
+    /// association.
     pub relationship_status: String,
     /// When the invitation `InviteMembers` sent this account was sent, in epoch
     /// milliseconds — the member's `InvitedAt`, "the timestamp when the invitation
