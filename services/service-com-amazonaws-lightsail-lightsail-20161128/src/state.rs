@@ -29,7 +29,9 @@
 //! Region's **Lightsail VPC** with the account's default VPC there, the
 //! temporary **container image registry log in** credentials
 //! `CreateContainerServiceRegistryLogin` hands out for the account's container
-//! image registry, the append-only **operation log** every mutating
+//! image registry, the **contact method** (the email address or mobile phone
+//! number the account's notifications are sent to, one per protocol per
+//! Region), the append-only **operation log** every mutating
 //! call writes, and the service's static **Region catalog** — the Regions and
 //! Availability Zones `GetRegions` lists and every other operation validates a
 //! location against. Everything mutable in this module is reached through
@@ -664,6 +666,8 @@ pub const OPERATION_TYPE_ATTACH_CERTIFICATE_TO_DISTRIBUTION: &str =
 pub const OPERATION_TYPE_CREATE_CONTACT_METHOD: &str = "CreateContactMethod";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DELETE_CONTACT_METHOD: &str = "DeleteContactMethod";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_SEND_CONTACT_METHOD_VERIFICATION: &str = "SendContactMethodVerification";
 /// The `operationType` the log entry of a change to a zone's recordsets carries.
 ///
 /// The modelled `OperationType` enum has `UpdateDomainEntry` and
@@ -10416,6 +10420,21 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// The alarm `name` names, for a reporting operation.
     pub fn alarm(&self, name: &str) -> Option<&StoredAlarm> {
         self.alarms.get(name)
+    }
+
+    /// The contact method `protocol` addresses in `region`, for an operation the
+    /// spec says mutates it — sending it a fresh verification request.
+    ///
+    /// The `(region, protocol)` pair is this record's store key, so neither may
+    /// be reassigned through this handle; a contact method never changes protocol
+    /// or Region.
+    pub fn contact_method_mut(
+        &mut self,
+        region: &str,
+        protocol: &str,
+    ) -> Option<&mut StoredContactMethod> {
+        self.contact_methods
+            .get_mut(&(region.to_string(), protocol.to_string()))
     }
 
     /// Store the alarm `PutAlarm` just created or re-configured.

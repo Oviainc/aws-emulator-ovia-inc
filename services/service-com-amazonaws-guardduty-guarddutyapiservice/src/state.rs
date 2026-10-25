@@ -16,6 +16,10 @@
 //! sorting). Each operation builds its own modelled output in its own
 //! `src/ops/<op>.rs`.
 
+/// The Runtime Monitoring coverage of the account's compute resources, which more than
+/// one operation reports on.
+pub mod coverage;
+
 use std::collections::{BTreeMap, HashMap};
 
 /// Per-service state for com-amazonaws-guardduty-guarddutyapiservice. A handler reaches it through [`service_state`].

@@ -87,6 +87,8 @@ mod merge_branches_fast_forward;
 mod merge_branches_squash;
 #[path = "all/merge_options.rs"]
 mod merge_options;
+#[path = "all/merge_pull_request_three_way.rs"]
+mod merge_pull_request_three_way;
 #[path = "all/object_store_bounds.rs"]
 mod object_store_bounds;
 #[path = "all/path_depth_bound.rs"]

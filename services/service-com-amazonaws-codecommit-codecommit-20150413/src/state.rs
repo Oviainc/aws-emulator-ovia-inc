@@ -69,6 +69,7 @@ pub const MAX_COMMENTS_PER_REPOSITORY: usize = 1_000;
 /// doc on `PullRequest.pullRequestStatus` states the only transition: "Pull
 /// request status can only change from OPEN to CLOSED."
 pub const PULL_REQUEST_STATUS_OPEN: &str = "OPEN";
+pub const PULL_REQUEST_STATUS_CLOSED: &str = "CLOSED";
 
 /// How many OPEN pull requests one repository holds before `CreatePullRequest`
 /// refuses the write with the modelled
@@ -2533,6 +2534,24 @@ pub const CANNOT_DELETE_APPROVAL_RULE_FROM_TEMPLATE_MESSAGE: &str =
 /// pull request that is no longer open.
 pub const PULL_REQUEST_ALREADY_CLOSED_MESSAGE: &str =
     "The pull request status cannot be updated because it is already closed.";
+
+/// `TipOfSourceReferenceIsDifferentException`'s message: the sentences the model
+/// documents for the shape, echoing nothing from the request. Worded here once
+/// for every operation that merges a pull request whose source reference no
+/// longer holds the tip the request was made against.
+pub const TIP_OF_SOURCE_REFERENCE_IS_DIFFERENT_MESSAGE: &str =
+    "The tip of the source branch in the destination repository does not match the tip of the \
+     source branch specified in your request. The pull request might have been updated. Make sure \
+     that you have the latest changes.";
+
+/// `ConcurrentReferenceUpdateException`'s message: the sentences the model
+/// documents for the shape, echoing nothing from the request — what a merge
+/// answers when the branch it would be applied to is no longer the reference the
+/// merge was evaluated for.
+pub const CONCURRENT_REFERENCE_UPDATE_MESSAGE: &str =
+    "The merge cannot be completed because the target branch has been modified. Another user might \
+     have modified the target branch while the merge was in progress. Wait a few minutes, and then \
+     try again.";
 
 /// Does an approval rule template's content apply to a pull request whose
 /// destination is this fully qualified reference?
