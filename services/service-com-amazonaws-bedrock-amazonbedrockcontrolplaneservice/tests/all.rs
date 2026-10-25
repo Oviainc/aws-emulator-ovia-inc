@@ -39,6 +39,8 @@ mod imported_models;
 mod inference_profiles;
 #[path = "all/marketplace_model_endpoints.rs"]
 mod marketplace_model_endpoints;
+#[path = "all/model_customization_jobs.rs"]
+mod model_customization_jobs;
 #[path = "all/model_import_jobs.rs"]
 mod model_import_jobs;
 #[path = "all/model_invocation_logging.rs"]
