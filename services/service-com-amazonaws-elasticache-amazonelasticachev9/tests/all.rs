@@ -150,3 +150,9 @@ mod reset_cache_parameter_group;
 // owns.
 #[path = "all/delete_user_built_in_user.rs"]
 mod delete_user_built_in_user;
+
+// Appended for the same reason: the refusal-wording suite (the identifier form of a
+// parameter-group name, the parameters a customer may not change, the tag rules and a
+// user-group id already taken).
+#[path = "all/refusal_message_fidelity.rs"]
+mod refusal_message_fidelity;
