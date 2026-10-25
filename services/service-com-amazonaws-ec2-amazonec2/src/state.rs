@@ -1220,6 +1220,8 @@ pub const SUPPORTED_INSTANCE_FILTERS: &[&str] = &[
     "owner-id",
     "private-dns-name",
     "private-ip-address",
+    "product-code",
+    "product-code.type",
     "reservation-id",
     "spot-instance-request-id",
     "subnet-id",
@@ -5129,6 +5131,49 @@ impl ComAmazonawsEc2Amazonec2State {
         )
     }
 
+    /// The product codes one instance carries: "the product codes attached to this
+    /// instance, if applicable" (`Instance$ProductCodes`).
+    ///
+    /// A product code reaches an instance through the AMI it was launched from — "the
+    /// product code associated with the AMI used to launch the instance" is what the
+    /// `product-code` filter selects on (`DescribeInstancesRequest$Filters`) — so they
+    /// are read off that image's "any product codes associated with the AMI"
+    /// (`Image$ProductCodes`) rather than copied onto the instance record, where the two
+    /// could disagree. An instance whose image this store no longer holds carries none.
+    pub fn instance_product_codes(&self, instance: &InstanceRecord) -> Vec<ProductCode> {
+        instance
+            .image_id
+            .as_ref()
+            .and_then(|image_id| self.images.get(image_id))
+            .and_then(|image| image.product_codes.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether the account `account_id` OWNS the product code `product_code`.
+    ///
+    /// No EC2 operation mints a product code: a code belongs to the seller whose PAID
+    /// resource carries it, so the codes this service knows are exactly those on the
+    /// images and Amazon FPGA Images it stores (`Image$ProductCodes`,
+    /// `FpgaImage$ProductCodes`), each owned by that resource's own owner
+    /// (`Image$OwnerId`, `FpgaImage$OwnerId`). An account owns a code when any resource
+    /// OF ITS OWN carries it, and owns none of the codes that reach it only through
+    /// another account's resources.
+    pub fn account_owns_product_code(&self, product_code: &str, account_id: &str) -> bool {
+        let carries = |codes: Option<&Vec<ProductCode>>| {
+            codes.is_some_and(|codes| {
+                codes
+                    .iter()
+                    .any(|code| code.product_code_id.as_deref() == Some(product_code))
+            })
+        };
+        self.images.values().any(|image| {
+            image.owner_id.as_deref() == Some(account_id) && carries(image.product_codes.as_ref())
+        }) || self.fpga_images.values().any(|record| {
+            record.view.owner_id.as_deref() == Some(account_id)
+                && carries(record.view.product_codes.as_ref())
+        })
+    }
+
     /// The modelled `Instance` for one stored instance.
     pub fn instance_view(&self, instance: &InstanceRecord) -> Instance {
         Instance {
@@ -5186,6 +5231,14 @@ impl ComAmazonawsEc2Amazonec2State {
                     .collect(),
             ),
             client_token: instance.client_token.clone(),
+            // "The product codes attached to this instance, IF APPLICABLE"
+            // (`Instance$ProductCodes`): the codes of the AMI it was launched from, so an
+            // instance report and `ConfirmProductInstance` cannot disagree about one
+            // instance — and absent, rather than an empty set, for an instance launched
+            // from an AMI nobody sells, which has no product code for the member to
+            // apply to.
+            product_codes: Some(self.instance_product_codes(instance))
+                .filter(|codes| !codes.is_empty()),
             tags: Some(tag_list(&instance.tags)),
             // "spot - the instance is a Spot Instance" (`Instance$InstanceLifecycle`) is
             // reported only for an instance a Spot Instance request launched; an
@@ -5291,6 +5344,21 @@ impl ComAmazonawsEc2Amazonec2State {
                     .then(|| instance.private_dns_name.clone()),
             ),
             "private-ip-address" => single(Some(instance.private_ip.clone())),
+            // "The product code associated with the AMI used to launch the instance",
+            // and "the type of product code (devpay | marketplace)" — both read off the
+            // same projection the instance report carries.
+            "product-code" => Some(
+                self.instance_product_codes(instance)
+                    .into_iter()
+                    .filter_map(|code| code.product_code_id)
+                    .collect(),
+            ),
+            "product-code.type" => Some(
+                self.instance_product_codes(instance)
+                    .into_iter()
+                    .filter_map(|code| code.product_code_type)
+                    .collect(),
+            ),
             "reservation-id" => single(Some(instance.reservation_id.clone())),
             "subnet-id" => single(instance.subnet_id.clone()),
             "tag-key" => Some(instance.tags.keys().cloned().collect()),
@@ -5558,17 +5626,25 @@ pub fn require_known_instance<E>(
     store: &ComAmazonawsEc2Amazonec2State,
     instance_id: &str,
 ) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    require_instance_record(store, instance_id).map(|_| ())
+}
+
+/// The stored instance `instance_id` names, refusing an id this service cannot resolve
+/// exactly as [`require_known_instance`] does — the ONE reading of those two refusals,
+/// for a caller that needs the record it resolved and not only the fact that it
+/// resolves, so no handler has to look the same id up twice.
+pub fn require_instance_record<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    instance_id: &str,
+) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
     if !instance_id_is_well_formed(instance_id) {
         return Err(crate::scaffolded::Scaffolded::invalid_instance_id_malformed(
             instance_id,
         ));
     }
-    if !store.instances.contains_key(instance_id) {
-        return Err(crate::scaffolded::Scaffolded::invalid_instance_id_not_found(
-            instance_id,
-        ));
-    }
-    Ok(())
+    store.instances.get(instance_id).ok_or_else(|| {
+        crate::scaffolded::Scaffolded::invalid_instance_id_not_found(instance_id)
+    })
 }
 
 /// `ids` in request order with repeats dropped.
@@ -11700,6 +11776,10 @@ pub struct ImageSpec {
     /// "The date and time to deprecate the AMI" (`Image$DeprecationTime`), for an image
     /// that carries one.
     pub deprecation_time: Option<String>,
+    /// "Any product codes associated with the AMI" (`Image$ProductCodes`): the
+    /// Marketplace or DevPay codes a PAID image carries, each with its
+    /// `ProductCodeValues` type. Empty for an image nobody sells.
+    pub product_codes: Vec<ProductCode>,
     /// "Indicates whether the image is eligible for Amazon Web Services Free Tier".
     pub free_tier_eligible: bool,
     /// "The name of the public Systems Manager parameter that resolves to this AMI",
@@ -11732,6 +11812,7 @@ impl Default for ImageSpec {
             owner_alias: None,
             creation_date: iso8601_utc(SystemTime::now()),
             deprecation_time: None,
+            product_codes: Vec::new(),
             free_tier_eligible: false,
             public_ssm_parameter_name: None,
             tags: Vec::new(),
@@ -11776,6 +11857,19 @@ pub fn image_payload_bytes(spec: &ImageSpec) -> usize {
         .saturating_add(optional(spec.platform.as_ref()))
         .saturating_add(optional(spec.boot_mode.as_ref()))
         .saturating_add(optional(spec.imds_support.as_ref()))
+        .saturating_add(product_code_list_bytes(&spec.product_codes))
+}
+
+/// The caller-chosen bytes a `ProductCode` list holds: each entry's code and its type.
+///
+/// The ONE definition of that charge, the way [`tag_list_bytes`] is for a tag list, so
+/// every store that keeps product codes beside a resource charges them the same way.
+pub fn product_code_list_bytes(codes: &[ProductCode]) -> usize {
+    codes.iter().fold(0usize, |total, code| {
+        total
+            .saturating_add(code.product_code_id.as_ref().map_or(0, String::len))
+            .saturating_add(code.product_code_type.as_ref().map_or(0, String::len))
+    })
 }
 
 impl ComAmazonawsEc2Amazonec2State {
@@ -11888,8 +11982,10 @@ impl ComAmazonawsEc2Amazonec2State {
             owner_id: Some(spec.owner_id),
             creation_date: Some(spec.creation_date),
             public: Some(spec.public),
-            // No product code: nothing here is a Marketplace or paid image.
-            product_codes: Some(Vec::new()),
+            // "Any product codes associated with the AMI" (`Image$ProductCodes`): the
+            // codes the image was registered with, which is none for an image nobody
+            // sells.
+            product_codes: Some(spec.product_codes),
             architecture: Some(spec.architecture),
             image_type: Some(IMAGE_TYPE_MACHINE.to_string()),
             // An HVM image carries neither a kernel nor a RAM disk image.
@@ -11950,6 +12046,7 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         inserted
     }
+
 }
 
 /// A public AMI Amazon publishes: owned by Amazon's publishing account
