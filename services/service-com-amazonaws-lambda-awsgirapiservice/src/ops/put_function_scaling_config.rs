@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutFunctionScalingConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutFunctionScalingConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutFunctionScalingConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores one scaling configuration on the function record [`crate::state`] holds, keyed
+//! by the qualifier the call addressed, so `GetFunctionScalingConfig` answers from the one
+//! record this call persisted and nothing is echoed back out of the request without being
+//! stored first.
+//!
+//! The configuration belongs to the QUALIFIER: the operation takes a `Qualifier` to say
+//! which version or published view of the function it sets the configuration for, and the
+//! model's `PublishedFunctionQualifier` admits exactly two forms for it — a published
+//! version number, which names a version only once it has been published, and
+//! [`crate::state::VERSION_LATEST_PUBLISHED`], the published view of the unpublished
+//! configuration every function has. A qualifier naming neither is refused the modelled
+//! 404.
+//!
+//! The bounds are a RANGE: "the minimum and maximum number of execution environments",
+//! so a request whose minimum is above its maximum describes no range at all and is
+//! refused the modelled 400 with nothing stored.
+//!
+//! Applying the bounds is not instant: the model distinguishes the configuration that was
+//! requested from the one "currently applied", so this call stores what it asked for as
+//! the requested configuration and the move to applied is owed by the clock (see
+//! [`crate::state::FUNCTION_SCALING_APPLY_DELAY`]); nothing here sleeps for it.
+//!
+//! The answer is a REPORT on the function: `FunctionState` is "the current state of the
+//! function after applying the scaling configuration", so it comes off the record this
+//! call resolved rather than being asserted by it.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +175,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutFunctionScalingConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutFunctionScalingConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutFunctionScalingConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(service_error("Lambda state is not reachable on this engine"));
+        };
+
+        // "The scaling configuration defines the MINIMUM and MAXIMUM number of execution
+        // environments that can be provisioned for the function": a request whose minimum
+        // is above its maximum describes no such range, so it is refused and stores
+        // nothing. The check is a property of the request alone, so it runs before any
+        // record is resolved.
+        let requested = input.function_scaling_config.clone().unwrap_or_default();
+        if let (Some(minimum), Some(maximum)) = (
+            requested.min_execution_environments,
+            requested.max_execution_environments,
+        ) {
+            if minimum > maximum {
+                return Err(invalid_parameter(format!(
+                    "1 validation error detected: Value '{minimum}' at \
+                     'functionScalingConfig.minExecutionEnvironments' failed to satisfy \
+                     constraint: Member must be less than or equal to the value \
+                     '{maximum}' at 'functionScalingConfig.maxExecutionEnvironments'"
+                )));
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // The function this configuration belongs to. `FunctionName` is an
+        // `UnqualifiedFunctionName` here, whose pattern admits no qualifier of its own, so
+        // the `Qualifier` parameter is the only thing that names one. Resolution is also
+        // what brings the record up to whatever the clock already made due.
+        let (record, _) =
+            crate::state::resolve_function(&mut store, &input.function_name, None, &region, now)
+                .map_err(|failure| match failure {
+                    crate::state::ResolveFailure::Malformed(message) => invalid_parameter(message),
+                    crate::state::ResolveFailure::NotFound(message) => not_found(message),
+                })?;
+
+        // The qualifier has to name something before a configuration can be set on it: a
+        // published version exists only once it has been published, while the published
+        // view of the unpublished configuration always does.
+        let Some(qualifier) = record.published_qualifier(&input.qualifier) else {
+            return Err(not_found(format!(
+                "Function not found: {}",
+                record.versioned_arn(&input.qualifier)
+            )));
+        };
+
+        // "Sets the scaling configuration": the bounds this call asked for replace
+        // whatever the qualifier held, as the requested configuration, and the move to
+        // the applied one is owed by the clock. Nothing waits for it here.
+        record
+            .function_scaling_configs
+            .entry(qualifier)
+            .or_default()
+            .request(requested, now);
+
+        // "The current state of the function after applying the scaling configuration":
+        // read off the record, which resolution already brought up to date, so this call
+        // reports the function's state rather than asserting one of its own.
+        Ok(PutFunctionScalingConfigOutput {
+            function_state: Some(record.state.clone()),
+        })
     }
+}
+
+/// The modelled 400 this operation refuses a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> PutFunctionScalingConfigError {
+    PutFunctionScalingConfigErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled 404 for a name and qualifier that name no function or no such version.
+fn not_found(message: String) -> PutFunctionScalingConfigError {
+    PutFunctionScalingConfigErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled 500 for a failure of the store itself.
+fn service_error(message: &str) -> PutFunctionScalingConfigError {
+    PutFunctionScalingConfigErrorModeled::ServiceException(ServiceException {
+        r#type: None,
+        message: Some(message.to_string()),
+    })
+    .into()
 }
