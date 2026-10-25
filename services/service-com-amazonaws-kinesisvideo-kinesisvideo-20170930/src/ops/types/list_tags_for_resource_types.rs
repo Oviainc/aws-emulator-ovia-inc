@@ -25,3 +25,23 @@ pub struct ListTagsForResourceOutput {
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
 
+/// How a [`ListTagsForResourceOutput`] reaches the wire: as a [`Report`], so EVERY
+/// modelled output member is present and one the listing has no value for is JSON `null`
+/// rather than an absent key — the same rule, and the same `NextToken` member, as the
+/// per-stream tag listing beside it.
+impl ReportedOutput for ListTagsForResourceOutput {
+    fn output_schema() -> &'static ::aws_smithy_schema::Schema {
+        &Self::SCHEMA
+    }
+
+    fn has_no_value(&self, member: &::aws_smithy_schema::Schema) -> bool {
+        match member.member_name() {
+            Some("NextToken") => self.next_token.is_none(),
+            Some("Tags") => self.tags.is_none(),
+            // A member added to the model is written by the record itself; it is
+            // reported as absent only once this match names it.
+            _ => false,
+        }
+    }
+}
+

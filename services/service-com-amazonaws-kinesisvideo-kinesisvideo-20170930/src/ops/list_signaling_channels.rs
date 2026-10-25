@@ -135,7 +135,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for ListSignalingChannels<Eng>
 {
     type Input = ListSignalingChannelsInput;
-    type Output = ListSignalingChannelsOutput;
+    type Output = Report<ListSignalingChannelsOutput>;
     type Error = ListSignalingChannelsError;
 
     const NAME: &'static str = "ListSignalingChannels";
@@ -240,10 +240,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(encode_token)
         });
 
-        Ok(ListSignalingChannelsOutput {
+        Ok(Report::of(ListSignalingChannelsOutput {
             channel_info_list: Some(page),
+            // Absent on the last page, where it reaches the wire as JSON `null` (see
+            // [`Report`]) rather than as a missing key.
             next_token,
-        })
+        }))
     }
 }
 

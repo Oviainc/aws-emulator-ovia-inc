@@ -8,6 +8,9 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# Calendar arithmetic for a reservation's lease: the first day of the current
+# month and the months a term runs for (`src/state/reservations.rs`).
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 # Hex encoding, for the lowercase-hex request id a response reports when it carries
 # none of its own (`src/service/error_envelope.rs`).
 hex = { workspace = true }
@@ -33,6 +36,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 # `time` for the one case that lets the clock move between two failures.
 tokio = { workspace = true, features = ["time"] }
+# The same calendar arithmetic the reservation slice uses, so a test computes a
+# lease's window and its end with the library rather than its own month table.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 # Percent-encodes the URI path labels the group suite's reads carry, rather than
 # carrying a second hand-written encoder. Pinned here rather than through
 # `[workspace.dependencies]` because the root manifest is not editable from a

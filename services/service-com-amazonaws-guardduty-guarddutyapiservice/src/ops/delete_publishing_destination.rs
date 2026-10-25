@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePublishingDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePublishingDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePublishingDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +127,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePublishingDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePublishingDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeletePublishingDestinationErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        // A MUTATION, so it advances this state's clock: the instant it hands out is
+        // when the deletion landed. Taken before the lookups the way every other
+        // detector sub-resource delete on this service takes it — a refused call
+        // leaves every record exactly as it was, and the counter itself is not
+        // something any read reports.
+        let now = state.tick_millis();
+
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            // Classified from the REQUEST the way every detector-scoped operation
+            // classifies it: a value that cannot be a detector id is a parameter
+            // failure, a well-formed one this account/Region does not hold an
+            // ownership failure.
+            return Err(bad_request(crate::state::detector_id_rejection(
+                &input.detector_id,
+            )));
+        };
+
+        // "Deletes the publishing definition with the specified destinationId" (this
+        // operation's own documentation): the destination must be there to be deleted,
+        // and `PublishingStatus` carries no deleted member
+        // (`smithy_query(operation="DescribePublishingDestination")`), so the record
+        // goes at once and a second delete of the same id is refused on the same fact
+        // `DescribePublishingDestination` then refuses on.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePublishingDestination"))
+        // Dropping the record drops everything it held with it: its tags, and the
+        // `ClientToken` index entry that lives ON the record
+        // ([`crate::state::Detector::publishing_destination_for_token`]), so a
+        // replayed create cannot resolve to a destination that no longer exists — and
+        // the slot it took against
+        // [`crate::state::PUBLISHING_DESTINATIONS_PER_DETECTOR`] is free again.
+        if detector
+            .publishing_destinations
+            .remove(&input.destination_id)
+            .is_none()
+        {
+            return Err(bad_request(crate::state::destination_id_rejection(
+                &input.destination_id,
+            )));
+        }
+        // The detector holds one fewer sub-resource than before, which is the change
+        // `CreatePublishingDestination` records on it in the other direction.
+        detector.updated_at_millis = now;
+
+        // `DeletePublishingDestinationResponse` declares no members
+        // (`smithy_query(operation="DeletePublishingDestination")`): success is the
+        // modelled 200 and an empty body.
+        Ok(DeletePublishingDestinationOutput {})
     }
+}
+
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` and its `type`
+/// member.
+fn bad_request(message: impl Into<String>) -> DeletePublishingDestinationError {
+    crate::scaffolded::Scaffolded::invalid_input(message)
 }

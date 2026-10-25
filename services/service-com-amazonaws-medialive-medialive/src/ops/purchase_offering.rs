@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PurchaseOffering
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PurchaseOffering`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PurchaseOffering::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +151,211 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PurchaseOffering` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PurchaseOfferingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PurchaseOffering"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        // A reservation reserves capacity in the region whose endpoint the
+        // caller addressed: `Reservation$Region` is "AWS region, e.g.
+        // 'us-west-2'" and its `Arn` names that region too.
+        let region = crate::state::request_region(ctx.parts());
+
+        // The bounds every caller-chosen string of this service is held to. Both
+        // members target bare `__string`, so the request boundary refuses nothing
+        // for them.
+        bounded(
+            "name",
+            input.name.as_deref(),
+            1,
+            crate::state::MAX_RESOURCE_NAME_LEN,
+        )?;
+        bounded(
+            "requestId",
+            input.request_id.as_deref(),
+            1,
+            crate::state::MAX_REQUEST_ID_LEN,
+        )?;
+
+        // `Count` is "Number of resources" and `RenewalSettings$RenewalCount` is
+        // "Count for the reservation renewal", both targeting `__integerMin1`:
+        // fewer than one resource is nothing to reserve and fewer than one
+        // renewal is nothing to renew, so each is refused here, where the
+        // request boundary lets the modelled minimum through.
+        at_least_one("count", Some(input.count))?;
+        at_least_one(
+            "renewalSettings.renewalCount",
+            input
+                .renewal_settings
+                .as_ref()
+                .and_then(|settings| settings.renewal_count),
+        )?;
+
+        // The purchase is against ONE entry of the offering catalog, so the
+        // `OfferingId` is resolved through it first: an id the catalog does not
+        // hold names nothing to buy, which is this operation's modelled 404 — the
+        // same resolution `DescribeOffering` performs for a read.
+        let offering_index =
+            crate::state::offering_index(&input.offering_id).ok_or_else(|| {
+                not_found(crate::state::not_found_message(
+                    "Offering",
+                    &input.offering_id,
+                ))
+            })?;
+
+        let now = ::std::time::SystemTime::now();
+
+        // `Start` is checked BEFORE anything is written, so a request this
+        // service cannot lease from purchases nothing. The rule and the calendar
+        // arithmetic live in `state`, so `UpdateReservation` holds a renewal to
+        // the same window when its own issue lands.
+        let start = crate::state::reservation_start(input.start.as_deref(), now).map_err(
+            |refusal| match refusal {
+                crate::state::ReservationStartRefusal::Unreadable => bad_request(format!(
+                    "start must be a UTC time in ISO-8601 format, got {:?}",
+                    input.start.as_deref().unwrap_or_default()
+                )),
+                crate::state::ReservationStartRefusal::OutsideWindow { earliest, latest } => {
+                    bad_request(format!(
+                        "start must be between the first day of the current month ({earliest}) \
+                         and one year from now ({latest}), got {:?}",
+                        input.start.as_deref().unwrap_or_default()
+                    ))
+                }
+            },
+        )?;
+
+        let mut state = state.lock();
+        // `settle` first, as every operation does: it materialises only what the
+        // clock had already made due, so it never changes what a later caller
+        // would otherwise have seen.
+        state.settle(now);
+
+        // A retried purchase (same `@idempotencyToken` `RequestId`) must answer
+        // with the reservation the first one created — "Unique request ID to be
+        // specified. This is needed to prevent retries from creating multiple
+        // resources" — not buy a second one.
+        if let Some(existing) = input
+            .request_id
+            .as_deref()
+            .and_then(|token| state.reservation_for_token(token))
+            .map(str::to_string)
+        {
+            let reservation = state
+                .reservation_description(&existing, now)
+                .ok_or_else(unavailable)?;
+            return Ok(PurchaseOfferingOutput {
+                reservation: Some(reservation),
+            });
+        }
+
+        // Everything the request chose is stored; nothing of what the offering
+        // describes is, because a reservation reports that from the catalog entry
+        // it was purchased from.
+        let id = state
+            .insert_reservation(
+                &region,
+                crate::state::NewReservation {
+                    offering_index,
+                    count: input.count,
+                    name: input.name,
+                    start,
+                    renewal_settings: input.renewal_settings,
+                    tags: input.tags.unwrap_or_default(),
+                },
+            )
+            .map_err(|refusal| match refusal {
+                // The store is bounded, so a purchase loop cannot grow the
+                // emulator's heap without limit: once it is full the operation's
+                // own modelled throttle is the answer, not another reservation.
+                crate::state::ReservationRefusal::StoreFull => too_many_requests(format!(
+                    "This emulator stores at most {} reservations; an expired one must be \
+                     deleted before another is purchased",
+                    crate::state::MAX_RESERVATIONS
+                )),
+            })?;
+
+        if let Some(token) = input.request_id {
+            // Bounded, evicting write: a caller-chosen token can neither
+            // accumulate past the cap nor outlive the reservation it purchased.
+            state.record_reservation_token(token, &id);
+        }
+
+        // The response is read back out of the STORED reservation, never from
+        // `input`, so what this purchase answers with is what a later
+        // `DescribeReservation` reports.
+        let reservation = state
+            .reservation_description(&id, now)
+            .ok_or_else(unavailable)?;
+        Ok(PurchaseOfferingOutput {
+            reservation: Some(reservation),
+        })
     }
+}
+
+/// Refuse a member whose length is outside the bounds every caller-chosen string
+/// of this service is held to, with this operation's own modelled client error.
+fn bounded(
+    member: &str,
+    value: Option<&str>,
+    min: usize,
+    max: usize,
+) -> Result<(), PurchaseOfferingError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let len = value.chars().count();
+    if len >= min && len <= max {
+        return Ok(());
+    }
+    Err(bad_request(format!(
+        "{member} must be between {min} and {max} characters long, but was {len}"
+    )))
+}
+
+/// Refuse a count below the one the model's `__integerMin1` sets as its floor,
+/// with this operation's own modelled client error. A member the request did not
+/// carry is not a count at all, so it is not refused.
+fn at_least_one(member: &str, value: Option<i32>) -> Result<(), PurchaseOfferingError> {
+    match value {
+        Some(count) if count < 1 => Err(bad_request(format!(
+            "{member} must be at least 1, got {count}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// A request this operation cannot serve as asked, as the 400
+/// `BadRequestException` it models. The message names the member, the rule and
+/// the value the request carried, so a caller can fix the request from that text
+/// alone.
+fn bad_request(message: String) -> PurchaseOfferingError {
+    PurchaseOfferingErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// An `OfferingId` naming nothing this service can sell a reservation against,
+/// as the 404 `NotFoundException` this operation models.
+fn not_found(message: String) -> PurchaseOfferingError {
+    PurchaseOfferingErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// A purchase this emulator has no room to store, as the 429
+/// `TooManyRequestsException` this operation models.
+fn too_many_requests(message: String) -> PurchaseOfferingError {
+    PurchaseOfferingErrorModeled::TooManyRequestsException(TooManyRequestsException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to create the reservation in. A modelled server error,
+/// never a fresh engine (which would drop the write when this request returns).
+fn unavailable() -> PurchaseOfferingError {
+    PurchaseOfferingErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

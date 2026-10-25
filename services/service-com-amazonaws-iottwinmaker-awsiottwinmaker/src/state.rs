@@ -276,6 +276,17 @@ pub const MAX_COMPONENTS_RETURNED: usize = 30;
 /// See [`MAX_COMPONENTS_RETURNED`].
 pub const MAX_PROPERTIES_RETURNED: usize = 800;
 
+/// The most values of ONE list- or map-typed property a read reports, from the
+/// documentation of the flag that reports whether it had to truncate them
+/// ("the maximum number of values per property returned is 50",
+/// `areAllPropertyValuesReturned`).
+///
+/// It is also exactly the top of the modelled `length` of a `DataValue`'s
+/// `listValue` and `mapValue` (0..50), so no value this service can store
+/// carries more — see [`all_property_values_returned`], which is where every
+/// reader of the flag decides it.
+pub const MAX_PROPERTY_VALUES_RETURNED: usize = 50;
+
 /// The most tags one taggable resource of this service carries.
 ///
 /// Taken from the model, not chosen here: `TagMap` is `@length(min: 0, max:
@@ -1466,6 +1477,32 @@ impl Workspace {
             .find_map(|component_type| component_type.property_groups.get(group_name))
     }
 
+    /// Every property a component HAS: the ones it stores itself, plus the ones
+    /// the component type it instantiates — or a type that type extends —
+    /// defines and it never restated.
+    ///
+    /// Naming a `componentTypeId` is what gives a component that type's
+    /// properties, so a component commonly stores only the VALUE of a property
+    /// whose definition lives on its type, and a property whose definition it
+    /// inherits is as much a property of the component as one it declares
+    /// inline. In property-name order, so a reader that pages over the set
+    /// resumes at a name. Shared by every reader that has to enumerate a
+    /// component's properties rather than resolve one of them
+    /// ([`effective_property_definition`](Self::effective_property_definition)).
+    pub fn component_property_names(
+        &self,
+        component_type_id: Option<&str>,
+        properties: &BTreeMap<String, PropertyRecord>,
+    ) -> BTreeSet<String> {
+        let mut property_names: BTreeSet<String> = properties.keys().cloned().collect();
+        if let Some(component_type_id) = component_type_id {
+            for component_type in self.component_type_chain(component_type_id) {
+                property_names.extend(component_type.property_definitions.keys().cloned());
+            }
+        }
+        property_names
+    }
+
     /// The external ids a component carries: the value of every property of it
     /// whose EFFECTIVE definition marks the property as the external id — "the
     /// primary key of an external storage system".
@@ -1502,20 +1539,9 @@ impl Workspace {
         // Every property the component HAS: the ones it stores itself plus the
         // ones its component type gives it and that it never restated — the
         // external-id property is normally one of the latter.
-        let mut property_names: BTreeSet<&str> =
-            properties.keys().map(String::as_str).collect();
-        if let Some(component_type_id) = component_type_id {
-            for component_type in self.component_type_chain(component_type_id) {
-                property_names.extend(
-                    component_type
-                        .property_definitions
-                        .keys()
-                        .map(String::as_str),
-                );
-            }
-        }
+        let property_names = self.component_property_names(component_type_id, properties);
         let mut external_ids = BTreeSet::new();
-        for property_name in property_names {
+        for property_name in &property_names {
             let Some(definition) =
                 self.effective_property_definition(component_type_id, properties, property_name)
             else {
@@ -2650,6 +2676,28 @@ pub fn latest_property_value(
     property
         .and_then(|property| property.value.clone())
         .or_else(|| definition.and_then(|definition| definition.default_value.clone()))
+}
+
+/// Whether a read of `value` reports every value the property holds —
+/// `areAllPropertyValuesReturned`, "whether all values of a list or map type
+/// property are returned in the API response".
+///
+/// Only a LIST or MAP value holds several values, and the flag's documentation
+/// caps how many of them a response carries at
+/// [`MAX_PROPERTY_VALUES_RETURNED`]; a value of any other data type is one
+/// value, and a property that reads as nothing has none, so both report every
+/// value they hold. Shared by every reader of a property's value so one
+/// property answers the flag the same way wherever it is reported.
+pub fn all_property_values_returned(value: Option<&crate::ops::types::DataValue>) -> bool {
+    let Some(value) = value else {
+        return true;
+    };
+    let held = value
+        .list_value
+        .as_ref()
+        .map(Vec::len)
+        .or_else(|| value.map_value.as_ref().map(::std::collections::HashMap::len));
+    held.is_none_or(|held| held <= MAX_PROPERTY_VALUES_RETURNED)
 }
 
 /// Whether `definition` declares a property whose values are a TIME SERIES —

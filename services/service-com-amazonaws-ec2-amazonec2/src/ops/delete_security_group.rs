@@ -150,42 +150,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You can specify either the security group name or the security group ID"
         // (`DeleteSecurityGroupRequest$GroupName`) — and a name only names a group of the
-        // DEFAULT VPC: "For security groups in a nondefault VPC, you must specify the
-        // security group ID", because a name is unique per VPC and not per account.
-        let group_id = match (input.group_id.as_deref(), input.group_name.as_deref()) {
-            (None, None) => {
-                return Err(state::missing_parameter(
-                    "The request must contain either the parameter GroupId or GroupName",
-                ))
-            }
-            (Some(group_id), None) => group_id.to_string(),
-            (None, Some(group_name)) => {
-                // The Region's ambient default network is the account's whatever it has
-                // created, so it is materialised before a name is resolved in that VPC.
-                store.ensure_default_network(&region);
-                let default_vpc = store
-                    .default_vpc_id(&region)
-                    .ok_or_else(|| state::invalid_group_not_found(group_name))?;
-                store
-                    .security_group_id_for_name(&default_vpc, group_name)
-                    .ok_or_else(|| state::invalid_group_not_found(group_name))?
-            }
-            (Some(group_id), Some(group_name)) => {
-                // Both members name one group, so they have to name the SAME group:
-                // honouring the id and ignoring a name that disagrees would delete a group
-                // the request did not ask for.
-                let named = store
-                    .security_groups
-                    .get(group_id)
-                    .and_then(|group| group.group_name.as_deref());
-                if !named.is_some_and(|held| held.eq_ignore_ascii_case(group_name)) {
-                    return Err(state::invalid_parameter_combination(format!(
-                        "The security group '{group_id}' is not named '{group_name}'"
-                    )));
-                }
-                group_id.to_string()
-            }
-        };
+        // DEFAULT VPC, because a name is unique per VPC and not per account: "for security
+        // groups in a nondefault VPC, you must specify the security group ID". The shared
+        // resolver is the one place that rule lives, so every operation that takes both
+        // members reads them the same way.
+        let group_id = state::resolve_security_group_id(
+            &mut store,
+            &region,
+            input.group_id.as_deref(),
+            input.group_name.as_deref(),
+        )?;
 
         // A group id this account holds no group for is a refusal, not a no-op — a caller
         // that deletes twice has to be able to tell the deletion it performed from one it

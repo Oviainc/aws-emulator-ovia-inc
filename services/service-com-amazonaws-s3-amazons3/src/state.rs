@@ -285,6 +285,22 @@ pub enum ObjectRetentionWrite {
     TotalByteBudgetReached { would_hold: usize },
 }
 
+/// What [`ComAmazonawsS3Amazons3State::replace_object_legal_hold`] did, so the caller
+/// answers each outcome without re-deriving it.
+///
+/// Shorter than [`ObjectRetentionWrite`] by the two byte-budget outcomes, and for a
+/// reason: a legal hold is one `ObjectLockLegalHoldStatus` value — whether the hold is on
+/// or off — so what the store keeps for it is a flag rather than a caller-supplied
+/// string, and it cannot take the bucket or the whole store past a byte budget the way a
+/// retention's mode can ([`Object::retained_bytes`] counts no bytes for it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectLegalHoldWrite {
+    /// The addressed object version's legal hold status is now the one that was handed in.
+    Applied,
+    /// The bucket exists but holds no such object version; nothing was written.
+    NoSuchObject,
+}
+
 /// What [`ComAmazonawsS3Amazons3State::restore_object_version`] did, so the caller answers
 /// each outcome without re-deriving it — and cannot record a restore without having gone
 /// through the byte budgets a stored object's members count against, per bucket AND
@@ -3546,6 +3562,21 @@ pub struct Bucket {
     /// while the bucket has no versioning state — the state a bucket is created in, and
     /// what makes `GetBucketVersioning` report no `Status` until a put sets one.
     pub versioning: Option<BucketVersioning>,
+    /// Whether S3 Object Lock is enabled on the bucket — "whether this bucket has an
+    /// Object Lock configuration enabled" (`ObjectLockConfiguration$ObjectLockEnabled`,
+    /// whose enum has the single value `Enabled`).
+    ///
+    /// A `bool` rather than an `Option<String>` because that enum names ONE state: a
+    /// bucket either has Object Lock enabled or has no Object Lock configuration at all,
+    /// and there is no second value for an `Option` to distinguish. `false` is the state
+    /// every bucket is created in unless the create asks for it
+    /// (`CreateBucketRequest$ObjectLockEnabledForBucket`, "specifies whether you want S3
+    /// Object Lock to be enabled for the new bucket"), and it is what makes an object-level
+    /// Object Lock call on the bucket a request S3 cannot carry out
+    /// ([`OBJECT_LOCK_CONFIGURATION_MISSING_MESSAGE`]).
+    ///
+    /// Private, like `tags`, so the accessor pair below is the only way in or out.
+    object_lock_enabled: bool,
     /// The Transfer Acceleration state the last `PutBucketAccelerateConfiguration` set on
     /// the bucket, or `None` while the bucket has none.
     ///
@@ -3905,6 +3936,25 @@ impl Bucket {
         self.versioning
             .as_ref()
             .is_some_and(|versioning| versioning.status == VERSIONING_ENABLED_STATUS)
+    }
+
+    /// Whether S3 Object Lock is enabled on the bucket — see [`Self::object_lock_enabled`].
+    ///
+    /// A pure read: a bucket Object Lock was never enabled on carries no configuration,
+    /// which is reported rather than stored.
+    pub fn object_lock_enabled(&self) -> bool {
+        self.object_lock_enabled
+    }
+
+    /// Enable S3 Object Lock on the bucket, and with it versioning: "Object Lock works only
+    /// in versioned buckets" (Amazon S3 User Guide, *Using S3 Object Lock*), so a bucket
+    /// that carries an Object Lock configuration carries the `Enabled` versioning status
+    /// that lets a lock be addressed to a version at all.
+    ///
+    /// One place, so no caller can record half of that pair.
+    pub fn enable_object_lock(&mut self) {
+        self.object_lock_enabled = true;
+        self.set_versioning(VERSIONING_ENABLED_STATUS, None);
     }
 
     /// The bucket's Transfer Acceleration state — a `BucketAccelerateStatus` value — or
@@ -5079,6 +5129,22 @@ pub struct Object {
     /// [`ComAmazonawsS3Amazons3State::replace_object_retention`], which is the one place
     /// that sees the byte budgets it has to stay inside.
     pub retention: Option<ObjectRetention>,
+    /// The Object Lock LEGAL HOLD on this stored version: `Some(true)` while a hold is in
+    /// place, `Some(false)` once one was taken off, and `None` while no legal hold has ever
+    /// been applied to it — the state a write leaves a version in.
+    ///
+    /// Three states rather than two, because "never applied" is one S3 reports apart from
+    /// `OFF`: `HeadObject`'s `ObjectLockLegalHoldStatus` "is not returned if the specified
+    /// version of this object has never had a legal hold applied"
+    /// (`smithy_query(query="doc",shape="HeadObjectOutput",
+    /// member="ObjectLockLegalHoldStatus")`), so a reader of a version nobody has placed a
+    /// hold on has no status to report.
+    ///
+    /// Set AFTER the write, like [`Self::retention`]: a legal hold is applied to an object
+    /// by `PutObjectLegalHold` ("applies a legal hold configuration to the specified
+    /// object"), through
+    /// [`ComAmazonawsS3Amazons3State::replace_object_legal_hold`].
+    pub legal_hold: Option<bool>,
     /// The restore `RestoreObject` last initiated on this stored version — see
     /// [`ObjectRestore`] — or `None` while no restore has been asked for, which is the
     /// state a write leaves a version in.
@@ -5241,6 +5307,15 @@ impl ObjectEncryption {
         .sum()
     }
 }
+
+/// The `ObjectLockLegalHoldStatus` value that means a legal hold IS in place on an object
+/// version — one of that enum's two values
+/// (`smithy_query(query="shape",shape="ObjectLockLegalHoldStatus")`, which
+/// [`crate::ops::types::OBJECT_LOCK_LEGAL_HOLD_STATUS_VALUES`] carries).
+pub const LEGAL_HOLD_ON_STATUS: &str = "ON";
+
+/// The other `ObjectLockLegalHoldStatus` value: no legal hold is in place on the version.
+pub const LEGAL_HOLD_OFF_STATUS: &str = "OFF";
 
 /// The `ObjectLockRetentionMode` value whose retention bars a weakening write unless the
 /// caller asks to bypass it — one of that enum's two values
@@ -6377,6 +6452,34 @@ impl ComAmazonawsS3Amazons3State {
             })
     }
 
+    /// Record `legal_hold` as the Object Lock legal hold status of the object version
+    /// `version_id` names in `bucket` — the key's current object when it names none.
+    /// Reports what the write did, or `None` when this emulator holds no such bucket (so a
+    /// legal hold write refuses a name that is not a bucket instead of creating one).
+    ///
+    /// A REPLACEMENT of the whole subresource, the way [`Self::replace_object_retention`]
+    /// replaces a retention: `LegalHold` is the "container element for the legal hold
+    /// configuration you want to apply to the specified object"
+    /// (`PutObjectLegalHoldRequest$LegalHold`), which holds one status, so what the version
+    /// carries afterwards is exactly the status this call named.
+    ///
+    /// No byte budget is consulted, unlike the retention seam: what is kept is a flag, not
+    /// a caller-supplied string, so a hold adds nothing to what the bucket retains.
+    pub fn replace_object_legal_hold(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        legal_hold: bool,
+    ) -> Option<ObjectLegalHoldWrite> {
+        let held = self.buckets.get_mut(bucket)?;
+        let Some(object) = held.addressed_object_mut(key, version_id) else {
+            return Some(ObjectLegalHoldWrite::NoSuchObject);
+        };
+        object.legal_hold = Some(legal_hold);
+        Some(ObjectLegalHoldWrite::Applied)
+    }
+
     /// Record `restore` on the object version `version_id` names in `bucket` — the key's
     /// current object when it names none. Reports what the write did, or `None` when this
     /// emulator holds no such bucket (so a restore refuses a name that is not a bucket
@@ -6587,10 +6690,11 @@ impl ComAmazonawsS3Amazons3State {
                     // The store mints a version id only for a versioning-enabled bucket,
                     // and a published bucket carries no versioning state.
                     version_id: None,
-                    // No Object Lock retention, no restore and no annotations: nothing
-                    // placed one, and a published object is readable without one being
-                    // asked for.
+                    // No Object Lock retention, no legal hold, no restore and no
+                    // annotations: nothing placed one, and a published object is readable
+                    // without one being asked for.
                     retention: None,
+                    legal_hold: None,
                     restore: None,
                     annotations: BTreeMap::new(),
                 };
@@ -6985,6 +7089,16 @@ pub const NO_SUCH_OBJECT_LOCK_CONFIGURATION_MESSAGE: &str =
 /// the other code/message pairs rather than being built in the handler.
 pub const OBJECT_LOCK_ACCESS_DENIED_MESSAGE: &str =
     "Access Denied because object protected by object lock.";
+
+/// The `<Message>` S3 sends beside the 400 [`INVALID_REQUEST_CODE`] of an object-level
+/// Object Lock call — a legal hold or a retention, read or written — addressed to a bucket
+/// that has no Object Lock configuration: "Bucket is missing Object Lock Configuration".
+///
+/// A fixed sentence for that one condition, naming neither the bucket nor the key, so
+/// nothing in it is derived from the request — which is why it lives here beside the other
+/// code/message pairs rather than being built in each of the handlers that answer it.
+pub const OBJECT_LOCK_CONFIGURATION_MISSING_MESSAGE: &str =
+    "Bucket is missing Object Lock Configuration";
 
 /// The code S3 answers a call that cannot be served because of the state the object is in:
 /// `InvalidObjectState`, HTTP 403 — the status the shape itself carries
@@ -7612,6 +7726,8 @@ mod tests {
             version_id: None,
             // A write places no retention; `replace_object_retention` is what does.
             retention: None,
+            // Nor a legal hold; `replace_object_legal_hold` is what does.
+            legal_hold: None,
             // A write initiates no restore; `restore_object_version` is what does.
             restore: None,
             // And it attaches no annotation; `put_object_annotation` is what does.

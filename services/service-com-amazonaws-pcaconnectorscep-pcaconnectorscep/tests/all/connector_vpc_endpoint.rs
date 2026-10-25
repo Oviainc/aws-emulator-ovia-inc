@@ -345,15 +345,27 @@ async fn endpoint_reflects_the_access_path_the_create_chose() {
              {listed:?} vs {endpoint:?}"
         );
 
-        // An Intune connector's OIDC issuer is its own SCEP URL, so it follows the same
-        // access path rather than advertising a host the client cannot reach.
+        // An Intune connector's OIDC issuer is the service's identity plane, which the Entra
+        // tenant fetches over the public internet: it is NOT the SCEP URL and it does not
+        // follow the access path the create chose, so restricting the data plane to one VPC
+        // endpoint cannot hide the issuer behind a host only that VPC can resolve.
         if row.mobile_device_management.is_some() {
             let read = call(&router, "GET", &format!("/connectors/{}", label(&arn)), None).await;
-            assert_eq!(
-                read.body["Connector"]["OpenIdConfiguration"]["Issuer"],
-                json!(endpoint),
-                "case {row:?}: the OIDC issuer must be the connector's own SCEP URL, got {:?}",
+            let issuer = read.body["Connector"]["OpenIdConfiguration"]["Issuer"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert_ne!(
+                issuer, endpoint,
+                "case {row:?}: the OIDC issuer must not be the connector's SCEP URL, got {:?}",
                 read.body
+            );
+            assert!(
+                issuer.starts_with("https://")
+                    && !issuer.contains(PRIVATE_SUFFIX)
+                    && issuer.contains(&format!(".{ARN_SERVICE}.{REGION}{PUBLIC_SUFFIX}/")),
+                "case {row:?}: the OIDC issuer must be an HTTPS URL on this service's public \
+                 regional domain whatever access path the SCEP endpoint took, got {issuer:?}"
             );
         }
     }

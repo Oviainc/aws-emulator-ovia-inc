@@ -293,11 +293,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `Type` follows from the request: absent `MobileDeviceManagement` means a
         // general-purpose connector, an `IntuneConfiguration` means an Intune one — and only
-        // an Intune connector publishes OIDC parameters.
+        // an Intune connector publishes OIDC parameters. Those parameters are the service's
+        // own to mint (see `crate::state::open_id_configuration`), so the Intune settings the
+        // request carries choose only WHETHER they are published, never their values.
         let (connector_type, open_id_configuration) = match input.mobile_device_management.as_ref() {
-            Some(MobileDeviceManagement::Intune(intune)) => (
+            Some(MobileDeviceManagement::Intune(_)) => (
                 crate::state::TYPE_INTUNE,
-                Some(crate::state::open_id_configuration(&arn, &endpoint, intune)),
+                Some(crate::state::open_id_configuration(&region, &connector_id)),
             ),
             None => (crate::state::TYPE_GENERAL_PURPOSE, None),
         };

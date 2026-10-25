@@ -481,6 +481,25 @@ impl JobState {
         matches!(self, Self::WithCustomer)
     }
 
+    /// Whether a node job in this state is still one of the nodes its cluster ships with.
+    ///
+    /// A cluster's quorum is the set of node jobs it will ship as: "Each cluster supports
+    /// five nodes. You use the CreateJob action separately to create the jobs for each of
+    /// these nodes. The cluster does not ship until these five node jobs have been created"
+    /// (`CreateCluster`), and `ClusterLimitExceededException` states the same rule from the
+    /// join side: "If you have fewer than five nodes for your cluster and you have more
+    /// nodes to create for this cluster, try again and create jobs until your cluster has
+    /// exactly five nodes." `Cancelled` is the one `JobState` in which the order was
+    /// stopped before any device was ever prepared for it ("You can only cancel a job
+    /// before its `JobState` value changes to `PreparingAppliance`", `CancelJob`), so a
+    /// cancelled node is a node the cluster will never ship with and the cluster is one
+    /// node short again. From every other state the node is still part of the cluster's
+    /// order — being prepared, shipped, with the customer, back at Amazon Web Services, or
+    /// finished.
+    pub fn is_live_cluster_node(self) -> bool {
+        !matches!(self, Self::Cancelled)
+    }
+
     /// Whether a job in this state has a Snow device allocated to the account.
     ///
     /// `GetSnowballUsage` reports "the number of Snow devices that this account is
@@ -806,15 +825,17 @@ pub struct StoredCluster {
     /// with, in the order they were supplied (`CreateClusterRequest$LongTermPricingIds`).
     pub long_term_pricing_ids: Vec<String>,
     /// This cluster's node jobs, in the order they were created.
+    ///
+    /// Every node ever registered against the cluster is here, whatever state it reached:
+    /// nothing in this API removes a job, so a cancelled node is a node whose `JobState`
+    /// says so. Which of them are the nodes the cluster SHIPS with is therefore read off
+    /// the jobs themselves
+    /// ([`ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState::live_cluster_nodes`])
+    /// rather than from the length of this list.
     pub node_job_ids: Vec<String>,
 }
 
 impl StoredCluster {
-    /// Whether this cluster holds the [`CLUSTER_NODE_QUORUM`] node jobs it ships with.
-    pub fn has_quorum(&self) -> bool {
-        self.node_job_ids.len() >= CLUSTER_NODE_QUORUM
-    }
-
     /// This record as the modelled `ClusterMetadata` `DescribeCluster` reports.
     pub fn to_cluster_metadata(&self) -> ClusterMetadata {
         ClusterMetadata {
@@ -1799,13 +1820,9 @@ impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     /// or answer `false`, storing nothing, when no such cluster is held or this store
     /// cannot hold all of them without passing [`MAX_STORED_JOBS`].
     ///
-    /// Registering a node is what can give the cluster its quorum, so the state move that
-    /// follows from holding [`CLUSTER_NODE_QUORUM`] nodes is made HERE rather than in a
-    /// handler: a cluster whose node jobs have all been created is no longer awaiting
-    /// them, so it leaves `AwaitingQuorum` for `Pending` — it now has every node it needs
-    /// and waits to be prepared and shipped (`CreateCluster`: "The cluster does not ship
-    /// until these five node jobs have been created"). A cluster in any other state keeps
-    /// it, so this can never move a cluster backwards.
+    /// Registering a node is what can give the cluster its quorum, so the cluster's
+    /// quorum-driven state is brought back in line HERE rather than in a handler (see
+    /// [`Self::refresh_cluster_quorum_state`]).
     pub fn add_cluster_node_jobs(&mut self, cluster_id: &str, nodes: Vec<StoredJob>) -> bool {
         if !self.clusters.contains_key(cluster_id) || !self.can_store_jobs(nodes.len()) {
             return false;
@@ -1818,10 +1835,64 @@ impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
             return false;
         };
         cluster.node_job_ids.extend(node_ids);
-        if cluster.cluster_state == ClusterState::AwaitingQuorum && cluster.has_quorum() {
-            cluster.cluster_state = ClusterState::Pending;
-        }
+        self.refresh_cluster_quorum_state(cluster_id);
         true
+    }
+
+    /// The node jobs the cluster `cluster_id` will ship with, in the order they were
+    /// created: every node registered against it whose own `JobState` still counts as one
+    /// of the cluster's nodes ([`JobState::is_live_cluster_node`]). Empty when this store
+    /// holds no cluster under that id.
+    ///
+    /// This — not the length of [`StoredCluster::node_job_ids`] — is what the five-node
+    /// quorum is counted over: "Each cluster supports five nodes … The cluster does not
+    /// ship until these five node jobs have been created" (`CreateCluster`), so a node the
+    /// cluster will never ship is not one of the five.
+    pub fn live_cluster_nodes(&self, cluster_id: &str) -> Vec<&StoredJob> {
+        self.cluster_jobs_in_creation_order(cluster_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|job| job.job_state.is_live_cluster_node())
+            .collect()
+    }
+
+    /// Whether the cluster `cluster_id` holds the [`CLUSTER_NODE_QUORUM`] live node jobs it
+    /// ships with. A cluster this store does not hold holds no node, so it has no quorum.
+    pub fn cluster_has_quorum(&self, cluster_id: &str) -> bool {
+        self.live_cluster_nodes(cluster_id).len() >= CLUSTER_NODE_QUORUM
+    }
+
+    /// Bring the cluster `cluster_id`'s `ClusterState` back in line with the node jobs it
+    /// now holds, in BOTH directions.
+    ///
+    /// A cluster holding its quorum is no longer awaiting it, so it reads `Pending` — it
+    /// has every node it needs and waits to be prepared and shipped (`CreateCluster`: "The
+    /// cluster does not ship until these five node jobs have been created"). A cluster
+    /// short of the quorum is awaiting the nodes it still needs, so it reads
+    /// `AwaitingQuorum`, which is the state from which the replacement nodes
+    /// `ClusterLimitExceededException` describes ("create jobs until your cluster has
+    /// exactly five nodes") can still be created: the quorum is a count of live nodes, so
+    /// losing one puts the cluster back to awaiting it just as creating one can complete
+    /// it.
+    ///
+    /// Only those two states turn on the quorum. A cluster that has reached `InUse`,
+    /// `Complete` or `Cancelled` keeps the state it reached, so this never resurrects a
+    /// cancelled cluster or walks a shipped one back.
+    pub fn refresh_cluster_quorum_state(&mut self, cluster_id: &str) {
+        let has_quorum = self.cluster_has_quorum(cluster_id);
+        let Some(cluster) = self.clusters.get_mut(cluster_id) else {
+            return;
+        };
+        if matches!(
+            cluster.cluster_state,
+            ClusterState::AwaitingQuorum | ClusterState::Pending
+        ) {
+            cluster.cluster_state = if has_quorum {
+                ClusterState::Pending
+            } else {
+                ClusterState::AwaitingQuorum
+            };
+        }
     }
 
     /// The job parts of `job_id`, in the order they were created, or an empty slice's

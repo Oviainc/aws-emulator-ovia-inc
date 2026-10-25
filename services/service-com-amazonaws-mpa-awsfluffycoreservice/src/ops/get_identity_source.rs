@@ -1,15 +1,47 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetIdentitySource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetIdentitySource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetIdentitySource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the identity source the request's `IdentitySourceArn` names, every member read
+//! off the record [`crate::state`] holds — the same record `ListIdentitySources` reports,
+//! so the two reads cannot disagree about one source. A READ: the only state it settles is
+//! what the CLOCK already owed every reader
+//! ([`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`]: a source's
+//! activation and the removal a started deletion owes), so calling it changes nothing a
+//! later caller sees.
+//!
+//! The ARN is resolved in the namespace an identity source lives in, and the answer is
+//! decided in this order:
+//!
+//! * A value that is not an identity source's ARN
+//!   ([`crate::state::is_identity_source_arn`]) addresses no identity source at all —
+//!   another service's namespace, another resource kind of this service, or a value that is
+//!   not a well-formed ARN of this service at all — so it is refused with the one sentence
+//!   this service answers the malformed-ARN class with ([`crate::state::invalid_arn`]):
+//!   `ValidationException` (400). The member carries no ARN `@pattern` of its own here
+//!   (`length(max: 1000)` only), so this handler is where that class is refused; on the
+//!   ARN-addressed reads whose member DOES carry one (`GetApprovalTeam$Arn`,
+//!   `GetPolicyVersion$PolicyVersionArn`) the framework's boundary refuses it and
+//!   [`crate::service`] words it with that same sentence, so this service answers one ARN
+//!   that names no resource of the kind asked for one way.
+//! * An ARN outside the caller's own account is refused with `AccessDeniedException` (403)
+//!   BEFORE the source is resolved ([`crate::state::authorize_resource_arn`]), the same
+//!   boundary every ARN-addressed operation of this service applies, so the answer to a
+//!   foreign ARN never depends on what is stored under it.
+//! * An identity-source ARN this store holds no record for is
+//!   `ResourceNotFoundException` (404) with the one sentence this service answers every
+//!   resource lookup that resolves to nothing with
+//!   ([`crate::state::resource_not_found`]).
+//!
+//! The management-account gate [`crate::service`] puts in front of the creates does not
+//! apply: this request identifies its resource BY ARN, so its authorization decision reads
+//! a value out of the request — it is the cross-account check above.
+//!
+//! `DeleteIdentitySource` reads the same member and stops at [`crate::state::is_well_formed_arn`]
+//! on purpose: it is `@idempotent` and declares NO `ResourceNotFoundException`, so an ARN it
+//! holds nothing under is a success that writes nothing whatever that ARN names, and the
+//! resource KIND makes no difference to its answer. It does to this one, which has to tell a
+//! value that addresses no identity source from an identity source that is not there.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +194,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetIdentitySource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetIdentitySourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetIdentitySource"))
+        // Nothing in this answer depends on the request's metadata: the ARN asked for
+        // carries the region and the account of the source it names.
+        let _ = ctx;
+
+        // `IdentitySourceArn` carries no ARN `@pattern` here, so the malformed-ARN class
+        // is refused by this handler with the one sentence this service answers it with
+        // (`crate::state::invalid_arn`, 400). A value that is not an identity source's own
+        // ARN addresses no identity source, so it is refused as that class rather than
+        // looked up and reported absent.
+        if !crate::state::is_identity_source_arn(&input.identity_source_arn) {
+            return Err(GetIdentitySourceErrorModeled::ValidationException(
+                crate::state::invalid_arn(),
+            )
+            .into());
+        }
+
+        // The account boundary is evaluated BEFORE the resource is resolved: an ARN
+        // outside the caller's account is refused with the modelled
+        // `AccessDeniedException` (403) whatever is stored under it, so a client can tell
+        // "not permitted" from "does not exist".
+        crate::state::authorize_resource_arn(Self::NAME, &input.identity_source_arn)
+            .map_err(GetIdentitySourceErrorModeled::AccessDeniedException)?;
+
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetIdentitySourceError::Modeled(
+                GetIdentitySourceErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the identity-source store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let mut state = store.lock();
+        // Only what the clock already owed every reader: the activation of a source that
+        // has come due, and the removal of one whose started deletion has. This read
+        // starts neither.
+        state.materialize_due(::std::time::SystemTime::now());
+
+        let Some(source) = state.identity_source(&input.identity_source_arn) else {
+            // The one message this service answers every resource lookup that resolves
+            // to nothing with: a service constant that names neither the operation nor
+            // the ARN asked for (`crate::state::resource_not_found`).
+            return Err(GetIdentitySourceErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(),
+            )
+            .into());
+        };
+        Ok(detail(source))
+    }
+}
+
+/// The `GetIdentitySource` response for a stored identity source, every member read off
+/// the record.
+fn detail(source: &crate::state::IdentitySource) -> GetIdentitySourceOutput {
+    // The reported parameters are the ones the source's TYPE names, so the union member
+    // can never disagree with the `IdentitySourceType` reported beside it.
+    let parameters = match source.source_type {
+        crate::state::IdentitySourceType::IamIdentityCenter => {
+            IdentitySourceParametersForGet::IamIdentityCenter(IamIdentityCenterForGet {
+                instance_arn: Some(source.instance_arn.clone()),
+                // The approval portal recorded on the source when its association with
+                // the IAM Identity Center instance was established
+                // (`crate::state::IdentitySource::activate`) — never recomputed here, so
+                // this read and `ListIdentitySources` report one portal per source, and
+                // none while the source is still `CREATING`.
+                approval_portal_url: source.approval_portal_url.clone(),
+                region: Some(source.instance_region.clone()),
+            })
+        }
+    };
+    GetIdentitySourceOutput {
+        identity_source_type: Some(source.source_type.as_wire().to_string()),
+        identity_source_parameters: Some(parameters),
+        identity_source_arn: Some(source.arn.clone()),
+        creation_time: Some(::aws_smithy_types::DateTime::from(source.creation_time)),
+        status: Some(source.status.as_wire().to_string()),
+        // Every `IdentitySourceStatusCode` the model declares is a FAILURE reason
+        // (`ACCESS_DENIED`, `DELETION_FAILED`, `IDC_INSTANCE_NOT_FOUND`,
+        // `IDC_INSTANCE_NOT_VALID`) and `StatusMessage` explains one, so a source in a
+        // status this service reaches on its own (`CREATING`, `ACTIVE`, `DELETING`)
+        // carries neither — the same rendering `ListIdentitySources` reports.
+        status_code: None,
+        status_message: None,
     }
 }

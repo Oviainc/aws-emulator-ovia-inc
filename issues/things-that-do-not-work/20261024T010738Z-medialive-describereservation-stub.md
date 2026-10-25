@@ -15,6 +15,17 @@ _Operation: DescribeReservation | Class: stub_
 
 That header line is the stub census — the one record of which operations are still scaffolds. Deleting it without implementing the handler, or leaving it in place on a handler you did implement, corrupts that record rather than closing this issue. A stub's 501 is also CORRECT for a stub: this issue asks you to implement the operation, never to change the error it returns while unimplemented.
 
+## Resolution note
+
+`DescribeReservation` was implemented alongside `PurchaseOffering` (see
+`issues/things-that-now-work/20261024T010738Z-medialive-purchaseoffering-stub.md`): a create
+must be provable by reading the resource back, and this was the reader. The handler no longer
+answers 501 and its `//! SCAFFOLDED, NOT IMPLEMENTED:` census line is gone, so nothing here is
+left to implement; `tests/all/reservation_purchase.rs` exercises it end to end.
+
+This report stays here only because the fix for another issue cannot move a report it does not
+own — the next scan of this operation will find it implemented and can retire this record.
+
 ## Evidence
 
 The handler carries the scaffold marker `//! SCAFFOLDED, NOT IMPLEMENTED:` at the top of `services/service-com-amazonaws-medialive-medialive/src/ops/describe_reservation.rs`.

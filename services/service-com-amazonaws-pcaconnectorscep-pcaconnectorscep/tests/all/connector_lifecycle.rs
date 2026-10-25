@@ -568,26 +568,43 @@ async fn created_connector_is_read_back_from_state() {
             "case {case:?}: MobileDeviceManagement must echo what was stored, got {:?}",
             read.body
         );
-        // OIDC parameters are for Microsoft Intune, so only an Intune connector has them.
+        // OIDC parameters are for Microsoft Intune, so only an Intune connector has them —
+        // and all three are published by the service, not read back out of the request.
         let oidc = read.connector("OpenIdConfiguration").clone();
         if case.expected_type == "INTUNE" {
-            assert_eq!(
-                oidc["Issuer"],
-                json!(endpoint),
-                "case {case:?}: the OIDC issuer must be the connector's own SCEP URL, got {oidc:?}"
+            let issuer = oidc["Issuer"].as_str().unwrap_or_default();
+            assert!(
+                issuer.starts_with("https://") && issuer != endpoint && issuer.contains(id),
+                "case {case:?}: the OIDC issuer must be an HTTPS issuer URL of this service \
+                 naming the connector, and not its SCEP endpoint {endpoint:?}, got {oidc:?}"
             );
-            assert_eq!(
+            assert_ne!(
                 oidc["Subject"],
                 json!(arn),
-                "case {case:?}: the OIDC subject must identify the connector, got {oidc:?}"
+                "case {case:?}: the OIDC subject must be minted inside the issuer's namespace \
+                 rather than being the connector ARN, got {oidc:?}"
             );
-            let app_id = case.mobile_device_management.as_ref().expect("intune case")["Intune"]
-                ["AzureApplicationId"]
-                .clone();
             assert_eq!(
-                oidc["Audience"], app_id,
-                "case {case:?}: the OIDC audience must name the Entra application, got {oidc:?}"
+                oidc["Audience"],
+                // The one audience Microsoft Entra workload identity federation accepts in
+                // an exchanged token; it is the same for every connector.
+                json!("api://AzureADTokenExchange"),
+                "case {case:?}: the OIDC audience must be the Entra token-exchange audience, \
+                 got {oidc:?}"
             );
+            let intune = case.mobile_device_management.as_ref().expect("intune case")["Intune"]
+                .clone();
+            for supplied in ["AzureApplicationId", "Domain"] {
+                let value = intune[supplied].as_str().unwrap_or_default();
+                for member in ["Issuer", "Subject", "Audience"] {
+                    let published = oidc[member].as_str().unwrap_or_default();
+                    assert!(
+                        !published.contains(value),
+                        "case {case:?}: OIDC {member} must not echo the request's {supplied} \
+                         {value:?}, got {published:?}"
+                    );
+                }
+            }
         } else {
             assert_eq!(
                 oidc,

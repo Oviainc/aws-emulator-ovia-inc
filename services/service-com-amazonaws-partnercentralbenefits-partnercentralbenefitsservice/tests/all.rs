@@ -59,6 +59,8 @@ mod service_error_rules;
 mod state_roundtrip;
 #[path = "all/tag_cap.rs"]
 mod tag_cap;
+#[path = "all/unknown_catalog_lookup.rs"]
+mod unknown_catalog_lookup;
 #[path = "all/validation_error_body.rs"]
 mod validation_error_body;
 #[path = "all/validation_exception_message.rs"]

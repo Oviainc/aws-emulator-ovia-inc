@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveTagsFromResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveTagsFromResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveTagsFromResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the named tag keys from the Amazon RDS resource its `ResourceName` ARN names,
+//! on the resource's OWN stored record — the list `AddTagsToResource` writes and
+//! `ListTagsForResource` reports, resolved through [`crate::state::tags`]. A key the
+//! resource does not carry leaves it unchanged: the call says what the tag set must no
+//! longer contain, so it is idempotent.
 //!
 //! ## Shape of an operation
 //!
@@ -119,28 +116,48 @@ impl ::aws_smithy_schema::serde::SerializableStruct for RemoveTagsFromResourceOu
     fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
 }
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `RemoveTagsFromResourceError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.rds#RemoveTagsFromResource")]
+// The operation's MODELED errors, widened with the not-found faults of the other
+// resource families whose ARNs `ResourceName` accepts — for the reason
+// `AddTagsToResource` widens the same eight in: an ARN naming a resource that does not
+// exist is that family's own not-found fault, and this operation's `errors` list names
+// only some of the families it resolves. Every one is a shape THIS SERVICE models.
+#[smithy_macros::operation_error(
+    "com.amazonaws.rds#RemoveTagsFromResource",
+    extra_errors = [
+        "CustomDBEngineVersionNotFoundFault",
+        "DBClusterParameterGroupNotFoundFault",
+        "DBClusterSnapshotNotFoundFault",
+        "DBParameterGroupNotFoundFault",
+        "DBSubnetGroupNotFoundFault",
+        "GlobalClusterNotFoundFault",
+        "OptionGroupNotFoundFault",
+        "SubscriptionNotFoundFault"
+    ]
+)]
 #[derive(Debug)]
 pub enum RemoveTagsFromResourceErrorModeled {
     BlueGreenDeploymentNotFoundFault(BlueGreenDeploymentNotFoundFault),
+    CustomDBEngineVersionNotFoundFault(CustomDBEngineVersionNotFoundFault),
     DBCapacityReservationNotFoundFault(DBCapacityReservationNotFoundFault),
     DBClusterNotFoundFault(DBClusterNotFoundFault),
+    DBClusterParameterGroupNotFoundFault(DBClusterParameterGroupNotFoundFault),
+    DBClusterSnapshotNotFoundFault(DBClusterSnapshotNotFoundFault),
     DBInstanceNotFoundFault(DBInstanceNotFoundFault),
+    DBParameterGroupNotFoundFault(DBParameterGroupNotFoundFault),
     DBProxyEndpointNotFoundFault(DBProxyEndpointNotFoundFault),
     DBProxyNotFoundFault(DBProxyNotFoundFault),
     DBProxyTargetGroupNotFoundFault(DBProxyTargetGroupNotFoundFault),
     DBShardGroupNotFoundFault(DBShardGroupNotFoundFault),
     DBSnapshotNotFoundFault(DBSnapshotNotFoundFault),
     DBSnapshotTenantDatabaseNotFoundFault(DBSnapshotTenantDatabaseNotFoundFault),
+    DBSubnetGroupNotFoundFault(DBSubnetGroupNotFoundFault),
+    GlobalClusterNotFoundFault(GlobalClusterNotFoundFault),
     IntegrationNotFoundFault(IntegrationNotFoundFault),
     InvalidDBClusterEndpointStateFault(InvalidDBClusterEndpointStateFault),
     InvalidDBClusterStateFault(InvalidDBClusterStateFault),
     InvalidDBInstanceStateFault(InvalidDBInstanceStateFault),
+    OptionGroupNotFoundFault(OptionGroupNotFoundFault),
+    SubscriptionNotFoundFault(SubscriptionNotFoundFault),
     TenantDatabaseNotFoundFault(TenantDatabaseNotFoundFault),
 }
 
@@ -195,18 +212,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveTagsFromResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveTagsFromResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveTagsFromResource"))
+        let region =
+            crate::state::request_region(ctx).map_err(RemoveTagsFromResourceError::validation)?;
+        // `ResourceName` is "the Amazon RDS resource that the tags are removed from. This
+        // value is an Amazon Resource Name (ARN)".
+        // Resolved exactly as the request gave it: an ARN is an exact identifier, so a
+        // value that is not one — whitespace and all — is refused rather than repaired.
+        let resource_name = input.resource_name.as_str();
+        // `TagKeys` is scanned against the stored list, so the request's own list is
+        // bounded by what one resource can carry at all.
+        crate::state::check_request_list_len(
+            "TagKeys",
+            input.tag_keys.len(),
+            crate::state::MAX_TAGS_PER_RESOURCE,
+        )
+        .map_err(RemoveTagsFromResourceError::invalid_parameter_value)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot resolve the resource at all. Unreachable with the engine the router
+        // builds; 501 is the honest answer, never a success that removed nothing.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due, so the resource this call resolves
+        // is in the state it is really in.
+        store.settle_due_transitions(&region);
+
+        let target = match store.resolve_tag_target(&region, resource_name) {
+            Ok(target) => target,
+            Err(miss) => {
+                return Err(crate::tag_target_refusal!(
+                    RemoveTagsFromResourceErrorModeled,
+                    miss
+                ))
+            }
+        };
+        let Some(tags) = store.tags_at_mut(&target) else {
+            return Err(crate::scaffolded::Scaffolded::internal_failure(format!(
+                "the resource {resource_name} resolved under this service's state lock is no \
+                 longer there"
+            )));
+        };
+
+        // "The tag key (name) of the tag to be removed": a tag is identified by its key,
+        // so every key the request names stops being carried and the rest are left as they
+        // are, in the order they were in.
+        tags.retain(|tag| {
+            tag.key
+                .as_deref()
+                .is_none_or(|key| !input.tag_keys.iter().any(|named| named == key))
+        });
+
+        Ok(RemoveTagsFromResourceOutput)
     }
 }

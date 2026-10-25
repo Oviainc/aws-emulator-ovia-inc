@@ -35,6 +35,8 @@ mod delete_user_attributes;
 mod delete_user_pool_client;
 #[path = "all/delete_user_pool_domain.rs"]
 mod delete_user_pool_domain;
+#[path = "all/describe_terms_by_client.rs"]
+mod describe_terms_by_client;
 #[path = "all/device_remembering.rs"]
 mod device_remembering;
 #[path = "all/error_message_wording.rs"]

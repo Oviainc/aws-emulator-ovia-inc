@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFieldLevelEncryptionProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFieldLevelEncryptionProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFieldLevelEncryptionProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one field-level encryption profile: the call MINTS the profile's identity (an id
+//! and a version token), records the instant it was written and PERSISTS the configuration
+//! as submitted, so `GetFieldLevelEncryptionProfile` and
+//! `GetFieldLevelEncryptionProfileConfig` answer from that record rather than from the
+//! request being served.
+//!
+//! A mutating operation — "Create a field-level encryption profile" — and the only path by
+//! which a profile enters this service's store.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +159,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFieldLevelEncryptionProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFieldLevelEncryptionProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let config = input.field_level_encryption_profile_config;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Materialise whatever the clock owes the rest of the store before this call reads
+        // it, as every handler here does. A profile itself has no transition owed: the model
+        // gives it no status, so one this service accepts is usable at once.
+        store.settle(now);
+
+        // Every CloudFront list travels in a wrapper that states its own length beside the
+        // list itself, and a request whose `Quantity` disagrees with its `Items` describes
+        // no list at all: "The value of Quantity and the size of Items don't match."
+        // Checked over every wrapper this configuration reaches — the `EncryptionEntities`
+        // and the `FieldPatterns` of each entity in it — before anything is minted.
+        if let Some(message) =
+            crate::state::field_level_encryption_profile_quantity_mismatch(&config)
+        {
+            return Err(
+                CreateFieldLevelEncryptionProfileErrorModeled::InconsistentQuantities(
+                    InconsistentQuantities {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "An optional comment for the field-level encryption profile. The comment cannot be
+        // longer than 128 characters." The member carries no `@length` in the model, so the
+        // documented bound is refused here — with the refusal this operation models for an
+        // unusable argument — BEFORE anything is minted.
+        let comment_length = config.comment.as_deref().unwrap_or_default().chars().count();
+        if comment_length > crate::state::MAX_FIELD_LEVEL_ENCRYPTION_PROFILE_COMMENT {
+            return Err(CreateFieldLevelEncryptionProfileErrorModeled::InvalidArgument(
+                crate::state::comment_too_long(comment_length),
+            )
+            .into());
+        }
+
+        // A caller reference identifies ONE profile for its whole life: it is "a unique
+        // number that ensures that the request can't be replayed", so a repeat under a
+        // reference the store already holds is either the SAME request again or a second
+        // profile under a taken reference. What separates the two is the content of the
+        // configuration — the rule this service's distribution, origin access identity and
+        // public key creates follow for their own references: a repeat whose configuration is
+        // the one that reference already names is answered with that profile, its version and
+        // its location (creating nothing), and a repeat that changes the configuration is
+        // refused.
+        if let Some(existing) =
+            store.field_level_encryption_profile_by_caller_reference(&config.caller_reference)
+        {
+            if crate::state::same_field_level_encryption_profile_config(&existing.config, &config) {
+                // The same request again: the record the first create left behind, at its
+                // current version. Nothing is minted and nothing is stored.
+                return Ok(CreateFieldLevelEncryptionProfileOutput {
+                    field_level_encryption_profile: Some(existing.to_profile()),
+                    location: Some(crate::state::location_uri(
+                        &crate::state::field_level_encryption_profile_path(&existing.id),
+                    )),
+                    e_tag: Some(existing.etag.clone()),
+                });
+            }
+            let message =
+                crate::state::field_level_encryption_profile_already_exists_message(&existing.id);
+            return Err(
+                CreateFieldLevelEncryptionProfileErrorModeled::FieldLevelEncryptionProfileAlreadyExists(
+                    FieldLevelEncryptionProfileAlreadyExists {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `EncryptionEntity$PublicKeyId` is "The public key associated with a set of
+        // field-level encryption patterns, to be used when encrypting the fields that match
+        // the patterns": the profile encrypts WITH that key, so an id no stored public key
+        // carries names no key to encrypt with and no profile can be built from it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFieldLevelEncryptionProfile"))
+        // Checked AFTER the caller reference above, because the replay that reference answers
+        // creates nothing: it reports the profile the first create already stored, whose keys
+        // were resolved then, so a repeat of that request stays idempotent even if one of the
+        // keys it named has since been deleted.
+        let names_unknown_key = config
+            .encryption_entities
+            .items
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|entity| store.public_key(&entity.public_key_id).is_none());
+        if names_unknown_key {
+            return Err(CreateFieldLevelEncryptionProfileErrorModeled::NoSuchPublicKey(
+                crate::state::no_such_public_key(),
+            )
+            .into());
+        }
+
+        // "The maximum number of profiles for field-level encryption have been created." A
+        // profile record is what a later read answers from, so it cannot be evicted: the
+        // bound is an entry count refused BEFORE anything is minted.
+        if store.field_level_encryption_profiles.len()
+            >= crate::state::MAX_FIELD_LEVEL_ENCRYPTION_PROFILES
+        {
+            return Err(
+                CreateFieldLevelEncryptionProfileErrorModeled::TooManyFieldLevelEncryptionProfiles(
+                    crate::state::too_many_field_level_encryption_profiles(),
+                )
+                .into(),
+            );
+        }
+
+        let id = store.allocate_field_level_encryption_profile_id();
+        let etag = store.next_etag();
+        let stored = crate::state::StoredFieldLevelEncryptionProfile {
+            id: id.clone(),
+            // "The last time the field-level encryption profile was updated": for a profile
+            // nothing has updated yet, the instant this call stored it.
+            last_modified_time: now,
+            // Stored whole: a later read answers from this record, never from the request
+            // that was served.
+            config,
+            etag: etag.clone(),
+        };
+        // Read from the record just built, never from the request.
+        let profile = stored.to_profile();
+        let location =
+            crate::state::location_uri(&crate::state::field_level_encryption_profile_path(&id));
+        store.field_level_encryption_profiles.insert(id, stored);
+
+        Ok(CreateFieldLevelEncryptionProfileOutput {
+            // "Returned when you create a new field-level encryption profile."
+            field_level_encryption_profile: Some(profile),
+            // "The fully qualified URI of the new profile resource just created."
+            location: Some(location),
+            // "The current version of the field level encryption profile" — the token an
+            // `If-Match` against this profile is checked against.
+            e_tag: Some(etag),
+        })
     }
 }

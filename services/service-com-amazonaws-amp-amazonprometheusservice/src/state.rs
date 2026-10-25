@@ -372,6 +372,21 @@ pub const RULE_GROUPS_NAMESPACE_PAGE_LIMIT: i32 = 1_000;
 /// See [`RULE_GROUPS_NAMESPACE_PAGE_LIMIT`].
 pub const RULE_GROUPS_NAMESPACE_PAGE_DEFAULT: i32 = 100;
 
+/// The largest page `ListAnomalyDetectors` serves, and the page size it uses when the
+/// request names no `maxResults`.
+///
+/// The limit is the published one: `ListAnomalyDetectorsRequest$maxResults` is modelled
+/// `@range(min: 1, max: 1000)` and documented "The maximum number of results to return
+/// in a single call. Valid range is 1 to 1000." The member publishes NO default, so the
+/// page size for a request that omits it is this emulator's own choice, taken to be the
+/// one every other list operation of this service documents ([`WORKSPACE_PAGE_DEFAULT`],
+/// [`SCRAPER_PAGE_DEFAULT`], [`RULE_GROUPS_NAMESPACE_PAGE_DEFAULT`]) so one listing does
+/// not bound a page differently from the next. Clamped by the handler rather than trusted
+/// from the request, exactly as [`WORKSPACE_PAGE_LIMIT`] is.
+pub const ANOMALY_DETECTOR_PAGE_LIMIT: i32 = 1_000;
+/// See [`ANOMALY_DETECTOR_PAGE_LIMIT`].
+pub const ANOMALY_DETECTOR_PAGE_DEFAULT: i32 = 100;
+
 /// The filter keys `ListScrapers` honours, as `ListScrapersRequest$filters` documents
 /// them: "Keys include `status`, `sourceArn`, `destinationArn`, and `alias`."
 ///

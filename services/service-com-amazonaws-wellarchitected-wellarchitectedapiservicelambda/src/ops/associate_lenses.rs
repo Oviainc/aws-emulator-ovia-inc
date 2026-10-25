@@ -255,11 +255,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(AssociateLensesOutput);
         }
 
+        // A lens review is a review against ONE version of the lens, so associating a lens
+        // pins the version its content is published as right now — the same pin a create
+        // that applies lenses records, resolved from the one place that rule lives and
+        // BEFORE the workload is taken for writing.
+        let reviews = store.applied_workload_lens_reviews(&fresh, now);
+
         let workload = store.workloads.get_mut(&input.workload_id).ok_or_else(|| {
             AssociateLensesErrorModeled::ResourceNotFoundException(
                 crate::state::workload_not_found(&input.workload_id),
             )
         })?;
+        for (alias, record) in reviews {
+            // A lens associated for the first time gets the review that association pins;
+            // one the workload already reviews was filtered out above, so no pin is
+            // overwritten and no review the workload holds is reset.
+            workload.lens_review_records.insert(alias, record);
+        }
         workload.lenses.extend(fresh);
         // The lenses are a member of the workload (`Workload$Lenses`), so associating one
         // changes the workload, and `Workload$UpdatedAt` — "the date and time recorded" —

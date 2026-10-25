@@ -789,11 +789,14 @@ struct StatusCase {
 
 #[tokio::test]
 async fn status_is_settable_only_among_the_statuses_the_group_can_hold() {
-    // The billing-owner classes: a primary account, a responsibility transfer
-    // relationship ("When specified, the PrimaryAccountId is no longer required"), and
-    // neither.
+    // The billing-owner classes: a primary account (which is one of the group's own
+    // linked accounts), a responsibility transfer relationship ("When specified, the
+    // PrimaryAccountId is no longer required"), and neither.
     fn primary_account() -> Value {
-        json!({ "PrimaryAccountId": "111122223333" })
+        json!({
+            "PrimaryAccountId": "111122223333",
+            "AccountGrouping": { "LinkedAccountIds": ["111122223333"] },
+        })
     }
     fn transfer_relationship() -> Value {
         json!({ "AccountGrouping": { "ResponsibilityTransferArn": transfer_arn("1234abcd") } })

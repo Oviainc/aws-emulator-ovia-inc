@@ -2177,6 +2177,15 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         ELASTIC_BEANSTALK_APPLICATION | ELASTIC_BEANSTALK_APPLICATION_VERSION => {
             rules(100, Characters::AsGenerated)
         }
+        // CodeDeploy `CreateApplication.applicationName` (`ApplicationName`),
+        // `CreateDeploymentGroup.deploymentGroupName` (`DeploymentGroupName`) and
+        // `CreateDeploymentConfig.deploymentConfigName` (`DeploymentConfigName`): each
+        // `@length(min: 1, max: 100)` with pattern `^[A-Za-z0-9+=,.@_-]*$` (CodeDeploy's own
+        // Smithy model), which a generated name is already inside — letters, digits and the
+        // hyphen are all admitted — but may be longer than.
+        CODEDEPLOY_APPLICATION | CODEDEPLOY_DEPLOYMENT_GROUP | CODEDEPLOY_DEPLOYMENT_CONFIG => {
+            rules(100, Characters::AsGenerated)
+        }
         // Elastic Beanstalk `CreateEnvironment.EnvironmentName`: `EnvironmentName`,
         // `@length(min: 4, max: 40)` (that service's own Smithy model) — the tightest
         // bound of the three, and one a generated name would otherwise break.
@@ -3774,6 +3783,23 @@ pub const ELASTIC_BEANSTALK_ENVIRONMENT: &str = "AWS::ElasticBeanstalk::Environm
 
 /// An Amazon ECS task definition's resource type.
 pub const ECS_TASK_DEFINITION: &str = "AWS::ECS::TaskDefinition";
+
+/// The three CodeDeploy resource types `super::provisioning` creates in CodeDeploy itself
+/// (that model: `cloudFormationName: CodeDeploy`).
+///
+/// Each deliberately carries NO [`return_values`] arm, so the default applies and the
+/// physical resource id is the resource's NAME — which is what each type's published return
+/// value is ("Ref returns the application name", "Ref returns the deployment group name",
+/// "Ref returns the deployment configuration name") and the identifier every CodeDeploy
+/// operation addresses the resource by (`GetApplication` takes an `applicationName`,
+/// `GetDeploymentGroup` that name and a `deploymentGroupName`, `GetDeploymentConfig` a
+/// `deploymentConfigName`). A deployment group's `ApplicationName` is the other half of its
+/// identity and stays a declared PROPERTY, which is what the provisioner's calls carry.
+pub const CODEDEPLOY_APPLICATION: &str = "AWS::CodeDeploy::Application";
+/// See [`CODEDEPLOY_APPLICATION`].
+pub const CODEDEPLOY_DEPLOYMENT_GROUP: &str = "AWS::CodeDeploy::DeploymentGroup";
+/// See [`CODEDEPLOY_APPLICATION`].
+pub const CODEDEPLOY_DEPLOYMENT_CONFIG: &str = "AWS::CodeDeploy::DeploymentConfig";
 
 /// An Elastic Load Balancing v2 load balancer's resource type (that model's
 /// `cloudFormationName: ElasticLoadBalancingV2`).
