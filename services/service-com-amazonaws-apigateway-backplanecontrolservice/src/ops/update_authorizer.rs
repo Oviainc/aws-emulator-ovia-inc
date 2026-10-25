@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAuthorizer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAuthorizer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies the request's `patchOperations` to the stored `Authorizer` record
+//! of the named API, in request order, and reports the updated authorizer — so a later
+//! `GetAuthorizer` reads back exactly what the patch set.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAuthorizer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The whole list is applied to a COPY of the record and written back only once every op
+//! has succeeded and the patched record still satisfies the rules its `type` carries
+//! ([`crate::ops::create_authorizer::require_members_of_type`]), so a list carrying one
+//! refused op leaves the stored authorizer as it was rather than half-patched.
 //!
 //! ## Shape of an operation
 //!
@@ -124,6 +123,125 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use super::create_authorizer::require_members_of_type;
+use crate::state::{
+    patch_i32, patch_optional_string, patch_required_string, patch_string_set, AuthorizerEntry,
+    Patch, PatchFailure, PatchOpKind, MAX_AUTHORIZER_RESULT_TTL_SECONDS, MAX_COLLECTION_ENTRIES,
+    MAX_STRING_CHARS, MIN_AUTHORIZER_RESULT_TTL_SECONDS,
+};
+
+/// The `path` values `UpdateAuthorizer` accepts: one per updateable member of the
+/// `Authorizer` shape. `id` is the authorizer's identity — the URI label that addresses
+/// this very record — so it is reported but not patchable, exactly as `UpdateApiKey`
+/// treats a key's `id`.
+const SUPPORTED_PATHS: &[&str] = &[
+    "/authType",
+    "/authorizerCredentials",
+    "/authorizerResultTtlInSeconds",
+    "/authorizerUri",
+    "/identitySource",
+    "/identityValidationExpression",
+    "/name",
+    "/providerARNs/<user-pool-arn>",
+    "/type",
+];
+
+/// The window `authorizerResultTtlInSeconds` takes, from the member's own documentation
+/// — the same one `CreateAuthorizer` enforces through
+/// [`crate::ops::create_authorizer::authorizer_result_ttl`].
+const AUTHORIZER_RESULT_TTL_RANGE: ::std::ops::RangeInclusive<i32> =
+    MIN_AUTHORIZER_RESULT_TTL_SECONDS..=MAX_AUTHORIZER_RESULT_TTL_SECONDS;
+
+/// Apply one patch to a COPY of a stored authorizer.
+fn apply_patch(entry: &mut AuthorizerEntry, patch: &Patch) -> Result<(), PatchFailure> {
+    match patch.member() {
+        // An authorizer always reports a name and a type, so each can be set but not
+        // cleared; a patch `value` is a bare string on the wire, so the `type`'s value set
+        // is checked here rather than by the boundary validator.
+        "name" => patch_required_string(&mut entry.name, patch, MAX_STRING_CHARS),
+        "type" => {
+            if matches!(patch.op, PatchOpKind::Add | PatchOpKind::Replace) {
+                patch.require_single_valued()?;
+                let value = patch.require_value()?;
+                if !AUTHORIZER_TYPE_VALUES.contains(&value) {
+                    return Err(PatchFailure::BadRequest(format!(
+                        "{} takes one of {}, got {value:?}",
+                        patch.path,
+                        AUTHORIZER_TYPE_VALUES.join(", ")
+                    )));
+                }
+            }
+            patch_required_string(&mut entry.r#type, patch, MAX_STRING_CHARS)
+        }
+        "authType" => patch_optional_string(&mut entry.auth_type, patch, MAX_STRING_CHARS),
+        "authorizerUri" => {
+            patch_optional_string(&mut entry.authorizer_uri, patch, MAX_STRING_CHARS)
+        }
+        // "To use resource-based permissions on the Lambda function, specify null"
+        // (`Authorizer$authorizerCredentials`), so this member can be cleared.
+        "authorizerCredentials" => {
+            patch_optional_string(&mut entry.authorizer_credentials, patch, MAX_STRING_CHARS)
+        }
+        "identitySource" => {
+            patch_optional_string(&mut entry.identity_source, patch, MAX_STRING_CHARS)
+        }
+        "identityValidationExpression" => patch_optional_string(
+            &mut entry.identity_validation_expression,
+            patch,
+            MAX_STRING_CHARS,
+        ),
+        // A stored authorizer always carries a TTL — the member documents the value the
+        // service picks for a request that sets none — so it is replaced inside its
+        // published window and never cleared.
+        "authorizerResultTtlInSeconds" => patch_i32(
+            &mut entry.authorizer_result_ttl_in_seconds,
+            patch,
+            AUTHORIZER_RESULT_TTL_RANGE,
+        ),
+        // The path names ONE pool ARN of the list, or the op's own `value` does: a
+        // collection member has elements added and removed rather than being replaced
+        // whole.
+        "providerARNs" => {
+            let arn = patch.collection_entry(1)?;
+            crate::state::bound_chars(&patch.path, &arn, MAX_STRING_CHARS)
+                .map_err(PatchFailure::BadRequest)?;
+            patch_string_set(&mut entry.provider_arns, patch, &arn, MAX_COLLECTION_ENTRIES)
+        }
+        _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
+    }
+}
+
+/// The modelled failure for a patch this operation cannot apply.
+fn patch_failure(failure: PatchFailure) -> UpdateAuthorizerError {
+    match failure {
+        PatchFailure::BadRequest(message) => {
+            UpdateAuthorizerErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::NotFound(message) => {
+            UpdateAuthorizerErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::Conflict(message) => {
+            UpdateAuthorizerErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
+}
+
+/// Refuse a request naming a record that does not exist, with the message this service
+/// shares for that identifier.
+fn not_found(message: String) -> UpdateAuthorizerError {
+    UpdateAuthorizerErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -197,18 +315,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAuthorizer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAuthorizerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAuthorizer"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The list is read BEFORE the store lock is taken, so a malformed patch never
+        // reaches the records at all.
+        let patches =
+            crate::state::parse_patches(input.patch_operations.as_ref()).map_err(patch_failure)?;
+
+        let mut store = state.lock();
+        let api = store
+            .rest_apis
+            .get_mut(&input.rest_api_id)
+            .ok_or_else(|| not_found(crate::state::no_such_rest_api(&input.rest_api_id)))?;
+        // Patched on a COPY: a list whose later op is refused leaves the stored authorizer
+        // untouched, rather than keeping the ops before it.
+        let mut updated = api
+            .authorizers
+            .get(&input.authorizer_id)
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_AUTHORIZER.to_string()))?
+            .clone();
+
+        for patch in &patches {
+            apply_patch(&mut updated, patch).map_err(patch_failure)?;
+        }
+        // The patched record has to be an authorizer its own `type` admits, whichever
+        // member the patch moved: the rule holds of the record, not of one request.
+        require_members_of_type(&updated)
+            .map_err(PatchFailure::BadRequest)
+            .map_err(patch_failure)?;
+
+        api.authorizers
+            .insert(input.authorizer_id.clone(), updated.clone());
+        // Rendered through the one `Authorizer` body this crate builds, so the update
+        // reports the record exactly as `GetAuthorizer` will read it back.
+        let body = super::create_authorizer::authorizer_body(&updated);
+        let output = UpdateAuthorizerOutput {
+            id: body.id,
+            name: body.name,
+            r#type: body.r#type,
+            provider_ar_ns: body.provider_ar_ns,
+            auth_type: body.auth_type,
+            authorizer_uri: body.authorizer_uri,
+            authorizer_credentials: body.authorizer_credentials,
+            identity_source: body.identity_source,
+            identity_validation_expression: body.identity_validation_expression,
+            authorizer_result_ttl_in_seconds: body.authorizer_result_ttl_in_seconds,
+        };
+        // Everything below is owned, so the lock is released before the audit record is
+        // emitted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome,
+        // as `crate::state::AUDIT_TARGET` documents it. Metadata only — the identifiers
+        // the request carried and how many ops it applied, never the authorizer's
+        // configuration.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            rest_api_id = ?input.rest_api_id,
+            authorizer_id = ?input.authorizer_id,
+            patch_operations = patches.len(),
+            outcome = "updated",
+            "authorizer updated",
+        );
+        Ok(output)
     }
 }

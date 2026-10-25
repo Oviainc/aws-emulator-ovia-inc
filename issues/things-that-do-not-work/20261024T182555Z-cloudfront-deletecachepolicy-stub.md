@@ -31,3 +31,15 @@ botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling
 Boot the cloudfront emulator
 Call DeleteCachePolicy and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Note from a later fix
+
+`services/service-com-amazonaws-cloudfront-cloudfront2020-05-31/src/ops/delete_cache_policy.rs`
+is no longer a scaffold: the fix for
+`20261024T182555Z-cloudfront-listdistributionsbycachepolicyid-stub.md` implemented it,
+because that issue's recorded unit asserts the delete refusal for a policy a cache behaviour
+still attaches. The handler now answers `NoSuchCachePolicy`, the two `If-Match` outcomes,
+`CachePolicyInUse` while attached, and 204 once detached. What this issue still covers is the
+`IllegalDelete` case its own unit (`cloudfront.managed-cache-policy-delete-rejected`) is
+about: CloudFront's MANAGED cache policies, which this store does not hold, so a delete of
+one is answered `NoSuchCachePolicy` rather than `IllegalDelete`.

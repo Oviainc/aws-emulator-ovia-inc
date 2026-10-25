@@ -117,6 +117,12 @@ mod access_policy_lifecycle;
 // Same reasoning: declared outside the sorted list, which is the stretch every
 // concurrent iotsitewise change edits. Fold it into the list once the churn
 // settles.
+#[path = "all/pipeline_delete.rs"]
+mod pipeline_delete;
+
+// Same reasoning: declared outside the sorted list, which is the stretch every
+// concurrent iotsitewise change edits. Fold it into the list once the churn
+// settles.
 #[path = "all/create_pipeline_bounds.rs"]
 mod create_pipeline_bounds;
 
