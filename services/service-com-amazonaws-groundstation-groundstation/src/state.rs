@@ -1809,7 +1809,91 @@ pub fn typed_reference_absent_message(required_type: &str, arn: &str) -> String 
 /// wrong is the type it points at, and the text states the type the member requires as
 /// the `ConfigCapabilityType` token a `ConfigArn`'s type segment carries.
 pub fn typed_reference_wrong_type_message(required_type: &str) -> String {
-    format!("Invalid ARN provided. Config Type must be of type \"{required_type}\".")
+    wrong_config_type_message(&[required_type])
+}
+
+/// `types` as the sentence fragment a refusal names them in, each quoted as the
+/// `ConfigCapabilityType` token it is: `"antenna-uplink"`, or `"dataflow-endpoint" or
+/// "s3-recording"`, or `"a", "b" or "c"`.
+fn quoted_config_types(types: &[&str]) -> String {
+    let quoted: Vec<String> = types.iter().map(|token| format!("\"{token}\"")).collect();
+    match quoted.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, leading)) => format!("{} or {last}", leading.join(", ")),
+    }
+}
+
+/// What this service answers for a config reference that resolved to a config whose
+/// capability type the POSITION it was named in does not admit: the reference resolved,
+/// so nothing is missing — what is wrong is the type it points at, and the text states
+/// the capability types that position does admit.
+///
+/// One text for the whole class: a position admitting exactly one type
+/// ([`typed_reference_wrong_type_message`], the recorded wording for
+/// `uplinkEchoConfig$antennaUplinkConfigArn`) and one admitting several (either end of a
+/// mission profile's dataflow edge) differ only in how many types the sentence lists.
+pub fn wrong_config_type_message(admissible: &[&str]) -> String {
+    format!(
+        "Invalid ARN provided. Config Type must be of type {}.",
+        quoted_config_types(admissible)
+    )
+}
+
+/// The member a refusal of a mission profile's dataflow graph names, shared by the create
+/// and the update so both answer one parameter name.
+pub const DATAFLOW_EDGES_PARAMETER: &str = "dataflowEdges";
+
+/// The ordered `(source, destination)` capability pairs a dataflow edge may join.
+///
+/// A dataflow edge is one dataflow of a contact, so its two ends are the capability that
+/// ORIGINATES the data and the capability that RECEIVES it: data an antenna downlinks
+/// (`antenna-downlink`, or `antenna-downlink-demod-decode` when the service demodulates
+/// and decodes it first) is carried to a dataflow endpoint of the customer's VPC or
+/// written to their bucket; data the customer hands to a dataflow endpoint is radiated by
+/// the antenna (`antenna-uplink`); and the echo of an uplink (`uplink-echo`) is carried
+/// back to a dataflow endpoint. The capability types that take part are the model's own:
+/// `Source$configDetails` is "Additional details for a Config, if type is
+/// dataflow-endpoint or antenna-downlink-demod-decode", `Destination$configDetails` the
+/// same for a destination, and `ConfigDetails` carries `s3RecordingDetails`, "Details for
+/// an S3 recording Config in a contact" (`smithy_query(query="shape",
+/// shape="Source,Destination,ConfigDetails")`).
+///
+/// The two capability types that appear in NO pair are the two a mission profile wires up
+/// through a member of its own rather than through the graph — `trackingConfigArn` is "ARN
+/// of a tracking Config" and `telemetrySinkConfigArn` that of a telemetry sink
+/// (`smithy_query(query="operation", operation="CreateMissionProfile")`) — so neither is a
+/// node of a dataflow.
+pub const DATAFLOW_EDGE_CAPABILITY_PAIRS: &[(&str, &str)] = &[
+    ("antenna-downlink", "dataflow-endpoint"),
+    ("antenna-downlink", "s3-recording"),
+    ("antenna-downlink-demod-decode", "dataflow-endpoint"),
+    ("antenna-downlink-demod-decode", "s3-recording"),
+    ("dataflow-endpoint", "antenna-uplink"),
+    ("uplink-echo", "dataflow-endpoint"),
+];
+
+/// The capability types a dataflow edge may name as its SOURCE: every distinct first
+/// element of [`DATAFLOW_EDGE_CAPABILITY_PAIRS`], in the order the table lists them, so
+/// the set is derived from the table rather than tabulated twice.
+pub fn dataflow_edge_source_types() -> Vec<&'static str> {
+    let mut types: Vec<&'static str> = Vec::new();
+    for (source, _) in DATAFLOW_EDGE_CAPABILITY_PAIRS {
+        if !types.contains(source) {
+            types.push(source);
+        }
+    }
+    types
+}
+
+/// The capability types a dataflow edge whose source is `source_type` may name as its
+/// DESTINATION; empty when no dataflow starts at that capability.
+pub fn dataflow_edge_destination_types(source_type: &str) -> Vec<&'static str> {
+    DATAFLOW_EDGE_CAPABILITY_PAIRS
+        .iter()
+        .filter(|(source, _)| *source == source_type)
+        .map(|(_, destination)| *destination)
+        .collect()
 }
 
 /// The message an operation that resolves a config BY ARN — a mission profile's
@@ -2975,6 +3059,51 @@ impl ComAmazonawsGroundstationGroundstationState {
             }
             Some(_) => None,
         }
+    }
+
+    /// Why the two configs an `edge` of a mission profile's `dataflowEdges` names cannot
+    /// form a dataflow, as the modelled `InvalidParameterException` (HTTP 431) to answer
+    /// with; `None` when they can.
+    ///
+    /// An edge is one dataflow of a contact, so its ends are type-checked and not merely
+    /// resolved: the source's capability must be one that originates a dataflow and the
+    /// destination's one that receives data from THAT source
+    /// ([`DATAFLOW_EDGE_CAPABILITY_PAIRS`]). The refusal names whichever end is at fault —
+    /// the source when its capability starts no dataflow at all, otherwise the destination
+    /// — and the capability types that end does admit, in the wording this service already
+    /// uses for a config reference pointing at a config of a type its position does not
+    /// take ([`wrong_config_type_message`]).
+    ///
+    /// An end whose ARN resolves to no config is NOT this fault: that is a missing
+    /// resource, answered by [`resolves_config`] before an edge reaches here.
+    ///
+    /// Shared by the create and the update, so a profile cannot be left holding a graph a
+    /// create would have refused.
+    ///
+    /// [`resolves_config`]: Self::resolves_config
+    pub fn dataflow_edge_fault(&self, edge: &[String]) -> Option<InvalidParameterException> {
+        // The model makes an edge a 2..2 list (`smithy_query(query="shape",
+        // shape="DataflowEdge")`), so the boundary validator has already refused any other
+        // length and there is no pair here to judge.
+        let [source, destination] = edge else {
+            return None;
+        };
+        let source_type = &self.config_by_arn(source)?.config_type;
+        let destination_type = &self.config_by_arn(destination)?.config_type;
+
+        let admissible_destinations = dataflow_edge_destination_types(source_type);
+        if admissible_destinations.contains(&destination_type.as_str()) {
+            return None;
+        }
+        let admissible = if admissible_destinations.is_empty() {
+            dataflow_edge_source_types()
+        } else {
+            admissible_destinations
+        };
+        Some(invalid_parameter(
+            DATAFLOW_EDGES_PARAMETER,
+            wrong_config_type_message(&admissible),
+        ))
     }
 
     /// The ARNs of the mission profiles that reference the config `config_arn` names, in

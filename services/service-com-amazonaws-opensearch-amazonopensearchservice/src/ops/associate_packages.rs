@@ -8,7 +8,10 @@
 //! other operation reports an association with.
 //!
 //! The whole call is validated before anything is written, so a request that cannot
-//! be served leaves the domain's associations exactly as they were.
+//! be served leaves the domain's associations exactly as they were. Each package is
+//! judged by the store's one `plan_package_association`, shared with the operation
+//! that links a single package, so the two cannot serve or refuse the same request
+//! differently.
 //!
 //! ## Shape of an operation
 //!
@@ -81,15 +84,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use std::collections::btree_map::Entry;
 use std::collections::BTreeSet;
 use std::time::SystemTime;
 
 use crate::state::{
-    association_in_flight, domain_not_found, package_named_twice, package_not_available,
-    package_not_found, prerequisite_is_self, prerequisite_not_associated, OwedStatus, Package,
-    PackageAssociation, DOMAIN_PACKAGE_STATUS_ASSOCIATING, DOMAIN_PACKAGE_STATUS_ACTIVE,
-    PACKAGE_STATUS_AVAILABLE, PROVISIONING,
+    domain_not_found, package_named_twice, AssociationRefusal, AssociationRequest, Package,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -180,11 +179,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A name that names no domain is refused by the lookup this settling precedes.
         let _ = store.settled_mut(&input.domain_name, now);
 
+        // The domain the call names is resolved whatever else the request carries, so
+        // a name that names no domain is refused even by a call that goes on to name
+        // no package at all: the domain is what the call acts on.
+        if !store.domains.contains_key(&input.domain_name) {
+            return Err(AssociatePackagesErrorModeled::ResourceNotFoundException(
+                domain_not_found(&input.domain_name),
+            )
+            .into());
+        }
+
         // A domain holds ONE association per package, so the same package cannot be
         // named twice by one call: that request asks for two states of one
         // association. The set is also what satisfies a prerequisite the call
         // associates "simultaneously with the package association".
         let mut requested: BTreeSet<String> = BTreeSet::new();
+        let mut asked: Vec<AssociationRequest> = Vec::with_capacity(input.package_list.len());
         for entry in &input.package_list {
             if !requested.insert(entry.package_id.clone()) {
                 return Err(AssociatePackagesErrorModeled::ValidationException(
@@ -192,6 +202,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+            asked.push(AssociationRequest {
+                package_id: entry.package_id.clone(),
+                prerequisite_package_ids: entry
+                    .prerequisite_package_id_list
+                    .clone()
+                    .unwrap_or_default(),
+                association_configuration: entry.association_configuration.clone(),
+            });
         }
 
         // NOTHING is written until every package the call names can be associated, so
@@ -200,137 +218,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the store holds, so a request can plan at most as many associations as the
         // package store's own quota allows, and one that names more is refused at the
         // first entry that repeats or resolves to nothing.
-        let mut planned: Vec<Planned> = Vec::new();
-        {
-            let domain = store.domains.get(&input.domain_name).ok_or_else(|| {
-                AssociatePackagesErrorModeled::ResourceNotFoundException(domain_not_found(
-                    &input.domain_name,
-                ))
-            })?;
-
-            for entry in &input.package_list {
-                let package = store.packages.get(&entry.package_id).ok_or_else(|| {
-                    AssociatePackagesErrorModeled::ResourceNotFoundException(package_not_found(
-                        &entry.package_id,
-                    ))
-                })?;
-
-                // A package can be put on a domain only once its content is in place:
-                // until then there is no version of it to associate, which is the
-                // conflict between the call and the status the package is in.
-                if package.status != PACKAGE_STATUS_AVAILABLE {
-                    return Err(AssociatePackagesErrorModeled::ConflictException(
-                        package_not_available(&entry.package_id, &package.status),
-                    )
-                    .into());
-                }
-
-                // An association whose previous change has not landed yet is in use by
-                // that change: a second change to it is refused rather than overtaking
-                // the first. One that HAS landed is re-associated below, which is what
-                // moves a domain onto a newer version of the package's content.
-                if let Some(existing) = domain.package_associations.get(&entry.package_id) {
-                    if existing.in_flight() {
-                        return Err(AssociatePackagesErrorModeled::ConflictException(
-                            association_in_flight(
-                                &entry.package_id,
-                                &input.domain_name,
-                                &existing.status,
-                            ),
-                        )
-                        .into());
-                    }
-                }
-
-                for prerequisite in entry.prerequisite_package_id_list.iter().flatten() {
-                    if prerequisite == &entry.package_id {
-                        return Err(AssociatePackagesErrorModeled::ValidationException(
-                            prerequisite_is_self(&entry.package_id),
-                        )
-                        .into());
-                    }
-                    if !store.packages.contains_key(prerequisite) {
-                        return Err(AssociatePackagesErrorModeled::ResourceNotFoundException(
-                            package_not_found(prerequisite),
-                        )
-                        .into());
-                    }
-                    // A prerequisite "must be linked to the domain before or
-                    // simultaneously with the package association": one the domain
-                    // already holds satisfies the first, one this same call associates
-                    // the second, and anything else is a request the domain cannot
-                    // serve as asked.
-                    let satisfied = domain.package_associations.contains_key(prerequisite)
-                        || requested.contains(prerequisite);
-                    if !satisfied {
-                        return Err(AssociatePackagesErrorModeled::ValidationException(
-                            prerequisite_not_associated(
-                                &entry.package_id,
-                                prerequisite,
-                                &input.domain_name,
-                            ),
-                        )
-                        .into());
-                    }
-                }
-
-                planned.push(Planned {
-                    package: package.clone(),
-                    prerequisite_package_ids: entry
-                        .prerequisite_package_id_list
-                        .clone()
-                        .unwrap_or_default(),
-                    association_configuration: entry.association_configuration.clone(),
-                });
-            }
+        //
+        // Each entry is decided by the one shared decision this service makes about
+        // linking a package to a domain, so this call and the one that links a single
+        // package cannot refuse the same request differently.
+        let mut planned: Vec<Package> = Vec::with_capacity(asked.len());
+        for request in &asked {
+            planned.push(
+                store
+                    .plan_package_association(&input.domain_name, request, &requested)
+                    .map_err(refuse)?,
+            );
         }
 
-        let domain = store.domains.get_mut(&input.domain_name).ok_or_else(|| {
-            AssociatePackagesErrorModeled::ResourceNotFoundException(domain_not_found(
-                &input.domain_name,
-            ))
-        })?;
-
-        let mut reported = Vec::new();
-        for item in planned {
-            let association = PackageAssociation {
-                package_id: item.package.package_id.clone(),
-                // The package is not on the domain the instant the call returns: it is
-                // being put there, and the clock owes the association the status that
-                // leaves it in once the span has passed.
-                status: DOMAIN_PACKAGE_STATUS_ASSOCIATING.to_string(),
-                owed: Some(OwedStatus {
-                    status: DOMAIN_PACKAGE_STATUS_ACTIVE.to_string(),
-                    message: None,
-                    due: now + PROVISIONING,
-                }),
-                // The version this association puts on the domain is the one the
-                // package has available now, so a package whose content was updated
-                // reaches the domain through THIS call rather than on its own.
-                package_version: item.package.version.to_string(),
-                // The call's own list, which REPLACES whatever an earlier association
-                // of the same package recorded: the prerequisites belong to the
-                // association this call makes.
-                prerequisite_package_ids: item.prerequisite_package_ids,
-                association_configuration: item.association_configuration,
-                last_updated: now,
-            };
-            // The association REPLACES any the domain already had with this package:
-            // a domain holds one per package, which is also what makes a second call
-            // the way a newer version of the package's content reaches the domain.
-            let stored = match domain
-                .package_associations
-                .entry(association.package_id.clone())
-            {
-                Entry::Occupied(mut slot) => {
-                    slot.insert(association);
-                    slot.into_mut()
-                }
-                Entry::Vacant(slot) => slot.insert(association),
-            };
-            // Answered from the STORED record, through the projection every read path
-            // reports an association with.
-            reported.push(stored.to_details(&input.domain_name, &item.package));
+        let mut reported = Vec::with_capacity(planned.len());
+        for (request, package) in asked.iter().zip(&planned) {
+            let details = store
+                .put_package_association(&input.domain_name, package, request, now)
+                .ok_or_else(|| {
+                    AssociatePackagesErrorModeled::ResourceNotFoundException(domain_not_found(
+                        &input.domain_name,
+                    ))
+                })?;
+            reported.push(details);
         }
 
         Ok(AssociatePackagesOutput {
@@ -339,13 +249,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// One association this call will make, once every package it names has been
-/// checked: the stored package it links to and what the call asked for it.
-///
-/// The package is CLONED out of the store so the validation pass, which reads both
-/// the package registry and the domain, is over before anything is written.
-struct Planned {
-    package: Package,
-    prerequisite_package_ids: Vec<String>,
-    association_configuration: Option<PackageAssociationConfiguration>,
+/// The shared refusal, as THIS operation's error channel names it.
+fn refuse(refusal: AssociationRefusal) -> AssociatePackagesError {
+    match refusal {
+        AssociationRefusal::NotFound(payload) => {
+            AssociatePackagesErrorModeled::ResourceNotFoundException(payload)
+        }
+        AssociationRefusal::Conflict(payload) => {
+            AssociatePackagesErrorModeled::ConflictException(payload)
+        }
+        AssociationRefusal::Validation(payload) => {
+            AssociatePackagesErrorModeled::ValidationException(payload)
+        }
+    }
+    .into()
 }

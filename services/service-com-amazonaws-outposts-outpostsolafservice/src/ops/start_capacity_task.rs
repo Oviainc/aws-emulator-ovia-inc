@@ -24,6 +24,14 @@
 //! change nothing, so it cannot answer with a persisted task either. A 501 says "nobody
 //! has written this yet", which is exactly true of the capacity model a dry run needs.
 //!
+//! A dry run is still a request about resources, though, so the resolution above runs
+//! FIRST and only the capacity verdict is unimplemented: an `OutpostIdentifier`, an
+//! `OrderId` or an `AssetId` that resolves to nothing is the same modelled
+//! `NotFoundException` a real start is refused with, because which resources a request
+//! names either exist or they do not whatever work it then asks for. The one-active-task
+//! rule and the store's entry ceiling, by contrast, are about a task being CREATED, and
+//! a dry run creates none — so neither is applied to one.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -215,16 +223,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // region's inventory and of no other's, so that is where the Outpost the
         // task would run on is resolved.
         let region = crate::state::request_region(ctx.parts());
-        // A dry run reports whether the requested pools are above or below the
-        // Outpost's AVAILABLE instance capacity, and changes nothing. This emulator
-        // models no installed capacity to weigh them against, so it can neither
-        // judge the request nor answer it with a persisted task: see this module's
-        // header for why that is the scaffold's 501 rather than a made-up verdict.
-        if input.dry_run {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "StartCapacityTask with DryRun set",
-            ));
-        }
         // `OutpostIdentifier` accepts the bare id or the full Outpost ARN; both name
         // the same stored Outpost.
         let outpost_id =
@@ -235,9 +233,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         let mut store = state.lock();
-        // Materialise what the clock already owed before judging whether another
-        // task may start: a task that has run to a terminal status holds nothing up.
-        store.settle_capacity_tasks();
         // A capacity task runs ON an Outpost, so an Outpost the store does not hold
         // cannot take one: the not-found error this operation models, worded as the
         // identifier echo of the value AS SUPPLIED.
@@ -296,6 +291,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         }
+        // A dry run reports whether the requested pools are above or below the
+        // Outpost's AVAILABLE instance capacity, and changes nothing. This emulator
+        // models no installed capacity to weigh them against, so it can neither
+        // judge the request nor answer it with a persisted task: see this module's
+        // header for why that is the scaffold's 501 rather than a made-up verdict.
+        //
+        // It is answered HERE — after every resource the request names has been
+        // resolved, and before anything is read of the tasks already stored or
+        // written to them — so the only thing a dry run is answered 501 for is the
+        // capacity verdict itself, and nothing a dry run touches changes what a
+        // later caller sees.
+        if input.dry_run {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "StartCapacityTask with DryRun set",
+            ));
+        }
+
+        // Materialise what the clock already owed before judging whether another
+        // task may start: a task that has run to a terminal status holds nothing up.
+        store.settle_capacity_tasks();
         // "You can have one active capacity task for each order and each Outpost":
         // a second one is the conflict this operation models, naming the resource
         // the conflict is about in `ResourceId` / `ResourceType`.

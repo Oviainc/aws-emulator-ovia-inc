@@ -181,26 +181,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let log_group_name =
             crate::state::log_group_name_from_identifier(&input.log_group_identifier).to_string();
 
-        let not_found = |resource_kind: &str| {
+        let not_found = |message: &str| {
             DeleteTransformerError::from(
                 DeleteTransformerErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::resource_not_found_message(resource_kind)),
+                        message: Some(message.to_string()),
                     },
                 ),
             )
         };
 
         let Some(group) = store.log_groups.get_mut(&log_group_name) else {
-            return Err(not_found("log group"));
+            return Err(not_found(&crate::state::resource_not_found_message(
+                "log group",
+            )));
         };
 
         // "Deletes the log transformer for the specified log group": the transformer is
         // what this call names, so a group that carries none names a resource that is not
-        // there rather than a deletion with nothing to do. The refusal is decided BEFORE
-        // anything is written, so a refused delete leaves the record exactly as it was.
+        // there rather than a deletion with nothing to do. The request identifies that
+        // transformer by nothing of its own — only by the group it belongs to — so the
+        // refusal states nothing about it beyond that the resource is not there. The
+        // refusal is decided BEFORE anything is written, so a refused delete leaves the
+        // record exactly as it was.
         if group.transformer.is_none() {
-            return Err(not_found("transformer"));
+            return Err(not_found(
+                crate::state::UNIDENTIFIED_RESOURCE_NOT_FOUND_MESSAGE,
+            ));
         }
         group.transformer = None;
 

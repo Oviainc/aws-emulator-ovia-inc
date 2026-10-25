@@ -166,25 +166,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let log_group_name =
             crate::state::log_group_name_from_identifier(&input.log_group_identifier).to_string();
 
-        let not_found = |resource_kind: &str| {
+        let not_found = |message: &str| {
             GetTransformerError::from(GetTransformerErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::resource_not_found_message(resource_kind)),
+                    message: Some(message.to_string()),
                 },
             ))
         };
 
         let Some(group) = store.log_groups.get(&log_group_name) else {
-            return Err(not_found("log group"));
+            return Err(not_found(&crate::state::resource_not_found_message(
+                "log group",
+            )));
         };
 
         // "This operation returns data only for transformers created at the log group
         // level": until one has been created for this group there is no transformer to
-        // report, which is a missing resource rather than an empty response. An
-        // account-level transformer is read through `DescribeAccountPolicies` and is not
-        // reported here even when one would apply to this group.
+        // report, which is a missing resource rather than an empty response. The request
+        // identifies that transformer by nothing of its own — only by the group it belongs
+        // to — so the refusal states nothing about it beyond that the resource is not
+        // there. An account-level transformer is read through `DescribeAccountPolicies` and
+        // is not reported here even when one would apply to this group.
         let Some(transformer) = group.transformer.as_ref() else {
-            return Err(not_found("transformer"));
+            return Err(not_found(
+                crate::state::UNIDENTIFIED_RESOURCE_NOT_FOUND_MESSAGE,
+            ));
         };
 
         Ok(GetTransformerOutput {

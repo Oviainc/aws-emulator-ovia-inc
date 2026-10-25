@@ -19,6 +19,7 @@
 //! `DeleteOptionGroup`, `CreateDBSubnetGroup`, `DescribeDBSubnetGroups`, the six
 //! cluster-parameter-group operations, `CreateDBParameterGroup`,
 //! `DescribeDBParameterGroups`, `ModifyDBParameterGroup`, `DescribeDBParameters`,
+//! `DeleteDBParameterGroup`,
 //! `CreateEventSubscription`,
 //! `DescribeEventSubscriptions`, `CreateGlobalCluster` and `DescribeGlobalClusters` all
 //! project the same records.
