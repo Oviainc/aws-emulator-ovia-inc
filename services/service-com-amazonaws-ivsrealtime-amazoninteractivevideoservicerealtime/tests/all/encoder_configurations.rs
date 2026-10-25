@@ -24,6 +24,13 @@
 //! 4. The two DOCUMENTED `Video` rules the model carries no trait for are enforced: a
 //!    resolution is even, and `width` times `height` stays within the documented maximum
 //!    total pixels.
+//! 5. A `name` INSIDE the member's modelled `@length`/`@pattern` is persisted and read
+//!    back unchanged, whatever it is; one OUTSIDE them is the modelled
+//!    `ValidationException` (HTTP 400) carrying no configuration, and the store keeps
+//!    exactly what the accepted requests put there.
+//! 6. The store this operation grows is BOUNDED: a create past the bound is the modelled
+//!    `ServiceQuotaExceededException` (HTTP 402) rather than another record, and deleting
+//!    a configuration frees the slot again.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,6 +51,14 @@ const ENCODER_CONFIGURATION_ARN_PATTERN: &str =
 
 /// The modelled `@length` maximum of `EncoderConfigurationArn`.
 const ENCODER_CONFIGURATION_ARN_MAX_LENGTH: usize = 128;
+
+/// `EncoderConfigurationName`'s `@pattern`, from
+/// `smithy_query(query="shape",shape="EncoderConfigurationName")`.
+const ENCODER_CONFIGURATION_NAME_PATTERN: &str = "^[a-zA-Z0-9-_]*$";
+
+/// The published bounds of `EncoderConfigurationName`'s `@length`, from that same shape:
+/// `0..128`.
+const ENCODER_CONFIGURATION_NAME_LENGTH: (usize, usize) = (0, 128);
 
 // The documented defaults of `Video`, each from that member's own doc in
 // `smithy_query(query="shape",shape="Video")`:
@@ -732,4 +747,175 @@ async fn the_documented_video_rules_are_enforced() {
         let created = emulator.create_in(case, "us-east-1", &request).await;
         assert_video(case, &request, &created);
     }
+}
+
+// ---------------------------------------------------------------------------
+// The modelled `name` constraints
+// ---------------------------------------------------------------------------
+
+/// A `name` inside the member's modelled `@length` and `@pattern` is persisted as sent
+/// and read back unchanged, whatever it is; one outside them is the modelled
+/// `ValidationException` (HTTP 400) carrying no configuration, and the configurations the
+/// accepted requests created are untouched by a refused one.
+#[tokio::test]
+async fn the_modeled_encoder_configuration_name_constraints_are_enforced() {
+    let emulator = RealTime::new();
+
+    // Each row is inside the pattern's character class and the length range: both
+    // published length bounds, each class of character the pattern admits on its own,
+    // and all of them at once.
+    let longest_name = "n".repeat(ENCODER_CONFIGURATION_NAME_LENGTH.1);
+    let accepted: Vec<(&str, String)> = vec![
+        (
+            "the modelled minimum length: the empty name",
+            "x".repeat(ENCODER_CONFIGURATION_NAME_LENGTH.0),
+        ),
+        ("one character", "a".to_string()),
+        ("upper case only", "STUDIO".to_string()),
+        ("digits only", "1080".to_string()),
+        ("the hyphen the pattern admits", "-".to_string()),
+        ("the underscore the pattern admits", "_".to_string()),
+        ("every admitted class at once", "Studio-720p_v2".to_string()),
+        ("the modelled maximum length", longest_name),
+    ];
+
+    let mut stored: Vec<(String, String, Value)> = Vec::new();
+    for (case, name) in &accepted {
+        let request = json!({ "name": name });
+        let created = emulator.create_in(case, "us-east-1", &request).await;
+        let reported = member(&created, "name");
+        assert_eq!(
+            &reported, name,
+            "case {case:?}: expected the name the request sent ({name:?}, {} characters), \
+             got {reported:?}",
+            name.chars().count()
+        );
+
+        // Persisted, not just echoed: the read reports the same name for the same ARN.
+        let configuration_arn = member(&created, "arn");
+        let read = emulator.get(case, &configuration_arn).await;
+        assert_eq!(
+            read, created,
+            "case {case:?}: GetEncoderConfiguration must report the created configuration, \
+             expected {created}, got {read}"
+        );
+        stored.push((case.to_string(), configuration_arn, created));
+    }
+
+    // Each row is outside the modelled `@length` or outside the `@pattern`.
+    let refused: Vec<(&str, String)> = vec![
+        (
+            "one character past the modelled maximum length",
+            "n".repeat(ENCODER_CONFIGURATION_NAME_LENGTH.1 + 1),
+        ),
+        ("a space, which the pattern excludes", "studio feed".to_string()),
+        ("a dot, which the pattern excludes", "studio.720p".to_string()),
+        ("punctuation the pattern excludes", "studio!".to_string()),
+        ("a slash, which the pattern excludes", "studio/720p".to_string()),
+        ("a non-ASCII letter", "naïve".to_string()),
+        ("a tab inside an otherwise legal name", "studio\t720p".to_string()),
+    ];
+    for (case, name) in &refused {
+        let request = json!({ "name": name });
+        let (status, response) = emulator.call("CreateEncoderConfiguration", &request).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: CreateEncoderConfiguration with a name outside \
+             {ENCODER_CONFIGURATION_NAME_PATTERN} / length \
+             {ENCODER_CONFIGURATION_NAME_LENGTH:?} must answer HTTP 400, got {status} \
+             {response}"
+        );
+        let code = error_code(&response);
+        assert_eq!(
+            code, "ValidationException",
+            "case {case:?}: expected ValidationException, got {code:?} in {response}"
+        );
+        assert!(
+            response.get("encoderConfiguration").is_none(),
+            "case {case:?}: a refused create must report no configuration, got {response}"
+        );
+    }
+
+    // A refused create left every accepted configuration exactly as it was.
+    for (case, configuration_arn, created) in &stored {
+        let read = emulator.get(case, configuration_arn).await;
+        assert_eq!(
+            &read, created,
+            "case {case:?}: the refused creates must leave {configuration_arn} as created, \
+             expected {created}, got {read}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The bound on the store this operation grows
+// ---------------------------------------------------------------------------
+
+/// The encoder-configuration store is bounded: once it holds as many configurations as
+/// the service admits, a further create is the modelled `ServiceQuotaExceededException`
+/// (HTTP 402) and nothing is persisted for it — and a delete frees the slot again, so the
+/// bound caps what is STORED rather than counting creates for all time.
+#[tokio::test]
+async fn the_encoder_configuration_store_is_bounded_and_reports_the_modeled_quota_error() {
+    // Read the bound from the crate rather than restating it here, so this test cannot
+    // drift from the bound the service actually enforces.
+    use service_com_amazonaws_ivsrealtime_amazoninteractivevideoservicerealtime::state::MAX_ENCODER_CONFIGURATIONS;
+
+    let emulator = RealTime::new();
+
+    // Fill the store, cycling the rows of the input class so the bound is reached with
+    // configurations of every shape rather than one repeated request.
+    let cases = create_cases();
+    let mut arns = Vec::with_capacity(MAX_ENCODER_CONFIGURATIONS);
+    for index in 0..MAX_ENCODER_CONFIGURATIONS {
+        let (case, request) = &cases[index % cases.len()];
+        let created = emulator.create_in(case, "us-east-1", request).await;
+        arns.push(member(&created, "arn"));
+    }
+
+    let (case, request) = &cases[0];
+    let (status, response) = emulator.call("CreateEncoderConfiguration", request).await;
+    assert_eq!(
+        status, 402,
+        "case {case:?}: one configuration past the bound of {MAX_ENCODER_CONFIGURATIONS} \
+         must answer HTTP 402, got {status} {response}"
+    );
+    let code = error_code(&response);
+    assert_eq!(
+        code, "ServiceQuotaExceededException",
+        "case {case:?}: expected ServiceQuotaExceededException, got {code:?} in {response}"
+    );
+    assert!(
+        response.get("encoderConfiguration").is_none(),
+        "case {case:?}: a refused create must report no configuration, got {response}"
+    );
+
+    // The refusal persisted nothing: every configuration the fill created still reads
+    // back, and the one the refused request would have added is not there to find.
+    let survivor = arns.last().expect("the fill created at least one configuration");
+    let read = emulator.get("the last configuration of the fill", survivor).await;
+    assert_eq!(
+        member(&read, "arn"),
+        *survivor,
+        "the configurations created before the refusal must still read back, got {read}"
+    );
+
+    // Freeing one slot admits exactly one more configuration, which then reads back.
+    emulator.delete("a configuration deleted to free a slot", &arns[0]).await;
+    let created = emulator.create_in("after freeing a slot", "us-east-1", request).await;
+    let fresh_arn = member(&created, "arn");
+    let read = emulator.get("after freeing a slot", &fresh_arn).await;
+    assert_eq!(
+        read, created,
+        "after freeing a slot the new configuration must read back as created, \
+         expected {created}, got {read}"
+    );
+
+    // And the store is full again.
+    let (status, response) = emulator.call("CreateEncoderConfiguration", request).await;
+    assert_eq!(
+        status, 402,
+        "with the freed slot taken, a further create must answer HTTP 402, \
+         got {status} {response}"
+    );
 }

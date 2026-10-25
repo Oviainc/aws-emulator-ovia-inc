@@ -2135,7 +2135,10 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
 
     /// The stored snapshot an `Identifier`-or-`Arn` pair names, if any.
     ///
-    /// The identifier is matched case-INSENSITIVELY: `smithy_query(query="doc",
+    /// EVERY locator the request carries must match the one record: a request
+    /// naming both an identifier and an ARN names the snapshot they BOTH name, so
+    /// two locators that disagree name nothing. The identifier is matched
+    /// case-INSENSITIVELY: `smithy_query(query="doc",
     /// shape="RestoreFromClusterSnapshotMessage", member="SnapshotIdentifier")`
     /// — "This parameter isn't case sensitive." The ARN is matched exactly,
     /// against the `Snapshot$SnapshotArn` the store persists. Naming neither

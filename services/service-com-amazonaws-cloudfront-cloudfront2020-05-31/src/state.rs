@@ -12,10 +12,12 @@
 //!
 //! The same holds for every other resource kind this store carries — a key value store, a
 //! response headers policy, an origin request policy, a cache policy, an origin access
-//! control, a CloudFront function, a connection function, a public key: each record is put
+//! control, a CloudFront function, a connection function, a public key, a real-time log
+//! configuration: each record is put
 //! there by the call that creates it and is what every later read of that resource answers
 //! from. None of a response headers policy, an origin request policy, a cache policy, an
-//! origin access control or a public key has a status member or a propagation deadline, so
+//! origin access control, a public key or a real-time log configuration has a status
+//! member or a propagation deadline, so
 //! nothing about one is owed by the clock; neither is anything about a function or a
 //! connection function, each of which reaches its `LIVE` stage through a publish CALL
 //! rather than by waiting.
@@ -92,6 +94,14 @@ pub use functions::*;
 /// [`functions`] is one; `pub use` keeps every name reachable as `crate::state::<name>`.
 pub mod connection_functions;
 pub use connection_functions::*;
+
+/// The REAL-TIME LOG CONFIGURATION slice of this store: the configuration record, the ARN
+/// one is addressed by, the bound a create is refused at, the rules a submitted
+/// configuration satisfies, and the modelled errors the real-time log configuration
+/// operations answer with. A SUBMODULE for the same reason [`functions`] is one; `pub use`
+/// keeps every name reachable as `crate::state::<name>`.
+pub mod realtime_log_configs;
+pub use realtime_log_configs::*;
 
 /// `Distribution$Status` while a configuration is still propagating to the edge
 /// locations. The model documents the terminal value — "When the status is `Deployed`,
@@ -2421,6 +2431,12 @@ pub struct ComAmazonawsCloudfrontCloudfront20200531State {
     /// for the same reason as `distributions`: one stable total order for
     /// `ListStreamingDistributions`'s `Marker` to index into.
     pub streaming_distributions: BTreeMap<String, StoredStreamingDistribution>,
+    /// Every real-time log configuration this emulator holds, keyed by its name — "The
+    /// unique name of this real-time log configuration", which is what makes the name the
+    /// key and a repeated name a `RealtimeLogConfigAlreadyExists`. A `BTreeMap` for the
+    /// same reason as `distributions`: one stable total order for a listing to page
+    /// through. Everything that reads or writes it lives in [`realtime_log_configs`].
+    pub realtime_log_configs: BTreeMap<String, StoredRealtimeLogConfig>,
 }
 
 impl ComAmazonawsCloudfrontCloudfront20200531State {

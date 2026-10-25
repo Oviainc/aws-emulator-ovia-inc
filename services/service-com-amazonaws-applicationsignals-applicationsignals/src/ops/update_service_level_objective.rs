@@ -168,12 +168,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Same documented exclusion as on create: "You can't specify both
-        // RequestBasedSliConfig and SliConfig in the same operation."
-        if input.sli_config.is_some() && input.request_based_sli_config.is_some() {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "You can't specify both RequestBasedSliConfig and SliConfig in the same operation.",
-            ));
+        // Same documented exclusion as on create, through the same wording. An update that
+        // names NEITHER config is a different case and legal: it leaves the indicator the
+        // stored record already carries alone.
+        if let Some(message) = crate::state::exclusive_sli_configs_refusal(
+            input.sli_config.as_ref(),
+            input.request_based_sli_config.as_ref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -203,8 +205,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exclusion above: that one is about one request naming two configs, this one about
         // a request whose single config is of the other kind than the stored record. The
         // check runs before any member is written, so a refused update leaves the record
-        // exactly as it was. A record that carries no indicator at all is of no kind yet, so
-        // a config of either kind is an initial choice rather than a change.
+        // exactly as it was. Every stored record carries an indicator, since a create that
+        // names none is refused, so a mismatch is between two known kinds.
         let requested_kind = crate::state::requested_evaluation_type(
             input.sli_config.as_ref(),
             input.request_based_sli_config.as_ref(),

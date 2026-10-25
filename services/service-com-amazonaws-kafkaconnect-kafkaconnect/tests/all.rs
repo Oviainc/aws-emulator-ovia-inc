@@ -27,6 +27,8 @@ mod custom_plugin_file_location;
 mod duplicate_name_conflict_message;
 #[path = "all/iso8601_timestamps.rs"]
 mod iso8601_timestamps;
+#[path = "all/restart_connector_scope.rs"]
+mod restart_connector_scope;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_rules.rs"]

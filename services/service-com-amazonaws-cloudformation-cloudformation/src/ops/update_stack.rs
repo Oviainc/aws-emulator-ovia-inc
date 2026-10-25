@@ -388,6 +388,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // `@length` for.
                 crate::state::validate_template_body(body)
                     .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+                // The documented per-template quotas, the ceilings
+                // `DescribeAccountLimits` advertises for this account: a body past one is
+                // refused before the update starts, so the stack keeps the template it
+                // has rather than one holding none of what the body declared.
+                crate::state::validate_template_quotas(body)
+                    .map_err(crate::scaffolded::Scaffolded::validation_error)?;
                 // A submitted template is only one CloudFormation can deploy: a body
                 // declaring a resource type it does not recognise is refused before the
                 // update starts, so the stack keeps the template it has

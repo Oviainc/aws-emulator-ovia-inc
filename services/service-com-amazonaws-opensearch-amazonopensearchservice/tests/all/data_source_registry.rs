@@ -39,7 +39,7 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
 use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX};
 
 /// `AddDataSource`: `POST /opensearch/domain/{DomainName}/dataSource`.
-async fn add(emulator: &Emulator, domain: &str, body: Value) -> Answer {
+pub(crate) async fn add(emulator: &Emulator, domain: &str, body: Value) -> Answer {
     emulator
         .call(
             "POST",
@@ -50,7 +50,7 @@ async fn add(emulator: &Emulator, domain: &str, body: Value) -> Answer {
 }
 
 /// `GetDataSource`: `GET /opensearch/domain/{DomainName}/dataSource/{Name}`.
-async fn get(emulator: &Emulator, domain: &str, name: &str) -> Answer {
+pub(crate) async fn get(emulator: &Emulator, domain: &str, name: &str) -> Answer {
     emulator
         .call(
             "GET",
@@ -61,7 +61,7 @@ async fn get(emulator: &Emulator, domain: &str, name: &str) -> Answer {
 }
 
 /// `ListDataSources`: `GET /opensearch/domain/{DomainName}/dataSource`.
-async fn list(emulator: &Emulator, domain: &str) -> Answer {
+pub(crate) async fn list(emulator: &Emulator, domain: &str) -> Answer {
     emulator
         .call(
             "GET",
@@ -91,7 +91,7 @@ async fn delete_domain(emulator: &Emulator, name: &str) -> Answer {
 
 /// The `DataSources` list of a `ListDataSources` answer, with the case named on
 /// failure.
-fn data_sources(answer: &Answer, case: &str) -> Vec<Value> {
+pub(crate) fn data_sources(answer: &Answer, case: &str) -> Vec<Value> {
     answer.body["DataSources"]
         .as_array()
         .unwrap_or_else(|| {
@@ -193,7 +193,7 @@ impl Row {
 }
 
 /// `CreateDomain` for `name`, asserting it was accepted.
-async fn created_domain(emulator: &Emulator, name: &str) {
+pub(crate) async fn created_domain(emulator: &Emulator, name: &str) {
     let answer = emulator.create(json!({ "DomainName": name })).await;
     assert_eq!(
         answer.status, 200,

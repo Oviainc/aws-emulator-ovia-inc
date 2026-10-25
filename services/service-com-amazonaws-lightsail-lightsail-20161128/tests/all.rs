@@ -119,6 +119,8 @@ mod relational_database_blueprints;
 mod relational_database_bundles;
 #[path = "all/relational_database_delete.rs"]
 mod relational_database_delete;
+#[path = "all/relational_database_events.rs"]
+mod relational_database_events;
 #[path = "all/relational_database_lifecycle.rs"]
 mod relational_database_lifecycle;
 #[path = "all/relational_database_listing.rs"]

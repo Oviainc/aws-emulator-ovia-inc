@@ -813,6 +813,85 @@ pub const ACCOUNT_ASSOCIATION_PAGE_LIMIT: usize = 100;
 /// quota.
 pub const MAX_ACCOUNT_ASSOCIATIONS: usize = 10_000;
 
+/// One stored credential locker: the authoritative record every credential-locker
+/// operation reads. `CreateCredentialLocker` inserts it, `GetCredentialLocker` projects it
+/// onto its output shape and `ListCredentialLockers` projects it onto a
+/// `CredentialLockerSummary`.
+#[derive(Debug, Clone)]
+pub struct CredentialLocker {
+    /// The generated `CredentialLockerId` this record is keyed by.
+    pub id: String,
+    pub arn: String,
+    /// The region the creating request was signed for. A credential locker is a regional
+    /// resource, as every resource of this service is: only that region's endpoint
+    /// resolves or lists it.
+    pub region: String,
+    /// `CredentialLockerName` — `@sensitive`, and absent on a locker the create named
+    /// none for, since the member is optional and the model publishes no default.
+    pub name: Option<String>,
+    pub tags: HashMap<String, String>,
+    pub created_at: SystemTime,
+    /// Monotonic insertion sequence. `ListCredentialLockers` pages by it, so a page token
+    /// keeps resuming at the right place even when records are deleted in between.
+    pub sequence: u64,
+}
+
+/// The `ResourceType` this service reports a credential locker under — the Smithy resource
+/// name, as [`MANAGED_THING_RESOURCE_TYPE`] is for a managed thing. It is also the resource
+/// kind an [`IdempotencyKey`] of a `CreateCredentialLocker` carries.
+pub const CREDENTIAL_LOCKER_RESOURCE_TYPE: &str = "CredentialLocker";
+
+/// The most `CredentialLockerSummary` items one `ListCredentialLockers` page carries, and
+/// the page size an absent `MaxResults` gets, for the same reason and on the same terms as
+/// [`MANAGED_THING_PAGE_LIMIT`]: a caller reaches the rest of the store through the
+/// `NextToken`, so one response stays bounded however many records are stored.
+pub const CREDENTIAL_LOCKER_PAGE_LIMIT: usize = 100;
+
+/// The most credential lockers one store holds, for the same reason and on the same terms
+/// as [`MAX_MANAGED_THINGS`]: a bound CHOSEN for the emulator, not a published AWS quota.
+/// `CreateCredentialLocker` models a quota error, so a create at this bound is refused with
+/// it rather than growing the store.
+pub const MAX_CREDENTIAL_LOCKERS: usize = 1_000;
+
+/// The resource-type segment a credential locker's ARN carries, which is also how the
+/// `CredentialLockerArn` and `IoTManagedIntegrationsResourceARN` patterns name that kind of
+/// resource.
+pub const CREDENTIAL_LOCKER_ARN_SEGMENT: &str = "credential-locker";
+
+/// The ARN of a credential locker in `region`, as the `CredentialLockerArn` pattern
+/// (`^arn:aws:iotmanagedintegrations:[0-9a-zA-Z-]+:[0-9]+:credential-locker/[0-9a-zA-Z]+$`)
+/// requires.
+pub fn credential_locker_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        SERVICE_ARN_NAMESPACE,
+        region,
+        &format!("{CREDENTIAL_LOCKER_ARN_SEGMENT}/{id}"),
+    )
+}
+
+/// How this service states that the credential locker a request named does not exist: the
+/// sentence the modelled `ResourceNotFoundException` documents for itself
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException")` -> "The specified
+/// resource does not exist"), as the recorded 404s of the credential-locker operations carry
+/// it.
+///
+/// The read 404s of this service are not one sentence — a managed thing's reads
+/// `Managed Thing resource not found.` ([`resource_not_found_message`]), a connector
+/// destination's `Connector Destination not found` ([`resource_name_not_found_message`]) —
+/// so each resource's paths word their own, and a credential locker's is this one on both
+/// the read and the mutating side.
+pub const CREDENTIAL_LOCKER_NOT_FOUND_MESSAGE: &str = "resource does not exist";
+
+/// The modelled `ResourceNotFoundException` a credential locker's read or mutation answers
+/// for an identifier the caller's region holds no locker under: the reason above plus the
+/// `ResourceId` and `ResourceType` members every 404 of this service reports the same way.
+pub fn credential_locker_not_found(identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(CREDENTIAL_LOCKER_NOT_FOUND_MESSAGE.to_string()),
+        ..resource_not_found(CREDENTIAL_LOCKER_RESOURCE_TYPE, identifier)
+    }
+}
+
 /// Per-service state for com-amazonaws-iotmanagedintegrations-iotmanagedintegrations. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
@@ -871,6 +950,14 @@ pub struct ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
     /// Insertion order of account-association ids, so `ListAccountAssociations` pages
     /// deterministically. An id is appended on create and removed on delete.
     pub account_association_order: Vec<String>,
+    /// The authoritative credential-locker store, keyed by the generated
+    /// `CredentialLockerId`. `CreateCredentialLocker` inserts a record,
+    /// `GetCredentialLocker` projects it onto its output shape and
+    /// `ListCredentialLockers` pages over it.
+    pub credential_lockers: HashMap<String, CredentialLocker>,
+    /// Insertion order of credential-locker ids, so `ListCredentialLockers` pages
+    /// deterministically. An id is appended on create.
+    pub credential_locker_order: Vec<String>,
     /// The authoritative destination store, keyed by the region and `DestinationName`
     /// that name it ([`RegionalName`]). `CreateDestination` inserts a record and
     /// `GetDestination` projects it onto its output shape.
@@ -1167,6 +1254,14 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
             .filter(|association| association.region == region)
     }
 
+    /// The credential locker `region`'s endpoint holds under `id`, if any. A locker
+    /// created in another region is not visible here, as for every regional resource.
+    pub fn credential_locker_in(&self, region: &str, id: &str) -> Option<&CredentialLocker> {
+        self.credential_lockers
+            .get(id)
+            .filter(|locker| locker.region == region)
+    }
+
     /// [`Self::account_association_in`], mutably.
     pub fn account_association_in_mut(
         &mut self,
@@ -1185,7 +1280,7 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
     /// The ARN has to be one this region really minted — it carries the region and the
     /// account it belongs to — so an ARN of another region or account resolves to nothing
     /// here, exactly as an identifier of another region does ([`Self::managed_thing_in`]).
-    /// The pattern admits five resource types; the two this service STORES resolve, and an
+    /// The pattern admits five resource types; the ones this service STORES resolve, and an
     /// ARN naming a kind whose create is not implemented holds no record under any id, so
     /// it resolves to nothing.
     pub fn tags_of(&self, region: &str, arn: &str) -> Option<&HashMap<String, String>> {
@@ -1199,6 +1294,10 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
                 .account_association_in(region, parts.id)
                 .filter(|association| association.arn == arn)
                 .map(|association| &association.tags),
+            CREDENTIAL_LOCKER_ARN_SEGMENT => self
+                .credential_locker_in(region, parts.id)
+                .filter(|locker| locker.arn == arn)
+                .map(|locker| &locker.tags),
             _ => None,
         }
     }
@@ -1220,6 +1319,11 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
                 .account_association_in_mut(region, parts.id)
                 .filter(|association| association.arn == arn)
                 .map(|association| &mut association.tags),
+            CREDENTIAL_LOCKER_ARN_SEGMENT => self
+                .credential_lockers
+                .get_mut(parts.id)
+                .filter(|locker| locker.region == region && locker.arn == arn)
+                .map(|locker| &mut locker.tags),
             _ => None,
         }
     }

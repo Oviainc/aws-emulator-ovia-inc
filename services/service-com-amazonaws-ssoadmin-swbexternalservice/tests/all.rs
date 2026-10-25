@@ -49,6 +49,8 @@ mod application_providers;
 mod application_update;
 #[path = "all/customer_managed_policy_references.rs"]
 mod customer_managed_policy_references;
+#[path = "all/discovered_instance_surface.rs"]
+mod discovered_instance_surface;
 #[path = "all/inline_policy.rs"]
 mod inline_policy;
 #[path = "all/inline_policy_independence.rs"]

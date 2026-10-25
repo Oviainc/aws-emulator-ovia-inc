@@ -655,6 +655,52 @@ pub fn parse(body: &str) -> Option<Template> {
     template_of(&document)
 }
 
+/// The documented per-template quota this body is past, worded as the refusal, or `None`
+/// when it is within every one of them.
+///
+/// The counts are taken on the PROCESSED template — the one CloudFormation validates. A
+/// body this reader will not read AT ALL is past no quota: that is a form error, which the
+/// operations reading a body answer on their own terms.
+///
+/// This is the rule's other half, and the ONE place the ceilings are counted:
+/// [`template_of`] consults [`quota_violation_in`] and reports no part of an over-quota
+/// template, while an operation that SUBMITS one refuses the request outright rather than
+/// deploying a stack holding none of it — the quotas are the ceilings
+/// `DescribeAccountLimits` advertises, and an advertised ceiling a write is not held to is
+/// no ceiling.
+pub fn quota_violation(body: &str) -> Option<String> {
+    let mut document = document(body)?;
+    super::sam::expand(&mut document);
+    quota_violation_in(&document)
+}
+
+/// [`quota_violation`] over an already-parsed, already-expanded document, so a submitting
+/// operation and the reader it hands the body to count the same sections once each rather
+/// than disagreeing about them.
+fn quota_violation_in(document: &Value) -> Option<String> {
+    // In section order, so a template past more than one is refused for the same quota
+    // however its body is spelled. The refusal names the section, the count the body
+    // declares and the maximum it is past, which is the form the service words it in.
+    [
+        ("Parameters", MAX_PARAMETERS_PER_TEMPLATE),
+        ("Resources", MAX_RESOURCES_PER_TEMPLATE),
+        ("Outputs", MAX_OUTPUTS_PER_TEMPLATE),
+    ]
+    .into_iter()
+    .find_map(|(section, quota)| {
+        let declared = document
+            .get(section)
+            .and_then(Value::as_object)
+            .map_or(0, Map::len);
+        (declared > quota).then(|| {
+            format!(
+                "Template format error: {section} count {declared} is greater than max \
+                 allowed {quota}"
+            )
+        })
+    })
+}
+
 /// The template body as CloudFormation PROCESSED it: the expansion of the macros this
 /// emulator processes, spelled as a JSON template (one `serde_json::Value` represents
 /// either submitted spelling, so the processed form of a YAML body is its JSON
@@ -721,8 +767,12 @@ fn within_node_bound(document: &Value) -> bool {
 
 /// The sections of a parsed template this service reads, or `None` when a section is past
 /// the documented quota on it (such a template is not one CloudFormation accepts, so
-/// nothing here reports part of it).
+/// nothing here reports part of it — [`quota_violation_in`] is where those ceilings are
+/// counted, once, for this reader and for the operations that refuse such a body).
 fn template_of(document: &Value) -> Option<Template> {
+    if quota_violation_in(document).is_some() {
+        return None;
+    }
     let mut template = Template {
         mappings: document
             .get("Mappings")
@@ -745,9 +795,6 @@ fn template_of(document: &Value) -> Option<Template> {
         .filter(|description| !description.is_empty())
         .map(ToString::to_string);
     if let Some(parameters) = document.get("Parameters").and_then(Value::as_object) {
-        if parameters.len() > MAX_PARAMETERS_PER_TEMPLATE {
-            return None;
-        }
         for (name, declaration) in parameters {
             template.parameters.push(DeclaredParameter {
                 key: name.clone(),
@@ -773,9 +820,6 @@ fn template_of(document: &Value) -> Option<Template> {
     }
     template.transforms = declared_transforms(document.get("Transform"));
     if let Some(resources) = document.get("Resources").and_then(Value::as_object) {
-        if resources.len() > MAX_RESOURCES_PER_TEMPLATE {
-            return None;
-        }
         for (logical_id, declaration) in resources {
             // "The Resources section declares the AWS resources that you want to include
             // in the stack … Type: required": an entry with no string `Type` declares no
@@ -799,9 +843,6 @@ fn template_of(document: &Value) -> Option<Template> {
         }
     }
     if let Some(outputs) = document.get("Outputs").and_then(Value::as_object) {
-        if outputs.len() > MAX_OUTPUTS_PER_TEMPLATE {
-            return None;
-        }
         for (key, declaration) in outputs {
             // "Value (required): The value of the property returned by the
             // DescribeStacks operation."

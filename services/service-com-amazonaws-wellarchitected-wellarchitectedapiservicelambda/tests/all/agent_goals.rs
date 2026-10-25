@@ -147,7 +147,11 @@ pub(crate) async fn get_goal(client: &Client, profile_arn: &str, id: &str) -> An
         .await
 }
 
-async fn delete_goal(client: &Client, profile_arn: &str, id: &str) -> Answer {
+/// `DELETE /api/v1/agent-profiles/{profileArn}/goals/{goalId}`.
+///
+/// `pub(crate)` because the update suite beside this one deletes the goal it spent its
+/// idempotency tokens on, and a goal is removed by exactly one operation.
+pub(crate) async fn delete_goal(client: &Client, profile_arn: &str, id: &str) -> Answer {
     client
         .send(
             "DELETE",

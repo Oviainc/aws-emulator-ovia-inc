@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ssoadmin_permission_sets::{
-    assert_refused, call, organization_router, router, seeded_instance_arn, UNKNOWN_INSTANCE_ARN,
+    account_instance_router, assert_refused, call, organization_router, UNKNOWN_INSTANCE_ARN,
 };
 
 /// A pattern-valid `PermissionSetArn` that was never minted, for the not-found rows.
@@ -475,8 +475,7 @@ async fn an_unknown_instance_or_permission_set_is_not_found() {
 /// before any resource lookup.
 #[tokio::test]
 async fn the_delete_is_refused_on_an_account_instance() {
-    let router = router();
-    let account_instance_arn = seeded_instance_arn(&router).await;
+    let (router, account_instance_arn) = account_instance_router().await;
     // Pattern-valid under the account instance's own id, so the refusal cannot be the
     // modelled constraint check.
     let permission_set_arn = format!(

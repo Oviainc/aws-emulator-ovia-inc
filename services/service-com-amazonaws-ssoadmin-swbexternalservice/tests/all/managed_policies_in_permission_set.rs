@@ -39,7 +39,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ssoadmin_permission_sets::{
-    call, error_code, organization_engine, router, router_over, seeded_instance_arn, with_store,
+    account_instance_router, call, error_code, organization_engine, router_over, with_store,
     UNKNOWN_INSTANCE_ARN,
 };
 
@@ -509,8 +509,7 @@ async fn a_token_this_enumeration_did_not_issue_is_refused() {
 /// the scaffold's 501.
 #[tokio::test]
 async fn the_operation_is_withdrawn_on_an_account_instance() {
-    let router = router();
-    let instance_arn = seeded_instance_arn(&router).await;
+    let (router, instance_arn) = account_instance_router().await;
 
     for max_results in [None, Some(1), Some(100)] {
         let case = format!("MaxResults {max_results:?}");
