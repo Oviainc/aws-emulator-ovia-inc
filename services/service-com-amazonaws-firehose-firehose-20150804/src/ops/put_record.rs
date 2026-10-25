@@ -198,29 +198,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
 
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        store.materialise_due(now);
-
         // One lookup resolves the stream, refuses it if it is not accepting data, and
         // mints the id the record is stored under — so no id is ever handed out for a
-        // record that was not stored.
-        let (record_id, encrypted) =
-            match store.ingest_record(&input.delivery_stream_name, input.record.data, now) {
-                Ok(stored) => stored,
-                Err(crate::state::StreamRefusal::NoSuchStream) => return Err(no_such_stream()),
-                Err(crate::state::StreamRefusal::NotActive(status)) => {
-                    return Err(stream_not_active(&input.delivery_stream_name, status))
-                }
-                Err(crate::state::StreamRefusal::SourceNotCloudWatchLogs) => {
-                    return Err(not_from_cloudwatch_logs(&input.delivery_stream_name))
-                }
-            };
+        // record that was not stored. The guard lives in this block alone: the delivery
+        // below is awaited with no lock of this store held.
+        let ingested = {
+            let mut store = state.lock();
+            store.materialise_due(now);
+            store.ingest_record(&input.delivery_stream_name, input.record.data, now)
+        };
+        let (record_id, encrypted) = match ingested {
+            Ok(stored) => stored,
+            Err(crate::state::StreamRefusal::NoSuchStream) => return Err(no_such_stream()),
+            Err(crate::state::StreamRefusal::NotActive(status)) => {
+                return Err(stream_not_active(&input.delivery_stream_name, status))
+            }
+            Err(crate::state::StreamRefusal::SourceNotCloudWatchLogs) => {
+                return Err(not_from_cloudwatch_logs(&input.delivery_stream_name))
+            }
+        };
 
         // A single put has no per-record channel to report a buffer with no room in, so
         // the whole request is refused with the modelled 503.
         let Some(record_id) = record_id else {
             return Err(at_capacity(&input.delivery_stream_name));
         };
+
+        // The buffer this record joined is delivered to the stream's destination once it
+        // is due, which is what the producer's data eventually being in the destination
+        // bucket means. This put delivers only what an EARLIER buffer was already owed
+        // (nothing this record is in can be due yet) and starts the task that waits for
+        // the clock, so the delivery happens without any further Firehose call.
+        crate::state::delivery::deliver_due(
+            &*self.engine,
+            now,
+            crate::state::delivery::Extractions::LeaveToThePump,
+        )
+        .await;
+        crate::state::delivery::drive_delivery_clock(&self.engine);
 
         Ok(PutRecordOutput {
             record_id,

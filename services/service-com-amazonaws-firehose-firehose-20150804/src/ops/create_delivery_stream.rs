@@ -346,6 +346,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             buffered_bytes: 0,
             // Firehose numbers destination ids from one.
             next_destination_id: 1,
+            delivery_retry_at: None,
         };
         let destination_id = stream.mint_destination_id();
         stream.destinations.push(crate::state::Destination {
