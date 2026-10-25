@@ -341,6 +341,16 @@ pub const AGGREGATE_RULE_COMPLIANCE_TYPES: [&str; 2] =
 /// Config uses the default").
 pub const GET_COMPLIANCE_DETAILS_PAGE_SIZE: usize = 10;
 
+/// How many evaluation results one page of a RESOURCE's evaluation details carries.
+///
+/// `GetComplianceDetailsByResource` has no `Limit` member at all
+/// (`smithy_query(query="operation", operation="GetComplianceDetailsByResource")`), so
+/// the page size is not the caller's to choose and the model documents none; it is the
+/// page the API's other evaluation-details read serves by default
+/// ([`GET_COMPLIANCE_DETAILS_PAGE_SIZE`]), so one resource's results are cut into pages
+/// exactly as one rule's are.
+pub const GET_COMPLIANCE_DETAILS_BY_RESOURCE_PAGE_SIZE: usize = GET_COMPLIANCE_DETAILS_PAGE_SIZE;
+
 /// The cap a `ComplianceSummary` counts Config rules up to
 /// (`ComplianceSummary$CompliantResourceCount`: "The number of Config rules or Amazon
 /// Web Services resources that are compliant, up to a maximum of 25 for rules").
@@ -4769,72 +4779,85 @@ pub fn decode_pending_aggregation_request_token(token: &str) -> Option<(String, 
     well_formed.then(|| (account.to_string(), region.to_string()))
 }
 
-/// Encode the [`EvaluationResultKey`] a `GetComplianceDetailsByConfigRule` page should
-/// resume at as an opaque `NextToken`.
+/// Encode `fields` as one opaque page token.
 ///
-/// The three fields are LENGTH-PREFIXED rather than joined on a separator:
-/// `ResourceType` (`StringWithCharLimit256`) and `ResourceId` (`BaseResourceId`) are
-/// unconstrained strings, so no character can be claimed as one without a resource id
-/// that contains it splitting the key wrongly.
-pub fn encode_evaluation_result_token(key: &EvaluationResultKey) -> String {
+/// Every field is LENGTH-PREFIXED rather than joined on a separator: a `ResourceType`
+/// (`StringWithCharLimit256`), a `ResourceId` (`BaseResourceId`) and a rule name are
+/// unconstrained strings, so no character can be claimed as a separator without a value
+/// that contains it splitting the key wrongly. The ONE place that encoding is written,
+/// so the paged reads that resume at a multi-field key cannot drift apart.
+fn encode_length_prefixed_token(fields: &[&str]) -> String {
     let mut encoded = String::new();
-    for field in [&key.0, &key.1, &key.2] {
+    for field in fields {
         encoded.push_str(&format!("{}:{field}", field.len()));
     }
     encode_page_token(&encoded)
 }
 
-/// The [`EvaluationResultKey`] a `NextToken` resumes at, or `None` when the token is
-/// malformed — i.e. not something [`encode_evaluation_result_token`] produced, so its
-/// three length-prefixed fields do not account for exactly its decoded bytes.
-pub fn decode_evaluation_result_token(token: &str) -> Option<EvaluationResultKey> {
+/// The `count` fields a length-prefixed token carries, or `None` when the token is
+/// malformed — i.e. not something [`encode_length_prefixed_token`] produced for that
+/// many fields, so its length-prefixed fields do not account for exactly its decoded
+/// bytes.
+fn decode_length_prefixed_token(token: &str, count: usize) -> Option<Vec<String>> {
     let decoded = decode_page_token(token)?;
     let mut rest = decoded.as_str();
-    let mut fields: Vec<String> = Vec::with_capacity(3);
-    for _ in 0..3 {
+    let mut fields: Vec<String> = Vec::with_capacity(count);
+    for _ in 0..count {
         let (length, tail) = rest.split_once(':')?;
         let length: usize = length.parse().ok()?;
         fields.push(tail.get(..length)?.to_string());
         rest = tail.get(length..)?;
     }
-    if !rest.is_empty() {
-        return None;
-    }
-    let mut fields = fields.into_iter();
+    rest.is_empty().then_some(fields)
+}
+
+/// Encode the [`EvaluationResultKey`] a `GetComplianceDetailsByConfigRule` page should
+/// resume at as an opaque `NextToken`.
+pub fn encode_evaluation_result_token(key: &EvaluationResultKey) -> String {
+    encode_length_prefixed_token(&[&key.0, &key.1, &key.2])
+}
+
+/// The [`EvaluationResultKey`] a `NextToken` resumes at, or `None` when the token is
+/// malformed — i.e. not something [`encode_evaluation_result_token`] produced.
+pub fn decode_evaluation_result_token(token: &str) -> Option<EvaluationResultKey> {
+    let mut fields = decode_length_prefixed_token(token, 3)?.into_iter();
     Some((fields.next()?, fields.next()?, fields.next()?))
+}
+
+/// What identifies one evaluation result within ONE RESOURCE's evaluation details: the
+/// Config rule that recorded it and the mode that rule was evaluated in.
+///
+/// The resource is fixed by the request a `GetComplianceDetailsByResource` report
+/// answers, so this pair is what the results of one resource differ along; ordering it
+/// gives the report a stable total order a page can resume at.
+pub type ResourceComplianceDetailKey = (String, String);
+
+/// Encode the [`ResourceComplianceDetailKey`] a `GetComplianceDetailsByResource` page
+/// should resume at as an opaque `NextToken`.
+pub fn encode_resource_compliance_detail_token(key: &ResourceComplianceDetailKey) -> String {
+    encode_length_prefixed_token(&[&key.0, &key.1])
+}
+
+/// The [`ResourceComplianceDetailKey`] a `NextToken` resumes at, or `None` when the
+/// token is malformed — i.e. not something
+/// [`encode_resource_compliance_detail_token`] produced.
+pub fn decode_resource_compliance_detail_token(
+    token: &str,
+) -> Option<ResourceComplianceDetailKey> {
+    let mut fields = decode_length_prefixed_token(token, 2)?.into_iter();
+    Some((fields.next()?, fields.next()?))
 }
 
 /// Encode the resource key a `DescribeRemediationExecutionStatus` page should resume at
 /// as an opaque `NextToken`.
-///
-/// The two fields are LENGTH-PREFIXED rather than joined on a separator, for the reason
-/// [`encode_evaluation_result_token`] gives: a `resourceId` is an unconstrained string,
-/// so no character can be claimed as a separator.
 pub fn encode_remediation_execution_token(resume_at: &(String, String)) -> String {
-    let mut encoded = String::new();
-    for field in [&resume_at.0, &resume_at.1] {
-        encoded.push_str(&format!("{}:{field}", field.len()));
-    }
-    encode_page_token(&encoded)
+    encode_length_prefixed_token(&[&resume_at.0, &resume_at.1])
 }
 
 /// The resource key a `NextToken` resumes at, or `None` when the token is malformed —
-/// i.e. not something [`encode_remediation_execution_token`] produced, so its two
-/// length-prefixed fields do not account for exactly its decoded bytes.
+/// i.e. not something [`encode_remediation_execution_token`] produced.
 pub fn decode_remediation_execution_token(token: &str) -> Option<(String, String)> {
-    let decoded = decode_page_token(token)?;
-    let mut rest = decoded.as_str();
-    let mut fields: Vec<String> = Vec::with_capacity(2);
-    for _ in 0..2 {
-        let (length, tail) = rest.split_once(':')?;
-        let length: usize = length.parse().ok()?;
-        fields.push(tail.get(..length)?.to_string());
-        rest = tail.get(length..)?;
-    }
-    if !rest.is_empty() {
-        return None;
-    }
-    let mut fields = fields.into_iter();
+    let mut fields = decode_length_prefixed_token(token, 2)?.into_iter();
     Some((fields.next()?, fields.next()?))
 }
 
@@ -4918,6 +4941,16 @@ pub fn unaccepted_value_message(member: &str, value: &str, accepted: &[&str]) ->
 pub fn unfilterable_compliance_type_message(member: &str, value: &str) -> String {
     unaccepted_value_message(member, value, &FILTERABLE_COMPLIANCE_TYPES)
 }
+
+/// How a resource-scoped evaluation-details read words `InvalidParameterValueException`
+/// for a request that did not say WHICH resource it is about.
+///
+/// A resource is named either by the execution that evaluated it or by its own type and
+/// id, and nothing else identifies one, so a request carrying neither is refused naming
+/// both ways ("You need to only provide either a ResourceEvaluationID or a ResourceID
+/// and ResourceType", `GetComplianceDetailsByResourceRequest$ResourceEvaluationId`).
+pub const RESOURCE_NOT_IDENTIFIED_MESSAGE: &str =
+    "Either ResourceEvaluationId or both ResourceType and ResourceId must be provided.";
 
 /// How Config words `NoSuchConfigRuleException` for a request that named ONE rule
 /// this account does not hold, through a single-name member (`ConfigRuleName`).

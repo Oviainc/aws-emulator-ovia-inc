@@ -2,7 +2,8 @@
 
 //! @op ListTags
 //! IMPLEMENTED: reports the tag set of the resource the request's `ARN` names — the
-//! ONE set `AddTags` writes and `RemoveTags` removes from.
+//! ONE set `AddTags` writes and `RemoveTags` removes from — and refuses an `ARN`
+//! that resolves to no resource of this account exactly as those two writers do.
 //!
 //! ## Shape of an operation
 //!
@@ -155,11 +156,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A pure read: the stored tag set is projected onto the response and nothing
         // about it changes, so the next caller sees what this one saw.
+        //
+        // An ARN that resolves to no resource of this account is refused the way the
+        // two tag writers refuse it: `ValidationException`, the only not-found error
+        // all three tagging operations model, so a reader and a writer of one tag set
+        // cannot disagree about what a miss on it is.
         let store = state.lock();
         let tags = store.tagged_resource(&input.arn).ok_or_else(|| {
-            ListTagsErrorModeled::ResourceNotFoundException(
-                crate::state::tagged_resource_not_found(&input.arn),
-            )
+            ListTagsErrorModeled::ValidationException(crate::state::tagged_resource_absent())
         })?;
 
         Ok(ListTagsOutput {

@@ -77,6 +77,8 @@ mod lifecycle_preconditions;
 mod offering_listing;
 #[path = "all/ops_name_bindings.rs"]
 mod ops_name_bindings;
+#[path = "all/offering_description.rs"]
+mod offering_description;
 #[path = "all/remove_flow_media_stream.rs"]
 mod remove_flow_media_stream;
 #[path = "all/remove_flow_output.rs"]

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveAutoScalingPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveAutoScalingPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveAutoScalingPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes the automatic scaling policy off one instance group of a cluster: the policy the
+//! group's record carries is dropped, so `ListInstanceGroups` reports the group with none
+//! from here on, and the response carries no members. A cluster the service holds no
+//! record for, a group that cluster does not carry, and a group that carries no policy to
+//! remove are all REFUSED (400 `ValidationException`) rather than answered with an empty
+//! success.
 //!
 //! ## Shape of an operation
 //!
@@ -73,9 +70,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-emr-elasticmapreduce.js
 // here — hence the `RemoveAutoScalingPolicyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.emr#RemoveAutoScalingPolicy")]
+// `InternalServerException` is widened in through `extra_errors`: this SERVICE models it
+// ("This exception occurs when there is an internal failure in the Amazon EMR service.")
+// and `DescribeCluster` declares it, but this operation's own `errors` list is empty —
+// so without the widening an unreachable shared store would have no modelled failure to
+// answer with.
+#[smithy_macros::operation_error(
+    "com.amazonaws.emr#RemoveAutoScalingPolicy",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum RemoveAutoScalingPolicyErrorModeled {
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -129,18 +135,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveAutoScalingPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveAutoScalingPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RemoveAutoScalingPolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the EMR cluster store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // The group's own provisioning span, and the attach span of the policy about to
+        // be taken off, are transitions the clock already owed, so they are materialised
+        // before this call changes anything.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveAutoScalingPolicy"))
+        // This operation models no client error, so a request it must refuse is answered
+        // with the 400 `ValidationException` channel rather than a 501 or an empty 200.
+        let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::unknown_cluster_message(&input.cluster_id),
+            ));
+        };
+
+        let Some(group) = cluster.group_mut(&input.instance_group_id) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::unknown_instance_group_message(&input.instance_group_id),
+            ));
+        };
+
+        // "Removes an automatic scaling policy from a specified instance group" (this
+        // operation's doc): a group carrying no policy has none to remove, so the call is
+        // refused rather than reported as a removal that happened. The group that runs
+        // the primary node falls under the same rule — nothing scales it, so it never
+        // carries a policy to take off.
+        if !group.remove_auto_scaling_policy() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::no_auto_scaling_policy_message(&input.instance_group_id),
+            ));
+        }
+        drop(store);
+
+        Ok(RemoveAutoScalingPolicyOutput {})
     }
 }

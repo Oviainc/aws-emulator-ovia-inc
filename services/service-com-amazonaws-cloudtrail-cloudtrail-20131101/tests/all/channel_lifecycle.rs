@@ -32,13 +32,15 @@
 //! * a channel the registry holds is a tagged resource like the other three, so
 //!   the tags `CreateChannel` persisted read back through `ListTags` and are
 //!   removable through `RemoveTags`;
-//! * `GetChannel` reads a channel back by its ARN or by the bare `UUID` CloudTrail
-//!   minted for it, reports the stored values, refuses an `arn:` value that is not a
-//!   channel ARN with `ChannelARNInvalidException` and an identifier that names no
-//!   stored channel — another account's, another Region's by bare id, or an id
-//!   CloudTrail never minted — with `ChannelNotFoundException` (HTTP 400, the status
-//!   the recorded service answers; the identifier reading and both refusals are the
-//!   registry's shared ones, which `DeleteChannel` and `ListChannels` use too).
+//! * `GetChannel` reads a channel back by its ARN or by the `UUID` CloudTrail minted
+//!   for it, reports the stored values, refuses a value in NEITHER of those two forms
+//!   — an `arn:` value that is not a channel ARN, or a bare value that is not written
+//!   as the modelled `UUID` — with `ChannelARNInvalidException`, and an identifier in
+//!   one of them that names no stored channel — another account's, another Region's by
+//!   bare id, or a `UUID` no channel carries — with `ChannelNotFoundException` (HTTP
+//!   400, the status the recorded service answers; the identifier reading and both
+//!   refusals are the registry's shared ones, which `DeleteChannel` and `ListChannels`
+//!   use too).
 //!
 //! How a request's `X-Amz-Target` prefix is read is pinned by
 //! `tests/all/target_prefix_dispatch.rs`, so these cases use the shared harness's
@@ -272,8 +274,7 @@ async fn create_channel_mints_an_arn_and_get_channel_reads_the_channel_back() {
 async fn create_channel_refuses_every_destination_that_is_not_a_usable_event_data_store() {
     let emulator = Emulator::new();
     let active = seed_store(&emulator, HOME_REGION, "eds-active", Enabled);
-    let deleting =
-        seed_store(&emulator, HOME_REGION, "eds-deleting", PendingDeletion);
+    let deleting = seed_store(&emulator, HOME_REGION, "eds-deleting", PendingDeletion);
     let elsewhere = seed_store(&emulator, OTHER_REGION, "eds-elsewhere", Enabled);
     let account = engine::EMULATOR_ACCOUNT_ID;
 
@@ -288,7 +289,9 @@ async fn create_channel_refuses_every_destination_that_is_not_a_usable_event_dat
             "resource-type-misspelled",
             destination(
                 EVENT_DATA_STORE,
-                &format!("arn:aws:cloudtrail:{OTHER_REGION}:{account}:eventdatastorewrong/{UNKNOWN_UUID}"),
+                &format!(
+                    "arn:aws:cloudtrail:{OTHER_REGION}:{account}:eventdatastorewrong/{UNKNOWN_UUID}"
+                ),
             ),
             400,
             "EventDataStoreARNInvalidException",
@@ -356,10 +359,7 @@ async fn create_channel_refuses_every_destination_that_is_not_a_usable_event_dat
             // Known id, but the ARN names a Region the store is not in: a
             // different ARN, so a different store, and this account holds none.
             "right-id-wrong-region",
-            destination(
-                EVENT_DATA_STORE,
-                &elsewhere.replace(OTHER_REGION, HOME_REGION),
-            ),
+            destination(EVENT_DATA_STORE, &elsewhere.replace(OTHER_REGION, HOME_REGION)),
             400,
             "EventDataStoreNotFoundException",
         ),
@@ -758,11 +758,14 @@ async fn get_channel_refuses_a_malformed_identifier_and_an_unknown_channel() {
 
     // Every value here satisfies `ChannelArn`'s modelled
     // `@pattern ^[a-zA-Z0-9._/\-:]+$` and `@length 3..256`, so the handler is what
-    // refuses it. An ARN is the only form with a format to get wrong, so an `arn:`
-    // value that is not a channel ARN is `ChannelARNInvalidException`, while
-    // anything else is read as a channel id — and an id CloudTrail never minted
-    // simply names no channel, which is `ChannelNotFoundException` (the shared
-    // reading in `state::channels`, also pinned by `channel_deletion.rs`).
+    // refuses it. `Channel` admits exactly two forms — a channel ARN, and the
+    // channel's `UUID` as the model writes one (`@length 36`,
+    // `@pattern ^[a-f0-9\-]+$`) — so a value in NEITHER form can name no channel and
+    // is `ChannelARNInvalidException`, while a value in one of them that no stored
+    // channel matches is `ChannelNotFoundException`. The id INSIDE a well-formed
+    // channel ARN stays opaque, because the ARN format the model publishes carries
+    // one that is not a UUID at all (the shared reading in `state::channels`, also
+    // pinned by `channel_deletion.rs`).
     let cases: Vec<(&str, String, u16, &str)> = vec![
         (
             // The recorded instance: a CloudTrail ARN with no `channel/` resource.
@@ -796,14 +799,47 @@ async fn get_channel_refuses_a_malformed_identifier_and_an_unknown_channel() {
             "ChannelARNInvalidException",
         ),
         (
-            "channel-id-not-a-minted-uuid",
-            format!("arn:aws:cloudtrail:{HOME_REGION}:{account}:channel/not-a-uuid"),
-            400,
-            "ChannelNotFoundException",
-        ),
-        (
+            // A bare value is the `UUID` form or nothing: this one has no groups
+            // at all.
             "bare-value-that-is-not-a-uuid",
             "my-channel".to_string(),
+            400,
+            "ChannelARNInvalidException",
+        ),
+        (
+            "bare-value-one-uuid-group-short",
+            UNKNOWN_UUID
+                .rsplit_once('-')
+                .expect("a UUID carries hyphen-separated groups")
+                .0
+                .to_string(),
+            400,
+            "ChannelARNInvalidException",
+        ),
+        (
+            "bare-value-with-a-non-hex-digit",
+            format!("{}z", &UNKNOWN_UUID[..UNKNOWN_UUID.len() - 1]),
+            400,
+            "ChannelARNInvalidException",
+        ),
+        (
+            // The `UUID` the model writes is lowercase hex, so this is in neither
+            // form either.
+            "bare-value-in-upper-case-hex",
+            UNKNOWN_UUID.to_uppercase(),
+            400,
+            "ChannelARNInvalidException",
+        ),
+        (
+            // The recorded instance of a bare value in neither form.
+            "recorded-bare-value",
+            "not-a-channel-arn".to_string(),
+            400,
+            "ChannelARNInvalidException",
+        ),
+        (
+            "channel-id-not-a-minted-uuid",
+            format!("arn:aws:cloudtrail:{HOME_REGION}:{account}:channel/not-a-uuid"),
             400,
             "ChannelNotFoundException",
         ),
@@ -840,4 +876,3 @@ async fn get_channel_refuses_a_malformed_identifier_and_an_unknown_channel() {
         );
     }
 }
-

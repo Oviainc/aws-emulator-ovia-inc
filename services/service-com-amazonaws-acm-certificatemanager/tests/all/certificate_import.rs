@@ -26,30 +26,30 @@ use crate::certificate_lifecycle::{
 };
 
 /// One imported certificate, as the test generated it.
-struct Generated {
+pub(crate) struct Generated {
     /// The PEM body handed to `ImportCertificate` as `Certificate`.
-    certificate: String,
+    pub(crate) certificate: String,
     /// The PEM body handed to it as `PrivateKey`.
-    private_key: String,
+    pub(crate) private_key: String,
     /// The certificate's own serial, as the detail must report it: lowercase hex of
     /// the X.509 serial number's bytes.
-    serial: String,
+    pub(crate) serial: String,
     /// The certificate's own validity window, in whole epoch seconds.
-    not_before: f64,
-    not_after: f64,
+    pub(crate) not_before: f64,
+    pub(crate) not_after: f64,
 }
 
 /// What one generated certificate is built from: the subject common name (if any),
 /// the subject organization (if any), the DNS subject alternative names, the signature
 /// algorithm its key pair uses, whether it asserts key usages, and its validity window
 /// as `(not_before, not_after)` years.
-struct Blueprint<'a> {
-    common_name: Option<&'a str>,
-    organization: Option<&'a str>,
-    dns_names: &'a [&'a str],
-    algorithm: &'static rcgen::SignatureAlgorithm,
-    key_usages: bool,
-    validity: (i32, i32),
+pub(crate) struct Blueprint<'a> {
+    pub(crate) common_name: Option<&'a str>,
+    pub(crate) organization: Option<&'a str>,
+    pub(crate) dns_names: &'a [&'a str],
+    pub(crate) algorithm: &'static rcgen::SignatureAlgorithm,
+    pub(crate) key_usages: bool,
+    pub(crate) validity: (i32, i32),
 }
 
 impl Default for Blueprint<'_> {
@@ -67,7 +67,7 @@ impl Default for Blueprint<'_> {
 }
 
 /// Generate a real self-signed certificate and its private key from `blueprint`.
-fn generate(blueprint: &Blueprint<'_>) -> Generated {
+pub(crate) fn generate(blueprint: &Blueprint<'_>) -> Generated {
     let key = rcgen::KeyPair::generate_for(blueprint.algorithm).expect("a key pair");
     generate_signed_by(blueprint, &key)
 }
@@ -133,12 +133,12 @@ fn epoch_seconds(at: std::time::SystemTime) -> f64 {
 }
 
 /// A PEM body as the base64 a blob member carries on the wire.
-fn blob(pem: &str) -> Value {
+pub(crate) fn blob(pem: &str) -> Value {
     json!(aws_smithy_types::base64::encode(pem.as_bytes()))
 }
 
 /// The `ImportCertificate` request body for one generated certificate.
-fn import_body(generated: &Generated) -> Value {
+pub(crate) fn import_body(generated: &Generated) -> Value {
     json!({
         "Certificate": blob(&generated.certificate),
         "PrivateKey": blob(&generated.private_key),
@@ -146,7 +146,7 @@ fn import_body(generated: &Generated) -> Value {
 }
 
 /// Import one certificate, requiring success, and return the ARN it was stored under.
-async fn import(router: &MultiServiceRouter, case: &str, body: &Value) -> String {
+pub(crate) async fn import(router: &MultiServiceRouter, case: &str, body: &Value) -> String {
     let (status, response) = call(router, "ImportCertificate", body).await;
     assert_eq!(
         status, 200,

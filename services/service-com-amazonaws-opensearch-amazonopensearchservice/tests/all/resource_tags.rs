@@ -24,10 +24,9 @@
 //!   named twice;
 //! * tags belong to the resource the ARN names: a call on one domain never changes
 //!   another domain's set, and a deleted domain's ARN no longer resolves;
-//! * an ARN that names no resource of this account is refused — with the modelled
-//!   `ValidationException` by the two writers, which model no
-//!   `ResourceNotFoundException`, and with `ResourceNotFoundException` by the
-//!   reader, which does — and a value that is no ARN at all is refused as a
+//! * an ARN that names no resource of this account is refused by all three with the
+//!   modelled `ValidationException` and ONE wording, over a table of ways an ARN
+//!   can resolve to nothing, and a value that is no ARN at all is refused as a
 //!   malformed request by all three;
 //! * a resource carries at most the documented number of tags: attaching more is
 //!   refused with the modelled `LimitExceededException` and leaves the stored set
@@ -142,6 +141,20 @@ fn label(tags: &[(String, String)]) -> String {
 
 fn tag(key: &str, value: &str) -> (String, String) {
     (key.to_string(), value.to_string())
+}
+
+/// How the service words the refusal of a tagging `ARN` that resolves to no
+/// resource of this account. Fixed text: the ARN named nothing, so nothing from the
+/// request fills it in.
+const UNRESOLVABLE_ARN: &str = "Invalid ARN. Domain not found.";
+
+/// The `message` an error answer carries, under either casing a wire path may use.
+fn error_message(answer: &Answer) -> String {
+    answer.body["message"]
+        .as_str()
+        .or_else(|| answer.body["Message"].as_str())
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// The tag-list table: one row per way one accepted list differs from another — how
@@ -488,48 +501,36 @@ async fn an_arn_that_names_no_resource_is_refused_by_every_tagging_operation() {
     for (what, arn) in unresolvable {
         let case = format!("{what}: {arn}");
 
-        // Neither writer models `ResourceNotFoundException`, so the modelled
-        // refusal for a resource that doesn't exist is `ValidationException`.
-        let attached = add_tags(&emulator, arn, wire_tags(&[tag("env", "prod")])).await;
-        assert_eq!(
-            attached.status, 400,
-            "case AddTags({case}): expected 400, got {} with {:?}",
-            attached.status, attached.body
-        );
-        assert_eq!(
-            error_code(&attached),
-            "ValidationException",
-            "case AddTags({case}): expected ValidationException, got {:?}",
-            attached.body
-        );
-
-        let removed = remove_tags(&emulator, arn, &["env"]).await;
-        assert_eq!(
-            removed.status, 400,
-            "case RemoveTags({case}): expected 400, got {} with {:?}",
-            removed.status, removed.body
-        );
-        assert_eq!(
-            error_code(&removed),
-            "ValidationException",
-            "case RemoveTags({case}): expected ValidationException, got {:?}",
-            removed.body
-        );
-
-        // The reader DOES model `ResourceNotFoundException`, which is the refusal
-        // for an ARN naming no resource.
-        let read = list_tags(&emulator, arn).await;
-        assert_eq!(
-            read.status, 409,
-            "case ListTags({case}): expected 409, got {} with {:?}",
-            read.status, read.body
-        );
-        assert_eq!(
-            error_code(&read),
-            "ResourceNotFoundException",
-            "case ListTags({case}): expected ResourceNotFoundException, got {:?}",
-            read.body
-        );
+        // `ValidationException` is the only not-found refusal all three tagging
+        // operations model — the two writers declare no `ResourceNotFoundException`
+        // at all — so the reader and the writers of one tag set answer a miss on it
+        // identically, down to the wording.
+        for (operation, answer) in [
+            (
+                "AddTags",
+                add_tags(&emulator, arn, wire_tags(&[tag("env", "prod")])).await,
+            ),
+            ("RemoveTags", remove_tags(&emulator, arn, &["env"]).await),
+            ("ListTags", list_tags(&emulator, arn).await),
+        ] {
+            assert_eq!(
+                answer.status, 400,
+                "case {operation}({case}): expected 400, got {} with {:?}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                error_code(&answer),
+                "ValidationException",
+                "case {operation}({case}): expected ValidationException, got {:?}",
+                answer.body
+            );
+            assert_eq!(
+                error_message(&answer),
+                UNRESOLVABLE_ARN,
+                "case {operation}({case}): expected the unresolvable-ARN wording, got {:?}",
+                answer.body
+            );
+        }
     }
 
     // The domain that does exist is untouched by every refusal above.

@@ -1222,12 +1222,12 @@ async fn a_tunnel_carries_at_most_its_limit_of_tags() {
             );
         } else {
             assert_eq!(
-                status, 400,
+                status, 403,
                 "case {count} tags at open: expected refusal, answered {status} {body:?}"
             );
             assert_eq!(
                 body["__type"].as_str(),
-                Some("ValidationException"),
+                Some("LimitExceededException"),
                 "case {count} tags at open: answered {body:?}"
             );
             assert_eq!(
@@ -1262,12 +1262,12 @@ async fn a_tunnel_carries_at_most_its_limit_of_tags() {
     )
     .await;
     assert_eq!(
-        status, 400,
+        status, 403,
         "a new key past the limit must be refused, answered {status} {refused:?}"
     );
     assert_eq!(
         refused["__type"].as_str(),
-        Some("ValidationException"),
+        Some("LimitExceededException"),
         "a new key past the limit answered {refused:?}"
     );
     let (_, listed) = call(

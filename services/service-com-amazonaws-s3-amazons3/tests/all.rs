@@ -75,6 +75,8 @@ mod head_object_read_back;
 mod list_buckets;
 #[path = "all/listing_encoding_type.rs"]
 mod listing_encoding_type;
+#[path = "all/listing_optional_members.rs"]
+mod listing_optional_members;
 #[path = "all/multipart_part_upload.rs"]
 mod multipart_part_upload;
 #[path = "all/multipart_upload_initiation.rs"]

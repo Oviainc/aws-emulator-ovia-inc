@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchLocalGatewayRoutes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchLocalGatewayRoutes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchLocalGatewayRoutes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Searches the routes of ONE local gateway route table out of [`crate::state`]: every
+//! route the table holds by default, or the subset the request's `Filters` select — the
+//! attribute filters by value, the `route-search.*` filters by CIDR relation — one
+//! `MaxResults`-sized page at a time. A reporting operation: it writes nothing, a stored
+//! route carrying no clock-owed transition, and a route table id the account holds no table
+//! for is refused with `InvalidLocalGatewayRouteTableID.NotFound` rather than answered with
+//! an empty set.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +146,421 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchLocalGatewayRoutes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchLocalGatewayRoutesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchLocalGatewayRoutes"))
+        // `ctx` carries request metadata only; this operation reads none of it. The store is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "Checks whether you have the required permissions for the action, without
+        // actually making the request, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation"
+        // (`SearchLocalGatewayRoutesRequest$DryRun`). Every caller of this emulator is
+        // permitted, so a dry run reports that outcome and reads nothing.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        let state = crate::state::require_service_state(&*self.engine)?;
+
+        // "The token for the next page of results" (`...Request$NextToken`) — anything else
+        // is refused rather than read as a destination, and it is refused before the filters,
+        // the page size and the route table id are looked at, so whether a bogus token is
+        // caught never depends on the rest of the request. A dry run is settled ahead of it
+        // (above), as it is for every sibling describe: "without actually making the request"
+        // means no member of the request is read as a destination at all.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(|| crate::state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // Matching cost is filters x values x routes, so each request-controlled factor is
+        // capped BEFORE any work proportional to it is done, the model bounding none of
+        // them, and their PRODUCT is charged to one [`crate::state::MatchBudget`] below —
+        // the bound the per-factor caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > crate::state::MAX_FILTERS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum of {}",
+                crate::state::MAX_FILTERS
+            )));
+        }
+
+        // A filter name this operation does not document is refused whether or not any route
+        // would have matched it, so an unsupported filter can never read as "no results".
+        // The attribute filters compare text, so each value is compiled into its pattern
+        // ONCE here; a `route-search.*` filter compares CIDR BLOCKS rather than text, so its
+        // values are read as blocks once here instead, and a value that is not a block is
+        // refused rather than compared as a string it would never equal.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<crate::state::CompiledFilter> = Vec::with_capacity(filters.len());
+        let mut searches: Vec<RouteSearch> = Vec::new();
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !ROUTE_FILTERS.contains(&name) {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > crate::state::MAX_FILTER_VALUES {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of {}",
+                    values.len(),
+                    crate::state::MAX_FILTER_VALUES
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the text matcher's cost is
+            // the product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > crate::state::MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of {}",
+                    oversize.len(),
+                    crate::state::MAX_FILTER_VALUE_BYTES
+                )));
+            }
+            match RouteSearchKind::of_filter(name) {
+                Some(kind) => {
+                    let mut blocks = Vec::with_capacity(values.len());
+                    for value in values {
+                        let block =
+                            crate::state::canonical_cidr_block(value).ok_or_else(|| {
+                                crate::state::invalid_parameter_value(format!(
+                                    "The value '{value}' for the filter '{name}' is not an \
+                                     IPv4 or IPv6 address range in CIDR notation"
+                                ))
+                            })?;
+                        blocks.push(block);
+                    }
+                    let longest = vec![None; blocks.len()];
+                    searches.push(RouteSearch {
+                        kind,
+                        blocks,
+                        longest,
+                    });
+                }
+                None => selectors.push(crate::state::CompiledFilter::new(
+                    name.to_string(),
+                    values.to_vec(),
+                )),
+            }
+        }
+
+        // "The maximum number of results to return with a single call"
+        // (`...Request$MaxResults`). The model puts no range on this member, so the handler
+        // is the only place a page can be bounded: a request that names none gets the
+        // largest page ([`crate::state::MAX_PAGE_SIZE`]), so the `NextToken` path below
+        // behaves the same whether or not a page size was asked for, and a value that cannot
+        // convert — a negative one — gets the SMALLEST page rather than the largest, so no
+        // conversion can widen a page.
+        let limit = match input.max_results {
+            None => crate::state::MAX_PAGE_SIZE,
+            Some(max_results) => usize::try_from(max_results)
+                .unwrap_or(1)
+                .clamp(1, crate::state::MAX_PAGE_SIZE),
+        };
+
+        let store = state.lock();
+
+        // "Searches for routes in the specified local gateway route table"
+        // (`SearchLocalGatewayRoutes`): the table is the thing being read, so an id the
+        // account holds no table for is a refusal rather than a search that matched nothing.
+        // Resolved through the crate's ONE reader of a local gateway route table id
+        // ([`crate::state::require_known_local_gateway_route_table`]), so this operation
+        // refuses an id exactly as the create, modify and delete of a route do: something
+        // that is not an id of this resource is `.Malformed`, and a well-formed id of no
+        // table of the account is `InvalidLocalGatewayRouteTableID.NotFound`. An account with
+        // no Outpost holds no local gateway route table at all, so that is the answer it gets
+        // for every well-formed id.
+        let route_table_id = input.local_gateway_route_table_id.as_str();
+        crate::state::require_known_local_gateway_route_table(&store, route_table_id)?;
+        // Every route of the table, by the destination that names it there: the table record
+        // is the only place a route lives, so a search reads the routes THROUGH the table it
+        // just resolved rather than from a second store that could disagree.
+        let routes = store
+            .local_gateway_route_tables
+            .get(route_table_id)
+            .map(|record| &record.routes)
+            .ok_or_else(|| {
+                crate::state::invalid_local_gateway_route_table_id_not_found(route_table_id)
+            })?;
+
+        // Every comparison, and every candidate, is charged to ONE budget, so the PRODUCT of
+        // the table's routes, the filters, their values and each value's length is bounded
+        // however the caller combines them — which is also what bounds how long this holds
+        // the state lock.
+        let mut budget = crate::state::MatchBudget::new(crate::state::MAX_FILTER_MATCH_STEPS);
+
+        // "route-search.longest-prefix-match - The longest prefix that matches the route":
+        // unlike every other filter this is not a property of one route but a comparison
+        // BETWEEN the table's routes, so the most specific destination containing each value
+        // is found first, here, and the filter then selects the routes that have it. It is
+        // computed over the whole table, each filter being evaluated against the table
+        // independently before the filters are joined with an AND.
+        for search in &mut searches {
+            if !matches!(search.kind, RouteSearchKind::LongestPrefix) {
+                continue;
+            }
+            for (index, block) in search.blocks.iter().enumerate() {
+                let mut best: Option<u32> = None;
+                for route in routes.values() {
+                    if !budget.spend() {
+                        break;
+                    }
+                    let Some(destination) = canonical_destination(route) else {
+                        continue;
+                    };
+                    if crate::state::cidr_block_contains_block(&destination, block) {
+                        let length = crate::state::cidr_block_prefix_length(&destination);
+                        best = match (best, length) {
+                            (Some(best), Some(length)) => Some(best.max(length)),
+                            (best, length) => best.or(length),
+                        };
+                    }
+                }
+                if let Some(slot) = search.longest.get_mut(index) {
+                    *slot = best;
+                }
+            }
+        }
+
+        // The default is to report every route of the table; every filter the request
+        // carries must then hold ("If you specify multiple filters, the filters are joined
+        // with an AND" — `Filter`).
+        let mut selected: Vec<(&str, &LocalGatewayRoute)> = Vec::new();
+        for (destination_key, route) in routes {
+            if budget.exhausted() {
+                break;
+            }
+            let destination = canonical_destination(route);
+            if matches_every_filter(route, &selectors, &mut budget)
+                && searches
+                    .iter()
+                    .all(|search| search.matches(destination.as_deref(), &mut budget))
+            {
+                selected.push((destination_key.as_str(), route));
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told
+        // so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {} comparisons to evaluate; \
+                     narrow them or page with MaxResults",
+                    crate::state::MAX_FILTER_MATCH_STEPS
+                ),
+            ));
+        }
+
+        // The routes come out of the table in destination order (the record's own key order),
+        // which is both the stable paging order and what the cursor names a position in — a
+        // route has no id of its own, its destination being what names it in its table — so a
+        // token naming the destination the next page starts at always advances, and the key
+        // the cursor is compared against IS the key the order is by.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|(destination, _)| *destination < cursor),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "This value is null when there are no more results to return"
+        // (`...Result$NextToken`): a token only when a route follows this page.
+        let next_token = page
+            .get(limit)
+            .map(|(destination, _)| crate::state::encode_page_token(destination));
+
+        Ok(SearchLocalGatewayRoutesOutput {
+            routes: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|(_, route)| (*route).clone())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// The filter names this operation documents, from
+/// `SearchLocalGatewayRoutesRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="SearchLocalGatewayRoutesRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// That doc names no `tag:<key>` or `tag-key` filter for this operation, and the modelled
+/// `LocalGatewayRoute` carries no tags either, so neither is accepted here. Every entry is
+/// answered either by [`filter_values`] (an attribute of the route) or by
+/// [`RouteSearchKind::of_filter`] (a CIDR relation between the route's destination and the
+/// value).
+const ROUTE_FILTERS: [&str; 7] = [
+    "prefix-list-id",
+    "route-search.exact-match",
+    "route-search.longest-prefix-match",
+    "route-search.subnet-of-match",
+    "route-search.supernet-of-match",
+    "state",
+    "type",
+];
+
+/// Which CIDR relation a `route-search.*` filter asks for between a route's destination and
+/// the block the filter names.
+///
+/// These are the filters that are NOT text comparisons: each one relates two CIDR blocks,
+/// so a value is read as a block and compared by address range rather than by the `*`/`?`
+/// pattern an attribute filter uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteSearchKind {
+    /// "route-search.exact-match - The exact match of the specified filter": the route's
+    /// destination IS the block.
+    Exact,
+    /// "route-search.longest-prefix-match - The longest prefix that matches the route": of
+    /// the destinations that contain the block, the most specific one.
+    LongestPrefix,
+    /// "route-search.subnet-of-match - The routes with a subnet that match the specified
+    /// CIDR filter": the route's destination is inside the block.
+    SubnetOf,
+    /// "route-search.supernet-of-match - The routes with a CIDR that encompass the CIDR
+    /// filter": the route's destination encompasses the block. The doc's own example —
+    /// "if you have 10.0.1.0/29 and 10.0.1.0/31 routes in your route table and you specify
+    /// supernet-of-match as 10.0.1.0/30, then the result returns 10.0.1.0/29" — is this
+    /// relation and not [`Self::SubnetOf`]'s.
+    SupernetOf,
+}
+
+impl RouteSearchKind {
+    /// The relation `name` asks for, or `None` when it is not a `route-search.*` filter at
+    /// all (an attribute filter, compared as text by [`filter_values`]).
+    fn of_filter(name: &str) -> Option<Self> {
+        match name {
+            "route-search.exact-match" => Some(Self::Exact),
+            "route-search.longest-prefix-match" => Some(Self::LongestPrefix),
+            "route-search.subnet-of-match" => Some(Self::SubnetOf),
+            "route-search.supernet-of-match" => Some(Self::SupernetOf),
+            _ => None,
+        }
+    }
+}
+
+/// One `route-search.*` filter: the relation it asks for and its values read as CIDR blocks
+/// ONCE, before any route is compared against them.
+#[derive(Debug)]
+struct RouteSearch {
+    kind: RouteSearchKind,
+    /// The filter's values, canonical ([`crate::state::canonical_cidr_block`]), in the order
+    /// the request gave them.
+    blocks: Vec<String>,
+    /// For a [`RouteSearchKind::LongestPrefix`] filter, the longest destination prefix
+    /// in the table that contains each value — one entry per entry of [`Self::blocks`], and
+    /// `None` where no route's destination contains that value. Left all-`None` for every
+    /// other relation, which needs no cross-route comparison.
+    longest: Vec<Option<u32>>,
+}
+
+impl RouteSearch {
+    /// Does a route whose canonical destination block is `destination` satisfy this filter?
+    ///
+    /// "If you specify multiple values for a filter, the values are joined with an OR"
+    /// (`Filter$Values`), so one value holding is enough — and a filter carrying no value at
+    /// all matches nothing, there being no block for the destination to relate to. A route
+    /// whose destination is a prefix list rather than a CIDR block carries no block to
+    /// compare, so it matches no `route-search.*` filter — the same answer EC2 gives for any
+    /// attribute a resource holds no value for.
+    ///
+    /// Every comparison is charged to `budget`, so one request's searching cannot cost more
+    /// than the ceiling however it combines filters and values.
+    fn matches(&self, destination: Option<&str>, budget: &mut crate::state::MatchBudget) -> bool {
+        let Some(destination) = destination else {
+            return false;
+        };
+        self.blocks.iter().enumerate().any(|(index, block)| {
+            if !budget.spend() {
+                return false;
+            }
+            match self.kind {
+                RouteSearchKind::Exact => destination == block.as_str(),
+                RouteSearchKind::SubnetOf => {
+                    crate::state::cidr_block_contains_block(block, destination)
+                }
+                RouteSearchKind::SupernetOf => {
+                    crate::state::cidr_block_contains_block(destination, block)
+                }
+                // The longest prefix was found over the whole table above: this route is
+                // selected when its destination contains the value and is exactly that
+                // long, so two equally specific destinations are both reported.
+                RouteSearchKind::LongestPrefix => {
+                    self.longest.get(index).copied().flatten().is_some_and(|best| {
+                        crate::state::cidr_block_prefix_length(destination) == Some(best)
+                            && crate::state::cidr_block_contains_block(destination, block)
+                    })
+                }
+            }
+        })
+    }
+}
+
+/// The route's destination CIDR block in canonical form, or `None` for a route whose
+/// destination is a prefix list (or a block this emulator cannot read).
+///
+/// Read once per route, so the `route-search.*` comparisons below all work on the same
+/// canonical form and a destination written as `10.0.1.5/24` relates exactly as
+/// `10.0.1.0/24` does.
+fn canonical_destination(route: &LocalGatewayRoute) -> Option<String> {
+    route
+        .destination_cidr_block
+        .as_deref()
+        .and_then(crate::state::canonical_cidr_block)
+}
+
+/// The values the EC2 filter `name` compares against this route, for the filters that
+/// compare an ATTRIBUTE of the route as text.
+///
+/// A filter naming an attribute this route does not carry compares against NO values, so it
+/// selects nothing — the same answer AWS gives for any attribute a resource holds no value
+/// for. The `route-search.*` names are not here: they relate CIDR blocks rather than text,
+/// and are answered by [`RouteSearch::matches`].
+fn filter_values<'a>(
+    route: &'a LocalGatewayRoute,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        // "prefix-list-id - The ID of the prefix list": the route's destination prefix list
+        // (`LocalGatewayRoute$DestinationPrefixListId`), which is the only prefix list a
+        // route names.
+        "prefix-list-id" => text(route.destination_prefix_list_id.as_deref()),
+        "state" => text(route.state.as_deref()),
+        "type" => text(route.r#type.as_deref()),
+        // Unreachable: the handler has already refused every other name, and the
+        // `route-search.*` ones never reach here. An undefined name compares against
+        // nothing, so it could never widen a result even if that check were bypassed.
+        _ => Vec::new(),
+    }
+}
+
+/// Does `route` satisfy every ATTRIBUTE filter?
+///
+/// The AND/OR evaluation EC2 defines for every `Filters` member, through the crate's one
+/// implementation of it ([`crate::state::matches_every_filter`]): "If you specify multiple
+/// filters, the filters are joined with an AND" (`Filter`), and within one filter "if you
+/// specify multiple values for a filter, the values are joined with an OR"
+/// (`Filter$Values`) — each value matched case-sensitively, with EC2's own `*`/`?`
+/// wildcards, by the pattern the value was compiled into.
+fn matches_every_filter(
+    route: &LocalGatewayRoute,
+    selectors: &[crate::state::CompiledFilter],
+    budget: &mut crate::state::MatchBudget,
+) -> bool {
+    crate::state::matches_every_filter(selectors, budget, &|name| filter_values(route, name))
 }

@@ -11,12 +11,12 @@
 //!   that same pair once the mapping verifies it;
 //! * a page carries at most `MaxResults` identifiers in a stable order and resumes where
 //!   the previous page ended, with no token on the last page;
-//! * a pair the mapping does not verify is a 409 `ResourceConflictException`, a mapping or
-//!   a resource this service does not hold is a 404 `ResourceNotFoundException`, an
-//!   identity of ANOTHER pool is a 403 `NotAuthorizedException`, and a request naming
-//!   neither side of the mapping is a 400 `InvalidParameterException`, while a value
-//!   outside a constraint the MODEL states is refused ahead of the operation with a 400
-//!   `ValidationException`;
+//! * a pair the mapping does not verify is a 409 `ResourceConflictException`, a resource
+//!   this service does not hold is a 404 `ResourceNotFoundException`, an identifier the
+//!   pool holds no mapping for and an identity of ANOTHER pool are both a 403
+//!   `NotAuthorizedException`, and a request naming neither side of the mapping is a 400
+//!   `InvalidParameterException`, while a value outside a constraint the MODEL states is
+//!   refused ahead of the operation with a 400 `ValidationException`;
 //! * the lookup is a REPORT: repeating it answers the same thing and leaves the pool's
 //!   identities exactly as they were.
 //!
@@ -312,9 +312,10 @@ async fn an_identity_answers_every_identifier_linked_to_it_one_page_at_a_time() 
 }
 
 /// RULE: a request the mapping cannot answer is refused with the modelled error for what
-/// is wrong with it — a pair the store does not link is a conflict, a resource or mapping
-/// this service does not hold is not found, an identity of another pool is forbidden, and
-/// an input the operation cannot act on is a bad parameter.
+/// is wrong with it — a pair the store does not link is a conflict, a resource this service
+/// does not hold is not found, an identifier the pool holds no mapping for and an identity
+/// of another pool are forbidden, and an input the operation cannot act on is a bad
+/// parameter.
 #[tokio::test]
 async fn a_request_the_mapping_cannot_answer_is_refused() {
     let emulator = Emulator::new();
@@ -366,14 +367,14 @@ async fn a_request_the_mapping_cannot_answer_is_refused() {
         (
             "an identifier that is not registered",
             lookup_request(&pool_id, None, Some("never-registered"), None, None),
-            404,
-            "ResourceNotFoundException",
+            403,
+            "NotAuthorizedException",
         ),
         (
             "an identifier of a pool that names no developer provider",
             lookup_request(&no_developer_provider, None, Some("user-1"), None, None),
-            404,
-            "ResourceNotFoundException",
+            403,
+            "NotAuthorizedException",
         ),
         (
             "an identity of ANOTHER pool",
@@ -513,7 +514,7 @@ async fn a_lookup_changes_nothing_a_later_caller_sees() {
         )
         .await;
     assert_eq!(
-        status, 404,
+        status, 403,
         "a lookup of an unregistered identifier is refused, got {status}"
     );
 

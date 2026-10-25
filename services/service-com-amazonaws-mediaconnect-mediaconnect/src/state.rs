@@ -4337,6 +4337,22 @@ pub fn published_offerings(region: &str) -> Vec<Offering> {
     offerings
 }
 
+/// The published offering `offering_arn` addresses in `region`, or `None` when this
+/// service's catalogue publishes no offering under that ARN.
+///
+/// The ONE place an `OfferingArn` is resolved, and it resolves it against
+/// [`published_offerings`] — the same projection the listing reports — so the ARN a client
+/// read from a listing is exactly the ARN that resolves here, and a described offering
+/// cannot drift from a listed one. An ARN naming another Region's catalogue, another
+/// account, another service, another resource type, or an entry this catalogue does not
+/// hold, addresses no offering: the Region and the entry are both part of an offering's
+/// identity.
+pub fn published_offering(region: &str, offering_arn: &str) -> Option<Offering> {
+    published_offerings(region)
+        .into_iter()
+        .find(|offering| offering.offering_arn == offering_arn)
+}
+
 /// The documented wire form of `Reservation$Start` and `Reservation$End`: "Use the
 /// following format: `YYYY-MM-DDTHH:mm:SSZ`, where `T` and `Z` are literal characters"
 /// (`smithy_query(query="doc",shape="PurchaseOfferingRequest",member="Start")`).
@@ -5786,6 +5802,7 @@ pub fn is_mintable_reservation_arn(arn: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         && is_valid_reservation_name(reservation_name)
 }
+
 
 /// Whether `arn` is an entitlement ARN this service could have minted: the prefix
 /// [`has_mintable_arn_prefix`] describes for the `entitlement` resource type, then the

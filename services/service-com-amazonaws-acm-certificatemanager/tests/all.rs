@@ -59,6 +59,8 @@ mod certificate_tag_removal;
 mod certificate_validation_state_machine;
 #[path = "all/email_validation_dispatch.rs"]
 mod email_validation_dispatch;
+#[path = "all/imported_certificate_serves_custom_domain.rs"]
+mod imported_certificate_serves_custom_domain;
 #[path = "all/pending_validation_and_tag_envelopes.rs"]
 mod pending_validation_and_tag_envelopes;
 #[path = "all/refusal_codes_and_search_projection.rs"]

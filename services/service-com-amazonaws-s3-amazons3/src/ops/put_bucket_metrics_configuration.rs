@@ -6,10 +6,12 @@
 //! bucket carried under THAT id and leaving every other id untouched. The payload IS the
 //! configuration, so what the request names becomes the stored configuration and
 //! `GetBucketMetricsConfiguration` reports it back. Refused before anything is written when
-//! the request is not one S3 records: an id that is not a metrics configuration id or that
-//! disagrees with the payload's own `Id`, or an `And` filter naming fewer than two
-//! predicates (`InvalidArgument`), and a NEW configuration past
-//! [`crate::state::MAX_METRICS_CONFIGURATIONS_PER_BUCKET`] (`TooManyConfigurations`).
+//! the request is not one S3 records: a payload whose `Id` is not a metrics configuration id
+//! or whose `And` filter names fewer than two predicates does not validate against the
+//! schema the API publishes for the document (`MalformedXML`), a `id` query argument that
+//! names a different configuration than the payload does (`InvalidArgument`), and a NEW
+//! configuration past [`crate::state::MAX_METRICS_CONFIGURATIONS_PER_BUCKET`]
+//! (`TooManyConfigurations`).
 //!
 //! The read side is `GetBucketMetricsConfiguration`, implemented in the same change so a
 //! put can be read back; `DeleteBucketMetricsConfiguration` and
@@ -259,18 +261,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The ID has a 64 character limit and can only contain letters, numbers, periods,
-        // dashes, and underscores" (`MetricsConfiguration$Id`, and the request's own `Id`
-        // carries the same `MetricsId`): a value outside that rule is not valid for the
-        // member carrying it, which is what `InvalidArgument` reports — the channel
-        // `PutBucketReplication` refuses a member whose value the service cannot take
-        // through.
-        if !crate::state::is_valid_metrics_id(&input.id) {
-            return Err(invalid_metrics_id("Id", &input.id));
+        // dashes, and underscores" (`MetricsConfiguration$Id`): that rule is part of the
+        // schema the API publishes for this payload, so a document whose `Id` is outside it
+        // does not validate against that schema — which is what `MalformedXML` reports.
+        // This operation publishes ONE special error of its own
+        // ([`crate::state::TOO_MANY_CONFIGURATIONS_CODE`]) and no `InvalidArgument`, unlike
+        // the analytics and S3 Intelligent-Tiering puts, whose own documentation lists
+        // `InvalidArgument` for a member value they cannot take.
+        //
+        // The payload is judged BEFORE the `id` query argument: the document is what the
+        // schema governs, and once the two agree an `Id` that satisfies the rule means the
+        // query argument does too.
+        if !crate::state::is_valid_metrics_id(&input.metrics_configuration.id) {
+            return Err(malformed_metrics_configuration());
         }
 
         // The configuration a put "specified by the metrics configuration ID" sets and the
         // `Id` the payload is "used to identify" name ONE configuration, so two different
-        // values name no configuration the service can record.
+        // values name no configuration the service can record. The `id` query argument is
+        // not part of the document the schema governs, so a request whose argument and
+        // document disagree is a bad argument (`InvalidArgument`), not a schema violation.
         if input.metrics_configuration.id != input.id {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::INVALID_ARGUMENT_CODE,
@@ -285,21 +295,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "A conjunction (logical AND) of predicates … The operator must have at least two
         // predicates" (`MetricsFilter$And`): a prefix, each tag and an access point ARN are
-        // one predicate each, so an `And` carrying fewer than two is a filter the service
-        // cannot evaluate rather than a payload it cannot parse.
+        // one predicate each, and that minimum is the published schema's as much as the id
+        // rule is, so an `And` carrying fewer is the same schema refusal as an `Id` outside
+        // its rule.
         if let Some(MetricsFilter::And(operator)) = &input.metrics_configuration.filter {
             let predicates = usize::from(operator.prefix.is_some())
                 + operator.tags.as_ref().map_or(0, Vec::len)
                 + usize::from(operator.access_point_arn.is_some());
             if predicates < MIN_AND_OPERATOR_PREDICATES {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::state::INVALID_ARGUMENT_CODE,
-                    crate::state::INVALID_ARGUMENT_STATUS,
-                    format!(
-                        "MetricsConfiguration.Filter.And names {predicates} predicate(s); the \
-                         operator must have at least {MIN_AND_OPERATOR_PREDICATES}"
-                    ),
-                ));
+                return Err(malformed_metrics_configuration());
             }
         }
 
@@ -334,23 +338,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The refusal for a `member` whose value is not a metrics configuration id, naming the
-/// member and the rule it broke — what a caller has to fix the request from.
-fn invalid_metrics_id(member: &str, value: &str) -> PutBucketMetricsConfigurationError {
+/// The refusal for a `MetricsConfiguration` document that does not validate against the
+/// schema the API publishes for it.
+///
+/// It carries that code's own FIXED published text
+/// ([`crate::state::MALFORMED_XML_MESSAGE`]) rather than anything about this request, for
+/// the reason [`crate::state::LifecycleConfigurationRejection::message`] gives: the code
+/// says the document did not validate against the published schema, and the schema is the
+/// same for every document.
+fn malformed_metrics_configuration() -> PutBucketMetricsConfigurationError {
     crate::scaffolded::Scaffolded::unmodeled(
-        crate::state::INVALID_ARGUMENT_CODE,
-        crate::state::INVALID_ARGUMENT_STATUS,
-        format!(
-            "{member} {value:?} is not a metrics configuration id: at most {} characters, each \
-             a letter, a number, a period, a dash or an underscore",
-            crate::state::MAX_METRICS_ID_CHARS
-        ),
+        crate::state::MALFORMED_XML_CODE,
+        MALFORMED_XML_STATUS,
+        crate::state::MALFORMED_XML_MESSAGE,
     )
 }
 
 /// The fewest predicates `MetricsFilter$And` may carry: "The operator must have at least
 /// two predicates" (that member's own documentation).
 const MIN_AND_OPERATOR_PREDICATES: usize = 2;
+
+/// The HTTP status AWS answers `MalformedXML` with: 400, the status S3's error-responses
+/// list carries for it.
+const MALFORMED_XML_STATUS: u16 = 400;
 
 /// The status `ExpectedBucketOwner` names for a mismatch: "the request fails with the HTTP
 /// status code 403 Forbidden (access denied)".

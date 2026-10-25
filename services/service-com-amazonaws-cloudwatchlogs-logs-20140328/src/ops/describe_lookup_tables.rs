@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeLookupTables
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeLookupTables`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeLookupTables::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the metadata of the lookup tables this account holds — "Retrieves metadata about
+//! lookup tables in your account" — optionally narrowed to the tables whose names start with
+//! `lookupTableNamePrefix`, in the order this operation documents ("Results are sorted by
+//! table name in ascending order") and paged with the opaque `nextToken` it mints.
+//!
+//! Each table is reported through [`crate::state::LookupTableRecord::reported`], the one
+//! rendering of a stored table, so this listing and `GetLookupTable` cannot disagree about
+//! one.
 //!
 //! ## Shape of an operation
 //!
@@ -117,6 +117,52 @@ impl From<DescribeLookupTablesErrorModeled> for DescribeLookupTablesError {
     }
 }
 
+/// The kind tag this operation's pagination cursor carries, so a token minted by
+/// another paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "DescribeLookupTables";
+
+/// The page size a request that leaves `maxResults` at its modelled default of `0` gets.
+/// Zero cannot bound the page at nothing: the member is "the maximum number of lookup tables
+/// to return in the response", so a maximum of zero would make every call answer an empty
+/// page and no caller could ever read a table back. An unset maximum is therefore the
+/// default the member itself documents: "The default value is 50 and the maximum value is
+/// 100."
+const UNSET_MAX_RESULTS: i32 = 50;
+
+/// Where the next page resumes: the name of the last table returned, plus the name prefix of
+/// the enumeration it belongs to. A continuation that changes the prefix is refused, because
+/// the token is only a position within one filtered enumeration.
+#[derive(Debug, Clone)]
+struct Cursor {
+    lookup_table_name_prefix: Option<String>,
+    after: String,
+}
+
+impl Cursor {
+    fn encode(&self) -> String {
+        crate::state::encode_token(&::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "lookupTableNamePrefix": self.lookup_table_name_prefix,
+            "after": self.after,
+        }))
+    }
+
+    fn decode(token: &str) -> Option<Self> {
+        let value = crate::state::decode_token(token)?;
+        if value.get("kind")?.as_str()? != CURSOR_KIND {
+            return None;
+        }
+        let lookup_table_name_prefix = match value.get("lookupTableNamePrefix") {
+            None | Some(::serde_json::Value::Null) => None,
+            Some(prefix) => Some(prefix.as_str()?.to_string()),
+        };
+        Some(Self {
+            lookup_table_name_prefix,
+            after: value.get("after")?.as_str()?.to_string(),
+        })
+    }
+}
+
 /// The `DescribeLookupTables` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -153,18 +199,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeLookupTables` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeLookupTablesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeLookupTables"))
+        // `ctx` carries only request metadata; this operation reports on the tables the
+        // account already holds, each under the ARN it was stored with, so it reads nothing
+        // from the request beyond its input.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeLookupTablesError::from(
+                DescribeLookupTablesErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let store = state.lock();
+
+        let invalid = |message: &str| {
+            DescribeLookupTablesError::from(
+                DescribeLookupTablesErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                ),
+            )
+        };
+
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) = Cursor::decode(token) else {
+                    return Err(invalid("nextToken is not a valid token"));
+                };
+                if cursor.lookup_table_name_prefix != input.lookup_table_name_prefix {
+                    return Err(invalid(
+                        "nextToken was issued for a different DescribeLookupTables request",
+                    ));
+                }
+                Some(cursor)
+            }
+            None => None,
+        };
+
+        // One enumeration, in the order the store holds it — the store is keyed by the name
+        // that identifies a table, so a single pass is already the order this operation
+        // documents ("Results are sorted by table name in ascending order") and nothing is
+        // re-sorted. `lookupTableNamePrefix` is "A prefix to filter lookup tables by name.
+        // Only tables whose names start with this prefix are returned. If you don't specify a
+        // prefix, all tables in the account and Region are returned."
+        let matching: Vec<&crate::state::LookupTableRecord> = store
+            .lookup_tables
+            .values()
+            .filter(|table| {
+                input
+                    .lookup_table_name_prefix
+                    .as_deref()
+                    .is_none_or(|prefix| table.name.starts_with(prefix))
+            })
+            .collect();
+
+        let first = match &cursor {
+            Some(cursor) => matching.partition_point(|table| table.name <= cursor.after),
+            None => 0,
+        };
+        // `maxResults` is modelled `range ..100` with a default of `0`, so the boundary
+        // validator has already refused a value above that maximum and only the unset
+        // default needs a page size of its own ([`UNSET_MAX_RESULTS`]).
+        let limit = usize::try_from(if input.max_results == 0 {
+            UNSET_MAX_RESULTS
+        } else {
+            input.max_results
+        })
+        .unwrap_or(0)
+        .max(1);
+        let last = first.saturating_add(limit).min(matching.len());
+        let page = &matching[first..last];
+
+        // A token is "The token to use when requesting the next set of items": there is a
+        // next set only while tables remain beyond this page.
+        let next_token = page.last().filter(|_| last < matching.len()).map(|table| {
+            Cursor {
+                lookup_table_name_prefix: input.lookup_table_name_prefix.clone(),
+                after: table.name.clone(),
+            }
+            .encode()
+        });
+
+        Ok(DescribeLookupTablesOutput {
+            lookup_tables: Some(
+                page.iter()
+                    .map(|table| table.reported())
+                    .collect::<Vec<LookupTable>>(),
+            ),
+            next_token,
+        })
     }
 }
