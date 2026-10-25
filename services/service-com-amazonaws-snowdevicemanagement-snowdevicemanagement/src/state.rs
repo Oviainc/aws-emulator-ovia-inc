@@ -19,13 +19,20 @@
 //! started yet ([`Execution::is_cancellable`]) to `CANCELED`, and the reporting
 //! operations compute their answers from these records.
 //!
+//! Two bounds keep the task records finite, and they bound different things: a Region
+//! may hold [`IN_FLIGHT_TASK_QUOTA`] tasks at once, which is what `CreateTask` refuses
+//! past, and it keeps [`TASK_HISTORY_LIMIT`] records, past which the oldest terminal
+//! ones are forgotten
+//! ([`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::trim_task_history`]) —
+//! a quota is about what is held now, and nothing here deletes a record on request.
+//!
 //! The inventory and the tasks are REGIONAL, the way the service is: Snow Device
 //! Management reports "all devices on your Amazon Web Services account that have
 //! Amazon Web Services Snow Device Management enabled in the Amazon Web Services
 //! Region where the command is run", so a record carries the region it belongs to
 //! and is invisible in every other one.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -48,14 +55,30 @@ pub const ARN_NAMESPACE: &str = "snow-device-management";
 /// `@range(min: 1, max: 100)`.
 pub const PAGE_LIMIT: i32 = 100;
 
-/// How many tasks the store holds before `CreateTask` refuses with the modelled
-/// `ServiceQuotaExceededException`.
+/// How many tasks one Region may have IN FLIGHT before `CreateTask` refuses with
+/// the modelled `ServiceQuotaExceededException`.
 ///
-/// This is the emulator's OWN bound on the store, not a claim about any account's
-/// AWS quota (Service Quotas is not modelled here). It is set far above any
-/// workflow an emulator serves, and it is what stops the state growing without
-/// end.
-pub const TASK_QUOTA: usize = 1_000;
+/// A service quota bounds what an account currently HOLDS, so this is counted over
+/// the tasks still `IN_PROGRESS` in the Region the request is signed for
+/// ([`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::tasks_in_flight_in`]),
+/// never over how many tasks were ever created: a task the clock carried to
+/// `COMPLETED`, or one `CancelTask` moved to `CANCELED`, is terminal and holds
+/// nothing, so the next create succeeds. The value is the emulator's OWN bound, not
+/// a claim about any account's AWS quota (Service Quotas is not modelled here), and
+/// it is set far above any workflow an emulator serves.
+pub const IN_FLIGHT_TASK_QUOTA: usize = 1_000;
+
+/// How many task records one Region keeps, terminal ones included.
+///
+/// The in-flight quota above bounds what a Region holds at once; this bounds the
+/// HISTORY behind it, which nothing else would: a task record is only ever added by
+/// a request, and this API models no operation that deletes one. Past this many
+/// records in a Region, the oldest TERMINAL ones make room for the new task
+/// ([`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::trim_task_history`]),
+/// so the store cannot grow for as long as the emulator runs. It is the emulator's
+/// own retention bound, set far above the history any workflow it serves reads back,
+/// and it refuses nothing.
+pub const TASK_HISTORY_LIMIT: usize = 10_000;
 
 /// How long an execution stays `QUEUED` before the clock owes it `IN_PROGRESS`.
 ///
@@ -325,6 +348,13 @@ pub struct Task {
 }
 
 impl Task {
+    /// True while this task still holds work: `TaskState` is `IN_PROGRESS`, the one
+    /// non-terminal value of the three (`COMPLETED` and `CANCELED` are both final,
+    /// and a task in either holds nothing a quota counts).
+    pub fn is_in_flight(&self) -> bool {
+        self.state == "IN_PROGRESS"
+    }
+
     /// The tags `DescribeTask` reports.
     pub fn tag_map(&self) -> HashMap<String, String> {
         self.tags
@@ -488,6 +518,74 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
         self.devices
             .get(managed_device_id)
             .filter(|device| device.region == region)
+    }
+
+    /// How many tasks are still in flight in `region`: the consumption
+    /// [`IN_FLIGHT_TASK_QUOTA`] bounds.
+    ///
+    /// Counted over the non-terminal records of ONE Region, the way every other
+    /// record in this state is scoped, because that is what the Region the request
+    /// is signed for actually holds — a terminal task, and a task of another
+    /// Region, consume none of it.
+    pub fn tasks_in_flight_in(&self, region: &str) -> usize {
+        self.tasks
+            .values()
+            .filter(|task| task.region == region && task.is_in_flight())
+            .count()
+    }
+
+    /// Drop the oldest terminal tasks of `region` until it keeps no more than
+    /// `keep` records, answering how many were dropped.
+    ///
+    /// The store's retention bound, applied where the store GROWS. Only terminal
+    /// records are candidates and the oldest go first, so a task still in flight is
+    /// never dropped and the recent history a caller reads back outlives the
+    /// forgotten one; a Region holding nothing but in-flight tasks loses nothing.
+    /// The executions of a dropped task go with it, as do the `clientToken` entries
+    /// that named it — a token whose task is gone names nothing, and a create
+    /// carrying it mints a new task.
+    pub fn trim_task_history(&mut self, region: &str, keep: usize) -> usize {
+        let mut oldest_first: Vec<(SystemTime, String)> = self
+            .tasks
+            .values()
+            .filter(|task| task.region == region)
+            .map(|task| (task.created_at, task.task_id.clone()))
+            .collect();
+        let excess = oldest_first.len().saturating_sub(keep);
+        if excess == 0 {
+            return 0;
+        }
+        // The id breaks a tie, so two tasks created in the same instant still have
+        // one order and the choice is not left to the map's iteration.
+        oldest_first.sort();
+
+        let mut dropped: HashSet<String> = HashSet::new();
+        for (_, task_id) in oldest_first {
+            if dropped.len() == excess {
+                break;
+            }
+            if self
+                .tasks
+                .get(&task_id)
+                .is_some_and(|task| task.is_in_flight())
+            {
+                continue;
+            }
+            dropped.insert(task_id);
+        }
+        if dropped.is_empty() {
+            return 0;
+        }
+
+        for task_id in &dropped {
+            self.tasks.remove(task_id);
+        }
+        self.executions.retain(|(execution_region, execution_task, _), _| {
+            execution_region.as_str() != region || !dropped.contains(execution_task)
+        });
+        self.idempotency
+            .retain(|_, task_id| !dropped.contains(task_id));
+        dropped.len()
     }
 
     /// The task `task_id` names in `region`, or `None` when no such task was
@@ -689,7 +787,7 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
         let task_ids: Vec<String> = self
             .tasks
             .iter()
-            .filter(|(_, task)| task.state == "IN_PROGRESS")
+            .filter(|(_, task)| task.is_in_flight())
             .map(|(id, _)| id.clone())
             .collect();
         for task_id in task_ids {
