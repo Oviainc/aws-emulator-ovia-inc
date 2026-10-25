@@ -221,16 +221,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
-        // The service-managed keyspaces are part of the account before any call, so
-        // `keyspaceName` resolves against them too — a keyspace Amazon Keyspaces always
-        // holds is never the `ResourceNotFoundException` below; it just holds no types.
-        store.ensure_service_managed_catalog(&region);
         // Reporting, not mutating: `settle` only materialises the status changes the clock
         // had already made due at this instant, so this listing shows what any caller
         // would have seen now whether or not anybody read the keyspace.
         store.settle(::std::time::SystemTime::now());
 
-        let Some(keyspace) = store.keyspaces.get(&input.keyspace_name) else {
+        // `keyspaceName` resolves against what this Region holds, the service-managed
+        // keyspaces included — one of those is never the `ResourceNotFoundException`
+        // below; it just holds no types.
+        let Some(keyspace) = store.keyspace(&region, &input.keyspace_name) else {
             return Err(ListTypesErrorModeled::ResourceNotFoundException(
                 crate::state::keyspace_not_found(&region, &input.keyspace_name),
             )

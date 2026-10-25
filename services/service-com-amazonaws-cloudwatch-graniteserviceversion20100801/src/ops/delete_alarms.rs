@@ -274,6 +274,9 @@ fn delete_named_alarms(
     }
     // A deleted alarm is an input every composite alarm whose rule references it loses,
     // so the alarms downstream of this call are evaluated before it returns.
+    for name in &named {
+        store.make_parents_due(name, now);
+    }
     store.evaluate_composite_alarms(
         now,
         &mut crate::state::alarm_evaluation::EvaluationBudget::for_one_request(),

@@ -10,14 +10,13 @@
 //! is fabricated for it — and a `Code` that is not the outstanding one (including any code
 //! while none is outstanding) is the modelled `ValidationException` (HTTP 400).
 //!
-//! A refused submission is still an attempt this flow made on the preference, so it is
-//! recorded against it
-//! ([`crate::state::StoredProcurementPortalPreference::failed_verification_attempts`])
-//! and the preference's `Version` and `LastUpdateDate` advance with that write, the way
-//! every write of this resource reports them. That count is what the refusal REPORTS: its
-//! message names the attempt that failed and the budget it counts against
-//! ([`MAX_VERIFICATION_ATTEMPTS`]). No plane's verification status moves: nothing
-//! verified the portal connection.
+//! A refused submission counts against the preference's failed-attempt budget
+//! ([`crate::state::StoredProcurementPortalPreference::failed_verification_attempts`]),
+//! which is what the refusal REPORTS: its message names the attempt that failed and the
+//! budget it counts against ([`MAX_VERIFICATION_ATTEMPTS`]). It changes nothing a reader
+//! of the preference can observe: no modelled member moves, and `Version` — "the version
+//! number of the procurement portal preference configuration" — and `LastUpdateDate` stay
+//! at what the last SUCCESSFUL write left them, because this call wrote no configuration.
 //!
 //! ## Shape of an operation
 //!
@@ -269,15 +268,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|validation| validation.verified_at.is_none())
                 .map(|validation| validation.code.as_str());
             if outstanding != Some(input.code.as_str()) {
-                // A refused submission is still an attempt the validation flow made on
-                // this preference, so it is recorded against it and the preference's
-                // `Version` and `LastUpdateDate` advance with that write, the way they do
-                // for every write of this resource. The plane's verification status does
-                // not move: nothing completed the validation.
+                // The refused submission counts against this preference's attempt
+                // budget, which the refusal reports. No modelled member of the preference
+                // moves with it: the call completed no validation and wrote no
+                // configuration, so `Version` and `LastUpdateDate` keep the values the
+                // last successful write left and a later read reports them unchanged.
                 stored.failed_verification_attempts =
                     stored.failed_verification_attempts.saturating_add(1);
-                stored.preference.version = stored.preference.version.saturating_add(1);
-                stored.preference.last_update_date = crate::state::now();
                 return Err(
                     VerifyProcurementPortalValidationErrorModeled::ValidationException(
                         ValidationException {

@@ -443,6 +443,15 @@ pub struct StoredAlarm {
     /// starts a longer one: the state it forces stands until the next periodic evaluation is
     /// due ([`alarm_evaluation::forced_state_span_secs`]).
     pub evaluation_due_secs: f64,
+    /// The instant, in epoch seconds, until which a state `SetAlarmState` forced on this alarm
+    /// stands; `None` when the alarm reports its own evaluated state.
+    ///
+    /// "Temporarily sets the state of an alarm for testing purposes." (`SetAlarmState`) — a
+    /// forced state is meant to stand for the span the force started, so an arriving datapoint
+    /// does not cut it short:
+    /// [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::make_alarms_due`] leaves an
+    /// alarm holding one alone until that span is out.
+    pub forced_state_until_secs: Option<f64>,
 }
 
 /// A stored composite alarm: the modelled shape `DescribeAlarms` returns, plus what the
@@ -610,6 +619,15 @@ pub struct ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     /// [`alarm_evaluation::MAX_PENDING_NOTIFICATIONS`]; drained by
     /// [`alarm_actions::settle_alarms`], which is what delivers them.
     pub pending_notifications: VecDeque<alarm_actions::AlarmNotification>,
+    /// The in-process task that waits for this store's due alarm evaluations and delivers
+    /// what the transitions they materialise owe ([`alarm_actions::drive_alarm_clock`]), when
+    /// one is running.
+    pub alarm_clock: Option<::tokio::task::JoinHandle<()>>,
+    /// Whether an alarm clock is running for this store: the CLAIM, so at most one runs.
+    pub alarm_clock_running: bool,
+    /// Which claim on the alarm clock is current, so a clock that stands down releases only
+    /// its own.
+    pub alarm_clock_generation: u64,
     /// The customer managed KMS key associated with a Region's default dataset, by Region.
     ///
     /// There is no dataset record to create: "The default dataset is implicit for every
@@ -639,14 +657,46 @@ pub fn now_secs() -> f64 {
         .map_or(0.0, |since| since.as_secs_f64())
 }
 
-/// Epoch seconds as the modelled timestamp type.
+/// Epoch seconds as the modelled timestamp type, held to the MILLISECOND.
+///
+/// One instant is reported two ways: as the modelled timestamp member (which this protocol
+/// puts on the wire as epoch seconds) and, inside a notification document or an explanation, as
+/// the text the timestamp type renders. The rendering carries a fixed number of fractional
+/// digits while the number carries the whole fraction, so an instant with a finer fraction than
+/// the rendering keeps would read as two different instants depending on which member a client
+/// looked at. Holding the instant to the millisecond — finer than anything CloudWatch reports
+/// about an alarm, and exactly representable in both forms — makes the two readings agree.
+///
+/// An instant too large for the millisecond form keeps the whole seconds it has rather than
+/// being clamped: it is outside any instant this emulator mints.
 pub fn to_timestamp(secs: f64) -> ::aws_smithy_types::DateTime {
+    /// The largest number of milliseconds the modelled timestamp's integer form holds.
+    const MAX_MILLIS: f64 = 9.0e15;
+
+    let millis = (secs * 1_000.0).round();
+    if millis.is_finite() && millis.abs() < MAX_MILLIS {
+        #[allow(clippy::cast_possible_truncation)]
+        return ::aws_smithy_types::DateTime::from_millis(millis as i64);
+    }
     ::aws_smithy_types::DateTime::from_secs_f64(secs)
 }
 
 /// A modelled timestamp as epoch seconds.
 pub fn from_timestamp(stamp: &::aws_smithy_types::DateTime) -> f64 {
     stamp.as_secs_f64()
+}
+
+/// `secs` as the instant a human-readable explanation names it, or `None` for an instant the
+/// timestamp type cannot render.
+///
+/// The rendering is the modelled timestamp type's own
+/// ([`::aws_smithy_types::date_time::Format::DateTime`], RFC 3339), so an instant a document
+/// reports and one a sentence names are the same text, and no second date implementation
+/// lives here.
+pub fn rfc3339(secs: f64) -> Option<String> {
+    to_timestamp(secs)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .ok()
 }
 
 /// Normalise a request's dimension list into the key form: later entries for one name win,
@@ -1403,6 +1453,65 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
         });
     }
 
+    /// Make every metric alarm watching one of `keys` DUE for evaluation at `now_secs`.
+    ///
+    /// An alarm's evaluation is owed from the arrival of the data it grades: the datapoints are
+    /// what the alarm is evaluated FROM, so the write that stores a datapoint of a series an
+    /// alarm watches is what makes that alarm's evaluation due — a span later
+    /// ([`alarm_evaluation::EVALUATION_DELAY_SECS`], as for every transition the clock owes),
+    /// so a caller reading straight after the write still sees the state the alarm had, and
+    /// the clock the write starts materialises the transition and delivers the actions it fires
+    /// without waiting for whatever call happens to read the alarm next. Nothing else is
+    /// pulled forward: an alarm whose series this write did not touch keeps the instant it
+    /// carries, and an alarm holding a state a caller forced keeps it until that force's own
+    /// span is out.
+    ///
+    /// An alarm is matched on the series it names — namespace, metric name and dimension set —
+    /// which is the identity its own evaluation reads, so a datapoint of any other series makes
+    /// no alarm due.
+    pub fn make_alarms_due(&mut self, keys: &[MetricKey], now_secs: f64) {
+        if keys.is_empty() {
+            return;
+        }
+        let due = now_secs + alarm_evaluation::EVALUATION_DELAY_SECS;
+        for stored in self.alarms.values_mut() {
+            if stored
+                .forced_state_until_secs
+                .is_some_and(|until| now_secs < until)
+            {
+                continue;
+            }
+            let watched = MetricKey {
+                namespace: stored.alarm.namespace.clone().unwrap_or_default(),
+                metric_name: stored.alarm.metric_name.clone().unwrap_or_default(),
+                dimensions: dimension_set(stored.alarm.dimensions.as_deref()),
+            };
+            if keys.contains(&watched) {
+                stored.evaluation_due_secs = stored.evaluation_due_secs.min(due);
+            }
+        }
+    }
+
+    /// Make every COMPOSITE alarm whose rule reads the alarm `name` DUE for evaluation at
+    /// `now_secs`.
+    ///
+    /// A composite alarm's state is its rule over the states of the alarms the rule names, so
+    /// its evaluation is owed from the moment one of those states changes — a span later
+    /// ([`COMPOSITE_EVALUATION_DELAY_SECS`], the same span its own write owes it), the same
+    /// principle as [`Self::make_alarms_due`] for the datapoints a metric alarm reads. The
+    /// clock the call that materialised the child's transition started is then what materialises
+    /// the parent's and delivers the actions the parent's transition fires, rather than
+    /// whatever call happens to read the parent next. A composite alarm no rule input touched
+    /// keeps the instant it carries.
+    pub fn make_parents_due(&mut self, name: &str, now_secs: f64) {
+        let due = now_secs + COMPOSITE_EVALUATION_DELAY_SECS;
+        for stored in self.composite_alarms.values_mut() {
+            if stored.child_names.iter().any(|child| child == name) {
+                stored.evaluation_due_secs = stored.evaluation_due_secs.min(due);
+            }
+        }
+    }
+
     /// The kind of alarm `name` already names, as one of the modelled `AlarmType` values;
     /// `None` when no alarm of that name exists.
     ///
@@ -1420,6 +1529,90 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
         } else {
             None
         }
+    }
+
+    /// Turn the ACTIONS of every alarm `names` names on or off, whatever kind of alarm each
+    /// one is, reporting back the names this store holds no alarm for.
+    ///
+    /// "Indicates whether actions should be executed during any changes to the alarm state"
+    /// (`MetricAlarm$ActionsEnabled`) — the one member `EnableAlarmActions` ("Enables the
+    /// actions for the specified alarms.") and `DisableAlarmActions` ("Disables the actions
+    /// for the specified alarms. When an alarm's actions are disabled, the alarm actions do
+    /// not execute when the alarm state changes.") write, so both operations share this one
+    /// writer and neither can drift from the other. Every kind of alarm carries the member,
+    /// so a name of any kind is written.
+    ///
+    /// A write that CHANGES the member is a configuration update: it stamps
+    /// `AlarmConfigurationUpdatedTimestamp` and records the `ConfigurationUpdate` history item
+    /// every other configuration write records. Asking for the setting an alarm already has
+    /// changes nothing, so it records nothing either.
+    pub fn set_actions_enabled(
+        &mut self,
+        names: &[String],
+        enabled: bool,
+        now_secs: f64,
+    ) -> Vec<String> {
+        // A name the request repeats names ONE alarm, so the deduplicated list is walked: the
+        // second mention would otherwise find the member already written and report the alarm
+        // as unchanged twice.
+        let mut named: Vec<&str> = names.iter().map(String::as_str).collect();
+        named.sort_unstable();
+        named.dedup();
+
+        let mut unknown: Vec<String> = Vec::new();
+        // The history items the writes owe, recorded once the store is no longer borrowed by
+        // the alarm each one belongs to.
+        let mut records: Vec<(String, &'static str, String)> = Vec::new();
+        for name in named {
+            if let Some(stored) = self.alarms.get_mut(name) {
+                if stored.alarm.actions_enabled == Some(enabled) {
+                    continue;
+                }
+                let previous = stored.alarm.clone();
+                stored.alarm.actions_enabled = Some(enabled);
+                stored.alarm.alarm_configuration_updated_timestamp = Some(to_timestamp(now_secs));
+                let data = configuration_update_history_data(Some(&previous), &stored.alarm);
+                records.push((name.to_string(), ALARM_TYPE_METRIC, data));
+            } else if let Some(stored) = self.composite_alarms.get_mut(name) {
+                if stored.alarm.actions_enabled == Some(enabled) {
+                    continue;
+                }
+                let previous = stored.alarm.clone();
+                stored.alarm.actions_enabled = Some(enabled);
+                stored.alarm.alarm_configuration_updated_timestamp = Some(to_timestamp(now_secs));
+                let data =
+                    composite_configuration_update_history_data(Some(&previous), &stored.alarm);
+                records.push((name.to_string(), ALARM_TYPE_COMPOSITE, data));
+            } else if let Some(stored) = self.log_alarms.get_mut(name) {
+                if stored.alarm.actions_enabled == Some(enabled) {
+                    continue;
+                }
+                let previous = stored.alarm.clone();
+                stored.alarm.actions_enabled = Some(enabled);
+                stored.alarm.alarm_configuration_updated_timestamp = Some(to_timestamp(now_secs));
+                let data = log_configuration_update_history_data(Some(&previous), &stored.alarm);
+                records.push((name.to_string(), ALARM_TYPE_LOG, data));
+            } else {
+                unknown.push(name.to_string());
+            }
+        }
+        for (name, kind, data) in records {
+            self.record_history(
+                &name,
+                now_secs,
+                AlarmHistoryItem {
+                    alarm_name: Some(name.clone()),
+                    alarm_contributor_id: None,
+                    alarm_type: Some(kind.to_string()),
+                    timestamp: Some(to_timestamp(now_secs)),
+                    history_item_type: Some("ConfigurationUpdate".to_string()),
+                    history_summary: Some("Alarm updated from configuration".to_string()),
+                    history_data: Some(data),
+                    alarm_contributor_attributes: None,
+                },
+            );
+        }
+        unknown
     }
 
     /// How many alarms this store holds, counting every kind.
@@ -1448,17 +1641,40 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
             })
     }
 
-    /// The names and current states of the alarms one composite-alarm rule references, in the
-    /// order the rule names them.
+    /// Each alarm one composite-alarm rule references, in the order the rule names them: which
+    /// alarm it is, the state it is in and when it moved there — everything the parent's
+    /// explanation of its own state, and the notification its transition publishes, report
+    /// about its children.
     ///
     /// Takes the resolved child names ([`StoredCompositeAlarm::child_names`]) rather than the
     /// rule, so a caller on a hot path never re-walks the rule to obtain them.
-    pub fn child_states_of(&self, names: &[String]) -> Vec<(String, Option<String>)> {
+    ///
+    /// The stores consulted are the ones the rule itself reads
+    /// ([`Self::alarm_state_value`]), so a child reported here is always an alarm the rule
+    /// evaluated over. A name the rule references and no alarm answers to is reported with
+    /// nothing filled in: the rule read no state for it.
+    pub fn child_alarm_states(&self, names: &[String]) -> Vec<ChildAlarmState> {
         names
             .iter()
-            .map(|name| {
-                let state = self.alarm_state_value(name);
-                (name.clone(), state)
+            .map(|reference| {
+                let name = alarm_rule_reference_name(reference);
+                if let Some(stored) = self.alarms.get(name) {
+                    return ChildAlarmState::of(
+                        name,
+                        stored.alarm.alarm_arn.as_deref(),
+                        stored.alarm.state_value.as_deref(),
+                        stored.alarm.state_transitioned_timestamp.as_ref(),
+                    );
+                }
+                match self.composite_alarms.get(name) {
+                    Some(stored) => ChildAlarmState::of(
+                        name,
+                        stored.alarm.alarm_arn.as_deref(),
+                        stored.alarm.state_value.as_deref(),
+                        stored.alarm.state_transitioned_timestamp.as_ref(),
+                    ),
+                    None => ChildAlarmState::of(name, None, None, None),
+                }
             })
             .collect()
     }
@@ -1610,7 +1826,13 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
         let previous = AlarmStateSnapshot::of_composite_alarm(&stored.alarm);
         let forced = stored.forced_child_states.clone();
         let suppressor = stored.alarm.actions_suppressor.clone();
-        let children = self.child_states_of(&stored.child_names);
+        let child_states = self.child_alarm_states(&stored.child_names);
+        // The pairs the forced-state snapshot is compared against: a state a caller forced
+        // stands until a CHILD's state changes, which is what this comparison detects.
+        let children: Vec<(String, Option<String>)> = child_states
+            .iter()
+            .map(|child| (child.name.clone(), child.state_value.clone()))
+            .collect();
         // "It returns to its actual state only once any of its children alarms change state."
         // (`SetAlarmState`) — until then the state a caller forced stands.
         let forced_stands = forced.is_some_and(|snapshot| snapshot == children);
@@ -1659,8 +1881,12 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
             return false;
         }
         stored.alarm.state_value = Some(state.to_string());
-        stored.alarm.state_reason = Some(composite_state_reason(evaluated, state));
-        stored.alarm.state_reason_data = Some(composite_state_reason_data(&children));
+        stored.alarm.state_reason = Some(composite_state_reason(
+            latest_child_transition(&child_states),
+            evaluated,
+            state,
+        ));
+        stored.alarm.state_reason_data = Some(composite_state_reason_data(&child_states));
         stored.alarm.state_updated_timestamp = Some(to_timestamp(now_secs));
         // "The timestamp of the last change to the alarm's StateValue."
         // (`CompositeAlarm$StateTransitionedTimestamp`) — this call changed it.
@@ -1671,6 +1897,7 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
         // holds for a composite alarm exactly as it does for a metric alarm.
         let notification = alarm_actions::AlarmNotification::of_composite_transition(
             &stored.alarm,
+            &child_states,
             previous.state_value.as_deref(),
             now_secs,
         );
@@ -1685,6 +1912,9 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
             alarm_contributor_attributes: None,
         };
         self.record_history(name, now_secs, item);
+        // This alarm's new state is an input to every composite alarm whose rule reads it, so
+        // their evaluations are owed from this instant too.
+        self.make_parents_due(name, now_secs);
         if let Some(notification) = notification {
             self.enqueue_notification(notification);
         }
@@ -1692,36 +1922,134 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     }
 }
 
-/// The reason a composite alarm reports for the state its rule evaluation put it in.
-fn composite_state_reason(evaluated: bool, state: &str) -> String {
+/// One child of a composite alarm's rule, as the parent's explanation of its own state and
+/// the notification its transition publishes report it.
+#[derive(Debug, Clone)]
+pub struct ChildAlarmState {
+    /// The child's name, as the rule resolved it.
+    pub name: String,
+    /// The ARN `DescribeAlarms` reports for the child, when the store holds the child at all.
+    pub arn: Option<String>,
+    /// The state the child is in, when the rule read one for it.
+    pub state_value: Option<String>,
+    /// When the child moved to that state, in epoch seconds, when it has ever moved.
+    pub transitioned_secs: Option<f64>,
+}
+
+impl ChildAlarmState {
+    /// One child as the stores hold it.
+    fn of(
+        name: &str,
+        arn: Option<&str>,
+        state_value: Option<&str>,
+        transitioned: Option<&::aws_smithy_types::DateTime>,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            arn: arn.map(ToString::to_string),
+            state_value: state_value.map(ToString::to_string),
+            transitioned_secs: transitioned.map(from_timestamp),
+        }
+    }
+
+    /// How an explanation names this child: the ARN `DescribeAlarms` reports for it, or its
+    /// name when the store holds no ARN for it.
+    #[must_use]
+    pub fn identity(&self) -> &str {
+        self.arn.as_deref().unwrap_or(&self.name)
+    }
+}
+
+/// The child of a composite alarm's rule whose own transition is the MOST RECENT one: the
+/// child a change in the parent's state is attributed to.
+///
+/// A composite alarm's state changes because one of the alarms its rule reads changed state,
+/// so the explanation of that change names THAT alarm, the state it moved to and when it moved
+/// there. The most recent transition among the rule's inputs is the one that made the rule's
+/// value what it now is: every earlier one was already accounted for by the state the parent
+/// held before. Two children that transitioned in the very same instant are
+/// indistinguishable, and the last in rule order is named.
+///
+/// `None` when no child of the rule still exists, or none of them has ever transitioned.
+fn latest_child_transition(children: &[ChildAlarmState]) -> Option<&ChildAlarmState> {
+    children
+        .iter()
+        .filter(|child| child.state_value.is_some())
+        .max_by(|left, right| {
+            left.transitioned_secs
+                .unwrap_or(f64::NEG_INFINITY)
+                .total_cmp(&right.transitioned_secs.unwrap_or(f64::NEG_INFINITY))
+        })
+        .filter(|child| child.transitioned_secs.is_some())
+}
+
+/// The reason a composite alarm reports for the state its rule evaluation put it in: the child
+/// transition the change is attributed to ([`latest_child_transition`]), and what the rule made
+/// of it.
+///
+/// A rule whose children have all been deleted still has an outcome, and the reason then
+/// reports the outcome alone: there is no transition to attribute it to.
+///
+/// Inside the modelled `@length 0..1023` of `StateReason`: the only variable part is the
+/// child's identity, and an alarm ARN this service minted is bounded by the alarm name's own
+/// `@length 1..255`.
+fn composite_state_reason(
+    trigger: Option<&ChildAlarmState>,
+    evaluated: bool,
+    state: &str,
+) -> String {
     let outcome = if evaluated { "TRUE" } else { "FALSE" };
-    format!("The composite alarm's rule evaluated to {outcome}, so the alarm is in {state} state")
+    let Some(trigger) = trigger else {
+        return format!(
+            "The composite alarm's rule evaluated to {outcome}, so the alarm is in {state} state"
+        );
+    };
+    let at = trigger
+        .transitioned_secs
+        .and_then(rfc3339)
+        .map_or_else(String::new, |at| format!(" at {at}"));
+    format!(
+        "{} transitioned to {}{at} and the composite alarm's rule evaluated to {outcome}, so \
+         the alarm is in {state} state",
+        trigger.identity(),
+        trigger.state_value.as_deref().unwrap_or_default()
+    )
 }
 
 /// The JSON `StateReasonData` of a composite alarm's evaluated state: the alarms its rule
 /// references and the state each one was in when the rule was evaluated.
 ///
 /// "An explanation for the alarm state, in JSON format."
-/// (`CompositeAlarm$StateReasonData`), bounded by [`MAX_STATE_REASON_DATA_LEN`] — a document
-/// is JSON, so it can never be truncated to fit: the children are dropped instead when a
-/// rule references more of them than the bound holds.
-fn composite_state_reason_data(children: &[(String, Option<String>)]) -> String {
+/// (`CompositeAlarm$StateReasonData`) — the alarms whose states the rule reacted to, each
+/// named by its ARN and carrying the state it is in and when it moved there, so a consumer can
+/// see WHICH child put the parent where it is rather than only that the rule was true. A child
+/// the rule read no state for is left out: it triggered nothing.
+///
+/// Bounded by [`MAX_STATE_REASON_DATA_LEN`] — a document is JSON, so it can never be truncated
+/// to fit: the children are dropped instead when a rule references more of them than the bound
+/// holds.
+fn composite_state_reason_data(children: &[ChildAlarmState]) -> String {
     let mut document = Map::new();
     document.insert("version".to_string(), Value::from(HISTORY_DATA_VERSION));
-    let evaluated: Vec<Value> = children
+    let triggering: Vec<Value> = children
         .iter()
-        .map(|(name, state)| {
-            let mut child = Map::new();
-            child.insert("alarmName".to_string(), Value::from(name.as_str()));
-            insert_member(&mut child, "stateValue", json_text(state));
-            Value::Object(child)
+        .filter(|child| child.state_value.is_some())
+        .map(|child| {
+            let mut state = Map::new();
+            insert_member(&mut state, "value", json_text(&child.state_value));
+            insert_member(
+                &mut state,
+                "timestamp",
+                child.transitioned_secs.and_then(rfc3339).map(Value::from),
+            );
+            let mut entry = Map::new();
+            entry.insert("arn".to_string(), Value::from(child.identity()));
+            entry.insert("state".to_string(), Value::Object(state));
+            Value::Object(entry)
         })
         .collect();
     let mut full = document.clone();
-    full.insert(
-        "evaluatedChildren".to_string(),
-        Value::Array(evaluated),
-    );
+    full.insert("triggeringAlarms".to_string(), Value::Array(triggering));
     let rendered = Value::Object(full).to_string();
     if rendered.len() <= MAX_STATE_REASON_DATA_LEN {
         return rendered;

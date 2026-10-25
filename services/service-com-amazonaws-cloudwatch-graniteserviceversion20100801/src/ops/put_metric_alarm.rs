@@ -854,6 +854,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // evaluation is not among them: it becomes due a span after this write, so a caller
         // reading straight after it still sees the state this write left behind.
         crate::state::alarm_actions::settle_alarms(&*self.engine, ctx).await;
+        // This alarm's own first evaluation is owed a span from here and the caller makes no
+        // further CloudWatch call before it looks for what that evaluation delivers, so the
+        // clock that materialises it is started here.
+        crate::state::alarm_actions::drive_alarm_clock(&self.engine, ctx);
 
         Ok(PutMetricAlarmOutput)
     }
@@ -1014,6 +1018,9 @@ fn write_alarm(
             // still reports the state it left behind, and the first evaluation against
             // the stored metric data becomes due at its end.
             evaluation_due_secs: now + crate::state::alarm_evaluation::EVALUATION_DELAY_SECS,
+            // A configuration write leaves the alarm reporting its own evaluated state: it
+            // is not holding one a caller forced.
+            forced_state_until_secs: None,
         },
     );
     store.record_history(

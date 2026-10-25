@@ -88,6 +88,12 @@ pub const DEFAULT_RECORDING_RECONNECT_WINDOW_SECONDS: i32 = 0;
 ///
 /// Documented on `AutoParticipantRecordingConfiguration$recordParticipantReplicas`:
 /// "Optional field to disable replica participant recording. … Default: `true`."
+///
+/// The model declares `@default false` for the same member, so the shape keeps the
+/// member's PRESENCE (see the hand-written `AutoParticipantRecordingConfiguration` in
+/// `crate::ops::types`) and this default applies only where the request carried no
+/// value: a `false` a caller sends to disable replica participant recording is reported
+/// as it arrived.
 pub const DEFAULT_RECORD_PARTICIPANT_REPLICAS: bool = true;
 
 /// Thumbnail-generation interval, when the thumbnail configuration does not set one.
@@ -114,6 +120,20 @@ pub const DEFAULT_THUMBNAIL_RECORDING_MODE: &str = "DISABLED";
 /// "Defines the target duration for recorded segments generated when recording a stage
 /// participant. … Default: 6."
 pub const DEFAULT_HLS_TARGET_SEGMENT_DURATION_SECONDS: i32 = 6;
+
+/// The value a member reports when the request left it out: `documented`, the default
+/// the member's own doc states — never the Smithy `@default` the framework would
+/// materialise for it.
+///
+/// `requested` is what arrived, which is `None` exactly when the request did not carry
+/// the member: the shapes whose documented default differs from their declared
+/// `@default` keep that presence (see `crate::ops::types`), so a value the caller DID
+/// send — the declared default included — is reported as it arrived, and the documented
+/// default is reported only in its absence. One member, one default, whatever its
+/// siblings carry.
+pub fn documented_default<T>(requested: Option<T>, documented: T) -> T {
+    requested.unwrap_or(documented)
+}
 
 /// [`DEFAULT_RECORDING_MEDIA_TYPE`] as the modelled `ParticipantRecordingMediaTypeList`.
 pub fn default_recording_media_types() -> Vec<String> {
@@ -168,9 +188,9 @@ pub fn default_recording_configuration() -> AutoParticipantRecordingConfiguratio
         storage_configuration_arn: NO_STORAGE_CONFIGURATION_ARN.to_string(),
         media_types: Some(default_recording_media_types()),
         thumbnail_configuration: Some(effective_thumbnail_configuration(None)),
-        recording_reconnect_window_seconds: DEFAULT_RECORDING_RECONNECT_WINDOW_SECONDS,
+        recording_reconnect_window_seconds: Some(DEFAULT_RECORDING_RECONNECT_WINDOW_SECONDS),
         hls_configuration: Some(effective_hls_configuration(None)),
-        record_participant_replicas: DEFAULT_RECORD_PARTICIPANT_REPLICAS,
+        record_participant_replicas: Some(DEFAULT_RECORD_PARTICIPANT_REPLICAS),
     }
 }
 
@@ -184,14 +204,11 @@ pub fn default_recording_configuration() -> AutoParticipantRecordingConfiguratio
 /// recording, set this to `\"\"`; other fields in this object will get reset to their
 /// defaults when sending `\"\"`."
 ///
-/// Otherwise each member the caller left out is filled in from its documented default.
-/// Two members cannot be "left out" at this seam: `recordingReconnectWindowSeconds` and
-/// `recordParticipantReplicas` carry Smithy `@default` traits, so the framework has
-/// already materialised the MODEL's default for them by the time a handler sees the
-/// request and an absent member is indistinguishable from one the caller sent — their
-/// values are reported as they arrived, which is also what honours an explicit `false`
-/// on `recordParticipantReplicas` ("Optional field to disable replica participant
-/// recording").
+/// Otherwise each member the caller left out is filled in from its documented default,
+/// through [`documented_default`] for the two the model also declares a Smithy
+/// `@default` for — the shape keeps their presence, so a value the caller sent is
+/// reported as it arrived and the documented default applies only where the member was
+/// absent.
 pub fn effective_recording_configuration(
     requested: Option<AutoParticipantRecordingConfiguration>,
 ) -> AutoParticipantRecordingConfiguration {
@@ -209,9 +226,17 @@ pub fn effective_recording_configuration(
         thumbnail_configuration: Some(effective_thumbnail_configuration(
             requested.thumbnail_configuration,
         )),
-        recording_reconnect_window_seconds: requested.recording_reconnect_window_seconds,
+        recording_reconnect_window_seconds: Some(documented_default(
+            requested.recording_reconnect_window_seconds,
+            DEFAULT_RECORDING_RECONNECT_WINDOW_SECONDS,
+        )),
         hls_configuration: Some(effective_hls_configuration(requested.hls_configuration)),
-        record_participant_replicas: requested.record_participant_replicas,
+        // The same documented default [`default_recording_configuration`] reports, so
+        // one member of one shape has ONE default whatever its siblings carry.
+        record_participant_replicas: Some(documented_default(
+            requested.record_participant_replicas,
+            DEFAULT_RECORD_PARTICIPANT_REPLICAS,
+        )),
     }
 }
 
@@ -673,6 +698,26 @@ pub const DEFAULT_PIP_BEHAVIOR: &str = "STATIC";
 /// Documented on `PipConfiguration$pipPosition`: "Default: `BOTTOM_RIGHT`."
 pub const DEFAULT_PIP_POSITION: &str = "BOTTOM_RIGHT";
 
+/// Spacing between a grid layout's participant tiles, when the request does not size it.
+///
+/// Documented on `GridConfiguration$gridGap`: "Specifies the spacing between participant
+/// tiles in pixels. Default: `2`." `PipConfiguration$gridGap` targets the same `GridGap`
+/// shape and documents `0` instead, so the default belongs to the member rather than to
+/// the shape, and the picture-in-picture layout keeps its own.
+///
+/// The model declares `@default 0` for the member, so the shape keeps the member's
+/// PRESENCE (see the hand-written `GridConfiguration` in `crate::ops::types`) and this
+/// default applies only where the request carried no value: a `0` the caller asks for —
+/// the published minimum of the member's `@range` — is reported as it arrived.
+pub const DEFAULT_GRID_GAP_PIXELS: i32 = 2;
+
+/// Whether a grid omits participants with stopped video, when the request does not say.
+///
+/// Documented on `GridConfiguration$omitStoppedVideo`: "Determines whether to omit
+/// participants with stopped video in the composition. Default: `false`" — the same
+/// value the model declares as the member's `@default`.
+pub const DEFAULT_OMIT_STOPPED_VIDEO: bool = false;
+
 /// Compositions this emulator keeps for one engine. Not an AWS quota — this emulator's
 /// own resource guard on the one store `StartComposition` grows, set the same way
 /// [`MAX_STAGES`] is and answered with the same modelled
@@ -695,14 +740,20 @@ pub fn composition_arn(region: &str, composition_id: &str) -> String {
 }
 
 /// The grid layout `requested` describes, with the documented default for every member
-/// it left out.
+/// it left out — each applied through [`documented_default`], so a value the request
+/// carried is reported as it arrived.
 ///
-/// The members the model carries a `@default` trait for (`omitStoppedVideo`, `gridGap`)
-/// arrive already filled in by the framework's deserializer — they are not optional on
-/// the Rust shape — so only the two the model documents a default for in prose are
-/// applied here.
+/// `gridGap` is the member whose documented default (`2`) differs from the `@default`
+/// (`0`) the model declares for it, which is why the shape keeps every member's
+/// presence; `omitStoppedVideo` documents the value the model declares, so its default
+/// is reached by the same route and reports the same thing either way.
 fn effective_grid(requested: GridConfiguration) -> GridConfiguration {
     GridConfiguration {
+        featured_participant_attribute: requested.featured_participant_attribute,
+        omit_stopped_video: Some(documented_default(
+            requested.omit_stopped_video,
+            DEFAULT_OMIT_STOPPED_VIDEO,
+        )),
         video_aspect_ratio: Some(
             requested
                 .video_aspect_ratio
@@ -713,12 +764,21 @@ fn effective_grid(requested: GridConfiguration) -> GridConfiguration {
                 .video_fill_mode
                 .unwrap_or_else(|| DEFAULT_GRID_VIDEO_FILL_MODE.to_string()),
         ),
-        ..requested
+        grid_gap: Some(documented_default(
+            requested.grid_gap,
+            DEFAULT_GRID_GAP_PIXELS,
+        )),
+        participant_order_attribute: requested.participant_order_attribute,
     }
 }
 
 /// The picture-in-picture layout `requested` describes, with the documented default for
 /// every member it left out.
+///
+/// `gridGap`, `pipOffset` and `omitStoppedVideo` each document the same default the model
+/// declares as their `@default`, so the value the framework materialised for an absent
+/// member is already the documented one and is reported as it arrived — which is why this
+/// shape is left to the macro where `GridConfiguration` is not.
 ///
 /// `pipWidth` and `pipHeight` are deliberately left absent when the request omits them:
 /// the model documents that each is then "based on the size of the composition and the
