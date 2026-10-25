@@ -160,9 +160,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 GetDeliveryDestinationError::from(
                     GetDeliveryDestinationErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: Some(crate::state::resource_not_found_message(
-                                "delivery destination",
-                            )),
+                            // The sentence every delivery-destination operation refuses an
+                            // unknown name with: the service states that the requested
+                            // delivery destination is not in this account.
+                            message: Some(
+                                crate::state::DELIVERY_DESTINATION_NOT_FOUND_MESSAGE.to_string(),
+                            ),
                         },
                     ),
                 )
