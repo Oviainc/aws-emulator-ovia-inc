@@ -5,6 +5,10 @@
 //! Resolves `ResourceArn` back to the stored environment and writes the requested pairs
 //! into the SAME tag map `GetEnvironment` and `ListTagsForResource` read.
 //!
+//! A key in the namespace [`crate::state::RESERVED_TAG_KEY_PREFIX`] reserves is AWS's own
+//! to apply, so a request naming one is refused with `ValidationException` (HTTP 400) and
+//! nothing is written.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -141,6 +145,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An environment lives in the Region it was created in, so an ARN is resolved in
         // the Region this request was signed for and nowhere else.
         let region = crate::state::request_region(ctx);
+
+        // The tags in the reserved namespace are AWS's own to apply: a caller may not
+        // create one. Judged on the request alone, so it is refused ahead of the ARN lookup
+        // and before any tag map is touched.
+        if let Some(reserved) =
+            crate::state::first_reserved_tag_key(input.tags.keys().map(String::as_str))
+        {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::reserved_tag_key_message("Tags", reserved)),
+            })
+            .into());
+        }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             TagResourceErrorModeled::InternalServerException(InternalServerException {

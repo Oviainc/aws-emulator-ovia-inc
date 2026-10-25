@@ -66,10 +66,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eks-awswesleyfrontend.j
 // here — hence the `DescribeCapabilityError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eks#DescribeCapability")]
+//
+// `ClientException` is widened in through `extra_errors`: this SERVICE models that
+// shape and many of its operations declare it, but this one does not list it — and it
+// is the class every operation of the Amazon EKS-managed plane refuses a cluster this
+// service does not manage with ([`crate::state::connected_cluster_refusal`]).
+#[smithy_macros::operation_error(
+    "com.amazonaws.eks#DescribeCapability",
+    extra_errors = ["ClientException"]
+)]
 #[derive(Debug)]
 pub enum DescribeCapabilityErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    ClientException(ClientException),
     InvalidParameterException(InvalidParameterException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServerException(ServerException),
@@ -154,11 +163,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A cluster name identifies a cluster only within one region, and a capability
         // only within its cluster, so the record this reads is the one in the region the
         // request is signed for.
-        if !guard
+        let Some(cluster) = guard
             .clusters
-            .contains_key(&(region.clone(), input.cluster_name.clone()))
-        {
+            .get(&(region.clone(), input.cluster_name.clone()))
+        else {
             return Err(not_found());
+        };
+        // A managed capability is software Amazon EKS runs in the cluster's control
+        // plane, and a cluster `RegisterCluster` connected has none of that plane: this
+        // operation does not apply to it. The gate is a fact about the CLUSTER, so it
+        // precedes resolving the capability.
+        if cluster.is_connected() {
+            return Err(DescribeCapabilityErrorModeled::ClientException(
+                crate::state::connected_cluster_refusal(&input.cluster_name),
+            )
+            .into());
         }
 
         let key = (region, input.cluster_name.clone(), input.capability_name.clone());

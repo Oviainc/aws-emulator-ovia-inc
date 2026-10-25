@@ -39,7 +39,8 @@
 use service_com_amazonaws_elasticbeanstalk_awselasticbeanstalkservice as eb;
 
 use crate::configuration_templates::{
-    as_params, expected_options, option_params, published_stack, reported_options, Option4,
+    as_params, expected_options, option_params, overridden_options, published_stack, remove_params,
+    Option4,
 };
 use crate::lifecycle::{Answer, Emulator, PAST_DUE, SOLUTION_STACK, TEST_REGION};
 
@@ -115,29 +116,9 @@ fn owned(params: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The awsQuery parameters that send `options` as the request's
-/// `OptionsToRemove` list: `(Namespace, OptionName, ResourceName)`, the three
-/// members `OptionSpecification` names one option by, with an empty
-/// `ResourceName` left off the request.
-fn remove_params(options: &[(&str, &str, &str)]) -> Vec<(String, String)> {
-    let mut params = Vec::new();
-    for (index, (namespace, option_name, resource_name)) in options.iter().enumerate() {
-        let at = index + 1;
-        params.push((format!("OptionsToRemove.member.{at}.Namespace"), (*namespace).to_string()));
-        params.push((format!("OptionsToRemove.member.{at}.OptionName"), (*option_name).to_string()));
-        if !resource_name.is_empty() {
-            params.push((
-                format!("OptionsToRemove.member.{at}.ResourceName"),
-                (*resource_name).to_string(),
-            ));
-        }
-    }
-    params
-}
-
 /// The option settings one configuration-settings description reports, as
 /// `(Namespace, OptionName, Value, ResourceName)` per option — the shape
-/// [`reported_options`] answers in.
+/// [`overridden_options`] answers in.
 type Options = Vec<(String, String, String, String)>;
 
 /// One configuration-settings description: its `DeploymentStatus` and the
@@ -148,6 +129,10 @@ type ConfigurationSet = (String, Options);
 /// reports for `environment`, as `(DeploymentStatus, option settings)` in
 /// document order — read description by description, so a description's status
 /// and its options cannot be re-aligned across descriptions.
+///
+/// The options are the description's OVERRIDES: a configuration set reports the
+/// resolved settings, platform defaults included, and what an update put in
+/// force is what these rows are about.
 async fn configuration_sets(
     emulator: &Emulator,
     case: &str,
@@ -169,7 +154,7 @@ async fn configuration_sets(
                     .value("DeploymentStatus")
                     .unwrap_or_default()
                     .to_string(),
-                reported_options(member),
+                overridden_options(member),
             )
         })
         .collect()

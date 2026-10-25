@@ -112,9 +112,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eks-awswesleyfrontend.j
 // here — hence the `ListPodIdentityAssociationsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eks#ListPodIdentityAssociations")]
+//
+// `ClientException` is widened in through `extra_errors`: this SERVICE models that
+// shape and many of its operations declare it, but this one does not list it — and it
+// is the class every operation of the Amazon EKS-managed plane refuses a cluster this
+// service does not manage with ([`crate::state::connected_cluster_refusal`]).
+#[smithy_macros::operation_error(
+    "com.amazonaws.eks#ListPodIdentityAssociations",
+    extra_errors = ["ClientException"]
+)]
 #[derive(Debug)]
 pub enum ListPodIdentityAssociationsErrorModeled {
+    ClientException(ClientException),
     InvalidParameterException(InvalidParameterException),
     InvalidRequestException(InvalidRequestException),
     ResourceNotFoundException(ResourceNotFoundException),
@@ -266,16 +275,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let guard = store.lock();
         // A `clusterName` names a cluster only within the region the request is signed
         // for, so an unknown name there is not found even if another region holds one.
-        if !guard
+        let Some(cluster) = guard
             .clusters
-            .contains_key(&(region.clone(), input.cluster_name.clone()))
-        {
+            .get(&(region.clone(), input.cluster_name.clone()))
+        else {
             return Err(
                 ListPodIdentityAssociationsErrorModeled::ResourceNotFoundException(
                     crate::state::cluster_not_found(&input.cluster_name),
                 )
                 .into(),
             );
+        };
+        // EKS Pod Identity hands credentials to Pods through the Amazon EKS-managed
+        // plane, which a cluster `RegisterCluster` connected has none of: this operation
+        // does not apply to it — which is a refusal, not an empty listing, because the
+        // listing itself is not something EKS keeps for that cluster.
+        if cluster.is_connected() {
+            return Err(ListPodIdentityAssociationsErrorModeled::ClientException(
+                crate::state::connected_cluster_refusal(&input.cluster_name),
+            )
+            .into());
         }
 
         // "You can filter the list by the namespace that the association is in or the

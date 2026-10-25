@@ -624,7 +624,8 @@ async fn a_connected_cluster_is_listed_only_when_include_asks_for_it() {
     }
 
     // "'all' must be in lowercase otherwise an error occurs", and no other value
-    // is documented at all.
+    // is documented at all: the token set is matched as an exact set membership
+    // test, so a case variant is refused exactly like an unknown token.
     for value in ["ALL", "All", "connected", "eks"] {
         let answer = list(&router, &format!("include={value}")).await;
         assert_eq!(
@@ -633,8 +634,8 @@ async fn a_connected_cluster_is_listed_only_when_include_asks_for_it() {
         );
         assert_eq!(
             answer.error_type.as_deref(),
-            Some("InvalidParameterException"),
-            "case {value:?}: expected InvalidParameterException, got {answer:?}"
+            Some("InvalidRequestException"),
+            "case {value:?}: expected InvalidRequestException, got {answer:?}"
         );
     }
 }

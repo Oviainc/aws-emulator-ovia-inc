@@ -2166,6 +2166,67 @@ pub fn published_configuration_options(
     options
 }
 
+/// The platform version a configuration set is FOR, from the two forms it is
+/// named by: a platform version is named BOTH by its solution stack name and by
+/// its ARN, and this service's catalog publishes both, so either form resolves
+/// the one published version. A version the catalog does not publish — a CUSTOM
+/// one — resolves to none, which is what leaves its catalog the general one.
+///
+/// The ONE place that resolution is written: every operation that has to know
+/// which platform version a stored configuration set belongs to (the option
+/// catalog it publishes, the defaults its settings resolve against) reads the
+/// same answer.
+pub fn configuration_platform(
+    region: &str,
+    solution_stack_name: Option<&str>,
+    platform_arn: Option<&str>,
+) -> Option<&'static SolutionStack> {
+    solution_stack_name
+        .and_then(solution_stack_named)
+        .or_else(|| platform_arn.and_then(|arn| managed_platform_version(region, arn)))
+}
+
+/// The option settings a configuration SET holds, RESOLVED: the option catalog
+/// `catalog` publishes at its default values, with the settings `written` on the
+/// configuration itself applied over them.
+///
+/// Elastic Beanstalk resolves a configuration through a layered chain — the
+/// platform version's defaults, then the saved configuration, then the settings
+/// set on the environment — so the configuration set a read reports is the
+/// resolved one: it carries options nobody wrote, each at the `DefaultValue`
+/// `DescribeConfigurationOptions` publishes for the same (`Namespace`,
+/// `OptionName`) on that platform version, and an option the configuration DOES
+/// set at the value it was set to.
+///
+/// An option the catalog defines no default for is in force at no value, so it
+/// is reported only where the configuration sets it; an option the catalog does
+/// not define at all — an application environment variable, which the caller
+/// names — is reported because the configuration sets it.
+///
+/// This is why the WRITTEN settings are what the store keeps: the override an
+/// `OptionsToRemove` takes out stops replacing the default, so that option
+/// resolves to the inherited default again rather than disappearing from the
+/// set.
+pub fn resolved_option_settings(
+    catalog: &[&'static ConfigurationOption],
+    written: &[ConfigurationOptionSetting],
+) -> Vec<ConfigurationOptionSetting> {
+    let defaults: Vec<ConfigurationOptionSetting> = catalog
+        .iter()
+        .filter(|option| !option.default_value.is_empty())
+        .map(|option| ConfigurationOptionSetting {
+            // "A unique resource name for the configuration option setting" —
+            // only a time-based scaling option is set on a resource of its own,
+            // and a catalog default is set on none.
+            resource_name: None,
+            namespace: Some(option.namespace.to_string()),
+            option_name: Some(option.name.to_string()),
+            value: Some(option.default_value.to_string()),
+        })
+        .collect();
+    merge_option_settings(&defaults, written)
+}
+
 /// The server clock, as the modelled timestamp type.
 ///
 /// Dated to the MICROSECOND the wire renders: the `date-time` rendering a client
@@ -3204,6 +3265,12 @@ pub struct ConfigurationTemplate {
     /// The option settings this configuration holds, in the order they were
     /// supplied, de-duplicated by the key an option is identified by
     /// (`Namespace`, `OptionName`, `ResourceName`).
+    ///
+    /// These are the settings the configuration itself WROTE — its overrides,
+    /// not the whole configuration in force: a read reports them resolved over
+    /// the platform version's option catalog
+    /// ([`resolved_option_settings`]), so an option an update removes from here
+    /// resolves to the inherited platform default again.
     pub option_settings: Vec<ConfigurationOptionSetting>,
     /// The deployment status of this configuration set: a stored template IS
     /// the configuration set the saved configuration holds — there is no
@@ -3407,8 +3474,13 @@ impl DraftConfiguration {
 /// Rust struct per operation for it with identical members, so the mapping is
 /// written once here and the struct is the parameter — the same seam
 /// [`environment_description`] provides for `EnvironmentDescription`.
+///
+/// `$store` is the store the settings are RESOLVED through and `$region` the
+/// region the platform version is named in: the description reports the
+/// resolved configuration set, not the settings the caller wrote. See
+/// [`ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState::resolved_configuration_settings`].
 macro_rules! configuration_settings_description {
-    ($ty:path, $template:expr) => {{
+    ($ty:path, $store:expr, $region:expr, $template:expr) => {{
         let template: &$crate::state::ConfigurationTemplate = $template;
         $ty {
             solution_stack_name: template.solution_stack_name.clone(),
@@ -3428,7 +3500,12 @@ macro_rules! configuration_settings_description {
             deployment_status: Some(template.deployment_status.clone()),
             date_created: Some(template.date_created),
             date_updated: Some(template.date_updated),
-            option_settings: Some(template.option_settings.clone()),
+            option_settings: Some($store.resolved_configuration_settings(
+                $region,
+                template.solution_stack_name.as_deref(),
+                template.platform_arn.as_deref(),
+                &template.option_settings,
+            )),
         }
     }};
 }
@@ -5965,6 +6042,49 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
     /// reports them for a version resolves the branch through here.
     pub fn platform_branch_named(&self, branch_name: &str) -> Option<&PlatformBranch> {
         platform_branch_named(&self.platform_branches, branch_name)
+    }
+
+    /// Whether the platform version `stack` can run a WORKER environment, which
+    /// is what its branch's supported tiers say — the one place that question is
+    /// answered, so the Amazon SQS daemon's options are published for the same
+    /// platform versions everywhere.
+    pub fn supports_worker_tier(&self, stack: Option<&SolutionStack>) -> bool {
+        stack
+            .and_then(|stack| self.platform_branch_named(stack.branch_name))
+            .is_some_and(|branch| {
+                branch
+                    .supported_tiers
+                    .iter()
+                    .any(|tier| tier == TIER_WORKER)
+            })
+    }
+
+    /// The configuration option catalog the platform version `stack` publishes —
+    /// the catalog `DescribeConfigurationOptions` serves for it, which is also
+    /// the one a configuration set for that version resolves its settings
+    /// against.
+    pub fn published_option_catalog(
+        &self,
+        stack: Option<&SolutionStack>,
+    ) -> Vec<&'static ConfigurationOption> {
+        published_configuration_options(stack, self.supports_worker_tier(stack))
+    }
+
+    /// The RESOLVED option settings of a configuration set whose platform
+    /// version is named by `solution_stack_name` and `platform_arn` and whose
+    /// own written settings are `written`. See [`resolved_option_settings`]:
+    /// this is the projection every read of a configuration set reports, so a
+    /// template, an environment's deployed configuration and its draft all
+    /// resolve against the catalog of the platform version they are for.
+    pub fn resolved_configuration_settings(
+        &self,
+        region: &str,
+        solution_stack_name: Option<&str>,
+        platform_arn: Option<&str>,
+        written: &[ConfigurationOptionSetting],
+    ) -> Vec<ConfigurationOptionSetting> {
+        let stack = configuration_platform(region, solution_stack_name, platform_arn);
+        resolved_option_settings(&self.published_option_catalog(stack), written)
     }
 
     /// How many environments have not reached `Terminated` — the count the

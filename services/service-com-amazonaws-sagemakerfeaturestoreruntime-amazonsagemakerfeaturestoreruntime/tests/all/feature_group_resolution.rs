@@ -45,6 +45,7 @@ const LATER_EVENT_TIME: &str = "2024-06-01T00:00:00Z";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Call {
     PutRecord,
+    BatchWriteRecord,
     GetRecord,
     UpdateRecord,
     ListRecords,
@@ -52,11 +53,11 @@ enum Call {
     DeleteRecord,
 }
 
-/// Every operation that names ONE feature group, in an order that leaves the delete last
-/// so a row's earlier calls still see the record. `BatchWriteRecord` is a scaffold stub
-/// (its own issue) and answers 501, so it is not part of this rule yet.
-const EVERY_CALL: [Call; 6] = [
+/// Every operation that names a feature group, in an order that leaves the delete last
+/// so a row's earlier calls still see the record.
+const EVERY_CALL: [Call; 7] = [
     Call::PutRecord,
+    Call::BatchWriteRecord,
     Call::GetRecord,
     Call::UpdateRecord,
     Call::ListRecords,
@@ -148,6 +149,21 @@ impl Emulator {
                 )
                 .await
             }
+            Call::BatchWriteRecord => {
+                self.send(
+                    "POST",
+                    "/BatchWriteRecord",
+                    Some(json!({ "Entries": [{
+                        "FeatureGroupName": percent_decoded(group),
+                        "Record": [
+                            feature(IDENTIFIER_FEATURE, RECORD),
+                            feature(EVENT_TIME_FEATURE, EVENT_TIME),
+                            feature("feature_a", "original")
+                        ]
+                    }] })),
+                )
+                .await
+            }
             Call::GetRecord => {
                 self.send(
                     "GET",
@@ -223,7 +239,8 @@ fn error_code(body: &Value) -> String {
         .to_owned()
 }
 
-/// The per-identifier `ErrorCode`s a `BatchGetRecord` response reports.
+/// The per-entry `ErrorCode`s a batch response reports — `BatchGetRecord` per
+/// identifier, `BatchWriteRecord` per entry.
 fn batch_error_codes(body: &Value) -> Vec<String> {
     body.get("Errors")
         .and_then(Value::as_array)
@@ -342,10 +359,10 @@ async fn every_operation_refuses_a_feature_group_name_that_resolves_to_no_featur
             };
             let (status, body) = emulator.perform(call, &spelling).await;
             let code = error_code(&body);
-            if call == Call::BatchGetRecord {
-                // BatchGetRecord reports a failure that concerns one identifier in
-                // `Errors` rather than failing the batch, so the same classification
-                // arrives as the per-identifier `ErrorCode`.
+            if matches!(call, Call::BatchGetRecord | Call::BatchWriteRecord) {
+                // A batch operation reports a failure that concerns one identifier or
+                // one entry in `Errors` rather than failing the batch, so the same
+                // classification arrives as that element's own `ErrorCode`.
                 let reported = batch_error_codes(&body);
                 let expected: Vec<String> = if refused {
                     vec!["ValidationError".to_owned()]

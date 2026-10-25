@@ -369,8 +369,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             let mut guard = store.lock();
             guard.materialize_due_transitions(now);
-            if !guard.clusters.contains_key(&cluster_key) {
+            let Some(cluster) = guard.clusters.get(&cluster_key) else {
                 return Err(cluster_not_found(&input.cluster_name));
+            };
+            // A managed node group is a resource of the Amazon EKS-managed plane, and a
+            // cluster `RegisterCluster` connected has none of that plane: EKS does not
+            // manage its nodes, so this operation does not apply to it at all. The gate
+            // is a fact about the CLUSTER, so it is answered as soon as the cluster is
+            // resolved, before anything in the body is judged against it.
+            if cluster.is_connected() {
+                return Err(CreateNodegroupErrorModeled::ClientException(
+                    state::connected_cluster_refusal(&input.cluster_name),
+                )
+                .into());
             }
         }
 
@@ -398,19 +409,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(cluster_not_found(&input.cluster_name));
         };
         // "You can only create a node group for your cluster that is equal to
-        // the current Kubernetes version for the cluster" — which an EXTERNAL
-        // cluster `RegisterCluster` connected does not have: it has no
-        // EKS-provisioned control plane, so it reports no `version` and cannot
-        // carry an EKS-managed node group. That is exactly what
-        // `InvalidRequestException` reports: "The request is invalid given the
-        // state of the cluster."
+        // the current Kubernetes version for the cluster", so the cluster's own
+        // version is what a node group is created at. Every Amazon EKS cluster
+        // reports one — the gate above already turned away the only kind of
+        // cluster that reports none — and a record without one has no version to
+        // create a node group at, which is what `InvalidRequestException`
+        // reports: "The request is invalid given the state of the cluster."
         let Some(cluster_version) = cluster.version.clone() else {
             return Err(CreateNodegroupErrorModeled::InvalidRequestException(
                 InvalidRequestException {
                     cluster_name: Some(input.cluster_name.clone()),
                     nodegroup_name: Some(input.nodegroup_name.clone()),
                     message: Some(format!(
-                        "Cluster {} is a connected cluster and cannot have a managed node group",
+                        "Cluster {} reports no Kubernetes version to create a node group at",
                         input.cluster_name
                     )),
                     ..Default::default()

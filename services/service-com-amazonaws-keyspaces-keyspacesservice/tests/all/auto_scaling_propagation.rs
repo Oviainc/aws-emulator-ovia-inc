@@ -904,3 +904,232 @@ async fn settings_registered_through_application_auto_scaling_are_reported_by_ke
         "case \"deregistered both\": expected the modelled not-found, got {status} {body}"
     );
 }
+
+/// The name Amazon Keyspaces gives the policy it registers for a table's capacity: the
+/// keyspace, the table and the `-scaling-policy` suffix, one name for BOTH capacities of
+/// the table (recorded Amazon Keyspaces behaviour — the Smithy model constrains
+/// `ScalingPolicy$PolicyName` only as a required 1..256 `^\p{Print}+$` string and says
+/// nothing about who mints it: `smithy_query(query="shape", shape="PolicyName")`).
+fn expected_policy_name(keyspace: &str, table: &str) -> String {
+    format!("{keyspace}-{table}-scaling-policy")
+}
+
+/// One row: a table created with `specification`, and the capacity dimensions it must
+/// leave a policy registered for.
+struct NamingCase {
+    name: &'static str,
+    keyspace: &'static str,
+    table: &'static str,
+    specification: Value,
+    dimensions: Vec<keyspaces::TableCapacity>,
+}
+
+/// RULE: a scaling policy a service registers with Application Auto Scaling on its own
+/// resource's behalf is named after the resource it was created for — for an Amazon
+/// Keyspaces table, `<keyspaceName>-<tableName>-scaling-policy`, the same name under each
+/// of the table's capacity dimensions, since a policy name is unique only under one
+/// scalable target and the dimension is what tells the two apart — and that name is the
+/// policy's identity in Application Auto Scaling: it is what `PolicyNames` selects, what
+/// the `PolicyARN` carries, what a `PutScalingPolicy` under the same name UPDATES rather
+/// than adds, and what `DeleteScalingPolicy` removes.
+///
+/// The rows differ along the keyspace and table names the policy name is built from
+/// (length, digits, underscores, the longest names Amazon Keyspaces admits), which
+/// capacities are configured, and the capacity bounds and target values.
+#[tokio::test]
+async fn keyspaces_minted_policies_are_named_after_the_table_they_scale() {
+    let read = keyspaces::TableCapacity::Read;
+    let write = keyspaces::TableCapacity::Write;
+    let cases = vec![
+        NamingCase {
+            name: "both_capacities",
+            keyspace: "naming_ks",
+            table: "sim2real_t",
+            specification: json!({
+                "readCapacityAutoScaling": enabled(2, 6, 50.0),
+                "writeCapacityAutoScaling": enabled(2, 5, 70.0),
+            }),
+            dimensions: vec![read, write],
+        },
+        NamingCase {
+            name: "read_capacity_only",
+            keyspace: "ks1",
+            table: "t1",
+            specification: json!({"readCapacityAutoScaling": enabled(1, 100, 20.0)}),
+            dimensions: vec![read],
+        },
+        NamingCase {
+            name: "write_capacity_only_with_underscores",
+            keyspace: "a_very_long_keyspace_name_for_naming_checks_01",
+            table: "another_long_table_name_for_naming_checks_0042",
+            specification: json!({"writeCapacityAutoScaling": enabled(12, 4000, 90.0)}),
+            dimensions: vec![write],
+        },
+        NamingCase {
+            name: "one_character_names",
+            keyspace: "k",
+            table: "t",
+            specification: json!({
+                "readCapacityAutoScaling": enabled(3, 3, 42.0),
+                "writeCapacityAutoScaling": enabled(9, 900, 88.5),
+            }),
+            dimensions: vec![read, write],
+        },
+    ];
+
+    for case in &cases {
+        // One emulator per row, so every policy the reads below see is this row's.
+        let emulator = Emulator::start();
+        emulator
+            .given_provisioned_table(
+                case.name,
+                case.keyspace,
+                case.table,
+                Some(&case.specification),
+            )
+            .await;
+        let name = case.name;
+        let expected = expected_policy_name(case.keyspace, case.table);
+        let resource = resource_id(case.keyspace, case.table);
+
+        let policies = emulator.cassandra_policies().await;
+        assert_eq!(
+            policies.len(),
+            case.dimensions.len(),
+            "case {name:?}: expected {} policy/policies, got {policies:?}",
+            case.dimensions.len()
+        );
+        for (index, capacity) in case.dimensions.iter().enumerate() {
+            let policy = &policies[index];
+            assert_member(
+                name,
+                policy,
+                "/ScalableDimension",
+                &json!(capacity.scalable_dimension()),
+            );
+            assert_member(name, policy, "/PolicyName", &json!(expected));
+            assert_member(name, policy, "/PolicyType", &json!("TargetTrackingScaling"));
+            // The ARN is minted from the policy's identity, so it carries that same name.
+            let arn = policy["PolicyARN"].as_str().unwrap_or_default();
+            assert!(
+                arn.ends_with(&format!(":policyName/{expected}")),
+                "case {name:?}: expected a PolicyARN naming {expected:?}, got {arn:?}"
+            );
+            // The minted name stays inside the member's modelled bounds.
+            let length = expected.chars().count();
+            assert!(
+                (1..=256).contains(&length)
+                    && expected
+                        .chars()
+                        .all(|character| !character.is_control() && !character.is_whitespace()),
+                "case {name:?}: {expected:?} is not a 1..256 printable PolicyName"
+            );
+        }
+
+        // The name is what addresses the policy: `PolicyNames` selects every dimension's.
+        let (status, body) = emulator
+            .auto_scaling(
+                "DescribeScalingPolicies",
+                json!({
+                    "ServiceNamespace": "cassandra",
+                    "ResourceId": resource,
+                    "PolicyNames": [expected.clone()],
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: expected DescribeScalingPolicies to answer 200, got {status} {body}"
+        );
+        let selected = body["ScalingPolicies"].as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            selected.len(),
+            case.dimensions.len(),
+            "case {name:?}: expected PolicyNames=[{expected:?}] to select {} policy/policies, \
+             got {selected:?}",
+            case.dimensions.len()
+        );
+
+        // A `PutScalingPolicy` under that name updates the policy already steering the
+        // dimension instead of adding a second one beside it — and Amazon Keyspaces
+        // reports the updated settings, since that is the one policy it reads back.
+        let capacity = case.dimensions[0];
+        let (status, body) = emulator
+            .auto_scaling(
+                "PutScalingPolicy",
+                json!({
+                    "ServiceNamespace": "cassandra",
+                    "ResourceId": resource,
+                    "ScalableDimension": capacity.scalable_dimension(),
+                    "PolicyName": expected.clone(),
+                    "PolicyType": "TargetTrackingScaling",
+                    "TargetTrackingScalingPolicyConfiguration": {
+                        "TargetValue": 33.0,
+                        "PredefinedMetricSpecification": {
+                            "PredefinedMetricType": capacity.predefined_metric(),
+                        },
+                    },
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: expected PutScalingPolicy under the minted name to answer 200, \
+             got {status} {body}"
+        );
+        let policies = emulator.cassandra_policies().await;
+        assert_eq!(
+            policies.len(),
+            case.dimensions.len(),
+            "case {name:?}: expected the put to UPDATE the minted policy, got {policies:?}"
+        );
+        let member = match capacity {
+            keyspaces::TableCapacity::Read => "readCapacityAutoScaling",
+            keyspaces::TableCapacity::Write => "writeCapacityAutoScaling",
+        };
+        let (status, body) = emulator
+            .keyspaces(
+                "GetTableAutoScalingSettings",
+                json!({"keyspaceName": case.keyspace, "tableName": case.table}),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: expected GetTableAutoScalingSettings to answer 200, got {status} {body}"
+        );
+        assert_member(
+            name,
+            &body,
+            &format!(
+                "/autoScalingSpecification/{member}/scalingPolicy\
+                 /targetTrackingScalingPolicyConfiguration/targetValue"
+            ),
+            &json!(33.0),
+        );
+
+        // And `DeleteScalingPolicy` under that name removes it.
+        let (status, body) = emulator
+            .auto_scaling(
+                "DeleteScalingPolicy",
+                json!({
+                    "ServiceNamespace": "cassandra",
+                    "ResourceId": resource,
+                    "ScalableDimension": capacity.scalable_dimension(),
+                    "PolicyName": expected.clone(),
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: expected DeleteScalingPolicy under the minted name to answer 200, \
+             got {status} {body}"
+        );
+        let policies = emulator.cassandra_policies().await;
+        assert!(
+            policies
+                .iter()
+                .all(|policy| policy["ScalableDimension"] != json!(capacity.scalable_dimension())),
+            "case {name:?}: expected the deleted policy to be gone, got {policies:?}"
+        );
+    }
+}

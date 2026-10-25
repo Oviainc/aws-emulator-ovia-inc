@@ -385,6 +385,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(validation)?;
         spec.validate().map_err(validation)?;
 
+        // The tags in the reserved namespace are AWS's own to apply, so a create may not
+        // seed one either: refused before the environment is recorded, so nothing is
+        // provisioned for a request AWS would not accept.
+        if let Some(reserved) = crate::state::first_reserved_tag_key(
+            input
+                .tags
+                .iter()
+                .flat_map(|tags| tags.keys())
+                .map(String::as_str),
+        ) {
+            return Err(validation(crate::state::reserved_tag_key_message(
+                "Tags", reserved,
+            )));
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let mut store = state.lock();
         store.settle(now);

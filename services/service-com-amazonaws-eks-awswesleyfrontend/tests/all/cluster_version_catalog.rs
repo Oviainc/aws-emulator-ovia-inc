@@ -60,8 +60,13 @@ fn rows(answer: &Answer) -> Vec<serde_json::Value> {
 
 /// The rows of the whole shipped calendar, which is the table every suite below
 /// runs over.
+///
+/// Read with `includeAll`, because an unfiltered listing publishes only the
+/// versions Amazon EKS still offers — a row whose extended support has ended is
+/// reported only to a caller that asks for it — and these suites are about what
+/// every row of the calendar reports, not about which rows are offered.
 async fn whole_calendar(router: &MultiServiceRouter) -> Vec<serde_json::Value> {
-    let answer = describe_versions(router, "").await;
+    let answer = describe_versions(router, "includeAll=true").await;
     assert_eq!(
         answer.status, 200,
         "setup: expected HTTP 200 from the catalog, got {} ({:?})",

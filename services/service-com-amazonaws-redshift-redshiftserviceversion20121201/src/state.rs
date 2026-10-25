@@ -25,7 +25,8 @@
 //! from a cluster's own configuration (one rule, [`populate_derived_members`],
 //! so the create, modify and read paths cannot report different member sets),
 //! and the clock-owed `creating` -> `available` transitions (see
-//! [`PROVISIONING_SPAN`]).
+//! [`PROVISIONING_SPAN`]) and the faster in-place `modifying` -> `available` one
+//! an IAM role change owes (see [`IAM_ROLE_APPLY_SPAN`]).
 
 use crate::ops::types::{
     AccountAttribute, AccountWithRestoreAccess, AquaConfiguration, AttributeValueTarget,
@@ -51,6 +52,28 @@ use std::time::{Duration, Instant, SystemTime};
 /// after the starting call still observes the transient `creating` state. The
 /// due instant is stored and nothing ever sleeps for it.
 pub const PROVISIONING_SPAN: Duration = Duration::from_millis(500);
+
+/// How long after the call that asks for it an IN-PLACE configuration change
+/// falls due: a cluster reported `modifying` because its IAM role set changed
+/// becomes `available` again, and each association leaves `adding` / `removing`,
+/// this long after the `ModifyClusterIamRoles` call that asked for it.
+///
+/// Much shorter than [`PROVISIONING_SPAN`], and for the same reason the two
+/// spans exist at all: Amazon Redshift documents neither duration, so each is
+/// this emulator's own compression of one — and the compression keeps their ORDER
+/// and their ratio. Provisioning a new cluster is the slow one; applying a role
+/// change to a cluster that is already running is the fast one, and it has to
+/// land inside the gap between one call of a client's poll loop and the next. A
+/// client reconciling a cluster's roles attaches one, polls until the association
+/// is `in-sync`, and repeats that per role; if one change outlived a poll gap,
+/// every change would cost that client a whole poll interval for work the service
+/// has nothing left to do.
+///
+/// Non-zero, so the transient `modifying` status and the transient `ApplyStatus`
+/// are reported by the call that asked for the change — which is where a client
+/// reads them, and what makes the change observable at all. The due instant is
+/// stored and nothing ever sleeps for it.
+pub const IAM_ROLE_APPLY_SPAN: Duration = Duration::from_millis(1);
 
 /// The default `DBName` when `CreateCluster` does not carry one.
 ///
@@ -3248,17 +3271,18 @@ pub fn cluster_security_groups_available() -> bool {
         .any(|platform| platform.name.as_deref() == Some(PLATFORM_EC2_CLASSIC))
 }
 
-/// Why a call that would mint a cluster security group is refused.
+/// Why any call in the cluster-security-group family is refused.
 ///
 /// The text says the capability is gone and names the one that replaced it,
 /// because that — not any value the request carried — is what the caller has to
-/// act on: no name, description or tag list could make such a call succeed. Only
-/// the status (400) and the error code (`InvalidParameterValue`) are wire
-/// requirements; this wording is the service's own account of the rule, which is
-/// why it lives here once rather than being spelled at a call site.
+/// act on: no name, description, rule or tag list could make such a call
+/// succeed. Only the status (400) and the error code (`InvalidParameterValue`)
+/// are wire requirements; this sentence is the service's own standing notice,
+/// identical for every request and every operation of the family, which is why
+/// it lives here once rather than being spelled at a call site.
 pub const CLUSTER_SECURITY_GROUPS_UNAVAILABLE: &str =
-    "Cluster security groups are discontinued. Use VPC security groups to control access to an \
-     Amazon Redshift cluster.";
+    "Amazon Redshift has discontinued cluster security groups. For security group \
+     configuration, associate VPC security groups when creating or modifying your cluster.";
 
 /// One Availability Zone as this service reports it: its name AND the platforms
 /// a cluster in it can run on.

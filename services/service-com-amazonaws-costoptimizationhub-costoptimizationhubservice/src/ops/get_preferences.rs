@@ -7,9 +7,10 @@
 //! every member the account never set carries the default the service applies in
 //! its place (`crate::state::Preferences::effective`). The report is never an
 //! empty record, because the service always acts on one preference per member —
-//! bar `memberAccountDiscountVisibility`, which has no default: the preference
-//! is the organization's management account's to set, so it is reported only
-//! once that account has set it.
+//! bar `memberAccountDiscountVisibility`, which has no default and is a
+//! preference of the ORGANIZATION rather than of one account: it is reported to
+//! the organization's management account alone, and then only once that account
+//! has set it (`crate::state::...::effective_preferences`).
 //!
 //! ## Shape of an operation
 //!

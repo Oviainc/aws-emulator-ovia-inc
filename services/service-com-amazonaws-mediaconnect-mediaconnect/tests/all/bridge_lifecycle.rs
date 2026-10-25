@@ -50,6 +50,64 @@ pub(crate) fn minted_gateway_arn(suffix: u64, name: &str) -> String {
     )
 }
 
+/// Create one gateway declaring a network per entry of `networks`, over the wire, and
+/// answer its ARN.
+///
+/// This is the gateway a bridge is PLACED on, and its networks are the set a bridge's
+/// network sources and network outputs may name: `GatewayNetwork$Name` "is used to
+/// reference the network and must be unique among networks in this gateway". The create is
+/// `gateway_lifecycle`'s subject; here it is only the fixture the bridge suites place their
+/// bridges on, so `pub(crate)` and one encoding of it for the whole test crate.
+pub(crate) async fn gateway_with_networks(
+    emulator: &Emulator,
+    name: &str,
+    networks: &[&str],
+) -> String {
+    let declared: Vec<Value> = networks
+        .iter()
+        .enumerate()
+        .map(|(index, network)| json!({ "name": network, "cidrBlock": format!("10.{index}.0.0/24") }))
+        .collect();
+    let (status, code, created) = emulator
+        .send(
+            "POST",
+            "/v1/gateways",
+            Some(json!({
+                "name": name,
+                "egressCidrBlocks": ["10.0.0.0/16"],
+                "networks": declared,
+            })),
+        )
+        .await;
+    assert_eq!(
+        (status, code.as_deref()),
+        (201, None),
+        "fixture gateway {name:?}: create expected 201, got {status} {code:?}: {created}"
+    );
+    created["gateway"]["gatewayArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("fixture gateway {name:?}: the create answers an ARN: {created}"))
+        .to_string()
+}
+
+/// Create one cloud flow over the wire and answer its ARN.
+///
+/// This is the flow a bridge's flow source names: "a flow source originates in MediaConnect
+/// as an existing cloud flow" (`BridgeFlowSource`). The create is `flow_lifecycle`'s
+/// subject; here it is only the fixture, so it carries just the one source "the request
+/// must include".
+pub(crate) async fn cloud_flow(emulator: &Emulator, name: &str) -> String {
+    crate::flow_sources::create_flow_from(
+        emulator,
+        name,
+        json!({
+            "name": name,
+            "source": { "name": "src", "protocol": "rtp", "whitelistCidr": "10.0.0.0/16" },
+        }),
+    )
+    .await
+}
+
 /// Every ARN CreateBridge mints must be one this service could have minted: the model
 /// puts no pattern on `BridgeArn` (it carries an `@arnReference` to
 /// `AWS::MediaConnect::Bridge`), so the form is the crate's own and is asserted through

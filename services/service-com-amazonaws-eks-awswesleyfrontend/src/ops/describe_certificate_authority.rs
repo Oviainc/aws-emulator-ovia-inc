@@ -68,9 +68,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eks-awswesleyfrontend.j
 // here — hence the `DescribeCertificateAuthorityError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eks#DescribeCertificateAuthority")]
+//
+// `ClientException` is widened in through `extra_errors`: this SERVICE models that
+// shape and many of its operations declare it, but this one does not list it — and it
+// is the class every operation of the Amazon EKS-managed plane refuses a cluster this
+// service does not manage with ([`crate::state::connected_cluster_refusal`]).
+#[smithy_macros::operation_error(
+    "com.amazonaws.eks#DescribeCertificateAuthority",
+    extra_errors = ["ClientException"]
+)]
 #[derive(Debug)]
 pub enum DescribeCertificateAuthorityErrorModeled {
+    ClientException(ClientException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServerException(ServerException),
     ServiceUnavailableException(ServiceUnavailableException),
@@ -155,6 +164,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // A cluster certificate authority is the Amazon EKS control plane's own CA, and
+        // a cluster `RegisterCluster` connected has no such control plane: this operation
+        // does not apply to it. The gate is a fact about the CLUSTER, so it precedes
+        // resolving the certificate authority id.
+        if cluster.is_connected() {
+            return Err(DescribeCertificateAuthorityErrorModeled::ClientException(
+                crate::state::connected_cluster_refusal(&input.cluster_name),
+            )
+            .into());
+        }
 
         match cluster.certificate_authority_mut(&input.certificate_authority_id) {
             Some(record) => {
