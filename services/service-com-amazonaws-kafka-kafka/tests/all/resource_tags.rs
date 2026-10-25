@@ -48,7 +48,9 @@ use service_com_amazonaws_kafka_kafka::state::{
 
 // The crate's shared test harness: the router, the HTTP call path and the
 // `CreateCluster` request builder every suite here dispatches through.
-use crate::kafka_harness::{pct, ClusterRequest, Emulator, Reply, ACCOUNT, REGION};
+use crate::kafka_harness::{
+    pct, sleep_past_activation, ClusterRequest, Emulator, Reply, ACCOUNT, REGION,
+};
 
 /// The text the tagging operations answer a resource they cannot find with.
 /// RECORDED behaviour, mirroring `state::TAGGING_NOT_FOUND_MESSAGE`: the model
@@ -640,6 +642,9 @@ async fn an_arn_naming_no_resource_is_not_found() {
     // A cluster that existed and was deleted: every later reader must answer as if
     // it never existed.
     let deleted = emulator.cluster_arn("deleted-cluster", &[]).await;
+    // A cluster is deletable once it has finished provisioning: the delete of a
+    // cluster still in `CREATING` is refused, which is not what this row is about.
+    sleep_past_activation();
     let dropped = emulator.delete_cluster(&deleted).await;
     assert_eq!(
         dropped.status, 200,
