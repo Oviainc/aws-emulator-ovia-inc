@@ -161,55 +161,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // An identifier that is neither an API id nor an ARN names no API at all, so
-        // the request is malformed rather than pointed at a missing resource (see
-        // `crate::state::is_api_identifier`).
-        if !crate::state::is_api_identifier(&input.merged_api_identifier) {
-            return Err(GetSourceApiAssociationErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(crate::state::invalid_api_id_message(
-                        &input.merged_api_identifier,
-                    )),
-                    ..Default::default()
-                },
-            )
-            .into());
-        }
-
+        // the request is malformed rather than pointed at a missing resource; an
+        // `associationId` names an association OF the Merged API addressed. Both are
+        // the shared lookup rule (`crate::state::…::resolve_association`), which
+        // `StartSchemaMerge` resolves the same pair by.
         let mut guard = state.lock();
 
         // The ONLY write a read makes: apply the merge the clock already owes, which
         // was due at the same instant whether or not this call ever happened.
         guard.settle_associations(std::time::SystemTime::now());
 
-        let Some(merged) =
-            crate::state::api_by_identifier(&guard.graphql_apis, &input.merged_api_identifier)
-        else {
-            return Err(GetSourceApiAssociationErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        };
-        let merged_api_id = merged.api_id.clone();
-
-        // An `associationId` names an association OF the Merged API addressed, so one
-        // that belongs to another Merged API is not found under this one.
-        let Some(association) = guard
-            .source_api_associations
-            .get(&input.association_id)
-            .filter(|association| association.merged_api_id == merged_api_id)
-        else {
-            return Err(GetSourceApiAssociationErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(crate::state::ASSOCIATION_NOT_FOUND_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        };
-
-        Ok(GetSourceApiAssociationOutput {
-            source_api_association: Some(association.to_source_api_association()),
-        })
+        match guard.resolve_association(&input.merged_api_identifier, &input.association_id) {
+            Ok(association) => Ok(GetSourceApiAssociationOutput {
+                source_api_association: Some(association.to_source_api_association()),
+            }),
+            Err(refusal) => Err(refuse(refusal)),
+        }
     }
+}
+
+/// This operation's modelled error for a refusal the shared lookup rule states.
+///
+/// Each variant keeps the status the model gives its shape and carries the rule's own
+/// text: a not-found names no identifier, so which side of the pair was missing is not
+/// reported.
+fn refuse(refusal: crate::state::AssociationLookupRefusal) -> GetSourceApiAssociationError {
+    match refusal {
+        crate::state::AssociationLookupRefusal::BadRequest(message) => {
+            GetSourceApiAssociationErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+        }
+        crate::state::AssociationLookupRefusal::NotFound(message) => {
+            GetSourceApiAssociationErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
 }

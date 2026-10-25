@@ -45,6 +45,8 @@ mod source_api_association;
 mod source_api_disassociation;
 #[path = "all/source_graphql_api_association.rs"]
 mod source_graphql_api_association;
+#[path = "all/start_schema_merge.rs"]
+mod start_schema_merge;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/flush_api_cache.rs"]
