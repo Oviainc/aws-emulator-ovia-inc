@@ -21,13 +21,32 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The key check value a key reports is computed from that key's own stored
+# material by the algorithm `KeyCheckValueAlgorithm` names, so the primitives are
+# the real ones rather than a hand-rolled imitation:
+# AES and Triple DES encrypt the zero block for the `ANSI_X9_24` KCV,
+aes = "0.8"
+des = "0.8"
+# AES-CMAC over the zero block for the `CMAC` KCV,
+cmac = "0.7"
+# HMAC over a zero-length message with the key's own SHA-2 hash for the `HMAC` KCV.
+# 0.12 — not the 0.13 the SigV4 stack resolves — because it is the release built on
+# `digest` 0.10, the generation `sha2` 0.10, `cmac` 0.7 and `aes` 0.8 above share: one
+# `digest` version has to serve all of them.
+hmac = "0.12"
+sha2 = { workspace = true }
+# and SHA-1 over the key material for the `SHA_1` KCV.
+sha1 = "0.10"
+# Renders a KCV as hex, and the opaque `NextToken` the list operations hand out.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
+# No `[dev-dependencies]`: every crate above is a production dependency of the key
+# check value computation in `src/state.rs`, and the integration tests reach that
+# computation through this crate's own public helpers rather than through a primitive
+# of their own.
 
 [lints]
 workspace = true

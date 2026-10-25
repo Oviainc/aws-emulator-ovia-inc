@@ -13,6 +13,10 @@
 //! The suites are TABLES: a single `ListNetworks` call on a store nothing has
 //! created a network in (the issue's own reproduction) is ONE row of the first of
 //! them.
+//!
+//! The request helpers below are `pub(crate)` because the DELETION suite
+//! (`network_deletion`) drives the same resource through them, so the two suites
+//! cannot disagree about how a network request reaches the emulator.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_medialive_medialive::state::{
@@ -26,7 +30,7 @@ use crate::wire::{call, error_code, medialive, ACCOUNT, DEFAULT_REGION};
 /// The collection URI `CreateNetwork` and `ListNetworks` are bound to
 /// (`smithy_query(query="operation", operation="CreateNetwork,ListNetworks")`:
 /// POST / GET /prod/networks).
-const NETWORKS: &str = "/prod/networks";
+pub(crate) const NETWORKS: &str = "/prod/networks";
 
 /// `CreateNetwork` with `body`.
 async fn create(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
@@ -35,7 +39,7 @@ async fn create(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
 
 /// `CreateNetwork` with `body`, answering the created network, with the create
 /// itself asserted to have answered the modelled 201.
-async fn created(router: &MultiServiceRouter, case: &str, body: Value) -> Value {
+pub(crate) async fn created(router: &MultiServiceRouter, case: &str, body: Value) -> Value {
     let (status, network) = create(router, body).await;
     assert_eq!(
         status, 201,
@@ -45,18 +49,18 @@ async fn created(router: &MultiServiceRouter, case: &str, body: Value) -> Value 
 }
 
 /// `DescribeNetwork` on `id`.
-async fn describe(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+pub(crate) async fn describe(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(router, "GET", &format!("{NETWORKS}/{id}"), None).await
 }
 
 /// `ListNetworks` with `query` appended verbatim (both input members are
 /// `@httpQuery`).
-async fn list(router: &MultiServiceRouter, query: &str) -> (u16, Value) {
+pub(crate) async fn list(router: &MultiServiceRouter, query: &str) -> (u16, Value) {
     call(router, "GET", &format!("{NETWORKS}{query}"), None).await
 }
 
 /// The `networks` member as a list, whatever its length.
-fn summaries(case: &str, body: &Value) -> Vec<Value> {
+pub(crate) fn summaries(case: &str, body: &Value) -> Vec<Value> {
     body["networks"]
         .as_array()
         .cloned()
@@ -66,7 +70,7 @@ fn summaries(case: &str, body: &Value) -> Vec<Value> {
 /// A list member as a client reads it: an empty list and an absent member both
 /// mean "no entries", and which of the two the restJson1 codec writes for an
 /// empty list is the serializer's choice, so both read here as the empty list.
-fn list_member(body: &Value, name: &str) -> Value {
+pub(crate) fn list_member(body: &Value, name: &str) -> Value {
     match body.get(name) {
         None | Some(Value::Null) => json!([]),
         Some(other) => other.clone(),
@@ -74,7 +78,7 @@ fn list_member(body: &Value, name: &str) -> Value {
 }
 
 /// The `id` member of a response, as a client reads it.
-fn id_of(case: &str, body: &Value) -> String {
+pub(crate) fn id_of(case: &str, body: &Value) -> String {
     body["id"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: expected an id, got {body}"))
@@ -560,10 +564,10 @@ async fn a_retried_create_answers_with_the_network_the_token_created() {
 
 /// A network id nothing minted, which is what a cluster mapping that names no
 /// stored network carries.
-const STRAY_NETWORK_ID: &str = "9999999";
+pub(crate) const STRAY_NETWORK_ID: &str = "9999999";
 
 /// `CreateCluster`, answering the created cluster's id.
-async fn created_cluster(router: &MultiServiceRouter, case: &str, body: Value) -> String {
+pub(crate) async fn created_cluster(router: &MultiServiceRouter, case: &str, body: Value) -> String {
     let (status, cluster) = call(router, "POST", "/prod/clusters", Some(body)).await;
     assert_eq!(
         status, 201,
@@ -573,20 +577,20 @@ async fn created_cluster(router: &MultiServiceRouter, case: &str, body: Value) -
 }
 
 /// One cluster an association row creates.
-struct ClusterSpec {
+pub(crate) struct ClusterSpec {
     /// Whether the create carries a `NetworkSettings` block at all; `false` is a
     /// cluster created without one.
-    settings: bool,
+    pub(crate) settings: bool,
     /// One `InterfaceMapping` per entry: `Some(index)` names the row's network at
     /// that index and `None` names [`STRAY_NETWORK_ID`]. A repeated index is a
     /// second interface mapped onto the same network.
-    mappings: &'static [Option<usize>],
+    pub(crate) mappings: &'static [Option<usize>],
     /// When set, `DefaultRoute` is spelled with the id of the row's network at
     /// this index. `DefaultRoute` is "the network interface that is the default
     /// route for traffic to and from the node"
     /// (`smithy_query(query="shape", shape="ClusterNetworkSettings")`) — an
     /// interface, not a network — so it attaches nothing.
-    default_route: Option<usize>,
+    pub(crate) default_route: Option<usize>,
 }
 
 /// One row of the association table: how many networks the store holds and the
@@ -599,7 +603,7 @@ struct Attachment {
 
 /// The `CreateCluster` body one [`ClusterSpec`] asks for, against the ids the
 /// row's networks were minted with.
-fn cluster_body(name: String, spec: &ClusterSpec, network_ids: &[String]) -> Value {
+pub(crate) fn cluster_body(name: String, spec: &ClusterSpec, network_ids: &[String]) -> Value {
     let mut body = json!({ "name": name, "clusterType": "ON_PREMISES" });
     if !spec.settings {
         return body;

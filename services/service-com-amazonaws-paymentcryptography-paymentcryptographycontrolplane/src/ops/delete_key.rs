@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Schedules a key for deletion: moves the stored key to `DELETE_PENDING` with a
+//! `DeletePendingTimestamp` the requested number of days out. The record stays in
+//! [`crate::state`], so a later `GetKey` reports the pending state and `RestoreKey`
+//! can still take it back.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +180,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteKey"))
+        // `KeyIdentifier`'s pattern and length and `DeleteKeyInDays`' 3..180 range are
+        // modelled, so the centralized walk refuses anything outside them before this
+        // body runs — but `DeleteKeyInDays` is request-controlled and is scaled into a
+        // duration, so this body does not rely on that: the bound is re-checked and
+        // both the multiply and the add are checked, in
+        // [`crate::state::delete_pending_instant`], and a value that does not fit is
+        // the modelled `ValidationException` rather than a panic or a wrapped number.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteKeyErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the payment cryptography key store is unavailable".to_string()),
+            })
+        })?;
+
+        let waiting_period = input
+            .delete_key_in_days
+            .unwrap_or(crate::state::DEFAULT_DELETE_KEY_IN_DAYS);
+        let now = crate::state::now();
+
+        // The one refusal a request naming no stored key earns, constructed once and
+        // used by the single resolution below.
+        let not_found = || {
+            DeleteKeyError::from(DeleteKeyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    resource_id: Some(input.key_identifier.clone()),
+                },
+            ))
+        };
+
+        let mut store = state.lock();
+        // The identifier is resolved to its key's ARN ONCE, and that ARN is what the
+        // record is fetched by below. A key the account does not hold is reported
+        // absent BEFORE the waiting period is judged: the resource's existence is the
+        // first thing the caller asked about, so a request naming no key earns the
+        // 404 it has actually earned whatever `DeleteKeyInDays` says.
+        let key_arn = store
+            .resolve_key_arn(&input.key_identifier)
+            .ok_or_else(not_found)?;
+        let deletable_at =
+            crate::state::delete_pending_instant(now, waiting_period).ok_or_else(|| {
+                DeleteKeyErrorModeled::ValidationException(ValidationException {
+                    message: Some(format!(
+                        "DeleteKeyInDays must be between {} and {}, got {waiting_period}",
+                        crate::state::MIN_DELETE_KEY_IN_DAYS,
+                        crate::state::MAX_DELETE_KEY_IN_DAYS
+                    )),
+                })
+            })?;
+
+        let key = store.keys.get_mut(&key_arn).ok_or_else(not_found)?;
+
+        // `effective_state` borrows the record, so the state it reports now is read
+        // into plain flags before the record below is mutated.
+        let (pending, deleted) = {
+            let state_now = key.effective_state(now);
+            (
+                state_now == crate::state::KEY_STATE_DELETE_PENDING,
+                state_now == crate::state::KEY_STATE_DELETE_COMPLETE,
+            )
+        };
+        // A key whose waiting period has already elapsed is gone; there is nothing
+        // left to schedule.
+        if deleted {
+            return Err(DeleteKeyErrorModeled::ConflictException(ConflictException {
+                message: Some(format!("the key {} is already deleted", input.key_identifier)),
+            })
+            .into());
+        }
+        // This operation is `@idempotent`, so the RETRY an SDK performs after a lost
+        // response must succeed: a key already waiting to be deleted under the SAME
+        // waiting period is answered as it stands, moving neither its state nor its
+        // deletion date. A second request naming a DIFFERENT waiting period is not
+        // that retry — it would move a deletion date the caller was already promised,
+        // the inconsistent state `ConflictException` documents — so it is refused,
+        // the same rule `CreateAlias` applies to rebinding an existing name.
+        if pending && key.delete_key_in_days != Some(waiting_period) {
+            let scheduled_for = key.delete_key_in_days;
+            return Err(DeleteKeyErrorModeled::ConflictException(ConflictException {
+                message: Some(match scheduled_for {
+                    Some(days) => format!(
+                        "the key {} is already scheduled for deletion in {days} days; \
+                         restore it before scheduling a different waiting period",
+                        input.key_identifier
+                    ),
+                    None => format!(
+                        "the key {} is already scheduled for deletion; restore it \
+                         before scheduling a different waiting period",
+                        input.key_identifier
+                    ),
+                }),
+            })
+            .into());
+        }
+        let scheduled = !pending;
+        if scheduled {
+            key.key_state = crate::state::KEY_STATE_DELETE_PENDING.to_string();
+            key.delete_pending_timestamp = Some(deletable_at);
+            // The period this call promised, so a later retry can be told from a
+            // request asking for a different one.
+            key.delete_key_in_days = Some(waiting_period);
+        }
+
+        // Answered from the record as it now stands, so the next reader sees the
+        // same state and timestamp.
+        let key = key.to_key(now);
+        // Audited only when this call actually wrote: the idempotent retry above
+        // stores nothing, so it must not leave a trace claiming a state change.
+        if scheduled {
+            crate::state::record_mutation(ctx.parts(), Self::NAME, &key.key_arn);
+        }
+        Ok(DeleteKeyOutput { key })
     }
 }

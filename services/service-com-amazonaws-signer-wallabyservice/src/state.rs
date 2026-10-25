@@ -109,6 +109,18 @@ pub const MAX_TAGS_PER_PROFILE: usize = 200;
 /// the boundary validator's regex engine cannot express, so the rule holds here.
 pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 
+/// The fewest characters a tag key can carry: `TagKey` is modelled
+/// `@length(min: 1, max: 128)` (`smithy_query(query="shape", shape="TagKey")`).
+///
+/// The bound is enforced in this crate because a map KEY is not a constrained
+/// leaf at the framework boundary (only a map's values and a list's members are),
+/// so nothing ahead of a handler judges the key of `TagMap`.
+pub const TAG_KEY_MIN_LENGTH: usize = 1;
+
+/// The most characters a tag key can carry — the `max` of the same modelled
+/// `@length` as [`TAG_KEY_MIN_LENGTH`].
+pub const TAG_KEY_MAX_LENGTH: usize = 128;
+
 /// The `ValidityType` unit the default signature validity period is counted in,
 /// spelled as the model spells it (see
 /// [`crate::ops::types::VALIDITY_TYPE_VALUES`]).
@@ -781,19 +793,82 @@ impl TaggingArnProblem {
     }
 }
 
-/// The first key of `keys` that carries [`RESERVED_TAG_KEY_PREFIX`], or `None`
-/// when none does.
-pub fn reserved_tag_key<'a, I>(keys: I) -> Option<&'a str>
+/// True when `character` is one the modelled tag-key character set admits.
+///
+/// `TagKey`'s pattern is `^(?!aws:)[a-zA-Z+-=._:/]+$`
+/// (`smithy_query(query="shape", shape="TagKey")`). Its character class is the
+/// ASCII letters, the inclusive range from `+` to `=` — which covers the digits
+/// and `+ , - . / : ; < =` — and `_`; the class also spells `.`, `:` and `/` out
+/// again, all three of which that range already holds. Nothing else is admitted:
+/// not a space, not `!`, `#`, `$`, `%`, `&`, `'`, `(`, `)`, `*`, `?`, `@`, `[`,
+/// `\`, `]`, `^`, a backtick, `{`, `|`, `}`, `~`, and no character outside ASCII.
+pub fn tag_key_character_admitted(character: char) -> bool {
+    character.is_ascii_alphabetic() || ('+'..='=').contains(&character) || character == '_'
+}
+
+/// Why a tag key is not one the modelled `TagKey` shape admits.
+///
+/// Each variant is one half of that shape's constraints: its `@length(min: 1,
+/// max: 128)` and the two halves of its `@pattern` — the negative lookahead that
+/// excludes AWS's reserved namespace, and the character class that states the
+/// alphabet (see [`tag_key_character_admitted`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagKeyProblem {
+    /// Outside `TagKey`'s modelled length bounds, carrying this many characters.
+    Length(usize),
+    /// Inside AWS's reserved namespace ([`RESERVED_TAG_KEY_PREFIX`]).
+    Reserved,
+    /// Carries a character the modelled alphabet does not admit.
+    Character(char),
+}
+
+/// Why `key` is not a key the modelled `TagKey` admits, or `None` when it is one.
+///
+/// The length is judged first so the prose for either later condition can echo a
+/// key the model's own bound already limits.
+pub fn tag_key_problem(key: &str) -> Option<TagKeyProblem> {
+    let length = key.chars().count();
+    if !(TAG_KEY_MIN_LENGTH..=TAG_KEY_MAX_LENGTH).contains(&length) {
+        return Some(TagKeyProblem::Length(length));
+    }
+    if key.starts_with(RESERVED_TAG_KEY_PREFIX) {
+        return Some(TagKeyProblem::Reserved);
+    }
+    key.chars()
+        .find(|character| !tag_key_character_admitted(*character))
+        .map(TagKeyProblem::Character)
+}
+
+/// The first key of `keys` the modelled `TagKey` does not admit, with the reason,
+/// or `None` when every one of them is a key it admits.
+///
+/// Every operation that takes tag keys judges them through this, so one rule
+/// decides what any of them may write: the keys a read of a signing profile can
+/// report are exactly the keys `TagKey` admits.
+pub fn invalid_tag_key<'a, I>(keys: I) -> Option<(&'a str, TagKeyProblem)>
 where
     I: IntoIterator<Item = &'a str>,
 {
     keys.into_iter()
-        .find(|key| key.starts_with(RESERVED_TAG_KEY_PREFIX))
+        .find_map(|key| tag_key_problem(key).map(|problem| (key, problem)))
 }
 
-/// The refusal prose for a tag key inside AWS's reserved namespace.
-pub fn reserved_tag_key_message(key: &str) -> String {
-    format!("tag key {key} is in the reserved prefix {RESERVED_TAG_KEY_PREFIX}")
+/// The refusal prose for a tag key the modelled `TagKey` does not admit: which
+/// key, and which of its constraints the key missed.
+pub fn invalid_tag_key_message(key: &str, problem: TagKeyProblem) -> String {
+    match problem {
+        TagKeyProblem::Length(length) => format!(
+            "a tag key is between {TAG_KEY_MIN_LENGTH} and {TAG_KEY_MAX_LENGTH} characters long; \
+             this request carries one of {length}"
+        ),
+        TagKeyProblem::Reserved => {
+            format!("tag key {key} is in the reserved prefix {RESERVED_TAG_KEY_PREFIX}")
+        }
+        TagKeyProblem::Character(character) => format!(
+            "tag key {key} carries {character:?}, which a tag key may not: a tag key is made of \
+             letters, digits and the characters +,-./:;<=_"
+        ),
+    }
 }
 
 /// The refusal prose for a tag write that would leave a profile holding more

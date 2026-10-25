@@ -17,6 +17,8 @@ mod catalog_fidelity;
 mod idempotency_token_reuse;
 #[path = "all/instance_deletion_lifecycle.rs"]
 mod instance_deletion_lifecycle;
+#[path = "all/instance_token_parameter_mismatch.rs"]
+mod instance_token_parameter_mismatch;
 #[path = "all/instance_type_catalog.rs"]
 mod instance_type_catalog;
 #[path = "all/region_catalog.rs"]

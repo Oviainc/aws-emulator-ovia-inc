@@ -2025,6 +2025,70 @@ pub fn billing_period_range_is_ordered(
     billing_period_key(&range.inclusive_start_billing_period).is_none_or(|start| start < end)
 }
 
+/// How many billing periods back a request may still apply a change to, counted from
+/// the current one: the PREVIOUS billing period is the oldest, which is what the
+/// operations bounded to it document ("in the current, or previous billing period").
+const MODIFIABLE_BILLING_PERIODS_BACK: i64 = 1;
+
+/// Is `billing_period` one of the periods such an operation may apply a change to —
+/// the CURRENT billing period or the one before it?
+///
+/// A period older than that belongs to a bill that is already closed, and one later
+/// than the current period to a bill that does not exist yet; neither is the current
+/// or the previous billing period. A value that is not a billing period at all
+/// ([`billing_period_key`] reads none) is not one of them either.
+pub fn billing_period_is_modifiable(billing_period: &str) -> bool {
+    let Some(wanted) = billing_period_key(billing_period) else {
+        return false;
+    };
+    let Some(current) = billing_period_key(&current_billing_period()) else {
+        return false;
+    };
+    (current - MODIFIABLE_BILLING_PERIODS_BACK..=current).contains(&wanted)
+}
+
+/// May a request carrying `range` be applied by an operation the model documents as
+/// acting in the current, or previous, billing period — or is that the refusal it
+/// earns?
+///
+/// `InclusiveStartBillingPeriod` is the period from which the request takes effect, so
+/// it is the bound this window judges: a start before the previous billing period
+/// restates a closed bill and a start after the current one a bill that does not exist
+/// yet, while the exclusive end only says how far forward the change reaches, exactly
+/// as an absent end (the open future) does. `ValidationExceptionReason` enumerates
+/// both the reason for a value that is no billing period (`ILLEGAL_BILLING_PERIOD`) and
+/// the reason for a real period this operation may not act in
+/// (`INVALID_BILLING_PERIOD_FOR_OPERATION`).
+///
+/// `Err` carries the `(reason, member, message)` of the modelled `ValidationException`
+/// the calling operation refuses the request with, so every operation bounded to that
+/// window answers an out-of-window range the same way.
+pub fn check_billing_period_range_is_modifiable(
+    range: &crate::ops::types::CustomLineItemBillingPeriodRange,
+) -> Result<(), ValidationRefusal> {
+    let start = &range.inclusive_start_billing_period;
+    if billing_period_is_modifiable(start) {
+        return Ok(());
+    }
+    let member = "BillingPeriodRange.InclusiveStartBillingPeriod";
+    if billing_period_key(start).is_none() {
+        return Err((
+            "ILLEGAL_BILLING_PERIOD",
+            member,
+            format!("{start} is not a billing period"),
+        ));
+    }
+    let current = current_billing_period();
+    Err((
+        "INVALID_BILLING_PERIOD_FOR_OPERATION",
+        member,
+        format!(
+            "billing period {start} is neither the current billing period ({current}) nor the \
+             previous one"
+        ),
+    ))
+}
+
 /// The modelled `ValidationException` this service refuses a request with: the
 /// reason (one of `ValidationExceptionReason`), the member at fault, and the text.
 ///

@@ -153,6 +153,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into()
         };
 
+        // `Name` targets `StringWithLengthBetween1And128`, a bound the shape documents
+        // but declares no trait for, so it is this handler's to enforce.
+        if let Err(message) = crate::state::validate_vpc_link_name(&input.name) {
+            return Err(bad_request(message));
+        }
+
         // `SubnetIds` and `SecurityGroupIds` are lists of unconstrained `__string`, so
         // the EC2 id form is this handler's to enforce: a value that is not an id of
         // that resource type names nothing the link could attach to, and a link with no

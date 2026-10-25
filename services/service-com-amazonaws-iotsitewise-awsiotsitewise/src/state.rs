@@ -74,10 +74,11 @@ use crate::ops::types::{
     ExecutionEnvironmentVariables, ExecutionStatus, ExecutionSummary, ExportErrorReportLocation,
     ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform, HierarchyMapping, Identity,
     ImageLocation, LoggingOptions, Mount, MountOverrides, PipelineExecutionStatus, PortalStatus,
-    PortalTypeEntry, ProcessingInput, PropertyMapping, PropertyType, QueryStatistics, ResolveTo,
-    Resource, ResourceStatus, SearchFilters, TargetResource, TaskConfiguration, TimeInNanos,
-    TrimSettings, Variant, WorkspaceEncryptionConfiguration, WorkspaceEncryptionConfigurationInfo,
-    WorkspaceStatus, ENCRYPTION_TYPE_VALUES, VIDEO_DATA_TYPE_VALUES,
+    PortalTypeEntry, ProcessingInput, PropertyMapping, PropertyType, QueryStatistics, QuerySummary,
+    ResolveTo, Resource, ResourceStatus, SearchFilters, TargetResource, TaskConfiguration,
+    TimeInNanos, TrimSettings, Variant, WorkspaceEncryptionConfiguration,
+    WorkspaceEncryptionConfigurationInfo, WorkspaceStatus, ENCRYPTION_TYPE_VALUES,
+    VIDEO_DATA_TYPE_VALUES,
 };
 
 /// The `iotsitewise` ARN service namespace, as `OPERATIONS.md` reports it.
@@ -2881,6 +2882,19 @@ impl QueryRecord {
             _ => None,
         }
     }
+
+    /// This query as the summary a listing reports for it, at `now`.
+    ///
+    /// Derived here rather than in the handler so a listing and a read of one
+    /// stored query cannot report different statuses or instants for it.
+    pub fn summary(&self, now: SystemTime) -> QuerySummary {
+        QuerySummary {
+            query_id: self.query_id.clone(),
+            status: self.status(now).to_string(),
+            submitted_at: to_date_time(self.submitted_at),
+            completed_at: self.completed_at(now).map(to_date_time),
+        }
+    }
 }
 
 /// The key [`ComAmazonawsIotsitewiseAwsiotsitewiseState::queries`] holds a query
@@ -3053,8 +3067,9 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     pub dataset_export_jobs: HashMap<(String, String), DatasetExportJobRecord>,
     /// The asynchronous queries of every workspace, by [`query_key`] — the
     /// workspace they were started in and their own id — because every operation
-    /// on a query addresses it within a workspace. Written by `StartQuery` and
-    /// read by `DescribeQuery`; bounded by [`MAX_QUERIES`] and
+    /// on a query addresses it within a workspace. Written by `StartQuery`,
+    /// read by `DescribeQuery` and enumerated, one workspace at a time, by
+    /// `ListQueries`; bounded by [`MAX_QUERIES`] and
     /// [`MAX_QUERIES_PER_WORKSPACE`].
     pub queries: HashMap<(String, String), QueryRecord>,
     /// Workspaces by `workspaceName`, which is what identifies one in an

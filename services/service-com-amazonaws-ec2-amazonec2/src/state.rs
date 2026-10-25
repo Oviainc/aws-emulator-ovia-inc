@@ -9657,6 +9657,28 @@ impl VolumeRecord {
         )
     }
 
+    /// The marker that makes `attachment` an attachment to an Amazon Web Services-managed
+    /// resource rather than to an instance of this account, if it is one.
+    ///
+    /// "The ARN of the Amazon Web Services-managed resource to which the volume is
+    /// attached" (`VolumeAttachment$AssociatedResource`) and "the service principal of the
+    /// Amazon Web Services service that owns the underlying resource"
+    /// (`VolumeAttachment$InstanceOwningService`) are each "returned only for volumes that
+    /// are attached to Amazon Web Services-managed resources", so either one alone marks
+    /// the attachment as one of those — and such an attachment reports no `InstanceId` or
+    /// `Device` at all ("if the volume is attached to an Amazon Web Services-managed
+    /// resource, this parameter returns null"). One reading, so the refusal and the message
+    /// that names the resource cannot disagree about which marker is set.
+    pub fn managed_resource_of(attachment: &AttachVolumeOutput) -> Option<&str> {
+        [
+            attachment.associated_resource.as_deref(),
+            attachment.instance_owning_service.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|marker| !marker.is_empty())
+    }
+
     /// Apply the detachments the clock has already made due: the attachments they took
     /// down are no longer the volume's, and nothing is owed on them any more.
     ///
@@ -9670,10 +9692,10 @@ impl VolumeRecord {
         let owed = &self.detaching_at;
         if let Some(attachments) = self.view.attachments.as_mut() {
             attachments.retain(|attachment| {
-                owed.contains_key(&(
-                    attachment.instance_id.clone().unwrap_or_default(),
-                    attachment.device.clone().unwrap_or_default(),
-                )) || attachment.state.as_deref() != Some(VOLUME_ATTACHMENT_STATE_DETACHING)
+                // The ONE reading of which attachment this is, the same key the owed
+                // instants above are stored under.
+                owed.contains_key(&Self::attachment_key(attachment))
+                    || attachment.state.as_deref() != Some(VOLUME_ATTACHMENT_STATE_DETACHING)
             });
         }
     }
@@ -16305,6 +16327,21 @@ pub fn incorrect_state<E>(message: impl Into<String>) -> Scaffolded<E> {
     Scaffolded::service_error(INCORRECT_STATE, 400, message)
 }
 
+/// Refuse a request whose resource exists but is not in a state that admits it, with
+/// EC2's own wording for the code: the KIND of resource, the id the request named and the
+/// state that resource is in, and nothing more — `Volume 'vol-…' is in the 'available'
+/// state.`
+///
+/// The message is built from the request and the store, so it is the RULE that is fixed
+/// here and not any one message: `<Kind> '<id>' is in the '<state>' state.` It says what
+/// the caller has to change (the state of that resource) and nothing about which operation
+/// asked, which is why every operation refusing SOLELY for the state of the resource it
+/// names shares it. An operation whose refusal also names which states DO admit the
+/// request, or whose resource is named by more than one id, keeps its own wording rather
+/// than dropping what that message carries.
+pub fn incorrect_state_of<E>(kind: &str, id: &str, state: &str) -> Scaffolded<E> {
+    incorrect_state(format!("{kind} '{id}' is in the '{state}' state."))
+}
 
 /// What the clock owes a stored Windows fast launch configuration next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

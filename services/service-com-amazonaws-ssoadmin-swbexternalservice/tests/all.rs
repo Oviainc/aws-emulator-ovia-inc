@@ -83,6 +83,8 @@ mod permission_set_update;
 mod permissions_boundary;
 #[path = "all/permissions_boundary_delete.rs"]
 mod permissions_boundary_delete;
+#[path = "all/policy_attach_conflict.rs"]
+mod policy_attach_conflict;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/ssoadmin_permission_sets.rs"]

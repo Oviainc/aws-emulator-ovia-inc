@@ -8,6 +8,10 @@
 //! error — the request states the keys that must be gone afterwards, so the same request
 //! twice leaves the same tag set, and keys it does not name are left alone.
 //!
+//! A key in the reserved `aws:` namespace ([`crate::state::RESERVED_TAG_KEY_PREFIX`]) names
+//! a tag Amazon Web Services owns, which a caller may no more remove than create: such a
+//! request is refused with the modelled 400 `ValidationException` and removes nothing.
+//!
 //! An ARN that names no resource this account holds is answered HTTP 401
 //! `UnauthorizedException`, as every resource lookup in this service is — see
 //! [`crate::ops::tag_resource`].
@@ -153,6 +157,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A key in the reserved namespace ([`crate::state::RESERVED_TAG_KEY_PREFIX`]) names
+        // a tag AWS itself owns: a caller may no more remove one than create it, so the
+        // request is refused as a field validation failure naming `tagKeys` — decided from
+        // the request alone, before the ARN is resolved, exactly as the tag write decides it.
+        if crate::state::reserved_tag_key(input.tag_keys.iter().map(String::as_str)).is_some() {
+            return Err(UntagResourceErrorModeled::ValidationException(
+                crate::state::reserved_tag_keys("tagKeys"),
+            )
+            .into());
+        }
 
         let mut store = state.lock();
         let Some(resource) = store.tagged_resource_mut(&input.resource_arn) else {

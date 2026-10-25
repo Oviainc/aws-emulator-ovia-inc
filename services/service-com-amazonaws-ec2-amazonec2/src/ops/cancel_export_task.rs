@@ -217,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            EXPORT_TASK_STATE_ACTIVE, TRANSITION_DELAY, incorrect_state,
+            EXPORT_TASK_STATE_ACTIVE, TRANSITION_DELAY, incorrect_state_of,
             invalid_export_task_id_not_found, require_service_state,
         };
 
@@ -237,14 +237,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_export_task_id_not_found(&input.export_task_id));
         };
         // Only an active task can be cancelled: one already cancelling, cancelled or
-        // complete is refused with the state it is in.
+        // complete is refused with the state it is in, worded the one way this crate words
+        // a refusal for the state of the resource the request names
+        // ([`crate::state::incorrect_state_of`]).
         let current = record.state_at(now);
         if current != EXPORT_TASK_STATE_ACTIVE {
-            return Err(incorrect_state(format!(
-                "Export task '{}' is in the '{current}' state, which is not a state it can be \
-                 cancelled from",
-                input.export_task_id
-            )));
+            return Err(incorrect_state_of(
+                "Export task",
+                &input.export_task_id,
+                &current,
+            ));
         }
         // The cancellation is started now and falls due on the clock, the same span a
         // volume's `creating` -> `available` move takes in this crate.
