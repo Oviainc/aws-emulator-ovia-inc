@@ -30,13 +30,6 @@ use crate::flow_lifecycle::{Emulator, REGION};
 use crate::router_input_restart::union;
 use crate::router_outputs::minted_network_interface;
 
-/// A router network interface ARN of the shape the modelled `RouterNetworkInterfaceArn`
-/// pattern fixes, for the router INPUT configuration below (that create stores the reference
-/// as given, so no interface has to exist). The router OUTPUT create resolves its interface
-/// against the store, so its body takes a minted one instead.
-const NETWORK_INTERFACE_ARN: &str =
-    "arn:aws:mediaconnect:us-east-1:000000000000:routerNetworkInterface:0000000000a1";
-
 /// A minimal valid CreateFlow body: "the request must include one source."
 fn flow_body(name: &str, _interface_arn: &str) -> Value {
     json!({
@@ -45,15 +38,16 @@ fn flow_body(name: &str, _interface_arn: &str) -> Value {
     })
 }
 
-/// A minimal valid CreateRouterInput body.
-fn router_input_body(name: &str, _interface_arn: &str) -> Value {
+/// A minimal valid CreateRouterInput body, on the router network interface `interface_arn` —
+/// a configuration must name an interface this account holds.
+fn router_input_body(name: &str, interface_arn: &str) -> Value {
     json!({
         "name": name,
         "configuration": union(
             "Standard",
             "standard",
             json!({
-                "networkInterfaceArn": NETWORK_INTERFACE_ARN,
+                "networkInterfaceArn": interface_arn,
                 "protocol": "RTP",
                 "protocolConfiguration": union("Rtp", "rtp", json!({ "port": 5000 })),
             }),
@@ -88,9 +82,9 @@ fn router_output_body(name: &str, interface_arn: &str) -> Value {
 }
 
 /// One create path that stores an Availability Zone: how to build a minimal valid body
-/// (from a name and the minted router network interface a router output's configuration
-/// names), the response member the created resource arrives in, the member its identity is
-/// reported in, and the read-back URI prefix that identity goes on.
+/// (from a name and the minted router network interface a router input's or output's
+/// configuration names), the response member the created resource arrives in, the member its
+/// identity is reported in, and the read-back URI prefix that identity goes on.
 struct CreatePath {
     operation: &'static str,
     uri: &'static str,
@@ -292,8 +286,8 @@ async fn create_flow_stores_only_a_documented_maintenance_start_hour() {
 #[tokio::test]
 async fn a_create_stores_only_an_availability_zone_of_its_region() {
     let emulator = Emulator::new();
-    // The router network interface a router output's configuration names: a create resolves
-    // it against the store, so it is minted over the wire first.
+    // The router network interface a router input's or output's configuration names: a
+    // create resolves it against the store, so it is minted over the wire first.
     let interface_arn = minted_network_interface(&emulator, "rni-zone").await;
     // The zone a request that names none is given: a zone of its own Region.
     let default_zone = format!("{REGION}a");

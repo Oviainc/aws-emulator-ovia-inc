@@ -77,6 +77,8 @@ mod resource_tags;
 mod revoke_flow_entitlement;
 #[path = "all/router_input_batch_get.rs"]
 mod router_input_batch_get;
+#[path = "all/router_input_configuration_targets.rs"]
+mod router_input_configuration_targets;
 #[path = "all/router_input_deletion.rs"]
 mod router_input_deletion;
 #[path = "all/router_input_restart.rs"]
