@@ -2418,33 +2418,60 @@ pub fn normalize_comment_id(raw: &str) -> Result<&str, CommentIdProblem> {
     Ok(trimmed)
 }
 
-/// The message `CommentDeletedException` carries: a FIXED sentence carrying no
-/// value from the request.
+/// Which of `CommentDeletedException`'s two fixed templates a refusal carries.
+///
+/// The exception is raised by several operations, and CodeCommit does not word
+/// them all alike: what the caller ASKED decides the text, so the template is
+/// chosen here by the kind of call rather than shared by every raiser. Neither
+/// template carries a value from the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentDeletedRefusal {
+    /// The exception's own sentence pair, with no lead clause: the recorded
+    /// answer where the call only asks ABOUT the comment whose content is gone
+    /// (`GetComment`), or about something that hangs off it rather than the
+    /// comment itself (`PutCommentReaction`, for which no lead clause is
+    /// recorded).
+    AlreadyDeleted,
+    /// That pair led by "You cannot delete this comment.": the recorded answer
+    /// where the call asks to EDIT OR DELETE the comment itself, which is the
+    /// pair of calls the exception's own documented sentence names ("You cannot
+    /// edit or delete a deleted comment") — a repeated `DeleteCommentContent`
+    /// and an `UpdateComment`.
+    EditOrDeleteRefused,
+}
+
+/// The message `CommentDeletedException` carries for `refusal`: a FIXED sentence
+/// carrying no value from the request, which is why each template is a constant
+/// rather than built per call.
 ///
 /// CodeCommit answers a call against a comment whose content has been deleted with
 /// "The specified comment has already been marked as deleted. Verify that you
-/// specified a valid comment ID, and then try again." — the recorded answer to a
-/// `GetComment` of such a comment is that sentence alone, so the sentence is what
-/// the exception says and the four operations that reject a deleted comment cannot
-/// disagree about it.
+/// specified a valid comment ID, and then try again.", led — where the call asked
+/// to edit or delete that comment — by "You cannot delete this comment.". Both
+/// templates are stated once here, so two operations can differ only by naming a
+/// different [`CommentDeletedRefusal`] and never by wording the same template
+/// twice.
 ///
-/// `refused_action` is the verb phrase of an operation the service is RECORDED
-/// leading that sentence with ("You cannot delete this comment." for a repeated
-/// `DeleteCommentContent`); an operation with no such recording passes `None`
-/// rather than synthesising a lead clause of its own.
-pub fn comment_deleted_message(refused_action: Option<&str>) -> String {
-    // The sentences of this constant are separated by TWO spaces, which is part of
-    // the recorded text rather than formatting latitude — hence the explicit
-    // `concat!` rather than a line-continued literal, whose continuation would
-    // swallow them.
-    let already_deleted = concat!(
+/// The sentences of each template are separated by TWO spaces, which is part of
+/// the recorded text rather than formatting latitude — hence the explicit
+/// `concat!` rather than a line-continued literal, whose continuation would
+/// swallow them.
+pub fn comment_deleted_message(refusal: CommentDeletedRefusal) -> &'static str {
+    const ALREADY_DELETED: &str = concat!(
         "The specified comment has already been marked as deleted.",
         "  ",
         "Verify that you specified a valid comment ID, and then try again.",
     );
-    match refused_action {
-        Some(action) => format!("You cannot {action} this comment.  {already_deleted}"),
-        None => already_deleted.to_string(),
+    const EDIT_OR_DELETE_REFUSED: &str = concat!(
+        "You cannot delete this comment.",
+        "  ",
+        "The specified comment has already been marked as deleted.",
+        "  ",
+        "Verify that you specified a valid comment ID, and then try again.",
+    );
+    match refusal {
+        CommentDeletedRefusal::AlreadyDeleted => ALREADY_DELETED,
+        CommentDeletedRefusal::EditOrDeleteRefused => EDIT_OR_DELETE_REFUSED,
     }
 }
 

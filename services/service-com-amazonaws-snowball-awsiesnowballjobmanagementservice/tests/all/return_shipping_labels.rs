@@ -67,15 +67,15 @@ const PREPARATION_MARGIN: Duration = Duration::from_millis(150);
 
 /// One label URI, split into the parts a client reads it as.
 #[derive(Debug)]
-struct LabelUrl {
-    host: String,
-    path: String,
-    query: BTreeMap<String, String>,
+pub(crate) struct LabelUrl {
+    pub(crate) host: String,
+    pub(crate) path: String,
+    pub(crate) query: BTreeMap<String, String>,
 }
 
 /// Split `uri` into host, path and query parameters, asserting it is an `https` URL within
 /// the modelled length.
-fn parse_label_url(uri: &str, case: &str) -> LabelUrl {
+pub(crate) fn parse_label_url(uri: &str, case: &str) -> LabelUrl {
     assert!(
         !uri.is_empty() && uri.len() <= LABEL_URI_MAX_LEN,
         "case {case:?}: expected a ReturnShippingLabelURI within the modelled \
@@ -107,7 +107,7 @@ fn parse_label_url(uri: &str, case: &str) -> LabelUrl {
 }
 
 /// A query parameter the URL must carry.
-fn parameter(url: &LabelUrl, name: &str, case: &str) -> String {
+pub(crate) fn parameter(url: &LabelUrl, name: &str, case: &str) -> String {
     url.query
         .get(name)
         .unwrap_or_else(|| panic!("case {case:?}: expected a {name} parameter, got {url:?}"))
@@ -126,14 +126,18 @@ fn now_epoch_seconds() -> f64 {
 ///
 /// A blocking sleep: the workspace's `tokio` carries no timer, and a test waiting for a
 /// span this emulator fixes has nothing else to run meanwhile.
-fn wait_for_the_label() {
+pub(crate) fn wait_for_the_label() {
     std::thread::sleep(RETURN_SHIPPING_LABEL_PREPARATION + PREPARATION_MARGIN);
 }
 
 /// Create one job of `submitted`'s shape against a deliverable address and return its
 /// `JobId`. The row's members are merged over the harness's order defaults
 /// (`job_lifecycle::complete_order`), so a row states only the axis it varies.
-async fn create_job(router: &MultiServiceRouter, submitted: Value, case: &str) -> String {
+pub(crate) async fn create_job(
+    router: &MultiServiceRouter,
+    submitted: Value,
+    case: &str,
+) -> String {
     let address_id = create_address(
         router,
         deliverable_address(case, "123 Main Street", json!({})),
@@ -147,7 +151,11 @@ async fn create_job(router: &MultiServiceRouter, submitted: Value, case: &str) -
 }
 
 /// The job ids `DescribeJob` reports as `job_id`'s job parts — empty for a job with none.
-async fn job_parts(router: &MultiServiceRouter, job_id: &str, case: &str) -> Vec<String> {
+pub(crate) async fn job_parts(
+    router: &MultiServiceRouter,
+    job_id: &str,
+    case: &str,
+) -> Vec<String> {
     let described = ok(router, "DescribeJob", json!({ "JobId": job_id }), case).await;
     described
         .get("SubJobMetadata")
@@ -158,7 +166,7 @@ async fn job_parts(router: &MultiServiceRouter, job_id: &str, case: &str) -> Vec
 
 /// The job the label is created for: the job `submitted` mints, or — when `use_job_part` —
 /// the first job part of the export order it mints, which is the job that carries a device.
-async fn label_subject(
+pub(crate) async fn label_subject(
     router: &MultiServiceRouter,
     submitted: Value,
     use_job_part: bool,

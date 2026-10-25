@@ -18,7 +18,7 @@
 //!   naming it collides, and a cluster can be created with it;
 //! * every paginated listing accepts `MaxResults` in 20..=100 and refuses anything
 //!   outside that window with the modelled `InvalidParameterValueException`, at each
-//!   bound and one past it;
+//!   bound and one past it (asserted in the `page_size_window` suite);
 //! * a parameter group created without a `Description` reads back with the service's own
 //!   default, and one created with any description reads that back verbatim;
 //! * a user, ACL, cluster or parameter-group name is refused unless it is at most 40
@@ -36,8 +36,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_memorydb_amazonmemorydb::state::{
     DEFAULT_PARAMETER_GROUP_DESCRIPTION, DEFAULT_USER_NAME, ENGINE_VERSIONS,
-    MAX_MAX_RESULTS, MAX_RESOURCE_NAME_LEN, MAX_USERS_PER_ACL, MIN_MAX_RESULTS,
-    OPEN_ACCESS_ACL_NAME,
+    MAX_RESOURCE_NAME_LEN, MAX_USERS_PER_ACL, OPEN_ACCESS_ACL_NAME,
 };
 
 // The suite-wide helpers: ONE SigV4 request builder and ONE error-code reader for every
@@ -242,70 +241,6 @@ async fn the_builtin_open_access_acl_is_there_before_any_call() {
         "case {:?}: the cluster must point at the built-in ACL, got {created}",
         "cluster on the built-in ACL"
     );
-}
-
-/// Every paginated listing accepts `MaxResults` in `MIN_MAX_RESULTS..=MAX_MAX_RESULTS`
-/// and refuses anything outside that window with the modelled
-/// `InvalidParameterValueException` — at each published bound and one past it.
-#[tokio::test]
-async fn an_out_of_window_page_size_is_the_modelled_invalid_value_error() {
-    let router = router();
-    ok(
-        &router,
-        "CreateUser",
-        &create_user_body("page-size-user", ACCESS_NO_CHANNELS),
-        "setup",
-    )
-    .await;
-    ok(
-        &router,
-        "CreateParameterGroup",
-        &json!({ "ParameterGroupName": "page-size-group", "Family": "memorydb_valkey7" }),
-        "setup",
-    )
-    .await;
-
-    // One row per listing in this service: the same window rule serves all of them.
-    // `DescribeParameters` carries the group it lists for, so each row is built from the
-    // operation's own request rather than from `MaxResults` alone.
-    let listings: &[(&str, Value)] = &[
-        ("DescribeUsers", json!({})),
-        ("DescribeACLs", json!({})),
-        ("DescribeClusters", json!({})),
-        ("DescribeParameterGroups", json!({})),
-        ("DescribeEngineVersions", json!({})),
-        (
-            "DescribeParameters",
-            json!({ "ParameterGroupName": "page-size-group" }),
-        ),
-    ];
-    for (operation, base) in listings {
-        // AT each bound: accepted.
-        for accepted in [MIN_MAX_RESULTS, MAX_MAX_RESULTS] {
-            let case = format!("{operation} MaxResults={accepted}");
-            let mut request = base.clone();
-            request["MaxResults"] = json!(accepted);
-            ok(&router, operation, &request, &case).await;
-        }
-        // One past each bound, and further out: refused with the modelled error.
-        for refused in [
-            MIN_MAX_RESULTS - 1,
-            MAX_MAX_RESULTS + 1,
-            -7,
-            i32::from(i16::MAX),
-        ] {
-            let case = format!("{operation} MaxResults={refused}");
-            let mut request = base.clone();
-            request["MaxResults"] = json!(refused);
-            let (status, body) = call(&router, operation, &request).await;
-            assert_eq!(
-                (status, error_code(&body).as_str()),
-                (400, "InvalidParameterValueException"),
-                "case {case:?}: expected the modelled invalid-value error, got {status} \
-                 with {body}"
-            );
-        }
-    }
 }
 
 /// A parameter group created without a `Description` reads back with the service's own

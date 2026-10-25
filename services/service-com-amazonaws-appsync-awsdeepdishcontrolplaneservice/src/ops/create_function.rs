@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFunction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFunction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFunction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: mints a `functionId`, persists the function under its API in
+//! [`crate::state`] and answers the stored record, refusing a request whose
+//! `dataSourceName` names no data source of that API or whose definition members do
+//! not pair up. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +167,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFunction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFunctionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFunction"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateFunctionErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // An `apiId` that is not an API id at all is a malformed request, not a
+        // missing resource (see `crate::state::is_api_id`).
+        if !crate::state::is_api_id(&input.api_id) {
+            return Err(CreateFunctionErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_api_id_message(&input.api_id)),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // A function whose definition members do not pair up describes no function
+        // AppSync could run, so it is refused before anything is written and the
+        // refusal leaves nothing behind.
+        if let Some(message) = crate::state::function_definition_refusal(
+            input.code.as_deref(),
+            input.runtime.as_ref(),
+            input.function_version.as_deref(),
+        ) {
+            return Err(CreateFunctionErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // The function is reported in the region the caller addressed, so its ARN is
+        // built from that region rather than from a fixed one.
+        let region = crate::state::request_region(ctx);
+        let mut guard = state.lock();
+
+        // A function is identified within its API by the id minted here, never by its
+        // name: "The function name does not have to be unique", so two functions of
+        // one API may carry the same name and the id is what tells them apart. It is
+        // minted BEFORE the API is resolved so the API is resolved exactly once, for
+        // reading and for writing both, and the refusals below cannot drift from a
+        // second lookup's; a refused create then leaves an unused opaque id behind,
+        // which no caller can observe (nothing reports the counter, and ids are never
+        // handed out in sequence).
+        let function_id = guard.mint_resource_id();
+        let seq = guard.next_seq();
+
+        // A function lives under a GraphQL API, so it cannot be created under an API
+        // this account does not hold.
+        let Some(api) = guard.graphql_apis.get_mut(&input.api_id) else {
+            return Err(CreateFunctionErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        // `dataSourceName` is "The Function DataSource name" — the data source the
+        // function resolves against — so it has to name one the API holds: a name no
+        // data source of this API carries names no resource, including one held by a
+        // DIFFERENT API.
+        if !api.data_sources.contains_key(&input.data_source_name) {
+            return Err(CreateFunctionErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::data_source_not_found_message(
+                    &input.data_source_name,
+                )),
+            })
+            .into());
+        }
+
+        // The store is bounded, so a repeated create cannot grow it without limit:
+        // the per-API collection this create writes to is bounded by the AppSync
+        // per-API quota of functions, the way the sibling creates in this crate bound
+        // theirs.
+        if api.functions.len() >= FUNCTIONS_PER_API {
+            return Err(CreateFunctionErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "an API may hold at most {FUNCTIONS_PER_API} functions"
+                )),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        let record = crate::state::FunctionRecord {
+            seq,
+            arn: ::engine::emulator_arn(
+                crate::state::ARN_SERVICE,
+                &region,
+                &crate::state::function_resource(&input.api_id, &function_id),
+            ),
+            function_id: function_id.clone(),
+            name: input.name,
+            // An empty description describes nothing, so the function keeps none for
+            // it — the rule this service's data sources already follow.
+            description: crate::state::data_source_description(input.description),
+            data_source_name: input.data_source_name,
+            request_mapping_template: input.request_mapping_template,
+            response_mapping_template: input.response_mapping_template,
+            function_version: input.function_version,
+            sync_config: input.sync_config,
+            max_batch_size: input.max_batch_size,
+            runtime: input.runtime,
+            code: input.code,
+        };
+        api.functions.insert(function_id.clone(), record);
+
+        // Answer from the STORED record, so this body is the one `GetFunction` answers
+        // with later.
+        Ok(CreateFunctionOutput {
+            function_configuration: api
+                .functions
+                .get(&function_id)
+                .map(crate::state::FunctionRecord::to_function_configuration),
+        })
     }
 }
+
+/// The AppSync service quota for functions on ONE GraphQL API, which also bounds the
+/// per-API collection this operation writes to: a create past it is refused, so
+/// repeating the call cannot grow the store without limit.
+const FUNCTIONS_PER_API: usize = 1_000;

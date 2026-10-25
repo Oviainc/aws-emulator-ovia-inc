@@ -27,6 +27,8 @@ mod cluster_tombstone;
 mod container_instance_not_found;
 #[path = "all/container_instances.rs"]
 mod container_instances;
+#[path = "all/daemon_task_definitions.rs"]
+mod daemon_task_definitions;
 #[path = "all/ecs_wire.rs"]
 mod ecs_wire;
 #[path = "all/error_messages.rs"]

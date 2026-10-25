@@ -364,9 +364,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 resource_arn
             }
             None => {
+                // This operation's `tags` member targets the modelled CONSTRAINED tag
+                // map, so its keys are held to that map's key character class as well
+                // as to the tagging limits every merge keeps (the walk above has
+                // already refused a value outside the map's value shape).
                 let tags = match crate::state::merge_tags(
                     &::std::collections::BTreeMap::new(),
                     &input.tags.clone().unwrap_or_default(),
+                    crate::state::TagConstraints::TagsMap,
                 ) {
                     Ok(tags) => tags,
                     Err(why) => {

@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendTaskHeartbeat
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendTaskHeartbeat`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendTaskHeartbeat::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation does here
+//!
+//! A worker that polled `GetActivityTask` holds the `taskToken` of ONE outstanding
+//! activity task, and this is how it reports that the task is still making progress:
+//! the call RESETS that task's heartbeat clock, so the window the scheduling state's
+//! `HeartbeatSeconds` opens runs again from this instant. It is therefore the only
+//! thing this call changes: the task is not closed, the execution waiting at it is not
+//! continued, and "this action does not in itself create an event in the execution
+//! history", so nothing is appended to it either. The task's own `TimeoutSeconds`
+//! bound is untouched — "the Timeout of a task ... is its maximum allowed duration,
+//! regardless of the number of SendTaskHeartbeat requests received" — so heartbeats
+//! keep a task alive only up to that whole-task bound.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +152,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendTaskHeartbeat` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendTaskHeartbeatErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendTaskHeartbeat"))
+        // `taskToken` (1..2048) is modelled, so the centralized walk has already
+        // refused anything outside it. That the token is one this service issued is
+        // not modelled, so it is checked here. `ctx` carries no value this operation
+        // reads: a task token names its task, its execution and its activity on its
+        // own.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The token is read BEFORE the store is consulted, exactly as every ARN here
+        // is: a value that is not a token this service mints is a defect in the
+        // REQUEST, which `InvalidToken` reports, and not a task that has been closed.
+        // The token NAMES the activity its task belongs to, which is what a refusal
+        // about a task the store no longer holds says.
+        let Some(token_activity) = crate::state::read_task_token(&input.task_token) else {
+            return Err(SendTaskHeartbeatErrorModeled::InvalidToken(InvalidToken {
+                message: Some(crate::state::invalid_token_message()),
+            })
+            .into());
+        };
+
+        let now = crate::state::now();
+        let mut store = state.lock();
+        // Settle first: a task whose own bound the clock already made due is closed —
+        // and the execution waiting at it failed — before this call decides whether
+        // the token still names a task to heartbeat. A heartbeat that arrives after
+        // the window ran out is therefore too late, which is exactly what the service
+        // reports with `TaskTimedOut`.
+        store.settle(now);
+
+        let Some(task) = store.activity_tasks.get(&input.task_token) else {
+            return Err(SendTaskHeartbeatErrorModeled::TaskTimedOut(TaskTimedOut {
+                message: Some(crate::state::task_timed_out_message(&token_activity)),
+            })
+            .into());
+        };
+        let activity_arn = task.activity_arn.clone();
+        let execution_arn = task.execution_arn.clone();
+        // The activity this task is queued under can be DELETED while the task is
+        // outstanding, which leaves the task with no activity to report progress for:
+        // the modelled `TaskDoesNotExist`, whose own documentation is "the activity
+        // does not exist".
+        if !store.activities.contains_key(&activity_arn) {
+            return Err(SendTaskHeartbeatErrorModeled::TaskDoesNotExist(
+                TaskDoesNotExist {
+                    message: Some(crate::state::resource_error_message(
+                        crate::state::ACTIVITY_DOES_NOT_EXIST,
+                        &activity_arn,
+                    )),
+                },
+            )
+            .into());
+        }
+        // A task whose execution is no longer running is making no progress for
+        // anybody: it was stopped, or the clock closed an earlier bound of it, so the
+        // token names a task that has already been closed.
+        if store
+            .executions
+            .get(&execution_arn)
+            .is_none_or(crate::state::Execution::is_terminal)
+        {
+            return Err(SendTaskHeartbeatErrorModeled::TaskTimedOut(TaskTimedOut {
+                message: Some(crate::state::task_timed_out_message(&token_activity)),
+            })
+            .into());
+        }
+
+        // The ONE write: "this action resets the Heartbeat clock". The window the
+        // scheduling state's `HeartbeatSeconds` opens now runs from this instant, and
+        // nothing else about the task, its execution or its history changes.
+        store.restart_heartbeat_window(&input.task_token, now);
+        Ok(SendTaskHeartbeatOutput {})
     }
 }

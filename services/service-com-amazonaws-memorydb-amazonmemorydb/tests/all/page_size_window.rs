@@ -15,6 +15,13 @@
 //!   both bounds — the SAME window on every paginated listing the service implements,
 //!   exercised at each bound, one past each bound and further out, each listing naming
 //!   its page size in the noun its own refusal uses;
+//! * a served page size is APPLIED: the page holds exactly what the size allows (the
+//!   whole set when the set is smaller), a `NextToken` is handed out exactly when the
+//!   page stopped short of the set, and a request with no page size answers the whole
+//!   set;
+//! * a `NextToken` names a POSITION and nothing about the page that produced it: a walk
+//!   that changes `MaxResults` between pages, to any other size the window serves, still
+//!   visits the whole set once in the listing's own order;
 //! * an accepted page size really bounds the page: a listing whose set is larger than
 //!   the page hands out a full page and a token, and the pages concatenate to the whole
 //!   set;
@@ -144,8 +151,11 @@ async fn seeded_store() -> (smithy_server_runtime::MultiServiceRouter, String) {
     (router, group)
 }
 
-/// A page size inside the window is served by every paginated listing, and the page it
-/// answers is no longer than the size asked for.
+/// A page size inside the window is served by every paginated listing, and it is
+/// APPLIED: the page holds exactly as many items as the size allows — the whole set when
+/// the set is smaller, the size itself when it is not — a `NextToken` is handed out
+/// exactly when the page stopped short of the set, and a request carrying no page size
+/// at all is served and answers the whole set.
 #[tokio::test]
 async fn a_page_size_inside_the_window_is_served_by_every_listing() {
     let (router, group) = seeded_store().await;
@@ -159,18 +169,49 @@ async fn a_page_size_inside_the_window_is_served_by_every_listing() {
         WINDOW_MAX,
     ];
     for (operation, items, _, base) in listings(&group) {
+        // The whole set, read at the top of the window, so each page below is checked
+        // against the set's OWN size rather than a bound that is trivially met.
+        let case = format!("{operation} whole set");
+        let mut request = base.clone();
+        request["MaxResults"] = json!(WINDOW_MAX);
+        let whole = ok(&router, operation, &request, &case).await;
+        let total = page_items(&whole, items, &case).len();
+        assert!(
+            whole.get("NextToken").is_none(),
+            "case {case:?}: a set that fits in the largest page is owed no token, got {whole}"
+        );
+
         for page_size in accepted {
             let case = format!("{operation} MaxResults={page_size}");
             let mut request = base.clone();
             request["MaxResults"] = json!(page_size);
             let body = ok(&router, operation, &request, &case).await;
             let page = page_items(&body, items, &case);
-            assert!(
-                i32::try_from(page.len()).unwrap_or(i32::MAX) <= page_size,
-                "case {case:?}: a page holds at most {page_size} items, got {}",
+            let expected = total.min(usize::try_from(page_size).unwrap_or(usize::MAX));
+            assert_eq!(
+                page.len(),
+                expected,
+                "case {case:?}: a page of a set of {total} holds {expected} items, got {}",
                 page.len()
             );
+            assert_eq!(
+                body.get("NextToken").is_some(),
+                page.len() < total,
+                "case {case:?}: a token is handed out exactly when the set is longer than \
+                 the page, got {body}"
+            );
         }
+
+        // No page size at all: served, and the whole set comes back — the window bounds
+        // a value the request supplied rather than being a size the listing requires.
+        let case = format!("{operation} with no MaxResults");
+        let body = ok(&router, operation, &base, &case).await;
+        assert_eq!(
+            page_items(&body, items, &case).len(),
+            total,
+            "case {case:?}: a request with no page size answers the whole set of {total}, \
+             got {body}"
+        );
     }
 }
 
@@ -280,6 +321,103 @@ async fn an_accepted_page_size_bounds_the_page() {
         walked, whole,
         "case {case:?}: the pages together must be the whole listing, in order"
     );
+}
+
+/// A token names a POSITION in the listing and nothing about the page that produced it:
+/// a walk may change `MaxResults` at every step — to any other size the window serves —
+/// and still visit the whole set exactly once, in the listing's own order, ending with no
+/// token left. That is what lets a client lower or raise its page size mid-walk.
+#[tokio::test]
+async fn a_token_resumes_the_listing_at_any_served_page_size() {
+    let (router, group) = seeded_store().await;
+    // More groups than the SMALLEST page the service serves, so the group listing hands
+    // out a token at the bottom of the window too.
+    for index in 0..WINDOW_MIN {
+        let name = format!("token-group-{index:02}");
+        ok(
+            &router,
+            "CreateParameterGroup",
+            &json!({ "ParameterGroupName": name, "Family": FAMILY }),
+            &name,
+        )
+        .await;
+    }
+
+    // (first page size, every later page size): both bounds of the window in both
+    // directions and a size in between, so a walk narrows, widens and holds still.
+    let steps: &[(i32, i32)] = &[
+        (WINDOW_MIN, WINDOW_MIN),
+        (WINDOW_MIN, WINDOW_MAX),
+        (WINDOW_MIN, (WINDOW_MIN + WINDOW_MAX) / 2),
+        (WINDOW_MIN + 1, WINDOW_MIN),
+        ((WINDOW_MIN + WINDOW_MAX) / 2, WINDOW_MIN),
+    ];
+    // The two listings with a set larger than the smallest page: one the SERVICE
+    // provides (a family's engine defaults) and one a CALLER created (the groups above).
+    let listings: &[(&str, &str, Value)] = &[
+        (
+            "DescribeParameters",
+            "Parameters",
+            json!({ "ParameterGroupName": &group }),
+        ),
+        ("DescribeParameterGroups", "ParameterGroups", json!({})),
+    ];
+
+    for (operation, items, base) in listings {
+        // The whole set in one page: the order and content every walk must reproduce.
+        let case = format!("{operation} whole set");
+        let mut request = base.clone();
+        request["MaxResults"] = json!(WINDOW_MAX);
+        let answered = ok(&router, operation, &request, &case).await;
+        let whole = page_items(&answered, items, &case);
+        assert!(
+            answered.get("NextToken").is_none()
+                && i32::try_from(whole.len()).unwrap_or(i32::MAX) > WINDOW_MIN,
+            "case {case:?}: the set must be larger than the smallest page and fit in the \
+             largest, got {} items in {answered}",
+            whole.len()
+        );
+
+        for (first, rest) in steps.iter().copied() {
+            let case = format!("{operation} first page {first}, later pages {rest}");
+            let mut walked: Vec<Value> = Vec::new();
+            let mut size = first;
+            let mut token: Option<String> = None;
+            loop {
+                let mut request = base.clone();
+                request["MaxResults"] = json!(size);
+                if let Some(token) = token.as_deref() {
+                    request["NextToken"] = json!(token);
+                }
+                let body = ok(&router, operation, &request, &case).await;
+                let items_read = page_items(&body, items, &case);
+                assert!(
+                    !items_read.is_empty(),
+                    "case {case:?}: every page of the walk must make progress, got {body}"
+                );
+                walked.extend(items_read);
+                assert!(
+                    walked.len() <= whole.len(),
+                    "case {case:?}: the walk must not outgrow the set, visited {} items",
+                    walked.len()
+                );
+                match body.get("NextToken").and_then(Value::as_str) {
+                    Some(next) => {
+                        token = Some(next.to_string());
+                        // Every later page is asked for at the OTHER size: the token has
+                        // to resume the listing whatever page size carries it.
+                        size = rest;
+                    }
+                    None => break,
+                }
+            }
+            assert_eq!(
+                walked, whole,
+                "case {case:?}: the walk must visit the whole set once, in the listing's \
+                 own order"
+            );
+        }
+    }
 }
 
 /// A name that is not a well-formed identifier is refused with the sentence the service

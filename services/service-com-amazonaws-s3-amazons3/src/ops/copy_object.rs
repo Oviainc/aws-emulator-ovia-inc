@@ -795,11 +795,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ssekms_key_id: encryption.kms_key_id.clone(),
             ssekms_encryption_context: encryption.kms_encryption_context.clone(),
             bucket_key_enabled: encryption.bucket_key_enabled,
+            // "If the object expiration is configured, the response includes this header"
+            // (`CopyObjectOutput$Expiration`): the DESTINATION bucket's lifecycle
+            // configuration applied to the copy just stored, computed from it the way
+            // `PutObject` computes it for the object it wrote.
+            expiration: store.bucket(&input.bucket).and_then(|bucket| {
+                bucket
+                    .object(&input.key)
+                    .and_then(|stored| bucket.object_expiration_header(&input.key, stored))
+            }),
             // Everything else this output can carry describes a feature no stored object
-            // here has, so none of it is reported rather than being invented:
-            // `Expiration` needs a lifecycle configuration (none is recorded for any
-            // bucket), the SSE-C members are refused above, and `RequestCharged` reports a
-            // Requester Pays charge this emulator does not model.
+            // here has, so none of it is reported rather than being invented: the SSE-C
+            // members are refused above, and `RequestCharged` reports a Requester Pays
+            // charge this emulator does not model.
             ..CopyObjectOutput::default()
         })
     }

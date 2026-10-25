@@ -123,29 +123,70 @@ pub const RESOURCE_ARN_CHARACTER_CLASS: &str = "[a-zA-Z0-9:*/-]+";
 
 /// The number of tags one deployment parameter holds.
 ///
-/// MODELLED, not chosen: `PutDeploymentParameterRequest$tags` and
+/// AWS's per-resource tag limit, which the model restates for its constrained copy
+/// of the tag map: `PutDeploymentParameterRequest$tags` and
 /// `PutDeploymentParameterResponse$tags` are a `TagsMap` with `length max 50`
 /// (`smithy_query(query="shape",shape="TagsMap")`), so a stored set larger than
 /// this could not be reported back through the response at all.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
-/// Longest tag key this service stores — the modelled `TagKey` `length 1..128`.
+/// Longest tag key this service stores, in CHARACTERS.
+///
+/// AWS's tagging limit for every taggable resource: a tag key holds at least one
+/// and at most this many characters. The modelled `TagKey` `length 1..128`
+/// restates it for the constrained copy of the tag map
+/// (`smithy_query(query="shape",shape="TagKey")`), so the bound is the same
+/// whichever member a tag arrives through.
 pub const TAG_KEY_MAX_LEN: usize = 128;
 
-/// Longest tag value this service stores — the modelled `TagValue`
-/// `length 1..256`.
+/// Longest tag value this service stores, in CHARACTERS.
+///
+/// AWS's tagging limit for every taggable resource, restated by the modelled
+/// `TagValue` `length 1..256` (`smithy_query(query="shape",shape="TagValue")`).
+/// Only the MAXIMUM is a limit on a value: the key is what must carry text, so a
+/// tag whose value is empty is an ordinary tag.
 pub const TAG_VALUE_MAX_LEN: usize = 256;
 
-/// The characters a tag key or value may hold: the expression the modelled
-/// `TagKey` / `TagValue` `@pattern` states, WITHOUT the `^` / `$` the model
-/// spells it with.
+/// The characters the model's CONSTRAINED tag map admits: the expression the
+/// modelled `TagKey` / `TagValue` `@pattern` states, WITHOUT the `^` / `$` the
+/// model spells it with.
 ///
 /// Smithy's `@pattern` is an unanchored find, so those two characters are how the
 /// model makes the match total; they are not part of the character class a client
 /// may send, and a message that quotes them reports a pattern the caller never
 /// sent. The model's own form is `^[a-zA-Z0-9/_+=.:@-]+$`
 /// (`smithy_query(query="shape",shape="TagKey,TagValue")`).
+///
+/// It is NOT a rule about tags in general: it applies exactly where a member
+/// targets the shape that carries it ([`TagConstraints::TagsMap`]), and a member
+/// targeting a map the model leaves unconstrained admits any UTF-8 text inside the
+/// length bounds above.
 pub const TAG_CHARACTER_CLASS: &str = "[a-zA-Z0-9/_+=.:@-]+";
+
+/// What the map a tagging member TARGETS constrains about the keys and values that
+/// member carries — which is what decides the rules a merge through it enforces.
+///
+/// Two members of this service carry tags and they target different shapes, so the
+/// same tag set is legal through one and refused through the other. A caller's
+/// request is judged by the shape ITS member names and never by the strictest shape
+/// the service happens to model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagConstraints {
+    /// The member targets a tag map the model leaves unconstrained
+    /// (`map<String,String>`: no `@length` and no `@pattern` on either side). Only
+    /// the tagging limits AWS applies to every taggable resource hold — a non-empty
+    /// key, [`TAG_KEY_MAX_LEN`] / [`TAG_VALUE_MAX_LEN`] characters and
+    /// [`MAX_TAGS_PER_RESOURCE`] entries — so any UTF-8 text inside them is stored,
+    /// spaces, letters outside ASCII and an empty value included.
+    Unconstrained,
+    /// The member targets the modelled `TagsMap`, whose key and value shapes carry a
+    /// `@length` and the `@pattern` [`TAG_CHARACTER_CLASS`] states. Those hold on top
+    /// of the limits above. The centralized constraint walk reports a map's VALUES
+    /// (through the element-constraints wrapper it captures) but not its KEYS, so the
+    /// key side of that pattern is judged here and the value side is already refused
+    /// before a handler runs.
+    TagsMap,
+}
 
 /// The tag-key namespace AWS owns.
 ///
@@ -686,30 +727,54 @@ fn is_tag_byte(byte: u8) -> bool {
         || matches!(byte, b'/' | b'_' | b'+' | b'=' | b'.' | b':' | b'@' | b'-')
 }
 
-/// Whether `candidate` is a tag key this service can store and report: the
-/// modelled `TagKey` `length 1..128` and [`TAG_CHARACTER_CLASS`].
-pub fn is_tag_key(candidate: &str) -> bool {
-    (1..=TAG_KEY_MAX_LEN).contains(&candidate.len()) && candidate.bytes().all(is_tag_byte)
+/// Whether `candidate` holds only characters [`TAG_CHARACTER_CLASS`] admits.
+///
+/// A byte test is enough to decide it: every character the class admits is ASCII,
+/// so any multi-byte UTF-8 character fails on its first byte.
+fn matches_tag_character_class(candidate: &str) -> bool {
+    candidate.bytes().all(is_tag_byte)
 }
 
-/// Whether `candidate` is a tag value this service can store and report: the
-/// modelled `TagValue` `length 1..256` and [`TAG_CHARACTER_CLASS`].
+/// The length of `candidate` the way a tag-length limit counts it: in CHARACTERS,
+/// not bytes — which is also how Smithy's `@length` measures a string — so a key or
+/// value of letters outside ASCII is measured by what a caller wrote rather than by
+/// how many bytes UTF-8 took to carry it.
+fn tag_text_len(candidate: &str) -> usize {
+    candidate.chars().count()
+}
+
+/// Whether `candidate` is a tag key this service stores: 1..[`TAG_KEY_MAX_LEN`]
+/// characters.
+///
+/// Any UTF-8 text inside that bound is one. The character class the model's
+/// constrained tag map states is a constraint of THAT map and not of tag keys in
+/// general ([`TagConstraints`]), so it is no part of this judgement.
+pub fn is_tag_key(candidate: &str) -> bool {
+    (1..=TAG_KEY_MAX_LEN).contains(&tag_text_len(candidate))
+}
+
+/// Whether `candidate` is a tag value this service stores: at most
+/// [`TAG_VALUE_MAX_LEN`] characters.
+///
+/// The EMPTY value is one — a tag's key is what must carry text — and so is any
+/// other UTF-8 text inside the bound, for the reason [`is_tag_key`] gives.
 pub fn is_tag_value(candidate: &str) -> bool {
-    (1..=TAG_VALUE_MAX_LEN).contains(&candidate.len()) && candidate.bytes().all(is_tag_byte)
+    tag_text_len(candidate) <= TAG_VALUE_MAX_LEN
 }
 
 /// Merge `incoming` onto `existing`, or say why the result could not be stored.
 ///
 /// A key already present takes the new value. The merge is computed BEFORE
-/// anything is stored, so a request the service cannot report back is refused
-/// outright rather than growing the record.
+/// anything is stored, so a refused request leaves the record exactly as it was.
+/// `incoming` is walked in key order, so the key a refusal names does not depend on
+/// hash iteration order.
 ///
-/// `TagResource`'s own `tags` member targets the unconstrained `Tags` map, but
-/// the tag set it writes is reported by `PutDeploymentParameter` through the
-/// modelled `TagsMap` (`length max 50`, keys `TagKey`, values `TagValue`) — so a
-/// write outside those bounds is refused with the modelled `ValidationException`
-/// rather than stored unreportably. `incoming` is walked in key order, so the
-/// member a refusal names does not depend on hash iteration order.
+/// `constraints` is what the MEMBER the tags arrived through targets
+/// ([`TagConstraints`]): every merge is held to AWS's own tagging limits — a
+/// non-empty key, the length bounds [`is_tag_key`] / [`is_tag_value`] state, and
+/// [`MAX_TAGS_PER_RESOURCE`] entries on the resulting record — and a merge through a
+/// member targeting the modelled constrained map is additionally held to the
+/// character class that map's key shape states.
 ///
 /// A key in the namespace AWS reserves is refused here as well
 /// ([`validate_tag_keys_unreserved`]), so no merge can leave a reserved key on a
@@ -717,6 +782,7 @@ pub fn is_tag_value(candidate: &str) -> bool {
 pub fn merge_tags(
     existing: &BTreeMap<String, String>,
     incoming: &HashMap<String, String>,
+    constraints: TagConstraints,
 ) -> Result<BTreeMap<String, String>, ValidationException> {
     validate_tag_keys_unreserved(incoming.keys().map(String::as_str), "tags")?;
     let mut merged = existing.clone();
@@ -725,7 +791,7 @@ pub fn merge_tags(
         if !is_tag_key(key) {
             return Err(ValidationException {
                 message: format!(
-                    "tag key '{key}' is outside the 1..{TAG_KEY_MAX_LEN} characters of {TAG_CHARACTER_CLASS} a tag key may hold"
+                    "tag key '{key}' is outside the 1..{TAG_KEY_MAX_LEN} characters a tag key may hold"
                 ),
                 field_name: "tags".to_string(),
             });
@@ -733,7 +799,18 @@ pub fn merge_tags(
         if !is_tag_value(value) {
             return Err(ValidationException {
                 message: format!(
-                    "the value of tag key '{key}' is outside the 1..{TAG_VALUE_MAX_LEN} characters of {TAG_CHARACTER_CLASS} a tag value may hold"
+                    "the value of tag key '{key}' is longer than the {TAG_VALUE_MAX_LEN} characters a tag value may hold"
+                ),
+                field_name: "tags".to_string(),
+            });
+        }
+        // The key side of the constrained map's own `@pattern`. Judged here because
+        // the centralized constraint walk reports a map's values and not its keys;
+        // the value side has therefore already been refused before this runs.
+        if constraints == TagConstraints::TagsMap && !matches_tag_character_class(key) {
+            return Err(ValidationException {
+                message: format!(
+                    "tag key '{key}' is outside the {TAG_CHARACTER_CLASS} characters this member's tag keys may hold"
                 ),
                 field_name: "tags".to_string(),
             });

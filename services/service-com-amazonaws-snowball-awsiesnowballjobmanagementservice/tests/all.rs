@@ -41,6 +41,8 @@ mod job_unlock_code;
 mod job_updates;
 #[path = "all/page_size_rule.rs"]
 mod page_size_rule;
+#[path = "all/return_shipping_label_reports.rs"]
+mod return_shipping_label_reports;
 #[path = "all/return_shipping_labels.rs"]
 mod return_shipping_labels;
 #[path = "all/service_versions.rs"]

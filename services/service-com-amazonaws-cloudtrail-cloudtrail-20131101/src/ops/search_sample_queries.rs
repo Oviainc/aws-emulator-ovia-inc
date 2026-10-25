@@ -1,15 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchSampleQueries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchSampleQueries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchSampleQueries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Searches the CloudTrail Lake SAMPLE-QUERY CATALOG — the service's own curated
+//! library of example queries, which is service-global data and not an account's
+//! resource — for the caller's natural-language `SearchPhrase`, and answers the
+//! entries that match it "ordered from most relevant to least relevant", one
+//! `MaxResults`-sized page at a time (`NextToken` continues the same ranking).
+//!
+//! Nothing here reads or writes this service's store: the catalog is the same for
+//! every caller and no operation in this service's surface changes it, so a search
+//! is a pure read (the model marks this operation `@idempotent`) and two identical
+//! requests answer identically.
+//!
+//! WHAT IS AND IS NOT FAITHFUL HERE: the real service ranks with a semantic model
+//! ("provide a natural language SearchPhrase in English") that this emulator cannot
+//! run, so the MAGNITUDE of a `Relevance` is an emulator-chosen LEXICAL stand-in
+//! (weighted query-term coverage of an entry's name, description and SQL — see
+//! [`relevance_of`], comparing words by the crude root of [`TRIMMED_ENDINGS`] so an
+//! inflection matches the word it inflects) and no caller should depend on the
+//! numbers. A phrase sharing no word with any entry therefore answers an EMPTY page
+//! rather than a guess: this emulator has no semantic model to find a synonym with,
+//! and inventing a ranking for a phrase it cannot match would be worse than saying
+//! nothing. What IS faithful,
+//! and what this crate's `tests/all/sample_queries.rs` pins, is everything around
+//! it: only catalog entries are ever returned, each with the catalog's own `Name`,
+//! `Description` and `SQL`; an entry carrying more of the phrase outranks one
+//! carrying less; the list is in descending `Relevance`; the page is at most
+//! `MaxResults` long (default 10) and `NextToken` appears exactly when matches
+//! remain; the pages of one phrase partition its ranking exactly once; and one
+//! input always yields one answer.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +102,11 @@
 //! * `UnsupportedOperationException` (HTTP 400) — This exception is thrown when the requested
 //!   operation is not supported.
 
+use std::collections::hash_map::DefaultHasher;
+use std::collections::BTreeSet;
+use std::hash::{Hash, Hasher};
+use std::sync::OnceLock;
+
 #[allow(unused_imports)]
 use super::types::*;
 
@@ -119,6 +144,295 @@ impl From<SearchSampleQueriesErrorModeled> for SearchSampleQueriesError {
     }
 }
 
+/// One entry of the sample-query catalog: exactly the three values a
+/// `SearchSampleQueriesSearchResult` reports beside its relevance.
+///
+/// `&'static str` because the catalog is fixed data compiled into the emulator, not
+/// a resource any request creates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SampleQuery {
+    /// `SearchSampleQueriesSearchResult$Name`.
+    pub name: &'static str,
+    /// `SearchSampleQueriesSearchResult$Description`.
+    pub description: &'static str,
+    /// `SearchSampleQueriesSearchResult$SQL` — the query text, over the event data
+    /// store the caller substitutes for `$EDS_ID`, as the sample queries CloudTrail
+    /// Lake ships are written.
+    pub sql: &'static str,
+}
+
+/// The sample queries this emulator's CloudTrail Lake library holds.
+///
+/// The real library is curated by AWS and published in the CloudTrail console's
+/// "Sample queries" tab; these entries are modelled on the example queries in the
+/// CloudTrail User Guide ("CloudTrail Lake example queries" —
+/// `lake-eql-examples.html`), which is the only published form of that catalog. They
+/// are therefore the EMULATOR's copy of the library, not a claim that AWS's own list
+/// is exactly this one: what a caller can rely on is that a search answers entries
+/// from a fixed, service-global catalog, each with a name, a description and runnable
+/// CloudTrail Lake SQL.
+///
+/// Order here is irrelevant to a response — a search ranks the catalog — but the list
+/// is kept name-sorted so a new entry has one obvious home.
+pub const SAMPLE_QUERY_CATALOG: &[SampleQuery] = &[
+    SampleQuery {
+        name: "Access denied errors by identity",
+        description: "Count the API calls each identity was denied, which surfaces \
+                      missing permissions and credential probing.",
+        sql: "SELECT userIdentity.arn AS identity, count(*) AS deniedCount \
+              FROM $EDS_ID \
+              WHERE errorCode = 'AccessDenied' \
+              GROUP BY userIdentity.arn \
+              ORDER BY deniedCount DESC",
+    },
+    SampleQuery {
+        name: "Amazon EC2 instances launched and terminated",
+        description: "Show who launched or terminated EC2 instances, and with which \
+                      request parameters.",
+        sql: "SELECT eventTime, eventName, userIdentity.arn AS identity, requestParameters \
+              FROM $EDS_ID \
+              WHERE eventSource = 'ec2.amazonaws.com' \
+              AND eventName IN ('RunInstances', 'TerminateInstances') \
+              ORDER BY eventTime DESC",
+    },
+    SampleQuery {
+        name: "Amazon RDS snapshots shared with other accounts",
+        description: "Find database snapshot attribute changes, the call that shares an \
+                      RDS snapshot outside the account.",
+        sql: "SELECT eventTime, userIdentity.arn AS identity, requestParameters \
+              FROM $EDS_ID \
+              WHERE eventSource = 'rds.amazonaws.com' \
+              AND eventName = 'ModifyDBSnapshotAttribute' \
+              ORDER BY eventTime DESC",
+    },
+    SampleQuery {
+        name: "Amazon S3 bucket policy and public access changes",
+        description: "Show changes to S3 bucket policies, ACLs and public access blocks, \
+                      the settings that make object data reachable.",
+        sql: "SELECT eventTime, userIdentity.arn AS identity, requestParameters \
+              FROM $EDS_ID \
+              WHERE eventSource = 's3.amazonaws.com' \
+              AND eventName IN ('PutBucketPolicy', 'DeleteBucketPolicy', 'PutBucketAcl', \
+              'PutBucketPublicAccessBlock') \
+              ORDER BY eventTime DESC",
+    },
+    SampleQuery {
+        name: "Amazon S3 buckets deleted",
+        description: "Find every bucket deletion, with the identity that deleted it.",
+        sql: "SELECT eventTime, userIdentity.arn AS identity, requestParameters \
+              FROM $EDS_ID \
+              WHERE eventSource = 's3.amazonaws.com' AND eventName = 'DeleteBucket' \
+              ORDER BY eventTime DESC",
+    },
+    SampleQuery {
+        name: "API calls by source IP address",
+        description: "Count the API calls made from each source IP address, to spot \
+                      traffic from unexpected networks.",
+        sql: "SELECT sourceIPAddress, count(*) AS apiCount \
+              FROM $EDS_ID \
+              GROUP BY sourceIPAddress \
+              ORDER BY apiCount DESC",
+    },
+    SampleQuery {
+        name: "AWS Lambda functions created or updated",
+        description: "Show Lambda function creations and code updates, with the identity \
+                      that made each change.",
+        sql: "SELECT eventTime, eventName, userIdentity.arn AS identity, requestParameters \
+              FROM $EDS_ID \
+              WHERE eventSource = 'lambda.amazonaws.com' \
+              AND (eventName LIKE 'CreateFunction%' OR eventName LIKE 'UpdateFunctionCode%') \
+              ORDER BY eventTime DESC",
+    },
+    SampleQuery {
+        name: "CloudTrail logging stopped or trails changed",
+        description: "Find attempts to disable auditing: trails stopped, deleted or \
+                      reconfigured.",
+        sql: "SELECT eventTime, eventName, userIdentity.arn AS identity, requestParameters \
+              FROM $EDS_ID \
+              WHERE eventSource = 'cloudtrail.amazonaws.com' \
+              AND eventName IN ('StopLogging', 'DeleteTrail', 'UpdateTrail', \
+              'PutEventSelectors') \
+              ORDER BY eventTime DESC",
+    },
+    SampleQuery {
+        name: "Console sign-ins without multi-factor authentication",
+        description: "Find console login events where MFA was not used.",
+        sql: "SELECT eventTime, userIdentity.arn AS identity, sourceIPAddress, \
+              additionalEventData.MFAUsed AS mfa \
+              FROM $EDS_ID \
+              WHERE eventName = 'ConsoleLogin' AND additionalEventData.MFAUsed = 'No' \
+              ORDER BY eventTime DESC",
+    },
+    SampleQuery {
+        name: "Failed console sign-in attempts",
+        description: "Find console login failures, with the user name and the source IP \
+                      address each attempt came from.",
+        sql: "SELECT eventTime, userIdentity.userName AS userName, sourceIPAddress, \
+              errorMessage \
+              FROM $EDS_ID \
+              WHERE eventName = 'ConsoleLogin' \
+              AND responseElements.ConsoleLogin = 'Failure' \
+              ORDER BY eventTime DESC",
+    },
+    SampleQuery {
+        name: "IAM access keys created, updated or deleted",
+        description: "Show the lifecycle of long-term credentials: access keys created, \
+                      rotated or removed.",
+        sql: "SELECT eventTime, eventName, userIdentity.arn AS identity, requestParameters \
+              FROM $EDS_ID \
+              WHERE eventSource = 'iam.amazonaws.com' \
+              AND eventName IN ('CreateAccessKey', 'UpdateAccessKey', 'DeleteAccessKey') \
+              ORDER BY eventTime DESC",
+    },
+    SampleQuery {
+        name: "IAM users, roles and policies created",
+        description: "Show every IAM resource creation, to review how identities and \
+                      permissions were added.",
+        sql: "SELECT eventTime, eventName, userIdentity.arn AS identity, requestParameters \
+              FROM $EDS_ID \
+              WHERE eventSource = 'iam.amazonaws.com' AND eventName LIKE 'Create%' \
+              ORDER BY eventTime DESC",
+    },
+    SampleQuery {
+        name: "KMS keys disabled or scheduled for deletion",
+        description: "Find changes that can make encrypted data unreadable: KMS keys \
+                      disabled or scheduled for deletion.",
+        sql: "SELECT eventTime, eventName, userIdentity.arn AS identity, requestParameters \
+              FROM $EDS_ID \
+              WHERE eventSource = 'kms.amazonaws.com' \
+              AND eventName IN ('DisableKey', 'ScheduleKeyDeletion') \
+              ORDER BY eventTime DESC",
+    },
+    SampleQuery {
+        name: "Most frequent errors by error code",
+        description: "Count events per error code, to see which failures dominate the \
+                      account's API traffic.",
+        sql: "SELECT errorCode, count(*) AS errorCount \
+              FROM $EDS_ID \
+              WHERE errorCode IS NOT NULL \
+              GROUP BY errorCode \
+              ORDER BY errorCount DESC",
+    },
+    SampleQuery {
+        name: "Network and VPC configuration changes",
+        description: "Show route table, subnet, internet gateway and VPC peering changes.",
+        sql: "SELECT eventTime, eventName, userIdentity.arn AS identity, requestParameters \
+              FROM $EDS_ID \
+              WHERE eventSource = 'ec2.amazonaws.com' \
+              AND (eventName LIKE '%Route%' OR eventName LIKE '%Subnet%' \
+              OR eventName LIKE '%Vpc%' OR eventName LIKE '%InternetGateway%') \
+              ORDER BY eventTime DESC",
+    },
+    SampleQuery {
+        name: "Role assumptions by identity",
+        description: "Count how often each identity assumed a role through AWS STS.",
+        sql: "SELECT userIdentity.arn AS identity, \
+              requestParameters.roleArn AS assumedRole, count(*) AS assumeCount \
+              FROM $EDS_ID \
+              WHERE eventSource = 'sts.amazonaws.com' AND eventName = 'AssumeRole' \
+              GROUP BY userIdentity.arn, requestParameters.roleArn \
+              ORDER BY assumeCount DESC",
+    },
+    SampleQuery {
+        name: "Root user activity",
+        description: "Find every event performed by the account root user, which should \
+                      be rare in a well-run account.",
+        sql: "SELECT eventTime, eventSource, eventName, awsRegion, sourceIPAddress \
+              FROM $EDS_ID \
+              WHERE userIdentity.type = 'Root' \
+              ORDER BY eventTime DESC",
+    },
+    SampleQuery {
+        name: "Security group rule changes",
+        description: "Show ingress and egress rules added to or revoked from security \
+                      groups, the firewall of an EC2 network.",
+        sql: "SELECT eventTime, eventName, userIdentity.arn AS identity, requestParameters \
+              FROM $EDS_ID \
+              WHERE eventName IN ('AuthorizeSecurityGroupIngress', \
+              'RevokeSecurityGroupIngress', 'AuthorizeSecurityGroupEgress', \
+              'RevokeSecurityGroupEgress') \
+              ORDER BY eventTime DESC",
+    },
+    SampleQuery {
+        name: "Top API calls by service",
+        description: "Count events per service and API name, the busiest calls first.",
+        sql: "SELECT eventSource, eventName, count(*) AS apiCount \
+              FROM $EDS_ID \
+              GROUP BY eventSource, eventName \
+              ORDER BY apiCount DESC",
+    },
+    SampleQuery {
+        name: "Which AWS Regions were used",
+        description: "Count events per Region, to find activity outside the Regions the \
+                      account is meant to use.",
+        sql: "SELECT awsRegion, count(*) AS eventCount \
+              FROM $EDS_ID \
+              GROUP BY awsRegion \
+              ORDER BY eventCount DESC",
+    },
+];
+
+/// Results on one page when the request names no `MaxResults`, from the model doc for
+/// `SearchSampleQueriesRequest$MaxResults`: "The default value is 10."
+pub const DEFAULT_MAX_RESULTS: usize = 10;
+
+/// Smallest page a caller may ask for, from `SearchSampleQueriesMaxResults`'s
+/// `@range(min: 1, max: 50)`.
+const MIN_MAX_RESULTS: usize = 1;
+/// Largest page a caller may ask for. See [`MIN_MAX_RESULTS`].
+const MAX_MAX_RESULTS: usize = 50;
+
+/// Share of an entry's relevance that comes from its `Name`. The three field weights
+/// sum to 1, which is what keeps a relevance in `0.0..=1.0`. Emulator-chosen: see the
+/// caveat in this module's documentation.
+const NAME_WEIGHT: f32 = 0.6;
+/// Share of an entry's relevance that comes from its `Description`. Emulator-chosen.
+const DESCRIPTION_WEIGHT: f32 = 0.3;
+/// Share of an entry's relevance that comes from its `SQL`. Emulator-chosen, and the
+/// smallest of the three: a term that appears only in query text ("select", "count")
+/// says least about what the entry is for.
+const SQL_WEIGHT: f32 = 0.1;
+
+/// Word endings trimmed before two words are compared, so an inflection matches the
+/// word it inflects: `identities`/`identity`, `queries`/`query`, `logins`/`login`,
+/// `changes`/`changed`, `deletion`/`deleted`/`delete`. Each entry is the ending and
+/// the shortest word it may be trimmed from, longest ending first; a word keeps its
+/// ending when trimming it would leave less than that.
+///
+/// Emulator-chosen, and deliberately crude: it is a lexical stand-in for the real
+/// service's language model (see this module's documentation), not an English
+/// stemmer. It is applied to a phrase's words and to a catalog entry's words alike,
+/// so the comparison stays symmetric.
+const TRIMMED_ENDINGS: &[(&str, usize)] = &[
+    ("ions", 6),
+    ("ies", 6),
+    ("ing", 6),
+    ("ion", 6),
+    ("es", 5),
+    ("ed", 5),
+    ("s", 4),
+    ("e", 5),
+    ("y", 5),
+];
+
+/// Words dropped from a search phrase before it is matched, because every English
+/// phrase carries them and they say nothing about which sample query is wanted
+/// ("show me all the failed logins"). Emulator-chosen.
+///
+/// Negations stay: `without` and `not` are filler grammatically but they change which
+/// sample query a caller wants, so dropping them would rank "console logins WITHOUT
+/// MFA" and "console logins WITH MFA" identically.
+const STOP_WORDS: &[&str] = &[
+    "a", "all", "an", "and", "any", "are", "be", "been", "by", "can", "did", "do", "does", "for",
+    "from", "get", "give", "how", "i", "in", "is", "list", "me", "my", "of", "on", "or", "please",
+    "show", "that", "the", "to", "was", "were", "what", "which", "with", "you",
+];
+
+/// Version tag and separator of the `NextToken` this operation hands out. Bumping the
+/// tag retires every token in flight, which is what a change to the token's own
+/// layout needs.
+const TOKEN_PREFIX: &str = "ssq1:";
+
 /// The `SearchSampleQueries` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -153,20 +467,241 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchSampleQueries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchSampleQueriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchSampleQueries"))
+        // Nothing in this answer depends on the store: the sample-query library is
+        // service-global data that no call changes, and a search persists nothing.
+        let _ = &self.engine;
+
+        let terms = phrase_terms(&input.search_phrase);
+        let fingerprint = phrase_fingerprint(&terms);
+
+        // "A list of objects containing the search results ordered from most relevant
+        // to least relevant": rank the whole catalog, keep the entries the phrase
+        // actually reaches, and break a tie on the entry name so one phrase has ONE
+        // order rather than a catalog-order accident.
+        let mut ranked: Vec<(f32, &SampleQuery)> = SAMPLE_QUERY_CATALOG
+            .iter()
+            .zip(catalog_terms())
+            .map(|(entry, entry_terms)| (relevance_of(&terms, entry_terms), entry))
+            .filter(|(relevance, _)| *relevance > 0.0)
+            .collect();
+        ranked.sort_by(|(left, left_entry), (right, right_entry)| {
+            right
+                .total_cmp(left)
+                .then_with(|| left_entry.name.cmp(right_entry.name))
+        });
+
+        let offset = match input.next_token.as_deref() {
+            Some(token) => page_offset(token, &fingerprint, ranked.len())?,
+            None => 0,
+        };
+        // "The maximum number of results to return on a single page. The default value
+        // is 10." The modelled `@range(1, 50)` is enforced by the boundary validator
+        // BEFORE this handler runs, which is where a caller's out-of-range page size is
+        // actually refused (as `ValidationException`) — so this arm is unreachable while
+        // that validation stands, and is here only so that a page size this operation
+        // cannot serve can never be silently coerced into a different one.
+        let page_size = match input.max_results {
+            Some(max_results) => usize::try_from(max_results)
+                .ok()
+                .filter(|max| (MIN_MAX_RESULTS..=MAX_MAX_RESULTS).contains(max))
+                .ok_or_else(|| {
+                    invalid_parameter(
+                        "MaxResults must be between 1 and 50 results on a single page.",
+                    )
+                })?,
+            None => DEFAULT_MAX_RESULTS,
+        };
+
+        let page: Vec<SearchSampleQueriesSearchResult> = ranked[offset..]
+            .iter()
+            .take(page_size)
+            .map(|(relevance, entry)| SearchSampleQueriesSearchResult {
+                name: Some(entry.name.to_string()),
+                description: Some(entry.description.to_string()),
+                sql: Some(entry.sql.to_string()),
+                relevance: *relevance,
+            })
+            .collect();
+
+        // A token only where there is a next page to reach with it, so a paginating
+        // client stops of its own accord.
+        let resume_at = offset + page.len();
+        let next_token = (resume_at < ranked.len()).then(|| page_token(resume_at, &fingerprint));
+
+        Ok(SearchSampleQueriesOutput {
+            search_results: Some(page),
+            next_token,
+        })
     }
+}
+
+/// How relevant a catalog entry carrying `entry_terms` (its name's, description's and
+/// SQL's terms, in that order) is to a phrase carrying `terms`, in `0.0..=1.0`.
+///
+/// It is the share of the phrase's distinct terms the entry carries, weighted by
+/// where they appear: the name says most about what a sample query is for, its
+/// description next, its SQL least. An entry carrying none of the terms scores 0 and
+/// is not a search result at all.
+///
+/// The weights are the EMULATOR's, not the service's — see the caveat in this
+/// module's documentation. The guarantees are ordinal: an entry carrying more of the
+/// phrase, or carrying it in a more telling field, outranks one that carries less,
+/// and the same phrase always ranks the catalog the same way.
+fn relevance_of(terms: &[String], entry_terms: &[BTreeSet<String>; 3]) -> f32 {
+    let [name, description, sql] = entry_terms;
+    let relevance = NAME_WEIGHT * coverage(terms, name)
+        + DESCRIPTION_WEIGHT * coverage(terms, description)
+        + SQL_WEIGHT * coverage(terms, sql);
+    relevance.clamp(0.0, 1.0)
+}
+
+/// Every catalog entry's comparable terms — name, description and SQL — folded once
+/// on first use. The catalog is fixed data, so a request folds only its own phrase.
+fn catalog_terms() -> &'static [[BTreeSet<String>; 3]] {
+    static TERMS: OnceLock<Vec<[BTreeSet<String>; 3]>> = OnceLock::new();
+    TERMS.get_or_init(|| {
+        SAMPLE_QUERY_CATALOG
+            .iter()
+            .map(|entry| {
+                [
+                    field_terms(entry.name),
+                    field_terms(entry.description),
+                    field_terms(entry.sql),
+                ]
+            })
+            .collect()
+    })
+}
+
+/// The distinct terms a search phrase is matched by: the roots of its words, in
+/// first-seen order, with the English filler of [`STOP_WORDS`] dropped. A phrase of
+/// nothing BUT filler carries no term at all, and so matches nothing — the same empty
+/// answer as a phrase sharing no word with any entry, rather than a ranking of the
+/// entries whose text happens to contain "show" or "the".
+///
+/// Filler is dropped AFTER folding, against the folded stop words, so that an
+/// inflection of a filler word ("showed", "lists") is filler too — the same fold the
+/// catalog's words go through, which is what keeps the comparison symmetric.
+fn phrase_terms(search_phrase: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    search_phrase
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(|word| root_of(&word.to_lowercase()))
+        .filter(|term| !stop_word_roots().contains(term))
+        .filter(|term| seen.insert(term.clone()))
+        .collect()
+}
+
+/// The filler of [`STOP_WORDS`], folded through the same root as every other word.
+fn stop_word_roots() -> &'static BTreeSet<String> {
+    static ROOTS: OnceLock<BTreeSet<String>> = OnceLock::new();
+    ROOTS.get_or_init(|| STOP_WORDS.iter().map(|word| root_of(word)).collect())
+}
+
+/// The share of `terms` that a field carrying `field_terms` holds, in `0.0..=1.0`.
+fn coverage(terms: &[String], field_terms: &BTreeSet<String>) -> f32 {
+    if terms.is_empty() {
+        return 0.0;
+    }
+    let matched = terms
+        .iter()
+        .filter(|term| field_terms.contains(*term))
+        .count();
+    matched as f32 / terms.len() as f32
+}
+
+/// One field's comparable terms.
+fn field_terms(field: &str) -> BTreeSet<String> {
+    terms_of(field).into_iter().collect()
+}
+
+/// Fold text into comparable terms: the roots of its lowercase alphanumeric words.
+fn terms_of(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(|word| root_of(&word.to_lowercase()))
+        .collect()
+}
+
+/// One lowercase word's root — the form two inflections of the same word share,
+/// reached by trimming at most one of [`TRIMMED_ENDINGS`]. A word ending in `ss`
+/// ("access") keeps it: that is not a plural.
+fn root_of(word: &str) -> String {
+    if word.ends_with("ss") {
+        return word.to_string();
+    }
+    for (ending, shortest) in TRIMMED_ENDINGS {
+        if word.len() >= *shortest && word.ends_with(ending) {
+            return word[..word.len() - ending.len()].to_string();
+        }
+    }
+    word.to_string()
+}
+
+/// The digest of the phrase a page token belongs to.
+///
+/// A token names a position in ONE phrase's ranking, so it carries the phrase it was
+/// issued for. The digest is over the phrase's TERMS rather than its characters: two
+/// phrasings that search for the same thing ("Root user activity" and "the root user
+/// activity") rank the catalog identically, so a token from one continues the other.
+///
+/// It is the standard library's own hasher, not a cryptographic digest and not a
+/// secret: the token is compared for equality inside one emulator run, which is the
+/// whole lifetime of a page walk, so nothing outlives the process that minted it.
+fn phrase_fingerprint(terms: &[String]) -> String {
+    let mut hasher = DefaultHasher::new();
+    terms.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// The page token for resuming a ranking at `offset`.
+fn page_token(offset: usize, fingerprint: &str) -> String {
+    format!("{TOKEN_PREFIX}{offset}:{fingerprint}")
+}
+
+/// Where `token` resumes a ranking of `ranked_len` entries, or the modelled
+/// `InvalidParameterException` when it is not a token this operation handed out for
+/// THIS phrase's ranking.
+fn page_offset(
+    token: &str,
+    fingerprint: &str,
+    ranked_len: usize,
+) -> Result<usize, SearchSampleQueriesError> {
+    let malformed = || {
+        invalid_parameter(
+            "NextToken is not a page token this operation handed out. Pass back the \
+             NextToken from the previous SearchSampleQueries response unchanged.",
+        )
+    };
+    let (offset, token_fingerprint) = token
+        .strip_prefix(TOKEN_PREFIX)
+        .and_then(|body| body.split_once(':'))
+        .ok_or_else(malformed)?;
+    let offset: usize = offset.parse().map_err(|_| malformed())?;
+    if token_fingerprint != fingerprint {
+        return Err(invalid_parameter(
+            "NextToken was handed out for a different SearchPhrase. A page token \
+             continues the ranking of the phrase it was issued for, so pass the same \
+             SearchPhrase with it.",
+        ));
+    }
+    // We hand out a token only where a further entry waits behind it, so an offset of
+    // zero, or one at or past the end of the ranking, is not a token this operation
+    // issued.
+    if offset == 0 || offset >= ranked_len {
+        return Err(malformed());
+    }
+    Ok(offset)
+}
+
+/// Refuse the request with the modelled `InvalidParameterException` (HTTP 400), whose
+/// text names the member that was not valid and how to make it valid.
+fn invalid_parameter(message: &str) -> SearchSampleQueriesError {
+    SearchSampleQueriesErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

@@ -58,8 +58,9 @@ async fn delete(router: &MultiServiceRouter, uri: &str, headers: &[(&str, String
     send(router, "DELETE", uri, "application/json", Vec::new(), headers).await
 }
 
-/// A delete that must have succeeded: the modelled 204, with no body.
-fn assert_deleted(case: &str, operation: &str, answer: &Answer) {
+/// A delete that must have succeeded: the modelled 204, with no body. `pub(crate)`
+/// because every delete in this target answers the same way.
+pub(crate) fn assert_deleted(case: &str, operation: &str, answer: &Answer) {
     assert_eq!(
         answer.status,
         204,
@@ -75,8 +76,9 @@ fn assert_deleted(case: &str, operation: &str, answer: &Answer) {
 }
 
 /// A call that must miss: the modelled `ResourceNotFoundException`, HTTP 404, with the
-/// error type on the wire where an SDK classifies it from.
-fn assert_not_found(case: &str, operation: &str, answer: &Answer) {
+/// error type on the wire where an SDK classifies it from. `pub(crate)` because every
+/// delete in this target is refused the same way.
+pub(crate) fn assert_not_found(case: &str, operation: &str, answer: &Answer) {
     assert_eq!(
         answer.status,
         404,
