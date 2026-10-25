@@ -2967,6 +2967,40 @@ pub fn ip_set_id_rejection(ip_set_id: &str) -> String {
     }
 }
 
+/// The wire name of the `Name` member an IPSet create or update carries: both
+/// bind it in the JSON body under `jsonName` `name`
+/// (`smithy_query(operation="CreateIPSet")`). It is what a rejection names,
+/// AS THE REQUEST CARRIES IT.
+pub const IP_SET_NAME_MEMBER: &str = "name";
+
+/// Does `name` hold only the characters an IPSet `Name` may contain?
+///
+/// "Allowed characters are alphanumeric, whitespace, dash (-), and underscores
+/// (_)" (`smithy_query(query="doc",shape="CreateIPSetRequest",member="Name")`)
+/// — a documented constraint the model's `len 1..300` does not express, so it is
+/// enforced here. The whitespace a user-friendly name carries is the space: an
+/// ASCII control character (a tab, a newline) is not a character such a name
+/// displays.
+pub fn is_ip_set_name(name: &str) -> bool {
+    is_list_name(name, true)
+}
+
+/// Does `name` hold only characters from the alphabet an uploaded list's `Name`
+/// is documented to allow — ASCII alphanumerics, dash (-) and underscore (_),
+/// plus the space when `space_allowed`?
+///
+/// The list families document the same alphabet and differ only on whether the
+/// space is in it, so the alphabet lives in ONE place and each family's
+/// predicate ([`is_ip_set_name`], [`is_entity_set_name`]) says which of the two
+/// it is. An empty name is in neither, though the modelled `len 1..300` already
+/// refuses it before any handler runs.
+fn is_list_name(name: &str, space_allowed: bool) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || (space_allowed && b == b' ')
+        })
+}
+
 /// One stored IPSet (trusted IP list). Timestamps are epoch milliseconds, the
 /// single source for the instants anything reports.
 #[derive(Debug, Clone)]
@@ -3498,11 +3532,10 @@ pub fn threat_entity_set_limit_message() -> String {
 /// (`smithy_query(query="doc",shape="CreateTrustedEntitySetRequest",member="Name")`)
 /// — a documented constraint the model's `len 1..300` does not express, so it is
 /// enforced here.
+/// The alphabet is the shared one ([`is_list_name`]) WITHOUT the space, which
+/// the entity-set documentation does not list.
 pub fn is_entity_set_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    is_list_name(name, false)
 }
 
 /// Is `location` a valid Amazon S3 URL for an uploaded entity-set list?

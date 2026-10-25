@@ -44,7 +44,7 @@ const TARGET_GROUP_NOT_FOUND: &str = "TargetGroupNotFound";
 const VALIDATION_ERROR: &str = "ValidationError";
 
 /// The form fields of one awsQuery request.
-type Form = Vec<(String, String)>;
+pub(crate) type Form = Vec<(String, String)>;
 
 /// One row of the rule table: the case, the priority the rule is evaluated at, the
 /// request fields carrying its conditions and actions, and the values a read of it must
@@ -57,7 +57,7 @@ struct RuleRow {
 }
 
 /// Create a load balancer across two subnets and answer its ARN.
-async fn create_load_balancer(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn create_load_balancer(router: &MultiServiceRouter, name: &str) -> String {
     let mut form = action("CreateLoadBalancer");
     form.push(p("Name", name));
     form.push(p("Subnets.member.1", "subnet-11111111"));
@@ -74,7 +74,7 @@ async fn create_load_balancer(router: &MultiServiceRouter, name: &str) -> String
 }
 
 /// Create an HTTP listener forwarding to `tg_arn` and answer its ARN.
-async fn create_listener(
+pub(crate) async fn create_listener(
     router: &MultiServiceRouter,
     lb_arn: &str,
     tg_arn: &str,
@@ -98,7 +98,7 @@ async fn create_listener(
 }
 
 /// Send one `CreateRule` request: the listener, the priority and `fields`.
-async fn create_rule(
+pub(crate) async fn create_rule(
     router: &MultiServiceRouter,
     listener_arn: &str,
     priority: &str,
@@ -112,7 +112,7 @@ async fn create_rule(
 }
 
 /// Add one rule that must be accepted, and answer its ARN.
-async fn add_rule(
+pub(crate) async fn add_rule(
     router: &MultiServiceRouter,
     case: &str,
     listener_arn: &str,
@@ -146,7 +146,7 @@ async fn add_rule(
 }
 
 /// A forwarding action to `tg_arn`.
-fn forward_to(tg_arn: &str) -> Form {
+pub(crate) fn forward_to(tg_arn: &str) -> Form {
     vec![
         p("Actions.member.1.Type", "forward"),
         p("Actions.member.1.TargetGroupArn", tg_arn),
@@ -154,7 +154,7 @@ fn forward_to(tg_arn: &str) -> Form {
 }
 
 /// A fixed-response action answering `status`.
-fn fixed_response(status: &str) -> Form {
+pub(crate) fn fixed_response(status: &str) -> Form {
     vec![
         p("Actions.member.1.Type", "fixed-response"),
         p("Actions.member.1.FixedResponseConfig.StatusCode", status),
@@ -163,7 +163,7 @@ fn fixed_response(status: &str) -> Form {
 }
 
 /// One host-header condition matching `host`.
-fn host_header(host: &str) -> Form {
+pub(crate) fn host_header(host: &str) -> Form {
     vec![
         p("Conditions.member.1.Field", "host-header"),
         p("Conditions.member.1.Values.member.1", host),
@@ -172,7 +172,11 @@ fn host_header(host: &str) -> Form {
 
 /// Read a listener's rules and answer `(priority, is_default)` for each, in the order
 /// the read reported them.
-async fn rules_of(router: &MultiServiceRouter, case: &str, listener_arn: &str) -> Vec<(String, String)> {
+pub(crate) async fn rules_of(
+    router: &MultiServiceRouter,
+    case: &str,
+    listener_arn: &str,
+) -> Vec<(String, String)> {
     let mut form = action("DescribeRules");
     form.push(p("ListenerArn", listener_arn));
     let reply = call(router, &form).await;
@@ -185,7 +189,7 @@ async fn rules_of(router: &MultiServiceRouter, case: &str, listener_arn: &str) -
 }
 
 /// `(Priority, IsDefault)` of every rule in one reply, in the order it reported them.
-fn summaries(reply: &Reply) -> Vec<(String, String)> {
+pub(crate) fn summaries(reply: &Reply) -> Vec<(String, String)> {
     members(&reply.body, "Rules")
         .iter()
         .map(|rule| {

@@ -1105,6 +1105,11 @@ use crate::ops::types::{
 };
 use crate::scaffolded::Scaffolded;
 
+// The Recycle Bin an AMI waits in between its deregistration and its permanent deletion,
+// and every rule that moves one in or out of it, in a module of its own.
+mod image_recycle_bin;
+pub use image_recycle_bin::{RecycledImageRecord, recycled_image, require_recycled_image};
+
 // One shape a security group rule's aggregated view is made of, imported on its own line so
 // this file's one big `use crate::ops::types::{..}` list stays as it is.
 use crate::ops::types::Ipv6Range;
@@ -1150,6 +1155,15 @@ pub const DEFAULT_INSTANCE_TYPE: &str = "m1.small";
 /// From the `CreateTags` documentation: "Each resource can have a maximum of 50
 /// tags."
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The maximum number of tags one request may name for REMOVAL.
+///
+/// Documented on `DeleteTagsRequest$Tags` ("Constraints: Up to 1000 tags"); the model
+/// declares no `@length`, so the handler is the only place the bound can exist. It is a
+/// bound on the request and not on a resource, which is why it is not
+/// [`MAX_TAGS_PER_RESOURCE`]: a key named for removal need not be one any resource holds,
+/// so a request may name more keys than a resource can carry.
+pub const MAX_TAGS_PER_DELETE_REQUEST: usize = 1000;
 
 /// The maximum number of resource or instance ids one request may name.
 ///
@@ -2228,6 +2242,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// plus any image a writer stores later. Ordered by id, which is the order the
     /// describe reports and pages over.
     pub images: BTreeMap<String, Image>,
+    /// Every AMI of the account that is currently in the Recycle Bin, by `ImageId` — see
+    /// the module docs. An image is in EITHER this store or [`Self::images`], never both:
+    /// a recycled AMI is not one of the images the account can see until it is restored.
+    /// Ordered by id, which is the order `ListImagesInRecycleBin` reports and pages over.
+    pub images_in_recycle_bin: BTreeMap<String, RecycledImageRecord>,
     /// Every security group the account holds, by `GroupId`, as the modelled
     /// [`SecurityGroup`] shape itself — so a member a writer sets round-trips through
     /// `DescribeSecurityGroups` without a field-by-field copy. Ordered by id, which is the
@@ -2845,6 +2864,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             network_insights_access_scope_analyses: BTreeMap::new(),
             network_insights_access_scope_analysis_client_tokens: HashMap::new(),
             images: BTreeMap::new(),
+            images_in_recycle_bin: BTreeMap::new(),
             security_groups: BTreeMap::new(),
             network_interfaces: BTreeMap::new(),
             network_interface_client_tokens: HashMap::new(),
@@ -4907,6 +4927,9 @@ impl ComAmazonawsEc2Amazonec2State {
     /// association moving `associating` -> `associated`.
     pub fn materialize_due_transitions(&mut self) {
         let now = Instant::now();
+        // The one clock-owed REMOVAL: a recycled AMI whose retention period has run out was
+        // permanently deleted when that instant passed, whether or not anybody called.
+        self.purge_expired_recycled_images(SystemTime::now());
         // A volume whose Recycle Bin retention period has run out was permanently deleted
         // at its exit instant whether or not anybody called, so that deletion is applied
         // before anything reads the bin.
@@ -6038,6 +6061,195 @@ pub fn merge_tag_list(existing: &mut Vec<Tag>, updates: &[(String, String)]) {
                 value: Some(value.clone()),
             }),
         }
+    }
+}
+
+/// One stored resource's tags, in whichever form the record holding that resource keeps
+/// them.
+///
+/// The tag operations take "the IDs of the resources" (`CreateTagsRequest$Resources`,
+/// `DeleteTagsRequest$Resources`) of ANY kind, so they cannot know each store's record
+/// shape: they resolve an id to one of these handles through
+/// [`ComAmazonawsEc2Amazonec2State::resource_tags_mut`] and read and write the resource's
+/// tags through it. That is also what keeps `CreateTags` and `DeleteTags` agreeing about
+/// which ids are taggable, instead of one accepting an id the other refuses.
+#[derive(Debug)]
+pub enum ResourceTagsMut<'store> {
+    /// Tags kept as a key -> value map, the form [`InstanceRecord`] uses.
+    Map(&'store mut BTreeMap<String, String>),
+    /// Tags kept as the modelled optional `Tag` list, the form every modelled EC2 shape
+    /// that carries tags uses.
+    List(&'store mut Option<Vec<Tag>>),
+}
+
+impl ResourceTagsMut<'_> {
+    /// The resource's tags as key -> value pairs, ordered by key.
+    ///
+    /// A list entry carrying no key names no tag at all, so it is not reported; an entry
+    /// with no value reads as the empty value, which is the value `CreateTags` stores for
+    /// a tag given without one ("if you don't want the tag to have a value, specify the
+    /// parameter with no value, and we set the value to an empty string").
+    pub fn pairs(&self) -> BTreeMap<String, String> {
+        match self {
+            Self::Map(tags) => (**tags).clone(),
+            Self::List(tags) => tags
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|tag| Some((tag.key.clone()?, tag.value.clone().unwrap_or_default())))
+                .collect(),
+        }
+    }
+
+    /// The bytes the stored tags hold, counted as the stores charge them against
+    /// [`MAX_STORED_BYTES`].
+    pub fn bytes(&self) -> usize {
+        match self {
+            Self::Map(tags) => tag_bytes(tags),
+            Self::List(tags) => tag_list_bytes(tags.as_deref().unwrap_or_default()),
+        }
+    }
+
+    /// Write `updates` onto the resource, overwriting a key it already carries — the rule
+    /// `CreateTags` documents ("When you specify an existing tag key, the value is
+    /// overwritten with the new value").
+    pub fn set(&mut self, updates: &[(String, String)]) {
+        match self {
+            Self::Map(tags) => {
+                for (key, value) in updates {
+                    tags.insert(key.clone(), value.clone());
+                }
+            }
+            Self::List(tags) => {
+                let mut list = tags.take().unwrap_or_default();
+                merge_tag_list(&mut list, updates);
+                **tags = Some(list);
+            }
+        }
+    }
+
+    /// Remove every tag `selected` answers `true` for, given its key and its value, and
+    /// answer the bytes that freed.
+    ///
+    /// Removing a tag the resource does not carry removes nothing and frees nothing: which
+    /// tags a request names is the caller's business, and the resource ends up without
+    /// them either way.
+    pub fn remove(&mut self, selected: impl Fn(&str, &str) -> bool) -> usize {
+        let before = self.bytes();
+        match self {
+            Self::Map(tags) => tags.retain(|key, value| !selected(key, value)),
+            Self::List(tags) => {
+                if let Some(list) = tags.as_mut() {
+                    list.retain(|tag| {
+                        !selected(
+                            tag.key.as_deref().unwrap_or_default(),
+                            tag.value.as_deref().unwrap_or_default(),
+                        )
+                    });
+                }
+            }
+        }
+        before.saturating_sub(self.bytes())
+    }
+}
+
+/// The stores whose resources carry the modelled `Tag` list, for
+/// [`ComAmazonawsEc2Amazonec2State::resource_tags_mut`].
+///
+/// `field` names a store whose record IS the modelled shape; `field => member` one that
+/// keeps that shape on a member, beside the facts the shape carries no member for. A
+/// resource kind is taggable exactly when it is named here, so this list is the one place
+/// the tag operations' reach is written down.
+macro_rules! resource_tag_lists {
+    ($store:ident, $id:ident, $($field:ident $(=> $member:ident)?),+ $(,)?) => {
+        $(
+            if let Some(record) = $store.$field.get_mut($id) {
+                return Some(ResourceTagsMut::List(&mut record $(.$member)?.tags));
+            }
+        )+
+    };
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// The tags of the resource `resource_id` names, whatever kind of resource that is, or
+    /// `None` when this store holds no resource under that id.
+    ///
+    /// `CreateTags` and `DeleteTags` act on a resource id without being told its kind, so
+    /// this is where an id is resolved against every store that holds a taggable resource.
+    /// Both reach a resource's tags ONLY through here, so neither can accept an id the
+    /// other refuses, and a store added to the list below becomes taggable for both at
+    /// once.
+    pub fn resource_tags_mut(&mut self, resource_id: &str) -> Option<ResourceTagsMut<'_>> {
+        let store = self;
+        // The instance record keeps its tags as a map rather than as the modelled list,
+        // so it is resolved on its own.
+        if let Some(instance) = store.instances.get_mut(resource_id) {
+            return Some(ResourceTagsMut::Map(&mut instance.tags));
+        }
+        // A network interface's modelled tag member is `TagSet` (`NetworkInterface$TagSet`)
+        // rather than `Tags`, so it is resolved on its own too — the tags are the same
+        // modelled list either way.
+        if let Some(interface) = store.network_interfaces.get_mut(resource_id) {
+            return Some(ResourceTagsMut::List(&mut interface.tag_set));
+        }
+        resource_tag_lists!(
+            store,
+            resource_id,
+            addresses,
+            capacity_reservation_fleets => view,
+            capacity_reservations => view,
+            carrier_gateways,
+            client_vpn_endpoints,
+            coip_pools,
+            dedicated_hosts,
+            dhcp_options,
+            export_tasks => view,
+            fleets => fleet,
+            fpga_images => view,
+            images,
+            import_image_tasks => view,
+            import_snapshot_tasks,
+            ipam_policies => view,
+            ipam_pools,
+            ipam_resource_discoveries,
+            ipam_resource_discovery_associations,
+            ipam_scopes,
+            ipams,
+            launch_templates => template,
+            local_gateway_route_table_virtual_interface_group_associations,
+            local_gateway_route_table_vpc_associations => view,
+            local_gateway_route_tables => view,
+            nat_gateways,
+            network_insights_access_scope_analyses => view,
+            network_insights_access_scopes,
+            placement_groups,
+            replace_root_volume_tasks => view,
+            reserved_instances,
+            route_server_endpoints,
+            route_server_peers,
+            route_servers => view,
+            secondary_networks => view,
+            secondary_subnets,
+            security_groups,
+            spot_instance_requests => view,
+            subnet_cidr_reservations,
+            subnets,
+            traffic_mirror_filters,
+            transit_gateway_connect_peers => view,
+            transit_gateway_policy_tables => view,
+            transit_gateway_route_tables,
+            transit_gateways,
+            verified_access_endpoints => view,
+            verified_access_groups,
+            volumes => view,
+            vpc_block_public_access_exclusions => view,
+            vpc_endpoint_services,
+            vpc_endpoints,
+            vpcs,
+            vpn_connections => view,
+            vpn_gateways => view,
+        );
+        None
     }
 }
 
@@ -12270,8 +12482,12 @@ pub fn invalid_ami_id_not_found<E>(image_id: &str) -> Scaffolded<E> {
     )
 }
 
-/// Refuse a request that named something that is not an AMI id at all: HTTP 400
+/// Refuse an AMI id a request named that EC2 cannot resolve as one at all: HTTP 400
 /// `InvalidAMIID.Malformed`.
+///
+/// The message is built from the request's own id, in the `Invalid id: '<id>'` form every
+/// malformed-id refusal in this crate uses, so one code reads one way across every
+/// operation that answers it.
 pub fn invalid_ami_id_malformed<E>(image_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_AMI_ID_MALFORMED,
@@ -12434,7 +12650,10 @@ impl ComAmazonawsEc2Amazonec2State {
     /// [`Self::would_exceed_stored_bytes`] with [`image_payload_bytes`] beside it, because a
     /// count of records is no bound on the caller-chosen bytes each one holds.
     pub fn has_image_capacity(&self) -> bool {
-        self.images.len() < MAX_IMAGES
+        // A recycled AMI is still held — it is restorable until its retention period runs
+        // out — so it counts against the ceiling the same way a visible image does, and
+        // restoring one can never be refused for want of room.
+        self.images.len().saturating_add(self.images_in_recycle_bin.len()) < MAX_IMAGES
     }
 
     /// Store an AMI, and answer the `ImageId` it was given.

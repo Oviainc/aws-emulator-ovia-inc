@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes the tags `TagKeys` names from the CloudWatch resource `ResourceARN` names.
+//! Implemented here, and the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The keys are removed from the ONE tag set that resource holds in [`crate::state`], the
+//! same set `TagResource` writes and `ListTagsForResource` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +148,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // The named keys are removed from the resource the ARN names; nothing else about it
+        // changes, and `ctx` carries nothing this operation needs.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch resource store is unavailable".into()),
+            })
+        })?;
+
+        // `ResourceARN`'s 1..1024 length and every key's 1..128 length are modelled
+        // constraints the boundary validator has already refused, so reaching here leaves
+        // only the ARN's FORM open.
+        let resource = taggable_resource(&input.resource_arn)?;
+
+        let mut store = state.lock();
+        let held = store
+            .resource_tags_mut(&resource)
+            .ok_or_else(|| unknown_resource(&input.resource_arn, &resource))?;
+        // Removal is idempotent: a key the resource does not carry removes nothing, and the
+        // call still succeeds.
+        crate::state::remove_tags(held, &input.tag_keys);
+
+        Ok(UntagResourceOutput {})
     }
+}
+
+/// The resource `arn` names, refused as a bad parameter value when it is not the ARN of a
+/// resource this service tags. The rule lives in `crate::state`, so this operation,
+/// `TagResource` and `ListTagsForResource` resolve an ARN by one rule.
+fn taggable_resource(arn: &str) -> Result<crate::state::TaggableResource<'_>, UntagResourceError> {
+    crate::state::taggable_resource(arn).map_err(|message| {
+        UntagResourceErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+            message: Some(message),
+        })
+        .into()
+    })
+}
+
+/// Report an ARN this store holds no resource for through this operation's modelled
+/// `ResourceNotFoundException` (HTTP 404): "The named resource does not exist."
+fn unknown_resource(
+    arn: &str,
+    resource: &crate::state::TaggableResource<'_>,
+) -> UntagResourceError {
+    UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        resource_type: Some(resource.kind.resource_type().to_string()),
+        resource_id: Some(arn.to_string()),
+        message: Some(crate::state::unknown_resource_message(arn)),
+    })
+    .into()
 }

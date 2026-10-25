@@ -139,7 +139,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
@@ -154,13 +154,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // An instance configuration belongs to the region it was onboarded in, so it
+        // is resolved in the region this request was signed for.
+        let region = crate::state::request_region(ctx);
         let store = state.lock();
         // Instance-wide limits are configuration of the instance, so an instance with
         // no finished onboarding job holds none to report — the same 404 whether it
         // was never onboarded or its job is still IN_PROGRESS. `onboarded_instance` is
         // the predicate `GetConnectInstanceConfig` and `CreateCampaign` ask, so the
         // three cannot disagree about which instances this service holds a config for.
-        let Some(record) = store.onboarded_instance(&input.connect_instance_id, now) else {
+        let Some(record) = store.onboarded_instance(&region, &input.connect_instance_id, now)
+        else {
             return Err(
                 GetInstanceCommunicationLimitsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {

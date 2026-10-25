@@ -512,6 +512,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state_machine_arn: String::new(),
             state_machine_name: String::new(),
             role_arn: input.role_arn.clone().unwrap_or_default(),
+            // The test runs no execution, so there is none that has been redriven.
+            redrive_count: 0,
         };
 
         // The walk is CPU work a caller's definition sizes, so it runs on a blocking

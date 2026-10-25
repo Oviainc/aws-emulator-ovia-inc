@@ -23,6 +23,8 @@ mod connector_update;
 mod custom_plugin_and_connector_lifecycle;
 #[path = "all/custom_plugin_file_location.rs"]
 mod custom_plugin_file_location;
+#[path = "all/describe_connector_operation.rs"]
+mod describe_connector_operation;
 #[path = "all/duplicate_name_conflict_message.rs"]
 mod duplicate_name_conflict_message;
 #[path = "all/iso8601_timestamps.rs"]

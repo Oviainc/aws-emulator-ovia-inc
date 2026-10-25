@@ -127,9 +127,11 @@ impl From<CreateVolumeErrorModeled> for CreateVolumeError {
 /// the service can provision:
 ///
 /// * a volume is created IN an Availability Zone, so `AvailabilityZone` must name one
-///   of the zones the Region this request was signed for has
-///   ([`crate::state::availability_zones_in_region`]) — the modelled `len 0..64` admits
-///   the empty string and any other text, neither of which is a zone;
+///   of the zones the Region this request was signed for PUBLISHES — each Region's own
+///   zone letters, which [`crate::state::availability_zones_in_region`] reads from the
+///   per-Region catalog, not a count of letters assumed alike for every Region — while
+///   the modelled `len 0..64` admits the empty string and any other text, none of
+///   which is a zone;
 /// * a volume needs a capacity source: "You must specify either a snapshot ID or a
 ///   volume size" (Amazon EBS `CreateVolume$Size`);
 /// * `SizeInGB`, `Iops` and `Throughput` must be ones the named volume type accepts,

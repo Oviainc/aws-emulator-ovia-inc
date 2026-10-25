@@ -2,13 +2,15 @@
 
 //! @op CreateTags
 //!
-//! Implemented: writes the tags onto the stored records — the instances
-//! `RunInstances` minted and the VPCs the VPC slice holds — so a later describe
-//! reports them and the `tag:<key>` / `tag-key` filters match on them.
+//! Implemented: writes the tags onto the stored records — reached through the ONE
+//! accessor `DeleteTags` reads too
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::resource_tags_mut`]), so every
+//! resource kind this crate stores tags for can be tagged here and untagged there, and
+//! neither operation accepts an id the other refuses. A later describe of the resource
+//! reports what was written, and the `tag:<key>` / `tag-key` filters match on it.
 //!
-//! Those are the only resources this crate stores, so an id of any other kind is
-//! refused rather than silently accepted. Every id in the request is resolved
-//! BEFORE any tag is written.
+//! An id naming no resource this account holds is refused rather than silently accepted,
+//! and every id in the request is resolved BEFORE any tag is written.
 //!
 //! ## Shape of an operation
 //!
@@ -161,9 +163,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            deduplicate_ids, instance_id_is_well_formed, merge_tag_list, require_service_state,
-            tag_bytes, tag_list_bytes, validate_tag_size, MAX_RESOURCE_IDS, MAX_STORED_BYTES,
-            MAX_TAGS_PER_RESOURCE, RESERVED_TAG_PREFIX,
+            deduplicate_ids, instance_id_is_well_formed, require_service_state, tag_bytes,
+            validate_tag_size, MAX_RESOURCE_IDS, MAX_STORED_BYTES, MAX_TAGS_PER_RESOURCE,
+            RESERVED_TAG_PREFIX,
         };
 
         let _ = ctx;
@@ -242,55 +244,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every resource is resolved, and its resulting tag count and byte size
         // checked, BEFORE a single tag is written: a request naming one unknown id
-        // leaves none of the others tagged.
+        // leaves none of the others tagged. The tags are reached through the ONE
+        // accessor `DeleteTags` reads too, so the two operations resolve the same ids
+        // whatever kind of resource each names.
         let mut added_bytes: usize = 0;
         for resource_id in &resource_ids {
-            if let Some(instance) = store.instances.get(resource_id) {
-                let mut keys: ::std::collections::BTreeSet<&str> =
-                    instance.tags.keys().map(String::as_str).collect();
-                for (key, _) in &updates {
-                    keys.insert(key.as_str());
-                }
-                if keys.len() > MAX_TAGS_PER_RESOURCE {
-                    return Err(Scaffolded::tag_limit_exceeded(format!(
-                        "The resource '{resource_id}' would carry {} tags, \
-                         above the maximum of {MAX_TAGS_PER_RESOURCE}",
-                        keys.len()
-                    )));
-                }
-                // How many MORE bytes this resource would hold once the write lands.
-                let mut merged = instance.tags.clone();
-                for (key, value) in &updates {
-                    merged.insert(key.clone(), value.clone());
-                }
-                added_bytes = added_bytes.saturating_add(
-                    tag_bytes(&merged).saturating_sub(tag_bytes(&instance.tags)),
-                );
-                continue;
+            let Some(tags) = store.resource_tags_mut(resource_id) else {
+                return Err(if instance_id_is_well_formed(resource_id) {
+                    Scaffolded::invalid_instance_id_not_found(resource_id)
+                } else {
+                    // An id naming no resource this account holds names nothing to tag.
+                    Scaffolded::invalid_id(resource_id)
+                });
+            };
+            // What the resource would hold once the write lands, asked of a COPY of its
+            // tags so the check itself writes nothing. Both sides of the delta are counted
+            // over the same reading of the stored tags — the key -> value pairs — so a
+            // stored list carrying a keyless or repeated entry cannot make the charge
+            // saturate to zero.
+            let current = tags.pairs();
+            let before_bytes = tag_bytes(&current);
+            let mut merged = current;
+            for (key, value) in &updates {
+                merged.insert(key.clone(), value.clone());
             }
-            if let Some(vpc) = store.vpcs.get(resource_id) {
-                let existing = vpc.tags.clone().unwrap_or_default();
-                let mut merged = existing.clone();
-                merge_tag_list(&mut merged, &updates);
-                if merged.len() > MAX_TAGS_PER_RESOURCE {
-                    return Err(Scaffolded::tag_limit_exceeded(format!(
-                        "The resource '{resource_id}' would carry {} tags, \
-                         above the maximum of {MAX_TAGS_PER_RESOURCE}",
-                        merged.len()
-                    )));
-                }
-                added_bytes = added_bytes.saturating_add(
-                    tag_list_bytes(&merged).saturating_sub(tag_list_bytes(&existing)),
-                );
-                continue;
+            if merged.len() > MAX_TAGS_PER_RESOURCE {
+                return Err(Scaffolded::tag_limit_exceeded(format!(
+                    "The resource '{resource_id}' would carry {} tags, \
+                     above the maximum of {MAX_TAGS_PER_RESOURCE}",
+                    merged.len()
+                )));
             }
-            return Err(if instance_id_is_well_formed(resource_id) {
-                Scaffolded::invalid_instance_id_not_found(resource_id)
-            } else {
-                // Instances and VPCs are the only taggable resources this crate
-                // stores, so any other id names nothing it can tag.
-                Scaffolded::invalid_id(resource_id)
-            });
+            added_bytes =
+                added_bytes.saturating_add(tag_bytes(&merged).saturating_sub(before_bytes));
         }
         if store.would_exceed_stored_bytes(added_bytes) {
             return Err(Scaffolded::tag_limit_exceeded(format!(
@@ -309,18 +295,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         for resource_id in &resource_ids {
-            if let Some(instance) = store.instances.get_mut(resource_id) {
-                for (key, value) in &updates {
-                    // Documented: "When you specify an existing tag key, the value
-                    // is overwritten with the new value."
-                    instance.tags.insert(key.clone(), value.clone());
-                }
-                continue;
-            }
-            if let Some(vpc) = store.vpcs.get_mut(resource_id) {
-                let mut tags = vpc.tags.take().unwrap_or_default();
-                merge_tag_list(&mut tags, &updates);
-                vpc.tags = Some(tags);
+            if let Some(mut tags) = store.resource_tags_mut(resource_id) {
+                // Documented: "When you specify an existing tag key, the value is
+                // overwritten with the new value."
+                tags.set(&updates);
             }
         }
         store.add_stored_bytes(added_bytes);

@@ -25,6 +25,8 @@ mod admin_user_pool_lifecycle;
 mod clock_dependent_state;
 #[path = "all/delete_group.rs"]
 mod delete_group;
+#[path = "all/delete_user_attributes.rs"]
+mod delete_user_attributes;
 #[path = "all/delete_user_pool_domain.rs"]
 mod delete_user_pool_domain;
 #[path = "all/device_remembering.rs"]
