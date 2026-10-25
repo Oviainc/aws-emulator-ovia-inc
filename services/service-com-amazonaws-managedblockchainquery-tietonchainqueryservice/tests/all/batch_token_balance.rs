@@ -19,6 +19,7 @@
 use serde_json::{json, Value};
 
 use crate::chain_query_slice::{error_code, refusal_explanation, token_json, Emulator, NetworkFixture};
+use crate::native_token_denomination::{amount_units, holding_decimals};
 
 /// The largest batch the model admits: `GetTokenBalanceInputList` carries
 /// `@length(min: 1, max: 10)`, and `BatchGetTokenBalanceOutputList` /
@@ -408,8 +409,10 @@ async fn a_batch_reports_the_balance_and_update_instant_the_ledger_stored() {
     for network in emulator.fixture() {
         // One row per (holding, instant it changed at), asserted against the STORED
         // record rather than against the single-item read, so a regression shared by
-        // both reads cannot pass.
-        let mut rows: Vec<(String, Value, String, i64)> = Vec::new();
+        // both reads cannot pass. A stored amount is in the token's smallest unit and the
+        // wire quotes it in the token's own unit, so the row carries the decimal places
+        // that convert between them (`native_token_denomination.rs`).
+        let mut rows: Vec<(String, Value, i128, u32, i64)> = Vec::new();
         for (key, holding) in &network.holdings {
             for record in &holding.history {
                 rows.push((
@@ -419,7 +422,8 @@ async fn a_batch_reports_the_balance_and_update_instant_the_ledger_stored() {
                         &key.owner_address,
                         Some(record.time),
                     ),
-                    record.balance.to_string(),
+                    record.balance,
+                    holding_decimals(key),
                     record.time,
                 ));
             }
@@ -431,7 +435,7 @@ async fn a_batch_reports_the_balance_and_update_instant_the_ledger_stored() {
         );
 
         for chunk in rows.chunks(MAX_BATCH) {
-            let items: Vec<Value> = chunk.iter().map(|(_, item, _, _)| item.clone()).collect();
+            let items: Vec<Value> = chunk.iter().map(|(_, item, _, _, _)| item.clone()).collect();
             let case = format!("{}/stored-balances", network.network);
             let reply = emulator
                 .ok(
@@ -445,11 +449,13 @@ async fn a_batch_reports_the_balance_and_update_instant_the_ledger_stored() {
                 chunk.len(),
                 "case {case}: every stored holding resolves, got {reply:?}"
             );
-            for (index, (label, _, balance, time)) in chunk.iter().enumerate() {
+            for (index, (label, _, balance, decimals, time)) in chunk.iter().enumerate() {
                 let got = &balances[index];
                 assert_eq!(
-                    got["balance"].as_str(),
-                    Some(balance.as_str()),
+                    got["balance"]
+                        .as_str()
+                        .and_then(|text| amount_units(text, *decimals)),
+                    Some(*balance),
                     "case {case}: row {label} must report the stored balance {balance}, got {got:?}"
                 );
                 assert_eq!(
@@ -473,8 +479,8 @@ async fn a_batch_answers_a_repeated_item_once_per_request_item() {
             .history
             .last()
             .unwrap_or_else(|| panic!("case {}: the holding has no balance", network.network))
-            .balance
-            .to_string();
+            .balance;
+        let decimals = holding_decimals(key);
         let known = Row {
             label: format!("{}/{}", network.network, key.resource_id()),
             item: request_item(
@@ -522,8 +528,10 @@ async fn a_batch_answers_a_repeated_item_once_per_request_item() {
             );
             for balance in balances {
                 assert_eq!(
-                    balance["balance"].as_str(),
-                    Some(stored.as_str()),
+                    balance["balance"]
+                        .as_str()
+                        .and_then(|text| amount_units(text, decimals)),
+                    Some(stored),
                     "case {case}: every copy of {} reports {stored}, got {balance:?}",
                     known.label
                 );
