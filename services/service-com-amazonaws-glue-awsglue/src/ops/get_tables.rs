@@ -8,18 +8,18 @@
 //!
 //! `Expression` selects the tables whose WHOLE name matches a Hive-style pattern: `*`
 //! matches any run of characters (including none), `|` separates alternatives, and
-//! every other character — `.`, `[`, `(` included — is a literal. The Data Catalog is
-//! Hive-metastore compatible (the model folds both `DatabaseInput$Name` and
-//! `TableInput$Name` "for Hive compatibility"), and that is the pattern language the
-//! metastore's table listing takes, which is why `events*` selects `events` and
-//! `events_raw` — the behaviour clients and this service's own reproduction script
-//! expect. The model's prose calls the member "A regular expression pattern"; the
-//! difference shows only on a regex metacharacter, and the Hive reading is the one the
-//! catalog implements. Every string is a valid pattern, so a pattern is never refused
-//! as malformed; one carrying more wildcards than [`MAX_PATTERN_WILDCARDS`] is refused
-//! with `InvalidInputException`, so the work a caller-supplied pattern can buy stays
-//! bounded. `MaxResults` truncates the page and the returned `NextToken` is the last
-//! name on it, so the next call resumes at the first stored name strictly after it.
+//! every other character — `.`, `[`, `(` included — is a literal. That pattern language
+//! is [`crate::state::matches_name_pattern`], which every listing of these tables
+//! shares, and its own documentation states why the metastore reads a pattern that way
+//! — which is why `events*` selects `events` and `events_raw`, the behaviour clients and
+//! this service's own reproduction script expect. The model's prose calls the member "A
+//! regular expression pattern"; the difference shows only on a regex metacharacter, and
+//! the Hive reading is the one the catalog implements. Every string is a valid pattern,
+//! so a pattern is never refused as malformed; one carrying more wildcards than
+//! [`MAX_PATTERN_WILDCARDS`] is refused with `InvalidInputException`, so the work a
+//! caller-supplied pattern can buy stays bounded. `MaxResults` truncates the page and
+//! the returned `NextToken` is the last name on it, so the next call resumes at the
+//! first stored name strictly after it.
 //!
 //! Members this slice does not act on, and why: `AuditContext` is input-only Lake
 //! Formation audit metadata that does not change this operation's answer. Every other
@@ -131,49 +131,10 @@ use super::types::*;
 const MAX_PAGE_SIZE: i32 = 100;
 
 /// Ceiling on the number of `*` wildcards and `|` alternatives one `Expression` may
-/// carry. The pattern is request text and every stored name in the database is matched
-/// against it, so the work it can buy is bounded here rather than left to grow with the
-/// modelled 2048-character length: matching is O(name length x wildcards) per name, so
-/// this ceiling and the per-database table ceiling together bound one request. A
-/// pattern past it is refused with `InvalidInputException`.
-pub const MAX_PATTERN_WILDCARDS: usize = 64;
-
-/// Whether `name` matches the Hive-style `pattern` in full: `|` separates alternatives
-/// and `*` matches any run of characters within one, every other character being a
-/// literal.
-fn matches_expression(pattern: &str, name: &str) -> bool {
-    pattern
-        .split('|')
-        .any(|alternative| matches_wildcard(alternative, name))
-}
-
-/// Whether `name` matches one alternative in full. The pattern's literal segments
-/// (what sits between its `*`s) must appear in order: the first as a prefix, the last
-/// as a suffix, and each middle one at its leftmost occurrence after the previous —
-/// which is the standard wildcard match, and needs no backtracking.
-fn matches_wildcard(pattern: &str, name: &str) -> bool {
-    let mut segments = pattern.split('*');
-    // `split` always yields at least one segment, so this cannot be `None`.
-    let first = segments.next().unwrap_or_default();
-    if !name.starts_with(first) {
-        return false;
-    }
-    // Safe to slice: `starts_with` means `first.len()` is a character boundary.
-    let mut rest = &name[first.len()..];
-    let after_first: Vec<&str> = segments.collect();
-    let Some((last, middle)) = after_first.split_last() else {
-        // No `*` at all: the pattern is a literal, so it must be the whole name.
-        return rest.is_empty();
-    };
-    for segment in middle {
-        match rest.find(segment) {
-            // `find` answers a character boundary, so this slice is safe too.
-            Some(at) => rest = &rest[at + segment.len()..],
-            None => return false,
-        }
-    }
-    rest.ends_with(last)
-}
+/// carry, re-exported from where it lives beside the matcher it bounds
+/// ([`crate::state::MAX_PATTERN_WILDCARDS`]) so every listing of these tables is bounded
+/// by ONE number. A pattern past it is refused here with `InvalidInputException`.
+pub use crate::state::MAX_PATTERN_WILDCARDS;
 
 /// Which members of each `Table` the request asked for.
 ///
@@ -383,10 +344,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored name.
         let filter = input.expression.as_deref();
         if let Some(pattern) = filter {
-            let wildcards = pattern
-                .chars()
-                .filter(|character| *character == '*' || *character == '|')
-                .count();
+            let wildcards = crate::state::pattern_wildcards(pattern);
             if wildcards > MAX_PATTERN_WILDCARDS {
                 return Err(GetTablesErrorModeled::InvalidInputException(
                     InvalidInputException {
@@ -427,7 +385,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into_iter()
             .filter(|table| !federated_only || table.federated_table.is_some())
             .filter(|table| {
-                filter.is_none_or(|pattern| matches_expression(pattern, &table.name))
+                filter.is_none_or(|pattern| {
+                    crate::state::matches_name_pattern(pattern, &table.name)
+                })
             })
             .collect();
 
