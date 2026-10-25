@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCustomKeyStores
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCustomKeyStores`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCustomKeyStores::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +180,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCustomKeyStores` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCustomKeyStoresErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCustomKeyStores"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeCustomKeyStoresErrorModeled::KMSInternalException(
+                KMSInternalException {
+                    message: Some("the KMS state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "To get only information about a particular custom key store, use either
+        // the CustomKeyStoreName or CustomKeyStoreId parameter (but not both)"
+        // (`smithy_query(query="operation",operation="DescribeCustomKeyStores")`): a
+        // request that gives both asks for two selections at once and is refused as
+        // an invalid request, whichever key stores the two name. The refusal carries
+        // the error code alone — the recorded corpus has the service sending no
+        // message with it — so none is invented.
+        if input.custom_key_store_id.is_some() && input.custom_key_store_name.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(String::new()));
+        }
+
+        let region = crate::state::request_region(ctx);
+        // A REPORTING operation: it reads the custom key stores of this account and
+        // Region and writes nothing, so two reads of an untouched store answer the
+        // same.
+        let state = state.lock();
+
+        // "By default, this operation returns information about all custom key stores
+        // in the account and Region", in creation order, so a page boundary is stable
+        // across calls. The selector the request gives NARROWS that list to the key
+        // store it names, and a selector that names none is a missing resource, never
+        // an empty list.
+        let selected = input.custom_key_store_id.is_some() || input.custom_key_store_name.is_some();
+        let listed: Vec<&crate::state::CustomKeyStore> = state
+            .custom_key_stores_in(&region)
+            .into_iter()
+            .filter(|store| {
+                input
+                    .custom_key_store_id
+                    .as_deref()
+                    .is_none_or(|id| store.custom_key_store_id == id)
+                    && input
+                        .custom_key_store_name
+                        .as_deref()
+                        .is_none_or(|name| store.custom_key_store_name == name)
+            })
+            .collect();
+        if selected && listed.is_empty() {
+            return Err(not_found());
+        }
+
+        // "Use this parameter in a subsequent request after you receive a response
+        // with truncated results. Set it to the value of NextMarker from the truncated
+        // response you just received", so a marker resumes after the last key store the
+        // previous page returned. Anything else "is not valid"
+        // (`InvalidMarkerException`) — including a token whose key store the account no
+        // longer holds, which resumes nowhere rather than at whichever key store now
+        // sits in that position. Like this operation's other refusals, it carries the
+        // error code alone.
+        let start = match input.marker.as_deref() {
+            None => 0,
+            Some(marker) => {
+                let resume_after = crate::state::decode_custom_key_store_marker(marker).and_then(
+                    |custom_key_store_id| {
+                        listed
+                            .iter()
+                            .position(|store| store.custom_key_store_id == custom_key_store_id)
+                    },
+                );
+                match resume_after {
+                    Some(position) => position + 1,
+                    None => {
+                        return Err(DescribeCustomKeyStoresErrorModeled::InvalidMarkerException(
+                            InvalidMarkerException { message: None },
+                        )
+                        .into());
+                    }
+                }
+            }
+        };
+
+        // "When this value is present, KMS does not return more than the specified
+        // number of items, but it might return fewer"
+        // (`smithy_query(query="doc",shape="DescribeCustomKeyStoresRequest",member="Limit")`).
+        // No default page size is documented for this listing, so a request that names
+        // none is paged at the largest page `LimitType`'s modelled `@range(1..1000)`
+        // admits — one answer is never unbounded, and what does not fit is reported as
+        // truncated. A `Limit` that reached here is already within that range.
+        let limit = input
+            .limit
+            .and_then(|limit| usize::try_from(limit).ok())
+            .unwrap_or(MAX_PAGE);
+        let page: Vec<CustomKeyStoresListEntry> = listed
+            .iter()
+            .skip(start)
+            .take(limit)
+            .map(|store| store.list_entry())
+            .collect();
+
+        // "A flag that indicates whether there are more items in the list": the page
+        // ended before the selection did. `NextMarker` is "the value to use for the
+        // Marker parameter in a subsequent request", so it names the last key store of
+        // this page and is present only while the list is truncated.
+        let truncated = start + page.len() < listed.len();
+        let next_marker = page
+            .last()
+            .filter(|_| truncated)
+            .and_then(|entry| entry.custom_key_store_id.as_deref())
+            .map(crate::state::encode_custom_key_store_marker);
+
+        Ok(DescribeCustomKeyStoresOutput {
+            custom_key_stores: Some(page),
+            next_marker,
+            truncated,
+        })
     }
 }
+
+/// How a selection naming no custom key store of this account and Region is
+/// refused: "KMS cannot find a custom key store with the specified key store name or
+/// ID" (`CustomKeyStoreNotFoundException`).
+///
+/// The refusal carries NO message member: the recorded corpus has the service
+/// answering this operation's missing-key-store refusal with the error code alone, so
+/// no message is invented for it.
+fn not_found() -> DescribeCustomKeyStoresError {
+    DescribeCustomKeyStoresErrorModeled::CustomKeyStoreNotFoundException(
+        CustomKeyStoreNotFoundException { message: None },
+    )
+    .into()
+}
+
+/// The largest page this listing answers with, which is also the largest `Limit` a
+/// request may ask for: `LimitType`'s modelled `@range(1..1000)`
+/// (`smithy_query(query="operation",operation="DescribeCustomKeyStores")`). It is
+/// what paces a request that names no `Limit`, so no single answer is unbounded
+/// however many key stores the account holds.
+const MAX_PAGE: usize = 1000;

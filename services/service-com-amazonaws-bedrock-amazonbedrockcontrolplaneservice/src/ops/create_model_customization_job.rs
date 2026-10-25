@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateModelCustomizationJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateModelCustomizationJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateModelCustomizationJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts the asynchronous customization of a base model: the job is minted `InProgress`
+//! and the clock owes it its terminal status, which is what brings the custom model named
+//! by `customModelName` into being. The record this operation writes is the one
+//! `ops/get_model_customization_job.rs` reads and `ops/stop_model_customization_job.rs`
+//! winds down, so the job this call mints is the job every later request sees.
 //!
 //! ## Shape of an operation
 //!
@@ -203,18 +200,272 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateModelCustomizationJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateModelCustomizationJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateModelCustomizationJob"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateModelCustomizationJobErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "model customization job state is not available on this engine"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // `TooManyTagsException` documents the bound itself ("50 tags per resource"), and
+        // this request carries tags for TWO resources — the job and the model it customizes
+        // — so each list is held to it separately. The modelled `@length(0..200)` on
+        // `TagList` is enforced ahead of this handler, so this is the per-resource bound
+        // inside that span.
+        for (member, tags) in [
+            ("jobTags", input.job_tags.as_ref()),
+            ("customModelTags", input.custom_model_tags.as_ref()),
+        ] {
+            let count = tags.map_or(0, Vec::len);
+            if count > crate::state::MAX_TAGS_PER_RESOURCE {
+                return Err(
+                    CreateModelCustomizationJobErrorModeled::TooManyTagsException(
+                        TooManyTagsException {
+                            message: Some(format!(
+                                "a resource may carry at most {} tags, and {member} carries \
+                                 {count}",
+                                crate::state::MAX_TAGS_PER_RESOURCE
+                            )),
+                            resource_name: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The customization the job runs: the value the request named, or the fine-tuning
+        // job this operation is documented to create when it named none.
+        let Some(customization_type) =
+            crate::state::customization_type_of(input.customization_type.as_deref())
+        else {
+            return Err(
+                CreateModelCustomizationJobErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "customizationType {} is not a customization Amazon Bedrock runs",
+                            input.customization_type.unwrap_or_default()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+
+        // `@idempotencyToken`: a replay answers with what the first request minted.
+        let replayed = input
+            .client_request_token
+            .as_ref()
+            .and_then(|token| {
+                store
+                    .model_customization_job_create_tokens
+                    .get(&(region.clone(), token.clone()))
+            })
+            .cloned();
+        if let Some(minted) = replayed {
+            if let Some(job) = store.model_customization_jobs.get(&minted) {
+                return Ok(CreateModelCustomizationJobOutput {
+                    job_arn: job.arn.clone(),
+                });
+            }
+        }
+
+        // `baseModelIdentifier` admits a foundation model — by its bare id or by its ARN —
+        // and a `custom-model` ARN of this account, which is a model that was itself
+        // customized (`smithy_query(query="operation",
+        // operation="CreateModelCustomizationJob")`: its pattern carries both). What a read
+        // of the job reports is a `FoundationModelArn`, so a custom model resolves to the
+        // foundation model it descends from, and the published catalog is what decides
+        // whether either names a model at all.
+        let from_catalog = store
+            .foundation_models
+            .qualified_model(crate::state::base_model_id_of(&input.base_model_identifier))
+            .copied();
+        let base_model = match from_catalog {
+            Some(model) => model,
+            None => {
+                let descended_from = store
+                    .custom_model(&input.base_model_identifier, &region, now)
+                    .and_then(|model| model.foundation_model_arn.clone());
+                let resolved = descended_from.as_deref().and_then(|arn| {
+                    store
+                        .foundation_models
+                        .qualified_model(crate::state::base_model_id_of(arn))
+                        .copied()
+                });
+                let Some(model) = resolved else {
+                    // Neither a published foundation model nor a custom model of this
+                    // account, so the identifier names no base model there is anything to
+                    // customize — reported absent, exactly as
+                    // `ops/create_provisioned_model_throughput.rs` reports a `modelId` the
+                    // catalog does not carry.
+                    return Err(
+                        CreateModelCustomizationJobErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: Some(format!(
+                                    "baseModelIdentifier {} does not name a base model in this \
+                                     account in {region}",
+                                    input.base_model_identifier
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                model
+            }
+        };
+
+        // A base model is published as supporting the customizations it supports and no
+        // others, so a job asking for one that model is not offered under is refused.
+        if !crate::state::supports_customization(&base_model, customization_type) {
+            return Err(
+                CreateModelCustomizationJobErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "model {} does not support the {customization_type} customization",
+                            base_model.model_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Both names address a resource on their own — a `ModelCustomizationJobIdentifier`
+        // may be a bare `jobName`, and a custom model's own `ModelIdentifier` a bare model
+        // name — so each names at most one resource in this account and region, and a
+        // create that reuses either conflicts with what holds it. A job name is held by
+        // every job this account has created, terminal ones included: the name still
+        // addresses that job, which a read of it answers to.
+        let name_key = (region.clone(), input.job_name.clone());
+        if store.model_customization_job_names.contains_key(&name_key) {
+            return Err(
+                CreateModelCustomizationJobErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "a model customization job named {} already exists in this account in \
+                         {region}",
+                        input.job_name
+                    )),
+                })
+                .into(),
+            );
+        }
+        if store
+            .custom_model_arn_of(&input.custom_model_name, &region)
+            .is_some()
+            || store.customizes_model_named(&region, &input.custom_model_name)
+        {
+            return Err(
+                CreateModelCustomizationJobErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "customModelName {} is already used by a custom model in this account \
+                         in {region}",
+                        input.custom_model_name
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // The account's customization job quota. Enforcing it here is also what bounds this
+        // part of the store: without a server-side cap a caller could grow it with nothing
+        // but fresh job names.
+        if store.model_customization_jobs.len()
+            >= crate::state::MAX_MODEL_CUSTOMIZATION_JOBS_PER_ACCOUNT
+        {
+            return Err(
+                CreateModelCustomizationJobErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this account already holds the maximum of {} model customization \
+                             jobs; request a quota increase",
+                            crate::state::MAX_MODEL_CUSTOMIZATION_JOBS_PER_ACCOUNT
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let job_id = store.mint_model_customization_job_id(now);
+        let arn = crate::state::model_customization_job_arn(&region, base_model.model_id, &job_id);
+        let model_id = store.mint_custom_model_id(now);
+        let job = crate::state::ModelCustomizationJobRecord {
+            arn: arn.clone(),
+            name: input.job_name,
+            region: region.clone(),
+            client_request_token: input.client_request_token.clone(),
+            role_arn: input.role_arn,
+            output_model_name: input.custom_model_name,
+            // The model the job is customizing is its target, so that model's ARN is fixed
+            // from this call onwards; it carries the base model segment the ARN of a
+            // customized model is spelled with.
+            output_model_arn: crate::state::custom_model_arn(
+                &region,
+                base_model.model_id,
+                &model_id,
+            ),
+            base_model_arn: crate::state::foundation_model_arn(&region, base_model.model_id),
+            customization_type,
+            // `customModelKmsKeyId` admits a key ARN, a bare key id or an alias, while the
+            // `outputModelKmsKeyArn` a read reports admits only a key ARN; the shared
+            // conversion is what decides which of those can be reported back.
+            output_model_kms_key_arn: crate::state::kms_key_arn(
+                input.custom_model_kms_key_id.as_deref(),
+                &region,
+            ),
+            hyper_parameters: input.hyper_parameters,
+            training_data_config: input.training_data_config,
+            // The read reports this member as required and its `validators` list admits
+            // zero entries, so a create that named no validation data is the job with no
+            // validators.
+            validation_data_config: input.validation_data_config.unwrap_or_default(),
+            output_data_config: input.output_data_config,
+            vpc_config: input.vpc_config,
+            customization_config: input.customization_config,
+            job_tags: input.job_tags.unwrap_or_default(),
+            custom_model_tags: input.custom_model_tags.unwrap_or_default(),
+            // The customization runs after this call returns, so the job is reported running
+            // now and is owed its completion once the span has passed.
+            status: crate::state::MODEL_CUSTOMIZATION_JOB_STATUS_IN_PROGRESS,
+            completed_due_at: Some(now + crate::state::MODEL_CUSTOMIZATION_JOB_COMPLETE_AFTER),
+            stopped_due_at: None,
+            created_at: now,
+            last_modified_at: now,
+            ended_at: None,
+        };
+
+        store
+            .model_customization_job_names
+            .insert(name_key, arn.clone());
+        if let Some(token) = input.client_request_token {
+            store
+                .model_customization_job_create_tokens
+                .insert((region, token), arn.clone());
+        }
+        store.model_customization_jobs.insert(arn.clone(), job);
+
+        // Read the response back out of the STORED record, so what the caller is told is
+        // exactly what a later GetModelCustomizationJob will find.
+        let stored = store
+            .model_customization_jobs
+            .get(&arn)
+            .expect("the model customization job just inserted under this ARN");
+        Ok(CreateModelCustomizationJobOutput {
+            job_arn: stored.arn.clone(),
+        })
     }
 }
+

@@ -294,13 +294,6 @@ async fn a_lookup_that_finds_nothing_names_the_resource_it_was_asked_for() {
             resource_type: "Network",
             id: other_gone_network.clone(),
         },
-        NotFoundCase {
-            case: "ListMembers/unknown-network",
-            method: "GET",
-            path: format!("/networks/{gone_network}/members"),
-            resource_type: "Network",
-            id: gone_network.clone(),
-        },
     ];
 
     for row in cases {

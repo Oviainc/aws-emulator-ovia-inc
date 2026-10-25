@@ -189,25 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // invalid-token text, which does not say which of the two it was. Judged ahead of
         // the store lookup, as `ListReportVersions` judges its own: a malformed request
         // parameter is refused whatever the state holds.
-        let resume_at = match input.next_token.as_deref() {
-            None => 0usize,
-            Some(token) => {
-                match crate::state::parse_inquiry_queries_token(
-                    token,
-                    &input.compliance_inquiry_id,
-                ) {
-                    Some(position) => position,
-                    None => {
-                        return Err(
-                            ListComplianceInquiryQueriesErrorModeled::ValidationException(
-                                crate::state::invalid_token(),
-                            )
-                            .into(),
-                        )
-                    }
-                }
-            }
-        };
+        let resume_at = crate::state::resume_position(input.next_token.as_deref(), |token| {
+            crate::state::parse_inquiry_queries_token(token, &input.compliance_inquiry_id)
+        })
+        .map_err(ListComplianceInquiryQueriesErrorModeled::ValidationException)?;
 
         let page_size = crate::state::page_size(input.max_results);
         let now = ::std::time::SystemTime::now();
@@ -228,26 +213,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reader of the inquiry sees.
         inquiry.materialise(now);
 
-        let mut queries = Vec::with_capacity(page_size.min(inquiry.queries.len()));
-        let mut next_token = None;
-        let mut position = 0usize;
-        for query in &inquiry.queries {
-            // Resume at the cursor's position in this operation's own order, so a page is
-            // still served when the query it was cut after is no longer the next one.
-            if position < resume_at {
-                position += 1;
-                continue;
-            }
-            if queries.len() >= page_size {
-                next_token = Some(crate::state::inquiry_queries_token(
-                    &input.compliance_inquiry_id,
-                    position,
-                ));
-                break;
-            }
-            queries.push(query.to_summary());
-            position += 1;
-        }
+        // The service's one page-walk rule: resume at the cursor's position in this
+        // operation's own order — so a page is still served when the query it was cut
+        // after is no longer the next one — and cut the page at `maxResults`.
+        let (queries, next_token) = crate::state::walk_page(
+            &inquiry.queries,
+            resume_at,
+            page_size,
+            |position| {
+                crate::state::inquiry_queries_token(&input.compliance_inquiry_id, position)
+            },
+            |query| query.to_summary(),
+        );
 
         Ok(ListComplianceInquiryQueriesOutput {
             queries: Some(queries),

@@ -204,6 +204,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = std::time::SystemTime::now();
 
         let mut store = state.lock();
+
+        // A question belongs to the LENS under review — the questions that lens's own
+        // content defines (`crate::state::...::lens_review_question`) — so a `QuestionId`
+        // that lens does not ask names no answer of this lens review to write, and every
+        // question it DOES ask is answerable here. This is the lookup every READ of these
+        // answers resolves through, so the questions a client just listed are exactly the
+        // ones it can write. Resolved first because it reads the lens content the SAME
+        // store holds, which the template cannot be borrowed for writing across; the
+        // refusal it produces is still raised below, after the resource the question
+        // belongs to has been resolved.
+        let question = store.lens_review_question(&input.lens_alias, &input.question_id);
+
         // The resource is resolved BEFORE the request's values are judged, so a request
         // that names a template, a lens review or a question that does not exist is
         // answered with that 404 whatever else it carries.
@@ -230,20 +242,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // A question belongs to the LENS under review: the answer this operation writes is
-        // the answer to one of the questions that lens asks, so a `QuestionId` it does not
-        // ask names no answer of this lens review.
-        let question = crate::state::lens_question(&input.lens_alias, &input.question_id)
-            .map(crate::state::FrameworkQuestion::to_review_question)
-            .ok_or_else(|| {
-                UpdateReviewTemplateAnswerErrorModeled::ResourceNotFoundException(
-                    crate::state::review_template_answer_not_found(
-                        &template.template_arn,
-                        &input.lens_alias,
-                        &input.question_id,
-                    ),
-                )
-            })?;
+        let question = question.ok_or_else(|| {
+            UpdateReviewTemplateAnswerErrorModeled::ResourceNotFoundException(
+                crate::state::review_template_answer_not_found(
+                    &template.template_arn,
+                    &input.lens_alias,
+                    &input.question_id,
+                ),
+            )
+        })?;
 
         // `AnswerReason` and `ChoiceStatus` / `ChoiceReason` are modelled enums, whose
         // value sets the boundary does not enforce, so a value outside one is refused here

@@ -297,8 +297,14 @@ impl ParsedArn {
     /// documentation), so the type is the resource field's leading segment where
     /// it has one — and, only where it has none, the single resource type
     /// [`implicit_resource_type`] names for that service.
+    ///
+    /// A PATH-STYLE resource field, which opens with the path separator rather
+    /// than with the type (`/apikeys/<id>`, `/restapis/<id>/stages/<name>`, as
+    /// API Gateway's ARNs are written), has its leading segment after that one
+    /// separator, so the two spellings of one resource field name one type.
     pub fn resource_type(&self) -> String {
-        match self.resource.split_once(['/', ':']) {
+        let path = self.resource.strip_prefix('/').unwrap_or(&self.resource);
+        match path.split_once(['/', ':']) {
             Some((kind, _)) if !kind.is_empty() => format!("{}:{kind}", self.service),
             _ => match implicit_resource_type(&self.service) {
                 Some(kind) => format!("{}:{kind}", self.service),

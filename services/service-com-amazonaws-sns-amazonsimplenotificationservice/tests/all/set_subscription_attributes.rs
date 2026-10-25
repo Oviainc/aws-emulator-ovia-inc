@@ -107,10 +107,10 @@ async fn setting_a_documented_subscription_attribute_persists_and_round_trips() 
             FILTER_POLICY,
         ),
         (
-            "a filter policy on a nested body property",
+            "a filter policy matching two message attributes",
             "sqs",
             "FilterPolicy",
-            r#"{"detail":{"state":["ok","degraded"]}}"#,
+            r#"{"kind":["alert"],"severity":["high","critical"]}"#,
         ),
         (
             "a filter policy on an email subscription awaiting confirmation",

@@ -34,7 +34,10 @@ use crate::hosted_zone_records::{call, router, Reply};
 
 /// Send one `CreateHealthCheck` request, with `config` as the body of its
 /// `HealthCheckConfig`.
-async fn create_health_check(
+///
+/// `pub(crate)` so a sibling suite builds its health checks through the SAME
+/// request rather than growing a second copy of it.
+pub(crate) async fn create_health_check(
     router: &MultiServiceRouter,
     caller_reference: &str,
     config: &str,
@@ -54,12 +57,17 @@ async fn create_health_check(
 }
 
 /// Read one health check back.
-async fn get_health_check(router: &MultiServiceRouter, id: &str) -> Reply {
+///
+/// `pub(crate)` so a sibling suite proves its reads through the SAME reader.
+pub(crate) async fn get_health_check(router: &MultiServiceRouter, id: &str) -> Reply {
     call(router, "GET", &format!("/2013-04-01/healthcheck/{id}"), "").await
 }
 
 /// The number of health checks `GetHealthCheckCount` reports.
-async fn health_check_count(router: &MultiServiceRouter, case: &str) -> i64 {
+///
+/// `pub(crate)` so a sibling suite counts the same population through the SAME
+/// operation.
+pub(crate) async fn health_check_count(router: &MultiServiceRouter, case: &str) -> i64 {
     let reply = call(router, "GET", "/2013-04-01/healthcheckcount", "").await;
     assert_eq!(
         reply.status, 200,
@@ -107,7 +115,9 @@ async fn health_check_usage(router: &MultiServiceRouter, case: &str) -> i64 {
 }
 
 /// The `Id` of a reply carrying a `HealthCheck`.
-fn health_check_id(reply: &Reply, case: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite reads an id out of a reply the same way.
+pub(crate) fn health_check_id(reply: &Reply, case: &str) -> String {
     assert!(
         reply.status == 201 || reply.status == 200,
         "case {case:?}: expected a successful health-check reply, got {} with body {}",
@@ -127,25 +137,28 @@ fn health_check_id(reply: &Reply, case: &str) -> String {
 
 /// One row of the health-check type catalog: a value of `HealthCheckType` and a
 /// configuration of that type the service accepts.
-struct TypeRow {
+///
+/// `pub(crate)` so a sibling suite populates the account from the SAME catalog
+/// rather than growing a second one that could drift from the model.
+pub(crate) struct TypeRow {
     /// The `Type` member, which every other member is conditional on.
-    kind: &'static str,
+    pub(crate) kind: &'static str,
     /// The rest of the `HealthCheckConfig`, as raw XML. `{child}` is replaced
     /// with the id of a health check created first, for a type whose
     /// configuration names child health checks.
-    members: &'static str,
+    pub(crate) members: &'static str,
     /// Whether the service fills in `RequestInterval` and `FailureThreshold`
     /// for a request of this type that leaves them out: it does so for the
     /// types that probe an endpoint, and `RequestInterval` / `FailureThreshold`
     /// are documented as unsupported for `RECOVERY_CONTROL`, while the alarm
     /// reader and the combination of child checks probe no endpoint at all.
-    endpoint_probe: bool,
+    pub(crate) endpoint_probe: bool,
 }
 
 /// The whole `HealthCheckType` catalog. Checked against the model's own value
 /// list below, so a type this table forgets fails the test rather than going
 /// unasserted.
-const CATALOG: &[TypeRow] = &[
+pub(crate) const CATALOG: &[TypeRow] = &[
     TypeRow {
         kind: "HTTP",
         members: "<IPAddress>192.0.2.44</IPAddress><Port>80</Port>\
@@ -202,7 +215,7 @@ const CATALOG: &[TypeRow] = &[
 impl TypeRow {
     /// This row's `HealthCheckConfig` body, with `child` standing in for any
     /// child health check it names.
-    fn config(&self, child: &str) -> String {
+    pub(crate) fn config(&self, child: &str) -> String {
         format!(
             "<Type>{}</Type>{}",
             self.kind,
@@ -213,7 +226,9 @@ impl TypeRow {
 
 /// Create the health check a row that names child health checks needs, and
 /// return its id. A row that names none gets an empty id, which it does not use.
-async fn child_for(router: &MultiServiceRouter, row: &TypeRow) -> String {
+///
+/// `pub(crate)` so a sibling suite builds the same catalog rows.
+pub(crate) async fn child_for(router: &MultiServiceRouter, row: &TypeRow) -> String {
     if !row.members.contains("{child}") {
         return String::new();
     }

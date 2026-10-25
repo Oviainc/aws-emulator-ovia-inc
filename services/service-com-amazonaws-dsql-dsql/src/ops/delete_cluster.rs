@@ -8,8 +8,10 @@
 //! deletion protection enabled is refused with `ValidationException` (400) — the
 //! condition is permanent until the caller changes the cluster, not a transient
 //! conflict; an unknown identifier with `ResourceNotFoundException` (404).
-//! `@idempotent`: a retry carrying the same `client-token` answers from the retired
-//! cluster rather than 404.
+//! `@idempotent`: a retry carrying the same `client-token` answers the result the
+//! first call gave — from the `clientToken` ledger, so it still answers once the
+//! clock has removed the cluster — and that token used for a DIFFERENT delete is
+//! refused with `ConflictException` (409).
 //!
 //! ## Shape of an operation
 //!
@@ -182,19 +184,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle(now);
 
-        let Some(cluster) = state.clusters.get_mut(&input.identifier) else {
-            // `@idempotent`: a retry of the same delete, carrying the same
-            // `client-token`, answers from the retired cluster instead of 404.
-            if let Some(retired) = state
-                .retired_clusters
-                .get(&input.identifier)
-                .filter(|retired| {
-                    input.client_token.is_some()
-                        && retired.delete_client_token == input.client_token
-                })
+        // `@idempotencyToken`: a repeat of the SAME delete answers with the result
+        // of the original call and has no additional effect; the same token with
+        // DIFFERENT parameters is a different request wearing a used token, which
+        // is a conflict rather than a retry.
+        //
+        // The ledger is consulted BEFORE the cluster is looked up — unlike the
+        // operations that act on a live resource — because the result this
+        // operation records is the resource's REMOVAL: the retry of a delete that
+        // already succeeded arrives exactly when the cluster is gone, so the
+        // recorded answer, not the store, is what serves it.
+        let fingerprint =
+            crate::state::request_fingerprint(std::slice::from_ref(&input.identifier));
+        if let Some(token) = input.client_token.as_deref() {
+            match state
+                .tokens_of(crate::state::TokenScope::DeleteCluster)
+                .verdict(token, &fingerprint)
             {
-                return Ok(delete_cluster_output(retired));
+                crate::state::TokenVerdict::Replay(recorded) => {
+                    return recorded_delete_output(&recorded).ok_or_else(|| {
+                        // A recorded delete always keeps every member it
+                        // answered, so there is nothing to serve here — and
+                        // nothing this request may retire in its place.
+                        DeleteClusterErrorModeled::InternalServerException(
+                            InternalServerException {
+                                message: "the recorded result of this request is unavailable"
+                                    .to_string(),
+                                retry_after_seconds: None,
+                            },
+                        )
+                        .into()
+                    });
+                }
+                crate::state::TokenVerdict::Mismatch => {
+                    return Err(DeleteClusterErrorModeled::ConflictException(ConflictException {
+                        message: crate::state::CLIENT_TOKEN_MISMATCH_MESSAGE.to_string(),
+                        resource_id: Some(input.identifier.clone()),
+                        resource_type: Some(crate::state::RESOURCE_TYPE_CLUSTER.to_string()),
+                    })
+                    .into());
+                }
+                crate::state::TokenVerdict::Unused => {}
             }
+        }
+
+        let Some(cluster) = state.clusters.get_mut(&input.identifier) else {
             return Err(DeleteClusterErrorModeled::ResourceNotFoundException(
                 crate::state::cluster_not_found(&region, &input.identifier),
             )
@@ -238,7 +272,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if cluster.status != crate::state::STATUS_DELETING {
             cluster.status = crate::state::STATUS_DELETING.to_string();
-            cluster.delete_client_token = input.client_token.clone();
             // The clock, not a later caller, finishes the deletion.
             cluster.pending = Some(crate::state::PendingTransition {
                 due_at: now + crate::state::SETTLE_AFTER,
@@ -246,7 +279,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        Ok(delete_cluster_output(cluster))
+        let creation_time = cluster.creation_time;
+        let deleted = delete_cluster_output(cluster);
+        if let Some(token) = input.client_token {
+            // Recorded whichever branch answered: a delete of a cluster already
+            // on its way out succeeded just as much as the one that started the
+            // deletion, so its retry has the same recorded result to answer
+            // from. Every member of the answer is kept, because the cluster this
+            // record describes is on its way out of the store.
+            state.tokens(crate::state::TokenScope::DeleteCluster).record(
+                token,
+                fingerprint,
+                crate::state::RecordedCall::new(&deleted.identifier)
+                    .answering(crate::state::STATUS_MEMBER, &deleted.status)
+                    .answering(crate::state::ARN_MEMBER, &deleted.arn)
+                    .answering(
+                        crate::state::CREATION_TIME_MEMBER,
+                        &crate::state::encode_instant(creation_time),
+                    ),
+            );
+        }
+        Ok(deleted)
     }
 }
 
@@ -264,4 +317,24 @@ fn delete_cluster_output(cluster: &crate::state::Cluster) -> DeleteClusterOutput
         status: cluster.status.clone(),
         creation_time: ::aws_smithy_types::DateTime::from(cluster.creation_time),
     }
+}
+
+/// The answer a recorded `DeleteCluster` call gave, rendered for its retry.
+///
+/// Every member comes from the record rather than from the store: the cluster
+/// the recorded call retired is, by the time a retry arrives, either on its way
+/// out or gone, and neither its current status nor its absence is what that
+/// request answered. `None` is a record missing a member it should hold — never
+/// an answer to serve.
+fn recorded_delete_output(
+    recorded: &crate::state::RecordedCall,
+) -> Option<DeleteClusterOutput> {
+    Some(DeleteClusterOutput {
+        identifier: recorded.resource.clone(),
+        arn: recorded.answered(crate::state::ARN_MEMBER)?.to_string(),
+        status: recorded.answered(crate::state::STATUS_MEMBER)?.to_string(),
+        creation_time: ::aws_smithy_types::DateTime::from(crate::state::decode_instant(
+            recorded.answered(crate::state::CREATION_TIME_MEMBER)?,
+        )?),
+    })
 }

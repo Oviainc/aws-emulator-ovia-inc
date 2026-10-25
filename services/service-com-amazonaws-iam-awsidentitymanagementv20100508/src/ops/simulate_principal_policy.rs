@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SimulatePrincipalPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SimulatePrincipalPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SimulatePrincipalPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -240,6 +231,25 @@ impl From<SimulatePrincipalPolicyErrorModeled> for SimulatePrincipalPolicyError 
     }
 }
 
+/// What IAM answers when `PolicySourceArn` names no entity whose policies it can
+/// read: this refusal carries one fixed sentence, describing the resource — an IAM
+/// entity the service could not retrieve — rather than naming the ARN the request
+/// supplied, which is what `NoSuchEntityException`'s "the error message describes
+/// the resource" comes to for an operation addressed by ARN.
+const ENTITY_NOT_RETRIEVABLE: &str = "Unable to retrieve specified IAM entity.";
+
+/// The values the model's `PolicyIdentifierPolicyType` enum declares
+/// (`smithy_query(query="shape",shape="PolicyIdentifierPolicyType")`): the policy
+/// kinds a `PolicyExclusionList` entry may name.
+const POLICY_EXCLUSION_TYPES: &[&str] = &[
+    "inline",
+    "aws-managed",
+    "user-managed",
+    "permission-boundary",
+    "scp",
+    "rcp",
+];
+
 /// The `SimulatePrincipalPolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -276,18 +286,552 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SimulatePrincipalPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SimulatePrincipalPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; nothing here depends on it — the
+        // principal, the actions, the resources and the extra documents are all named
+        // by the request. A simulation reports what the policies in force WOULD decide
+        // for the principal the request names, which is not the caller's own identity.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The operation models no `ServiceFailureException`; its own server-side
+            // failure is `PolicyEvaluationException`, "the request failed because a
+            // provided policy could not be successfully evaluated".
+            return Err(
+                SimulatePrincipalPolicyErrorModeled::PolicyEvaluationException(
+                    PolicyEvaluationException {
+                        message: Some("the IAM store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every supplied document has to be a policy document before anything is
+        // decided from it: the rule is the shared one every operation taking a policy
+        // document applies (`crate::state::is_policy_document`).
+        let supplied = input.policy_input_list.unwrap_or_default();
+        let boundary = input.permissions_boundary_policy_input_list.unwrap_or_default();
+        for (member, documents) in [
+            ("PolicyInputList", &supplied),
+            ("PermissionsBoundaryPolicyInputList", &boundary),
+        ] {
+            if let Some(position) = documents
+                .iter()
+                .position(|document| !crate::state::is_policy_document(document))
+            {
+                return Err(invalid_input(format!(
+                    "Syntax errors in policy: {member} member {} must be a JSON object \
+                     carrying a Statement element",
+                    position + 1
+                )));
+            }
+        }
+        if let Some(document) = input.resource_policy.as_deref() {
+            if !crate::state::is_policy_document(document) {
+                return Err(invalid_input(
+                    "Syntax errors in policy: ResourcePolicy must be a JSON object \
+                     carrying a Statement element"
+                        .to_string(),
+                ));
+            }
+        }
+        // "An IAM entity can only have one permissions boundary in effect at a time.
+        // You can input only one permissions boundary when you pass a policy to this
+        // operation."
+        if boundary.len() > 1 {
+            return Err(invalid_input(format!(
+                "Invalid value for PermissionsBoundaryPolicyInputList: only one \
+                 permissions boundary may be simulated, got {}",
+                boundary.len()
+            )));
+        }
+        // How much one request may ask to be decided is bounded, because the work is
+        // the PRODUCT of the actions, the resources and the documents it names: past
+        // either cap the request is refused rather than served, so a single call cannot
+        // make this handler do unbounded work.
+        for (member, named, cap) in [
+            ("PolicyInputList", supplied.len(), MAX_SIMULATED_DOCUMENTS),
+            (
+                "ResourceArns",
+                input.resource_arns.as_ref().map_or(0, Vec::len),
+                MAX_SIMULATED_RESOURCES,
+            ),
+            (
+                "ContextEntries",
+                supplied_context_values(input.context_entries.as_deref()),
+                MAX_SIMULATED_CONTEXT_VALUES,
+            ),
+        ] {
+            if named > cap {
+                return Err(invalid_input(format!(
+                    "Invalid value for {member}: at most {cap} may be simulated in one \
+                     request, got {named}"
+                )));
+            }
+        }
+
+        // "Each operation must include the service identifier, such as
+        // iam:CreateUser": an action name with no service prefix names no action, so
+        // nothing can be decided about it.
+        if let Some(action) = input
+            .action_names
+            .iter()
+            .find(|action| !names_a_service_action(action))
+        {
+            return Err(invalid_input(format!(
+                "Invalid Action name: {action} must name a service and an action, as in \
+                 iam:CreateUser"
+            )));
+        }
+
+        // An ARN that is not a user's, a group's or a role's names no principal whose
+        // policies could be read, which is an invalid input rather than a missing
+        // entity — the same refusal `GetContextKeysForPrincipalPolicy` answers.
+        if crate::state::parse_entity_arn(&input.policy_source_arn).is_none() {
+            return Err(invalid_input(format!(
+                "ARN {} is not valid: PolicySourceArn must be the ARN of an IAM user, \
+                 group or role",
+                input.policy_source_arn
+            )));
+        }
+
+        // "Syntactically invalid identifiers, such as malformed ARNs or wildcards in
+        // disallowed positions, cause the request to fail with an InvalidInput error."
+        let exclusions = input.policy_exclusion_list.unwrap_or_default();
+        for exclusion in &exclusions {
+            match exclusion {
+                PolicyIdentifier::PolicyArn(arn)
+                    if crate::state::parse_policy_arn(arn).is_none() =>
+                {
+                    return Err(invalid_input(format!(
+                        "ARN {arn} is not valid: PolicyExclusionList entries must name a \
+                         managed policy by its ARN"
+                    )));
+                }
+                PolicyIdentifier::PolicyType(kind)
+                    if !POLICY_EXCLUSION_TYPES.contains(&kind.as_str()) =>
+                {
+                    return Err(invalid_input(format!(
+                        "Invalid value for PolicyType: {kind} is not a policy type"
+                    )));
+                }
+                _ => {}
+            }
+        }
+
+        // The page resumes strictly after the POSITION the marker names, exactly as
+        // this crate's list operations do, so a token this service's encoding cannot
+        // have produced is refused rather than read as the start of the results.
+        let resume_at = match &input.marker {
+            Some(marker) => {
+                match crate::state::decode_marker(
+                    crate::state::MARKER_SCOPE_SIMULATION_RESULTS,
+                    marker,
+                )
+                .and_then(|key| key.parse::<usize>().ok())
+                {
+                    Some(position) => position,
+                    None => {
+                        return Err(invalid_input(
+                            "Invalid Marker: the value is not a marker this service issued"
+                                .to_string(),
+                        ))
+                    }
+                }
+            }
+            None => 0,
+        };
+        // `maxItemsType` is range 1..1000 and the boundary validator has already
+        // refused anything outside it, so the only choice left here is the default for
+        // an absent `MaxItems`. `.max(1)` is what makes the cast lossless.
+        let page_size = input
+            .max_items
+            .unwrap_or(crate::state::DEFAULT_MAX_ITEMS)
+            .max(1) as usize;
+
+        // A read: the simulation reports what the stored policies decide and writes
+        // nothing — simulating a call neither performs it nor records it. The lock is
+        // held only for the collection, so nothing else waits on it while the
+        // decisions below are made.
+        let documents: Vec<String> = {
+            let store = state.lock();
+            let Some(carried) = store.principal_sourced_policies(&input.policy_source_arn) else {
+                return Err(SimulatePrincipalPolicyErrorModeled::NoSuchEntityException(
+                    NoSuchEntityException {
+                        message: Some(ENTITY_NOT_RETRIEVABLE.to_string()),
+                    },
+                )
+                .into());
+            };
+            // "Use this parameter to test what the simulation result would be if a
+            // policy were removed": an excluded policy is left out of the documents the
+            // decision is made from, and "syntactically valid identifiers that don't
+            // match any attached policy are ignored".
+            let kept: Vec<crate::state::SourcedPolicy> = carried
+                .into_iter()
+                .filter(|policy| !excluded(&policy.source, &exclusions))
+                .collect();
+            // An attached policy AWS owns whose document this emulator's catalog is
+            // short of: what it grants is not held, so no decision can be made about
+            // it, and the honest answer is that nobody has written that entry down yet
+            // — never a decision that silently leaves it out.
+            if let Some(uncarried) =
+                kept.iter()
+                    .find_map(|policy| match (&policy.document, &policy.source) {
+                        (None, crate::state::PolicySource::Managed { policy_arn, .. }) => {
+                            Some(policy_arn)
+                        }
+                        _ => None,
+                    })
+            {
+                return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                    crate::state::uncarried_aws_managed_policy(uncarried, "document"),
+                ));
+            }
+            // "An optional list of additional policy documents to include in the
+            // simulation": the principal's own documents TOGETHER with the supplied
+            // ones.
+            kept.into_iter()
+                .filter_map(|policy| policy.document)
+                .chain(supplied)
+                .collect()
+        };
+
+        // "Whenever a context key is evaluated in one of the simulated IAM permissions
+        // policies, the corresponding value is supplied": the entries the request
+        // carries are the condition values the decision knows.
+        let context = supplied_context(input.context_entries.as_deref());
+        // Every context key the documents test that the request did not supply a value
+        // for: a condition over such a key cannot be decided, which is what
+        // `MissingContextValues` reports. The keys are read from the documents as a
+        // whole rather than per (action, resource), because which statements a request
+        // reaches is not what makes a key's value missing — the request either carries
+        // a value for the key or it does not.
+        // Every context key the documents in force test that the request did not
+        // supply a value for: a condition over such a key cannot be decided, which is
+        // what `MissingContextValues` reports. EVERY document that takes part in the
+        // decision is read for them — the principal's own and the supplied ones, the
+        // simulated permissions boundary, and the resource-based policy — because a
+        // condition in any of them is one the simulation could not decide. The keys
+        // are read from the documents as a whole rather than per (action, resource),
+        // because which statements a pair reaches is not what makes a key's value
+        // missing: the request either carries a value for the key or it does not.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SimulatePrincipalPolicy"))
+        // The supplied keys are a SET, so testing a key against them is a lookup
+        // rather than a scan of the request's own entries, and the collection stops
+        // one key past the bound below, so neither the work nor the allocation here is
+        // the product of two things the request chooses.
+        let supplied_keys: ::std::collections::BTreeSet<String> = context
+            .iter()
+            .map(|(key, _)| key.to_ascii_lowercase())
+            .collect();
+        let deciding = documents
+            .iter()
+            .map(String::as_str)
+            .chain(boundary.iter().map(String::as_str))
+            .chain(input.resource_policy.as_deref());
+        let missing: Vec<String> = crate::state::context_keys_in_policies(deciding)
+            .into_iter()
+            .filter(|key| !supplied_keys.contains(&key.to_ascii_lowercase()))
+            .take(MAX_SIMULATED_CONTEXT_KEYS + 1)
+            .collect();
+        // The list is reported on every result the page carries, so its length is a
+        // factor of the response's size: past the bound the request is refused rather
+        // than answered with a report nothing bounds. Truncating the list instead would
+        // be worse — a short list would read as "these are the only keys missing".
+        if missing.len() > MAX_SIMULATED_CONTEXT_KEYS {
+            return Err(invalid_input(format!(
+                "Invalid value for PolicyInputList: the policies in force test more than \
+                 {MAX_SIMULATED_CONTEXT_KEYS} context keys the request supplied no value \
+                 for, and at most that many may be reported in one simulation"
+            )));
+        }
+
+        // "If this parameter is not provided, then the value defaults to * (all
+        // resources). Each API in the ActionNames parameter is evaluated for each
+        // resource in this list."
+        let named_resources = input.resource_arns.unwrap_or_default();
+        let reports_each_resource = !named_resources.is_empty();
+        let resources: Vec<String> = if named_resources.is_empty() {
+            vec![ANY_RESOURCE.to_string()]
+        } else {
+            named_resources
+        };
+        // How many actions this page decides: the request's `MaxItems`, narrowed so the
+        // page's (action, resource) pairs stay within [`MAX_EVALUATIONS_PER_PAGE`].
+        // Answering fewer results than asked for is what the model provides for — "IAM
+        // might return fewer than the MaxItems number of results even when there are
+        // more results available. In that case, the IsTruncated response element
+        // returns true, and Marker contains a value to include in the subsequent call"
+        // — so the rest of the actions are reported on the next page rather than
+        // dropped, and neither the work nor the response grows with the product.
+        let page_size = page_size.min((MAX_EVALUATIONS_PER_PAGE / resources.len()).max(1));
+
+        let prepared = ::service_common::iam_authorization::prepare_documents(&documents);
+        let prepared_boundary = ::service_common::iam_authorization::prepare_documents(&boundary);
+        // One result per action, and the page is taken BEFORE anything is decided, so a
+        // request asking about many actions does the work of the page it asked for
+        // rather than of the whole list.
+        let total = input.action_names.len();
+        let paged = input
+            .action_names
+            .iter()
+            .skip(resume_at)
+            .take(page_size);
+        let mut results: Vec<EvaluationResult> = Vec::new();
+        let mut decided_pairs = 0usize;
+        for action in paged {
+            let mut per_resource: Vec<ResourceSpecificResult> = Vec::new();
+            for resource in &resources {
+                let decided = decide(
+                    &prepared,
+                    &prepared_boundary,
+                    boundary.is_empty(),
+                    action,
+                    resource,
+                    input.resource_policy.as_deref(),
+                    &context,
+                );
+                per_resource.push(decided);
+                decided_pairs += 1;
+                // The evaluation is synchronous work inside an async handler, so it
+                // hands the executor back periodically: one simulation never holds a
+                // worker for its whole run, whatever this page was asked to decide.
+                if decided_pairs.is_multiple_of(EVALUATIONS_PER_YIELD) {
+                    ::tokio::task::yield_now().await;
+                }
+            }
+            // The evaluation result reports the decision on the FIRST resource it was
+            // asked about, and `ResourceSpecificResults` "the individual results of
+            // the simulation of the API operation specified in EvalActionName on each
+            // resource". The keys the request supplied no value for are the same for
+            // every result (see above), so the ONE list computed for this request is
+            // what each of them reports.
+            let reported_missing = (!missing.is_empty()).then(|| missing.clone());
+            if reports_each_resource {
+                for result in &mut per_resource {
+                    result.missing_context_values = reported_missing.clone();
+                }
+            }
+            let first = per_resource.first().cloned().unwrap_or_default();
+            results.push(EvaluationResult {
+                eval_action_name: action.clone(),
+                eval_resource_name: Some(first.eval_resource_name.clone()),
+                eval_decision: first.eval_resource_decision.clone(),
+                missing_context_values: reported_missing,
+                permissions_boundary_decision_detail: first
+                    .permissions_boundary_decision_detail
+                    .clone(),
+                resource_specific_results: reports_each_resource.then_some(per_resource),
+                // `MatchedStatements` reports the SOURCE POSITION (line and column) of
+                // each statement that matched, which the shared evaluator does not
+                // track; reporting a position that was not measured would be worse
+                // than reporting none, so the member is left absent.
+                matched_statements: None,
+                // This emulator models no organization, so nothing about one is
+                // reported, and `EvalDecisionDetails` is for a decision taken from
+                // several sources (an organization policy, a boundary), none of which
+                // applies here.
+                organizations_decision_detail: None,
+                eval_decision_details: None,
+            });
+        }
+
+        let next = resume_at.saturating_add(results.len());
+        let is_truncated = next < total;
+        Ok(SimulatePrincipalPolicyOutput {
+            evaluation_results: Some(results),
+            is_truncated,
+            marker: is_truncated.then(|| {
+                crate::state::encode_marker(
+                    crate::state::MARKER_SCOPE_SIMULATION_RESULTS,
+                    &next.to_string(),
+                )
+            }),
+        })
+    }
+}
+
+/// The resource a simulation is about when the request names none: "if this parameter
+/// is not provided, then the value defaults to * (all resources)"
+/// (`SimulatePrincipalPolicy$ResourceArns`).
+const ANY_RESOURCE: &str = "*";
+
+/// How many resources one request may ask to have decided.
+///
+/// The model bounds the number of RESULTS a page carries (`maxItemsType`, range
+/// 1..1000) but puts no bound on `ResourceArns`, and the work this operation does is
+/// the PRODUCT of the actions, the resources and the documents named — so the same
+/// ceiling is applied to the resource axis, and a request past it is refused rather
+/// than served. Nothing is silently dropped: the refusal says what the bound is.
+const MAX_SIMULATED_RESOURCES: usize = 1_000;
+
+/// How many extra policy documents one request may supply in `PolicyInputList`, for
+/// the same reason [`MAX_SIMULATED_RESOURCES`] exists: the documents are the third
+/// factor of that product, each may be 131,072 characters, and every one of them is
+/// read for the context keys it tests.
+const MAX_SIMULATED_DOCUMENTS: usize = 10;
+
+/// How many (action, resource) pairs one PAGE may decide. The page's action count is
+/// narrowed so this holds, which bounds both the work the request does and the size of
+/// the response it gets back; the actions that do not fit are reported on the next
+/// page.
+const MAX_EVALUATIONS_PER_PAGE: usize = 1_000;
+
+/// How many pairs are decided between two yields back to the async executor, so a
+/// simulation cannot hold a worker thread for its whole run.
+const EVALUATIONS_PER_YIELD: usize = 64;
+
+/// How many context keys one simulation may report as missing a value.
+///
+/// The list is reported on every result the page carries, so its length multiplies the
+/// response's size; the keys come from the documents in force, which the request itself
+/// can supply. Past this bound the request is refused rather than answered.
+const MAX_SIMULATED_CONTEXT_KEYS: usize = 100;
+
+/// How many condition values one request may supply in `ContextEntries` — counted over
+/// every value of every entry, since each is one value the decision may test against.
+/// Bounded for the same reason the other axes are: the keys the documents test are
+/// looked up among them.
+const MAX_SIMULATED_CONTEXT_VALUES: usize = 1_000;
+
+/// The modelled 400 refusal for a request this operation cannot decide from.
+fn invalid_input(message: String) -> SimulatePrincipalPolicyError {
+    SimulatePrincipalPolicyErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Whether `action` names a service and an action within it, the form
+/// `ActionNames` requires ("each operation must include the service identifier, such
+/// as iam:CreateUser").
+fn names_a_service_action(action: &str) -> bool {
+    match action.split_once(':') {
+        Some((service, operation)) => !service.is_empty() && !operation.is_empty(),
+        None => false,
+    }
+}
+
+/// Whether a `PolicyExclusionList` entry names the policy `source` came from.
+///
+/// A `PolicyType` entry excludes every policy of that kind, a `PolicyArn` entry the one
+/// managed policy it names, and an `InlinePolicyIdentifier` the one inline policy of
+/// that name on that entity — IAM names are not distinguished by case, so the names are
+/// compared case-folded, while an ARN is compared literally.
+fn excluded(source: &crate::state::PolicySource, exclusions: &[PolicyIdentifier]) -> bool {
+    exclusions.iter().any(|exclusion| match (exclusion, source) {
+        (PolicyIdentifier::PolicyType(kind), crate::state::PolicySource::Inline { .. }) => {
+            kind == "inline"
+        }
+        (
+            PolicyIdentifier::PolicyType(kind),
+            crate::state::PolicySource::Managed { aws_owned, .. },
+        ) => kind == if *aws_owned { "aws-managed" } else { "user-managed" },
+        (
+            PolicyIdentifier::PolicyArn(excluded_arn),
+            crate::state::PolicySource::Managed { policy_arn, .. },
+        ) => excluded_arn == policy_arn,
+        (
+            PolicyIdentifier::InlinePolicyIdentifier(named),
+            crate::state::PolicySource::Inline {
+                policy_name,
+                attachment_type,
+                attachment_name,
+            },
+        ) => {
+            crate::state::name_key(&named.policy_name) == crate::state::name_key(policy_name)
+                && named.attachment_type.eq_ignore_ascii_case(attachment_type)
+                && crate::state::name_key(&named.attachment_name)
+                    == crate::state::name_key(attachment_name)
+        }
+        _ => false,
+    })
+}
+
+/// The condition values a request supplies, as the shared evaluator takes them: one
+/// `(key, value)` pair per value, since a key tested against any of its values holds.
+fn supplied_context(entries: Option<&[ContextEntry]>) -> Vec<(String, String)> {
+    let mut context = Vec::new();
+    for entry in entries.unwrap_or_default() {
+        let Some(key) = entry.context_key_name.as_deref() else {
+            continue;
+        };
+        for value in entry.context_key_values.iter().flatten() {
+            context.push((key.to_string(), value.clone()));
+        }
+    }
+    context
+}
+
+/// How many condition values `entries` carries in all — the measure
+/// [`MAX_SIMULATED_CONTEXT_VALUES`] is taken against, counted from the request's own
+/// lists before anything is built from them.
+fn supplied_context_values(entries: Option<&[ContextEntry]>) -> usize {
+    entries
+        .unwrap_or_default()
+        .iter()
+        .map(|entry| entry.context_key_values.as_ref().map_or(0, Vec::len))
+        .sum()
+}
+
+/// What the documents in force decide about one `(action, resource)` pair.
+///
+/// The decision is the shared evaluation's ([`service_common::iam_authorization`]):
+/// the identity-based documents and, when the request supplies one, the resource-based
+/// policy. A simulated permissions boundary bounds the result the way IAM's does — a
+/// request the boundary does not allow is denied, and the boundary can only take
+/// permission away, never grant it.
+///
+/// `MissingContextValues` is not filled in here: the keys the request supplied no value
+/// for are the same for every pair, so the caller computes that list ONCE and reports it
+/// on each result rather than this deriving it per pair.
+#[allow(clippy::too_many_arguments)]
+fn decide(
+    documents: &[::service_common::iam_authorization::PreparedDocument],
+    boundary: &[::service_common::iam_authorization::PreparedDocument],
+    no_boundary: bool,
+    action: &str,
+    resource: &str,
+    resource_policy: Option<&str>,
+    context: &[(String, String)],
+) -> ResourceSpecificResult {
+    use ::service_common::iam_authorization as iam;
+
+    let principals: [String; 0] = [];
+    let request = iam::Request::new(action, resource, &principals).with_context(context);
+    let identity = iam::identity_decision_prepared(documents, &request);
+    let from_resource = match resource_policy {
+        Some(document) => iam::resource_decision(document, &request),
+        None => iam::Decision::NotStated,
+    };
+    let decision = crate::state::authorization::decision_name(identity, from_resource);
+
+    // "The permissions boundary sets the maximum permissions that the entity can
+    // have": a request outside it is denied even where the identity policies allow it.
+    let allowed_by_boundary = no_boundary
+        || iam::is_allowed(
+            iam::identity_decision_prepared(boundary, &request),
+            iam::Decision::NotStated,
+        );
+    let decision = if allowed_by_boundary
+        || decision == crate::state::authorization::DECISION_EXPLICIT_DENY
+    {
+        decision
+    } else {
+        crate::state::authorization::DECISION_IMPLICIT_DENY
+    };
+
+    ResourceSpecificResult {
+        eval_resource_name: resource.to_string(),
+        eval_resource_decision: decision.to_string(),
+        // Filled in by the caller, from the one list it computed (see the docs above).
+        missing_context_values: None,
+        matched_statements: None,
+        eval_decision_details: None,
+        permissions_boundary_decision_detail: (!no_boundary).then_some(
+            PermissionsBoundaryDecisionDetail {
+                allowed_by_permissions_boundary: allowed_by_boundary,
+            },
+        ),
     }
 }

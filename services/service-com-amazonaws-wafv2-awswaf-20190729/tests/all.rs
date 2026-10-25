@@ -45,5 +45,7 @@ mod sampled_requests;
 mod state_roundtrip;
 #[path = "all/top_path_statistics.rs"]
 mod top_path_statistics;
+#[path = "all/web_acl_associations.rs"]
+mod web_acl_associations;
 #[path = "all/web_acl_lifecycle.rs"]
 mod web_acl_lifecycle;

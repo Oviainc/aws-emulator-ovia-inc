@@ -492,7 +492,7 @@ async fn publish_batch_reports_a_failed_entry_beside_the_published_ones() {
         .element("SubscriptionArn")
         .expect("a subscription ARN");
 
-    let long_subject = "s".repeat(100);
+    let long_subject = "s".repeat(101);
     let long_ordering_id = "d".repeat(129);
     // (entry, whether the batch publishes it)
     let cases: Vec<(&str, Entry, bool)> = vec![
@@ -508,7 +508,7 @@ async fn publish_batch_reports_a_failed_entry_beside_the_published_ones() {
             false,
         ),
         (
-            "a subject at the 100 character bound",
+            "a subject one character past the bound",
             Entry::new("subject", "body").subject(&long_subject),
             false,
         ),

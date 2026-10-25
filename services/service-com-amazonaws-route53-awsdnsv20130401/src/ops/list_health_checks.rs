@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListHealthChecks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListHealthChecks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListHealthChecks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the health checks the account holds, as one page of a stable listing:
+//! the store keys them by id, so the walk is a total order a `Marker` can always
+//! resume at, and a page stops after `MaxItems` records with `NextMarker` naming
+//! the first record the next page starts at. A pure read — nothing here writes to
+//! the store.
 //!
 //! ## Shape of an operation
 //!
@@ -92,6 +89,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The most health checks one response carries.
+///
+/// `ListHealthChecksRequest$MaxItems`'s own documentation: "Amazon Route 53
+/// returns a maximum of 1000 items. If you set MaxItems to a value greater than
+/// 1000, Route 53 returns only the first 1000 health checks."
+const MAX_PAGE_SIZE: i32 = 1_000;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -159,20 +163,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListHealthChecks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListHealthChecksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListHealthChecks"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            ListHealthChecksErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        let page_size = input
+            .max_items
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+        // Route 53 echoes the `maxitems` the caller asked for; the clamped
+        // `page_size` above only bounds the work and the response size.
+        let reported_max_items = input.max_items.unwrap_or(MAX_PAGE_SIZE);
+        // `Marker` is "the ID of the first health check that Amazon Route 53 will
+        // return if you submit another request", so a page RESUMES at it, and the
+        // response echoes it verbatim.
+        let marker = input.marker.clone().unwrap_or_default();
+
+        // A pure read: nothing below writes to the store.
+        let store = state.lock();
+        // The store keys health checks by id in a BTreeMap, so this walk is a
+        // stable total order and a marker always resumes at the same place.
+        let matching = store
+            .health_checks
+            .values()
+            .filter(|check| marker.is_empty() || check.id.as_str() >= marker.as_str());
+
+        let mut health_checks = Vec::new();
+        let mut next_marker = None;
+        for check in matching {
+            if health_checks.len() >= page_size as usize {
+                // "the value of NextMarker identifies the first health check that
+                // Amazon Route 53 returns if you submit another request".
+                next_marker = Some(check.id.clone());
+                break;
+            }
+            health_checks.push(check.to_health_check());
+        }
+
+        Ok(ListHealthChecksOutput {
+            health_checks,
+            marker,
+            is_truncated: next_marker.is_some(),
+            next_marker,
+            // The echoed `maxitems`, so a request outside the documented range
+            // reads its own value back while the page itself stays clamped.
+            max_items: reported_max_items,
+        })
     }
 }
