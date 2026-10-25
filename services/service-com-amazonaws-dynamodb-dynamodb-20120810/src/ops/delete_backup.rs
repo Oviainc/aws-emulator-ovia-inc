@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBackup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBackup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBackup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the one backup a `BackupArn` names from the catalogue and
+//! reports the record it removed, in the `DELETED` status that removal leaves it in. A
+//! backup still being created is refused rather than removed, and an ARN this region
+//! holds no backup for answers the `BackupNotFoundException` this operation models.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +149,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBackup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBackupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBackup"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        crate::state::check_backup_arn(&input.backup_arn, &region).map_err(lift)?;
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+        // "There is another ongoing conflicting backup control plane operation on the
+        // table. The backup is either being created, deleted or restored to a table"
+        // (`BackupInUseException`): a backup the clock has not finished creating yet is
+        // not one to remove.
+        if store
+            .backup(&region, &input.backup_arn)
+            .map_err(lift)?
+            .still_creating(now)
+        {
+            return Err(DeleteBackupErrorModeled::BackupInUseException(
+                BackupInUseException {
+                    message: Some(format!(
+                        "Backup is being created: {}",
+                        input.backup_arn
+                    )),
+                },
+            )
+            .into());
+        }
+        let removed = store.remove_backup(&region, &input.backup_arn).map_err(lift)?;
+
+        // The audit record for a state-changing call: who asked, what was removed and
+        // that it succeeded. Never a credential — only the access key id the caller
+        // presented.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            table_name = %removed.table_name,
+            backup_arn = %removed.arn,
+            "backup deleted"
+        );
+
+        Ok(DeleteBackupOutput {
+            // The record as it stood, in the status this call left it in: the backup is
+            // gone from the catalogue, so the only status it can be reported in is
+            // `DELETED`.
+            backup_description: Some(removed.describe(crate::state::BACKUP_STATUS_DELETED)),
+        })
+    }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> DeleteBackupError {
+    DeleteBackupErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel: a backup this region holds
+/// none of is the `BackupNotFoundException` this operation models, and a value that is no
+/// backup ARN of this endpoint at all is the `ValidationException` such an input is.
+fn lift(error: crate::state::RequestError) -> DeleteBackupError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            DeleteBackupErrorModeled::BackupNotFoundException(BackupNotFoundException {
+                message: Some(message),
+            })
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
     }
 }

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutBucketRequestPayment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutBucketRequestPayment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutBucketRequestPayment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets who pays for downloads from an existing bucket: the `Payer` of the submitted
+//! `RequestPaymentConfiguration` is recorded on the named bucket's state and the
+//! operation answers 200 with an empty body, so `GetBucketRequestPayment` reports exactly
+//! what was last put. A bucket this emulator does not hold is `NoSuchBucket` (404), and a
+//! configuration naming a `Payer` outside the modelled pair is refused without touching
+//! what the bucket carries.
 //!
 //! ## Shape of an operation
 //!
@@ -114,14 +112,22 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutBucketRequestPaymentO
     fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
 }
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `PutBucketRequestPaymentError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#PutBucketRequestPayment")]
+// The operation's MODELED errors, widened by `NoSuchBucket`.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="PutBucketRequestPayment")` reports
+// `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket that does
+// not exist and AWS answers the service-wide `NoSuchBucket` ("The specified bucket does
+// not exist", `httpError 404`). `extra_errors` widens the set with that shape, which the
+// SERVICE models, so this handler answers the same 404 every other bucket-scoped
+// operation does rather than inventing a second rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#PutBucketRequestPayment",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum PutBucketRequestPaymentErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -175,18 +181,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutBucketRequestPayment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutBucketRequestPaymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutBucketRequestPayment"))
+        // Everything this write needs is in its deserialized input: the expected owner
+        // travels as a member, not as a raw header.
+        let _ = ctx;
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // bucket, the request fails with the HTTP status code 403 Forbidden (access
+        // denied)" — `PutBucketRequestPaymentRequest$ExpectedBucketOwner`, judged the way
+        // `PutBucketVersioning` judges it: this emulator serves one account, so that
+        // account owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                403,
+                "Access Denied",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The store is unreachable only when this service is mounted on an engine
+            // that is not the shared `InMemoryEngine`; nothing can then be persisted, so
+            // this answers the server-fault channel every other implemented
+            // bucket-subresource put uses rather than a 501, which would say "not written
+            // yet" about an operation that is written.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INTERNAL_ERROR_CODE,
+                500,
+                "the S3 store is unavailable",
+            ));
+        };
+
+        // `RequestPaymentConfiguration$Payer` is a REQUIRED `Payer`, whose values are
+        // `BucketOwner` and `Requester` (`PAYER_VALUES`). A payload whose `Payer` is
+        // outside them does not validate against the schema the API publishes, which AWS
+        // refuses with `MalformedXML` (HTTP 400) — a code this service's model declares no
+        // shape for, so it goes out through the unmodelled channel carrying that code's
+        // own published message.
+        let payer = input.request_payment_configuration.payer.as_str();
+        if !PAYER_VALUES.contains(&payer) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::MALFORMED_XML_CODE,
+                MALFORMED_XML_STATUS,
+                crate::state::MALFORMED_XML_MESSAGE,
+            ));
+        }
+
+        // The configuration is judged BEFORE the store is touched, so a refused request
+        // leaves what the bucket carries exactly as it was.
+        let mut store = state.lock();
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            return Err(PutBucketRequestPaymentErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+
+        // "Sets the request payment configuration for a bucket" (this operation's own
+        // documentation) from the complete container it carries as its payload, so what
+        // the request names becomes the bucket's configuration in full, whether it had one
+        // already or was still on the default.
+        bucket.set_payer(payer);
+
+        // `Unit` output: success is the modelled 200 and an empty body.
+        Ok(PutBucketRequestPaymentOutput)
     }
 }
+
+/// The HTTP status AWS answers `MalformedXML` with: 400, the status S3's error-responses
+/// list carries for it.
+const MALFORMED_XML_STATUS: u16 = 400;

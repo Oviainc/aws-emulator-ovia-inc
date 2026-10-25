@@ -102,10 +102,8 @@
 use super::types::*;
 
 use crate::state::{
-    health_check_config_with_defaults, resource_location, StoredHealthCheck,
-    ENDPOINT_HEALTH_CHECK_TYPES, FIRST_HEALTH_CHECK_VERSION, HEALTH_CHECK_TYPE_CALCULATED,
-    HEALTH_CHECK_TYPE_CLOUDWATCH_METRIC, HEALTH_CHECK_TYPE_RECOVERY_CONTROL, MAX_HEALTH_CHECKS,
-    STRING_MATCH_HEALTH_CHECK_TYPES,
+    health_check_config_problem, health_check_config_with_defaults, resource_location,
+    StoredHealthCheck, FIRST_HEALTH_CHECK_VERSION, MAX_HEALTH_CHECKS,
 };
 use std::collections::BTreeMap;
 
@@ -123,75 +121,6 @@ use std::collections::BTreeMap;
 const HEALTH_CHECK_ALREADY_EXISTS_MESSAGE: &str =
     "A health check has already been created with the specified caller reference and a \
      different configuration.";
-
-/// Why `config` could not be used, or `None` when it holds together.
-///
-/// `HealthCheckConfig`'s members are conditional on its `Type`: the model
-/// constrains each member on its own, so the rules that relate them — an
-/// endpoint type needs an endpoint to check, a string-match type needs the
-/// string to search for, an alarm-backed type needs the alarm, a
-/// routing-control type needs the routing control, and the two types that check
-/// no endpoint take no port — are the service's to enforce, under the
-/// `InvalidInput` its model declares.
-fn config_problem(config: &HealthCheckConfig) -> Option<String> {
-    let given = |member: &Option<String>| {
-        member
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty())
-    };
-    let kind = config.r#type.as_str();
-    if ENDPOINT_HEALTH_CHECK_TYPES.contains(&kind) {
-        // `IPAddress`: "If you don't specify a value for IPAddress, Route 53
-        // sends a DNS request to resolve the domain name that you specify in
-        // FullyQualifiedDomainName" — so one of the two has to be there for
-        // there to be an endpoint at all.
-        if !given(&config.ip_address) && !given(&config.fully_qualified_domain_name) {
-            return Some(format!(
-                "a {kind} health check must specify HealthCheckConfig.IPAddress or \
-                 HealthCheckConfig.FullyQualifiedDomainName"
-            ));
-        }
-        // `SearchString`: "If the value of Type is HTTP_STR_MATCH or
-        // HTTPS_STR_MATCH, the string that you want Amazon Route 53 to search
-        // for in the response body".
-        if STRING_MATCH_HEALTH_CHECK_TYPES.contains(&kind) && !given(&config.search_string) {
-            return Some(format!(
-                "a {kind} health check must specify HealthCheckConfig.SearchString"
-            ));
-        }
-        return None;
-    }
-    // "Don't specify a value for Port when you specify a value for Type of
-    // CLOUDWATCH_METRIC or CALCULATED."
-    if matches!(
-        kind,
-        HEALTH_CHECK_TYPE_CLOUDWATCH_METRIC | HEALTH_CHECK_TYPE_CALCULATED
-    ) && config.port.is_some()
-    {
-        return Some(format!(
-            "HealthCheckConfig.Port cannot be specified for a {kind} health check"
-        ));
-    }
-    match kind {
-        // `AlarmIdentifier` "identifies the CloudWatch alarm that you want
-        // Amazon Route 53 health checkers to use to determine whether the
-        // specified health check is healthy", which is the whole of a
-        // CLOUDWATCH_METRIC check's input.
-        HEALTH_CHECK_TYPE_CLOUDWATCH_METRIC if config.alarm_identifier.is_none() => Some(format!(
-            "a {kind} health check must specify HealthCheckConfig.AlarmIdentifier"
-        )),
-        // "The Amazon Resource Name (ARN) for the Route 53 Application Recovery
-        // Controller routing control", which is what a RECOVERY_CONTROL check
-        // follows.
-        HEALTH_CHECK_TYPE_RECOVERY_CONTROL if !given(&config.routing_control_arn) => {
-            Some(format!(
-                "a {kind} health check must specify HealthCheckConfig.RoutingControlArn"
-            ))
-        }
-        _ => None,
-    }
-}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -271,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        if let Some(problem) = config_problem(&input.health_check_config) {
+        if let Some(problem) = health_check_config_problem(&input.health_check_config) {
             return Err(CreateHealthCheckErrorModeled::InvalidInput(InvalidInput {
                 message: Some(format!("Invalid request: {problem}")),
             })
@@ -288,20 +217,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A CALCULATED health check is "healthy" as a function of its children,
         // so a child it names has to be a health check the account holds.
-        if config.r#type == HEALTH_CHECK_TYPE_CALCULATED {
-            let children = config.child_health_checks.clone().unwrap_or_default();
-            if let Some(missing) = children
-                .iter()
-                .find(|child| !store.health_checks.contains_key(child.as_str()))
-            {
-                return Err(CreateHealthCheckErrorModeled::InvalidInput(InvalidInput {
-                    message: Some(format!(
-                        "Invalid request: HealthCheckConfig.ChildHealthChecks names no health \
-                         check of this account: {missing}"
-                    )),
-                })
-                .into());
-            }
+        if let Some(missing) = store.missing_child_health_check(&config) {
+            return Err(CreateHealthCheckErrorModeled::InvalidInput(InvalidInput {
+                message: Some(format!(
+                    "Invalid request: HealthCheckConfig.ChildHealthChecks names no health \
+                     check of this account: {missing}"
+                )),
+            })
+            .into());
         }
 
         // `CallerReference` is the idempotency token. "If you send a

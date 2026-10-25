@@ -37,6 +37,8 @@ mod custom_detection_rules;
 mod detector_data_sources_projection;
 #[path = "all/detector_lifecycle.rs"]
 mod detector_lifecycle;
+#[path = "all/detector_sub_resource_creates.rs"]
+mod detector_sub_resource_creates;
 #[path = "all/filter_delete.rs"]
 mod filter_delete;
 #[path = "all/filter_lifecycle.rs"]
@@ -65,6 +67,8 @@ mod invitation_listing;
 mod ip_set_lifecycle;
 #[path = "all/ip_set_listing.rs"]
 mod ip_set_listing;
+#[path = "all/ip_set_name_alphabet.rs"]
+mod ip_set_name_alphabet;
 #[path = "all/ip_set_update_and_delete.rs"]
 mod ip_set_update_and_delete;
 #[path = "all/malware_protection_plan.rs"]

@@ -4686,6 +4686,12 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// `CreateLensShare`'s `ClientRequestToken` -> what the original request created.
     /// Caller input keys it, so it is a BOUNDED [`TokenLedger`].
     pub create_lens_share_tokens: TokenLedger<CreateLensShareToken>,
+    /// `DeleteLensShare`'s `ClientRequestToken` -> the delete the original request
+    /// completed ([`delete_replay`]), held exactly as [`Self::delete_workload_tokens`] is
+    /// and for the same reason: the revoked share cannot serve the replay, so the
+    /// completed delete does, and a retry carrying the token answers that success rather
+    /// than the not-found the original request's own work produced.
+    pub delete_lens_share_tokens: TokenLedger<CompletedDeleteToken>,
     /// Normalized workload name -> `WorkloadId`. Backs the documented "name must be
     /// unique within an account within a Region; spaces and capitalization are
     /// ignored" rule.
@@ -4849,9 +4855,9 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
 
     /// A fresh `ShareId`: 32 lowercase hex characters, as `^[0-9a-f]{32}$` requires, and
     /// unused by any share this store holds. A `ShareId` identifies the share on its own
-    /// (`DeleteWorkloadShare` resolves one by id), so uniqueness is checked over every
-    /// share of every SHARED RESOURCE rather than within one of them — a workload's and a
-    /// lens's shares live in one id space.
+    /// (`DeleteWorkloadShare` and `DeleteLensShare` each resolve one by id), so uniqueness
+    /// is checked over every share of every SHARED RESOURCE rather than within one of them
+    /// — a workload's and a lens's shares live in one id space.
     pub fn mint_share_id(&mut self) -> String {
         loop {
             let id = self.next_hex_id();
@@ -5939,6 +5945,29 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
             .get(lens_id)?
             .values()
             .find(|share| share.shared_with == shared_with)
+    }
+
+    /// Drop one share of a lens and everything keyed to it: the create token that
+    /// resolved to it — so the next request carrying that token shares afresh rather than
+    /// replaying a share that is gone — and the lens's share map once its last share is
+    /// gone, so a lens nobody shares leaves nothing behind.
+    ///
+    /// `None` when the lens holds no such share, which is what tells a delete that the
+    /// share it was asked to remove does not exist.
+    ///
+    /// This is the first share removal in this store; a workload share is removed the
+    /// same way — drop the record, forget the create token that resolved to it, prune the
+    /// resource's map once it is empty — so whichever operation needs that next should
+    /// generalise this one over the two share maps rather than write a second copy.
+    pub fn remove_lens_share(&mut self, lens_id: &str, share_id: &str) -> Option<LensShareRecord> {
+        let shares = self.lens_shares.get_mut(lens_id)?;
+        let record = shares.remove(share_id)?;
+        if shares.is_empty() {
+            self.lens_shares.remove(lens_id);
+        }
+        self.create_lens_share_tokens
+            .retain(|token| !(token.lens_id == lens_id && token.share_id == share_id));
+        Some(record)
     }
 
     /// The share the invitation `share_invitation_id` mediates, if it was offered to
@@ -7342,6 +7371,22 @@ pub fn lens_share_conflict(existing: &LensShareRecord) -> ConflictException {
             "The lens with ARN {} is already shared with {}.",
             existing.lens_arn, existing.shared_with
         ),
+    )
+}
+
+/// [`resource_not_found`] for a share id that names no share of the lens.
+///
+/// A `ShareId` identifies a share on its own — the id space is unique across every
+/// share this store holds — so the `ResourceId` is that id AS SENT, and the message names
+/// the lens the share was looked for in, so a caller can tell a share of another lens
+/// from a share that was deleted. `alias` is the lens as sent, which is how the request
+/// named it. Shared by every operation that resolves a lens `ShareId`, so they cannot
+/// word it differently.
+pub fn lens_share_not_found(alias: &str, share_id: &str) -> ResourceNotFoundException {
+    resource_not_found(
+        LENS_SHARE_RESOURCE_TYPE,
+        share_id.to_string(),
+        &format!("share with ID {share_id} of a lens with alias {alias}"),
     )
 }
 

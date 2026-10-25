@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateChannelMessage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateChannelMessage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateChannelMessage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the content of a stored message and records WHEN it was edited, so
+//! `GetChannelMessage` and `ListChannelMessages` report the new content with a
+//! `LastEditedTimestamp`. Editing one's own message is a channel member's capability, the
+//! one the model lists on `CreateChannelMembership`, so only the message's sender may
+//! update it.
 //!
 //! ## Shape of an operation
 //!
@@ -112,10 +109,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-chimesdkmessaging-chime
 // here — hence the `UpdateChannelMessageError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.chimesdkmessaging#UpdateChannelMessage")]
+// `extra_errors` widens the set with `NotFoundException`, a shape the SERVICE models
+// (`GetChannelMessage` lists it) that this operation's own error list omits: an update for
+// a channel ARN that names no channel has to say the channel is not there, and answering
+// 400 would tell the caller its REQUEST was malformed when it was not.
+#[smithy_macros::operation_error(
+    "com.amazonaws.chimesdkmessaging#UpdateChannelMessage",
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum UpdateChannelMessageErrorModeled {
     BadRequestException(BadRequestException),
+    NotFoundException(NotFoundException),
     ConflictException(ConflictException),
     ForbiddenException(ForbiddenException),
     ServiceFailureException(ServiceFailureException),
@@ -173,20 +178,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateChannelMessage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateChannelMessageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateChannelMessage"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateChannelMessageErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the channel store is unavailable".to_string()),
+            })
+        })?;
+
+        // Sub-channels exist only on elastic channels, which this slice does not serve.
+        if let Some(sub_channel_id) = &input.sub_channel_id {
+            return Err(UpdateChannelMessageErrorModeled::BadRequestException(
+                BadRequestException {
+                    code: Some("BadRequest".to_string()),
+                    message: Some(format!(
+                        "SubChannelId {sub_channel_id:?} is not supported: this emulator does not serve elastic channels"
+                    )),
+                },
+            )
+            .into());
+        }
+        // The edited content is stored, so it is held to the same per-message retention
+        // budget as the content a send stores.
+        let request_bytes = crate::state::message_bytes(
+            &input.content,
+            input.metadata.as_deref(),
+            input.content_type.as_deref(),
+            None,
+            None,
+        );
+        if request_bytes > crate::state::MAX_MESSAGE_BYTES {
+            return Err(UpdateChannelMessageErrorModeled::BadRequestException(
+                BadRequestException {
+                    code: Some("BadRequest".to_string()),
+                    message: Some(format!(
+                        "the edited message would retain {request_bytes} bytes for its Content, Metadata and ContentType; this emulator's per-message retention budget is {}",
+                        crate::state::MAX_MESSAGE_BYTES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+        let channel = store.channels.get_mut(&input.channel_arn).ok_or_else(|| {
+            UpdateChannelMessageErrorModeled::NotFoundException(NotFoundException {
+                code: Some("NotFound".to_string()),
+                message: Some(format!("channel {} not found", input.channel_arn)),
+            })
+        })?;
+        let channel_arn = channel.arn.clone();
+        let message = channel
+            .messages
+            .iter_mut()
+            .find(|m| m.message_id == input.message_id)
+            .ok_or_else(|| {
+                // This operation models no `NotFoundException`, and a message the channel
+                // does not hold is refused at the message level with the modelled
+                // `ForbiddenException`.
+                forbidden()
+            })?;
+
+        // Editing is the SENDER's own capability: nobody else rewrites a member's words.
+        if message.sender.arn.as_deref() != Some(input.chime_bearer.as_str()) {
+            return Err(forbidden());
+        }
+        // A redacted message has no content left to edit, and restoring content the
+        // redaction removed would undo it.
+        if message.redacted {
+            return Err(UpdateChannelMessageErrorModeled::ConflictException(ConflictException {
+                code: Some("Conflict".to_string()),
+                message: Some(format!(
+                    "message {} was redacted and cannot be updated",
+                    input.message_id
+                )),
+            })
+            .into());
+        }
+
+        message.content = input.content;
+        message.metadata = input.metadata;
+        message.content_type = input.content_type;
+        message.last_edited_millis = Some(now);
+        message.last_updated_millis = now;
+        let status = message.status_structure();
+
+        Ok(UpdateChannelMessageOutput {
+            channel_arn: Some(channel_arn),
+            message_id: Some(input.message_id),
+            status: Some(status),
+            // Sub-channels are not served, so no sub-channel is echoed back.
+            sub_channel_id: None,
+        })
     }
+}
+
+/// Refuse the request with the modelled 403 for a message this caller may not edit.
+fn forbidden() -> UpdateChannelMessageError {
+    UpdateChannelMessageErrorModeled::ForbiddenException(ForbiddenException {
+        code: Some("Forbidden".to_string()),
+        message: Some(crate::state::INSUFFICIENT_ACCESS_MESSAGE.to_string()),
+    })
+    .into()
 }

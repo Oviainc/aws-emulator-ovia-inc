@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBackups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBackups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBackups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the on-demand backups this emulator holds for the region the
+//! request reached, as `CreateBackup` catalogued them and `DeleteBackup` left them, in
+//! ascending `BackupArn` order so `ExclusiveStartBackupArn` resumes exactly where the
+//! previous page stopped. The request's `TableName`, `BackupType` and time range select
+//! which records are reported, and `Limit` truncates the page.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +166,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBackups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBackupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBackups"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        // "Lists the backups from the table specified in TableName. You can also provide
+        // the Amazon Resource Name (ARN) of the table in this parameter"
+        // (`ListBackups$TableName`) — either form names the table whose backups are
+        // reported, and a request that names none is answered over every table's.
+        let table = input
+            .table_name
+            .as_deref()
+            .map(crate::state::resolve_table_name)
+            .transpose()
+            .map_err(lift)?;
+        // "USER - On-demand backup created by you. (The default setting if no other
+        // backup types are specified.)" (`ListBackups$BackupType`).
+        let filter = input
+            .backup_type
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_BACKUP_TYPE_FILTER);
+
+        let mut store = state.lock();
+        // Finish any transition the clock already made due before reporting; this is a
+        // read, so that is the only write it makes.
+        store.apply_due_transitions(now);
+        let mut summaries: Vec<BackupSummary> = store
+            // Backups are catalogued per region, so a list answers with the ones this
+            // request's own region holds, in the ascending ARN order the store keys by.
+            .backups_in(&region)
+            .filter(|backup| {
+                table
+                    .as_deref()
+                    .is_none_or(|named| backup.table_name == named)
+                    && crate::state::backup_type_selected(filter, &backup.backup_type)
+                    // "Only backups created after this time are listed" /
+                    // "before this time", measured against the instant the backup was
+                    // requested (`ListBackups$TimeRangeLowerBound`/`$TimeRangeUpperBound`).
+                    && crate::state::within_time_range(
+                        backup.created_at,
+                        input.time_range_lower_bound.as_ref(),
+                        input.time_range_upper_bound.as_ref(),
+                    )
+            })
+            // The cursor: the next page starts after the backup the previous one ended
+            // on, which `LastEvaluatedBackupArn` reported and this member resumes from
+            // (`ListBackups$ExclusiveStartBackupArn`).
+            .filter(|backup| {
+                input
+                    .exclusive_start_backup_arn
+                    .as_deref()
+                    .is_none_or(|start| backup.arn.as_str() > start)
+            })
+            .map(|backup| backup.summary(now))
+            .collect();
+
+        // "Maximum number of backups to return at once" (`ListBackups$Limit`), which the
+        // model bounds at 100 — the page size this reports when the request names none.
+        let limit = usize::try_from(input.limit.unwrap_or(DEFAULT_LIMIT)).unwrap_or(0);
+        let truncated = summaries.len() > limit;
+        summaries.truncate(limit);
+        // "The ARN of the backup last evaluated when the current page of results was
+        // returned, inclusive of the current page of results. ... If
+        // LastEvaluatedBackupArn is empty, then the last page of results has been
+        // processed" (`ListBackupsOutput$LastEvaluatedBackupArn`).
+        let last_evaluated_backup_arn = truncated
+            .then(|| {
+                summaries
+                    .last()
+                    .and_then(|summary| summary.backup_arn.clone())
+            })
+            .flatten();
+
+        Ok(ListBackupsOutput {
+            backup_summaries: Some(summaries),
+            last_evaluated_backup_arn,
+        })
     }
+}
+
+/// The page size this operation reports when the request names no `Limit`: the ceiling
+/// the model declares for the member (`BackupsInputLimit`, range 1..=100), so a request
+/// that asks for no bound is answered with as many backups as one page may carry.
+const DEFAULT_LIMIT: i32 = 100;
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> ListBackupsError {
+    ListBackupsErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel.
+///
+/// The only one this operation can meet is a `TableName` that is not a table name at all
+/// — it looks up no table, because a list is answered over whatever the catalogue holds —
+/// so a refusal here is about the request's own member and is reported as the
+/// `ValidationException` such a value is.
+fn lift(error: crate::state::RequestError) -> ListBackupsError {
+    crate::scaffolded::Scaffolded::validation(error.message().to_string())
 }

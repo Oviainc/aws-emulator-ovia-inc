@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetContainerLog
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetContainerLog`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the log events this store holds for one container of one container
+//! service of the region the request is made in.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetContainerLog::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! The containers this operation answers about are the ones the deployment that
+//! became ACTIVE declares — the service's `currentDeployment`, which is the one
+//! deployment the store has ever had active; a name outside it is the service's
+//! `DoesNotExist` refusal. The log of a container that DID run is empty, and stays
+//! empty: a log event is a line the container's own process wrote, this emulator runs
+//! no container runtime, so nothing ran and nothing wrote one — the same reason the
+//! service's public URL answers 501 rather than the image's response
+//! (`crate::service`).
 //!
 //! ## Shape of an operation
 //!
@@ -188,18 +192,202 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetContainerLog` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetContainerLogErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A container service is a REGIONAL resource whose name is unique within
+        // one region of the account, so the region the request is signed for is
+        // what names the service whose container log is asked for.
+        let region = crate::state::request_region(ctx.parts());
+
+        // `serviceName` and `containerName` are modelled `@required` members and
+        // the service name carries the modelled length and pattern, so the
+        // centralized walk refused anything outside them before this body ran.
+        // What is left is what the model cannot express: the interval has to be
+        // an interval, the service has to exist in this region, the container has
+        // to be one that ran on it, and a page token has to name a page of its
+        // log.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetContainerLog"))
+        // "The start of the time interval for which to get log data" / "The end
+        // of the time interval for which to get log data": both members are
+        // optional, so an absent bound leaves that side of the interval open —
+        // but an interval whose end does not follow its start is no interval at
+        // all, and this service refuses that pair the same way wherever it takes
+        // one (see `GetInstanceMetricData`).
+        if let (Some(start), Some(end)) = (input.start_time, input.end_time) {
+            let start_key = crate::state::timestamp_key(start);
+            let end_key = crate::state::timestamp_key(end);
+            if start_key >= end_key {
+                return Err(invalid(format!(
+                    "startTime must be earlier than endTime, got startTime {}.{:09} and \
+                     endTime {}.{:09} (seconds and nanoseconds since the epoch)",
+                    start_key.0, start_key.1, end_key.0, end_key.1
+                )));
+            }
+        }
+
+        // An absent — or empty — `pageToken` asks for the first page.
+        let page_token = input
+            .page_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+            .map(str::to_string);
+
+        crate::state::with_state(&*self.engine, |store| {
+            // Reporting only: the answer is read from the stored records, and the
+            // one write behind this call is the clock materialising the lifecycle
+            // phases it already owed (see `crate::state::with_state`) — which is
+            // also what makes a deployment's containers ones that have RUN.
+            let service = store
+                .container_service(&region, &input.service_name)
+                .ok_or_else(|| service_does_not_exist(&input.service_name))?;
+
+            // "The name of the container that is either running or previously ran
+            // on the container service for which to return a log": a container no
+            // deployment of this service has launched has no log on it, so such a
+            // name earns the service's `DoesNotExist` envelope rather than an
+            // empty report, which would read as "it ran and wrote nothing".
+            //
+            // The containers that have run are the ones declared by a deployment
+            // that BECAME ACTIVE, and the store holds that deployment as the
+            // service's CURRENT one: a `nextDeployment` is still waiting, so its
+            // containers have not run yet, and a deployment the clock replaces is
+            // marked inactive and dropped. So the current deployment's container
+            // map IS the set of containers that have run on the service, and this
+            // reads it rather than keeping a second copy of it beside the record.
+            // (Nothing can give a service a second deployment while
+            // `CreateContainerServiceDeployment` is a scaffold; when that lands
+            // and the store retains the deployments that ran before — what
+            // `GetContainerServiceDeployments` reports — this set widens to the
+            // containers of every deployment that was active, in that change.)
+            if !has_run_container(&input.container_name, service) {
+                return Err(container_does_not_exist(
+                    &input.container_name,
+                    &input.service_name,
+                    service,
+                ));
+            }
+
+            // "To get a page token, perform an initial GetContainerLog request.
+            // If your results are paginated, the response will return a next page
+            // token": a page token is the `nextPageToken` a previous page of THIS
+            // container's log reported. That log has no page after its first (see
+            // below), so no token was ever issued for it and every token a caller
+            // can present names no page of it.
+            if let Some(token) = &page_token {
+                return Err(invalid(format!(
+                    "pageToken {token:?} names no page of the log of container \
+                     '{container}' on the container service {service_name}; a page token \
+                     is the value a previous GetContainerLog request reported as \
+                     nextPageToken, and this log reports none",
+                    container = input.container_name,
+                    service_name = input.service_name,
+                )));
+            }
+
+            Ok(GetContainerLogOutput {
+                // The log events this store holds for that container: NONE, for
+                // every container of every service, every interval and every
+                // filter pattern.
+                //
+                // A container service log event is a line the container's own
+                // process wrote while running — "merged from all nodes on your
+                // container service" when the service has more than one node.
+                // Producing one needs the deployed image to be RUN, and this
+                // emulator has no container runtime, so no image was ever
+                // started: it is the same reason the service's own public URL
+                // answers 501 instead of the image's response (`crate::service`).
+                // Nothing ran, so nothing wrote a line in any interval.
+                //
+                // An empty list says exactly that, and is what the service itself
+                // answers for a container that logged nothing in the requested
+                // interval. Plausible-looking lines would be fabricated output a
+                // client could not tell from a container's own. `filterPattern`
+                // SELECTS among the events the log holds — it is "the pattern to
+                // use to filter the returned log events to a specific term" — so
+                // whatever term it carries it selects nothing from an empty log,
+                // which is why nothing here reads it.
+                log_events: Some(Vec::new()),
+                // "A next page token is not returned if there are no more results
+                // to display": this answer displayed every event the log holds,
+                // so there is no page after it.
+                next_page_token: None,
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the rule it broke.
+fn invalid(message: String) -> GetContainerLogError {
+    GetContainerLogErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// No container service of that name is stored in that region: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body `code`
+/// `DoesNotExist` and a message naming the resource type and the requested name.
+/// The region scopes the LOOKUP (a container service name is unique within one
+/// region), but it is not part of the message: the identifier the message names is
+/// the one the request carried.
+fn service_does_not_exist(name: &str) -> GetContainerLogError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_CONTAINER_SERVICE,
+        name,
+    )
+}
+
+/// Whether `container` is one that is running, or previously ran, on `service` —
+/// i.e. one the deployment that became active declares (see the call site for why
+/// the current deployment is that whole set).
+fn has_run_container(container: &str, service: &crate::state::StoredContainerService) -> bool {
+    service
+        .current_deployment
+        .as_ref()
+        .is_some_and(|deployment| deployment.containers.contains_key(container))
+}
+
+/// The container service exists, but no deployment of it has ever launched a
+/// container of that name: the same `DoesNotExist` envelope (HTTP 400, wire error
+/// `NotFoundException`, body `code` `DoesNotExist`), with a message built from the
+/// request — the container and service it named — and the containers that HAVE run
+/// on that service, so the caller can fix the request from the text alone. A
+/// container is not a resource of the account (the modelled `ResourceType` enum has
+/// no entry for one), so the message is not the resource-type/name one. The list is
+/// bounded by `crate::state::MAX_CONTAINERS_PER_DEPLOYMENT`, so the refusal's size
+/// does not grow with what the store holds.
+fn container_does_not_exist(
+    container: &str,
+    service_name: &str,
+    service: &crate::state::StoredContainerService,
+) -> GetContainerLogError {
+    let known = match service.current_deployment.as_ref() {
+        None => "no deployment of it has become active yet, so no container has run on it"
+            .to_string(),
+        Some(deployment) => format!(
+            "the containers that have run on it are [{}]",
+            deployment
+                .containers
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<&str>>()
+                .join(", ")
+        ),
+    };
+    crate::scaffolded::Scaffolded::does_not_exist(format!(
+        "No container named \"{container}\" is running, or previously ran, on the container \
+         service {service_name}: {known}."
+    ))
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetContainerLogError {
+    GetContainerLogErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail container service store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

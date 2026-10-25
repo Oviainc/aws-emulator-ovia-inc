@@ -61,7 +61,8 @@ use crate::ops::types::{
     AccessDeniedException, As2ConnectorConfig, ConnectorEgressConfig,
     ConnectorVpcLatticeEgressConfig, CustomDirectoriesType, DescribedWebAppEndpointDetails,
     DescribedWebAppIdentityProviderDetails, EndpointDetails, HomeDirectoryMapEntry,
-    IdentityProviderDetails, InvalidRequestException, PosixProfile, ProtocolDetails, ProxyConfig,
+    IdentityProviderDetails, InvalidNextTokenException, InvalidRequestException, PosixProfile,
+    ProtocolDetails, ProxyConfig,
     ResourceExistsException, ResourceNotFoundException, S3StorageOptions, SftpConnectorConfig,
     SftpPortWithOptions, Tag, UpdateConnectorEgressConfig, WebAppUnits, WorkflowDetails,
     WorkflowStep,
@@ -722,6 +723,14 @@ pub fn not_configured_for_external_auth(server_id: &str) -> InvalidRequestExcept
     }
 }
 
+/// What an access operation DOES to the grant it addresses, as that operation's
+/// directory-provider refusal names the action: one word per operation, taken from the
+/// operation's own name, so the refusal text is fixed for the operation rather than
+/// built from anything the caller sent.
+pub const ACCESS_ACTION_CREATE: &str = "create";
+pub const ACCESS_ACTION_DESCRIBE: &str = "describe";
+pub const ACCESS_ACTION_DELETE: &str = "delete";
+
 /// The refusal for an access-grant request addressed at a server that has no
 /// directory to hold groups.
 ///
@@ -730,22 +739,20 @@ pub fn not_configured_for_external_auth(server_id: &str) -> InvalidRequestExcept
 /// read out of Active Directory with `Get-ADGroup`. Only a server whose
 /// `IdentityProviderType` is `AWS_DIRECTORY_SERVICE` authenticates against a
 /// directory, so on any other server there is no group an `ExternalId` could name —
-/// which is a malformed request, not a missing grant. The message names the member and
-/// the configuration the request was submitted under; both come from the request and
-/// the stored server.
+/// which is a malformed request, not a missing grant.
+///
+/// The text is fixed for the operation and the server's configuration: `action` is the
+/// operation's own verb (one of [`ACCESS_ACTION_CREATE`], [`ACCESS_ACTION_DESCRIBE`],
+/// [`ACCESS_ACTION_DELETE`]) and `identity_provider_type` is a value of the
+/// `IdentityProviderType` enum's closed set, read off the STORED server. Nothing the
+/// caller sent — no `ServerId`, no `ExternalId` — reaches it, so two requests refused
+/// for the same condition on equally configured servers read identically.
 pub fn accesses_require_directory_provider(
-    server_id: &str,
+    action: &str,
     identity_provider_type: &str,
 ) -> InvalidRequestException {
     InvalidRequestException {
-        message: must_be_when(
-            "IdentityProviderType",
-            IDENTITY_PROVIDER_AWS_DIRECTORY_SERVICE,
-            &format!(
-                "an access is addressed by ExternalId on server {server_id}, \
-                 whose IdentityProviderType is {identity_provider_type}"
-            ),
-        ),
+        message: format!("Cannot {action} access on server with IdP type: {identity_provider_type}"),
     }
 }
 
@@ -2171,10 +2178,39 @@ fn unsupported_for_identity_provider(identity_provider_type: &str) -> String {
     )
 }
 
-/// "exactly one of `<first>` and `<second>` must be specified" — two members the model
-/// documents as alternatives, exactly one of which configures the resource.
-fn exactly_one_of(first: &str, second: &str) -> String {
-    format!("exactly one of {first} and {second} must be specified")
+/// "One of `<first>` or `<second>` must be specified" — two members the model documents
+/// as alternatives, exactly one of which configures the resource, and the request named
+/// NEITHER.
+///
+/// The text states the requirement the request actually violated — that one of the two
+/// is needed — rather than the whole either/or rule: the condition being reported is
+/// that nothing configures the resource, not that both were named.
+fn one_of_required(first: &str, second: &str) -> String {
+    format!("One of {first} or {second} must be specified")
+}
+
+/// "`<first>` and `<second>` cannot both be specified" — the OTHER half of the same
+/// either/or: two alternative members of which the request named both, so which
+/// configuration to build is ambiguous. A different condition from
+/// [`one_of_required`]'s, so a different text.
+fn not_both_of(first: &str, second: &str) -> String {
+    format!("{first} and {second} cannot both be specified")
+}
+
+/// The violation an either/or member pair reports for the way it was violated, or
+/// `None` when exactly one of the two is named — the ONE reading of a documented
+/// "specify either A or B, but not both" requirement, so every pair in this service
+/// words both halves the same way.
+fn either_or_violation(
+    first: (&str, bool),
+    second: (&str, bool),
+) -> Option<String> {
+    let ((first_member, first_named), (second_member, second_named)) = (first, second);
+    match (first_named, second_named) {
+        (false, false) => Some(one_of_required(first_member, second_member)),
+        (true, true) => Some(not_both_of(first_member, second_member)),
+        _ => None,
+    }
 }
 
 /// "`<member>` must be at most `<maximum>`" — a member whose documented upper bound the
@@ -2403,8 +2439,11 @@ impl ConnectorConfig<'_> {
     /// * `MaxConcurrentConnections` states "The maximum values is `5`" — a bound the
     ///   member's `@range` does not carry (see [`MAX_CONCURRENT_CONNECTIONS`]).
     pub fn cross_member_violation(&self) -> Option<String> {
-        if self.as2_config.is_some() == self.sftp_config.is_some() {
-            return Some(exactly_one_of("As2Config", "SftpConfig"));
+        if let Some(violation) = either_or_violation(
+            ("As2Config", self.as2_config.is_some()),
+            ("SftpConfig", self.sftp_config.is_some()),
+        ) {
+            return Some(violation);
         }
 
         let vpc_lattice = self.egress_type == CONNECTOR_EGRESS_TYPE_VPC_LATTICE;
@@ -3171,6 +3210,23 @@ pub fn decode_page_token(token: &str) -> Option<String> {
     String::from_utf8(::hex::decode(token).ok()?).ok()
 }
 
+/// The fixed `Message` for a `NextToken` this service did not issue — the one
+/// diagnostic every `@paginated` operation of this service answers for that condition,
+/// whatever it was listing.
+pub const INVALID_NEXT_TOKEN: &str = "Invalid nextToken";
+
+/// The refusal payload for a `NextToken` [`decode_page_token`] could not read back.
+///
+/// Every `List*` handler builds its own modelled `InvalidNextTokenException` variant
+/// from this ONE payload, so the token diagnostic cannot differ between two listings:
+/// the text is fixed for the condition and carries neither the rejected token nor
+/// anything else the request sent.
+pub fn invalid_next_token() -> InvalidNextTokenException {
+    InvalidNextTokenException {
+        message: INVALID_NEXT_TOKEN.to_string(),
+    }
+}
+
 /// The index range of one page of an ordered key list, and the next page's token key.
 ///
 /// `all` must be sorted (it comes straight out of a `BTreeMap`). `after` is the
@@ -3426,10 +3482,11 @@ pub fn agreement_base_directory(base_directory: Option<&str>) -> Option<String> 
 /// members — one of them says where an agreement's AS2 files land, and the second half
 /// of the sentence rules out naming both — so an agreement is written with exactly one
 /// of them and a request naming both, or neither, is refused with the modelled
-/// `InvalidRequestException`. The wording is the one
-/// [`ConnectorConfig::cross_member_violation`] already gives the same either/or on
-/// `As2Config` and `SftpConfig` ("You must specify exactly one configuration object"),
-/// so the two cannot drift apart.
+/// `InvalidRequestException`. The wording comes from [`either_or_violation`], the one
+/// reading of that requirement this crate has — the same one
+/// [`ConnectorConfig::cross_member_violation`] gives the either/or on `As2Config` and
+/// `SftpConfig` ("You must specify exactly one configuration object") — so the two
+/// cannot drift apart, and each half of the rule is reported as the condition it is.
 ///
 /// What counts as "specified" for `BaseDirectory` is EMPTINESS, not presence: the
 /// member's pattern `^(|/.*)$` admits the empty string, which names no directory (see
@@ -3444,10 +3501,10 @@ pub fn agreement_directory_violation(
     custom_directories: Option<&CustomDirectoriesType>,
 ) -> Option<String> {
     let based = agreement_base_directory(base_directory).is_some();
-    if based == custom_directories.is_some() {
-        return Some(exactly_one_of("BaseDirectory", "CustomDirectories"));
-    }
-    None
+    either_or_violation(
+        ("BaseDirectory", based),
+        ("CustomDirectories", custom_directories.is_some()),
+    )
 }
 
 impl ComAmazonawsTransferTransferserviceState {

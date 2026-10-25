@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ReimportApi
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ReimportApi`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: PUTS the api resource the OpenAPI definition in `Body` describes over the
+//! api `ApiId` names, so the api keeps its identity — its `ApiId`, its `ApiEndpoint`, its
+//! `CreatedDate`, its tags, and the stages, deployments and authorizers it holds — while
+//! the configuration a definition carries is REPLACED by the one just read: the name,
+//! description and version from `info`, the CORS and endpoint-configuration extensions,
+//! and exactly the [`crate::state::Route`]s and [`crate::state::Integration`]s the
+//! document's `paths` declare. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ReimportApi::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! That replacement is what makes a reimported document change what the api's deployed
+//! stages serve: the routes the previous document declared are gone, so the data plane
+//! ([`crate::service`]) matches a request against the new document's route keys alone.
+//!
+//! The definition is read by the ONE reader `ImportApi` reads it with
+//! (`super::import_api::parse_definition`, which that operation makes `pub` for exactly
+//! this reason), under the same `Basepath` interpretation and the same refusals, so the
+//! same body imports and reimports identically. "Supported only for HTTP APIs"
+//! (`ReimportApi$Body`), so an api of the other protocol type is refused rather than
+//! having an HTTP-only definition written over it.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +192,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ReimportApi` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ReimportApiErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ReimportApi"))
+        let _ = ctx;
+        // The definition is read and bounded BEFORE the store lock is taken, so a body
+        // this operation cannot read never reaches the api's records at all — and the api
+        // it names is left exactly as it was.
+        let basepath =
+            super::import_api::base_path_mode(input.basepath.as_deref()).map_err(bad_request)?;
+        let definition =
+            super::import_api::parse_definition(&input.body, basepath).map_err(bad_request)?;
+
+        // "Specifies whether to rollback the API creation when a warning is encountered"
+        // (`ReimportApi$FailOnWarnings`): nothing is written before this point, so the
+        // rollback is that the api still carries the configuration it had.
+        if input.fail_on_warnings.unwrap_or(false) && !definition.warnings.is_empty() {
+            return Err(bad_request(format!(
+                "Errors found during import: {}",
+                definition.warnings.join("; ")
+            )));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("ReimportApi"));
+        };
+        let mut store = state.lock();
+
+        // An api the store does not hold — one never created, or one a DeleteApi removed
+        // — is "the resource specified in the request was not found".
+        let Some(existing) = store.apis.get_mut(&input.api_id) else {
+            return Err(ReimportApiErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::invalid_identifier_message("API", &input.api_id)),
+                resource_type: ::std::option::Option::None,
+            })
+            .into());
+        };
+
+        // "The OpenAPI definition. Supported only for HTTP APIs" (`ReimportApi$Body`): a
+        // definition describes routes, integrations and a CORS configuration an api of the
+        // other protocol type has no behaviour for, so it is refused rather than written.
+        // The gate is the one every writer of a protocol-restricted member shares.
+        if let Err(message) = crate::state::validate_protocol_restricted_members(
+            &existing.protocol_type,
+            &[crate::state::ProtocolRestrictedMember::http_only("Body", true)],
+        ) {
+            return Err(bad_request(message));
+        }
+
+        // The same per-api quotas the import enforces, through the ONE check they share
+        // (`super::import_api::definition_quota_exceeded`), checked against what the WHOLE
+        // definition asks for before any of it is written: a reimport is one call, so it
+        // either fits or it is refused and the api keeps the configuration it had.
+        if let Some((limit_type, message)) =
+            super::import_api::definition_quota_exceeded(&definition)
+        {
+            return Err(too_many_requests(limit_type, message));
+        }
+
+        // PUT, not PATCH: what a definition describes is REPLACED by what this one
+        // describes, so a member the new document leaves out is left out of the api too —
+        // otherwise a reimport could only ever add to the api it was aimed at.
+        existing.name = definition.name;
+        existing.description = definition.description;
+        existing.version = definition.version;
+        existing.cors_configuration = definition.cors_configuration;
+        existing.disable_execute_api_endpoint = definition.disable_execute_api_endpoint;
+
+        // The routes and integrations of the PREVIOUS definition are not part of this one,
+        // so they go: this is what changes which route of the api answers a request. What
+        // replaces them is written by the ONE materialisation `ImportApi` uses, so the same
+        // body imports and reimports into the same records.
+        existing.routes.clear();
+        existing.integrations.clear();
+        super::import_api::write_definition_routes(existing, definition.routes);
+
+        let stored = existing.to_wire();
+        Ok(ReimportApiOutput {
+            api_endpoint: stored.api_endpoint,
+            api_gateway_managed: stored.api_gateway_managed,
+            api_id: stored.api_id,
+            api_key_selection_expression: stored.api_key_selection_expression,
+            cors_configuration: stored.cors_configuration,
+            created_date: stored.created_date,
+            description: stored.description,
+            disable_schema_validation: stored.disable_schema_validation,
+            disable_execute_api_endpoint: stored.disable_execute_api_endpoint,
+            // The two members no stored record carries: they report on THIS reimport —
+            // what of the definition was not carried over — rather than on the api, so
+            // they are assigned from the definition just read and are absent when it
+            // ignored nothing and warned about nothing.
+            import_info: (!definition.import_info.is_empty()).then_some(definition.import_info),
+            ip_address_type: stored.ip_address_type,
+            name: Some(stored.name),
+            protocol_type: Some(stored.protocol_type),
+            route_selection_expression: Some(stored.route_selection_expression),
+            tags: stored.tags,
+            version: stored.version,
+            warnings: (!definition.warnings.is_empty()).then_some(definition.warnings),
+        })
     }
+}
+
+/// This operation's refusal of a definition it cannot put over an api: the modelled
+/// `BadRequestException` ("The request is not valid, for example, the input is incomplete
+/// or incorrect"), whose message names what the caller has to fix.
+fn bad_request(message: String) -> ReimportApiError {
+    ReimportApiErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// This operation's refusal of a definition that would grow the api past a quota, with the
+/// limit's name in `LimitType`.
+fn too_many_requests(limit_type: &str, message: String) -> ReimportApiError {
+    ReimportApiErrorModeled::TooManyRequestsException(TooManyRequestsException {
+        limit_type: Some(limit_type.to_string()),
+        message: Some(message),
+    })
+    .into()
 }

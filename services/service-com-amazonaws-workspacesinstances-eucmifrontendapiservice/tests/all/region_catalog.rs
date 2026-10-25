@@ -342,7 +342,12 @@ async fn listing_regions_changes_nothing_a_later_caller_sees() {
         &router,
         "create an instance",
         "CreateWorkspaceInstance",
-        json!({ "ManagedInstance": { "InstanceType": "t3.medium" } }),
+        json!({
+            "ManagedInstance": {
+                "ImageId": "ami-0123456789abcdef0",
+                "InstanceType": "t3.medium",
+            },
+        }),
     )
     .await;
     assert!(

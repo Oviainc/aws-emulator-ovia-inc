@@ -21,7 +21,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_workspacesinstances_eucmifrontendapiservice as wsinst;
 
 use crate::workspace_instance_lifecycle::{
-    call, create, error_code, harness, list_all_ids, minimal_create, ok, router, stored_tags,
+    call, create, error_code, harness, launchable_managed_instance, list_all_ids, minimal_create,
+    ok, router, stored_tags,
 };
 
 /// Keys inside the reserved namespace, varying the case of the prefix, what follows
@@ -99,7 +100,10 @@ async fn tag_resource_refuses_a_reserved_key_and_leaves_the_tag_set_unchanged() 
     let router = router();
     let id = create(
         &router,
-        json!({ "ManagedInstance": {}, "Tags": tags(&[("env", "dev")]) }),
+        json!({
+            "ManagedInstance": launchable_managed_instance(),
+            "Tags": tags(&[("env", "dev")]),
+        }),
     )
     .await;
     let before: BTreeMap<String, String> = stored_tags(&router, &id).await;
@@ -180,7 +184,10 @@ async fn create_refuses_a_reserved_key_and_creates_no_instance() {
         let (status, payload) = call(
             &router,
             "CreateWorkspaceInstance",
-            json!({ "ManagedInstance": { "InstanceType": "t3.medium" }, "Tags": tags(&[(key, "mine")]) }),
+            json!({
+                "ManagedInstance": launchable_managed_instance(),
+                "Tags": tags(&[(key, "mine")]),
+            }),
         )
         .await;
         assert_refused(case, "Tags", status, &payload);
@@ -202,7 +209,7 @@ async fn create_refuses_a_reserved_key_and_creates_no_instance() {
         "CreateWorkspaceInstance",
         json!({
             "ClientToken": token,
-            "ManagedInstance": {},
+            "ManagedInstance": launchable_managed_instance(),
             "Tags": tags(&[("aws:created-by", "me")]),
         }),
     )
@@ -210,7 +217,11 @@ async fn create_refuses_a_reserved_key_and_creates_no_instance() {
     assert_refused("a refused create carrying a token", "Tags", status, &payload);
     let minted = create(
         &router,
-        json!({ "ClientToken": token, "ManagedInstance": {}, "Tags": tags(&[("env", "dev")]) }),
+        json!({
+            "ClientToken": token,
+            "ManagedInstance": launchable_managed_instance(),
+            "Tags": tags(&[("env", "dev")]),
+        }),
     )
     .await;
     let tagged = stored_tags(&router, &minted).await;
@@ -230,7 +241,10 @@ async fn create_instance_stores_a_key_outside_the_reserved_namespace() {
     for (case, key) in ordinary_keys() {
         let id = create(
             &router,
-            json!({ "ManagedInstance": {}, "Tags": tags(&[(key, "mine")]) }),
+            json!({
+                "ManagedInstance": launchable_managed_instance(),
+                "Tags": tags(&[(key, "mine")]),
+            }),
         )
         .await;
         let got = stored_tags(&router, &id).await;

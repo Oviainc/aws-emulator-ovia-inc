@@ -31,6 +31,8 @@ mod application_access_scopes;
 mod application_assignment_configuration;
 #[path = "all/application_assignment_delete.rs"]
 mod application_assignment_delete;
+#[path = "all/application_assignment_describe.rs"]
+mod application_assignment_describe;
 #[path = "all/application_assignments.rs"]
 mod application_assignments;
 #[path = "all/application_authentication_methods.rs"]
@@ -49,6 +51,8 @@ mod application_grants_list;
 mod application_provider_describe;
 #[path = "all/application_providers.rs"]
 mod application_providers;
+#[path = "all/application_session_configuration.rs"]
+mod application_session_configuration;
 #[path = "all/application_update.rs"]
 mod application_update;
 #[path = "all/customer_managed_policy_references.rs"]

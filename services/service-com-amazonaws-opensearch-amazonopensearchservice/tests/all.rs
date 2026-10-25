@@ -45,6 +45,8 @@ mod package_registry;
 mod reserved_instance_offerings;
 #[path = "all/reserved_instances.rs"]
 mod reserved_instances;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/scheduled_actions.rs"]
 mod scheduled_actions;
 #[path = "all/service_software_rollback.rs"]
@@ -53,3 +55,5 @@ mod service_software_rollback;
 mod shared_es_signing_name_claim;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/vpc_endpoint_access.rs"]
+mod vpc_endpoint_access;

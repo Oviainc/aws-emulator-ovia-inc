@@ -53,6 +53,8 @@ mod generated_templates;
 mod hook_result_invocations;
 #[path = "all/iam_capability_gate.rs"]
 mod iam_capability_gate;
+#[path = "all/list_change_sets.rs"]
+mod list_change_sets;
 #[path = "all/list_stack_resources.rs"]
 mod list_stack_resources;
 #[path = "all/nested_resource_outputs.rs"]
@@ -79,6 +81,8 @@ mod sam_deployed_resources;
 mod sam_transform;
 #[path = "all/scratch.rs"]
 mod scratch;
+#[path = "all/stack_exports.rs"]
+mod stack_exports;
 #[path = "all/stack_lifecycle.rs"]
 mod stack_lifecycle;
 #[path = "all/stack_output_resolution.rs"]

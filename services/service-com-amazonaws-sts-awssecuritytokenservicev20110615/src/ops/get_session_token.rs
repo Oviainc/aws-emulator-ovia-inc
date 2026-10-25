@@ -210,7 +210,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::{NewSession, SessionKind, VENDED_SESSION_DEFAULT_DURATION_SECONDS};
+        use crate::state::{
+            caller_may_call, long_term_identity, resolve_request_caller, NewSession, SessionKind,
+            VENDED_SESSION_DEFAULT_DURATION_SECONDS,
+        };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // This service has no store on the engine it was mounted on, so it cannot
@@ -223,18 +226,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = ctx.credential_store();
         let now = ::std::time::SystemTime::now();
         let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+        // The identity a long-term key speaks for comes from the IAM store, read before
+        // the session lock is taken so the two are never held at once.
+        let long_term = {
+            let iam = crate::state::iam_state(&*self.engine);
+            match iam.as_ref() {
+                Some(iam) => long_term_identity(Some(&iam.lock()), &access_key_id),
+                None => long_term_identity(None, &access_key_id),
+            }
+        };
         let mut registry = state.lock();
 
         // The session speaks for whoever asked for it, so an expired credential cannot
         // be exchanged for a fresh one: that would renew a session past its end.
-        let identity =
-            crate::state::resolve_caller(&mut registry, &access_key_id, now, store).map_err(
-                |expired| {
-                    GetSessionTokenErrorModeled::ExpiredTokenException(ExpiredTokenException {
-                        message: Some(expired.message()),
-                    })
-                },
-            )?;
+        let caller = resolve_request_caller(&mut registry, &access_key_id, now, store, long_term)
+            .map_err(|expired| {
+                GetSessionTokenErrorModeled::ExpiredTokenException(ExpiredTokenException {
+                    message: Some(expired.message()),
+                })
+            })?;
+
+        // This operation "must be called by using the long-term Amazon Web Services
+        // security credentials of an IAM user" (this operation's documentation), so a
+        // temporary credential of any class is refused; see `caller_may_call`.
+        if !caller_may_call(caller.kind, Self::NAME) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                crate::state::session_credentials_message(Self::NAME),
+            ));
+        }
 
         // SerialNumber and TokenCode name the caller's MFA device. They gate the call
         // only through an MFA condition in a policy, which this emulator holds no
@@ -246,7 +265,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store,
             &mut registry,
             now,
-            NewSession::new(identity, SessionKind::SessionToken, duration_seconds),
+            NewSession::new(
+                caller.identity,
+                SessionKind::SessionToken,
+                duration_seconds,
+            ),
         );
         let minted = match minted {
             Ok(minted) => minted,

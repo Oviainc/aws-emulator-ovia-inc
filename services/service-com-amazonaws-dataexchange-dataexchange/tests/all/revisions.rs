@@ -80,7 +80,7 @@ fn revision_cases() -> Vec<RevisionCase> {
 
 /// Create one revision of `data_set_id`, failing the named case if the create itself
 /// did not answer 201.
-async fn create_revision(
+pub(crate) async fn create_revision(
     router: &MultiServiceRouter,
     data_set_id: &str,
     comment: Option<&str>,

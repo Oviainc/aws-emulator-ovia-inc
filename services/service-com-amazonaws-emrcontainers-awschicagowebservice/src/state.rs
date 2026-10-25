@@ -301,6 +301,9 @@ pub const LIST_JOB_TEMPLATES_SCOPE: &str = "jobtemplates";
 /// The scope [`encode_list_cursor`] tags a `ListSecurityConfigurations` cursor with.
 pub const LIST_SECURITY_CONFIGURATIONS_SCOPE: &str = "securityconfigurations";
 
+/// The scope [`encode_list_cursor`] tags a `ListVirtualClusters` cursor with.
+pub const LIST_VIRTUAL_CLUSTERS_SCOPE: &str = "virtualclusters";
+
 /// The scope [`encode_list_cursor`] tags a `ListManagedEndpoints` cursor with: one cluster's
 /// endpoint listing, so a cursor is never read as a position in another cluster's order, nor
 /// in the SAME cluster's job-run listing (which scopes its cursors by the cluster id alone).
@@ -499,6 +502,9 @@ pub struct VirtualClusterRecord {
     /// The `UpdateVirtualCluster` `clientToken`s this cluster has already applied, most
     /// recent last, at most [`MAX_RETAINED_UPDATE_TOKENS`] of them.
     pub update_client_tokens: Vec<String>,
+    /// Creation sequence, so clusters minted within one millisecond still have a total
+    /// order for `ListVirtualClusters` to page through.
+    pub sequence: u64,
     pub pending: Option<PendingTransition>,
 }
 
@@ -1249,7 +1255,7 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
                             .cluster_job_runs(&record.id)
                             .all(|run| job_state_is_terminal(&run.state))
                 })
-                .min_by_key(|record| (record.created_at_millis, record.id.clone()))
+                .min_by_key(|record| (record.created_at_millis, record.sequence))
                 .map(|record| {
                     (
                         record.id.clone(),
@@ -1625,8 +1631,25 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
     /// `schedulerStatus` counted out of the cluster's stored job runs (see
     /// [`Self::cluster_scheduler_status`]).
     pub fn virtual_cluster_view(&self, region: &str, id: &str) -> Option<VirtualCluster> {
-        let record = self.virtual_cluster(region, id)?;
-        Some(record.to_virtual_cluster(self.cluster_scheduler_status(id)))
+        Some(self.virtual_cluster_view_of(self.virtual_cluster(region, id)?))
+    }
+
+    /// The modelled `VirtualCluster` for a record this store already holds, so a lister
+    /// that has walked the records renders each one through the SAME rendering a describe
+    /// answers with instead of looking every id up again.
+    pub fn virtual_cluster_view_of(&self, record: &VirtualClusterRecord) -> VirtualCluster {
+        record.to_virtual_cluster(self.cluster_scheduler_status(&record.id))
+    }
+
+    /// This region's stored virtual clusters, in no particular order: what a
+    /// `ListVirtualClusters` against this region's endpoint reports on.
+    pub fn region_virtual_clusters<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = &'a VirtualClusterRecord> {
+        self.virtual_clusters
+            .values()
+            .filter(move |record| record.region == region)
     }
 
     /// The virtual cluster this container provider's `namespace` is already mapped onto,

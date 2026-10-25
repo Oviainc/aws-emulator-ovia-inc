@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetApplicationSessionConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetApplicationSessionConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetApplicationSessionConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one application's SESSION configuration: the
+//! `UserBackgroundSessionApplicationStatus` the last `PutApplicationSessionConfiguration`
+//! stored on the application record, or
+//! [`crate::state::USER_BACKGROUND_SESSION_STATUS_DEFAULT`] for an application nothing
+//! has configured. A REPORT — it changes nothing a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +151,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetApplicationSessionConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetApplicationSessionConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetApplicationSessionConfiguration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetApplicationSessionConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // A READ, except for what the CLOCK already owes: an instance whose deletion
+        // instant has passed is gone, and the applications held inside it with it,
+        // whether or not anybody read one of their configurations.
+        store.on_request(&region, ::std::time::SystemTime::now());
+
+        // Never created, or created under an instance that has since gone — the same
+        // answer either way: there is no such application to report a configuration for.
+        let application = store.application(&input.application_arn).ok_or_else(|| {
+            GetApplicationSessionConfigurationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::application_not_found_message(
+                        &input.application_arn,
+                    )),
+                    // The model's `ResourceNotFoundExceptionReason` enum carries only
+                    // `KMS_NotFoundException`, which this is not.
+                    reason: None,
+                },
+            )
+        })?;
+
+        Ok(GetApplicationSessionConfigurationOutput {
+            user_background_session_application_status: Some(
+                application
+                    .reported_user_background_session_status()
+                    .to_string(),
+            ),
+        })
     }
 }

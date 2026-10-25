@@ -59,6 +59,8 @@ mod application_status;
 mod application_status_checks;
 #[path = "all/associate_address.rs"]
 mod associate_address;
+#[path = "all/associate_subnet_cidr_block.rs"]
+mod associate_subnet_cidr_block;
 #[path = "all/authorize_security_group_egress.rs"]
 mod authorize_security_group_egress;
 #[path = "all/availability_zones.rs"]
@@ -147,6 +149,8 @@ mod fast_launch_images;
 // What `DisableFastSnapshotRestores` answers per (snapshot, Availability Zone) pair.
 #[path = "all/fast_snapshot_restores.rs"]
 mod fast_snapshot_restores;
+#[path = "all/filter_matcher_budget.rs"]
+mod filter_matcher_budget;
 #[path = "all/fleet_instances.rs"]
 mod fleet_instances;
 #[path = "all/fpga_image_tasks_and_volume_io.rs"]
@@ -349,3 +353,7 @@ mod local_gateway_route_table_vpc_associations;
 // Declared LAST for the reason the header gives.
 #[path = "all/release_hosts.rs"]
 mod release_hosts;
+// Declared LAST for the reason the header gives: taking one AMI back out of the Recycle
+// Bin, and what that refuses.
+#[path = "all/image_recycle_bin.rs"]
+mod image_recycle_bin;

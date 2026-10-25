@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListChannelModerators
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListChannelModerators`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListChannelModerators::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the moderators stored on the channel named by `ChannelArn`, ordered by moderator
+//! ARN so successive pages agree. A PRIVATE channel is readable only by its members and
+//! moderators.
 //!
 //! ## Shape of an operation
 //!
@@ -102,10 +97,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-chimesdkmessaging-chime
 // here — hence the `ListChannelModeratorsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.chimesdkmessaging#ListChannelModerators")]
+// `extra_errors` widens the set with `NotFoundException`, a shape the SERVICE models
+// (`DescribeChannelModerator` lists it) that this operation's own error list omits: a list
+// for a channel ARN that names no channel has to say the channel is not there, and
+// answering 400 would tell the caller its REQUEST was malformed when it was not.
+#[smithy_macros::operation_error(
+    "com.amazonaws.chimesdkmessaging#ListChannelModerators",
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum ListChannelModeratorsErrorModeled {
     BadRequestException(BadRequestException),
+    NotFoundException(NotFoundException),
     ForbiddenException(ForbiddenException),
     ServiceFailureException(ServiceFailureException),
     ServiceUnavailableException(ServiceUnavailableException),
@@ -162,20 +165,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListChannelModerators` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListChannelModeratorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListChannelModerators"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListChannelModeratorsErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the channel store is unavailable".to_string()),
+            })
+        })?;
+
+        // `MaxResults` is modelled `range 1..50`; an omitted page size takes that
+        // maximum, so a caller that asks for no size still gets a bounded page.
+        let requested = input.max_results.unwrap_or(MAX_RESULTS_MAX);
+        if !(1..=MAX_RESULTS_MAX).contains(&requested) {
+            return Err(bad_request(format!(
+                "MaxResults must be between 1 and {MAX_RESULTS_MAX}; got {requested}"
+            )));
+        }
+        let page_size = usize::try_from(requested).unwrap_or(0);
+
+        let store = state.lock();
+        let channel = store.channels.get(&input.channel_arn).ok_or_else(|| {
+            ListChannelModeratorsErrorModeled::NotFoundException(NotFoundException {
+                code: Some("NotFound".to_string()),
+                message: Some(format!("channel {} not found", input.channel_arn)),
+            })
+        })?;
+        if let Some(reason) = channel.read_refusal(&input.chime_bearer) {
+            return Err(ListChannelModeratorsErrorModeled::ForbiddenException(
+                ForbiddenException {
+                    code: Some("Forbidden".to_string()),
+                    message: Some(reason.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // One stable ordered view: the moderator ARN is unique per record, so successive
+        // pages agree.
+        let mut view: Vec<&crate::state::ChannelModeratorRecord> =
+            channel.moderators.iter().collect();
+        view.sort_by(|left, right| left.moderator_arn.cmp(&right.moderator_arn));
+
+        // A `NextToken` names the last moderator of the previous page, so this page
+        // resumes at the one after it in THIS ordered view.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let cursor = crate::state::decode_next_token(token).ok_or_else(|| {
+                    bad_request("NextToken is not a token this service issued".to_string())
+                })?;
+                view.iter()
+                    .position(|m| m.moderator_arn == cursor)
+                    .ok_or_else(|| {
+                        bad_request(
+                            "NextToken does not resume this view: the moderator it names is no longer in it"
+                                .to_string(),
+                        )
+                    })?
+                    + 1
+            }
+        };
+
+        let page: Vec<&crate::state::ChannelModeratorRecord> =
+            view.iter().skip(start).take(page_size).copied().collect();
+        let next_token = (start + page.len() < view.len())
+            .then(|| {
+                page.last()
+                    .map(|m| crate::state::encode_next_token(&m.moderator_arn))
+            })
+            .flatten();
+
+        Ok(ListChannelModeratorsOutput {
+            channel_arn: Some(channel.arn.clone()),
+            next_token,
+            channel_moderators: Some(page.iter().map(|m| m.to_summary()).collect()),
+        })
     }
+}
+
+/// `MaxResults`'s modelled upper bound for this operation (`range 1..50`).
+const MAX_RESULTS_MAX: i32 = 50;
+
+/// Refuse the request with this service's own client-input error, HTTP 400.
+fn bad_request(message: String) -> ListChannelModeratorsError {
+    ListChannelModeratorsErrorModeled::BadRequestException(BadRequestException {
+        code: Some("BadRequest".to_string()),
+        message: Some(message),
+    })
+    .into()
 }

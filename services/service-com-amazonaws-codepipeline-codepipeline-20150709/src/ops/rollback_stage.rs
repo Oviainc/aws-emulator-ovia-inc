@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RollbackStage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RollbackStage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RollbackStage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +154,213 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RollbackStage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RollbackStageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RollbackStage"))
+        let state = crate::state::require_state(&*self.engine)?;
+        // Whether the stage is still running, and whether the target execution's own run
+        // of it has finished, are facts the clock may still owe: every due step is
+        // materialised before the request is judged.
+        crate::state::advance(&*self.engine, ctx, &input.pipeline_name).await;
+        let now = ::std::time::SystemTime::now();
+
+        let execution_id = {
+            let mut state = state.lock();
+
+            let Some(pipeline) = state.pipelines.get(&input.pipeline_name) else {
+                return Err(RollbackStageErrorModeled::PipelineNotFoundException(
+                    PipelineNotFoundException {
+                        message: Some(crate::state::pipeline_not_found_message(
+                            &input.pipeline_name,
+                        )),
+                    },
+                )
+                .into());
+            };
+            let pipeline_version = pipeline.version;
+            let execution_mode = crate::state::resolved_execution_mode(&pipeline.declaration);
+            // The rollback re-runs ONE stage, so its plan is that stage of the pipeline's
+            // current declaration alone — and a name that declaration does not declare is
+            // the unknown stage the model has an error for.
+            let Some(plan) =
+                crate::state::plan_stage(&pipeline.declaration, &input.stage_name, now)
+            else {
+                return Err(RollbackStageErrorModeled::StageNotFoundException(
+                    StageNotFoundException {
+                        message: Some(crate::state::stage_not_found_message(
+                            &input.pipeline_name,
+                            &input.stage_name,
+                        )),
+                    },
+                )
+                .into());
+            };
+
+            // The rollback target is an execution OF THIS PIPELINE: an id the store does
+            // not hold, or one that belongs to another pipeline, names no execution to
+            // roll back to.
+            let Some(target) = state
+                .executions
+                .get(&input.target_pipeline_execution_id)
+                .filter(|record| record.pipeline_name == input.pipeline_name)
+            else {
+                return Err(
+                    RollbackStageErrorModeled::PipelineExecutionNotFoundException(
+                        PipelineExecutionNotFoundException {
+                            message: Some(crate::state::pipeline_execution_not_found_message(
+                                &input.pipeline_name,
+                                &input.target_pipeline_execution_id,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
+
+            // An execution that ran an EARLIER version of the pipeline ran a stage this
+            // declaration no longer describes, so re-running it would not restore what
+            // that execution deployed: that is the outdated target the model declares an
+            // error for.
+            if target.pipeline_version != pipeline_version {
+                return Err(
+                    RollbackStageErrorModeled::PipelineExecutionOutdatedException(
+                        PipelineExecutionOutdatedException {
+                            message: Some(format!(
+                                "Pipeline execution {} ran version {} of pipeline {}, which is \
+                                 not its current version {pipeline_version}, so it cannot be \
+                                 the target of a rollback",
+                                input.target_pipeline_execution_id,
+                                target.pipeline_version,
+                                input.pipeline_name,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // Only a run of the stage that REACHED an outcome is a state to roll back
+            // to; a target that never entered the stage, or whose run of it has not
+            // finished, is the incorrect target id this error words.
+            let completed_in_target = target
+                .stages
+                .iter()
+                .find(|run| run.name == input.stage_name)
+                .is_some_and(crate::state::StageRun::is_terminal);
+            if !completed_in_target {
+                return Err(
+                    RollbackStageErrorModeled::UnableToRollbackStageException(
+                        UnableToRollbackStageException {
+                            message: Some(format!(
+                                "Pipeline execution {} has no completed run of stage '{}' of \
+                                 pipeline {} to roll back to",
+                                input.target_pipeline_execution_id,
+                                input.stage_name,
+                                input.pipeline_name,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // A stage an execution is still running cannot be rolled back under it.
+            let running = state
+                .executions_by_pipeline
+                .get(&input.pipeline_name)
+                .into_iter()
+                .flatten()
+                .filter_map(|id| state.executions.get(id))
+                .filter(|record| !crate::state::is_terminal_status(&record.status))
+                .any(|record| {
+                    record
+                        .stages
+                        .iter()
+                        .any(|run| run.name == input.stage_name && run.is_in_progress())
+                });
+            if running {
+                return Err(
+                    RollbackStageErrorModeled::UnableToRollbackStageException(
+                        UnableToRollbackStageException {
+                            message: Some(format!(
+                                "Stage '{}' of pipeline {} is currently running, so it cannot \
+                                 be rolled back",
+                                input.stage_name, input.pipeline_name,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // A rollback IS an execution of the pipeline, so it occupies one of the
+            // pipeline's concurrent execution slots: with none free, the pipeline is
+            // busy with the activities it already has.
+            if state.concurrent_execution_count(&input.pipeline_name)
+                >= crate::state::MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE
+            {
+                return Err(RollbackStageErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "Pipeline {} already has {} executions in flight, so it cannot \
+                             take the rollback of stage '{}' as well",
+                            input.pipeline_name,
+                            crate::state::MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE,
+                            input.stage_name,
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            // Rolling the stage back means re-running it with what the target execution
+            // ran it with: that execution's resolved variables, its source revisions and
+            // the artifacts it had produced, in the artifact store it wrote them to. So
+            // the stage's actions consume exactly the artifacts the target ran with, and
+            // re-running them restores the state that execution left.
+            let target = target.clone();
+            let record = crate::state::PipelineExecutionRecord {
+                // Minted against the store, so the id this call reports is the one the
+                // rollback execution is filed under and no other execution carries it.
+                pipeline_execution_id: state.new_execution_id(),
+                pipeline_name: input.pipeline_name.clone(),
+                pipeline_version,
+                status: crate::state::STATUS_IN_PROGRESS.to_string(),
+                status_summary: None,
+                start_time: now,
+                last_update_time: now,
+                trigger: ExecutionTrigger {
+                    trigger_type: Some(crate::state::TRIGGER_TYPE_MANUAL_ROLLBACK.to_string()),
+                    // `ExecutionTrigger$triggerDetail` carries the ARN of the user who
+                    // ran the command; this emulator does not resolve a caller identity,
+                    // so the member is absent rather than invented.
+                    trigger_detail: None,
+                },
+                execution_mode,
+                execution_type: crate::state::EXECUTION_TYPE_ROLLBACK.to_string(),
+                variables: target.variables,
+                variables_map: target.variables_map,
+                source_revisions: target.source_revisions,
+                stages: vec![plan],
+                artifact_bucket: target.artifact_bucket,
+                artifact_encryption_key: target.artifact_encryption_key,
+                // The stage is not running and the pipeline has a slot, which is what
+                // the refusals above establish, so the rollback runs rather than waits.
+                queued: false,
+                stop: None,
+                artifacts: target.artifacts,
+                manual_retry_attempts: 0,
+                rollback_target: Some(input.target_pipeline_execution_id.clone()),
+            };
+
+            // No `clientRequestToken` names a rollback: the request models none.
+            state.record_execution(record, None)
+        };
+
+        // The rollback's first step is not due yet (it becomes due a span from now), so
+        // this only publishes it; the steps the clock makes due are materialised by
+        // whichever call comes after each one.
+        crate::state::advance(&*self.engine, ctx, &input.pipeline_name).await;
+
+        Ok(RollbackStageOutput {
+            pipeline_execution_id: execution_id,
+        })
     }
 }

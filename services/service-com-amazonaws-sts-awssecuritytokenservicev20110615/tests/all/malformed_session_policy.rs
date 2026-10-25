@@ -206,7 +206,11 @@ fn malformed_documents() -> Vec<Malformed> {
 /// line and column it sits at.
 #[tokio::test]
 async fn an_unparseable_session_policy_is_refused_describing_the_parse_failure() {
-    let (router, _engine) = emulator();
+    let (router, engine) = emulator();
+    // `sts:AssumeRole` resolves its role in IAM and evaluates the role's trust policy,
+    // so the role the rows below name has to be one this account holds and admits the
+    // caller.
+    let (_role_arn, _role_id) = super::sts_sessions::seed_demo_role(&engine);
 
     for (action, base_params) in policy_operations() {
         let mut seen: Vec<(&str, String)> = Vec::new();
@@ -284,7 +288,8 @@ async fn an_unparseable_session_policy_is_refused_describing_the_parse_failure()
 /// it carries; a document that IS a JSON object is accepted.
 #[tokio::test]
 async fn a_session_policy_that_is_not_a_json_object_is_refused_naming_its_type() {
-    let (router, _engine) = emulator();
+    let (router, engine) = emulator();
+    let (_role_arn, _role_id) = super::sts_sessions::seed_demo_role(&engine);
     // One row per JSON type a document can carry, plus the object AWS requires.
     let cases: Vec<(&str, Option<&str>)> = vec![
         ("[1,2,3]", Some("a JSON array")),

@@ -28,7 +28,8 @@ use crate::ops::types::{
     AIMLOptionsInput, AIMLOptionsOutput, AIMLOptionsStatus, AWSDomainInformation,
     AccessPoliciesStatus, AdditionalLimit,
     AdvancedOptionsStatus, AdvancedSecurityOptions, AdvancedSecurityOptionsInput,
-    AdvancedSecurityOptionsStatus, AutoTuneOptions, AutoTuneOptionsInput, AutoTuneOptionsOutput,
+    AdvancedSecurityOptionsStatus, AuthorizedPrincipal,
+    AutoTuneOptions, AutoTuneOptionsInput, AutoTuneOptionsOutput,
     AutoTuneOptionsStatus, AutoTuneStatus, AutomatedSnapshotPauseOptions,
     AutomatedSnapshotPauseOptionsStatus, AutomatedSnapshotPauseRequestOptions,
     ChangeProgressDetails, ChangeProgressStatusDetails, ClusterConfig, ClusterConfigStatus,
@@ -43,7 +44,8 @@ use crate::ops::types::{
     IAMFederationOptionsOutput, IPAddressTypeStatus, IdentityCenterOptions,
     IdentityCenterOptionsInput, IdentityCenterOptionsStatus, InstanceCountLimits, InstanceLimits,
     InstanceTypeDetails,
-    InvalidPaginationTokenException, JWTOptionsOutput, Limits, LogPublishingOption,
+    InvalidPaginationTokenException, JWTOptionsOutput, LimitExceededException, Limits,
+    LogPublishingOption,
     LogPublishingOptionsStatus, NaturalLanguageQueryGenerationOptionsOutput,
     NodeToNodeEncryptionOptions, NodeToNodeEncryptionOptionsStatus, OffPeakWindowOptions,
     OffPeakWindowOptionsStatus, OptionStatus, OutboundConnection, OutboundConnectionStatus,
@@ -226,6 +228,71 @@ pub const DOMAIN_QUOTA: usize = 100;
 /// `ListDataSources` answers with, it also bounds the size of that answer, and with
 /// [`DOMAIN_QUOTA`] it bounds the whole data-source store.
 pub const DATA_SOURCE_QUOTA: usize = 20;
+
+/// How many tags ONE taggable resource carries before a call that would attach
+/// another is refused with the modelled `LimitExceededException`.
+///
+/// Documented by the service rather than chosen here: "A domain, data source, or
+/// application can have up to 10 tags"
+/// (`smithy_query(query="doc",shape="AddTags")`).
+pub const TAG_QUOTA: usize = 10;
+
+/// A taggable resource's tag set: the `TagValue` each `TagKey` carries.
+///
+/// A map rather than a list of the modelled `Tag`, because "Tag keys must be unique
+/// for the domain to which they are attached" (`Tag$Key`) — keying the store by the
+/// tag key is what makes that uniqueness structural instead of something each
+/// handler has to re-enforce. Iterating a `BTreeMap` is order-stable, which is what
+/// lets two reads of one resource's tags report them in the same order.
+pub type TagSet = BTreeMap<String, String>;
+
+/// The stored form of a modelled `TagList`: the last value a repeated key carries is
+/// the one the resource holds, because the set holds ONE value per key.
+pub fn tag_set(tag_list: Vec<Tag>) -> TagSet {
+    tag_list
+        .into_iter()
+        .map(|tag| (tag.key, tag.value))
+        .collect()
+}
+
+/// A stored tag set as the modelled `TagList` a response carries.
+pub fn tag_list(tags: &TagSet) -> Vec<Tag> {
+    tags.iter()
+        .map(|(key, value)| Tag {
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .collect()
+}
+
+/// The `LimitExceededException` payload for a call that would leave a resource
+/// carrying more than [`TAG_QUOTA`] tags.
+pub fn tag_quota_exceeded(arn: &str, requested: usize) -> LimitExceededException {
+    LimitExceededException {
+        message: Some(format!(
+            "{arn} would carry {requested} tags, more than the {TAG_QUOTA} a resource may have."
+        )),
+    }
+}
+
+/// The `ValidationException` payload for an ARN that names no resource of this
+/// account — "an exception for accessing or deleting a resource that doesn't exist",
+/// which is how the tag-writing operations model that refusal (neither declares
+/// `ResourceNotFoundException`).
+pub fn tagged_resource_absent(arn: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!("Resource not found: {arn}")),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for the same miss on an operation that
+/// DOES model it — the mirror of [`tagged_resource_absent`], so one refusal reads
+/// like the other.
+pub fn tagged_resource_not_found(arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Resource not found: {arn}")),
+    }
+}
 
 /// How long work this control plane starts takes before the clock owes its outcome:
 /// a domain stays `Processing` after the call that started it (`CreateDomain`, or an
@@ -445,6 +512,45 @@ impl DataSource {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// VPC endpoint access
+//
+// An authorization is a principal's access to ONE domain through an interface
+// VPC endpoint: `AuthorizeVpcEndpointAccess` grants it, `ListVpcEndpointAccess`
+// reports every principal that holds one and `RevokeVpcEndpointAccess` takes it
+// away. The set lives on the domain itself ([`Domain::vpc_endpoint_access`]).
+// ---------------------------------------------------------------------------
+
+/// `PrincipalType`'s `AWS_ACCOUNT` value: the authorized principal is an Amazon Web
+/// Services account, named by its account id.
+pub const PRINCIPAL_TYPE_AWS_ACCOUNT: &str = "AWS_ACCOUNT";
+
+/// `PrincipalType`'s `AWS_SERVICE` value — the other member of that same two-value
+/// enum: the authorized principal is a service, named by its service principal.
+pub const PRINCIPAL_TYPE_AWS_SERVICE: &str = "AWS_SERVICE";
+
+/// How many principals ONE domain's VPC endpoint access set holds before
+/// `AuthorizeVpcEndpointAccess` refuses with the modelled `LimitExceededException`.
+///
+/// Like [`DATA_SOURCE_QUOTA`] this is the emulator's OWN bound on the store — it
+/// models neither Service Quotas nor an account's adjustments — and it is what stops
+/// a caller looping with fresh principals from growing the state without end: every
+/// record it counts is released when `DeleteDomain` releases the domain that holds it
+/// (`RevokeVpcEndpointAccess`, which releases one on its own, is still a stub).
+/// Because the per-domain set IS what `ListVpcEndpointAccess` answers with, and that
+/// set is held on the domain, with [`DOMAIN_QUOTA`] it also bounds the whole
+/// authorization store.
+pub const VPC_ENDPOINT_ACCESS_QUOTA: usize = 50;
+
+/// How many authorized principals ONE page of `ListVpcEndpointAccess` carries.
+///
+/// That operation takes a `NextToken` and its response declares one as REQUIRED, so
+/// the listing is paged; the model gives it no page-size member, so the page size is
+/// the service's to pick and this is the emulator's choice of it. It is smaller than
+/// [`VPC_ENDPOINT_ACCESS_QUOTA`], so a domain's set can span more than one page and a
+/// caller that ignores the token cannot mistake a first page for the whole set.
+pub const VPC_ENDPOINT_ACCESS_PAGE: usize = 10;
 
 // ---------------------------------------------------------------------------
 // Indexes
@@ -1162,7 +1268,10 @@ pub struct Domain {
     pub aiml_options: Option<AIMLOptionsOutput>,
     pub deployment_strategy_options: Option<DeploymentStrategyOptions>,
     pub automated_snapshot_pause_options: Option<AutomatedSnapshotPauseOptions>,
-    pub tags: Vec<Tag>,
+    /// The resource tags attached to this domain: the ONE copy `CreateDomain`'s
+    /// `TagList`, `AddTags`, `RemoveTags` and `ListTags` all write and read, so no
+    /// two of them can report the same domain's tags differently. See [`TagSet`].
+    pub tags: TagSet,
     pub created_at: SystemTime,
     /// The instant of the last call that changed any option.
     pub updated_at: SystemTime,
@@ -1174,6 +1283,22 @@ pub struct Domain {
     /// domain, so the name IS the key. Iterating a `BTreeMap` is order-stable, which
     /// is what lets `ListDataSources` report the same order twice.
     pub data_sources: BTreeMap<String, DataSource>,
+    /// Every principal allowed to reach this domain through an interface VPC
+    /// endpoint, keyed by the principal itself — an account id or a service
+    /// principal, which is what identifies it, so one principal holds at most one
+    /// authorization however many times it is authorized. Bounded by
+    /// [`VPC_ENDPOINT_ACCESS_QUOTA`].
+    ///
+    /// `AuthorizeVpcEndpointAccess` mints an entry, `ListVpcEndpointAccess` reports
+    /// the set and `RevokeVpcEndpointAccess` removes one — all from THIS map, so the
+    /// grant's own answer and a later listing cannot disagree. Held on the domain
+    /// rather than beside it, because an authorization is access TO a domain: the
+    /// record goes when `DeleteDomain` releases the domain it belongs to.
+    ///
+    /// Iterating a `BTreeMap` is order-stable, which is what lets a paged listing
+    /// resume where the previous page stopped without repeating or skipping a
+    /// principal.
+    pub vpc_endpoint_access: BTreeMap<String, AuthorizedPrincipal>,
     /// This domain's OpenSearch indexes, keyed by their `IndexName` — unique per
     /// domain, so the name IS the key. `CreateIndex` mints one and `GetIndex`
     /// reports it, from THIS one record, and deleting the domain releases every
@@ -3157,6 +3282,31 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
         for package in self.packages.values_mut() {
             package.settle(now);
         }
+    }
+
+    /// The tag set of the resource `arn` names, for a caller about to READ it.
+    ///
+    /// A domain is the taggable resource this store persists an ARN for
+    /// ([`domain_arn`]); the other two the tagging operations name — a data source
+    /// and an application — have no stored ARN to resolve against (a data source is
+    /// addressed by its domain and name, and no operation that mints an application
+    /// is implemented), so an ARN naming neither resolves to nothing and the caller
+    /// refuses it.
+    pub fn tagged_resource(&self, arn: &str) -> Option<&TagSet> {
+        self.domains
+            .values()
+            .find(|domain| domain.arn == arn)
+            .map(|domain| &domain.tags)
+    }
+
+    /// The tag set of the resource `arn` names, for a caller about to WRITE it —
+    /// resolved exactly as [`Self::tagged_resource`] resolves it, so a tag write and
+    /// a tag read can never disagree about which resource an ARN names.
+    pub fn tagged_resource_mut(&mut self, arn: &str) -> Option<&mut TagSet> {
+        self.domains
+            .values_mut()
+            .find(|domain| domain.arn == arn)
+            .map(|domain| &mut domain.tags)
     }
 
     /// The package `package_name` names, if the account holds one.

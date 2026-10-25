@@ -223,6 +223,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(format!("channel {} not found", input.channel_arn)),
             })
         })?;
+        // A ban puts a member outside the channel altogether; a PUBLIC channel's messages
+        // can be listed without a membership and a PRIVATE channel's only by its members
+        // — the rule the model states on `CreateChannelMembership`.
+        if let Some(reason) = channel.read_refusal(&input.chime_bearer) {
+            return Err(ListChannelMessagesErrorModeled::ForbiddenException(ForbiddenException {
+                code: Some("Forbidden".to_string()),
+                message: Some(reason.to_string()),
+            })
+            .into());
+        }
 
         // The stored order IS ascending `CreatedTimestamp`, because messages are
         // appended as they are accepted; DESCENDING is that view reversed. The

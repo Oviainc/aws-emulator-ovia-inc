@@ -60,10 +60,20 @@
 //! whose condition may not hold is not a grant) while it still refuses (a `Deny` whose
 //! condition may hold is never weakened into permission). That is the fail-closed reading
 //! in both directions; nothing here guesses a condition value.
+//!
+//! A key the request carries SEVERAL values for — the session tag keys of an STS mint,
+//! say — is passed as one `(key, value)` pair per value, and is decided only under one of
+//! IAM's set qualifiers (`ForAllValues:` / `ForAnyValue:` before the operator), by IAM's
+//! own rule for the empty set: `ForAllValues:` holds when the request carries no value for
+//! the key, `ForAnyValue:` does not. That empty-set reading applies only to a key the
+//! request DECLARES it models ([`Request::published`]); for every other key, absence from
+//! the context means this emulator does not model it and the clause stays undecided, the
+//! same fail-closed reading as everywhere else here. Under an UNqualified operator a
+//! multi-valued key is left undecided rather than compared against one of its values.
 
 /// The string condition operators this evaluator decides. Everything else — the numeric,
-/// date, IP, ARN and `Null` operators, and the `ForAnyValue:`/`ForAllValues:` set
-/// qualifiers — leaves the statement undecided (see the module docs).
+/// date, IP, ARN and `Null` operators — leaves the statement undecided (see the module
+/// docs). Each of them may be written under a set qualifier; see [`split_set_qualifier`].
 const STRING_OPERATORS: &[&str] = &[
     "StringEquals",
     "StringNotEquals",
@@ -109,6 +119,11 @@ pub struct Request<'a> {
     /// The condition keys whose values this request knows, as `(key, value)` pairs. A
     /// clause over any other key leaves its statement undecided.
     pub context: &'a [(String, String)],
+    /// The condition keys this request MODELS, whether or not it carries a value for
+    /// each — the keys whose absence from [`Self::context`] means "the caller passed
+    /// none" rather than "this emulator does not model the key". Only these get IAM's
+    /// empty-set reading under a set qualifier; see the module docs.
+    pub published: &'a [&'a str],
 }
 
 impl<'a> Request<'a> {
@@ -120,12 +135,21 @@ impl<'a> Request<'a> {
             resource,
             principals,
             context: &[],
+            published: &[],
         }
     }
 
     /// The same request, carrying the condition keys `context` names.
     pub fn with_context(mut self, context: &'a [(String, String)]) -> Self {
         self.context = context;
+        self
+    }
+
+    /// The same request, declaring the condition keys it MODELS. See
+    /// [`Self::published`].
+    #[must_use]
+    pub fn with_published_keys(mut self, published: &'a [&'a str]) -> Self {
+        self.published = published;
         self
     }
 }
@@ -454,8 +478,18 @@ fn principal_values(value: &::serde_json::Value) -> Option<Vec<&str>> {
 /// `Some(true)` when the statement carries no `Condition` or every clause holds,
 /// `Some(false)` when a clause this evaluator decides does NOT hold (so the statement does
 /// not apply, whichever effect it states), and `None` when a clause cannot be decided at
-/// all — an operator outside [`STRING_OPERATORS`], or a key the request context does not
-/// carry — which the caller reads fail-closed in both directions.
+/// all — an operator outside [`STRING_OPERATORS`], or a single-valued key the request
+/// context does not carry — which the caller reads fail-closed in both directions.
+///
+/// A key the request carries SEVERAL values for (the session tag keys of an STS mint,
+/// say) is decided only under one of the set qualifiers, and then by IAM's own rule for
+/// the empty set: `ForAllValues:` "returns true if there are no request values" while
+/// `ForAnyValue:` returns false. That empty-set reading applies ONLY to a key the request
+/// DECLARES it models ([`Request::published`]), because here absence from the context
+/// otherwise means "this emulator does not model the key" rather than "the caller passed
+/// no values", and reading the first as the second would turn an undecided `Allow` into a
+/// grant. A multi-valued key under an UNqualified operator is left undecided rather than
+/// compared against one of its values.
 fn conditions_hold(statement: &::serde_json::Value, request: &Request<'_>) -> Option<bool> {
     let Some(clauses) = statement["Condition"].as_object() else {
         // No condition at all holds trivially; an element that is not a map is not a
@@ -463,22 +497,75 @@ fn conditions_hold(statement: &::serde_json::Value, request: &Request<'_>) -> Op
         return statement["Condition"].is_null().then_some(true);
     };
     let mut held = true;
-    for (operator, keys) in clauses {
+    for (clause, keys) in clauses {
         let keys = keys.as_object()?;
-        if !STRING_OPERATORS.contains(&operator.as_str()) {
+        let (qualifier, operator) = split_set_qualifier(clause);
+        if !STRING_OPERATORS.contains(&operator) {
             return None;
         }
         for (key, expected) in keys {
-            let actual = request
+            let actual: Vec<&str> = request
                 .context
                 .iter()
-                .find(|(known, _)| known.eq_ignore_ascii_case(key))
-                .map(|(_, value)| value.as_str())?;
+                .filter(|(known, _)| known.eq_ignore_ascii_case(key))
+                .map(|(_, value)| value.as_str())
+                .collect();
             let expected = super::iam_trust_policy::json_strings(expected);
-            held = held && clause_holds(operator, &expected, actual);
+            let decided = match qualifier {
+                // Unqualified: the key must carry exactly one value for the comparison
+                // to mean what IAM means by it.
+                None => match actual[..] {
+                    [one] => clause_holds(operator, &expected, one),
+                    _ => return None,
+                },
+                // Under a qualifier, a key with no values is IAM's empty set — but only
+                // where the request DECLARES it models the key; otherwise its absence is
+                // this emulator not modelling it, which decides nothing.
+                Some(_)
+                    if actual.is_empty()
+                        && !request
+                            .published
+                            .iter()
+                            .any(|known| known.eq_ignore_ascii_case(key)) =>
+                {
+                    return None
+                }
+                Some(SetQualifier::ForAllValues) => actual
+                    .iter()
+                    .all(|value| clause_holds(operator, &expected, value)),
+                Some(SetQualifier::ForAnyValue) => actual
+                    .iter()
+                    .any(|value| clause_holds(operator, &expected, value)),
+            };
+            held = held && decided;
         }
     }
     Some(held)
+}
+
+/// The set qualifier a condition clause's key may be written with, for a request key that
+/// carries SEVERAL values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetQualifier {
+    /// Every value the request carries for the key must satisfy the clause.
+    ForAllValues,
+    /// At least one value the request carries for the key must satisfy it.
+    ForAnyValue,
+}
+
+/// Split a condition clause's name into its set qualifier, if it carries one, and the
+/// operator itself: `ForAllValues:StringEquals` is `StringEquals` under
+/// [`SetQualifier::ForAllValues`].
+fn split_set_qualifier(clause: &str) -> (Option<SetQualifier>, &str) {
+    for (prefix, qualifier) in [
+        ("ForAllValues:", SetQualifier::ForAllValues),
+        ("ForAnyValue:", SetQualifier::ForAnyValue),
+    ] {
+        if let Some(operator) = clause.strip_prefix(prefix) {
+            return (Some(qualifier), operator);
+        }
+    }
+    (None, clause)
 }
 
 /// Whether one decided string clause holds: `expected` are the clause's values, `actual`
@@ -786,6 +873,137 @@ mod tests {
                 "case {case:?}: expected {expected:?}, got {reached:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_set_qualifier_decides_a_key_the_request_carries_several_values_for() {
+        let statement = |condition: &str| {
+            identity(&format!(
+                "{{\"Effect\":\"Allow\",\"Action\":\"rum:PutRumEvents\",\"Resource\":\"*\",\
+                 \"Condition\":{condition}}}"
+            ))
+        };
+        let held = principals();
+        // Two values for one key, as a caller passes a multi-valued condition key.
+        let two = [
+            ("aws:TagKeys".to_string(), "Project".to_string()),
+            ("aws:TagKeys".to_string(), "Owner".to_string()),
+        ];
+        let one = [("aws:TagKeys".to_string(), "Project".to_string())];
+        let none: [(String, String); 0] = [];
+
+        // The rows differ along what the rule generalises over: the qualifier, how many
+        // values the request carries (two, one, none), whether the clause's values cover
+        // them, and whether the request MODELS the key at all.
+        type QualifierRow<'a> = (&'a str, &'a str, &'a [(String, String)], Decision);
+        let rows: [QualifierRow<'_>; 8] = [
+            (
+                "ForAllValues over both values, both covered",
+                "{\"ForAllValues:StringEquals\":{\"aws:TagKeys\":[\"Project\",\"Owner\"]}}",
+                &two,
+                Decision::Allowed,
+            ),
+            (
+                "ForAllValues over both values, only one covered",
+                "{\"ForAllValues:StringEquals\":{\"aws:TagKeys\":[\"Project\"]}}",
+                &two,
+                Decision::NotStated,
+            ),
+            (
+                "ForAllValues over one value, covered",
+                "{\"ForAllValues:StringEquals\":{\"aws:TagKeys\":[\"Project\",\"Owner\"]}}",
+                &one,
+                Decision::Allowed,
+            ),
+            (
+                "ForAllValues over a modelled key the request carries no value for, \
+                 which IAM holds true",
+                "{\"ForAllValues:StringEquals\":{\"aws:TagKeys\":[\"Project\"]}}",
+                &none,
+                Decision::Allowed,
+            ),
+            (
+                "ForAnyValue over both values, one covered",
+                "{\"ForAnyValue:StringEquals\":{\"aws:TagKeys\":[\"Owner\"]}}",
+                &two,
+                Decision::Allowed,
+            ),
+            (
+                "ForAnyValue over both values, none covered",
+                "{\"ForAnyValue:StringEquals\":{\"aws:TagKeys\":[\"Team\"]}}",
+                &two,
+                Decision::NotStated,
+            ),
+            (
+                "ForAnyValue over a modelled key the request carries no value for, \
+                 which IAM holds false",
+                "{\"ForAnyValue:StringEquals\":{\"aws:TagKeys\":[\"Project\"]}}",
+                &none,
+                Decision::NotStated,
+            ),
+            (
+                "an unqualified operator on a key carrying several values",
+                "{\"StringEquals\":{\"aws:TagKeys\":\"Project\"}}",
+                &two,
+                Decision::NotStated,
+            ),
+        ];
+
+        // The key every row above declares the request MODELS, so an empty set is the
+        // caller passing no values rather than this evaluator not knowing the key.
+        let published = ["aws:TagKeys"];
+        for (case, condition, context, expected) in rows {
+            let request = Request::new("rum:PutRumEvents", RESOURCE, &held)
+                .with_context(context)
+                .with_published_keys(&published);
+            let reached = identity_decision(&[statement(condition)], &request);
+            assert_eq!(
+                reached, expected,
+                "case {case:?}: expected {expected:?}, got {reached:?}"
+            );
+        }
+
+        // A key the request does NOT model is undecided whatever the qualifier says, so
+        // neither spelling turns an `Allow` into a grant: absence there means this
+        // evaluator was told nothing about the key, not that the caller passed no values.
+        for (case, condition) in [
+            (
+                "ForAllValues over a key the request does not model",
+                "{\"ForAllValues:StringEquals\":{\"aws:SourceVpc\":[\"vpc-1\"]}}",
+            ),
+            (
+                "ForAnyValue over a key the request does not model",
+                "{\"ForAnyValue:StringEquals\":{\"aws:SourceVpc\":[\"vpc-1\"]}}",
+            ),
+        ] {
+            let request = Request::new("rum:PutRumEvents", RESOURCE, &held)
+                .with_context(&two)
+                .with_published_keys(&published);
+            let reached = identity_decision(&[statement(condition)], &request);
+            assert_eq!(
+                reached,
+                Decision::NotStated,
+                "case {case:?}: expected the clause to grant nothing, got {reached:?}"
+            );
+        }
+
+        // A wildcard pattern under a qualifier is the same matcher the unqualified
+        // operator uses.
+        let request = Request::new("rum:PutRumEvents", RESOURCE, &held)
+            .with_context(&two)
+            .with_published_keys(&published);
+        let reached = identity_decision(
+            &[statement(
+                "{\"ForAllValues:StringLike\":{\"aws:TagKeys\":[\"Pro*\",\"Own*\"]}}",
+            )],
+            &request,
+        );
+        assert_eq!(
+            reached,
+            Decision::Allowed,
+            "case 'ForAllValues:StringLike': expected the wildcards to cover both values, got \
+             {reached:?}"
+        );
     }
 
     #[test]
