@@ -17,6 +17,8 @@ mod arn_read_precondition;
 mod contact_channel_deactivation;
 #[path = "all/contact_channel_name_uniqueness.rs"]
 mod contact_channel_name_uniqueness;
+#[path = "all/contact_channel_updates.rs"]
+mod contact_channel_updates;
 #[path = "all/contact_lifecycle.rs"]
 mod contact_lifecycle;
 #[path = "all/contact_plan_references.rs"]
