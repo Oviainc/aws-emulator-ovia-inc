@@ -637,6 +637,14 @@ pub const RESOURCE_TYPE_CALL_ANALYTICS_CATEGORY: &str = "analytics-category";
 /// family's published `<type>/${JobName}` segment — the same hyphenated family name
 /// the other job families' types use. See [`RESOURCE_TYPE_TRANSCRIPTION_JOB`].
 pub const RESOURCE_TYPE_MEDICAL_SCRIBE_JOB: &str = "medical-scribe-job";
+/// The ARN resource type of a Call Analytics JOB, spelled as this family's published
+/// `<type>/${JobName}` segment
+/// (`arn:${Partition}:transcribe:${Region}:${Account}:analytics-job/${JobName}`) — the
+/// same hyphenation the sibling Call Analytics family uses
+/// ([`RESOURCE_TYPE_CALL_ANALYTICS_CATEGORY`]). A resource type of its own, so a Call
+/// Analytics job and a transcription job of the same name are two resources. See
+/// [`RESOURCE_TYPE_TRANSCRIPTION_JOB`].
+pub const RESOURCE_TYPE_CALL_ANALYTICS_JOB: &str = "analytics-job";
 
 /// The word this service's own client-error messages use for the kind of resource an
 /// ARN's `<type>` segment names, for each type this emulator stores records of.
@@ -688,6 +696,8 @@ pub enum ResourceFamily {
     CallAnalyticsCategory,
     /// [`RESOURCE_TYPE_MEDICAL_SCRIBE_JOB`].
     MedicalScribeJob,
+    /// [`RESOURCE_TYPE_CALL_ANALYTICS_JOB`].
+    CallAnalyticsJob,
 }
 
 impl ResourceFamily {
@@ -704,6 +714,7 @@ impl ResourceFamily {
             RESOURCE_TYPE_LANGUAGE_MODEL => Some(Self::LanguageModel),
             RESOURCE_TYPE_CALL_ANALYTICS_CATEGORY => Some(Self::CallAnalyticsCategory),
             RESOURCE_TYPE_MEDICAL_SCRIBE_JOB => Some(Self::MedicalScribeJob),
+            RESOURCE_TYPE_CALL_ANALYTICS_JOB => Some(Self::CallAnalyticsJob),
             _ => None,
         }
     }
@@ -719,19 +730,21 @@ impl ResourceFamily {
             Self::LanguageModel => RESOURCE_TYPE_LANGUAGE_MODEL,
             Self::CallAnalyticsCategory => RESOURCE_TYPE_CALL_ANALYTICS_CATEGORY,
             Self::MedicalScribeJob => RESOURCE_TYPE_MEDICAL_SCRIBE_JOB,
+            Self::CallAnalyticsJob => RESOURCE_TYPE_CALL_ANALYTICS_JOB,
         }
     }
 
     /// The word this service's own client-error messages name this family by.
     ///
-    /// A Medical Scribe job and a medical transcription job are each a "job" like the
-    /// transcription-job family: the recorded not-found response of every job family
-    /// reads "The requested job couldn't be found."
+    /// A Medical Scribe job, a Call Analytics job and a medical transcription job are
+    /// each a "job" like the transcription-job family: the recorded not-found response
+    /// of every job family reads "The requested job couldn't be found."
     pub fn kind(self) -> &'static str {
         match self {
-            Self::TranscriptionJob | Self::MedicalTranscriptionJob | Self::MedicalScribeJob => {
-                KIND_JOB
-            }
+            Self::TranscriptionJob
+            | Self::MedicalTranscriptionJob
+            | Self::MedicalScribeJob
+            | Self::CallAnalyticsJob => KIND_JOB,
             Self::Vocabulary => KIND_VOCABULARY,
             Self::MedicalVocabulary => KIND_MEDICAL_VOCABULARY,
             Self::VocabularyFilter => KIND_VOCABULARY_FILTER,
@@ -1198,10 +1211,10 @@ pub struct ComAmazonawsTranscribeTranscribeState {
     /// account" — model doc for `CallAnalyticsJob$CallAnalyticsJobName`).
     ///
     /// A family of its own: a Call Analytics job and a transcription job may share a
-    /// name, and like the Medical Scribe jobs it is absent from [`Self::tags`] /
-    /// [`Self::tags_mut`] because this emulator has no recorded spelling for the ARN
-    /// `<type>` segment of a Call Analytics job. The tags its start request asked for
-    /// are carried on the record and reported by that family's own operations.
+    /// name. A job of this family carries the tags its start request asked for, reports
+    /// them through its own operations, and is reachable from [`Self::tags`] /
+    /// [`Self::tags_mut`] under [`RESOURCE_TYPE_CALL_ANALYTICS_JOB`], like every other
+    /// family this state holds records of.
     pub call_analytics_jobs: RegionalStore<CallAnalyticsJobRecord>,
     /// Source of [`TranscriptionJobRecord::sequence`]: a monotonic counter, so
     /// creation order is total even when two jobs start in the same clock tick.
@@ -1525,6 +1538,10 @@ impl ComAmazonawsTranscribeTranscribeState {
                 .medical_scribe_jobs
                 .get(region, name)
                 .map(|record| &record.tags),
+            ResourceFamily::CallAnalyticsJob => self
+                .call_analytics_jobs
+                .get(region, name)
+                .map(|record| &record.tags),
         }
     }
 
@@ -1577,6 +1594,10 @@ impl ComAmazonawsTranscribeTranscribeState {
                 .map(|record| &mut record.tags),
             ResourceFamily::MedicalScribeJob => self
                 .medical_scribe_jobs
+                .get_mut(region, &resource.name)
+                .map(|record| &mut record.tags),
+            ResourceFamily::CallAnalyticsJob => self
+                .call_analytics_jobs
                 .get_mut(region, &resource.name)
                 .map(|record| &mut record.tags),
         }
