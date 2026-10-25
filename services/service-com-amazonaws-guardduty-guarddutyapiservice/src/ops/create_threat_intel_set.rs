@@ -267,6 +267,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // create-and-delete cycles a caller sends.
         detector.evict_deleted_threat_intel_sets(None);
         detector.threat_intel_sets.insert(id.clone(), record);
+        // The detector itself changed: it holds one more sub-resource than before,
+        // the same rule every other sub-resource create on this detector follows,
+        // and the one `DeleteThreatIntelSet` records in the other direction. A
+        // replayed token minted nothing and returned above, so it moves nothing, and
+        // a refused create returned before the clock moved at all.
+        detector.updated_at_millis = now;
 
         Ok(CreateThreatIntelSetOutput {
             threat_intel_set_id: id,
