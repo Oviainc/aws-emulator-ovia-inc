@@ -47,6 +47,8 @@ mod private_connectivity;
 mod private_connectivity_ownership;
 #[path = "all/quote_lifecycle.rs"]
 mod quote_lifecycle;
+#[path = "all/quote_listing.rs"]
+mod quote_listing;
 #[path = "all/quote_update.rs"]
 mod quote_update;
 #[path = "all/regional_scope.rs"]

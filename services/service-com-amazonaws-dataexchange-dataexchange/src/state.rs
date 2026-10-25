@@ -167,6 +167,83 @@ pub struct ComAmazonawsDataexchangeDataexchangeState {
     pub job_order: Vec<String>,
 }
 
+impl ComAmazonawsDataexchangeDataexchangeState {
+    /// The tags stored on the resource the tagging `ResourceArn` addresses, or `None`
+    /// when this emulator holds no resource with that ARN.
+    ///
+    /// The target is located by the ARN each resource was MINTED with
+    /// ([`data_set_arn`], [`revision_arn`]), so the whole ARN — partition, vendor,
+    /// region, account and resource path — is the identity being compared, and this
+    /// crate holds no second account of what an ARN looks like: an ARN naming the
+    /// same ids under another partition, region or account addresses nothing,
+    /// because those fields are part of a resource's identity.
+    ///
+    /// The scan is bounded by the store: at most [`MAX_DATA_SETS`] data sets, each
+    /// holding at most [`MAX_REVISIONS_PER_DATA_SET`] revisions.
+    ///
+    /// A data set and its revisions are the taggable resources this emulator stores.
+    /// The model's other two — event actions and data grants, whose creates also
+    /// carry `Tags` — are minted by operations that are still scaffolds, so no ARN
+    /// can address one yet, and one will be found here as soon as the record exists.
+    pub fn resource_tags(&self, resource_arn: &str) -> Option<&HashMap<String, String>> {
+        self.data_sets.values().find_map(|data_set| {
+            if data_set.arn == resource_arn {
+                return Some(&data_set.tags);
+            }
+            data_set
+                .revisions
+                .values()
+                .find(|revision| revision.arn == resource_arn)
+                .map(|revision| &revision.tags)
+        })
+    }
+
+    /// The same lookup as [`Self::resource_tags`], for a tag write.
+    pub fn resource_tags_mut(
+        &mut self,
+        resource_arn: &str,
+    ) -> Option<&mut HashMap<String, String>> {
+        self.data_sets.values_mut().find_map(|data_set| {
+            if data_set.arn == resource_arn {
+                return Some(&mut data_set.tags);
+            }
+            data_set
+                .revisions
+                .values_mut()
+                .find(|revision| revision.arn == resource_arn)
+                .map(|revision| &mut revision.tags)
+        })
+    }
+}
+
+/// What a value must start with to be an Amazon Resource Name.
+///
+/// This is the whole of the ARN grammar this crate states. WHICH resource a tagging
+/// `ResourceArn` addresses is decided by comparing it with the ARNs this service
+/// minted ([`ComAmazonawsDataexchangeDataexchangeState::resource_tags`]), so the ARN
+/// a resource carries is read in exactly one place — the builders
+/// [`data_set_arn`] / [`revision_arn`] — and no second parse can disagree with them.
+const ARN_PREFIX: &str = "arn:";
+
+/// Whether `value` is an Amazon Resource Name at all, as opposed to an identifier, a
+/// name or any other text a caller may have sent in a `ResourceArn`.
+///
+/// A value that is not one is a bad REQUEST (the member cannot name a resource of any
+/// service), which is a different answer from an ARN that addresses no resource this
+/// emulator holds — that one is the modelled 404 ([`tagged_resource_not_found`]).
+pub fn is_resource_arn(value: &str) -> bool {
+    value.starts_with(ARN_PREFIX)
+}
+
+/// The 400 for a `ResourceArn` that is not an Amazon Resource Name, naming the member
+/// and what it has to carry so the caller can fix the request from the text alone.
+pub fn resource_arn_not_an_arn(value: &str) -> ValidationException {
+    invalid_request(format!(
+        "ResourceArn must be an Amazon Resource Name of the form \
+         arn:<partition>:{SERVICE}:<region>:<account>:<resource>, got {value:?}"
+    ))
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
@@ -230,6 +307,21 @@ pub fn job_not_found(job_id: &str) -> ResourceNotFoundException {
         message: format!("The job {job_id} couldn't be found."),
         resource_id: Some(job_id.to_string()),
         resource_type: Some(RESOURCE_TYPE_JOB.to_string()),
+    }
+}
+
+/// The modelled 404 for a tagging `ResourceArn` that is an ARN but addresses no
+/// resource this emulator holds.
+///
+/// `ResourceId` is the ARN the caller wrote — the only identifier of the resource
+/// this call named — and `ResourceType` is left absent, because an ARN that
+/// addresses nothing stored names no resource whose kind this service can state. The
+/// id-addressed 404s above report both, since there the kind is the route's.
+pub fn tagged_resource_not_found(resource_arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("The resource {resource_arn} couldn't be found."),
+        resource_id: Some(resource_arn.to_string()),
+        resource_type: None,
     }
 }
 

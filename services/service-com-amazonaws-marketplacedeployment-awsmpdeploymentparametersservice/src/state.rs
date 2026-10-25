@@ -762,30 +762,28 @@ pub fn is_tag_value(candidate: &str) -> bool {
     tag_text_len(candidate) <= TAG_VALUE_MAX_LEN
 }
 
-/// Merge `incoming` onto `existing`, or say why the result could not be stored.
+/// Judge the tag map a request CARRIES, before anything is read or written.
 ///
-/// A key already present takes the new value. The merge is computed BEFORE
-/// anything is stored, so a refused request leaves the record exactly as it was.
+/// This is a judgement on the INPUT alone: every entry of `incoming` is held to
+/// AWS's own tagging limits — a key in no reserved namespace
+/// ([`validate_tag_keys_unreserved`]) and the length bounds [`is_tag_key`] /
+/// [`is_tag_value`] state — and a map arriving through a member that targets the
+/// modelled constrained map is additionally held to the character class that map's
+/// key shape states ([`TagConstraints`]).
+///
+/// Because it judges only the input, a request carrying a tag the member does not
+/// admit is refused the SAME way whichever path the operation would then take, and
+/// whether or not the tags would have been applied at all: an operation runs this
+/// over its `tags` ahead of resolving anything, and nothing is stored either way.
+/// [`merge_tags`] runs it too, so no merge can store an entry this would refuse.
+///
 /// `incoming` is walked in key order, so the key a refusal names does not depend on
 /// hash iteration order.
-///
-/// `constraints` is what the MEMBER the tags arrived through targets
-/// ([`TagConstraints`]): every merge is held to AWS's own tagging limits — a
-/// non-empty key, the length bounds [`is_tag_key`] / [`is_tag_value`] state, and
-/// [`MAX_TAGS_PER_RESOURCE`] entries on the resulting record — and a merge through a
-/// member targeting the modelled constrained map is additionally held to the
-/// character class that map's key shape states.
-///
-/// A key in the namespace AWS reserves is refused here as well
-/// ([`validate_tag_keys_unreserved`]), so no merge can leave a reserved key on a
-/// record whatever path reached this function.
-pub fn merge_tags(
-    existing: &BTreeMap<String, String>,
+pub fn validate_tags_member(
     incoming: &HashMap<String, String>,
     constraints: TagConstraints,
-) -> Result<BTreeMap<String, String>, ValidationException> {
+) -> Result<(), ValidationException> {
     validate_tag_keys_unreserved(incoming.keys().map(String::as_str), "tags")?;
-    let mut merged = existing.clone();
     let ordered: BTreeMap<&String, &String> = incoming.iter().collect();
     for (key, value) in ordered {
         if !is_tag_key(key) {
@@ -815,6 +813,31 @@ pub fn merge_tags(
                 field_name: "tags".to_string(),
             });
         }
+    }
+    Ok(())
+}
+
+/// Merge `incoming` onto `existing`, or say why the result could not be stored.
+///
+/// A key already present takes the new value. The merge is computed BEFORE
+/// anything is stored, so a refused request leaves the record exactly as it was.
+///
+/// Every entry of `incoming` is judged first ([`validate_tags_member`], which the
+/// operations also run on their own input ahead of resolving anything), so no merge
+/// can leave on a record an entry that judgement refuses — a reserved-namespace key,
+/// a key or value outside its length bound, or a key outside the character class the
+/// member's own map shape states. What this adds is the one limit that is a property
+/// of the RESULT rather than of the input: [`MAX_TAGS_PER_RESOURCE`] entries on the
+/// record the merge would leave.
+pub fn merge_tags(
+    existing: &BTreeMap<String, String>,
+    incoming: &HashMap<String, String>,
+    constraints: TagConstraints,
+) -> Result<BTreeMap<String, String>, ValidationException> {
+    validate_tags_member(incoming, constraints)?;
+    let mut merged = existing.clone();
+    let ordered: BTreeMap<&String, &String> = incoming.iter().collect();
+    for (key, value) in ordered {
         merged.insert(key.clone(), value.clone());
     }
     if merged.len() > MAX_TAGS_PER_RESOURCE {

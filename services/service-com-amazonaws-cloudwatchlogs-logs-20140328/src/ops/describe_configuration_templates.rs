@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeConfigurationTemplates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeConfigurationTemplates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeConfigurationTemplates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the service-managed catalogue of vended-log delivery configuration templates
+//! ([`crate::state::configuration_templates`]): every template whose service, log type,
+//! resource type and delivery destination type the request's filters select (or all of them,
+//! when it names no filter), in template order, one `limit`-sized page at a time.
+//!
+//! Nothing here is an account's resource: no operation creates, updates or deletes a
+//! template, so this operation reads the catalogue and writes nothing, and two calls report
+//! the same templates.
 //!
 //! ## Shape of an operation
 //!
@@ -124,6 +124,87 @@ impl From<DescribeConfigurationTemplatesErrorModeled> for DescribeConfigurationT
     }
 }
 
+/// The kind tag this operation's pagination cursor carries, so a token minted by another
+/// paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "DescribeConfigurationTemplates";
+
+/// Where the next page resumes: the key of the last configuration template returned
+/// ([`crate::state::configuration_template_key`]), plus the filters of the enumeration it
+/// belongs to. A continuation that changes a filter is refused, because the token is only a
+/// position within one filtered enumeration.
+#[derive(Debug, Clone)]
+struct Cursor {
+    service: Option<String>,
+    log_types: Option<Vec<String>>,
+    resource_types: Option<Vec<String>>,
+    delivery_destination_types: Option<Vec<String>>,
+    after: String,
+}
+
+impl Cursor {
+    fn encode(&self) -> String {
+        crate::state::encode_token(&::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "service": self.service,
+            "logTypes": self.log_types,
+            "resourceTypes": self.resource_types,
+            "deliveryDestinationTypes": self.delivery_destination_types,
+            "after": self.after,
+        }))
+    }
+
+    fn decode(token: &str) -> Option<Self> {
+        let value = crate::state::decode_token(token)?;
+        if value.get("kind")?.as_str()? != CURSOR_KIND {
+            return None;
+        }
+        let strings = |member: &str| match value.get(member) {
+            None | Some(::serde_json::Value::Null) => Some(None),
+            Some(values) => values
+                .as_array()?
+                .iter()
+                .map(|entry| entry.as_str().map(ToString::to_string))
+                .collect::<Option<Vec<String>>>()
+                .map(Some),
+        };
+        Some(Self {
+            service: match value.get("service") {
+                None | Some(::serde_json::Value::Null) => None,
+                Some(service) => Some(service.as_str()?.to_string()),
+            },
+            log_types: strings("logTypes")?,
+            resource_types: strings("resourceTypes")?,
+            delivery_destination_types: strings("deliveryDestinationTypes")?,
+            after: value.get("after")?.as_str()?.to_string(),
+        })
+    }
+}
+
+/// Whether one template is selected by the request's filters.
+///
+/// Each filter the request names selects the templates "that apply to" the values it names —
+/// so a template qualifies when its own value is among them — and a template must satisfy
+/// EVERY filter the request names, because each one narrows the response further. A filter the
+/// request leaves out selects every template.
+fn selected(
+    input: &DescribeConfigurationTemplatesInput,
+    template: &ConfigurationTemplate,
+) -> bool {
+    let among = |filter: Option<&Vec<String>>, value: Option<&String>| {
+        filter.is_none_or(|values| value.is_some_and(|value| values.contains(value)))
+    };
+    input
+        .service
+        .as_ref()
+        .is_none_or(|service| template.service.as_ref() == Some(service))
+        && among(input.log_types.as_ref(), template.log_type.as_ref())
+        && among(input.resource_types.as_ref(), template.resource_type.as_ref())
+        && among(
+            input.delivery_destination_types.as_ref(),
+            template.delivery_destination_type.as_ref(),
+        )
+}
+
 /// The `DescribeConfigurationTemplates` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -160,18 +241,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeConfigurationTemplates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeConfigurationTemplatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeConfigurationTemplates"))
+        // `ctx` carries only request metadata; which templates this service publishes depends
+        // on none of it.
+        let _ = ctx;
+
+        // The catalogue is service-managed, so no record in the account's store changes what
+        // is reported and nothing is read from it. The store is still required to be there: a
+        // request that reaches a service mounted on no store at all is a server failure, not
+        // an empty catalogue.
+        if crate::state::service_state(&*self.engine).is_none() {
+            return Err(DescribeConfigurationTemplatesError::from(
+                DescribeConfigurationTemplatesErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            ));
+        }
+
+        let invalid = |message: &str| {
+            DescribeConfigurationTemplatesError::from(
+                DescribeConfigurationTemplatesErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message.to_string()),
+                    },
+                ),
+            )
+        };
+
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) = Cursor::decode(token) else {
+                    return Err(invalid("nextToken is not a valid token"));
+                };
+                if cursor.service != input.service
+                    || cursor.log_types != input.log_types
+                    || cursor.resource_types != input.resource_types
+                    || cursor.delivery_destination_types != input.delivery_destination_types
+                {
+                    return Err(invalid(
+                        "nextToken was issued for a different DescribeConfigurationTemplates \
+                         request",
+                    ));
+                }
+                Some(cursor)
+            }
+            None => None,
+        };
+
+        // One enumeration, in catalogue order, of the templates the request's filters select.
+        let catalogue = crate::state::configuration_templates();
+        let matching: Vec<&ConfigurationTemplate> = catalogue
+            .iter()
+            .filter(|template| selected(&input, template))
+            .collect();
+
+        let first = match &cursor {
+            Some(cursor) => matching.partition_point(|template| {
+                crate::state::configuration_template_key(template) <= cursor.after
+            }),
+            None => 0,
+        };
+        // "Use this parameter to limit the number of configuration templates that are returned
+        // in the response." `limit` is modelled `range 1..50`, so the boundary validator has
+        // already refused a value outside it; `max(1)` only keeps the page bounds sane.
+        let limit = usize::try_from(input.limit.unwrap_or(crate::state::DEFAULT_DESCRIBE_LIMIT))
+            .unwrap_or(0)
+            .max(1);
+        let last = first.saturating_add(limit).min(matching.len());
+        let page = &matching[first..last];
+
+        // A token is "The token for the next set of items to return": there is a next set only
+        // while templates remain beyond this page.
+        let next_token = page
+            .last()
+            .filter(|_| last < matching.len())
+            .map(|template| {
+                Cursor {
+                    service: input.service.clone(),
+                    log_types: input.log_types.clone(),
+                    resource_types: input.resource_types.clone(),
+                    delivery_destination_types: input.delivery_destination_types.clone(),
+                    after: crate::state::configuration_template_key(template),
+                }
+                .encode()
+            });
+
+        Ok(DescribeConfigurationTemplatesOutput {
+            configuration_templates: Some(
+                page.iter()
+                    .map(|template| (*template).clone())
+                    .collect::<Vec<ConfigurationTemplate>>(),
+            ),
+            next_token,
+        })
     }
 }

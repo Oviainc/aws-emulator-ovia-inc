@@ -17,6 +17,8 @@ mod destination_service_limit;
 mod reserved_tag_keys;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_key_count.rs"]
+mod tag_key_count;
 #[path = "all/tunnel_lifecycle.rs"]
 mod tunnel_lifecycle;
 #[path = "all/tunnel_refusal_rules.rs"]

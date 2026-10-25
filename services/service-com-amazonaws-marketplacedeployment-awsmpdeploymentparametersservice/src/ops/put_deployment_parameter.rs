@@ -24,7 +24,10 @@
 //! applied here before this request resolves anything) and a call for the same
 //! identity creates a NEW resource rather than updating the expired one. It is
 //! also OPTIONAL, so an update that omits it leaves the stored date alone: only
-//! the members a request carries are applied.
+//! the members a request carries are applied. On the wire it is an RFC 3339
+//! date-time string — the member is `@timestampFormat("date-time")`, and
+//! [`super::types::PutDeploymentParameterInput`]'s schema carries that format — so
+//! a value in any other JSON form is refused before this handler runs.
 //!
 //! A write is TARGETED: the operation "is targeted by `catalog` and
 //! `agreementId`" for the product its URI names, and that target — an agreement
@@ -234,15 +237,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The TAG KEYS next, still before any state is touched: a key in the
-        // namespace AWS reserves for its own generated tags is a bad request, so it
-        // is refused here rather than at the merge below — the judgement is on the
-        // INPUT, so the refusal does not depend on whether this call would create
-        // the parameter (and apply `tags`) or update one that exists (where the
-        // member documents that `tags` is ignored). Nothing is stored either way.
+        // The TAGS next, still before any state is touched: the modelled `tags`
+        // member is judged on the INPUT, so the refusal does not depend on whether
+        // this call would create the parameter (and apply `tags`) or update one that
+        // exists (where the member documents that `tags` is ignored). A key in the
+        // namespace AWS reserves for its own generated tags, a key or value outside
+        // its length bound, and a key outside the character class this member's own
+        // `TagsMap` states are all bad requests, answered here rather than at the
+        // merge below — which runs the same judgement, so no stored record can
+        // disagree with it. Nothing is stored either way.
         if let Some(tags) = input.tags.as_ref() {
             if let Err(why) =
-                crate::state::validate_tag_keys_unreserved(tags.keys().map(String::as_str), "tags")
+                crate::state::validate_tags_member(tags, crate::state::TagConstraints::TagsMap)
             {
                 return Err(PutDeploymentParameterErrorModeled::ValidationException(why).into());
             }

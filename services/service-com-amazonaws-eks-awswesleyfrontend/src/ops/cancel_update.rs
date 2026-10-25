@@ -13,11 +13,18 @@
 //!    `DescribeUpdate` perform;
 //! 2. that cluster must hold the named update id, or the answer is 404
 //!    `ResourceNotFoundException` naming the id, as `DescribeUpdate` answers;
-//! 3. the update must be cancellable — "Cancellation is only performed if the update
-//!    can be cancelled": in flight, of the one cancellable type, on an EKS Auto Mode
-//!    cluster, and still in its node rollback phase — or the answer is 400
-//!    `InvalidRequestException`, which is exactly "the request is invalid given the
-//!    state of the cluster".
+//! 3. the update must be of a cancellable KIND — "Cancellation is only performed if
+//!    the update can be cancelled. Currently, this is supported for VersionRollback
+//!    update types on EKS Auto Mode clusters" — or the answer is 400
+//!    `InvalidParameterException` naming that supported combination. This boundary is a
+//!    property of the named update and its cluster, not of how far the update has got,
+//!    so it is decided BEFORE anything about the update's progress and gives the same
+//!    permanent refusal whether the update is still running or already terminal;
+//! 4. only then does the update's instantaneous progress decide: an update of the
+//!    cancellable kind that is no longer in flight, or whose control plane rollback has
+//!    already begun ("if the control plane rollback has already begun, the cancellation
+//!    request fails"), is 400 `InvalidRequestException`, which is exactly "the request
+//!    is invalid given the state of the cluster".
 //!
 //! A cancellation that is performed is PERSISTED on the update (status `Cancelled`,
 //! plus the `cancellation` the model says is "present only if any cancellation is
@@ -174,6 +181,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }))
         })?;
 
+        // The two 400s this handler can answer are a MODELED distinction, and the error
+        // code is the only thing a client branches on:
+        //
+        // * `InvalidParameterException` — "the specified parameter is invalid" — is the
+        //   permanent, argument-level refusal: the update this request names is not of a
+        //   kind cancellation is supported for, so no amount of waiting makes the call
+        //   succeed and a caller must stop;
+        // * `InvalidRequestException` — "the request is invalid given the state of the
+        //   cluster" — is the state-dependent refusal: the update IS of the supported
+        //   kind, and only where it has got to makes this call impossible.
+        let not_cancellable = |message: String| {
+            CancelUpdateError::from(CancelUpdateErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    cluster_name: Some(input.name.clone()),
+                    message: Some(message),
+                    ..Default::default()
+                },
+            ))
+        };
         let invalid_request = |message: String| {
             CancelUpdateError::from(CancelUpdateErrorModeled::InvalidRequestException(
                 InvalidRequestException {
@@ -243,6 +269,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
+        // "Currently, this is supported for VersionRollback update types on EKS Auto Mode
+        // clusters": WHICH updates can be cancelled at all is settled by the update's
+        // type and its cluster's compute, both of which an update carries for life. So
+        // this boundary is tested FIRST and refuses the same way for an update that is
+        // still running as for one that has already finished — a non-cancellable kind is
+        // never cancellable, and the refusal names the boundary rather than the update's
+        // instantaneous status.
+        if update.r#type != UPDATE_TYPE_VERSION_ROLLBACK {
+            return Err(not_cancellable(format!(
+                "Update is not in a cancellable state. Supported update types: \
+                 {UPDATE_TYPE_VERSION_ROLLBACK}"
+            )));
+        }
+        if !auto_mode {
+            return Err(not_cancellable(format!(
+                "Update is not in a cancellable state. Supported update types: \
+                 {UPDATE_TYPE_VERSION_ROLLBACK} on EKS Auto Mode clusters"
+            )));
+        }
+        // Past this point the update IS of the cancellable kind, so what is left is
+        // state: an update the clock has already carried to a terminal status has nothing
+        // left to stop, ...
         if !update.is_in_progress() {
             return Err(invalid_request(format!(
                 "Update {} is in status {} and is no longer in progress, so it cannot be \
@@ -250,22 +298,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 update.id, update.status
             )));
         }
-        if update.r#type != UPDATE_TYPE_VERSION_ROLLBACK {
-            return Err(invalid_request(format!(
-                "Update {} has type {}. Cancellation is supported only for \
-                 {UPDATE_TYPE_VERSION_ROLLBACK} updates.",
-                update.id, update.r#type
-            )));
-        }
-        if !auto_mode {
-            return Err(invalid_request(format!(
-                "Cluster {} is not an EKS Auto Mode cluster, so update {} cannot be \
-                 cancelled.",
-                input.name, update.id
-            )));
-        }
-        // Past the node rollback phase the control plane rollback has begun, and "if the
-        // control plane rollback has already begun, the cancellation request fails".
+        // ... and past the node rollback phase the control plane rollback has begun, and
+        // "if the control plane rollback has already begun, the cancellation request
+        // fails".
         if update
             .control_plane_phase_at()
             .is_none_or(|begins_at| now >= begins_at)

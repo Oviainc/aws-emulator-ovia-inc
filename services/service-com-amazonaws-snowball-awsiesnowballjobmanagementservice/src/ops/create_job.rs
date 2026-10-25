@@ -11,10 +11,10 @@
 //! `SubJobMetadata`. Every other job type is one plain job. The `JobId` answered is the
 //! main job's for an export order, the job's own otherwise.
 //!
-//! A request that names a `ClusterId` creates a node of that cluster instead: the job's
-//! attributes are the cluster's ("the other job attributes are inherited from the
-//! cluster"), and the create is refused once the cluster holds the five nodes a cluster
-//! supports.
+//! A request that names a `ClusterId` creates a node of that cluster instead: a job
+//! attribute the request leaves out is the cluster's ("the other job attributes are
+//! inherited from the cluster"), while one the request supplies is this job's own, and the
+//! create is refused once the cluster holds the five nodes a cluster supports.
 //!
 //! ## Shape of an operation
 //!
@@ -239,6 +239,13 @@ pub const EXPORT_JOB_TYPE: &str = "EXPORT";
 /// an export, so an order is one device's worth — the documented minimum.
 pub const JOB_PARTS_PER_EXPORT_JOB: usize = 1;
 
+/// What the request supplied for an optional string member, as this operation reads it: a
+/// member the caller left out and a member the caller sent empty both name nothing, so
+/// each counts as not supplied.
+fn supplied(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty())
+}
+
 /// The `CreateJob` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -301,6 +308,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                              again."
                         )),
                         resource_type: Some("longTermPricing".to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The address a device ships to is such a record as well, and it is named the
+        // same way whether or not the order joins a cluster: the check belongs to the
+        // member that names the address, not to one of the two branches below, so a
+        // supplied id that answers to no stored address is refused either way. A
+        // forwarding address is an address too, so the same rule holds for it. This is
+        // exactly what `CreateCluster` does for the same two members.
+        for address_id in [
+            input.address_id.as_deref(),
+            input.forwarding_address_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !store.addresses.contains_key(address_id) {
+                return Err(CreateJobErrorModeled::InvalidResourceException(
+                    InvalidResourceException {
+                        message: Some(format!(
+                            "The address ID {address_id} can't be found. Check the information \
+                             you provided in your last request, and try again."
+                        )),
+                        resource_type: Some("address".to_string()),
                     },
                 )
                 .into());
@@ -371,15 +405,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
 
-            // The node job IS the cluster's attributes, under an id of its own: "you only
-            // need to provide the clusterId value; the other job attributes are inherited
-            // from the cluster", so a member the cluster carries (the address its device
-            // ships to, the description, the resources, the role, the key, the
-            // notification, the shipping speed, the capacity preference, the tax
-            // documents, the on-device services) is taken from the cluster whether or not
-            // the request repeats it — the model says a node request need not carry it,
-            // so carrying it is not an error, and the cluster is what the order agreed.
-            // Only the members a cluster does not model are this request's to supply.
+            // The node job starts as the cluster's attributes, under an id of its own:
+            // "you only need to provide the clusterId value; the other job attributes are
+            // inherited from the cluster" — inheritance is what fills a member the request
+            // leaves OUT, which is the whole of what "you only need to provide" says. A
+            // member the request does carry is this job's own, since every one of them is
+            // a modelled input of this operation and `Description` is documented as "an
+            // optional description of this specific job": per job, not per cluster. So
+            // each member is the value supplied, and the cluster's only where none was.
+            // The members a cluster does not model at all have nothing to inherit, so for
+            // them the request is the only source.
             let job_id = store.mint_job_id();
             let unlock_code = store.mint_unlock_code();
             let mut node = cluster.node_job(
@@ -387,6 +422,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ::std::time::SystemTime::now(),
                 unlock_code,
             );
+            // The job type and the device type are the two the check above has already
+            // held to the cluster's, so a supplied value here equals what was inherited.
+            node.job_type = supplied(input.job_type).or(node.job_type);
+            node.snowball_type = supplied(input.snowball_type).or(node.snowball_type);
+            node.snowball_capacity_preference = supplied(input.snowball_capacity_preference)
+                .or(node.snowball_capacity_preference);
+            node.shipping_option = supplied(input.shipping_option).or(node.shipping_option);
+            node.description = supplied(input.description).or(node.description);
+            node.address_id = supplied(input.address_id).or(node.address_id);
+            node.forwarding_address_id =
+                supplied(input.forwarding_address_id).or(node.forwarding_address_id);
+            node.role_arn = supplied(input.role_arn).or(node.role_arn);
+            node.kms_key_arn = supplied(input.kms_key_arn).or(node.kms_key_arn);
+            node.remote_management = supplied(input.remote_management).or(node.remote_management);
+            node.resources = input.resources.or(node.resources);
+            node.notification = input.notification.or(node.notification);
+            node.on_device_service_configuration = input
+                .on_device_service_configuration
+                .or(node.on_device_service_configuration);
+            node.tax_documents = input.tax_documents.or(node.tax_documents);
+            // A cluster models none of these, so there is nothing to inherit them from.
             node.long_term_pricing_id = input.long_term_pricing_id;
             node.device_configuration = input.device_configuration;
             node.impact_level = input.impact_level;
@@ -415,33 +471,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        if !store.addresses.contains_key(&address_id) {
-            return Err(CreateJobErrorModeled::InvalidResourceException(
-                InvalidResourceException {
-                    message: Some(format!(
-                        "The address ID {address_id} can't be found. Check the information you \
-                         provided in your last request, and try again."
-                    )),
-                    resource_type: Some("address".to_string()),
-                },
-            )
-            .into());
-        }
-        // A forwarding address is an address too, so the same rule holds for it.
-        if let Some(forwarding_address_id) = input.forwarding_address_id.as_deref() {
-            if !store.addresses.contains_key(forwarding_address_id) {
-                return Err(CreateJobErrorModeled::InvalidResourceException(
-                    InvalidResourceException {
-                        message: Some(format!(
-                            "The address ID {forwarding_address_id} can't be found. Check the \
-                             information you provided in your last request, and try again."
-                        )),
-                        resource_type: Some("address".to_string()),
-                    },
-                )
-                .into());
-            }
-        }
+        // Both this address and the forwarding address have already been held to naming a
+        // stored record above, whichever branch the order takes.
 
         // A job that joins no cluster IS its own order, so the request has to describe
         // the device order itself: "If you're creating a job for a node in a cluster, you

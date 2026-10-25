@@ -182,9 +182,24 @@ impl Emulator {
 
 /// A well-formed MIME message whose `Subject` is `subject` and whose body is
 /// `body`.
+///
+/// It carries the header fields RFC 5322 §3.6 requires every message to have —
+/// `Date` and `From` — because the `RawMessageContent` documentation requires that
+/// "the message must contain all the required header fields"
+/// (`smithy_query(query="doc", shape="RawMessageContent")`), so content without
+/// them is not content an update may install. It carries no `Message-ID` and no
+/// `Received` trace, so an update from one of these messages to another changes no
+/// immutable header; `crate::mime_header_criteria` is where those are asserted.
 pub(crate) fn mime(subject: &str, body: &str) -> Vec<u8> {
-    format!("From: sender@example.com\r\nSubject: {subject}\r\n\r\n{body}\r\n").into_bytes()
+    format!(
+        "Date: {DATE}\r\nFrom: sender@example.com\r\nSubject: {subject}\r\n\r\n{body}\r\n"
+    )
+    .into_bytes()
 }
+
+/// An RFC 5322 date-time, for the `Date` field every message must carry. Its value
+/// is never asserted on: only the field's presence is a documented criterion.
+pub(crate) const DATE: &str = "Tue, 24 Oct 2026 17:03:49 +0000";
 
 /// The bucket every test that is not exercising the location rules resolves
 /// against. 3..63 chars, `^[a-z0-9][a-z0-9\-]*$` (model: `S3Reference$bucket`).
@@ -374,7 +389,7 @@ async fn put_replaces_the_stored_content_and_the_next_get_reports_it() {
         (
             "the issue's recorded case",
             reference("updated/message-mime"),
-            b"Subject: rewritten".to_vec(),
+            format!("Date: {DATE}\r\nFrom: a@example.com\r\nSubject: rewritten").into_bytes(),
         ),
         (
             "a versioned reference",
@@ -384,35 +399,38 @@ async fn put_replaces_the_stored_content_and_the_next_get_reports_it() {
         (
             "content shorter than the original",
             reference("short"),
-            b"Subject: s\r\n".to_vec(),
+            format!("Date: {DATE}\r\nFrom: a@b\r\n").into_bytes(),
         ),
         ("content much longer than the original", reference("long"), {
-            let mut content = b"From: a@example.com\r\nSubject: long\r\n\r\n".to_vec();
+            let mut content =
+                format!("Date: {DATE}\r\nFrom: a@example.com\r\nSubject: long\r\n\r\n")
+                    .into_bytes();
             for index in 0..512 {
                 content.extend(format!("paragraph {index}\r\n").as_bytes());
             }
             content
         }),
-        (
-            "multipart content",
-            reference("multipart/object"),
-            concat!(
-                "From: sender@example.com\r\n",
-                "Subject: rewritten multipart\r\n",
-                "MIME-Version: 1.0\r\n",
-                "Content-Type: multipart/alternative; boundary=\"zz\"\r\n",
-                "\r\n",
-                "--zz\r\n",
-                "Content-Type: text/plain\r\n\r\n",
-                "text\r\n",
-                "--zz\r\n",
-                "Content-Type: text/html\r\n\r\n",
-                "<p>html</p>\r\n",
-                "--zz--\r\n",
-            )
-            .as_bytes()
-            .to_vec(),
-        ),
+        ("multipart content", reference("multipart/object"), {
+            let mut content = format!("Date: {DATE}\r\n").into_bytes();
+            content.extend_from_slice(
+                concat!(
+                    "From: sender@example.com\r\n",
+                    "Subject: rewritten multipart\r\n",
+                    "MIME-Version: 1.0\r\n",
+                    "Content-Type: multipart/alternative; boundary=\"zz\"\r\n",
+                    "\r\n",
+                    "--zz\r\n",
+                    "Content-Type: text/plain\r\n\r\n",
+                    "text\r\n",
+                    "--zz\r\n",
+                    "Content-Type: text/html\r\n\r\n",
+                    "<p>html</p>\r\n",
+                    "--zz--\r\n",
+                )
+                .as_bytes(),
+            );
+            content
+        }),
         (
             "a line exactly at the RFC 5321 limit",
             reference("at-the-limit"),
@@ -896,19 +914,33 @@ async fn put_with_unusable_mime_content_is_rejected() {
         ),
         (
             "a duplicated Subject header",
-            b"From: a@example.com\r\nSubject: one\r\nSubject: two\r\n\r\nbody\r\n".to_vec(),
+            format!("Date: {DATE}\r\nFrom: a@example.com\r\nSubject: one\r\nSubject: two\r\n\r\nbody\r\n")
+                .into_bytes(),
         ),
         (
             "a duplicated From header",
-            b"From: a@example.com\r\nFrom: b@example.com\r\nSubject: s\r\n\r\nbody\r\n".to_vec(),
+            format!(
+                "Date: {DATE}\r\nFrom: a@example.com\r\nFrom: b@example.com\r\nSubject: s\r\n\r\nbody\r\n"
+            )
+            .into_bytes(),
         ),
         (
             "a duplicated Message-ID header, in different cases",
-            b"message-id: <1@example.com>\r\nMESSAGE-ID: <2@example.com>\r\n\r\nbody\r\n".to_vec(),
+            format!(
+                "Date: {DATE}\r\nFrom: a@example.com\r\nmessage-id: <1@example.com>\r\nMESSAGE-ID: <2@example.com>\r\n\r\nbody\r\n"
+            )
+            .into_bytes(),
         ),
         (
             "a duplicated Subject header, the second one folded over two lines",
-            b"Subject: one\r\nSubject: two\r\n and more\r\n\r\nbody\r\n".to_vec(),
+            format!(
+                "Date: {DATE}\r\nFrom: a@example.com\r\nSubject: one\r\nSubject: two\r\n and more\r\n\r\nbody\r\n"
+            )
+            .into_bytes(),
+        ),
+        (
+            "the shortest possible header-only message, which carries no required field",
+            b"a:\r\n".to_vec(),
         ),
     ];
 
@@ -960,16 +992,22 @@ async fn put_with_unusable_mime_content_is_rejected() {
             padded_line_message(MAX_LINE_OCTETS - 1),
         ),
         (
-            "the shortest possible header-only message",
-            b"a:\r\n".to_vec(),
+            "the shortest message carrying both required header fields",
+            format!("Date: {DATE}\r\nFrom: a@b\r\n").into_bytes(),
         ),
         (
             "a header that may repeat, repeated",
-            b"From: a@example.com\r\nReceived: by one\r\nReceived: by two\r\n\r\nbody\r\n".to_vec(),
+            format!(
+                "Date: {DATE}\r\nFrom: a@example.com\r\nComments: one\r\nComments: two\r\n\r\nbody\r\n"
+            )
+            .into_bytes(),
         ),
         (
             "a folded continuation line is not a second header",
-            b"From: a@example.com\r\nSubject: one\r\n continued here\r\n\r\nbody\r\n".to_vec(),
+            format!(
+                "Date: {DATE}\r\nFrom: a@example.com\r\nSubject: one\r\n continued here\r\n\r\nbody\r\n"
+            )
+            .into_bytes(),
         ),
     ];
     for (case, content) in accepted {
@@ -1005,7 +1043,7 @@ fn padded_line_message(octets: usize) -> Vec<u8> {
         .saturating_sub(prefix.len() + "\r\n".len())
         .max(1);
     format!(
-        "From: a@example.com\r\n{prefix}{}\r\n\r\nbody\r\n",
+        "Date: {DATE}\r\nFrom: a@example.com\r\n{prefix}{}\r\n\r\nbody\r\n",
         "a".repeat(padding)
     )
     .into_bytes()
@@ -1115,7 +1153,8 @@ fn case_bytes(index: usize) -> Vec<u8> {
 /// US-ASCII and folded into lines well inside the RFC 5321 limit.
 fn case_mime(index: usize) -> Vec<u8> {
     let mut content =
-        format!("From: a@example.com\r\nSubject: case {index}\r\n\r\n").into_bytes();
+        format!("Date: {DATE}\r\nFrom: a@example.com\r\nSubject: case {index}\r\n\r\n")
+            .into_bytes();
     for chunk in case_bytes(index).chunks(64) {
         content.extend(chunk.iter().map(|byte| 33 + (byte % 94)));
         content.extend(b"\r\n");

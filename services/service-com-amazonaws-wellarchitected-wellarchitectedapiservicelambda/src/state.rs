@@ -1926,6 +1926,27 @@ impl WorkloadRecord {
             .any(|attached| lens_alias(attached) == lens_alias(lens))
     }
 
+    /// Drop the review of one lens from this workload: the lens itself, the answers
+    /// recorded against its review and whatever a caller wrote to that review.
+    ///
+    /// A lens review is not a resource of its own — it exists exactly while that lens is
+    /// associated with the workload ([`Self::reviews_lens`]) — so dropping the lens drops
+    /// the review, and the answers and notes held under it go with it rather than
+    /// surviving to reappear under a later association. A milestone records the workload
+    /// BY VALUE, so a milestone taken before this still reports the review as it stood.
+    ///
+    /// Idempotent in the lens and in the SPELLING of it: a lens is one lens however it is
+    /// named ([`lens_alias`]), so every entry naming the same lens goes and the order of
+    /// the rest is left alone. It answers nothing, because whether the workload reviewed
+    /// the lens is what [`Self::reviews_lens`] is for — an operation that has to refuse a
+    /// lens the workload does not review resolves it BEFORE removing any.
+    pub fn disassociate_lens(&mut self, lens: &str) {
+        let alias = lens_alias(lens);
+        self.lenses.retain(|attached| lens_alias(attached) != alias);
+        self.answers.remove(alias);
+        self.lens_review_records.remove(alias);
+    }
+
     /// Whether a profile ARN names a profile associated with this workload.
     ///
     /// The ARN identifies the profile on its own, so the comparison is exact: an ARN

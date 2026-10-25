@@ -37,7 +37,9 @@ fn authorization(region: &str) -> String {
 /// carries `:` and `/`, and a non-greedy `@httpLabel` is one segment, so the `/`
 /// separators have to be escaped exactly as an AWS SDK escapes them. Every byte
 /// outside the unreserved set is escaped, which is always valid in both positions.
-fn uri_encode(value: &str) -> String {
+/// `pub(crate)` so the suites beside this one in the same test binary share this one
+/// encoder rather than each carrying a copy.
+pub(crate) fn uri_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
@@ -52,7 +54,9 @@ fn uri_encode(value: &str) -> String {
 
 /// A one-service emulator over the shared engine, driven through the same
 /// `MultiServiceRouter::dispatch` the production front door uses.
-struct Emulator {
+/// `pub(crate)` so the suites beside this one in the same test binary drive the service
+/// through this one harness rather than each building another.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     /// The SAME engine the service holds, so a test can read the store's shape
     /// directly to assert an invariant no response exposes (how many records it holds).
@@ -61,7 +65,7 @@ struct Emulator {
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::in_region("us-west-2")
     }
 
@@ -94,7 +98,12 @@ impl Emulator {
         )
     }
 
-    async fn call(&self, method: &str, path_and_query: &str, body: Option<Value>) -> (u16, Value) {
+    pub(crate) async fn call(
+        &self,
+        method: &str,
+        path_and_query: &str,
+        body: Option<Value>,
+    ) -> (u16, Value) {
         let payload = body
             .map(|b| Bytes::from(serde_json::to_vec(&b).expect("a serializable request body")))
             .unwrap_or_default();
@@ -139,7 +148,7 @@ impl Emulator {
     }
 
     /// Create an app instance and return its ARN, failing the test if it was refused.
-    async fn app_instance(&self, name: &str, token: &str) -> String {
+    pub(crate) async fn app_instance(&self, name: &str, token: &str) -> String {
         let (status, body) = self.create_app_instance(name, None, token).await;
         assert_eq!(status, 201, "CreateAppInstance({name}) answered: {body:?}");
         body["AppInstanceArn"]
@@ -174,7 +183,7 @@ impl Emulator {
     }
 
     /// Create a user and return its ARN, failing the test if it was refused.
-    async fn user(&self, app_instance_arn: &str, user_id: &str, token: &str) -> String {
+    pub(crate) async fn user(&self, app_instance_arn: &str, user_id: &str, token: &str) -> String {
         let (status, body) = self
             .create_user(app_instance_arn, user_id, user_id, None, None, token)
             .await;

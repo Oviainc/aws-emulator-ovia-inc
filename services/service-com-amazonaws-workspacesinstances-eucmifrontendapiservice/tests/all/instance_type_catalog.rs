@@ -241,7 +241,12 @@ async fn the_catalog_is_reported_in_full_and_is_not_per_account_state() {
     let created = ok(
         &router,
         "CreateWorkspaceInstance",
-        json!({ "ManagedInstance": { "InstanceType": "t3.medium" } }),
+        json!({
+            "ManagedInstance": {
+                "ImageId": "ami-0123456789abcdef0",
+                "InstanceType": "t3.medium",
+            },
+        }),
     )
     .await;
     assert!(

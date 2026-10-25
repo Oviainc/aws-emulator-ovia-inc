@@ -55,6 +55,8 @@ mod self_service_sign_up;
 mod sign_up_client_secret;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/terms_documents.rs"]
+mod terms_documents;
 #[path = "all/token_signing.rs"]
 mod token_signing;
 #[path = "all/update_group.rs"]

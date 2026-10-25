@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListChangeSets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListChangeSets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListChangeSets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: lists the change sets the named stack still carries, one
+//! `ChangeSetSummary` per change set, in creation order and one bounded page at a time.
+//! Every member is a projection of the SAME stored record `DescribeChangeSet` reports in
+//! full, so the two reads cannot disagree about a change set's id, stack, statuses or
+//! creation time. A `StackName` that resolves to no stack is refused with
+//! `ValidationError` rather than answered with an empty list, and a change set a request
+//! deleted, an execution superseded or a completed stack deletion took with it is no
+//! longer listed ("Returns the ID and status of each ACTIVE change set for a stack").
 //!
 //! ## Shape of an operation
 //!
@@ -72,6 +71,36 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::StoredChangeSet;
+
+/// One stored change set as the modelled `ChangeSetSummary` shape.
+///
+/// The summary is a projection of the SAME stored record `DescribeChangeSet` reports in
+/// full — its id and name, the stack it plans changes for, the pair of statuses its
+/// creation and execution left it in with the reason that came with the first of them, the
+/// instant it was created, and the two settings it was created with — so the two readers of
+/// one record cannot disagree about it.
+///
+/// `ParentChangeSetId` and `RootChangeSetId` are absent for exactly the reason
+/// `DescribeChangeSet` leaves them absent: they belong to a nested change-set hierarchy,
+/// and this emulator creates no nested change sets, so there is no parent or root to name.
+fn change_set_summary(stored: &StoredChangeSet) -> ChangeSetSummary {
+    ChangeSetSummary {
+        stack_id: Some(stored.stack_id.clone()),
+        stack_name: Some(stored.stack_name.clone()),
+        change_set_id: Some(stored.change_set_id.clone()),
+        change_set_name: Some(stored.change_set_name.clone()),
+        execution_status: Some(stored.execution_status.clone()),
+        status: Some(stored.status.clone()),
+        status_reason: stored.status_reason.clone(),
+        creation_time: Some(crate::state::timestamp(stored.creation_time)),
+        description: stored.description.clone(),
+        include_nested_stacks: Some(stored.include_nested_stacks),
+        parent_change_set_id: None,
+        root_change_set_id: None,
+        import_existing_resources: Some(stored.import_existing_resources),
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -140,18 +169,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListChangeSets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListChangeSetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListChangeSets"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no change set store to read, so
+            // this answers 501 rather than an empty, truthful-looking list.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListChangeSets",
+            ));
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a status transition the
+        // clock had already made due, which was owed whether or not anyone called — and it
+        // is that settling which also reclaims the change sets whose stack is gone.
+        store.settle(::std::time::SystemTime::now());
+
+        // The change sets are listed for ONE stack, named the way every other read of a
+        // stack names it (by name while it is running, by stack id either way), and a
+        // `StackName` that resolves to nothing is a `ValidationError`, not an empty list.
+        let stack = store.resolve(&region, &input.stack_name).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation_error(crate::state::stack_does_not_exist(
+                &input.stack_name,
+            ))
+        })?;
+        // "Returns the ID and status of each ACTIVE change set for a stack": the change
+        // sets this store still holds for that stack, in creation order — one a request
+        // deleted, one an execution superseded and one whose stack's deletion completed
+        // are no longer held, so they are no longer listed.
+        let summaries: Vec<ChangeSetSummary> = store
+            .change_sets_of(&stack.stack_id)
+            .map(change_set_summary)
+            .collect();
+        // `@paginated(inputToken: NextToken, outputToken: NextToken, items: Summaries)`:
+        // one response carries one bounded page, and the token resumes just past it.
+        let (summaries, next_token) = crate::state::paginate(
+            crate::state::PageOf::ChangeSetSummaries,
+            summaries,
+            input.next_token.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        Ok(ListChangeSetsOutput {
+            summaries: Some(summaries),
+            next_token,
+        })
     }
 }

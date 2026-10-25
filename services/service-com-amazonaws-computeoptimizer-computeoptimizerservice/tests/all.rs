@@ -43,6 +43,8 @@ mod lambda_function_recommendations;
 mod license_recommendations;
 #[path = "all/organization_enrollment_statuses.rs"]
 mod organization_enrollment_statuses;
+#[path = "all/preference_records_hold_a_preference.rs"]
+mod preference_records_hold_a_preference;
 #[path = "all/preference_resource_type_support.rs"]
 mod preference_resource_type_support;
 #[path = "all/rds_database_recommendation_options.rs"]

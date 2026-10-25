@@ -120,7 +120,10 @@ fn request_shapes(agreement_id: &str, token: &str) -> Vec<(&'static str, Value)>
                 "agreementId": agreement_id,
                 "deploymentParameter": { "name": "Other.Name+1", "secretString": "s" },
                 "clientToken": token,
-                "expirationDate": 1_893_456_000_i64,
+                // The RFC 3339 form the member's `@timestampFormat("date-time")`
+                // declares: 2030-01-01T00:00:00Z, far enough ahead that the row's
+                // parameter stays live for the whole suite.
+                "expirationDate": "2030-01-01T00:00:00Z",
             }),
         ),
         (
@@ -590,8 +593,9 @@ async fn the_target_ledger_is_bounded_and_refuses_a_target_past_its_ceiling() {
             // An expiry that has already come, so each stored parameter is purged
             // on the very next request and hands its slot under the
             // deployment-parameter quota straight back: only the target ledger's
-            // OWN ceiling bounds this run.
-            "expirationDate": 1_i64,
+            // OWN ceiling bounds this run. In the RFC 3339 form the member's
+            // `@timestampFormat("date-time")` declares.
+            "expirationDate": "1970-01-01T00:00:01Z",
         })
     };
 

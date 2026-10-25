@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFirewallDomains
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFirewallDomains`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFirewallDomains::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies one set operation to the domains of a DNS Firewall domain list this
+//! account created: `ADD` unions the requested domains into the list, `REMOVE`
+//! subtracts them, and `REPLACE` makes the list exactly the requested ones. The
+//! domains are a SET — membership is decided on the case-folded name — so a
+//! domain already present is not stored twice, and the update is reported with
+//! the status of the change it started.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +173,191 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFirewallDomains` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFirewallDomainsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFirewallDomains"))
+        // The engine is reachable from `&self` (constructor-injected); this
+        // operation mints no ARN, so it takes nothing from `ctx`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateFirewallDomainsErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "There is a limit of 1000 domains per request": refused before the
+        // store is locked, so a request past the limit writes nothing.
+        if input.domains.len() > crate::state::MAX_DOMAINS_PER_UPDATE {
+            return Err(UpdateFirewallDomainsErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Domains carries at most {} domains per request",
+                        crate::state::MAX_DOMAINS_PER_UPDATE
+                    )),
+                    resource_type: Some(
+                        crate::state::RESOURCE_TYPE_FIREWALL_DOMAIN_LIST.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Every domain must satisfy the requirements the member's doc states;
+        // the modelled length (1..255) is already enforced by the time a
+        // handler runs, the character and label rules are not.
+        if let Some(malformed) = input
+            .domains
+            .iter()
+            .find(|domain| !crate::state::firewall_domain_is_wellformed(domain))
+        {
+            return Err(UpdateFirewallDomainsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Domains carries {malformed:?}, which is not a domain specification: a \
+                         domain may start with an asterisk and otherwise carries only letters, \
+                         digits, hyphens and underscores in dot-separated labels"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The three operations the modelled `FirewallDomainUpdateOperation`
+        // enum declares, as its doc defines them. An unmodelled value is
+        // refused rather than silently treated as one of them.
+        let operation = input.operation.as_str();
+        if !crate::ops::types::FIREWALL_DOMAIN_UPDATE_OPERATION_VALUES.contains(&operation) {
+            return Err(UpdateFirewallDomainsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Operation must be one of {:?}",
+                        crate::ops::types::FIREWALL_DOMAIN_UPDATE_OPERATION_VALUES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::Instant::now();
+        let timestamp = crate::state::now_rfc3339();
+        let mut store = state.lock();
+
+        let Some(record) = store
+            .firewall_domain_lists
+            .get_mut(&input.firewall_domain_list_id)
+        else {
+            // A list DNS Firewall publishes itself belongs to the service, not
+            // to the account reading it: nothing this account does changes it,
+            // so an update that names one is refused rather than resolving to a
+            // record this store could write.
+            if crate::state::managed_firewall_domain_list(&input.firewall_domain_list_id).is_some()
+            {
+                return Err(UpdateFirewallDomainsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "Firewall domain list with ID \"{}\" is managed by {} and its domains cannot be updated",
+                            input.firewall_domain_list_id,
+                            crate::state::MANAGED_FIREWALL_DOMAIN_LIST_OWNER
+                        )),
+                    },
+                )
+                .into());
+            }
+            return Err(
+                UpdateFirewallDomainsErrorModeled::ResourceNotFoundException(
+                    crate::state::firewall_domain_list_not_found(&input.firewall_domain_list_id),
+                )
+                .into(),
+            );
+        };
+
+        // The requested domains, in the order they arrived and without a
+        // repeat: a domain list holds a domain once however many times one
+        // request names it. Both capacities are the length of the request's
+        // already-materialised list, which the limit above bounds.
+        let mut requested: Vec<String> = Vec::with_capacity(input.domains.len());
+        let mut requested_keys: ::std::collections::HashSet<String> =
+            ::std::collections::HashSet::with_capacity(input.domains.len());
+        for domain in &input.domains {
+            if requested_keys.insert(crate::state::firewall_domain_key(domain)) {
+                requested.push(domain.clone());
+            }
+        }
+
+        let updated: Vec<String> = match operation {
+            // "ADD - Add the domains to the ones that are already in the domain
+            // list": the union, with the domains already stored keeping their
+            // places, so a caller paging the list only ever sees the new ones
+            // appended.
+            "ADD" => {
+                let mut domains = record.domains.clone();
+                let stored: ::std::collections::HashSet<String> = domains
+                    .iter()
+                    .map(|domain| crate::state::firewall_domain_key(domain))
+                    .collect();
+                domains.extend(
+                    requested
+                        .iter()
+                        .filter(|domain| {
+                            !stored.contains(&crate::state::firewall_domain_key(domain))
+                        })
+                        .cloned(),
+                );
+                domains
+            }
+            // "REMOVE - Search the domain list for the domains and remove them
+            // from the list": the difference. A requested domain the list does
+            // not hold removes nothing.
+            "REMOVE" => record
+                .domains
+                .iter()
+                .filter(|domain| !requested_keys.contains(&crate::state::firewall_domain_key(domain)))
+                .cloned()
+                .collect(),
+            // "REPLACE - Update the domain list to exactly match the list that
+            // you are providing": whatever the list held before is gone.
+            _ => requested,
+        };
+
+        // The store is bounded: an update that would carry one list past the
+        // bound is refused and the stored domains are left exactly as they
+        // were. A REMOVE or a REPLACE that shrinks the list is unaffected.
+        if updated.len() > crate::state::MAX_DOMAINS_PER_LIST {
+            return Err(UpdateFirewallDomainsErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This emulator stores at most {} domains per firewall domain list; remove some before adding more",
+                        crate::state::MAX_DOMAINS_PER_LIST
+                    )),
+                    resource_type: Some(
+                        crate::state::RESOURCE_TYPE_FIREWALL_DOMAIN_LIST.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        record.domains = updated;
+        record.modification_time = timestamp;
+        // The change is applied to the stored domains at once and the list
+        // reports `UPDATING` while it settles: the move to `COMPLETE` is the
+        // one the clock owes, so a caller reading the list straight after this
+        // call still observes the transient status.
+        record.status = crate::state::FIREWALL_DOMAIN_LIST_STATUS_UPDATING.to_string();
+        record.settled_at = Some(now + crate::state::PROVISIONING_DELAY);
+
+        Ok(UpdateFirewallDomainsOutput {
+            id: Some(record.id.clone()),
+            name: Some(record.name.clone()),
+            // "Status of the UpdateFirewallDomains request", which is this
+            // list's status as of now.
+            status: Some(record.status_at(now).to_string()),
+            // "Additional information about the status of the list, IF
+            // AVAILABLE": the model states no text for it and the record
+            // carries none, so none is invented here.
+            status_message: record.status_message.clone(),
+        })
     }
 }

@@ -7,7 +7,10 @@
 //! created with probes is `PENDING` until the clock makes its activation due.
 //! A second create naming a monitor that already exists is a RETRY only when it
 //! repeats the stored `clientToken`; any other repeat is refused with
-//! `ConflictException`.
+//! `ConflictException`. A retry REPORTS the monitor the token already minted, so
+//! like every other reporting path it first materialises the transitions the
+//! clock has already made due
+//! ([`crate::state::ComAmazonawsNetworkmonitorNetworkmonitorState::settle_monitor`]).
 //!
 //! ## Shape of an operation
 //!
@@ -240,6 +243,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         store.prune_client_tokens(now);
+        // The transitions the clock already owed the monitor this request names,
+        // so the replay below reports the state the monitor is in at the instant
+        // of THIS call rather than the state it was stored in: a retry and a
+        // `GetMonitor` taken at the same instant answer the same state. A name
+        // nothing stores settles nothing.
+        store.settle_monitor(&region, &input.monitor_name, now);
 
         // A repeat create is a retry of the ORIGINAL request only when it
         // carries the same idempotency token; a request with no token is not a

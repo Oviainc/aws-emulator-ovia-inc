@@ -49,6 +49,8 @@ mod application_grants_list;
 mod application_provider_describe;
 #[path = "all/application_providers.rs"]
 mod application_providers;
+#[path = "all/application_session_configuration.rs"]
+mod application_session_configuration;
 #[path = "all/application_update.rs"]
 mod application_update;
 #[path = "all/customer_managed_policy_references.rs"]

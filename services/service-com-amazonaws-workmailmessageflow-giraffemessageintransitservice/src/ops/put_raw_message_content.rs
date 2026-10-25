@@ -12,8 +12,9 @@
 //! eligible for update (`MessageFrozen`), the object must be readable
 //! (`InvalidContentLocation`), and its bytes must be usable MIME
 //! (`MessageRejected`). The rules for the last two come from the model's own
-//! documentation — see [`resolve_content`] and [`validate_mime`], which also name
-//! the documented criteria this emulator does NOT decide.
+//! documentation — see [`resolve_content`], [`validate_mime`] and
+//! [`immutable_header_conflict`], which also name the documented criteria this
+//! emulator does NOT decide.
 //!
 //! The message an update names is addressed by the region the request was made in
 //! together with the `messageId`, since this service is a regional data plane: an
@@ -220,21 +221,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Validation runs with NO lock held.
-        validate_mime(&content).map_err(|reason| {
-            ::tracing::info!(
-                operation = "PutRawMessageContent",
-                akid = %akid,
-                message_id = %input.message_id,
-                reference = ?reference,
-                region = %request_region,
-                outcome = "MessageRejected",
-                reason = %reason,
-                "refused an update whose content is not usable MIME"
-            );
-            PutRawMessageContentErrorModeled::MessageRejected(MessageRejected {
-                message: Some(reason),
-            })
-        })?;
+        if let Err(reason) = validate_mime(&content) {
+            return Err(refuse_rejected(
+                &akid,
+                &input.message_id,
+                &reference,
+                &request_region,
+                reason,
+            ));
+        }
 
         // SECOND critical section: install the bytes. The lock was released while
         // the content was validated, so the eligibility the first section checked is
@@ -251,6 +246,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(refuse_frozen(&akid, &input.message_id, &request_region))
                 }
                 Eligibility::Updatable => {}
+            }
+            // The last content criterion is a COMPARISON, so it is decided here,
+            // against the message as it stands in this critical section: the update
+            // may not change a header the message carried on its way into the flow.
+            let conflict = state
+                .message(&request_region, &input.message_id)
+                .and_then(|message| immutable_header_conflict(&message.content, &content));
+            if let Some(reason) = conflict {
+                drop(state);
+                return Err(refuse_rejected(
+                    &akid,
+                    &input.message_id,
+                    &reference,
+                    &request_region,
+                    reason,
+                ));
             }
             // The whole point of the operation: the store now holds the resolved
             // bytes, so the next `GetRawMessageContent` reports them and not the old
@@ -348,6 +359,35 @@ fn refuse_frozen(akid: &str, message_id: &str, region: &str) -> PutRawMessageCon
     .into()
 }
 
+/// Record and build the refusal for content that is not usable MIME.
+///
+/// `reason` becomes the `message` of `MessageRejected`, which the model documents
+/// as carrying "more information about what caused the error". It is built from
+/// header FIELD NAMES this module names and from counts, never from the content's
+/// own bytes, so no part of a caller's object reaches a response or a record.
+fn refuse_rejected(
+    akid: &str,
+    message_id: &str,
+    reference: &S3Ref,
+    region: &str,
+    reason: String,
+) -> PutRawMessageContentError {
+    ::tracing::info!(
+        operation = "PutRawMessageContent",
+        akid = %akid,
+        message_id = %message_id,
+        reference = ?reference,
+        region = %region,
+        outcome = "MessageRejected",
+        reason = %reason,
+        "refused an update whose content is not usable MIME"
+    );
+    PutRawMessageContentErrorModeled::MessageRejected(MessageRejected {
+        message: Some(reason),
+    })
+    .into()
+}
+
 /// The bytes the reference resolves to, or the reason it is not readable — an
 /// `InvalidContentLocation` for the caller, and this string for the access record.
 ///
@@ -409,6 +449,30 @@ const SINGLETON_HEADERS: &[&str] = &[
     "subject",
 ];
 
+/// Headers RFC 5322 §3.6 requires every message to carry, lowercased.
+///
+/// The model's `RawMessageContent` documentation
+/// (`smithy_query(query="doc", shape="RawMessageContent")`) requires that "the
+/// message must contain all the required header fields"; it names no field, and
+/// RFC 5322 §3.6 — the same section that states which headers may appear only
+/// once, above — is the list of which ones: `orig-date` (`Date`) and `from`
+/// (`From`) are the two every message must have, and both must appear exactly
+/// once, which [`SINGLETON_HEADERS`] is the other half of.
+const REQUIRED_HEADERS: &[&str] = &["date", "from"];
+
+/// Headers an update may not change, lowercased.
+///
+/// The model's `RawMessageContent` documentation requires that "the value of
+/// immutable headers must remain unchanged"; it names no header, and what makes a
+/// header unchangeable by this API is that the mail system, not the message's
+/// author, set it before the message reached the flow: `Message-ID` is assigned by
+/// the originating system and identifies this one message (RFC 5322 §3.6.4), and
+/// the `Received` fields are the trace each relay that has already handled the
+/// message added, which a later handler must not alter or reorder (RFC 5321 §4.4,
+/// RFC 5322 §3.6.7). Everything else in the header block — the addresses, the
+/// subject, the content type, the body — is what an update exists to rewrite.
+const IMMUTABLE_HEADERS: &[&str] = &["message-id", "received"];
+
 /// The longest a line of a message may be, including its CRLF.
 ///
 /// From the model's `RawMessageContent` documentation: "Per RFC 5321, the maximum
@@ -426,27 +490,30 @@ const MAX_LINE_OCTETS: usize = 1000;
 /// the scans below are linear in the content and run inside one request.
 const MAX_CONTENT_OCTETS: usize = 128 * 1024 * 1024;
 
-/// Whether `content` is usable MIME content, answering why it is not when it is
-/// not — the `message` of `MessageRejected`, which the model documents as carrying
-/// "more information about what caused the error".
+/// Whether `content` is usable MIME content on its own, answering why it is not
+/// when it is not — the `message` of `MessageRejected`, which the model documents
+/// as carrying "more information about what caused the error".
 ///
 /// Every rule is one the model's `RawMessageContent` documentation states:
 ///
 /// 1. the object must carry content at all, and that content must begin with a
-///    header field, so the message HAS a header block — "The message must contain
-///    all the required header fields";
-/// 2. no line may exceed [`MAX_LINE_OCTETS`] including its CRLF;
-/// 3. a header from [`SINGLETON_HEADERS`] may not appear twice.
+///    header field, so the message HAS a header block;
+/// 2. that header block must carry every field in [`REQUIRED_HEADERS`] — "The
+///    message must contain all the required header fields";
+/// 3. no line may exceed [`MAX_LINE_OCTETS`] including its CRLF;
+/// 4. a header from [`SINGLETON_HEADERS`] may not appear twice.
 ///
-/// Four documented criteria are deliberately NOT enforced, because neither the
-/// model nor the service's documentation says what to enforce them against: WHICH
-/// header fields are required (rule 1 checks that a header block is present, not
-/// that a particular field is — the model names no field, and refusing a message
-/// AWS would accept is the worse error of the two), that "each part of a multipart
-/// MIME message" is "formatted properly" (the documentation states no rule for
-/// what makes a part malformed, and a message is not refused for failing a rule
-/// this emulator invented), the set of attachment content types Amazon SES
-/// supports (an external appendix), and which headers are immutable.
+/// The one remaining documented criterion is not a property of the content alone:
+/// "the value of immutable headers must remain unchanged" is a COMPARISON against
+/// the message in transit, and [`immutable_header_conflict`] decides it where that
+/// message is reachable.
+///
+/// Two documented criteria are deliberately NOT enforced, because neither the
+/// model nor the service's documentation says what to enforce them against: that
+/// "each part of a multipart MIME message" is "formatted properly" (the
+/// documentation states no rule for what makes a part malformed, and a message is
+/// not refused for failing a rule this emulator invented) and the set of
+/// attachment content types Amazon SES supports (an external appendix).
 ///
 /// One refusal is not a fidelity rule but a guard on this process, and says so in
 /// the message it produces: content beyond [`MAX_CONTENT_OCTETS`]. That ceiling
@@ -484,6 +551,19 @@ fn validate_mime(content: &[u8]) -> Result<(), String> {
     }
 
     let counts = header_field_counts(content);
+
+    let missing: Vec<&str> = REQUIRED_HEADERS
+        .iter()
+        .copied()
+        .filter(|name| counts.get(*name).copied().unwrap_or_default() == 0)
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "The message is missing the required header field(s) {}.",
+            missing.join(", ")
+        ));
+    }
+
     for name in SINGLETON_HEADERS {
         if counts.get(*name).copied().unwrap_or_default() > 1 {
             return Err(format!(
@@ -495,15 +575,71 @@ fn validate_mime(content: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Why `updated` may not replace `current`, when it changes the value of a header
+/// in [`IMMUTABLE_HEADERS`], and `None` when every one of those headers reads
+/// exactly as it does on the message in transit.
+///
+/// "Unchanged" is compared over the whole sequence of a header's values, in order:
+/// a header that may legitimately appear several times (the `Received` trace) is
+/// unchanged only when the update carries the same values in the same order, so
+/// rewriting one of them, dropping one, reordering them or adding one are all
+/// changes, as is removing or inventing a header that appears once.
+fn immutable_header_conflict(current: &[u8], updated: &[u8]) -> Option<String> {
+    let before = header_fields(current);
+    let after = header_fields(updated);
+    for name in IMMUTABLE_HEADERS {
+        let before: Vec<&str> = values_of(&before, name);
+        let after: Vec<&str> = values_of(&after, name);
+        if before == after {
+            continue;
+        }
+        return Some(if before.len() == after.len() {
+            format!(
+                "The update changes the value of the {name} header, which is immutable and must \
+                 remain unchanged."
+            )
+        } else {
+            format!(
+                "The message in transit carries {} {name} header field(s) and the update carries \
+                 {}; the value of an immutable header must remain unchanged.",
+                before.len(),
+                after.len()
+            )
+        });
+    }
+    None
+}
+
+/// The values of the header field `name` in `fields`, in the order the message
+/// carries them.
+fn values_of<'a>(fields: &'a [(String, String)], name: &str) -> Vec<&'a str> {
+    fields
+        .iter()
+        .filter(|(field, _)| field == name)
+        .map(|(_, value)| value.as_str())
+        .collect()
+}
+
 /// How many times each header field name appears in the message's header block,
 /// lowercased (RFC 5322 field names are case-insensitive).
-///
-/// The block is the content up to the first empty line, and a line that opens with
-/// a space or a tab continues the field before it (RFC 5322 §2.2.3 folding) rather
-/// than starting a new one.
 fn header_field_counts(content: &[u8]) -> ::std::collections::BTreeMap<String, usize> {
     let mut counts: ::std::collections::BTreeMap<String, usize> =
         ::std::collections::BTreeMap::new();
+    for (name, _) in header_fields(content) {
+        *counts.entry(name).or_default() += 1;
+    }
+    counts
+}
+
+/// The message's header block as (lowercased name, value) pairs, in order.
+///
+/// The block is the content up to the first empty line, and a line that opens with
+/// a space or a tab continues the field before it (RFC 5322 §2.2.3 folding) rather
+/// than starting a new one, so a folded value is compared as the one value it is.
+/// Field names are lowercased because RFC 5322 makes them case-insensitive;
+/// values are not, since a value is what it says.
+fn header_fields(content: &[u8]) -> Vec<(String, String)> {
+    let mut fields: Vec<(String, String)> = Vec::new();
     for line in content.split(|byte| *byte == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() {
@@ -511,7 +647,12 @@ fn header_field_counts(content: &[u8]) -> ::std::collections::BTreeMap<String, u
             break;
         }
         if line[0] == b' ' || line[0] == b'\t' {
-            // A folded continuation of the field above.
+            // A folded continuation of the field above: unfolding removes the line
+            // break and keeps the rest of the line, including its leading
+            // whitespace.
+            if let Some((_, value)) = fields.last_mut() {
+                value.push_str(&String::from_utf8_lossy(line));
+            }
             continue;
         }
         let Some(colon) = line.iter().position(|byte| *byte == b':') else {
@@ -520,9 +661,12 @@ fn header_field_counts(content: &[u8]) -> ::std::collections::BTreeMap<String, u
         let name = String::from_utf8_lossy(&line[..colon])
             .trim()
             .to_ascii_lowercase();
-        *counts.entry(name).or_default() += 1;
+        let value = String::from_utf8_lossy(&line[colon + 1..])
+            .trim()
+            .to_string();
+        fields.push((name, value));
     }
-    counts
+    fields
 }
 
 /// The 1-based number and octet length of the first line of `content` longer than

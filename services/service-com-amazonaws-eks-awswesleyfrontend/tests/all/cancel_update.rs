@@ -7,11 +7,19 @@
 //! region the request is signed for, then that cluster's stored update, and cancels the
 //! update only while a cancellation can still stop it — in flight, of the one
 //! cancellable `UpdateType`, on an EKS Auto Mode cluster, and still in its node
-//! rollback phase; anything else is the modelled refusal (404 `ResourceNotFoundException`
-//! for a cluster or an update id the region does not hold, 400 `InvalidRequestException`
-//! for an update whose state makes the request impossible), and a cancellation that is
+//! rollback phase; anything else is the modelled refusal, and a cancellation that is
 //! performed is persisted on the update and hands its cluster back from `UPDATING` to
 //! `ACTIVE`.
+//!
+//! Which refusal is itself part of the rule, because the error code is what a client
+//! branches on: a cluster or an update id the region does not hold is 404
+//! `ResourceNotFoundException`; an update cancellation is not supported FOR AT ALL — one
+//! whose type is not the cancellable one, or whose cluster is not an Auto Mode cluster —
+//! is the permanent, argument-level 400 `InvalidParameterException` naming that supported
+//! combination, decided before and regardless of how far the update has got; and only an
+//! update of that supported kind whose own progress makes the call impossible (already
+//! terminal, or past its node rollback phase) is the state-dependent 400
+//! `InvalidRequestException`.
 //!
 //! Each suite asserts that rule over a TABLE of inputs whose rows differ along what the
 //! rule generalises over (update type, update status, how far into the update's life the
@@ -65,6 +73,16 @@ fn error_code_of(answer: &Answer) -> &str {
 }
 
 const REGION: &str = "us-west-2";
+
+/// The modelled class of the PERMANENT refusal: an update cancellation is not supported
+/// for at all — "the specified parameter is invalid. Review the available parameters for
+/// the API request" — which no waiting turns into a success.
+const NOT_CANCELLABLE: &str = "InvalidParameterException";
+
+/// The modelled class of the STATE-dependent refusal: an update of the supported kind
+/// whose own progress makes the call impossible — "the request is invalid given the state
+/// of the cluster. Check the state of the cluster and the associated operations".
+const NOT_IN_A_STATE_TO_CANCEL: &str = "InvalidRequestException";
 
 /// Whether the cluster a row creates has EKS Auto Mode compute enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,8 +267,11 @@ struct Case {
 // ---------------------------------------------------------------------------
 // RULE: an update is cancelled only while a cancellation can still stop it —
 // in flight, of the one cancellable update type, on an Auto Mode cluster, and
-// still in its node rollback phase. Every other state is a 400
-// InvalidRequestException that leaves the update as it was.
+// still in its node rollback phase. Anything outside the supported KIND (type,
+// Auto Mode) is a permanent 400 InvalidParameterException naming that
+// combination, whatever the update's status; an update of the supported kind
+// whose own progress makes the call impossible is a 400
+// InvalidRequestException. Either way the update is left as it was.
 // ---------------------------------------------------------------------------
 
 /// The table spans what the rule generalises over: the update's TYPE (five of the
@@ -258,7 +279,8 @@ struct Case {
 /// shape="UpdateType"`), its STATUS (all four members of `UpdateStatus`), HOW FAR into
 /// its life the call arrives (inside the node rollback phase, past it, and past the
 /// moment the clock owes the update its terminal status), and whether its cluster is an
-/// Auto Mode one.
+/// Auto Mode one — so the rows cross the KIND boundary with the STATE one in both
+/// directions, which is what pins which refusal each produces.
 #[tokio::test]
 async fn an_update_is_cancelled_only_while_a_cancellation_can_still_stop_it() {
     let (router, engine) = emulator_with_engine();
@@ -294,7 +316,7 @@ async fn an_update_is_cancelled_only_while_a_cancellation_can_still_stop_it() {
             age: past_node_phase,
             completes_after: slow,
             mode: Mode::AutoMode,
-            expected: Expected::Refused(400, "InvalidRequestException"),
+            expected: Expected::Refused(400, NOT_IN_A_STATE_TO_CANCEL),
             stored_status_after: UPDATE_IN_PROGRESS,
         },
         Case {
@@ -305,7 +327,7 @@ async fn an_update_is_cancelled_only_while_a_cancellation_can_still_stop_it() {
             age: UPDATE_COMPLETION_DELAY + Duration::from_secs(1),
             completes_after: in_flight,
             mode: Mode::AutoMode,
-            expected: Expected::Refused(400, "InvalidRequestException"),
+            expected: Expected::Refused(400, NOT_IN_A_STATE_TO_CANCEL),
             stored_status_after: UPDATE_SUCCESSFUL,
         },
         Case {
@@ -316,7 +338,7 @@ async fn an_update_is_cancelled_only_while_a_cancellation_can_still_stop_it() {
             age: Duration::ZERO,
             completes_after: in_flight,
             mode: Mode::SelfManaged,
-            expected: Expected::Refused(400, "InvalidRequestException"),
+            expected: Expected::Refused(400, NOT_CANCELLABLE),
             stored_status_after: UPDATE_IN_PROGRESS,
         },
         Case {
@@ -327,7 +349,7 @@ async fn an_update_is_cancelled_only_while_a_cancellation_can_still_stop_it() {
             age: Duration::ZERO,
             completes_after: in_flight,
             mode: Mode::AutoMode,
-            expected: Expected::Refused(400, "InvalidRequestException"),
+            expected: Expected::Refused(400, NOT_CANCELLABLE),
             stored_status_after: UPDATE_IN_PROGRESS,
         },
         Case {
@@ -338,7 +360,51 @@ async fn an_update_is_cancelled_only_while_a_cancellation_can_still_stop_it() {
             age: Duration::ZERO,
             completes_after: in_flight,
             mode: Mode::AutoMode,
-            expected: Expected::Refused(400, "InvalidRequestException"),
+            expected: Expected::Refused(400, NOT_CANCELLABLE),
+            stored_status_after: UPDATE_IN_PROGRESS,
+        },
+        Case {
+            label: "a config update the clock has already carried to Successful",
+            id: "66666666-6666-6666-6666-66666666666a",
+            update_type: "ConfigUpdate",
+            status: UPDATE_IN_PROGRESS,
+            age: UPDATE_COMPLETION_DELAY + Duration::from_secs(1),
+            completes_after: in_flight,
+            mode: Mode::AutoMode,
+            expected: Expected::Refused(400, NOT_CANCELLABLE),
+            stored_status_after: UPDATE_SUCCESSFUL,
+        },
+        Case {
+            label: "a config update that already succeeded",
+            id: "66666666-6666-6666-6666-66666666666b",
+            update_type: "ConfigUpdate",
+            status: UPDATE_SUCCESSFUL,
+            age: Duration::ZERO,
+            completes_after: None,
+            mode: Mode::AutoMode,
+            expected: Expected::Refused(400, NOT_CANCELLABLE),
+            stored_status_after: UPDATE_SUCCESSFUL,
+        },
+        Case {
+            label: "a logging update that failed",
+            id: "66666666-6666-6666-6666-66666666666c",
+            update_type: "LoggingUpdate",
+            status: UPDATE_FAILED,
+            age: Duration::ZERO,
+            completes_after: None,
+            mode: Mode::AutoMode,
+            expected: Expected::Refused(400, NOT_CANCELLABLE),
+            stored_status_after: UPDATE_FAILED,
+        },
+        Case {
+            label: "an in-flight config update on a cluster that is not in Auto Mode",
+            id: "66666666-6666-6666-6666-66666666666d",
+            update_type: "ConfigUpdate",
+            status: UPDATE_IN_PROGRESS,
+            age: Duration::ZERO,
+            completes_after: in_flight,
+            mode: Mode::SelfManaged,
+            expected: Expected::Refused(400, NOT_CANCELLABLE),
             stored_status_after: UPDATE_IN_PROGRESS,
         },
         Case {
@@ -349,7 +415,7 @@ async fn an_update_is_cancelled_only_while_a_cancellation_can_still_stop_it() {
             age: Duration::ZERO,
             completes_after: in_flight,
             mode: Mode::AutoMode,
-            expected: Expected::Refused(400, "InvalidRequestException"),
+            expected: Expected::Refused(400, NOT_CANCELLABLE),
             stored_status_after: UPDATE_IN_PROGRESS,
         },
         Case {
@@ -360,7 +426,7 @@ async fn an_update_is_cancelled_only_while_a_cancellation_can_still_stop_it() {
             age: Duration::ZERO,
             completes_after: in_flight,
             mode: Mode::AutoMode,
-            expected: Expected::Refused(400, "InvalidRequestException"),
+            expected: Expected::Refused(400, NOT_CANCELLABLE),
             stored_status_after: UPDATE_IN_PROGRESS,
         },
         Case {
@@ -371,7 +437,7 @@ async fn an_update_is_cancelled_only_while_a_cancellation_can_still_stop_it() {
             age: Duration::ZERO,
             completes_after: None,
             mode: Mode::AutoMode,
-            expected: Expected::Refused(400, "InvalidRequestException"),
+            expected: Expected::Refused(400, NOT_IN_A_STATE_TO_CANCEL),
             stored_status_after: UPDATE_SUCCESSFUL,
         },
         Case {
@@ -382,7 +448,7 @@ async fn an_update_is_cancelled_only_while_a_cancellation_can_still_stop_it() {
             age: Duration::ZERO,
             completes_after: None,
             mode: Mode::AutoMode,
-            expected: Expected::Refused(400, "InvalidRequestException"),
+            expected: Expected::Refused(400, NOT_IN_A_STATE_TO_CANCEL),
             stored_status_after: UPDATE_FAILED,
         },
         Case {
@@ -393,7 +459,7 @@ async fn an_update_is_cancelled_only_while_a_cancellation_can_still_stop_it() {
             age: Duration::ZERO,
             completes_after: None,
             mode: Mode::AutoMode,
-            expected: Expected::Refused(400, "InvalidRequestException"),
+            expected: Expected::Refused(400, NOT_IN_A_STATE_TO_CANCEL),
             stored_status_after: UPDATE_CANCELLED,
         },
     ];
@@ -487,6 +553,24 @@ async fn an_update_is_cancelled_only_while_a_cancellation_can_still_stop_it() {
                     "case {:?}: expected error code {code}, got {answer:?}",
                     case.label
                 );
+                if code == NOT_CANCELLABLE {
+                    // The permanent refusal is built from the operation's contract: it
+                    // names the boundary it enforces (the supported update type), not
+                    // where this update happens to have got to.
+                    assert!(
+                        message_of(&answer).contains(UPDATE_TYPE_VERSION_ROLLBACK),
+                        "case {:?}: expected the refusal to name the supported update \
+                         type {UPDATE_TYPE_VERSION_ROLLBACK}, got {answer:?}",
+                        case.label
+                    );
+                    assert!(
+                        !message_of(&answer).contains(case.stored_status_after),
+                        "case {:?}: expected the refusal to be keyed on the update's \
+                         kind rather than its status {}, got {answer:?}",
+                        case.label,
+                        case.stored_status_after
+                    );
+                }
                 assert!(
                     answer.body.get("update").is_none(),
                     "case {:?}: a refusal must carry no update, got {answer:?}",
@@ -533,7 +617,8 @@ async fn an_update_is_cancelled_only_while_a_cancellation_can_still_stop_it() {
 }
 
 /// An update minted by a real producer is subject to the same rule: it is not a
-/// `VersionRollback`, so cancelling it is refused and it keeps running.
+/// `VersionRollback`, so cancelling it can never be supported and the call is refused
+/// with the permanent, argument-level class while the update keeps running.
 #[tokio::test]
 async fn an_update_started_by_a_real_producer_is_refused_for_its_type() {
     const CLUSTER: &str = "producer-cluster";
@@ -580,9 +665,14 @@ async fn an_update_started_by_a_real_producer_is_refused_for_its_type() {
     );
     assert_eq!(
         error_code_of(&answer),
-        "InvalidRequestException",
-        "case \"a real AssociateEncryptionConfig update\": expected InvalidRequestException, \
+        NOT_CANCELLABLE,
+        "case \"a real AssociateEncryptionConfig update\": expected {NOT_CANCELLABLE}, \
          got {answer:?}"
+    );
+    assert!(
+        message_of(&answer).contains(UPDATE_TYPE_VERSION_ROLLBACK),
+        "case \"a real AssociateEncryptionConfig update\": expected the refusal to name \
+         the supported update type, got {answer:?}"
     );
 
     let read_back = describe_update(&router, CLUSTER, &update_id).await;
@@ -593,6 +683,87 @@ async fn an_update_started_by_a_real_producer_is_refused_for_its_type() {
          running, got {:?}",
         update_of(&read_back)["status"]
     );
+}
+
+/// The refusal for an update cancellation is not supported for does NOT depend on how
+/// far that update has got: the same real producer update is refused the same way while
+/// it is still running and after the clock has carried it to its terminal status, and
+/// neither refusal disturbs it.
+#[tokio::test]
+async fn an_unsupported_update_is_refused_the_same_way_running_or_finished() {
+    const CLUSTER: &str = "logging-cluster";
+    let (router, _engine) = emulator_with_engine();
+    create_cluster(&router, REGION, CLUSTER, Mode::AutoMode).await;
+    // The producer starts an update only on an `ACTIVE` cluster.
+    tokio::time::sleep(
+        service_com_amazonaws_eks_awswesleyfrontend::state::CLUSTER_ACTIVATION_DELAY
+            + Duration::from_millis(150),
+    )
+    .await;
+
+    let started = call(
+        &router,
+        REGION,
+        "POST",
+        &format!("/clusters/{CLUSTER}/update-config"),
+        &serde_json::json!({
+            "logging": { "clusterLogging": [{ "types": ["api"], "enabled": true }] },
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(
+        started.status, 200,
+        "setup: expected UpdateClusterConfig to start an update, got {started:?}"
+    );
+    let update_id = update_of(&started)["id"]
+        .as_str()
+        .expect("setup: the started update carries an id")
+        .to_owned();
+
+    // Row 1: the update is still in flight. Row 2: the clock has carried it to its
+    // terminal status. The refusal must be identical.
+    for case in ["still in progress", "already successful"] {
+        if case == "already successful" {
+            tokio::time::sleep(UPDATE_COMPLETION_DELAY + Duration::from_millis(250)).await;
+        }
+        let expected_status = if case == "still in progress" {
+            UPDATE_IN_PROGRESS
+        } else {
+            UPDATE_SUCCESSFUL
+        };
+
+        let answer = cancel_update(&router, CLUSTER, &update_id, None).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: expected HTTP 400, got {answer:?}"
+        );
+        assert_eq!(
+            error_code_of(&answer),
+            NOT_CANCELLABLE,
+            "case {case:?}: expected {NOT_CANCELLABLE}, got {answer:?}"
+        );
+        assert!(
+            message_of(&answer).contains(UPDATE_TYPE_VERSION_ROLLBACK),
+            "case {case:?}: expected the refusal to name the supported update type, \
+             got {answer:?}"
+        );
+
+        // The rejected call had no effect: the update keeps its status and acquired no
+        // cancellation.
+        let read_back = describe_update(&router, CLUSTER, &update_id).await;
+        assert_eq!(
+            update_of(&read_back)["status"],
+            serde_json::json!(expected_status),
+            "case {case:?}: expected the refused update to still report {expected_status}, \
+             got {:?}",
+            update_of(&read_back)["status"]
+        );
+        assert!(
+            update_of(&read_back).get("cancellation").is_none(),
+            "case {case:?}: a refused cancel must add no cancellation, got {read_back:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -854,8 +1025,8 @@ async fn a_retry_with_the_same_idempotency_token_is_answered_with_the_cancellati
         );
         assert_eq!(
             error_code_of(&other),
-            "InvalidRequestException",
-            "case {label:?}: expected InvalidRequestException, got {other:?}"
+            NOT_IN_A_STATE_TO_CANCEL,
+            "case {label:?}: expected {NOT_IN_A_STATE_TO_CANCEL}, got {other:?}"
         );
     }
 

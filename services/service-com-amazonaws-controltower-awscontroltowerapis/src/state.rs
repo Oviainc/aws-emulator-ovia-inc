@@ -31,6 +31,11 @@
 //! `GetBaseline` resolves an identifier against, not in the per-account store. No call
 //! creates, changes or deletes a baseline, so nothing a caller does can grow it.
 //!
+//! CONTROLS are catalog data of exactly that kind: a control is AWS-managed and identical
+//! in every account, so the controls a caller may name live in the constant
+//! [`CONTROL_CATALOG`] that `EnableControl` resolves a `controlIdentifier` against, and no
+//! call creates, changes or deletes one either.
+//!
 //! RETENTION: every store a caller can grow by repeating calls is BOUNDED, so ordinary
 //! request traffic cannot grow this process's heap, or the per-request scan [`settle`]
 //! runs under the state lock, without limit:
@@ -102,27 +107,17 @@ pub const MAX_LANDING_ZONE_OPERATIONS: usize = 1024;
 /// `ListEnabledControls` runs under the state lock.
 pub const MAX_ENABLED_CONTROLS: usize = 1024;
 
-/// The most `EnabledControlParameter`s one `EnableControl` request may carry.
-///
-/// `EnabledControlParameters` carries no `@length` trait, so the front door imposes no
-/// count on it and the only other ceiling is the server's request-body limit — which
-/// admits hundreds of thousands of entries. The count a caller chooses is therefore
-/// bounded HERE, before any per-parameter work runs, and refused with the modelled
-/// `ValidationException`. The value is CHOSEN: an AWS Control Tower control is
-/// configured by a handful of parameters, so this is far above any real configuration
-/// and small enough that the duplicate-key pass and the stored record are bounded.
-pub const MAX_ENABLED_CONTROL_PARAMETERS: usize = 200;
-
 /// The most bytes one `EnableControl` request's `parameters` may weigh, keys and
 /// documents together.
 ///
-/// A parameter count alone does not bound the store: an `EnabledControlParameter$value`
-/// is an unconstrained `Document`, so one parameter can carry a whole body. The weight
-/// is measured with [`document_weight_within`], which stops as soon as this cap is
-/// exceeded, and a request above it is refused with the modelled `ValidationException`.
-/// CHOSEN for the same reason as the count: orders of magnitude above any real control
-/// configuration, and small enough that [`MAX_ENABLED_CONTROLS`] records bound the
-/// store's size in bytes as well as in entries.
+/// The declared-key check ([`unacceptable_control_parameters_message`]) already bounds the
+/// parameter COUNT of an enablement — a control declares a handful of keys and each may be
+/// given once — but an `EnabledControlParameter$value` is an unconstrained `Document`, so
+/// one parameter can still carry a whole body. The weight is measured with
+/// [`document_weight_within`], which stops as soon as this cap is exceeded, and a request
+/// above it is refused with the modelled `ValidationException`. CHOSEN: orders of
+/// magnitude above any real control configuration, and small enough that
+/// [`MAX_ENABLED_CONTROLS`] records bound the store's size in bytes as well as in entries.
 pub const MAX_ENABLED_CONTROL_PARAMETER_BYTES: usize = 64 * 1024;
 
 /// The most control operation records the log retains.
@@ -1907,6 +1902,332 @@ pub fn is_baseline_arn(identifier: &str) -> bool {
         })
 }
 
+/// One entry of this service's CONTROL catalog: a control AWS Control Tower publishes,
+/// which a caller names with a `controlIdentifier`.
+///
+/// A control is NOT an account resource — no call creates, changes or deletes one, and the
+/// same controls exist in every account — so the catalog is service-managed data
+/// ([`CONTROL_CATALOG`]) rather than a map in the per-account store, exactly like
+/// [`BASELINE_CATALOG`] one level up. What an account owns is the ENABLEMENT of a control
+/// on a target, which is what `enabled_controls` holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogControl {
+    /// The control's NAME, which is the resource segment of its AWS Control Tower ARN
+    /// (`arn:aws:controltower:<region>::control/<name>`) and the control's identity.
+    ///
+    /// These names are the ones the AWS Control Tower controls reference guide publishes
+    /// for its `AWS-GR_`-prefixed controls. A control whose published name carries a
+    /// character `ControlIdentifier`'s pattern (`^arn:aws[0-9a-zA-Z_\-:\/]+$`) does not
+    /// admit — a dot, say — cannot reach a handler at all, so the catalog publishes none.
+    pub name: &'static str,
+    /// The resource segment of the SAME control's AWS Control Catalog ARN
+    /// (`arn:<partition>:controlcatalog:::control/<id>`), the newer form of the identifier
+    /// a caller may name a control by.
+    ///
+    /// These ids are opaque in AWS — nothing published derives one from a control's name —
+    /// so, like the baseline ids, they are this emulator's own publication: chosen once
+    /// and never minted per request, so an identifier a caller stores keeps resolving for
+    /// the life of this emulator. Each is 26 lowercase alphanumeric characters, the form
+    /// AWS Control Catalog control ARNs carry.
+    pub catalog_id: &'static str,
+    /// Whether `EnableControl` may enable this control.
+    ///
+    /// `EnableControlInput$controlIdentifier` is documented as "Only Strongly recommended
+    /// and Elective controls are permitted, with the exception of the Region deny
+    /// control": the MANDATORY controls AWS Control Tower applies to every governed
+    /// account itself are named by a `controlIdentifier` — `ListEnabledControls` reports
+    /// them — but cannot be enabled by a caller, so a request naming one is refused rather
+    /// than persisted. False for exactly those.
+    pub enablable: bool,
+    /// The `EnabledControlParameter` keys this control DECLARES, in a stable order.
+    ///
+    /// `EnabledControlParameter$key` is "a string denoting the parameter applied to the
+    /// control" — a parameter the control itself declares, not a name the caller invents,
+    /// so a key outside this set configures nothing and is refused. Most AWS Control Tower
+    /// controls take no configuration at all and carry an EMPTY set, for which any
+    /// `parameters` entry is refused; the Region deny control is the one the API
+    /// reference's own `EnableControl` example configures, with `AllowedRegions`, beside
+    /// the exemption keys its documentation publishes. Like the ids, this set is this
+    /// emulator's publication and moves with AWS's releases.
+    pub parameters: &'static [&'static str],
+}
+
+impl CatalogControl {
+    /// Whether this control declares `key` as an enablement parameter.
+    pub fn declares_parameter(&self, key: &str) -> bool {
+        self.parameters.contains(&key)
+    }
+}
+
+/// The controls this emulator publishes, in a stable order.
+///
+/// A mix of the three kinds of control the AWS Control Tower controls reference guide
+/// publishes — the mandatory ones the service applies itself, the strongly recommended and
+/// elective ones a caller enables, and the Region deny control — so that every rule
+/// `EnableControl` applies to a `controlIdentifier` has catalog entries on both sides of
+/// it. It is not AWS's whole catalogue of hundreds of controls: a name outside this set
+/// names no control this emulator has.
+pub const CONTROL_CATALOG: &[CatalogControl] = &[
+    // The mandatory controls: AWS Control Tower applies these to every governed account
+    // itself, so a caller may not enable them.
+    CatalogControl {
+        name: "AWS-GR_AUDIT_BUCKET_DELETION_PROHIBITED",
+        catalog_id: "5kvme4m5d2b4d7dcf0fqkdmxt3",
+        enablable: false,
+        parameters: &[],
+    },
+    CatalogControl {
+        name: "AWS-GR_AUDIT_BUCKET_ENCRYPTION_ENABLED",
+        catalog_id: "9h2jr6twx1pzn4bq8sm0lyvke5",
+        enablable: false,
+        parameters: &[],
+    },
+    CatalogControl {
+        name: "AWS-GR_AUDIT_BUCKET_POLICY_CHANGES_PROHIBITED",
+        catalog_id: "3fxn7cgp5rmbt8wzd1qkj4shvy",
+        enablable: false,
+        parameters: &[],
+    },
+    CatalogControl {
+        name: "AWS-GR_CLOUDTRAIL_CHANGE_PROHIBITED",
+        catalog_id: "2mpr9vxtc6gln6tjb5hwqz0dkf",
+        enablable: false,
+        parameters: &[],
+    },
+    CatalogControl {
+        name: "AWS-GR_CLOUDTRAIL_ENABLED",
+        catalog_id: "1ysc3nmpx8rvg0kdwt2fqhj7zm",
+        enablable: false,
+        parameters: &[],
+    },
+    CatalogControl {
+        name: "AWS-GR_CLOUDTRAIL_VALIDATION_ENABLED",
+        catalog_id: "7dcf0fqkdmxt35kvme4m5d2b4d",
+        enablable: false,
+        parameters: &[],
+    },
+    CatalogControl {
+        name: "AWS-GR_CONFIG_CHANGE_PROHIBITED",
+        catalog_id: "4bq8sm0lyvke59h2jr6twx1pzn",
+        enablable: false,
+        parameters: &[],
+    },
+    CatalogControl {
+        name: "AWS-GR_CONFIG_ENABLED",
+        catalog_id: "8wzd1qkj4shvy3fxn7cgp5rmbt",
+        enablable: false,
+        parameters: &[],
+    },
+    CatalogControl {
+        name: "AWS-GR_IAM_ROLE_CHANGE_PROHIBITED",
+        catalog_id: "6tjb5hwqz0dkf2mpr9vxtc6gln",
+        enablable: false,
+        parameters: &[],
+    },
+    CatalogControl {
+        name: "AWS-GR_LOG_GROUP_POLICY",
+        catalog_id: "0kdwt2fqhj7zm1ysc3nmpx8rvg",
+        enablable: false,
+        parameters: &[],
+    },
+    CatalogControl {
+        name: "AWS-GR_SNS_SUBSCRIPTION_CHANGE_PROHIBITED",
+        catalog_id: "5kvme4m5d2b4d9h2jr6twx1pzn",
+        enablable: false,
+        parameters: &[],
+    },
+    // The strongly recommended and elective controls, which a caller enables on a target.
+    CatalogControl {
+        name: "AWS-GR_ENCRYPTED_VOLUMES",
+        catalog_id: "7dcf0fqkdmxt34bq8sm0lyvke5",
+        enablable: true,
+        parameters: &[],
+    },
+    CatalogControl {
+        name: "AWS-GR_EBS_OPTIMIZED_INSTANCE",
+        catalog_id: "9h2jr6twx1pzn3fxn7cgp5rmbt",
+        enablable: true,
+        parameters: &[],
+    },
+    CatalogControl {
+        name: "AWS-GR_EC2_VOLUME_INUSE_CHECK",
+        catalog_id: "4bq8sm0lyvke58wzd1qkj4shvy",
+        enablable: true,
+        parameters: &[],
+    },
+    CatalogControl {
+        name: "AWS-GR_RDS_INSTANCE_PUBLIC_ACCESS_CHECK",
+        catalog_id: "3fxn7cgp5rmbt2mpr9vxtc6gln",
+        enablable: true,
+        parameters: &[],
+    },
+    CatalogControl {
+        name: "AWS-GR_RDS_STORAGE_ENCRYPTED",
+        catalog_id: "8wzd1qkj4shvy6tjb5hwqz0dkf",
+        enablable: true,
+        parameters: &[],
+    },
+    CatalogControl {
+        name: "AWS-GR_RESTRICTED_COMMON_PORTS",
+        catalog_id: "2mpr9vxtc6gln1ysc3nmpx8rvg",
+        enablable: true,
+        parameters: &[],
+    },
+    CatalogControl {
+        name: "AWS-GR_ROOT_ACCOUNT_MFA_ENABLED",
+        catalog_id: "6tjb5hwqz0dkf0kdwt2fqhj7zm",
+        enablable: true,
+        parameters: &[],
+    },
+    CatalogControl {
+        name: "AWS-GR_S3_BUCKET_PUBLIC_READ_PROHIBITED",
+        catalog_id: "1ysc3nmpx8rvg5kvme4m5d2b4d",
+        enablable: true,
+        parameters: &[],
+    },
+    CatalogControl {
+        name: "AWS-GR_S3_BUCKET_PUBLIC_WRITE_PROHIBITED",
+        catalog_id: "0kdwt2fqhj7zm7dcf0fqkdmxt3",
+        enablable: true,
+        parameters: &[],
+    },
+    CatalogControl {
+        name: "AWS-GR_MFA_ENABLED_FOR_IAM_CONSOLE_ACCESS",
+        catalog_id: "5kvme4m5d2b4d4bq8sm0lyvke5",
+        enablable: true,
+        parameters: &[],
+    },
+    CatalogControl {
+        name: "AWS-GR_RESTRICT_ROOT_USER",
+        catalog_id: "7dcf0fqkdmxt33fxn7cgp5rmbt",
+        enablable: true,
+        parameters: &[],
+    },
+    CatalogControl {
+        name: "AWS-GR_RESTRICT_ROOT_USER_ACCESS_KEYS",
+        catalog_id: "9h2jr6twx1pzn8wzd1qkj4shvy",
+        enablable: true,
+        parameters: &[],
+    },
+    CatalogControl {
+        name: "AWS-GR_DISALLOW_CROSS_REGION_NETWORKING",
+        catalog_id: "4bq8sm0lyvke52mpr9vxtc6gln",
+        enablable: true,
+        parameters: &[],
+    },
+    CatalogControl {
+        name: "AWS-GR_DISALLOW_VPC_INTERNET_ACCESS",
+        catalog_id: "3fxn7cgp5rmbt6tjb5hwqz0dkf",
+        enablable: true,
+        parameters: &[],
+    },
+    CatalogControl {
+        name: "AWS-GR_DISALLOW_VPN_CONNECTIONS",
+        catalog_id: "8wzd1qkj4shvy1ysc3nmpx8rvg",
+        enablable: true,
+        parameters: &[],
+    },
+    // The Region deny control: permitted by the member's own documentation despite not
+    // being one of the strongly recommended or elective controls, and the one control this
+    // catalog publishes with parameters.
+    CatalogControl {
+        name: "AWS-GR_REGION_DENY",
+        catalog_id: "2mpr9vxtc6gln0kdwt2fqhj7zm",
+        enablable: true,
+        parameters: &["AllowedRegions", "ExemptedPrincipalArns", "ExemptedActions"],
+    },
+];
+
+/// The catalog entry a `controlIdentifier` names, or `None` when the identifier is not a
+/// control ARN or the catalog holds no control it names.
+///
+/// A control is named by either of the two ARN forms AWS publishes for it — the AWS
+/// Control Tower form, whose resource segment is the control's NAME, and the AWS Control
+/// Catalog form, whose resource segment is the control's opaque id — so both resolve to
+/// the same entry here. The same catalog is published in every partition, region and
+/// account, so the segments before the resource select nothing and are not compared beyond
+/// being the ones a control ARN carries; the name and the id are matched exactly, so a
+/// value differing from a catalog entry in one character names no control.
+pub fn resolve_control(control_identifier: &str) -> Option<&'static CatalogControl> {
+    match control_reference(control_identifier)? {
+        ControlReference::Name(name) => CONTROL_CATALOG.iter().find(|control| control.name == name),
+        ControlReference::CatalogId(id) => CONTROL_CATALOG
+            .iter()
+            .find(|control| control.catalog_id == id),
+    }
+}
+
+/// Whether `identifier` is a control ARN at all, in either form AWS publishes.
+///
+/// `EnableControl$controlIdentifier` is typed as `ControlIdentifier`, whose pattern
+/// (`^arn:aws[0-9a-zA-Z_\-:\/]+$`) admits any ARN of any service, so an ARN naming some
+/// other kind of resource reaches the handler and is told apart here: one of these two
+/// forms naming no catalog entry references a control that does not exist, while anything
+/// else is not a control reference at all.
+pub fn is_control_arn(identifier: &str) -> bool {
+    control_reference(identifier).is_some()
+}
+
+/// How a control ARN names its control: by name in the AWS Control Tower form, by opaque
+/// id in the AWS Control Catalog form.
+enum ControlReference<'a> {
+    /// `arn:<partition>:controltower:<region>::control/<NAME>`.
+    Name(&'a str),
+    /// `arn:<partition>:controlcatalog:::control/<id>`.
+    CatalogId(&'a str),
+}
+
+/// The control `identifier` references, or `None` when it is not a control ARN.
+///
+/// Neither form names an account: a control belongs to no account, which is why the
+/// account segment must be empty in both. The Control Catalog form names no region either
+/// — that catalog is global — while the Control Tower form carries the region the caller
+/// read the control's ARN in.
+fn control_reference(identifier: &str) -> Option<ControlReference<'_>> {
+    let (partition, service, region, account, resource) = arn_segments(identifier)?;
+    if partition.is_empty()
+        || !partition
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+        || !account.is_empty()
+    {
+        return None;
+    }
+    let resource = resource.strip_prefix("control/")?;
+    match service {
+        ARN_NAMESPACE
+            if region
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                && is_control_name(resource) =>
+        {
+            Some(ControlReference::Name(resource))
+        }
+        "controlcatalog" if region.is_empty() && is_control_catalog_id(resource) => {
+            Some(ControlReference::CatalogId(resource))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `value` has the form of an AWS Control Tower control name: a non-empty run of
+/// the uppercase letters, digits, underscores and hyphens the published names are made of.
+fn is_control_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
+        })
+}
+
+/// Whether `value` has the form of an AWS Control Catalog control id: 26 lowercase
+/// alphanumeric characters.
+fn is_control_catalog_id(value: &str) -> bool {
+    value.len() == 26
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
 /// Whether `target` is the ARN of an AWS Organizations organizational unit.
 ///
 /// `EnableBaseline$targetIdentifier` is "the ARN of the target on which the baseline will
@@ -2028,22 +2349,66 @@ pub fn unacceptable_parameters_message(
     baseline: &CatalogBaseline,
     parameters: &[(String, ::aws_smithy_types::Document)],
 ) -> Option<String> {
+    unacceptable_enablement_parameters_message(
+        "baseline",
+        baseline.name,
+        baseline.parameters,
+        MAX_ENABLED_BASELINE_PARAMETER_BYTES,
+        parameters,
+    )
+}
+
+/// Why `parameters` does not configure `control`, or `None` when it does.
+///
+/// The one place a control's parameter list is checked, so `EnableControl` and
+/// `UpdateEnabledControl` refuse the same lists in the same words — the rule
+/// [`unacceptable_parameters_message`] applies to a baseline's parameters one level up, so
+/// both read it off the same walk.
+pub fn unacceptable_control_parameters_message(
+    control: &CatalogControl,
+    parameters: &[(String, ::aws_smithy_types::Document)],
+) -> Option<String> {
+    unacceptable_enablement_parameters_message(
+        "control",
+        control.name,
+        control.parameters,
+        MAX_ENABLED_CONTROL_PARAMETER_BYTES,
+        parameters,
+    )
+}
+
+/// Why `parameters` does not configure the resource named by `kind`/`name`, or `None` when
+/// it does.
+///
+/// The ONE rule both an enabled baseline's and an enabled control's parameter list are
+/// checked by: a list is unacceptable when it names a key the resource does not declare (it
+/// would configure nothing), repeats a key (one key addresses one parameter, so a list
+/// carrying it twice does not describe one configuration) or weighs more than
+/// `byte_cap`. `kind` is the word the refusal calls the resource, so the message names the
+/// member and what that resource declares.
+fn unacceptable_enablement_parameters_message(
+    kind: &str,
+    name: &str,
+    declared: &[&str],
+    byte_cap: usize,
+    parameters: &[(String, ::aws_smithy_types::Document)],
+) -> Option<String> {
+    // One pass over a set of the keys already seen, so detecting a repeat costs
+    // O(n log n) in the entry count rather than O(n^2).
     let mut seen: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
     let mut weight = 0usize;
     for (key, value) in parameters {
-        if !baseline.declares_parameter(key) {
-            return Some(if baseline.parameters.is_empty() {
+        if !declared.contains(&key.as_str()) {
+            return Some(if declared.is_empty() {
                 format!(
-                    "parameters names {key:?}, which baseline {} does not declare; that \
-                     baseline declares no enablement parameters",
-                    baseline.name
+                    "parameters names {key:?}, which {kind} {name} does not declare; that \
+                     {kind} declares no enablement parameters"
                 )
             } else {
                 format!(
-                    "parameters names {key:?}, which baseline {} does not declare; the \
+                    "parameters names {key:?}, which {kind} {name} does not declare; the \
                      parameters it declares are {}",
-                    baseline.name,
-                    baseline.parameters.join(", ")
+                    declared.join(", ")
                 )
             });
         }
@@ -2055,58 +2420,11 @@ pub fn unacceptable_parameters_message(
         }
         // The budget left for this value, so the whole list is measured once and the walk
         // stops at the first node that takes it past the cap.
-        let budget =
-            MAX_ENABLED_BASELINE_PARAMETER_BYTES.saturating_sub(weight.saturating_add(key.len()));
+        let budget = byte_cap.saturating_sub(weight.saturating_add(key.len()));
         let Some(value_weight) = document_weight_within(value, budget) else {
             return Some(format!(
-                "parameters weighs more than the {MAX_ENABLED_BASELINE_PARAMETER_BYTES} \
-                 bytes a baseline enablement's parameters may hold"
-            ));
-        };
-        weight = weight.saturating_add(key.len()).saturating_add(value_weight);
-    }
-    None
-}
-
-/// Why `parameters` does not configure an enabled control, or `None` when it does.
-///
-/// The one place a control's parameter list is checked, so `EnableControl` and
-/// `UpdateEnabledControl` refuse the same lists in the same words. `EnabledControlParameters`
-/// carries no modelled length and a control publishes no parameter catalogue, so a list is
-/// unacceptable when it holds more than [`MAX_ENABLED_CONTROL_PARAMETERS`] entries, repeats
-/// a key (a parameter is addressed by its key, so a list carrying one twice does not
-/// describe one configuration) or weighs more than
-/// [`MAX_ENABLED_CONTROL_PARAMETER_BYTES`].
-pub fn unacceptable_control_parameters_message(
-    parameters: &[(String, ::aws_smithy_types::Document)],
-) -> Option<String> {
-    if parameters.len() > MAX_ENABLED_CONTROL_PARAMETERS {
-        return Some(format!(
-            "parameters carries {} entries, more than the {MAX_ENABLED_CONTROL_PARAMETERS} a \
-             control may be configured with",
-            parameters.len()
-        ));
-    }
-
-    // One pass over a set of the keys already seen, so detecting a repeat costs
-    // O(n log n) in the entry count rather than O(n^2).
-    let mut seen: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
-    let mut weight = 0usize;
-    for (key, value) in parameters {
-        if !seen.insert(key.as_str()) {
-            return Some(format!(
-                "parameters carries key {key:?} more than once; each control parameter key \
-                 may be given at most once"
-            ));
-        }
-        // The budget left for this value, so the whole list is measured once and the walk
-        // stops at the first node that takes it past the cap.
-        let budget =
-            MAX_ENABLED_CONTROL_PARAMETER_BYTES.saturating_sub(weight.saturating_add(key.len()));
-        let Some(value_weight) = document_weight_within(value, budget) else {
-            return Some(format!(
-                "parameters weighs more than the {MAX_ENABLED_CONTROL_PARAMETER_BYTES} bytes \
-                 a control configuration may hold"
+                "parameters weighs more than the {byte_cap} bytes one {kind} enablement's \
+                 parameters may hold"
             ));
         };
         weight = weight.saturating_add(key.len()).saturating_add(value_weight);

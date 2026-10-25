@@ -7,8 +7,10 @@
 //! cluster subnet groups they are configured from, the HSM configurations that
 //! tell a cluster where to store its database encryption keys, the usage limits
 //! set on their features, the snapshot copy grants that let Redshift encrypt
-//! copied snapshots in another region, and the Query Editor (QEV2) IAM Identity
-//! Center applications the account registered. Every collection keeps
+//! copied snapshots in another region, the Query Editor (QEV2) IAM Identity
+//! Center applications the account registered, and the namespace registrations
+//! that expose a cluster's or a serverless namespace's data to a consumer
+//! account through the Glue Data Catalog. Every collection keeps
 //! INSERTION ORDER, so the `Marker`
 //! cursor the paginated `Describe*` operations hand out is a stable, resumable
 //! offset into the same sequence a later page walks.
@@ -33,6 +35,7 @@ use crate::ops::types::{
     AvailabilityZone, Cluster, ClusterIamRole,
     ClusterNode, ClusterParameterGroup, ClusterParameterGroupStatus, ClusterParameterStatus,
     ClusterSubnetGroup, ClusterVersion, CreateUsageLimitOutput, HsmConfiguration, MaintenanceTrack,
+    NamespaceIdentifierUnion,
     NetworkInterface, Parameter, PendingModifiedValues, Qev2IdcApplication, RecurringCharge,
     ReservedNodeOffering, Snapshot, SnapshotCopyGrant, Subnet, SupportedOperation,
     SupportedPlatform, UpdateTarget,
@@ -1726,6 +1729,164 @@ pub fn is_arn(value: &str) -> bool {
 pub const STORE_UNAVAILABLE: &str =
     "the Amazon Redshift control-plane store is temporarily unavailable";
 
+/// How long after the call that asks for it a namespace REGISTRATION change
+/// falls due.
+///
+/// Two things fall due at that instant, both started by the same call: a
+/// provisioned cluster whose namespace registration changed is reported
+/// [`STATUS_MODIFYING`] until then and [`STATUS_AVAILABLE`] from then on (see
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::begin_namespace_registration_change`]),
+/// and a registration a `DeregisterNamespace` reported as leaving is GONE from
+/// then on — the namespace is registered to that consumer no longer.
+///
+/// The span is the emulator's own choice, for the same reason and with the same
+/// shape as [`PROVISIONING_SPAN`]: Amazon Redshift documents no duration for a
+/// registration change, and the span is deliberately non-zero so a caller that
+/// polls the cluster straight after the call still observes the change being
+/// applied. The due instant is stored and nothing ever sleeps for it.
+pub const NAMESPACE_REGISTRATION_SPAN: Duration = Duration::from_millis(500);
+
+/// How many namespace registrations the store holds before
+/// `RegisterNamespace` refuses to record another one.
+///
+/// The same reasoning as [`SNAPSHOT_COPY_GRANT_QUOTA`]: the emulator's own bound
+/// on
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::namespace_registrations`],
+/// not a claim about an account's published limit. A registration's identity is
+/// the (namespace, consumer account) pair the request carries, and the
+/// serverless arm of that pair is any identifier a caller sends, so this bound
+/// is what stops the collection growing without end; it is set far above any
+/// workflow an emulator serves, and every record it holds is released by
+/// `DeregisterNamespace`.
+pub const NAMESPACE_REGISTRATION_QUOTA: usize = 10_000;
+
+/// The registration status reported for a namespace a `RegisterNamespace` call
+/// has just registered.
+///
+/// Source: `smithy_query(query="shape", shape="NamespaceRegistrationStatus")` —
+/// the enum carries exactly `Registering` and `Deregistering`.
+pub const NAMESPACE_REGISTERING: &str = "Registering";
+
+/// The registration status reported for a namespace a `DeregisterNamespace`
+/// call has just deregistered; same source as [`NAMESPACE_REGISTERING`].
+pub const NAMESPACE_DEREGISTERING: &str = "Deregistering";
+
+/// Which namespace a registration request names: the namespace of a
+/// provisioned cluster, or a serverless namespace reached through one of its
+/// workgroups.
+///
+/// ONE resolution of the modelled union for both `RegisterNamespace` and
+/// `DeregisterNamespace` (see [`registered_namespace`]), so a registration can
+/// never be stored under a key the deregister then fails to match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegisteredNamespace {
+    /// The namespace of the provisioned cluster with this `ClusterIdentifier`.
+    Provisioned {
+        /// The cluster whose namespace is registered.
+        cluster_identifier: String,
+    },
+    /// The serverless namespace with this identifier, reached through the
+    /// workgroup with this one.
+    Serverless {
+        /// The serverless namespace that is registered.
+        namespace_identifier: String,
+        /// The workgroup the request reaches that namespace through.
+        workgroup_identifier: String,
+    },
+}
+
+impl RegisteredNamespace {
+    /// How a refusal or a message names this namespace.
+    pub fn described(&self) -> String {
+        match self {
+            Self::Provisioned { cluster_identifier } => {
+                format!("cluster {cluster_identifier}")
+            }
+            Self::Serverless {
+                namespace_identifier,
+                workgroup_identifier,
+            } => format!(
+                "serverless namespace {namespace_identifier} of workgroup {workgroup_identifier}"
+            ),
+        }
+    }
+}
+
+/// The namespace a modelled `NamespaceIdentifierUnion` names, as this store
+/// keys it.
+pub fn registered_namespace(identifier: &NamespaceIdentifierUnion) -> RegisteredNamespace {
+    match identifier {
+        NamespaceIdentifierUnion::ProvisionedIdentifier(provisioned) => {
+            RegisteredNamespace::Provisioned {
+                cluster_identifier: provisioned.cluster_identifier.clone(),
+            }
+        }
+        NamespaceIdentifierUnion::ServerlessIdentifier(serverless) => {
+            RegisteredNamespace::Serverless {
+                namespace_identifier: serverless.namespace_identifier.clone(),
+                workgroup_identifier: serverless.workgroup_identifier.clone(),
+            }
+        }
+    }
+}
+
+/// Why a namespace a registration request names can take no registration
+/// change.
+///
+/// One rule for `RegisterNamespace` and `DeregisterNamespace` (see
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::registration_target`]);
+/// each operation maps it to its OWN modelled error, because the two declare
+/// the same three and must answer the same one for the same cause.
+#[derive(Debug, Clone)]
+pub enum NamespaceRefusal {
+    /// No cluster this account holds carries the identifier the request names.
+    ClusterNotFound(String),
+    /// The cluster is not in the state a registration change is admitted in.
+    InvalidClusterState(String),
+    /// The request names no namespace that could exist.
+    InvalidNamespace(String),
+}
+
+/// The consumer account id a registration request names, or why the value names
+/// no account.
+///
+/// `ConsumerIdentifiers` is "an array containing the ID of the consumer account"
+/// (`smithy_query(query="doc", shape="RegisterNamespaceInputMessage",
+/// member="ConsumerIdentifiers")`) and the model constrains it only by length,
+/// so the one form an account id takes — [`ACCOUNT_ID_DIGITS`] digits, as
+/// [`account_with_restore_access`] also admits — is checked here rather than
+/// storing a registration for an account that cannot exist.
+pub fn consumer_account_id(value: &str) -> Result<String, String> {
+    if value.len() == ACCOUNT_ID_DIGITS && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(value.to_string());
+    }
+    Err(format!(
+        "Invalid value for ConsumerIdentifiers: '{value}'. It must be a {ACCOUNT_ID_DIGITS}-digit Amazon Web Services account identifier."
+    ))
+}
+
+/// A namespace registration as this service stores it: which namespace is
+/// registered to which consumer account, and the registration status the call
+/// that last changed it reported.
+///
+/// The `NamespaceRegistrationStatus` enum carries only the two transient values
+/// (see [`NAMESPACE_REGISTERING`]), so a record that exists is a namespace
+/// registered to that consumer and a record a deregister marked is one the
+/// clock is about to remove (see [`StoredNamespaceRegistration::removed_at`]).
+#[derive(Debug, Clone)]
+pub struct StoredNamespaceRegistration {
+    /// The namespace that is registered.
+    pub namespace: RegisteredNamespace,
+    /// The consumer account the namespace is registered to.
+    pub consumer_identifier: String,
+    /// [`NAMESPACE_REGISTERING`] or [`NAMESPACE_DEREGISTERING`].
+    pub status: String,
+    /// When the clock-owed REMOVAL of this record falls due, set by the
+    /// deregister that asked for it and `None` while the namespace is
+    /// registered. See [`NAMESPACE_REGISTRATION_SPAN`].
+    pub removed_at: Option<Instant>,
+}
+
 /// A cluster as this service stores it: the modelled projection a response is
 /// built from, plus what the model does not carry.
 #[derive(Debug, Clone)]
@@ -1917,6 +2078,10 @@ pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// operation adds to or removes from the list (see
     /// [`published_reserved_node_offerings`]).
     pub reserved_node_offerings: Vec<ReservedNodeOffering>,
+    /// Every namespace registration `RegisterNamespace` recorded, keyed by the
+    /// (namespace, consumer account) pair it is a registration of, in
+    /// registration order.
+    pub namespace_registrations: Vec<StoredNamespaceRegistration>,
 }
 
 /// Where in the store one resource an ARN names sits: its collection and its
@@ -1958,6 +2123,7 @@ impl Default for ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             maintenance_tracks: published_maintenance_tracks(),
             account_attributes: published_account_attributes(),
             reserved_node_offerings: published_reserved_node_offerings(),
+            namespace_registrations: Vec::new(),
         }
     }
 }
@@ -2047,6 +2213,126 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             // it falls with the clock whether or not anybody called.
             refresh_manual_retention(&mut stored.snapshot, wall);
         }
+        // A registration a deregister reported as leaving is GONE once that
+        // call's span has passed: the namespace is registered to that consumer
+        // no longer, and that was due at this instant whether or not anybody
+        // called.
+        self.namespace_registrations
+            .retain(|registration| registration.removed_at.is_none_or(|due| now < due));
+    }
+
+    /// The namespace a registration request names, checked against the state
+    /// that holds it — or why it can take no registration change.
+    ///
+    /// The ONE precondition rule `RegisterNamespace` and `DeregisterNamespace`
+    /// share: a provisioned cluster's namespace can be registered only while
+    /// this account holds that cluster and the cluster is
+    /// [`STATUS_AVAILABLE`], and an identifier that names nothing a namespace
+    /// could be names no namespace at all.
+    ///
+    /// A serverless namespace lives in the Redshift Serverless control plane,
+    /// which is a DIFFERENT service with its own store, so this store checks
+    /// the identifier's form and records the registration against it rather
+    /// than refusing a namespace it cannot see.
+    pub fn registration_target(
+        &self,
+        identifier: &NamespaceIdentifierUnion,
+    ) -> Result<RegisteredNamespace, NamespaceRefusal> {
+        let namespace = registered_namespace(identifier);
+        match &namespace {
+            RegisteredNamespace::Provisioned { cluster_identifier } => {
+                let Some(stored) = self.cluster(cluster_identifier) else {
+                    return Err(NamespaceRefusal::ClusterNotFound(format!(
+                        "Cluster not found: {cluster_identifier}"
+                    )));
+                };
+                let status = stored
+                    .cluster
+                    .cluster_status
+                    .clone()
+                    .unwrap_or_default();
+                if status != STATUS_AVAILABLE {
+                    // The message template is this pair of operations' own, as
+                    // the recorded refusal shows: the sentence is fixed and the
+                    // identifier is interpolated from the request.
+                    return Err(NamespaceRefusal::InvalidClusterState(format!(
+                        "Cluster {cluster_identifier} is not in available state."
+                    )));
+                }
+            }
+            RegisteredNamespace::Serverless {
+                namespace_identifier,
+                workgroup_identifier,
+            } => {
+                // The model bounds both members only by length, so a blank one
+                // passes the boundary and still names no namespace and no
+                // workgroup to reach it through.
+                if namespace_identifier.trim().is_empty() || workgroup_identifier.trim().is_empty()
+                {
+                    return Err(NamespaceRefusal::InvalidNamespace(
+                        "The namespace isn't valid: ServerlessIdentifier must carry a NamespaceIdentifier and a WorkgroupIdentifier."
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(namespace)
+    }
+
+    /// Where the registration of `namespace` to `consumer_identifier` sits, if
+    /// this store holds one.
+    ///
+    /// The (namespace, consumer account) pair is the registration's identity:
+    /// registering the same namespace to the same consumer twice is one
+    /// registration, and a deregister releases only the consumer it names.
+    pub fn namespace_registration_position(
+        &self,
+        namespace: &RegisteredNamespace,
+        consumer_identifier: &str,
+    ) -> Option<usize> {
+        self.namespace_registrations.iter().position(|registration| {
+            &registration.namespace == namespace
+                && registration.consumer_identifier == consumer_identifier
+        })
+    }
+
+    /// Apply to the CLUSTER the in-place change a namespace registration change
+    /// asks of it: the cluster is being modified from the call that asked, and
+    /// is available again once the change falls due.
+    ///
+    /// Registering or deregistering a provisioned cluster's namespace is a
+    /// change to that cluster, so the cluster reports the work in progress from
+    /// the call that asked for it — which is where a client polling the cluster
+    /// reads it — and the clock-owed [`settle`](Self::settle) is what moves it
+    /// back, exactly as it does for the other in-place cluster changes. A
+    /// serverless namespace is no cluster of this control plane, so there is
+    /// nothing to move.
+    ///
+    /// One rule for `RegisterNamespace` and `DeregisterNamespace`, so the two
+    /// cannot leave the same cluster in different states.
+    pub fn begin_namespace_registration_change(
+        &mut self,
+        namespace: &RegisteredNamespace,
+        started: Instant,
+    ) {
+        let RegisteredNamespace::Provisioned { cluster_identifier } = namespace else {
+            return;
+        };
+        let Some(position) = self.cluster_position(cluster_identifier) else {
+            return;
+        };
+        let stored = &mut self.clusters[position];
+        stored.cluster.cluster_status = Some(STATUS_MODIFYING.to_string());
+        stored.available_at = started + NAMESPACE_REGISTRATION_SPAN;
+        // Re-derive every member this service computes from the cluster's own
+        // configuration — the availability status among them — through the same
+        // rule the create and the modify paths use.
+        let cluster_type = stored.cluster_type.clone();
+        populate_derived_members(
+            &mut stored.cluster,
+            &cluster_type,
+            ::aws_smithy_types::DateTime::from(SystemTime::now()),
+        );
     }
 
     /// The stored cluster with this identifier, if any.

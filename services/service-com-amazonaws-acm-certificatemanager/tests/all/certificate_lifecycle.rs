@@ -840,8 +840,9 @@ async fn tags_round_trip_through_the_certificate_record() {
         );
     }
 
-    // An untagged certificate reports no Tags member: `TagList` has a minimum length
-    // of one, so an empty list is not a legal value.
+    // An untagged certificate reports the EMPTY Tags list: the response IS the stored
+    // tag map, and "no tags" is a tag set the member states rather than a member a
+    // client has to infer from absence.
     let fresh = request_certificate(
         &router,
         &json!({ "DomainName": "untagged.example.com", "ValidationMethod": "DNS" }),
@@ -854,9 +855,10 @@ async fn tags_round_trip_through_the_certificate_record() {
     )
     .await;
     assert_eq!(status, 200, "an untagged certificate still lists: {response}");
-    assert!(
-        response["Tags"].is_null(),
-        "expected no Tags member for an untagged certificate, got {response}"
+    assert_eq!(
+        response["Tags"],
+        json!([]),
+        "expected the empty Tags list for an untagged certificate, got {response}"
     );
 
     // A reserved key is refused, and refused without touching the stored tags.

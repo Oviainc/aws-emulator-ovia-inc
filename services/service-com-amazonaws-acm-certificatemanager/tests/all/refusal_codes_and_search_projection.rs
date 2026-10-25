@@ -13,8 +13,8 @@
 //!    A well-formed ARN no record answers to is a different class and keeps
 //!    `ResourceNotFoundException`.
 //! 2. `UpdateCertificateOptions` applies only to a certificate ACM has ISSUED, and a
-//!    request naming one in any other status does not satisfy the operation's
-//!    constraints: `ValidationException` (HTTP 400), with nothing written.
+//!    request naming one in any other status has reached no state the operation can be
+//!    served in: `InvalidStateException` (HTTP 400), with nothing written.
 //! 3. A union of this service's input carries exactly one member, and a request that
 //!    sets more than one is refused with `ValidationException` (HTTP 400) whose
 //!    message is built FROM the request: it names the union, states the
@@ -260,10 +260,10 @@ async fn bad_parameters_of_a_domain_validation_listing_are_one_validation_except
 }
 
 /// RULE 2: `UpdateCertificateOptions` applies only to a certificate ACM has ISSUED,
-/// and any other status is a request that does not satisfy the operation's
-/// constraints: `ValidationException` (HTTP 400), with nothing written.
+/// and any other status is a PROCESSING STATE the request has to wait out rather than a
+/// malformed request: `InvalidStateException` (HTTP 400), with nothing written.
 #[tokio::test]
-async fn updating_the_options_of_a_certificate_that_is_not_issued_is_a_validation_exception() {
+async fn updating_the_options_of_a_certificate_that_is_not_issued_is_an_invalid_state_exception() {
     // The rows differ along the statuses a stored certificate can be in other than
     // ISSUED, and along the `Options` member the request asks for.
     let cases: &[(&str, Value, bool, &str, Value)] = &[
@@ -286,15 +286,15 @@ async fn updating_the_options_of_a_certificate_that_is_not_issued_is_a_validatio
             json!({ "CertificateTransparencyLoggingPreference": "ENABLED" }),
         ),
         (
-            "a public certificate whose validation failed",
-            json!({ "DomainName": "failed.classify.example.net", "ValidationMethod": "DNS" }),
+            "a public certificate whose validation timed out",
+            json!({ "DomainName": "timedout.classify.probe-domain.net", "ValidationMethod": "DNS" }),
             false,
-            "FAILED",
+            "VALIDATION_TIMED_OUT",
             json!({ "ValidationMethod": "HTTP" }),
         ),
         (
             "a failed certificate asked for the export option it already has",
-            json!({ "DomainName": "failed.classify.example.io", "ValidationMethod": "EMAIL" }),
+            json!({ "DomainName": "failed.classify.example.org", "ValidationMethod": "EMAIL" }),
             false,
             "FAILED",
             json!({ "Export": "DISABLED" }),
@@ -320,8 +320,8 @@ async fn updating_the_options_of_a_certificate_that_is_not_issued_is_a_validatio
         let (status, response) = update_options(&router, &arn, options).await;
         assert_eq!(
             (status, error_code(&response).as_str()),
-            (400, "ValidationException"),
-            "case {case}: expected 400 ValidationException for a {expected_status} \
+            (400, "InvalidStateException"),
+            "case {case}: expected 400 InvalidStateException for a {expected_status} \
              certificate, got {status} {response}"
         );
         let message = error_message(&response);
@@ -371,8 +371,8 @@ async fn updating_the_options_of_a_certificate_that_is_not_issued_is_a_validatio
         update_options(&router, &arn, &json!({ "ValidationMethod": "HTTP" })).await;
     assert_eq!(
         (status, error_code(&response).as_str()),
-        (400, "ValidationException"),
-        "case once revoked: expected 400 ValidationException, got {status} {response}"
+        (400, "InvalidStateException"),
+        "case once revoked: expected 400 InvalidStateException, got {status} {response}"
     );
 }
 

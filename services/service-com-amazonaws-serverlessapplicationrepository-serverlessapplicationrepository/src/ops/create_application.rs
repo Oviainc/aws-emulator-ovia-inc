@@ -362,7 +362,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 source_code_url: input.source_code_url.clone(),
                 source_code_archive_url: input.source_code_archive_url.clone(),
                 parameter_definitions,
-                required_capabilities: Vec::new(),
+                // The acknowledgement a deployment of this version will be held to, from
+                // the template being published now.
+                required_capabilities: crate::state::required_capabilities_of(
+                    input.template_body.as_ref(),
+                ),
                 resources_supported: true,
             };
             application.insert_version(version);

@@ -3,8 +3,9 @@
 //! @op PutRecommendationPreferences
 //!
 //! IMPLEMENTED: creates or updates (upserts) the one stored preference record for the
-//! requested (resourceType, scope) key, merging the supplied preference fields into it,
-//! and refuses with `InvalidParameterValueException` a request that breaks a preference
+//! requested (resourceType, scope) key, merging the supplied preference fields into it —
+//! and storing no record at all when the merged result holds no preference, so a request
+//! that sets none creates none — and refuses with `InvalidParameterValueException` a request that breaks a preference
 //! rule this service applies — the resource types each preference member may be set for,
 //! the scope levels a resource type admits, and the well-formedness of the preference
 //! values themselves.
@@ -256,20 +257,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // preference": one record per (resourceType, scope) key, with the supplied fields
         // merged into whatever that key already holds.
         let key = crate::state::PreferenceKey::new(&input.resource_type, input.scope.as_ref());
-        // The key comes from caller-supplied `resourceType` + `scope`, so a NEW key is a
-        // new allocation this request asked for: refuse once the store is full rather than
-        // growing without limit. An update to a key already held allocates nothing and is
-        // still accepted.
+        // The record this request leaves at that key: whatever the key already holds, or a
+        // record for a key it does not, with the supplied fields merged into it. Computed
+        // before anything is stored, so what is stored is decided by what the merge
+        // actually holds.
+        let mut record = guard.preferences.get(&key).cloned().unwrap_or_else(|| {
+            crate::state::PreferenceRecord::for_key(&input.resource_type, input.scope.as_ref())
+        });
+        record.apply(&input);
+
+        // A record holding no preference is not a preference: a request that sets none
+        // creates none, and one that leaves nothing set on a key already held drops it, so
+        // no later read can report or inherit a preference nobody set. The same invariant
+        // `DeleteRecommendationPreferences` keeps, stated here for the other writer.
+        if !record.holds_any_preference() {
+            guard.preferences.remove(&key);
+            return Ok(PutRecommendationPreferencesOutput {});
+        }
+
+        // Only a record that holds a preference claims a slot. The key comes from
+        // caller-supplied `resourceType` + `scope`, so a NEW key is a new allocation this
+        // request asked for: refuse once the store is full rather than growing without
+        // limit. An update to a key already held allocates nothing and is still accepted.
         if !guard.can_hold(&key) {
             return Err(store_full());
         }
-        guard
-            .preferences
-            .entry(key)
-            .or_insert_with(|| {
-                crate::state::PreferenceRecord::for_key(&input.resource_type, input.scope.as_ref())
-            })
-            .apply(&input);
+        guard.preferences.insert(key, record);
 
         Ok(PutRecommendationPreferencesOutput {})
     }

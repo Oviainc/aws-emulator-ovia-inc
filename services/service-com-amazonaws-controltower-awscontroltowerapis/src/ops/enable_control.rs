@@ -11,6 +11,12 @@
 //! reporting operations read, so it is implemented with them rather than left a stub
 //! that would leave the enabled-control list permanently empty.
 //!
+//! What it accepts is settled before anything is written: the `controlIdentifier` must name
+//! a control of [`crate::state::CONTROL_CATALOG`] that a caller may enable, the
+//! `targetIdentifier` an AWS Organizations organizational unit, and `parameters` only keys
+//! that control declares — so no enablement of a control or a target that could not exist
+//! becomes persisted state.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -180,12 +186,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `EnabledControlParameters` carries no modelled length and no uniqueness
-        // constraint, so the count, the keys and the weight of what a caller sends are
-        // bounded HERE, before any per-parameter work runs, by the same rule
-        // `UpdateEnabledControl` applies to the configuration it is given: a list outside
-        // it is refused with this operation's own `ValidationException`, naming the member
-        // and the bound.
+        // WHAT the request asks for is settled before any state is touched, so a request
+        // naming something that could not exist writes nothing: the control must be one
+        // this service's catalog publishes and one a caller is permitted to enable, applied
+        // to an organizational unit, configured only by parameters that control declares.
+        // `controlIdentifier` and `targetIdentifier` are typed as the generic
+        // `ControlIdentifier`/`TargetIdentifier`, whose pattern cannot express either kind
+        // of resource, so these are the handler's to check.
+        let control = match crate::state::resolve_control(&input.control_identifier) {
+            Some(control) => control,
+            // A control ARN that names no catalog control is a reference to a resource that
+            // does not exist; anything else is not a control reference at all, which is a
+            // malformed input rather than a missing resource.
+            None if crate::state::is_control_arn(&input.control_identifier) => {
+                return Err(EnableControlErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "no control matches controlIdentifier {}",
+                            input.control_identifier
+                        ),
+                    },
+                )
+                .into());
+            }
+            None => {
+                return Err(EnableControlErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "controlIdentifier {:?} is not the ARN of an AWS Control Tower \
+                             control; a control is named by its control ARN, \
+                             arn:aws:controltower:<region>::control/<CONTROL_NAME>, or by \
+                             its control catalog ARN, arn:aws:controlcatalog:::control/<id>",
+                            input.control_identifier
+                        ),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // Only part of the catalog may be enabled by a caller: the mandatory controls AWS
+        // Control Tower applies to every governed account itself are named by a
+        // `controlIdentifier` but are not a caller's to enable.
+        if !control.enablable {
+            return Err(EnableControlErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "control {} is a mandatory control, which AWS Control Tower applies \
+                         itself; only strongly recommended and elective controls may be \
+                         enabled, with the exception of the Region deny control",
+                        control.name
+                    ),
+                },
+            )
+            .into());
+        }
+
+        if let Some(message) =
+            crate::state::non_organizational_unit_target_message(&input.target_identifier)
+        {
+            return Err(
+                EnableControlErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
+        // A parameter list configures the control the request names, so it is checked
+        // against the parameters that control declares — and for its keys' uniqueness and
+        // its weight — by the same rule `UpdateEnabledControl` applies to the configuration
+        // it is given: a list outside it is refused with this operation's own
+        // `ValidationException`, naming the member and what the control declares.
         let parameters: Vec<(String, ::aws_smithy_types::Document)> = input
             .parameters
             .unwrap_or_default()
@@ -193,7 +263,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|parameter| (parameter.key, parameter.value))
             .collect();
 
-        if let Some(message) = crate::state::unacceptable_control_parameters_message(&parameters) {
+        if let Some(message) =
+            crate::state::unacceptable_control_parameters_message(control, &parameters)
+        {
             return Err(
                 EnableControlErrorModeled::ValidationException(ValidationException { message })
                     .into(),

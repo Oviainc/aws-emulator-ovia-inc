@@ -2659,6 +2659,8 @@ pub enum PageOf {
     StackResourceSummaries,
     /// `DescribeChangeSet`'s `Changes`.
     Changes,
+    /// `ListChangeSets`'s `Summaries`.
+    ChangeSetSummaries,
     /// `ListHookResults`'s `HookResults`.
     HookResults,
     /// `DescribeAccountLimits`'s `AccountLimits`.
@@ -2674,6 +2676,7 @@ impl PageOf {
             Self::StackEvents => "events",
             Self::StackResourceSummaries => "resources",
             Self::Changes => "changes",
+            Self::ChangeSetSummaries => "change-set-summaries",
             Self::HookResults => "hookresults",
             Self::AccountLimits => "account-limits",
         }

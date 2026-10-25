@@ -739,11 +739,12 @@ impl StoredCluster {
     ///
     /// "If you're creating a job for a node in a cluster, you only need to provide the
     /// clusterId value; the other job attributes are inherited from the cluster"
-    /// (`CreateJobRequest$ClusterId`), so every member the cluster carries is this job's
-    /// too. The members only a job models — its device configuration, its impact level,
-    /// its pickup details, the long-term pricing it is associated with — are left for the
-    /// caller of this helper to fill in, since the cluster holds nothing to inherit them
-    /// from.
+    /// (`CreateJobRequest$ClusterId`), so every member the cluster carries is what this
+    /// job inherits. This is the INHERITED record: a member the request supplied is the
+    /// job's own and is applied over it by the caller of this helper. The members only a
+    /// job models — its device configuration, its impact level, its pickup details, the
+    /// long-term pricing it is associated with — are left for that caller too, since the
+    /// cluster holds nothing to inherit them from.
     pub fn node_job(&self, job_id: String, created: SystemTime, unlock_code: String) -> StoredJob {
         StoredJob {
             job_id,
