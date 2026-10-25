@@ -49,7 +49,11 @@ use crate::task_lifecycle::container;
 const ELB_VERSION: &str = "2015-12-01";
 
 /// The VPC every target group below is created in.
-const VPC: &str = "vpc-0abc1234ecs0lb";
+///
+/// `pub(crate)` for the same reason the helpers are: a sibling suite that creates its own
+/// target group through the ELBv2 API puts it in the SAME VPC as the load balancers this
+/// harness builds.
+pub(crate) const VPC: &str = "vpc-0abc1234ecs0lb";
 
 /// A router carrying the ECS service AND the Elastic Load Balancing v2 service over ONE
 /// shared engine — the two stores this rule reads across, mounted the way the production
@@ -89,7 +93,9 @@ fn encode(value: &str) -> String {
 }
 
 /// The text of the first element named `tag` in an awsQuery answer.
-fn first_text(xml: &str, tag: &str) -> Option<String> {
+///
+/// `pub(crate)`: shared with the sibling suites that read an ARN out of an ELBv2 answer.
+pub(crate) fn first_text(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = xml.find(&open)? + open.len();
@@ -98,7 +104,10 @@ fn first_text(xml: &str, tag: &str) -> Option<String> {
 }
 
 /// One ELBv2 awsQuery call through the shared router, returning the status and the body.
-async fn elb_call(
+///
+/// `pub(crate)`: shared with the sibling suites that drive the Elastic Load Balancing v2
+/// side of a cross-service rule through calls this module has no fixture for.
+pub(crate) async fn elb_call(
     router: &MultiServiceRouter,
     action: &str,
     params: &[(&str, &str)],

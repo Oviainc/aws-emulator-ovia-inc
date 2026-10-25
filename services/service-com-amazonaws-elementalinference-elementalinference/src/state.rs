@@ -386,6 +386,69 @@ pub fn too_many_outputs_message() -> String {
     )
 }
 
+/// A request that sets a feed's whole output list to an EMPTY one.
+///
+/// "The key contents of the feed is an array of outputs" and a create "must specify at
+/// least one output" (`CreateFeedRequest$outputs`), so a feed HOLDS at least one output
+/// and an operation that sets the whole list cannot leave it with none. The rule is
+/// about the shape of the request rather than about any one value it carried, so the
+/// message is the rule's invariant sentence and interpolates nothing, and the same
+/// sentence answers whichever operation set the list (`CreateFeed`, `UpdateFeed`).
+/// `AssociateFeed` is not one of them: it APPENDS to the stored list ("New outputs will
+/// be appended"), so a call that appends nothing leaves a feed that already holds an
+/// output exactly as it was and cannot empty it.
+pub const MISSING_OUTPUTS_MESSAGE: &str = "You must specify at least one output.";
+
+/// A `FixtureId` the data source does not hold.
+///
+/// One sentence for every operation that resolves a fixture id — `GetFixture`, and the
+/// operations that store an output whose clipping config names one — so none of them can
+/// disagree about how the service words a fixture id that resolves to nothing. The rule
+/// is about ONE value the request supplied, so the message is built from the request and
+/// names that identifier.
+pub fn cannot_find_fixture_message(fixture_id: &str) -> String {
+    format!("Can't find fixture {fixture_id}. Use a different fixtureId and try again.")
+}
+
+/// A `DictionaryId` no dictionary of the request's Region holds, named by an output's
+/// subtitling config — the dictionary's counterpart of [`cannot_find_fixture_message`],
+/// and likewise built from the identifier the request supplied.
+pub fn cannot_find_dictionary_message(dictionary_id: &str) -> String {
+    format!("Can't find dictionary {dictionary_id}. Use a different dictionary and try again.")
+}
+
+/// The id of the dictionary an output config references, if it references one.
+///
+/// Only a subtitling output can: `SubtitlingConfig$dictionary` is "The ID of a custom
+/// dictionary … Use the CreateDictionary operation to create a dictionary", and no other
+/// member of the `OutputConfig` union names a dictionary.
+pub fn dictionary_reference(config: &OutputConfig) -> Option<&str> {
+    match config {
+        OutputConfig::Subtitling(subtitling) => subtitling.dictionary.as_deref(),
+        OutputConfig::Cropping(_)
+        | OutputConfig::Clipping(_)
+        | OutputConfig::contextualMetadata(_) => None,
+    }
+}
+
+/// The id of the fixture an output config references, if it references one.
+///
+/// Only a clipping output can, and only when it carries the optional data source:
+/// `DataSourceConfiguration$fixtureId` is "The ID of the fixture whose event data you
+/// want Elemental Inference to map onto this clipping output", obtained from a
+/// `SearchFixtures` result.
+pub fn fixture_reference(config: &OutputConfig) -> Option<&str> {
+    match config {
+        OutputConfig::Clipping(clipping) => clipping
+            .data_source_configuration
+            .as_ref()
+            .map(|data_source| data_source.fixture_id.as_str()),
+        OutputConfig::Cropping(_)
+        | OutputConfig::Subtitling(_)
+        | OutputConfig::contextualMetadata(_) => None,
+    }
+}
+
 /// The `DictionaryStatus` values this slice of the service produces.
 ///
 /// These are the LIFECYCLE statuses a dictionary record holds. The model's enum also
@@ -534,19 +597,11 @@ pub struct Output {
 }
 
 impl Output {
-    /// The id of the dictionary this output references, if it references one.
-    ///
-    /// Only a subtitling output can: `SubtitlingConfig$dictionary` is "the ID of a
-    /// custom dictionary to improve transcription accuracy", and no other member of
-    /// the `OutputConfig` union names a dictionary. An output whose subtitling config
-    /// carries no dictionary references none.
+    /// The id of the dictionary this output references, if it references one — the
+    /// stored output's view of [`dictionary_reference`], the one definition of which
+    /// ids an output config names.
     pub fn referenced_dictionary(&self) -> Option<&str> {
-        match &self.output_config {
-            OutputConfig::Subtitling(subtitling) => subtitling.dictionary.as_deref(),
-            OutputConfig::Cropping(_)
-            | OutputConfig::Clipping(_)
-            | OutputConfig::contextualMetadata(_) => None,
-        }
+        dictionary_reference(&self.output_config)
     }
 
     /// One output of a feed as it is STORED, from the output a create or update
@@ -1230,6 +1285,42 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
             })
             .map(|feed| feed.id.clone())
             .collect()
+    }
+
+    /// The refusal an output list earns for a REFERENCE that resolves to nothing, or
+    /// `None` when every reference it carries resolves.
+    ///
+    /// An output can name another resource of this service: a subtitling output names a
+    /// dictionary ([`dictionary_reference`]) and a clipping output's data source names a
+    /// fixture ([`fixture_reference`]). The service maintains that relation in the other
+    /// direction already — `GetDictionary$references` reports the feeds that name a
+    /// dictionary and `DeleteDictionary` refuses while one does — so an id that resolves
+    /// to no record describes a reference the service's integrity rules do not admit,
+    /// and the request is refused rather than stored. Every operation that writes
+    /// outputs into a feed goes through this ONE scan (`CreateFeed`, `UpdateFeed`,
+    /// `AssociateFeed`), so none of them can disagree about which references a stored
+    /// feed may carry.
+    ///
+    /// A dictionary id resolves WITHIN the request's Region, as every id-based lookup of
+    /// this regional service does ([`Self::dictionary`]); a fixture is not a resource of
+    /// this service but an event the data source holds ([`Self::fixture`]), so its id is
+    /// resolved against that catalog. Walks the supplied list once, which every writer
+    /// of the list bounds by [`MAX_OUTPUTS_PER_FEED`].
+    pub fn unresolved_output_reference<'a>(
+        &self,
+        region: &str,
+        configs: impl IntoIterator<Item = &'a OutputConfig>,
+    ) -> Option<String> {
+        configs.into_iter().find_map(|config| {
+            if let Some(dictionary_id) = dictionary_reference(config)
+                .filter(|dictionary_id| self.dictionary(region, dictionary_id).is_none())
+            {
+                return Some(cannot_find_dictionary_message(dictionary_id));
+            }
+            fixture_reference(config)
+                .filter(|fixture_id| self.fixture(fixture_id).is_none())
+                .map(cannot_find_fixture_message)
+        })
     }
 
     /// Materialise every transition the clock already owes at `now`, for feeds and

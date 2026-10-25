@@ -360,10 +360,12 @@ pub fn part_at_location<'a>(
 /// The `ConflictException` message for a location another documentation part of the same
 /// API already documents.
 ///
-/// Built from the request: it names the entity whose documentation already exists, which
-/// is the one thing the caller has to change.
+/// A fixed sentence followed by the location that is already documented, written as the
+/// members the location sets — each name beside its quoted value — and closed with a
+/// period: the entity whose documentation already exists is the one thing the caller has
+/// to change, and nothing else is in the text.
 pub fn location_clash_message(location: &DocumentationPartLocation) -> String {
-    let mut named = vec![format!("type={}", location.r#type)];
+    let mut named = vec![format!("type '{}'", location.r#type)];
     for (member, value) in [
         ("path", &location.path),
         ("method", &location.method),
@@ -371,11 +373,11 @@ pub fn location_clash_message(location: &DocumentationPartLocation) -> String {
         ("name", &location.name),
     ] {
         if let Some(value) = value {
-            named.push(format!("{member}={value}"));
+            named.push(format!("{member} '{value}'"));
         }
     }
     format!(
-        "Documentation part already exists for the specified location: {}",
+        "Documentation part already exists for the specified location: {}.",
         named.join(", ")
     )
 }
@@ -495,9 +497,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(CreateDocumentationPartErrorModeled::LimitExceededException(
                     LimitExceededException {
                         retry_after_seconds: None,
-                        message: Some(format!(
-                            "Maximum number of documentation parts exceeded for this API: {}",
-                            crate::state::MAX_DOCUMENTATION_PARTS_PER_API
+                        message: Some(crate::state::quota_reached(
+                            "Documentation Parts",
+                            "API",
                         )),
                     },
                 )

@@ -418,6 +418,16 @@ pub const ANOMALY_DETECTOR_NOT_FOUND_MESSAGE: &str = "Anomaly detector not found
 /// the same deletion releases) growing without end.
 pub const ANOMALY_DETECTORS_PER_WORKSPACE_QUOTA: usize = 1_000;
 
+/// How many scrapers this account holds before `CreateScraper` refuses with the modelled
+/// `ServiceQuotaExceededException`.
+///
+/// Amazon Managed Service for Prometheus publishes an adjustable quota on scrapers per
+/// account per Region, and this emulator models neither Service Quotas nor an account's
+/// adjustments — so this is the emulator's OWN bound on the store, the role
+/// [`WORKSPACE_QUOTA`] plays for workspaces. It is what stops the scraper map (and the
+/// create-token map the same deletion releases) growing without end.
+pub const SCRAPERS_PER_ACCOUNT_QUOTA: usize = 1_000;
+
 /// The PromQL aggregation operators a Random Cut Forest query may be wrapped by.
 ///
 /// Source: `RandomCutForestConfiguration$query`, which states "Random Cut Forest
@@ -748,11 +758,10 @@ pub struct ScraperLoggingConfiguration {
 
 /// One stored scraper: every member `ScraperSummary` reports.
 ///
-/// `ListScrapers` reports the scrapers this store HOLDS, so the listing is computed from
-/// state rather than announced. `CreateScraper` is still scaffolded and answers 501,
-/// which is its own stub issue — so an account that has never created one lists the empty
-/// page AWS lists for it; when `CreateScraper` lands it inserts here and the listing needs
-/// no change. `DeleteScraper` moves the record it names to `DELETING` and lets the clock
+/// `CreateScraper` puts one record here per accepted create, and `ListScrapers` reports
+/// the scrapers this store HOLDS, so the listing is computed from state rather than
+/// announced — an account that has never created one lists the empty page AWS lists for
+/// it. `DeleteScraper` moves the record it names to `DELETING` and lets the clock
 /// drop it ([`ComAmazonawsAmpAmazonprometheusserviceState::materialize_due`]);
 /// `UpdateScraper` replaces the members it carries and moves the record to `UPDATING`
 /// until that same clock settles it.
@@ -852,6 +861,13 @@ pub struct ComAmazonawsAmpAmazonprometheusserviceState {
     /// `clientToken -> workspaceId`, which is what makes `CreateWorkspace`
     /// idempotent per its `@idempotencyToken`.
     pub client_tokens: HashMap<String, String>,
+    /// `clientToken -> scraperId`, which is what makes `CreateScraper` idempotent per its
+    /// `@idempotencyToken` — the role [`ComAmazonawsAmpAmazonprometheusserviceState::client_tokens`]
+    /// plays for a workspace. Kept apart from that map because a token is scoped to the
+    /// request that carried it: the same string may create a workspace and a scraper, and
+    /// neither create may then answer with the other's resource. An entry is forgotten
+    /// with the scraper it names, so the map cannot outgrow the scrapers it indexes.
+    pub scraper_tokens: HashMap<String, String>,
     /// Counts the identifiers this store has minted — workspace ids and resource-policy
     /// revision ids both; see [`mint_workspace_id`] and [`mint_revision_id`].
     pub next_id: u64,
@@ -1003,6 +1019,9 @@ impl ComAmazonawsAmpAmazonprometheusserviceState {
             // A scraper's logging configuration belongs to that scraper, so it goes
             // when the scraper does.
             self.scraper_logging.remove(&scraper_id);
+            // So does the create token that named it: with the scraper gone there is no
+            // record for a replay of that create to answer from.
+            self.scraper_tokens.retain(|_, id| id != &scraper_id);
         }
 
         // A scraper's logging configuration settles on its own clock too, on the same
@@ -1281,6 +1300,63 @@ pub fn rule_groups_namespace_arn(region: &str, workspace_id: &str, name: &str) -
     )
 }
 
+/// A scraper ARN, in the form `ScraperDescription$arn` documents: "For example,
+/// `arn:aws:aps:<region>:123456798012:scraper/s-example1-1234-abcd-5678-ef9012abcd34`".
+/// The account segment comes from the engine, never from a literal.
+pub fn scraper_arn(region: &str, scraper_id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("scraper/{scraper_id}"))
+}
+
+/// The ARN of the IAM role one scraper collects through.
+///
+/// `CreateScraper` documents that the service makes it: "An IAM role will be created for
+/// you that Amazon Managed Service for Prometheus uses to access the metrics in your
+/// source." So a scraper's `roleArn` — `@required` on `ScraperDescription`, and documented
+/// "the IAM role that provides permissions for the scraper to discover and collect metrics
+/// on your behalf" with the example
+/// `arn:aws:iam::123456789012:role/service-role/AmazonGrafanaServiceRole-12example` — is
+/// the service-linked role Amazon Managed Service for Prometheus creates for a scraper,
+/// under the path it reserves for that role. One role per scraper, so the name carries
+/// the scraper's id; the account segment comes from the engine, and IAM is global, so the
+/// region segment is empty, as `IamRoleArn`'s pattern
+/// (`^arn:aws[-a-z]*:iam::[0-9]{12}:role/.+$`) requires.
+pub fn scraper_role_arn(scraper_id: &str) -> String {
+    ::engine::emulator_arn(
+        "iam",
+        "",
+        &format!("role/{SCRAPER_ROLE_PATH}/{SCRAPER_ROLE_NAME_PREFIX}_{scraper_id}"),
+    )
+}
+
+/// The IAM path the scraper's service-linked role sits under, and the name that role
+/// carries before the scraper's own id — see [`scraper_role_arn`].
+const SCRAPER_ROLE_PATH: &str = "aws-service-role/scraper.aps.amazonaws.com";
+/// See [`SCRAPER_ROLE_PATH`].
+const SCRAPER_ROLE_NAME_PREFIX: &str = "AWSServiceRoleForAmazonPrometheusScraper";
+
+/// The workspace id a workspace ARN names: the resource segment of
+/// `arn:aws:aps:<region>:<account>:workspace/<workspaceId>`, which is what the modelled
+/// `ResourceNotFoundException$resourceId` reports for a reference that does not resolve.
+/// An ARN carrying no resource segment is reported as it came, so the refusal still names
+/// what the caller sent.
+pub fn workspace_id_of_arn(workspace_arn: &str) -> &str {
+    workspace_arn
+        .split('/')
+        .next_back()
+        .filter(|id| !id.is_empty())
+        .unwrap_or(workspace_arn)
+}
+
+/// Whether `arn` names a resource in the account this emulator serves, so this store is
+/// the one that would hold it. A reference to any other account names a resource no local
+/// state can speak for, which is why resolution is attempted only for this one.
+///
+/// The account is the fifth colon-separated segment of an ARN
+/// (`arn:<partition>:<service>:<region>:<account>:<resource>`).
+pub fn names_this_account(arn: &str) -> bool {
+    arn.split(':').nth(4) == Some(::engine::emulator_account_id())
+}
+
 /// The workspace's Prometheus endpoint, in the form
 /// `WorkspaceDescription$prometheusEndpoint` documents: "For example,
 /// `https://aps-workspaces.<region>.amazonaws.com/workspaces/ws-.../api/v1/`".
@@ -1302,6 +1378,15 @@ pub fn mint_workspace_id(counter: &mut u64) -> String {
 /// store counter, so two resources never share an id's input.
 pub fn mint_anomaly_detector_id(counter: &mut u64) -> String {
     mint_id(b"anomalydetector", "ad", counter)
+}
+
+/// A fresh scraper id of the shape the service mints: `s-` followed by a UUID, which
+/// `ScraperId`'s pattern (`^[0-9A-Za-z][-.0-9A-Z_a-z]*$`, length 1..64) accepts and
+/// `ScraperDescription$scraperId` shows ("For example,
+/// `s-example1-1234-abcd-5678-ef9012abcd34`"). Minted exactly as [`mint_workspace_id`]
+/// is, off the same store counter, so two resources never share an id's input.
+pub fn mint_scraper_id(counter: &mut u64) -> String {
+    mint_id(b"scraper", "s", counter)
 }
 
 /// A fresh resource-policy revision id: the opaque, server-minted value

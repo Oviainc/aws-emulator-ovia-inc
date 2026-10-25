@@ -18,7 +18,11 @@
 //! (`ConflictException`, HTTP 409) rather than minting a feed whose outputs cannot be
 //! told apart, and a list past the feed's output quota is refused with the modelled
 //! `ServiceQuotaExceededException` (HTTP 402), the bound every writer of a feed's
-//! output list is held to.
+//! output list is held to. A feed holds at least one output, so an EMPTY list is refused
+//! (`ValidationException`, HTTP 400, `crate::state::MISSING_OUTPUTS_MESSAGE`), and an
+//! output that names another resource — a dictionary, or a fixture of the data source —
+//! is stored only when that id resolves, so no feed is minted carrying a reference to
+//! nothing (`unresolved_output_reference`).
 //!
 //! The operation is `@idempotent` and carries no `@idempotencyToken`, so the request's
 //! own members are its key: a request this Region has already served answers with the
@@ -254,6 +258,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "The key contents of the feed is an array of outputs" and "You must specify at
+        // least one output" (`CreateFeedRequest$outputs`): a feed HOLDS at least one
+        // output, so a create that sets the whole list to an empty one describes a feed
+        // the service would never hold and is refused (HTTP 400) rather than minted. The
+        // list shape carries no `@length`, so the boundary validator cannot decide this
+        // and the service's own rule does — the same rule, and the same sentence, that
+        // answers the `UpdateFeed` which would empty a stored feed's list.
+        if input.outputs.is_empty() {
+            return Err(CreateFeedErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::MISSING_OUTPUTS_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
+
         // An output's name identifies it within the feed, so a request naming one
         // output twice would mint a feed whose outputs are not addressable by name.
         // The scan is the one every operation that supplies an output list goes
@@ -303,6 +323,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut state = state.lock();
         state.settle_due_transitions(now);
+
+        // An output may NAME another resource — a dictionary for a subtitling output, a
+        // fixture of the data source for a clipping output's data source — and the
+        // service keeps that relation in both directions (`GetDictionary$references`
+        // reports the feeds that name a dictionary, and `DeleteDictionary` refuses while
+        // one does). So a reference that resolves to no record is refused with the
+        // modelled `ValidationException` (HTTP 400) rather than minting a feed whose
+        // reference dangles; the scan is the one every operation that writes outputs
+        // into a feed goes through. Decided before the idempotency lookup, since a
+        // request the service cannot serve is not one it has served.
+        if let Some(message) = state.unresolved_output_reference(
+            &region,
+            outputs.iter().map(|output| &output.output_config),
+        ) {
+            return Err(CreateFeedErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
 
         // The operation is `@idempotent` and carries no `@idempotencyToken`, so the
         // request's own members are its key: a request this Region has already served

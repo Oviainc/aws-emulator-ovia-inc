@@ -206,12 +206,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // (This is the one shape of refusal that does name a value: a message is
             // invariant only where the rule is about state or about a relation between
             // members, and reports a value only where that value is the caller's own.)
+            // The sentence lives in `crate::state` because the operations that STORE an
+            // output naming a fixture resolve the same id and answer with it too.
             return Err(GetFixtureErrorModeled::ValidationException(
                 ValidationException {
-                    message: format!(
-                        "Can't find fixture {}. Use a different fixtureId and try again.",
-                        input.fixture_id
-                    ),
+                    message: crate::state::cannot_find_fixture_message(&input.fixture_id),
                 },
             )
             .into());

@@ -390,18 +390,12 @@ async fn a_patch_this_service_cannot_apply_is_refused_and_changes_nothing() {
 }
 
 #[tokio::test]
-async fn an_unsupported_patch_path_is_refused_with_the_path_the_op_and_the_supported_set() {
-    // The refusal's TEXT is part of the rule here, because API Gateway builds it from
-    // the request: it names the path, the op, and the paths the resource has FOR THAT
-    // OP. Two recorded refusals are the authority for the two ApiKey sets asserted
-    // below: a `replace` of `/id` reads `Invalid patch path  '/id' specified for op
-    // 'replace'. Must be one of: [/description, /enabled, /name, /customerId]`, and a
-    // `remove` of `/description` reads `Invalid patch path  '/description' specified
-    // for op 'remove'. Must be one of: [/stages, /labels]` — so a single-valued member
-    // takes a `replace` and a collection takes an `add` or a `remove`.
-    const REPLACE_PATHS: &str = "[/description, /enabled, /name, /customerId]";
-    const COLLECTION_PATHS: &str = "[/stages, /labels]";
-
+async fn an_unsupported_patch_path_is_refused_with_the_path_the_request_sent() {
+    // The refusal's TEXT is part of the rule here: API Gateway answers a path the
+    // resource cannot be addressed by with one fixed sentence and the path exactly as
+    // the request spelled it — a recorded refusal of a `replace` of `/id` reads
+    // `Invalid patch path /id` — and names neither the op nor the paths the resource
+    // does have.
     let gateway = Gateway::new();
     let (id, _) = baseline(&gateway, "unsupported api key paths").await;
 
@@ -426,25 +420,16 @@ async fn an_unsupported_patch_path_is_refused_with_the_path_the_op_and_the_suppo
         )
         .await;
         assert_failure(&answer, 400, "BadRequestException", &case);
-        let expected_set = if kind == "replace" {
-            REPLACE_PATHS
-        } else {
-            COLLECTION_PATHS
-        };
         assert_eq!(
             answer.body["message"].as_str(),
-            Some(
-                format!(
-                    "Invalid patch path  '{path}' specified for op '{kind}'. Must be one of: {expected_set}"
-                )
-                .as_str()
-            ),
-            "case {case}: the refusal must name the path, the op and the supported set, got {:?}",
+            Some(format!("Invalid patch path {path}").as_str()),
+            "case {case}: the refusal must be the fixed sentence and the path, got {:?}",
             answer.body["message"]
         );
     }
 
-    // The same rule on the other PATCH-style operations, each listing its own set.
+    // The same rule on the other PATCH-style operations, whichever resource the path
+    // named.
     let (api, root) = create_api(&gateway, "unsupported-paths").await;
     let resource = create_resource(&gateway, &api, &root, "pets").await;
     let resource_id = string_member(&resource, "id", "pets");
@@ -461,24 +446,17 @@ async fn an_unsupported_patch_path_is_refused_with_the_path_the_op_and_the_suppo
         put.status, put.body
     );
 
-    for (case, uri, path, expected_member) in [
-        (
-            "UpdateRestApi",
-            format!("/restapis/{api}"),
-            "/rootResourceId",
-            "/name",
-        ),
+    for (case, uri, path) in [
+        ("UpdateRestApi", format!("/restapis/{api}"), "/rootResourceId"),
         (
             "UpdateResource",
             format!("/restapis/{api}/resources/{resource_id}"),
             "/path",
-            "/pathPart",
         ),
         (
             "UpdateMethod",
             format!("/restapis/{api}/resources/{resource_id}/methods/GET"),
             "/httpMethod",
-            "/apiKeyRequired",
         ),
     ] {
         let answer = patch(&gateway, &uri, vec![replace(path, "x")]).await;
@@ -487,15 +465,10 @@ async fn an_unsupported_patch_path_is_refused_with_the_path_the_op_and_the_suppo
             .as_str()
             .unwrap_or_else(|| panic!("case {case}: expected a message, got {:?}", answer.body))
             .to_owned();
-        let prefix =
-            format!("Invalid patch path  '{path}' specified for op 'replace'. Must be one of: [");
-        assert!(
-            message.starts_with(&prefix),
-            "case {case}: expected the refusal to start {prefix:?}, got {message:?}"
-        );
-        assert!(
-            message.contains(expected_member),
-            "case {case}: the supported set must name {expected_member}, got {message:?}"
+        assert_eq!(
+            message,
+            format!("Invalid patch path {path}"),
+            "case {case}: expected the fixed sentence and the path, got {message:?}"
         );
     }
 }

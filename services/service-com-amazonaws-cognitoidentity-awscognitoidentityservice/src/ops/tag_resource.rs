@@ -205,12 +205,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // every entry of the map whichever path refuses it.
         let violations = constraint_violations(&requested);
         if !violations.is_empty() {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "{} validation error{} detected: {}",
-                violations.len(),
-                if violations.len() == 1 { "" } else { "s" },
-                violations.join("; ")
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::validation_errors_detected(violations.len(), &violations),
+            ));
         }
 
         for (tag_key, _) in &requested {
@@ -260,38 +257,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The modelled length bounds of `IdentityPoolTagsType`'s key shape, `TagKeysType`
-/// (`smithy_query(query="shape",shape="IdentityPoolTagsType")`: key `len 1..128`).
-const TAG_KEY_LENGTH: ::std::ops::RangeInclusive<usize> = 1..=128;
-
-/// The modelled length bounds of its value shape, `TagValueType` (`len 0..256`), from the
-/// same query.
-const TAG_VALUE_LENGTH: ::std::ops::RangeInclusive<usize> = 0..=256;
-
 /// Every modelled-constraint violation in the request's `Tags`, in key order, each phrased
 /// the way a constraint refusal names the member and the constraint it failed.
 ///
-/// The map's KEY and VALUE shapes carry the bounds, so a violation is in one entry of the
-/// map rather than in the member as a whole, and the entry is named in the member path.
-/// Length is counted in characters, as the `length` trait measures a string.
+/// The map's KEY and VALUE shapes carry the bounds ([`crate::state::TAG_KEY_LENGTH`] and
+/// [`crate::state::TAG_VALUE_LENGTH`], which every operation of this service reading a tag
+/// shares), so a violation is in one entry of the map rather than in the member as a whole,
+/// and the entry is named in the member path.
 fn constraint_violations(requested: &[(&String, &String)]) -> Vec<String> {
     let mut violations = Vec::new();
     for (tag_key, tag_value) in requested {
-        let key_length = tag_key.chars().count();
-        if !TAG_KEY_LENGTH.contains(&key_length) {
+        if !crate::state::length_is_within(tag_key, &crate::state::TAG_KEY_LENGTH) {
             violations.push(format!(
                 "Value '{tag_key}' at 'tags' failed to satisfy constraint: Map keys must have \
                  length greater than or equal to {} and less than or equal to {}",
-                TAG_KEY_LENGTH.start(),
-                TAG_KEY_LENGTH.end()
+                crate::state::TAG_KEY_LENGTH.start(),
+                crate::state::TAG_KEY_LENGTH.end()
             ));
         }
-        let value_length = tag_value.chars().count();
-        if !TAG_VALUE_LENGTH.contains(&value_length) {
+        if !crate::state::length_is_within(tag_value, &crate::state::TAG_VALUE_LENGTH) {
             violations.push(format!(
                 "Value '{tag_value}' at 'tags.{tag_key}' failed to satisfy constraint: Member \
                  must have length less than or equal to {}",
-                TAG_VALUE_LENGTH.end()
+                crate::state::TAG_VALUE_LENGTH.end()
             ));
         }
     }

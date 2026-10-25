@@ -191,6 +191,16 @@ fn imported_part(entry: &Value) -> Result<ImportedPart, String> {
     })
 }
 
+/// The refusal for a `body` that is not a documentation set this operation can read.
+///
+/// API Gateway answers such a body with ONE sentence that names no detail of what is
+/// wrong with it — it could not build the importer from what was provided — whichever way
+/// the document is unreadable: unparsable, not a JSON object, declaring no documentation
+/// parts, or declaring them as something other than a list. The emulator's own resource
+/// guards keep their own wording, because they are this emulator's bounds rather than
+/// anything the service publishes.
+const UNREADABLE_IMPORT: &str = "Unable to build importer with provided input.";
+
 /// Read the documentation set out of a `body` payload.
 ///
 /// The body is "a JSON object" per the member's documentation, read by `serde_json` under
@@ -198,8 +208,8 @@ fn imported_part(entry: &Value) -> Result<ImportedPart, String> {
 /// so it cannot amplify what the body carries. The per-API part quota is NOT a bound here:
 /// it counts the parts the API would hold, which `handle` is where it knows.
 ///
-/// `Err` carries the message for a body that is not such a document: the caller has to fix
-/// it from this text alone.
+/// `Err` carries [`UNREADABLE_IMPORT`] for a body that is not such a document, and this
+/// emulator's own bound for one that is too large to read.
 fn parse_import(body: &[u8]) -> Result<ImportedParts, String> {
     if body.len() > MAX_IMPORT_BYTES {
         return Err(format!(
@@ -207,26 +217,16 @@ fn parse_import(body: &[u8]) -> Result<ImportedParts, String> {
             body.len()
         ));
     }
-    let document: Value = ::serde_json::from_slice(body).map_err(|_| {
-        "body must be a UTF-8 encoded JSON object carrying the documentation parts to import"
-            .to_string()
-    })?;
-    let object = document.as_object().ok_or_else(|| {
-        "body must be a JSON object carrying the documentation parts to import".to_string()
-    })?;
+    let document: Value = ::serde_json::from_slice(body).map_err(|_| UNREADABLE_IMPORT.to_string())?;
+    let object = document.as_object().ok_or_else(|| UNREADABLE_IMPORT.to_string())?;
     let declared = object
         .get(DOCUMENTATION_EXTENSION)
         .and_then(|extension| extension.get(DOCUMENTATION_PARTS_MEMBER))
         .or_else(|| object.get(DOCUMENTATION_PARTS_MEMBER))
-        .ok_or_else(|| {
-            format!(
-                "body declares no {DOCUMENTATION_PARTS_MEMBER}: the documentation parts to \
-                 import are the {DOCUMENTATION_EXTENSION}.{DOCUMENTATION_PARTS_MEMBER} list"
-            )
-        })?;
-    let declared = declared.as_array().ok_or_else(|| {
-        format!("{DOCUMENTATION_PARTS_MEMBER} must be a list of documentation parts")
-    })?;
+        .ok_or_else(|| UNREADABLE_IMPORT.to_string())?;
+    let declared = declared
+        .as_array()
+        .ok_or_else(|| UNREADABLE_IMPORT.to_string())?;
     // The reader's own entry bound, so the work one request causes is bounded by a
     // constant and not by how many entries fit in the body's bytes. It is NOT the AWS
     // quota: that one counts the documentation parts an API HOLDS — one per documented
@@ -402,9 +402,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(ImportDocumentationPartsErrorModeled::LimitExceededException(
                     LimitExceededException {
                         retry_after_seconds: None,
-                        message: Some(format!(
-                            "Maximum number of documentation parts exceeded for this API: {}",
-                            crate::state::MAX_DOCUMENTATION_PARTS_PER_API
+                        message: Some(crate::state::quota_reached(
+                            "Documentation Parts",
+                            "API",
                         )),
                     },
                 )

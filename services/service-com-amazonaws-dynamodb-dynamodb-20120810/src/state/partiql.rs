@@ -1788,20 +1788,21 @@ pub fn compare_by_attribute(
     }
 }
 
-/// The one item an `UPDATE` or a `DELETE` addresses: the primary key its `WHERE`
-/// clause pins by equality.
+/// The one item a statement addresses: the primary key its `WHERE` clause pins by
+/// equality.
 ///
 /// "ExecuteStatement allows you to perform reads and SINGLETON writes" (the
 /// operation's doc): a write statement names one item, so a `WHERE` clause that does
 /// not pin every key attribute by equality names no item and is refused rather than
-/// applied to whatever it matches.
+/// applied to whatever it matches. A read inside a transaction addresses one item the
+/// same way, which is why both reach this.
 pub fn singleton_key(table: &Table, predicate: &Predicate) -> Result<ItemKey, RequestError> {
     let pinned = pinned_equalities(predicate);
     let mut key = Item::new();
     for element in &table.key_schema {
         let Some(value) = pinned.get(&element.attribute_name) else {
             return Err(statement_refused(&format!(
-                "the WHERE clause of a write statement must address one item: it states no \
+                "the WHERE clause of a statement that addresses one item must state an \
                  equality on the key attribute {}",
                 element.attribute_name
             )));

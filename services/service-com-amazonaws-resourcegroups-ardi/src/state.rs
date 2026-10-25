@@ -105,13 +105,16 @@ impl ComAmazonawsResourcegroupsArdiState {
     ///   region from resolving to a same-named local group;
     /// * the APPLICATION-group form of that ARN, `…:group/<name>/<id>`, names the
     ///   same group through the id that qualifies its name (see
-    ///   [`GroupRecord::application_group_arn`]), so an ARN this service itself
-    ///   reported — in a tag-sync task, say — resolves back to the group it was
-    ///   minted from, and only while that group still carries that id;
+    ///   [`GroupRecord::application_arn`]), so an ARN this service itself
+    ///   reported — an application group's own identity, or a tag-sync task's —
+    ///   resolves back to the group it was minted from, and only while that group
+    ///   still carries that id;
     /// * anything else must be a bare `GroupName`, which the model constrains to
-    ///   `[a-zA-Z0-9_\.-]{1,300}` or `<name>/<ulid>` — no colon — so an identifier
-    ///   that is neither a well-formed ARN nor a well-formed name resolves to
-    ///   nothing instead of slipping past the ARN check.
+    ///   `[a-zA-Z0-9_\.-]{1,300}` or `<name>/<ulid>` — no colon — so a stored name
+    ///   resolves, the qualified form of an application group's name resolves to
+    ///   that same group, and an identifier that is neither a well-formed ARN nor
+    ///   a well-formed name resolves to nothing instead of slipping past the ARN
+    ///   check.
     ///
     /// The caller picks the identifier: an operation that models both members takes
     /// `Group` and falls back to the deprecated `GroupName`, so the group a request
@@ -139,7 +142,7 @@ impl ComAmazonawsResourcegroupsArdiState {
             let key = GroupKey::new(region, head);
             let record = self.groups.get(&key)?;
             if record.application_id.as_deref() != Some(id)
-                || identifier != format!("{}/{id}", record.group_arn)
+                || record.application_arn().as_deref() != Some(identifier)
             {
                 return None;
             }
@@ -149,7 +152,21 @@ impl ComAmazonawsResourcegroupsArdiState {
             return None;
         }
         let key = GroupKey::new(region, identifier);
-        self.groups.contains_key(&key).then_some(key)
+        if self.groups.contains_key(&key) {
+            return Some(key);
+        }
+        // The QUALIFIED form of a group name, `<name>/<id>`, which the modelled
+        // `GroupName` admits beside a bare name: it names the group stored under
+        // the head segment whose own qualifying id is that segment, so the
+        // identity this service reports for an application group addresses the
+        // group it was minted from.
+        let (head, id) = identifier.rsplit_once('/')?;
+        if !is_qualifying_id(id) {
+            return None;
+        }
+        let key = GroupKey::new(region, head);
+        let record = self.groups.get(&key)?;
+        (record.application_id.as_deref() == Some(id)).then_some(key)
     }
 
     /// Every group stored in `region`, in group-name order — the listing order.
@@ -441,8 +458,24 @@ pub const DELETION_PROTECTION_UNLESS_EMPTY: &str = "UNLESS_EMPTY";
 pub const STATIC_MEMBERSHIP_CONFIGURATION_TYPES: &[&str] = &[
     "AWS::EC2::CapacityReservationPool",
     "AWS::EC2::HostManagement",
-    "AWS::ResourceGroups::ApplicationGroup",
+    APPLICATION_GROUP_CONFIGURATION_TYPE,
 ];
+
+/// The service-configuration type that makes a group an APPLICATION group.
+///
+/// `GroupConfigurationType`'s pattern `^AWS::[a-zA-Z0-9]+::[a-zA-Z0-9]+$` admits
+/// exactly one spelling of it, so a stored item's type is compared to this
+/// exactly; a group declaring it is the kind of group the modelled
+/// `Group$ApplicationTag` is "only supported for"
+/// (`smithy_query(query="doc",shape="Group",member="ApplicationTag")`).
+pub const APPLICATION_GROUP_CONFIGURATION_TYPE: &str = "AWS::ResourceGroups::ApplicationGroup";
+
+/// The one tag key an application group's membership tag is written with.
+///
+/// The modelled `ApplicationTagKey` pattern is `^awsApplication$`
+/// (`smithy_query(query="shape",shape="ApplicationTag")`), so the map an
+/// application group reports has this single key.
+pub const APPLICATION_TAG_KEY: &str = "awsApplication";
 
 /// The message a static-membership operation reports for a group whose stored
 /// configuration declares none of [`STATIC_MEMBERSHIP_CONFIGURATION_TYPES`].
@@ -466,7 +499,10 @@ pub struct GroupRecord {
     /// [`GroupKey`] in [`ComAmazonawsResourcegroupsArdiState::groups`].
     pub name: String,
     /// `arn:aws:resource-groups:<region>:<account>:group/<name>`, minted once at
-    /// create time and never recomputed, so every later read returns the same ARN.
+    /// create time and never recomputed, so every later read returns the same
+    /// ARN. An APPLICATION group's name is QUALIFIED by its application id in
+    /// that ARN (`group/<name>/<id>`), because the modelled `ApplicationArn` its
+    /// membership tag carries admits only the qualified form.
     pub group_arn: String,
     /// The id of the account that owns the group, captured once at create time
     /// from the emulator's canonical account id — the same account the stored
@@ -493,39 +529,92 @@ pub struct GroupRecord {
     /// Ordered by ARN, so that listing and its continuation token are stable.
     pub grouping_statuses: BTreeMap<String, GroupingStatusRecord>,
     /// The id that qualifies this group's name where an ARN addresses it as an
-    /// APPLICATION group, minted once the group first needs one and kept
-    /// afterwards. `None` until then. See
+    /// APPLICATION group: minted at create time for a group whose configuration
+    /// declares it an application group (and part of its stored
+    /// [`GroupRecord::group_arn`] from then on), and otherwise minted once the
+    /// group first hosts a resource that needs one. `None` until then. See
     /// [`GroupRecord::application_group_arn`].
     pub application_id: Option<String>,
 }
 
 impl GroupRecord {
-    /// This group's ARN in the APPLICATION-group form, in which the group's name
-    /// is qualified by a 26-character id:
-    /// `arn:aws:resource-groups:<region>:<account>:group/<name>/<id>`.
+    /// Whether this group's stored service configuration declares it an
+    /// APPLICATION group, i.e. carries an item of type
+    /// [`APPLICATION_GROUP_CONFIGURATION_TYPE`].
+    ///
+    /// Read across every configuration item the group holds, because the
+    /// configuration is one document whatever order its items are in; a group
+    /// with no configuration declares nothing.
+    pub fn is_application_group(&self) -> bool {
+        self.configuration
+            .iter()
+            .flatten()
+            .any(|item| item.r#type == APPLICATION_GROUP_CONFIGURATION_TYPE)
+    }
+
+    /// This group's ARN in the APPLICATION-group form — its name qualified by the
+    /// 26-character id it carries,
+    /// `arn:aws:resource-groups:<region>:<account>:group/<name>/<id>` — or `None`
+    /// while it carries no qualifying id at all.
+    ///
+    /// Computed from the STORED id, so it never mints one: a group whose stored
+    /// ARN already ends in that id (an application group, whose identity carries
+    /// it from create time) reports that ARN unchanged, and a group whose stored
+    /// NAME is already written `<name>/<id>` (the form the modelled `GroupName`
+    /// also admits) is likewise already qualified.
+    pub fn application_arn(&self) -> Option<String> {
+        if let Some(id) = self.application_id.as_deref() {
+            let suffix = format!("/{id}");
+            return Some(if self.group_arn.ends_with(&suffix) {
+                self.group_arn.clone()
+            } else {
+                format!("{}{suffix}", self.group_arn)
+            });
+        }
+        self.name
+            .rsplit_once('/')
+            .filter(|(head, id)| !head.is_empty() && is_qualifying_id(id))
+            .map(|_| self.group_arn.clone())
+    }
+
+    /// This group's ARN in the APPLICATION-group form, minting the qualifying id
+    /// if the group has none yet.
     ///
     /// A tag-sync task is addressed by an ARN NESTED inside this form (the
     /// modelled `TagSyncTaskArn` is
-    /// `…:group/<name>/<26 chars>/tag-sync-task/<26 chars>`), while a group is
-    /// created and addressed by its bare name here, so the qualifying id is
-    /// minted on first use and then stored: every ARN this group hosts carries
-    /// the same one, and repeated reads of a hosted resource resolve back to
-    /// this group. A group whose stored name ALREADY carries such an id (the
-    /// `<name>/<id>` form the modelled `GroupName` also admits) is already
-    /// qualified, so its stored ARN is returned unchanged.
+    /// `…:group/<name>/<26 chars>/tag-sync-task/<26 chars>`), while a group that
+    /// is not an application group is created and addressed by its bare name, so
+    /// the qualifying id is minted on first use and then stored: every ARN this
+    /// group hosts carries the same one, and repeated reads of a hosted resource
+    /// resolve back to this group.
     pub fn application_group_arn(&mut self) -> String {
-        if self
-            .name
-            .rsplit_once('/')
-            .is_some_and(|(head, id)| !head.is_empty() && is_qualifying_id(id))
-        {
-            return self.group_arn.clone();
+        if let Some(arn) = self.application_arn() {
+            return arn;
         }
         let id = self
             .application_id
             .get_or_insert_with(new_qualifying_id)
             .as_str();
         format!("{}/{id}", self.group_arn)
+    }
+
+    /// The modelled `ApplicationTag` this group reports: the tag that defines
+    /// membership of the application, `awsApplication` bound to the group's own
+    /// application-group ARN — the value a caller then puts on the resources it
+    /// wants in the application.
+    ///
+    /// Only an application group has one, so a group whose stored configuration
+    /// declares none reports no tag at all. Computed from the stored identity, so
+    /// reading it mints nothing.
+    pub fn application_tag(&self) -> Option<std::collections::HashMap<String, String>> {
+        if !self.is_application_group() {
+            return None;
+        }
+        let arn = self.application_arn()?;
+        Some(std::collections::HashMap::from([(
+            APPLICATION_TAG_KEY.to_string(),
+            arn,
+        )]))
     }
 
     /// The modelled `Group` structure for this record.
@@ -538,9 +627,7 @@ impl GroupRecord {
             criticality: self.criticality,
             owner: self.owner.clone(),
             display_name: self.display_name.clone(),
-            // Only an application group (created through the Service Catalog
-            // AppRegistry integration) carries one, and this slice creates none.
-            application_tag: None,
+            application_tag: self.application_tag(),
         }
     }
 
@@ -871,25 +958,26 @@ pub fn new_qualifying_id() -> String {
     ::ulid::Ulid::new().to_string().to_lowercase()
 }
 
-/// The longest group name a tag-sync task's ARN can carry.
+/// The longest group name an ARN that QUALIFIES that name by an id can carry.
 ///
-/// The modelled `TagSyncTaskArn` writes the group-name segment as
-/// `[a-zA-Z0-9_\.-]{1,150}`, narrower than the 300 characters a group name may
-/// have, so a task cannot be addressed on a group with a longer name.
+/// Every modelled ARN production that nests something under a group writes the
+/// group-name segment as `[a-zA-Z0-9_\.-]{1,150}` — the `TagSyncTaskArn`
+/// (`…:group/<name>/<26 chars>/tag-sync-task/<26 chars>`), the `ApplicationArn`
+/// and the qualified alternative of `GroupArn` itself — narrower than the 300
+/// characters a group name may have, so a longer name cannot be qualified at
+/// all.
 ///
-/// Source: `smithy_query(query="shape",shape="TagSyncTaskArn")`.
-pub const MAX_TAG_SYNC_TASK_GROUP_NAME_LENGTH: usize = 150;
+/// Source: `smithy_query(query="shape",shape="TagSyncTaskArn")` and
+/// `smithy_query(query="shape",shape="ApplicationArn")`.
+pub const MAX_QUALIFIED_GROUP_NAME_LENGTH: usize = 150;
 
-/// Whether a tag-sync task's ARN can carry the group name `name`.
+/// Whether an ARN that qualifies a group name by an id can carry `name`.
 ///
-/// The modelled `TagSyncTaskArn` writes that segment as
-/// `[a-zA-Z0-9_\.-]{1,150}`, where the modelled `GroupName` is wider (up to 300
-/// characters, and the `<name>/<id>` form besides), so the name decides whether a
-/// task on this group is addressable at all. A name already qualified by an id is
-/// judged on its leading segment, which is the one the task ARN carries.
-pub fn is_tag_sync_task_group_name(name: &str) -> bool {
+/// Judged on the leading segment, which is the one such an ARN writes: a name
+/// already qualified by an id carries that id in its own trailing segment.
+pub fn is_qualifiable_group_name(name: &str) -> bool {
     let segment = name.split('/').next().unwrap_or_default();
-    (1..=MAX_TAG_SYNC_TASK_GROUP_NAME_LENGTH).contains(&segment.len())
+    (1..=MAX_QUALIFIED_GROUP_NAME_LENGTH).contains(&segment.len())
         && segment
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
@@ -1314,11 +1402,24 @@ fn is_arn_region(region: &str) -> bool {
 /// 404 text.
 pub const GROUP_NOT_FOUND_MESSAGE: &str = "The specified group does not exist";
 
-/// The ARN of the group named `name` in `region`, in the one form every
-/// operation of this service reports: `arn:aws:resource-groups:<region>:<account>:group/<name>`.
+/// The ARN of the group named `name` in `region`, in the form every operation of
+/// this service reports for a group whose name is not qualified by an id:
+/// `arn:aws:resource-groups:<region>:<account>:group/<name>`.
 /// The account segment is the emulator's canonical account id.
 pub fn group_arn(region: &str, name: &str) -> String {
     emulator_server::emulator_arn("resource-groups", region, &format!("group/{name}"))
+}
+
+/// The ARN of the group named `name` in `region` with its name QUALIFIED by
+/// `application_id`: `arn:aws:resource-groups:<region>:<account>:group/<name>/<id>`.
+///
+/// This is the identity an APPLICATION group is reported with: the modelled
+/// `GroupArn` admits the qualified alternative
+/// `group/[a-zA-Z0-9_\.-]{1,150}/[a-z0-9]{26}`, and the modelled `ApplicationArn`
+/// — the value of an application group's membership tag — admits ONLY that form
+/// (`smithy_query(query="shape",shape="ApplicationArn")`).
+pub fn qualified_group_arn(region: &str, name: &str, application_id: &str) -> String {
+    group_arn(region, &format!("{name}/{application_id}"))
 }
 
 /// The id of the account that owns every group this emulator holds: the

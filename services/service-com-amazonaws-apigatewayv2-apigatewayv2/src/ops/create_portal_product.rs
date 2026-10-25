@@ -202,6 +202,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             display_order: None,
             last_modified: ::std::time::SystemTime::now(),
             tags: input.tags.unwrap_or_default().into_iter().collect(),
+            // A freshly created product carries no sharing policy; it gets one only from
+            // its own `PutPortalProductSharingPolicy` call.
+            sharing_policy: None,
             // A freshly created product owns no product REST endpoint pages; each one is
             // added by its own `CreateProductRestEndpointPage` call, which mints the
             // page's id from the seed beside this map.

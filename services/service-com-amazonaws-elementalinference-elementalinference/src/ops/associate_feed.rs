@@ -30,6 +30,11 @@
 //!   output;
 //! * "This name must not resemble an ARN" — the member's own pattern admits `:` and
 //!   `/`, so the boundary validator cannot enforce that one;
+//! * an appended output that names another resource — a dictionary, or a fixture of the
+//!   data source — is stored only when that id resolves, so an append cannot leave a
+//!   feed carrying a reference to nothing
+//!   (`crate::state::...::unresolved_output_reference`, the one scan every writer of a
+//!   feed's outputs goes through);
 //! * `dryRun` runs every check above and persists NOTHING.
 //!
 //! The scaffold's own notes on the operation shape and on reaching state are kept
@@ -258,6 +263,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle_due_transitions(now);
 
+        // An output may NAME another resource — a dictionary for a subtitling output, a
+        // fixture of the data source for a clipping output's data source — and a feed
+        // may not come to hold a reference to nothing, whichever operation appended the
+        // output: the service keeps that relation in both directions
+        // (`GetDictionary$references`, and `DeleteDictionary`'s refusal while a feed
+        // references the dictionary). The scan is the one every writer of a feed's
+        // outputs goes through; it is resolved here, before the feed is borrowed for the
+        // write, and REPORTED below once the feed and its status have been checked, so a
+        // request naming a feed this Region does not hold still earns the not-found
+        // refusal.
+        let unresolved_reference = state.unresolved_output_reference(
+            &region,
+            input.outputs.iter().map(|output| &output.output_config),
+        );
+
         // The feed is resolved WITHIN the request's Region, as every other id-based
         // operation resolves it: another Region's feed is not this endpoint's to claim.
         let Some(feed) = state.feed_mut(&region, &input.id) else {
@@ -313,6 +333,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+        }
+
+        // The reference refusal resolved above, now that the feed and its status have
+        // been checked: nothing has been written, so a refused append leaves the feed as
+        // it was — and a dry run of it answers the same way.
+        if let Some(message) = unresolved_reference {
+            return Err(AssociateFeedErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
         }
 
         // The request's outputs as the service STORES them: an output that enters a feed

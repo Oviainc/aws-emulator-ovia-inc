@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInstanceConnectEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInstanceConnectEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInstanceConnectEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints an EC2 Instance Connect Endpoint in the subnet the request names and
+//! stores it in [`crate::state`], where `DescribeInstanceConnectEndpoints` reads it back.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +152,288 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInstanceConnectEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInstanceConnectEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInstanceConnectEndpoint"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            default_ip_address_type, deduplicate_ids, idempotent_parameter_mismatch,
+            instance_connect_endpoint_dns_name, instance_connect_endpoint_fips_dns_name,
+            instance_connect_endpoint_limit_exceeded, instance_connect_endpoint_payload_bytes,
+            invalid_group_not_found, invalid_subnet_id_not_found, request_region,
+            require_service_state, same_tags, security_group_id_is_well_formed,
+            subnet_serves_ip_address_type,
+            system_time_to_date_time, tags_from_specifications, InstanceConnectEndpointRecord,
+            DEFAULT_SECURITY_GROUP_NAME, INSTANCE_CONNECT_ENDPOINT_ID_PREFIX,
+            IP_ADDRESS_TYPE_IPV4, MAX_CLIENT_TOKEN_CHARS, MAX_STORED_BYTES,
+            RESOURCE_TYPE_INSTANCE_CONNECT_ENDPOINT, TRANSITION_DELAY,
+        };
+
+        // The Region the request was signed for: the endpoint's ARN and its DNS names name
+        // it, and it is the only thing a request says about the Region it is asking in.
+        let region = request_region(ctx.parts());
+
+        // "The tags to apply to the EC2 Instance Connect Endpoint during creation"
+        // (`CreateInstanceConnectEndpointRequest$TagSpecifications`) — the shared reader
+        // refuses a specification naming any other resource type and holds the payload to
+        // the documented bounds.
+        let tags: Vec<Tag> = tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            RESOURCE_TYPE_INSTANCE_CONNECT_ENDPOINT,
+            Self::NAME,
+        )?;
+        // The model declares no `@length` on `ClientToken`, so the handler is the only place
+        // its documented bound can be enforced — and the token map keeps whatever it is
+        // given for the process's lifetime.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+        let payload_bytes =
+            instance_connect_endpoint_payload_bytes(&tags, input.client_token.as_deref());
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        let now = ::std::time::Instant::now();
+
+        // "The ID of the subnet in which to create the EC2 Instance Connect Endpoint": the
+        // endpoint lives in a subnet of the account, so an id that names none is refused
+        // rather than stored as a dangling reference.
+        let Some(subnet) = store.subnets.get(&input.subnet_id).cloned() else {
+            return Err(invalid_subnet_id_not_found(&input.subnet_id));
+        };
+        let Some(vpc_id) = subnet.vpc_id.clone() else {
+            return Err(Scaffolded::internal_error(format!(
+                "the subnet '{}' is in no VPC",
+                input.subnet_id
+            )));
+        };
+
+        // "If no value is specified, the default value is determined by the IP address type
+        // of the subnet" (`CreateInstanceConnectEndpointRequest$IpAddressType`) — and the
+        // same sentence is what makes a type the subnet carries no CIDR block for
+        // unservable, so a request naming one is refused instead of stored.
+        let ip_address_type = match input.ip_address_type.as_deref() {
+            Some(requested) if !subnet_serves_ip_address_type(&subnet, requested) => {
+                return Err(Scaffolded::invalid_parameter_combination(format!(
+                    "Invalid value '{requested}' for ipAddressType. The subnet \
+                     '{subnet_id}' has no CIDR block for it",
+                    subnet_id = input.subnet_id,
+                )));
+            }
+            Some(requested) => requested.to_string(),
+            None => default_ip_address_type(&subnet)
+                .ok_or_else(|| {
+                    Scaffolded::internal_error(format!(
+                        "the subnet '{}' has no CIDR block",
+                        input.subnet_id
+                    ))
+                })?
+                .to_string(),
+        };
+
+        // "`PreserveClientIp` is only supported on IPv4 EC2 Instance Connect Endpoints. To
+        // use `PreserveClientIp`, the value for `IpAddressType` must be `ipv4`"
+        // (`CreateInstanceConnectEndpointRequest$PreserveClientIp`). "Default: false", and
+        // the default is not "using" it, so an endpoint of another address type may be
+        // created as long as the request does not ask for the client IP.
+        let preserve_client_ip = input.preserve_client_ip.unwrap_or(false);
+        if preserve_client_ip && ip_address_type != IP_ADDRESS_TYPE_IPV4 {
+            return Err(Scaffolded::invalid_parameter_combination(format!(
+                "preserveClientIp is supported on {IP_ADDRESS_TYPE_IPV4} EC2 Instance Connect \
+                 Endpoints only, not on a {ip_address_type} endpoint"
+            )));
+        }
+
+        // "One or more security groups to associate with the endpoint. If you don't specify
+        // a security group, the default security group for your VPC will be associated with
+        // the endpoint" (`CreateInstanceConnectEndpointRequest$SecurityGroupIds`). A group
+        // is associated with the endpoint's network, so one of another VPC is refused; the
+        // modelled `@length` of at most 16 has already been enforced at the boundary.
+        let requested_groups = deduplicate_ids(input.security_group_ids.as_deref().unwrap_or(&[]));
+        let security_group_ids = if requested_groups.is_empty() {
+            let default_group = store
+                .security_group_id_for_name(&vpc_id, DEFAULT_SECURITY_GROUP_NAME)
+                .ok_or_else(|| {
+                    Scaffolded::internal_error(format!(
+                        "the VPC '{vpc_id}' has no {DEFAULT_SECURITY_GROUP_NAME} security group"
+                    ))
+                })?;
+            vec![default_group]
+        } else {
+            for group_id in &requested_groups {
+                if !security_group_id_is_well_formed(group_id) {
+                    return Err(Scaffolded::invalid_id(group_id));
+                }
+                let Some(group) = store.security_groups.get(group_id) else {
+                    return Err(invalid_group_not_found(group_id));
+                };
+                if group.vpc_id.as_deref() != Some(vpc_id.as_str()) {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "The security group '{group_id}' and the subnet '{subnet_id}' \
+                         belong to different networks",
+                        subnet_id = input.subnet_id,
+                    )));
+                }
+            }
+            requested_groups
+        };
+
+        // Idempotency: "Unique, case-sensitive identifier that you provide to ensure the
+        // idempotency of the request" (`CreateInstanceConnectEndpointRequest$ClientToken`) —
+        // one token names the one endpoint it minted, so a replay reports that endpoint and
+        // creates nothing.
+        let replayed = input.client_token.as_deref().and_then(|token| {
+            store
+                .instance_connect_endpoint_client_tokens
+                .get(token)
+                .cloned()
+        });
+
+        // A replay is answered BEFORE the store's ceilings and before DryRun: it stores
+        // nothing, so the ceilings a fresh create has to clear do not apply to it, and a
+        // request that would have been REFUSED — a token reused with different parameters —
+        // is refused with that reason rather than with `DryRunOperation`.
+        if let Some(endpoint_id) = replayed {
+            let Some(record) = store.instance_connect_endpoints.get(&endpoint_id) else {
+                return Err(Scaffolded::internal_error(format!(
+                    "a client token names endpoint '{endpoint_id}', which is not stored"
+                )));
+            };
+            // A token identifies ONE request, so a later request that reuses it with
+            // different parameters is not that request, and EC2 answers
+            // `IdempotentParameterMismatch` for it rather than an endpoint the caller did
+            // not ask for. The comparison is against the STORED endpoint, which carries
+            // every member the first create resolved, so no second copy of the request is
+            // kept anywhere.
+            // `SecurityGroupIds` is a SET of associations, so the same groups named in a
+            // different order are the same request; the tags are compared the same way, by
+            // the crate's shared [`crate::state::same_tags`], which every create of this
+            // crate that honors a `ClientToken` compares its tags through.
+            let group_set = |ids: &[String]| -> ::std::collections::BTreeSet<String> {
+                ids.iter().cloned().collect()
+            };
+            let stored = &record.view;
+            let same_request = stored.subnet_id.as_deref() == Some(input.subnet_id.as_str())
+                && stored.ip_address_type.as_deref() == Some(ip_address_type.as_str())
+                && stored.preserve_client_ip == Some(preserve_client_ip)
+                && group_set(stored.security_group_ids.as_deref().unwrap_or_default())
+                    == group_set(&security_group_ids)
+                && same_tags(stored.tags.as_deref().unwrap_or_default(), &tags);
+            if !same_request {
+                return Err(idempotent_parameter_mismatch());
+            }
+            // The replay itself would have succeeded, so a dry run of it stops here.
+            if input.dry_run == Some(true) {
+                return Err(Scaffolded::dry_run_operation());
+            }
+            return Ok(CreateInstanceConnectEndpointOutput {
+                instance_connect_endpoint: Some(record.view_at(now)),
+                client_token: input.client_token.clone(),
+            });
+        }
+
+        if !store.has_instance_connect_endpoint_capacity() {
+            return Err(instance_connect_endpoint_limit_exceeded());
+        }
+        // A fresh create is refused rather than overshooting the store's byte budget.
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store {payload_bytes} more",
+                store.stored_bytes()
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let endpoint_id = store.next_id(INSTANCE_CONNECT_ENDPOINT_ID_PREFIX.trim_end_matches('-'));
+        let record = InstanceConnectEndpointRecord {
+            view: Ec2InstanceConnectEndpoint {
+                owner_id: Some(::engine::emulator_account_id().to_string()),
+                instance_connect_endpoint_id: Some(endpoint_id.clone()),
+                instance_connect_endpoint_arn: Some(::engine::emulator_arn(
+                    "ec2",
+                    &region,
+                    &format!("instance-connect-endpoint/{endpoint_id}"),
+                )),
+                // Derived from `create_complete_at` on every read.
+                state: None,
+                // "The message for the current state … Can include a failure message"
+                // (`Ec2InstanceConnectEndpoint$StateMessage`): nothing failed, so there is
+                // no message to report.
+                state_message: None,
+                dns_name: Some(instance_connect_endpoint_dns_name(&endpoint_id, &region)),
+                fips_dns_name: Some(instance_connect_endpoint_fips_dns_name(
+                    &endpoint_id,
+                    &region,
+                )),
+                // "The ID of the elastic network interface that Amazon EC2 automatically
+                // created" (`Ec2InstanceConnectEndpoint$NetworkInterfaceIds`): this emulator
+                // holds no network interfaces at all — it has no store for them and every
+                // network-interface operation is still a scaffold — so there is no interface
+                // to name here, and the member is left absent rather than naming one nothing
+                // else holds.
+                network_interface_ids: None,
+                // The network facts are the SUBNET's, read off the stored subnet rather than
+                // taken from the request, so the endpoint can never report a VPC or a zone
+                // its subnet is not in.
+                vpc_id: Some(vpc_id),
+                availability_zone: subnet.availability_zone.clone(),
+                availability_zone_id: subnet.availability_zone_id.clone(),
+                created_at: Some(system_time_to_date_time(::std::time::SystemTime::now())),
+                subnet_id: Some(input.subnet_id.clone()),
+                preserve_client_ip: Some(preserve_client_ip),
+                security_group_ids: Some(security_group_ids),
+                tags: Some(tags.clone()),
+                ip_address_type: Some(ip_address_type),
+                // "The public DNS names of the endpoint"
+                // (`Ec2InstanceConnectEndpoint$PublicDnsNames`): an EC2 Instance Connect
+                // Endpoint created here is reached inside its VPC through `DnsName` above,
+                // and nothing in this emulator publishes it to the internet, so it has no
+                // public name to report.
+                public_dns_names: None,
+            },
+            // An endpoint AWS hands back is `create-in-progress` and reaches
+            // `create-complete` without anyone asking: the same clock-owed span a volume's
+            // `creating` -> `available` move takes in this crate.
+            create_complete_at: now + TRANSITION_DELAY,
+        };
+        if let Some(token) = input.client_token.clone() {
+            store
+                .instance_connect_endpoint_client_tokens
+                .insert(token, endpoint_id.clone());
+        }
+        // The bytes this record and its token retain are charged against the store's budget
+        // at the insert, so no path can store them uncharged.
+        store.add_stored_bytes(payload_bytes);
+        store
+            .instance_connect_endpoints
+            .insert(endpoint_id.clone(), record);
+
+        // Read the response back OUT of the store, so the caller sees what a later
+        // `DescribeInstanceConnectEndpoints` will see rather than the request object.
+        store
+            .instance_connect_endpoints
+            .get(&endpoint_id)
+            .map(|record| CreateInstanceConnectEndpointOutput {
+                instance_connect_endpoint: Some(record.view_at(now)),
+                // "Unique, case-sensitive idempotency token provided by the client in the
+                // the request" (`CreateInstanceConnectEndpointResult$ClientToken`).
+                client_token: input.client_token.clone(),
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the newly created endpoint '{endpoint_id}' could not be read back"
+                ))
+            })
     }
 }

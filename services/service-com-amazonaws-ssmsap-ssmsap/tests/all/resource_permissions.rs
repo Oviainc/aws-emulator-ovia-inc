@@ -2,21 +2,33 @@
 
 //! `PutResourcePermission` and `GetResourcePermission` end to end, over the wire.
 //!
-//! The rule these cases pin: a resource permission is the (target resource ARN,
-//! `PermissionActionType`, source resource ARN) triple the service holds, and the
-//! `Policy` either operation reports is PROJECTED from the triples held for that one
-//! target — one `Allow` statement per granted source, in an order that does not depend
-//! on the order the grants arrived, absent entirely for a target nobody has granted
-//! anything on, and unchanged by re-granting a triple already held or by reading it.
+//! The rules these cases pin:
 //!
-//! The table spans what that rule generalises over: the ARN form of the target
-//! (both branches of the modelled `Arn` pattern — the colon-segment form and the
-//! `.../path` form), the number of sources granted on one target, the ARN form of a
-//! source, and every `PermissionActionType` the model declares
-//! (`service_com_amazonaws_ssmsap_ssmsap::ops::types::PERMISSION_ACTION_TYPE_VALUES`).
-//! A single HANA database target with one source — the shape the issue's reproduction
-//! calls — is ONE row. A separate case pins that a grant is held per Region, the
-//! partitioning `crate::region_scoping` pins for the rest of this service's state.
+//! * A resource permission is the (target resource ARN, `PermissionActionType`, source
+//!   resource ARN) triple the service holds, and the `Policy` either operation reports
+//!   is PROJECTED from the triples held for that one target — one `Allow` statement per
+//!   granted source, in an order that does not depend on the order the grants arrived,
+//!   absent entirely for a target nobody has granted anything on, and unchanged by
+//!   re-granting a triple already held or by reading it.
+//! * The target is a resource this account and Region HOLDS: a registered SAP
+//!   application, or a SAP HANA database of one of its registrations. An ARN that names
+//!   no such resource is refused with the modelled `ResourceNotFoundException`
+//!   (HTTP 404) naming that ARN, by the grant and by the read alike, and the refusal
+//!   persists nothing. A grant therefore cannot outlive the registration its target came
+//!   from.
+//!
+//! The tables span what those rules generalise over: the kind of resource the target ARN
+//! names (the application itself, a database its credentials named, a database its
+//! `DatabaseArn` named), the ARN form of the target (both branches of the modelled `Arn`
+//! pattern — the colon-segment form and the `.../path` form), the number of sources
+//! granted on one target, the ARN form of a source (a registered database of this Region,
+//! a database of another Region or account, another service's resource), every
+//! `PermissionActionType` the model declares
+//! (`service_com_amazonaws_ssmsap_ssmsap::ops::types::PERMISSION_ACTION_TYPE_VALUES`),
+//! and the ways an ARN can name nothing here (never registered, deregistered, another
+//! Region, a database the registration never named, another service's resource). A single
+//! HANA database target with one source — the shape the issue's reproduction calls — is
+//! ONE row.
 //!
 //! Every call goes through `MultiServiceRouter::dispatch` (the harness
 //! `tests/all/application_lifecycle.rs` owns), so the restJson1 routing, the boundary
@@ -28,68 +40,125 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use crate::application_lifecycle::{Emulator, Reply};
+use crate::application_lifecycle::{settle, Emulator, Reply};
+use crate::resource_tags::{application_arn, database_arn, register, registration};
+use crate::validation_message_rendering::{message, VALIDATION_EXCEPTION};
 use service_com_amazonaws_ssmsap_ssmsap::ops::types::PERMISSION_ACTION_TYPE_VALUES;
 use service_com_amazonaws_ssmsap_ssmsap::state::{
-    permission_policy_action, MAX_REGIONS, POLICY_EFFECT_ALLOW, POLICY_VERSION,
+    permission_policy_action, MAX_PERMISSION_SOURCES_PER_RESOURCE, POLICY_EFFECT_ALLOW,
+    POLICY_VERSION,
 };
 
 /// The account every emulated ARN carries, from the core's single source of truth.
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
-/// The wire error code a refused request carries; this service models its own
-/// `ValidationException` (HTTP 400).
-const VALIDATION_EXCEPTION: &str = "ValidationException";
+/// The Region this suite signs for, which is the Region every resource it registers
+/// lives in.
+const REGION: &str = "us-east-1";
 
-/// One row: a label, the target resource ARN, and the source resource ARNs granted on
-/// it in the order the test grants them.
+/// A second regional endpoint, so a target can be named at a Region its resource was not
+/// registered in.
+const OTHER_REGION: &str = "us-west-2";
+
+/// The modelled error code and status an ARN naming no resource is answered with
+/// (`smithy_query(query="operation", operation="PutResourcePermission")`:
+/// `ResourceNotFoundException` `@httpError 404`, declared for `GetResourcePermission`
+/// too).
+const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+
+/// One row: a label, the registration that brings the target into being, the target
+/// resource ARN, and the source resource ARNs granted on it in the order the test grants
+/// them.
 struct Case {
     label: &'static str,
+    /// The `RegisterApplication` body the row registers before granting anything.
+    registration: Value,
     resource: String,
     sources: Vec<String>,
 }
 
-/// The rows. Each row owns its OWN target ARN, so the last assertion can check that a
-/// grant on one target never shows up in another's policy.
+/// The rows. Each row owns its OWN target, so the last assertion can check that a grant
+/// on one target never shows up in another's policy.
 fn cases() -> Vec<Case> {
     vec![
-        // The shape the issue's reproduction calls: one HANA database target, one
-        // source database. `database/<application>/<database>` is the `.../path`
-        // branch of the modelled `Arn` pattern.
+        // The shape the issue's reproduction calls: one HANA database target, one source
+        // database. `database/<application>/<database>` is the `.../path` branch of the
+        // modelled `Arn` pattern.
         Case {
-            label: "one source on a database target",
-            resource: format!("arn:aws:ssm-sap:us-east-1:{ACCOUNT}:database/HDB-TEST/HDB"),
+            label: "one source on the registration's HANA database",
+            registration: registration("perm-hdb", &[], Some(&["HDB"])),
+            resource: database_arn(REGION, "perm-hdb", "HDB"),
             sources: vec![format!(
-                "arn:aws:ssm-sap:us-east-1:{ACCOUNT}:database/HDB-SOURCE/HDB"
+                "arn:aws:ssm-sap:{REGION}:{ACCOUNT}:database/perm-source/HDB"
             )],
         },
-        // Three sources on one target: the statement count follows the grant count.
+        // Three sources on one of the three databases a registration named: the
+        // statement count follows the grant count, and the source ARNs span a database
+        // registered in this Region, one of another Region, and another service's
+        // resource — a source is the counterparty a restore is permitted for, which need
+        // not be a resource of this account or Region at all.
         Case {
-            label: "three sources on a database target",
-            resource: format!("arn:aws:ssm-sap:us-east-1:{ACCOUNT}:database/HDB-FANIN/HDB"),
+            label: "three sources on one database of a three-database registration",
+            registration: registration("perm-multi", &[], Some(&["SYSTEMDB", "TNT1", "TNT2"])),
+            resource: database_arn(REGION, "perm-multi", "TNT1"),
             sources: vec![
-                format!("arn:aws:ssm-sap:us-east-1:{ACCOUNT}:database/HDB-S3/HDB"),
-                format!("arn:aws:ssm-sap:eu-west-1:{ACCOUNT}:database/HDB-S1/HDB"),
-                format!("arn:aws:ssm-sap:us-east-1:{ACCOUNT}:database/HDB-S2/HDB"),
+                database_arn(REGION, "perm-hdb", "HDB"),
+                format!("arn:aws:ssm-sap:eu-west-1:{ACCOUNT}:database/perm-far/HDB"),
+                "arn:aws:s3:::sap-backint-bucket/backups".to_string(),
             ],
         },
-        // A target in the colon-segment branch of the pattern (no `/`), with a source
-        // in the other branch: neither ARN's form changes how a grant is stored.
+        // The registered application itself as the target, with an IAM role as a source:
+        // the rule is about what the ARN RESOLVES to here, not about which resource kind
+        // or which service the ARN spells.
         Case {
-            label: "colon-segment target, mixed source forms",
-            resource: format!("arn:aws:ssm-sap:us-east-1:{ACCOUNT}:HDB-COLON"),
+            label: "two sources on the registered application",
+            registration: registration("perm-app", &[], None),
+            resource: application_arn(REGION, "perm-app"),
             sources: vec![
-                "arn:aws:s3:::sap-backint-bucket/backups".to_string(),
                 format!("arn:aws:iam::{ACCOUNT}:role/sap-restore"),
+                database_arn(REGION, "perm-app", "HDB"),
             ],
+        },
+        // A database the registration named by `DatabaseArn`: its ARN is the one the
+        // registration gave it, which here is in the colon-segment branch of the modelled
+        // `Arn` pattern and names another service entirely. It resolves because the
+        // registration named it, which is the whole rule.
+        Case {
+            label: "the database a registration named by ARN",
+            registration: registered_by_arn("perm-by-arn", COLON_SEGMENT_DATABASE_ARN),
+            resource: COLON_SEGMENT_DATABASE_ARN.to_string(),
+            sources: vec![format!(
+                "arn:aws:ssm-sap:{REGION}:{ACCOUNT}:database/perm-source/HDB"
+            )],
         },
     ]
 }
 
-/// `PutResourcePermission` over the wire.
-async fn put(emulator: &Emulator, resource: &str, action: &str, source: &str) -> Reply {
+/// A `DatabaseArn` in the colon-segment branch of the modelled `Arn` pattern
+/// (`^arn:(.+:){2,4}.+$`), the form `tests/all/registered_database_arn.rs` registers too.
+const COLON_SEGMENT_DATABASE_ARN: &str = "arn:aws:rds:us-east-1:000000000000:db:sap-prd";
+
+/// A registration for `application_id` that names its SAP HANA database by
+/// `DatabaseArn`, so the database carries exactly that ARN.
+fn registered_by_arn(application_id: &str, database_arn: &str) -> Value {
+    let mut body = registration(application_id, &[], None);
+    body.as_object_mut()
+        .expect("a registration body is a JSON object")
+        .insert("DatabaseArn".to_string(), json!(database_arn));
+    body
+}
+
+/// `PutResourcePermission` at `region`'s endpoint.
+async fn put_in_region(
+    emulator: &Emulator,
+    region: &str,
+    resource: &str,
+    action: &str,
+    source: &str,
+) -> Reply {
     emulator
-        .send(
+        .send_in_region(
+            region,
             "/put-resource-permission",
             json!({
                 "ResourceArn": resource,
@@ -100,13 +169,42 @@ async fn put(emulator: &Emulator, resource: &str, action: &str, source: &str) ->
         .await
 }
 
-/// `GetResourcePermission` over the wire, with an `ActionType` when `action` is given.
-async fn get(emulator: &Emulator, resource: &str, action: Option<&str>) -> Reply {
+/// `PutResourcePermission` at [`REGION`]'s endpoint.
+async fn put(emulator: &Emulator, resource: &str, action: &str, source: &str) -> Reply {
+    put_in_region(emulator, REGION, resource, action, source).await
+}
+
+/// `GetResourcePermission` at `region`'s endpoint, with an `ActionType` when `action` is
+/// given.
+async fn get_in_region(
+    emulator: &Emulator,
+    region: &str,
+    resource: &str,
+    action: Option<&str>,
+) -> Reply {
     let body = match action {
         Some(action) => json!({ "ResourceArn": resource, "ActionType": action }),
         None => json!({ "ResourceArn": resource }),
     };
-    emulator.send("/get-resource-permission", body).await
+    emulator
+        .send_in_region(region, "/get-resource-permission", body)
+        .await
+}
+
+/// `GetResourcePermission` at [`REGION`]'s endpoint.
+async fn get(emulator: &Emulator, resource: &str, action: Option<&str>) -> Reply {
+    get_in_region(emulator, REGION, resource, action).await
+}
+
+/// Register `body` at `region`'s endpoint, asserting the registration was accepted.
+async fn register_in_region(emulator: &Emulator, case: &str, region: &str, body: Value) {
+    let reply = emulator
+        .send_in_region(region, "/register-application", body)
+        .await;
+    assert_eq!(
+        reply.status, 200,
+        "case {case:?}: expected 200 from RegisterApplication, got {reply:?}"
+    );
 }
 
 /// The `Policy` member of a reply, which must be present.
@@ -216,6 +314,27 @@ fn assert_policy_grants(
     );
 }
 
+/// Assert the call was refused as the modelled `ResourceNotFoundException`, naming the
+/// ARN the request carried.
+fn assert_not_found(reply: &Reply, arn: &str, case: &str) {
+    assert_eq!(
+        reply.status, 404,
+        "case {case:?}: expected HTTP 404 for an ARN naming no resource, got {reply:?}"
+    );
+    assert_eq!(
+        reply.code(),
+        RESOURCE_NOT_FOUND_EXCEPTION,
+        "case {case:?}: expected {RESOURCE_NOT_FOUND_EXCEPTION}, got {reply:?}"
+    );
+    let stated = message(reply);
+    assert!(
+        stated.contains(arn),
+        "case {case:?}: expected the refusal to name {arn:?}, got {stated:?}"
+    );
+}
+
+/// RULE: the grants held for a target are projected as that target's policy — one
+/// statement per granted source, persisted for every later read.
 #[tokio::test]
 async fn granted_permissions_are_projected_as_the_targets_policy() {
     // Every `PermissionActionType` the model declares, on a fresh emulator each time,
@@ -223,6 +342,12 @@ async fn granted_permissions_are_projected_as_the_targets_policy() {
     for action in PERMISSION_ACTION_TYPE_VALUES {
         let emulator = Emulator::new();
         let rows = cases();
+
+        // Every row's target is a resource this Region holds, which is what the
+        // registrations bring into being.
+        for row in &rows {
+            register(&emulator, row.label, row.registration.clone()).await;
+        }
 
         for row in &rows {
             let mut granted: BTreeSet<String> = BTreeSet::new();
@@ -290,58 +415,284 @@ async fn granted_permissions_are_projected_as_the_targets_policy() {
     }
 }
 
+/// RULE: a target that EXISTS but has been granted nothing carries no policy — an absent
+/// `Policy` member on a 200, not an invented document and not a refusal.
 #[tokio::test]
-async fn a_target_with_no_grant_has_no_policy() {
+async fn a_target_that_exists_with_no_grant_has_no_policy() {
     let emulator = Emulator::new();
-    let ungranted = format!("arn:aws:ssm-sap:us-east-1:{ACCOUNT}:database/HDB-NONE/HDB");
+    register(
+        &emulator,
+        "an ungranted registration",
+        registration("perm-none", &[], Some(&["HDB"])),
+    )
+    .await;
+    register(
+        &emulator,
+        "another registration to grant on",
+        registration("perm-other", &[], Some(&["HDB"])),
+    )
+    .await;
+
+    // Rows: the kinds of resource a registration brings with it, each granted nothing.
+    let ungranted = [
+        ("the application", application_arn(REGION, "perm-none")),
+        (
+            "its HANA database",
+            database_arn(REGION, "perm-none", "HDB"),
+        ),
+    ];
 
     for action in PERMISSION_ACTION_TYPE_VALUES {
-        for (label, requested) in [
-            ("no ActionType", None),
-            ("with ActionType", Some(*action)),
-        ] {
-            let case = format!("ungranted target / {action} / {label}");
-            let reply = get(&emulator, &ungranted, requested).await;
-            assert_eq!(
-                reply.status, 200,
-                "case {case:?}: expected HTTP 200, got {reply:?}"
-            );
-            assert!(
-                reply.member("Policy").is_none(),
-                "case {case:?}: a target with no grant must carry no Policy, got {reply:?}"
-            );
+        for (resource_label, resource) in &ungranted {
+            for (label, requested) in [("no ActionType", None), ("with ActionType", Some(*action))] {
+                let case = format!("{resource_label} / {action} / {label}");
+                let reply = get(&emulator, resource, requested).await;
+                assert_eq!(
+                    reply.status, 200,
+                    "case {case:?}: expected HTTP 200, got {reply:?}"
+                );
+                assert!(
+                    reply.member("Policy").is_none(),
+                    "case {case:?}: a target with no grant must carry no Policy, got {reply:?}"
+                );
+            }
         }
     }
 
-    // A grant on ANOTHER target does not give this one a policy.
-    let other = format!("arn:aws:ssm-sap:us-east-1:{ACCOUNT}:database/HDB-OTHER/HDB");
-    let source = format!("arn:aws:ssm-sap:us-east-1:{ACCOUNT}:database/HDB-SRC/HDB");
+    // A grant on ANOTHER target does not give these ones a policy.
+    let other = database_arn(REGION, "perm-other", "HDB");
+    let source = database_arn(REGION, "perm-none", "HDB");
     let action = PERMISSION_ACTION_TYPE_VALUES[0];
     let reply = put(&emulator, &other, action, &source).await;
     assert_eq!(
         reply.status, 200,
         "case \"grant on another target\": expected HTTP 200, got {reply:?}"
     );
-    let reply = get(&emulator, &ungranted, None).await;
+    for (resource_label, resource) in &ungranted {
+        let reply = get(&emulator, resource, None).await;
+        assert!(
+            reply.member("Policy").is_none(),
+            "case {resource_label:?}: the ungranted target must still carry no Policy, got \
+             {reply:?}"
+        );
+    }
+}
+
+/// RULE: an ARN that names no resource of this account and Region is refused with the
+/// modelled `ResourceNotFoundException` (HTTP 404) naming that ARN — by the grant and by
+/// the read alike — and the refused grant persists nothing.
+#[tokio::test]
+async fn an_arn_naming_no_resource_here_is_refused_and_persists_nothing() {
+    let emulator = Emulator::new();
+    let action = PERMISSION_ACTION_TYPE_VALUES[0];
+
+    register(
+        &emulator,
+        "a registration that stays",
+        registration("perm-present", &[], Some(&["HDB"])),
+    )
+    .await;
+    register(
+        &emulator,
+        "a registration to deregister",
+        registration("perm-gone", &[], Some(&["HDB"])),
+    )
+    .await;
+    let reply = emulator
+        .send(
+            "/deregister-application",
+            json!({ "ApplicationId": "perm-gone" }),
+        )
+        .await;
+    assert_eq!(
+        reply.status, 200,
+        "expected 200 from DeregisterApplication, got {reply:?}"
+    );
+    // Deregistration is asynchronous: the application stops resolving when the removal
+    // the clock owes it falls due.
+    settle().await;
+
+    // (label, the Region the call is made in, the ARN it names)
+    let rows: Vec<(&str, &str, String)> = vec![
+        (
+            "an application never registered",
+            REGION,
+            application_arn(REGION, "perm-never-registered"),
+        ),
+        (
+            "a database of an application never registered",
+            REGION,
+            database_arn(REGION, "perm-never-registered", "HDB"),
+        ),
+        (
+            "an application that was deregistered",
+            REGION,
+            application_arn(REGION, "perm-gone"),
+        ),
+        (
+            "a database of an application that was deregistered",
+            REGION,
+            database_arn(REGION, "perm-gone", "HDB"),
+        ),
+        (
+            "a database the registration never named",
+            REGION,
+            database_arn(REGION, "perm-present", "NOPE"),
+        ),
+        (
+            "a registered resource named at another regional endpoint",
+            OTHER_REGION,
+            database_arn(REGION, "perm-present", "HDB"),
+        ),
+        (
+            "an ARN carrying another Region",
+            REGION,
+            database_arn(OTHER_REGION, "perm-present", "HDB"),
+        ),
+        (
+            "another service's resource",
+            REGION,
+            "arn:aws:s3:::a-bucket/an-object".to_string(),
+        ),
+        (
+            "a colon-segment ARN no registration named",
+            REGION,
+            COLON_SEGMENT_DATABASE_ARN.to_string(),
+        ),
+    ];
+
+    let source = database_arn(REGION, "perm-present", "HDB");
+    for (label, region, arn) in rows {
+        let grant = put_in_region(&emulator, region, &arn, action, &source).await;
+        assert_not_found(&grant, &arn, label);
+
+        // The read refuses the same ARN in the same way, rather than reporting an empty
+        // policy for a resource that does not exist.
+        let read = get_in_region(&emulator, region, &arn, None).await;
+        assert_not_found(&read, &arn, label);
+        let narrowed = get_in_region(&emulator, region, &arn, Some(action)).await;
+        assert_not_found(&narrowed, &arn, label);
+    }
+
+    // The resource that does exist was untouched by every refusal: it still carries no
+    // policy, and a grant on it is still served.
+    let target = database_arn(REGION, "perm-present", "HDB");
+    let reply = get(&emulator, &target, None).await;
     assert!(
         reply.member("Policy").is_none(),
-        "case \"grant on another target\": the ungranted target must still carry no Policy, got {reply:?}"
+        "case \"the registered database\": a refused call persists nothing, got {reply:?}"
+    );
+    let reply = put(&emulator, &target, action, &source).await;
+    let expected: BTreeSet<String> = BTreeSet::from([source.clone()]);
+    assert_policy_grants(
+        &policy(&reply, "the registered database"),
+        &target,
+        action,
+        &expected,
+        "the registered database",
     );
 }
 
+/// RULE: a grant is held ON a resource, so it cannot outlive the registration that
+/// resource came from.
+#[tokio::test]
+async fn a_grant_does_not_outlive_the_registration_its_target_came_from() {
+    let emulator = Emulator::new();
+    let action = PERMISSION_ACTION_TYPE_VALUES[0];
+    let source = format!("arn:aws:ssm-sap:{REGION}:{ACCOUNT}:database/perm-source/HDB");
+
+    // Rows: the kinds of resource a registration brings with it, each granted on.
+    let databases: &[&str] = &["HDB", "SYSTEMDB"];
+    register(
+        &emulator,
+        "a registration to deregister",
+        registration("perm-lifetime", &[], Some(databases)),
+    )
+    .await;
+
+    let mut targets = vec![application_arn(REGION, "perm-lifetime")];
+    targets.extend(
+        databases
+            .iter()
+            .map(|database_id| database_arn(REGION, "perm-lifetime", database_id)),
+    );
+    for target in &targets {
+        let reply = put(&emulator, target, action, &source).await;
+        let expected: BTreeSet<String> = BTreeSet::from([source.clone()]);
+        assert_policy_grants(&policy(&reply, target), target, action, &expected, target);
+    }
+
+    let reply = emulator
+        .send(
+            "/deregister-application",
+            json!({ "ApplicationId": "perm-lifetime" }),
+        )
+        .await;
+    assert_eq!(
+        reply.status, 200,
+        "expected 200 from DeregisterApplication, got {reply:?}"
+    );
+    settle().await;
+
+    // The resources are gone, so both calls refuse their ARNs.
+    for target in &targets {
+        let case = format!("{target} after deregistration");
+        assert_not_found(&get(&emulator, target, None).await, target, &case);
+        assert_not_found(
+            &put(&emulator, target, action, &source).await,
+            target,
+            &case,
+        );
+    }
+
+    // The same application registered again is a NEW registration: its resources carry
+    // the grants its own callers made, which is none of the old ones.
+    register(
+        &emulator,
+        "the registration that replaces it",
+        registration("perm-lifetime", &[], Some(databases)),
+    )
+    .await;
+    for target in &targets {
+        let reply = get(&emulator, target, None).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {target:?}: expected HTTP 200 after re-registration, got {reply:?}"
+        );
+        assert!(
+            reply.member("Policy").is_none(),
+            "case {target:?}: the grants of the old registration are gone, got {reply:?}"
+        );
+    }
+}
+
+/// RULE: the statement order of a document does not depend on the order the grants
+/// arrived, so two reads of equally granted targets render the same statements.
 #[tokio::test]
 async fn the_document_does_not_depend_on_the_order_grants_arrived() {
     let emulator = Emulator::new();
     let action = PERMISSION_ACTION_TYPE_VALUES[0];
     let sources = [
-        format!("arn:aws:ssm-sap:us-east-1:{ACCOUNT}:database/HDB-Z/HDB"),
-        format!("arn:aws:ssm-sap:us-east-1:{ACCOUNT}:database/HDB-A/HDB"),
+        format!("arn:aws:ssm-sap:{REGION}:{ACCOUNT}:database/HDB-Z/HDB"),
+        format!("arn:aws:ssm-sap:{REGION}:{ACCOUNT}:database/HDB-A/HDB"),
         "arn:aws:s3:::sap-backint-bucket/restore".to_string(),
     ];
 
     // Two targets, the same three sources, granted in opposite orders.
-    let forward = format!("arn:aws:ssm-sap:us-east-1:{ACCOUNT}:database/HDB-FORWARD/HDB");
-    let backward = format!("arn:aws:ssm-sap:us-east-1:{ACCOUNT}:database/HDB-BACKWARD/HDB");
+    register(
+        &emulator,
+        "the forward target",
+        registration("perm-forward", &[], Some(&["HDB"])),
+    )
+    .await;
+    register(
+        &emulator,
+        "the backward target",
+        registration("perm-backward", &[], Some(&["HDB"])),
+    )
+    .await;
+    let forward = database_arn(REGION, "perm-forward", "HDB");
+    let backward = database_arn(REGION, "perm-backward", "HDB");
     for source in &sources {
         put(&emulator, &forward, action, source).await;
     }
@@ -372,98 +723,82 @@ async fn the_document_does_not_depend_on_the_order_grants_arrived() {
     );
 }
 
+/// RULE: the service is regional, so a grant is made on the resource of THIS Region and
+/// is neither read nor reported through another endpoint.
 #[tokio::test]
 async fn grants_are_held_per_region() {
-    // The service is regional, so a grant made at one regional endpoint is neither
-    // read nor reported through another; the same target ARN is free in every other
-    // Region. (The harness signs each call for the Region it names.)
     let emulator = Emulator::new();
     let action = PERMISSION_ACTION_TYPE_VALUES[0];
     let regions = ["us-east-1", "eu-west-1", "ap-southeast-2"];
-    let target = format!("arn:aws:ssm-sap:us-east-1:{ACCOUNT}:database/HDB-REGIONS/HDB");
+
+    // The SAME application id registered at each regional endpoint: an id in use in one
+    // Region is free in every other, and each registration's database carries its own
+    // Region's ARN.
+    for region in regions {
+        register_in_region(
+            &emulator,
+            region,
+            region,
+            registration("perm-regions", &[], Some(&["HDB"])),
+        )
+        .await;
+    }
 
     for granted_in in regions {
-        let source = format!("arn:aws:ssm-sap:{granted_in}:{ACCOUNT}:database/HDB-SRC/HDB");
+        let target = database_arn(granted_in, "perm-regions", "HDB");
+        let source = format!("arn:aws:ssm-sap:{granted_in}:{ACCOUNT}:database/perm-source/HDB");
         let case = format!("granted in {granted_in}");
-        let reply = emulator
-            .send_in_region(
-                granted_in,
-                "/put-resource-permission",
-                json!({
-                    "ResourceArn": target,
-                    "ActionType": action,
-                    "SourceResourceArn": source,
-                }),
-            )
-            .await;
-        let document = policy(&reply, &case);
+        let reply = put_in_region(&emulator, granted_in, &target, action, &source).await;
         let expected: BTreeSet<String> = BTreeSet::from([source.clone()]);
-        assert_policy_grants(&document, &target, action, &expected, &case);
+        assert_policy_grants(&policy(&reply, &case), &target, action, &expected, &case);
 
         for read_in in regions {
             let case = format!("granted in {granted_in}, read in {read_in}");
-            let reply = emulator
-                .send_in_region(
-                    read_in,
-                    "/get-resource-permission",
-                    json!({ "ResourceArn": target }),
-                )
-                .await;
+            let reply = get_in_region(&emulator, read_in, &target, None).await;
             if read_in == granted_in {
                 assert_policy_grants(&policy(&reply, &case), &target, action, &expected, &case);
             } else {
-                // Another Region either holds its own single grant or none at all —
-                // never the one made here.
-                assert_eq!(
-                    reply.status, 200,
-                    "case {case:?}: expected HTTP 200, got {reply:?}"
-                );
-                let document = reply
-                    .member("Policy")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                assert!(
-                    !document.contains(&source),
-                    "case {case:?}: the grant made in {granted_in} must not be reported in {read_in}, got {document:?}"
-                );
+                // The target is a resource of ANOTHER Region, so this endpoint holds no
+                // such resource at all — it cannot report the grant made there.
+                assert_not_found(&reply, &target, &case);
             }
         }
     }
 }
 
+/// RULE: the store holds at most [`MAX_PERMISSION_SOURCES_PER_RESOURCE`] sources for one
+/// (target, action type) pair; a grant past that ceiling is refused with the modelled
+/// `ValidationException` (HTTP 400) and persists nothing.
 #[tokio::test]
-async fn the_region_partition_ceiling_is_enforced() {
-    // The Region comes from the caller's credential scope, so a grant must not mint a
-    // partition for every Region a caller invents: past `MAX_REGIONS` the grant is
-    // refused, and the refusal persists nothing.
+async fn the_per_resource_source_ceiling_is_refused_and_persists_nothing() {
     let emulator = Emulator::new();
     let action = PERMISSION_ACTION_TYPE_VALUES[0];
-    let target = format!("arn:aws:ssm-sap:us-east-1:{ACCOUNT}:database/HDB-CEILING/HDB");
-    let source = format!("arn:aws:ssm-sap:us-east-1:{ACCOUNT}:database/HDB-SRC/HDB");
-    let body = json!({
-        "ResourceArn": target,
-        "ActionType": action,
-        "SourceResourceArn": source,
-    });
+    register(
+        &emulator,
+        "a registration to fill up",
+        registration("perm-ceiling", &[], Some(&["HDB"])),
+    )
+    .await;
+    let target = database_arn(REGION, "perm-ceiling", "HDB");
 
-    for index in 0..MAX_REGIONS {
-        let region = format!("us-test-{index}");
-        let case = format!("region {region} (partition {}/{MAX_REGIONS})", index + 1);
-        let reply = emulator
-            .send_in_region(&region, "/put-resource-permission", body.clone())
-            .await;
+    let mut granted: BTreeSet<String> = BTreeSet::new();
+    for index in 0..MAX_PERMISSION_SOURCES_PER_RESOURCE {
+        let source = format!("arn:aws:ssm-sap:{REGION}:{ACCOUNT}:database/perm-src-{index}/HDB");
+        let case = format!("source {} of {MAX_PERMISSION_SOURCES_PER_RESOURCE}", index + 1);
+        let reply = put(&emulator, &target, action, &source).await;
         assert_eq!(
             reply.status, 200,
             "case {case:?}: expected HTTP 200 within the ceiling, got {reply:?}"
         );
+        granted.insert(source);
     }
+    let at_ceiling = policy(&get(&emulator, &target, Some(action)).await, "at the ceiling");
+    assert_policy_grants(&at_ceiling, &target, action, &granted, "at the ceiling");
 
-    let over = format!("us-test-{MAX_REGIONS}");
-    let case = format!("region {over} (one past {MAX_REGIONS})");
-    let reply = emulator
-        .send_in_region(&over, "/put-resource-permission", body.clone())
-        .await;
+    // One past the ceiling is refused, and the document is exactly what it was.
+    let over = format!("arn:aws:ssm-sap:{REGION}:{ACCOUNT}:database/perm-src-over/HDB");
+    let case = format!("one past {MAX_PERMISSION_SOURCES_PER_RESOURCE}");
+    let reply = put(&emulator, &target, action, &over).await;
     assert_eq!(
         reply.status, 400,
         "case {case:?}: expected HTTP 400 past the ceiling, got {reply:?}"
@@ -473,31 +808,39 @@ async fn the_region_partition_ceiling_is_enforced() {
         VALIDATION_EXCEPTION,
         "case {case:?}: expected {VALIDATION_EXCEPTION}, got {reply:?}"
     );
-    let read = emulator
-        .send_in_region(&over, "/get-resource-permission", json!({"ResourceArn": target}))
-        .await;
-    assert!(
-        read.member("Policy").is_none(),
-        "case {case:?}: a refused grant must persist nothing, got {read:?}"
+    let after = policy(&get(&emulator, &target, Some(action)).await, &case);
+    assert_eq!(
+        after, at_ceiling,
+        "case {case:?}: a refused grant persists nothing, got {after:?}"
     );
 
-    // Every Region within the ceiling still holds its grant.
-    let expected: BTreeSet<String> = BTreeSet::from([source.clone()]);
-    for index in 0..MAX_REGIONS {
-        let region = format!("us-test-{index}");
-        let case = format!("region {region} after the refusal");
-        let reply = emulator
-            .send_in_region(&region, "/get-resource-permission", json!({"ResourceArn": target}))
-            .await;
-        assert_policy_grants(&policy(&reply, &case), &target, action, &expected, &case);
-    }
+    // A source already held is still accepted at the ceiling: it adds nothing.
+    let repeat = granted
+        .iter()
+        .next()
+        .expect("the ceiling held at least one source")
+        .clone();
+    let reply = put(&emulator, &target, action, &repeat).await;
+    assert_eq!(
+        policy(&reply, "repeat at the ceiling"),
+        at_ceiling,
+        "case \"repeat at the ceiling\": re-granting a held source must change nothing"
+    );
 }
 
+/// RULE: a request outside what the model declares is refused with the modelled
+/// `ValidationException` (HTTP 400) before anything is resolved or stored.
 #[tokio::test]
 async fn a_request_outside_the_modelled_constraints_is_refused() {
     let emulator = Emulator::new();
     let action = PERMISSION_ACTION_TYPE_VALUES[0];
-    let good = format!("arn:aws:ssm-sap:us-east-1:{ACCOUNT}:database/HDB-REFUSE/HDB");
+    register(
+        &emulator,
+        "a registration to grant on",
+        registration("perm-refuse", &[], Some(&["HDB"])),
+    )
+    .await;
+    let good = database_arn(REGION, "perm-refuse", "HDB");
 
     // Each row is one way the request falls outside what the model declares: an ARN
     // that is not an ARN on either member, an omitted `@required` member, and an

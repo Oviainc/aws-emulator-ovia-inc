@@ -1314,18 +1314,14 @@ fn s3_location(value: &Value) -> Option<Value> {
 /// an optional `?versionId=`), or an object stating `Bucket`, `Key` and `Version`.
 ///
 /// `None` for anything else — a local path, which is what `sam package` replaces with an S3
-/// URI before the template is deployed, is not a location this expansion can state.
+/// URI before the template is deployed, is not a location this expansion can state. The URI
+/// spelling is read by the crate's one reader of it
+/// ([`super::template::s3_uri_parts`]).
 fn s3_parts(value: &Value) -> Option<(Value, Value, Option<Value>)> {
     match value {
         Value::String(uri) => {
-            let rest = uri.strip_prefix("s3://")?;
-            let (bucket, key) = rest.split_once('/')?;
-            let (key, version) = match key.split_once("?versionId=") {
-                Some((key, version)) => (key, Some(json!(version))),
-                None => (key, None),
-            };
-            (!bucket.is_empty() && !key.is_empty())
-                .then(|| (json!(bucket), json!(key), version))
+            let (bucket, key, version) = super::template::s3_uri_parts(uri)?;
+            Some((json!(bucket), json!(key), version.map(|version| json!(version))))
         }
         Value::Object(members) => Some((
             members.get("Bucket")?.clone(),

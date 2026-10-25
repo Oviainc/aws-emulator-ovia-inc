@@ -646,13 +646,23 @@ async fn a_created_origin_endpoint_stores_every_supplied_setting_and_a_derived_u
                             "case {case:?}: a stored CMAF manifest must keep its id, \
                              got {child:?}"
                         );
+                        // A child manifest sent without a name of its own inherits the
+                        // ENDPOINT's effective manifestName, so the name it reports and the
+                        // name its url carries are both that one.
                         let child_url = child.get("url").and_then(Value::as_str).unwrap_or("");
                         let child_name = sent_child
                             .get("manifestName")
                             .and_then(Value::as_str)
-                            .unwrap_or("index");
+                            .unwrap_or(expected_manifest);
+                        assert_eq!(
+                            child.get("manifestName").and_then(Value::as_str),
+                            Some(child_name),
+                            "case {case:?}: CMAF manifest {child:?} must report manifestName \
+                             {child_name:?}"
+                        );
                         assert!(
-                            child_url.contains(child_name) && child_url.ends_with("/index.m3u8"),
+                            child_url.contains(&format!("/{child_name}/"))
+                                && child_url.ends_with("/index.m3u8"),
                             "case {case:?}: CMAF manifest {child:?} must carry a url naming \
                              {child_name:?}, got {child_url:?}"
                         );
@@ -664,13 +674,28 @@ async fn a_created_origin_endpoint_stores_every_supplied_setting_and_a_derived_u
                     // `origin_endpoint_defaults.rs`), so the stored block is a SUPERSET of
                     // the sent one. What this asserts is that nothing sent was dropped or
                     // rewritten.
+                    // A nested block (streamSelection) is compared the same way, member by
+                    // member, because the service completes it too.
                     for (member, value) in sent.as_object().expect("a packaging object") {
-                        assert_eq!(
-                            stored.get(member).unwrap_or(&Value::Null),
-                            value,
-                            "case {case:?}: {key}.{member} must be stored as sent, \
-                             got {stored:?}"
-                        );
+                        let stored_member = stored.get(member).unwrap_or(&Value::Null);
+                        match value.as_object() {
+                            Some(nested) => {
+                                for (inner, inner_value) in nested {
+                                    assert_eq!(
+                                        stored_member.get(inner).unwrap_or(&Value::Null),
+                                        inner_value,
+                                        "case {case:?}: {key}.{member}.{inner} must be stored \
+                                         as sent, got {stored_member:?}"
+                                    );
+                                }
+                            }
+                            None => assert_eq!(
+                                stored_member,
+                                value,
+                                "case {case:?}: {key}.{member} must be stored as sent, \
+                                 got {stored:?}"
+                            ),
+                        }
                     }
                 }
             }

@@ -366,6 +366,19 @@ impl ComAmazonawsCodeartifactCodeartifactcontrolplaneserviceState {
 /// one resource's tag set without limit.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// The sentence every tag-quota refusal of this service carries.
+///
+/// The bound is on the tag set a request would leave the resource HOLDING, and the
+/// service states the refusal that way — as a statement of the rule, naming the bound
+/// and nothing about the particular request. [`MAX_TAGS_PER_RESOURCE`] fills the one
+/// variable part.
+///
+/// One owner, so `TagResource` and every create site that carries a `tags` member word
+/// the refusal the same way rather than each inventing its own sentence.
+pub fn tag_quota_exceeded_message() -> String {
+    format!("The resultant tag set must not have more than {MAX_TAGS_PER_RESOURCE} user tags.")
+}
+
 /// The tag accessors, a second `impl` block beside the store's own so this whole surface
 /// reads in one place.
 impl ComAmazonawsCodeartifactCodeartifactcontrolplaneserviceState {

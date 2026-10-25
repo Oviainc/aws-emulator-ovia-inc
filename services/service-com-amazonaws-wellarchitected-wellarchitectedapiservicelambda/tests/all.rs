@@ -68,6 +68,9 @@ mod get_agent_goal;
 #[path = "all/get_agent_profile.rs"]
 mod get_agent_profile;
 
+#[path = "all/get_agent_recommendation.rs"]
+mod get_agent_recommendation;
+
 #[path = "all/get_answer_reads.rs"]
 mod get_answer_reads;
 

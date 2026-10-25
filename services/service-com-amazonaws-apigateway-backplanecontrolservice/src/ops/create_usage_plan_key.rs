@@ -255,9 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateUsagePlanKeyErrorModeled::LimitExceededException(
                 LimitExceededException {
                     retry_after_seconds: None,
-                    message: Some(crate::state::too_many_usage_plan_keys(
-                        crate::state::MAX_USAGE_PLAN_KEYS_PER_PLAN,
-                    )),
+                    message: Some(crate::state::too_many_usage_plan_keys()),
                 },
             )
             .into());

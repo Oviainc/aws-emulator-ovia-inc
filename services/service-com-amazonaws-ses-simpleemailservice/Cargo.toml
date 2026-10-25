@@ -26,6 +26,11 @@ tracing = { workspace = true }
 # rendering. Both are already in this crate's dependency closure.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `email_address`: the ONE reading of a caller-supplied email address and domain name,
+# shared with every other service whose model documents a member as one — the form this
+# service documents (`UserName@[SubDomain.]Domain.TopLevelDomain`) is read through it
+# rather than stated again here.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
