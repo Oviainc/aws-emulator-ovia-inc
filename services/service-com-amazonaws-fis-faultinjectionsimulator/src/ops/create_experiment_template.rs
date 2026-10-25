@@ -187,43 +187,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
         );
 
-        // Every modelled constraint on this input — the required members, the lengths
-        // and patterns on `clientToken`, `description` and `roleArn`, the 50-entry tag
-        // map — was already refused at the boundary. What the model cannot express is
-        // that `roleArn` names an IAM ROLE, what FIS documents for a stop condition's
-        // `source`/`value` pair, which values the two `experimentOptions` enums admit,
-        // and the parameters FIS's built-in actions take.
-        if let Some(refusal) =
-            crate::state::role_arn_refusal("roleArn", Some(record.role_arn.as_str()))
-        {
-            return Err(CreateExperimentTemplateErrorModeled::ValidationException(refusal).into());
-        }
-        if let Some(refusal) = crate::state::stop_conditions_refusal(&record.stop_conditions) {
-            return Err(CreateExperimentTemplateErrorModeled::ValidationException(refusal).into());
-        }
-        if let Some(refusal) =
-            crate::state::template_experiment_options_refusal(&record.experiment_options)
-        {
-            return Err(CreateExperimentTemplateErrorModeled::ValidationException(refusal).into());
-        }
-        // A log configuration says WHERE the experiment's logs are delivered, so one that
-        // names no destination is refused rather than stored.
-        if let Some(refusal) =
-            crate::state::log_configuration_refusal(record.log_configuration.as_ref())
-        {
-            return Err(CreateExperimentTemplateErrorModeled::ValidationException(refusal).into());
-        }
-        // A wait beyond the documented bound is refused HERE rather than persisted: a
-        // template this call accepts is one the service would run. The action count is
-        // capped for the same reason, and because it is what bounds the work the action
-        // graph of this template costs every later `StartExperiment`.
-        if let Some(refusal) = crate::state::actions_quota_refusal(&record.actions) {
-            return Err(
-                CreateExperimentTemplateErrorModeled::ServiceQuotaExceededException(refusal).into(),
-            );
-        }
-        if let Some(refusal) = crate::state::actions_refusal(&record.actions) {
-            return Err(CreateExperimentTemplateErrorModeled::ValidationException(refusal).into());
+        // The server-side rules of a template, applied to the record this request builds
+        // by the one sequence that states them — the SAME sequence
+        // `UpdateExperimentTemplate` judges its candidate by, so the two operations
+        // cannot drift apart about which templates are admissible. Everything the model
+        // CAN express (the required members, the lengths and patterns on `clientToken`,
+        // `description` and `roleArn`, the 50-entry tag map) was already refused at the
+        // boundary. All this handler decides is which of its own errors carries the
+        // refusal.
+        if let Some(refusal) = crate::state::template_refusal(&record) {
+            return Err(match refusal {
+                crate::state::TemplateRefusal::Invalid(refusal) => {
+                    CreateExperimentTemplateErrorModeled::ValidationException(refusal)
+                }
+                crate::state::TemplateRefusal::QuotaExceeded(refusal) => {
+                    CreateExperimentTemplateErrorModeled::ServiceQuotaExceededException(refusal)
+                }
+            }
+            .into());
         }
 
         let mut store = state.lock();
