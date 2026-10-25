@@ -21,8 +21,8 @@ use std::collections::BTreeMap;
 /// Every member list below is copied from this service's Smithy model; see the
 /// doc comment on each enum for the `smithy_query` call that produced it. Keeping
 /// them as Rust enums means a record in the store cannot hold a value the model
-/// does not declare, and `from_wire` is the single membership test a request
-/// filter is validated against.
+/// does not declare, and `from_wire` is the single membership test the request
+/// members the model types as enums are validated against.
 macro_rules! wire_enum {
     (
         $(#[$meta:meta])*
@@ -139,47 +139,14 @@ wire_enum! {
     }
 }
 
-/// The wire members of an enum, as the value set a refusal states them — used both
-/// by [`FilterName::value_members`] and by the handler's own refusals, so one
-/// mapping serves every value set this service names.
+/// The wire members of an enum, as the value set a refusal states them — the one
+/// mapping behind every value set this service names in a `ValidationException`.
+///
+/// Only the request members the model TYPES as enums are stated this way: a member
+/// whose target is a plain string closes no value set, so what a caller sends in it
+/// is compared against the stored records rather than checked against a list.
 pub fn member_strings<E: std::fmt::Display>(all: &[E]) -> Vec<String> {
     all.iter().map(std::string::ToString::to_string).collect()
-}
-
-impl FilterName {
-    /// Whether `value` is a member of the enum this filter key names.
-    ///
-    /// This is the rule the service applies to `ActionFilter$values`: the values
-    /// of a `FEATURE` filter are `Feature` members, of a `SEVERITY` filter
-    /// `Severity` members, and of a `TYPE` filter `ActionType` members.
-    pub fn accepts_value(self, value: &str) -> bool {
-        match self {
-            Self::Feature => Feature::from_wire(value).is_some(),
-            Self::Severity => Severity::from_wire(value).is_some(),
-            Self::Type => ActionType::from_wire(value).is_some(),
-        }
-    }
-
-    /// The name of the enum whose members this filter key accepts — for the
-    /// `ValidationException` message a rejected value produces.
-    pub const fn value_enum_name(self) -> &'static str {
-        match self {
-            Self::Feature => "Feature",
-            Self::Severity => "Severity",
-            Self::Type => "ActionType",
-        }
-    }
-
-    /// Every member of the enum this filter key's values are drawn from, in model
-    /// order — the value set a `ValidationException` states when a value falls
-    /// outside it.
-    pub fn value_members(self) -> Vec<String> {
-        match self {
-            Self::Feature => member_strings(Feature::ALL),
-            Self::Severity => member_strings(Severity::ALL),
-            Self::Type => member_strings(ActionType::ALL),
-        }
-    }
 }
 
 /// One recommended action held for an account: every member of the wire
