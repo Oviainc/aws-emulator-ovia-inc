@@ -223,12 +223,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // response you just received"
         // (`smithy_query(query="doc",shape="ListResourceTagsRequest",member="Marker")`),
         // so a marker resumes after the last tag the previous page returned. Anything
-        // else "is not valid" (`InvalidMarkerException`).
-        // "Set it to the value of NextMarker from the truncated response you just
-        // received" — a marker names the tag the previous page ended at, so a token
-        // whose tag key the key no longer carries (it was removed between pages)
-        // resumes nowhere and is reported as not valid rather than silently resuming
-        // at whichever tag now sits in that position.
+        // else "is not valid" (`InvalidMarkerException`). A token whose tag key the key
+        // no longer carries (it was removed between pages) resumes nowhere and is
+        // reported as not valid rather than silently resuming at whichever tag now sits
+        // in that position.
         let start = match input.marker.as_deref() {
             None => 0,
             Some(marker) => {

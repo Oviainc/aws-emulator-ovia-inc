@@ -95,17 +95,22 @@ async fn call(router: &MultiServiceRouter, uri: &str, body: Value) -> Answer {
     Answer { status, body }
 }
 
-/// A full alternate contact body for `account_id` / `contact_type`, valid under
-/// `PutAlternateContact`'s required members.
-fn contact_body(account_id: &str, contact_type: &str) -> Value {
-    json!({
-        "AccountId": account_id,
+/// A full alternate contact body for `owner` / `contact_type`, valid under
+/// `PutAlternateContact`'s required members. `None` is the caller's own account,
+/// which a request reaches by OMITTING `AccountId`.
+fn contact_body(owner: Option<&str>, contact_type: &str) -> Value {
+    let label = owner.unwrap_or("the standalone account");
+    let mut body = json!({
         "AlternateContactType": contact_type,
-        "Name": format!("{contact_type} on {account_id}"),
+        "Name": format!("{contact_type} on {label}"),
         "Title": format!("{contact_type} Lead"),
         "EmailAddress": "grace@example.com",
         "PhoneNumber": "+1 206-555-0199",
-    })
+    });
+    if let Some(account_id) = owner {
+        body["AccountId"] = json!(account_id);
+    }
+    body
 }
 
 /// Account ids inside `AccountId`'s `^\d{12}$` that no request ever writes:
@@ -136,24 +141,32 @@ fn unknown_account_ids() -> Vec<String> {
 /// is stored on an account OTHER than the ones under test.
 const POPULATED_MEMBER: &str = "876543210987";
 
+/// The accounts this suite populates: the caller's own (named by omitting
+/// `AccountId`) and one member account.
+const POPULATED_ACCOUNTS: [Option<&str>; 2] = [None, Some(POPULATED_MEMBER)];
+
 /// Store every contact type on the caller's own account and on one known member
 /// account, so the sub-resource the refused calls name exists elsewhere.
 async fn populate_contacts_elsewhere(router: &MultiServiceRouter) {
-    for account_id in [default_account_id(), POPULATED_MEMBER] {
+    for owner in POPULATED_ACCOUNTS {
         for contact_type in ALTERNATE_CONTACT_TYPES {
-            let put = call(
-                router,
-                "/putAlternateContact",
-                contact_body(account_id, contact_type),
-            )
-            .await;
+            let put = call(router, "/putAlternateContact", contact_body(owner, contact_type)).await;
             assert_eq!(
                 put.status, 200,
-                "case {contact_type:?} on {account_id:?}: the setup put must answer 200, got {} with {:?}",
+                "case {contact_type:?} on {owner:?}: the setup put must answer 200, got {} with {:?}",
                 put.status, put.body
             );
         }
     }
+}
+
+/// A request naming `owner`'s alternate contact of `contact_type`.
+fn contact_request(owner: Option<&str>, contact_type: &str) -> Value {
+    let mut request = json!({"AlternateContactType": contact_type});
+    if let Some(account_id) = owner {
+        request["AccountId"] = json!(account_id);
+    }
+    request
 }
 
 /// Deleting a contact on an account with no record is the 403 authorization
@@ -220,13 +233,13 @@ async fn a_refused_delete_leaves_every_other_account_untouched() {
 
     // Nothing the refusals touched: every stored contact still reads back, and
     // the unknown accounts are still unknown.
-    for owner in [default_account_id(), POPULATED_MEMBER] {
+    for owner in POPULATED_ACCOUNTS {
         for contact_type in ALTERNATE_CONTACT_TYPES {
-            let case = format!("{contact_type} on {owner} after the refusals");
+            let case = format!("{contact_type} on {owner:?} after the refusals");
             let read = call(
                 &router,
                 "/getAlternateContact",
-                json!({"AccountId": owner, "AlternateContactType": contact_type}),
+                contact_request(owner, contact_type),
             )
             .await;
             assert_eq!(
@@ -267,11 +280,11 @@ async fn delete_on_a_known_account_reaches_the_contact_lookup() {
     let router = emulator();
     populate_contacts_elsewhere(&router).await;
 
-    for owner in [default_account_id(), POPULATED_MEMBER] {
+    for owner in POPULATED_ACCOUNTS {
         for contact_type in ALTERNATE_CONTACT_TYPES {
-            let request = json!({"AccountId": owner, "AlternateContactType": contact_type});
+            let request = contact_request(owner, contact_type);
 
-            let case = format!("first delete of {contact_type} on {owner}");
+            let case = format!("first delete of {contact_type} on {owner:?}");
             let deleted = call(&router, "/deleteAlternateContact", request.clone()).await;
             assert_eq!(
                 deleted.status, 200,
@@ -279,7 +292,7 @@ async fn delete_on_a_known_account_reaches_the_contact_lookup() {
                 deleted.status, deleted.body
             );
 
-            let case = format!("second delete of {contact_type} on {owner}");
+            let case = format!("second delete of {contact_type} on {owner:?}");
             let again = call(&router, "/deleteAlternateContact", request.clone()).await;
             assert_eq!(
                 again.status, 404,
@@ -299,7 +312,7 @@ async fn delete_on_a_known_account_reaches_the_contact_lookup() {
                 again.message()
             );
 
-            let case = format!("read back {contact_type} on {owner} after the delete");
+            let case = format!("read back {contact_type} on {owner:?} after the delete");
             let read = call(&router, "/getAlternateContact", request).await;
             assert_eq!(
                 read.status, 404,

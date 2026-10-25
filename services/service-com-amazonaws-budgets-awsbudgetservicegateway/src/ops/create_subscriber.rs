@@ -185,7 +185,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(message));
         }
 
-        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = crate::state::store_at(&state, now);
         // A subscriber is held inside the notification, which is held inside the budget,
         // so the budget is resolved by the same `(AccountId, BudgetName)` identity every
         // other operation uses: "you must create the associated budget and notification

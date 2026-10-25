@@ -520,9 +520,10 @@ async fn account_name_round_trips_and_the_created_date_is_stable() {
     );
 }
 
-/// The resolved account id is what keys every record: naming the caller's own
-/// account explicitly is the same record as naming none, and another account id
-/// is a record of its own.
+/// The resolved account id is what keys every record: a request that names no
+/// `AccountId` lands on the caller's own record, another account id is a record
+/// of its own, and naming the caller's OWN id is refused instead of resolved —
+/// the member names a member account of the organization.
 #[tokio::test]
 async fn the_resolved_account_id_keys_the_record() {
     let own = default_account_id().to_string();
@@ -549,20 +550,40 @@ async fn the_resolved_account_id_keys_the_record() {
         unknown.body
     );
 
-    // Writing with the own id named explicitly, reading with it absent: one record.
-    put_account_name(&router, json!({"AccountName": "Named By Id", "AccountId": own})).await;
-    for (case, request) in [
-        ("AccountId absent", json!({})),
-        ("AccountId named explicitly", json!({"AccountId": own})),
+    // Naming the caller's own id is refused on either operation: the caller's
+    // own record is reached by the standalone call, with no `AccountId` at all.
+    for (case, uri, request) in [
+        (
+            "PutAccountName naming the caller's own id",
+            "/putAccountName",
+            json!({"AccountName": "Named By Id", "AccountId": own}),
+        ),
+        (
+            "GetAccountInformation naming the caller's own id",
+            "/getAccountInformation",
+            json!({"AccountId": own}),
+        ),
     ] {
-        let answer = get_account_information(&router, request).await;
+        let answer = call(&router, uri, request).await;
         assert_eq!(
-            answer.member("AccountName"),
-            "Named By Id",
-            "case {case:?}: both forms must land on the caller's own record, got {:?}",
+            (answer.status, answer.error_code()),
+            (403, "AccessDeniedException"),
+            "case {case:?}: expected the 403 refusal, got {} with {:?}",
+            answer.status,
             answer.body
         );
     }
+
+    // The standalone call writes and reads that same record.
+    put_account_name(&router, json!({"AccountName": "Named By Id"})).await;
+    let answer = get_account_information(&router, json!({})).await;
+    assert_eq!(
+        answer.member("AccountName"),
+        "Named By Id",
+        "case \"AccountId absent\": the standalone call must land on the caller's own \
+         record, got {:?}",
+        answer.body
+    );
 
     // A second account is its own record: its name and contacts are separate.
     put_account_name(&router, json!({"AccountName": "Member Account", "AccountId": other})).await;
@@ -666,22 +687,26 @@ async fn a_write_that_would_add_an_account_past_the_bound_is_refused() {
         unknown.status, unknown.body
     );
 
-    // Accounts already in the store are unaffected by the bound.
+    // Accounts already in the store are unaffected by the bound. The caller's own
+    // account is reached by the standalone call (`AccountId` absent), a member
+    // account by naming it.
     for (case, account_id) in [
-        ("the caller's own account", default_account_id().to_string()),
-        ("an account stored earlier", format!("{:012}", 1)),
+        ("the caller's own account", None),
+        ("an account stored earlier", Some(format!("{:012}", 1))),
     ] {
-        let put = put_account_name(
-            &router,
-            json!({"AccountName": "Renamed", "AccountId": account_id}),
-        )
-        .await;
+        let mut request = json!({"AccountName": "Renamed"});
+        let mut read = json!({});
+        if let Some(account_id) = &account_id {
+            request["AccountId"] = json!(account_id);
+            read["AccountId"] = json!(account_id);
+        }
+        let put = put_account_name(&router, request).await;
         assert_eq!(
             put.status, 200,
             "case {case:?}: a stored account must stay writable, got {} with {:?}",
             put.status, put.body
         );
-        let answer = get_account_information(&router, json!({"AccountId": account_id})).await;
+        let answer = get_account_information(&router, read).await;
         assert_eq!(
             answer.member("AccountName"),
             "Renamed",

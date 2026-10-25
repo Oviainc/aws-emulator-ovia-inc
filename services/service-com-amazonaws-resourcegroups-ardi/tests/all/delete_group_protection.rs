@@ -55,6 +55,13 @@ struct ProtectionCase {
     /// create that sends none at all.
     configuration: Value,
     protects: bool,
+    /// Whether this configuration lets `GroupResources` record a static
+    /// membership on the group — true exactly for a configuration that declares
+    /// one of the three types `GroupResources` documents
+    /// (`smithy_query(query="doc",shape="GroupResources")`). A row that cannot
+    /// hold resources is exercised empty only: the protection it declares is
+    /// about a group that still contains some.
+    static_members: bool,
 }
 
 /// The configurations a group can carry, spanning the ways the protecting
@@ -71,12 +78,16 @@ struct ProtectionCase {
 fn protection_cases() -> Vec<ProtectionCase> {
     vec![
         ProtectionCase {
-            label: "the protecting value on the generic item",
-            configuration: json!([{
-                "Type": "AWS::ResourceGroups::Generic",
-                "Parameters": [{ "Name": "deletion-protection", "Values": ["UNLESS_EMPTY"] }]
-            }]),
+            label: "the protecting value on the generic item, beside a host-management item",
+            configuration: json!([
+                { "Type": "AWS::EC2::HostManagement" },
+                {
+                    "Type": "AWS::ResourceGroups::Generic",
+                    "Parameters": [{ "Name": "deletion-protection", "Values": ["UNLESS_EMPTY"] }]
+                }
+            ]),
             protects: true,
+            static_members: true,
         },
         ProtectionCase {
             // The parameter is read wherever the configuration sets it, not only
@@ -87,6 +98,7 @@ fn protection_cases() -> Vec<ProtectionCase> {
                 "Parameters": [{ "Name": "deletion-protection", "Values": ["UNLESS_EMPTY"] }]
             }]),
             protects: true,
+            static_members: true,
         },
         ProtectionCase {
             label: "the protecting value on the second of two items, beside another parameter",
@@ -104,57 +116,77 @@ fn protection_cases() -> Vec<ProtectionCase> {
                 }
             ]),
             protects: true,
+            static_members: true,
         },
         ProtectionCase {
             label: "the parameter carrying several values, one of them the protecting one",
             configuration: json!([{
-                "Type": "AWS::ResourceGroups::Generic",
+                "Type": "AWS::EC2::CapacityReservationPool",
                 "Parameters": [
                     { "Name": "deletion-protection", "Values": ["DISABLED", "UNLESS_EMPTY"] }
                 ]
             }]),
             protects: true,
+            static_members: true,
         },
         ProtectionCase {
             label: "the parameter explicitly disabled",
             configuration: json!([{
-                "Type": "AWS::ResourceGroups::Generic",
+                "Type": "AWS::ResourceGroups::ApplicationGroup",
                 "Parameters": [{ "Name": "deletion-protection", "Values": ["DISABLED"] }]
             }]),
             protects: false,
+            static_members: true,
         },
         ProtectionCase {
             label: "a value the parameter does not define, which protects nothing",
             configuration: json!([{
-                "Type": "AWS::ResourceGroups::Generic",
+                "Type": "AWS::ResourceGroups::ApplicationGroup",
                 "Parameters": [{ "Name": "deletion-protection", "Values": ["unless_empty"] }]
             }]),
             protects: false,
+            static_members: true,
         },
         ProtectionCase {
             label: "the parameter absent, another parameter set",
             configuration: json!([{
-                "Type": "AWS::ResourceGroups::Generic",
+                "Type": "AWS::EC2::HostManagement",
                 "Parameters": [
                     { "Name": "allowed-resource-types", "Values": ["AWS::EC2::Instance"] }
                 ]
             }]),
             protects: false,
+            static_members: true,
+        },
+        ProtectionCase {
+            // Protection set by a configuration that holds no resources of its
+            // own: a group outside the catalog `GroupResources` serves cannot
+            // hold a static membership, so it is always deletable.
+            label: "the protecting value on a configuration that holds no static members",
+            configuration: json!([{
+                "Type": "AWS::ResourceGroups::Generic",
+                "Parameters": [{ "Name": "deletion-protection", "Values": ["UNLESS_EMPTY"] }]
+            }]),
+            protects: true,
+            static_members: false,
         },
         ProtectionCase {
             label: "a configuration item carrying no parameters at all",
             configuration: json!([{ "Type": "AWS::ResourceGroups::Generic" }]),
             protects: false,
+            static_members: false,
         },
         ProtectionCase {
             label: "an empty configuration list, which configures nothing",
             configuration: json!([]),
             protects: false,
+            static_members: false,
         },
         ProtectionCase {
             label: "no configuration member at all",
             configuration: Value::Null,
             protects: false,
+            static_members: false,
         },
     ]
 }
@@ -206,6 +238,12 @@ fn listed_member_arns(case: &str, listed: &Value) -> Vec<String> {
 async fn deletion_protection_refuses_a_delete_only_while_the_group_holds_resources() {
     for configuration in protection_cases() {
         for members in [0usize, 1, MEMBERS.len()] {
+            // A group whose configuration is outside the catalog
+            // `GroupResources` serves cannot hold a static membership at all, so
+            // only its empty row exists.
+            if members > 0 && !configuration.static_members {
+                continue;
+            }
             let case = format!("{} with {members} member(s)", configuration.label);
             let name = "protection-probe";
             let emulator = Emulator::new();
@@ -296,10 +334,13 @@ async fn deletion_protection_refuses_a_delete_only_while_the_group_holds_resourc
 /// store still deletes.
 #[tokio::test]
 async fn protection_follows_the_group_and_not_the_identifier_form() {
-    let protecting = json!([{
-        "Type": "AWS::ResourceGroups::Generic",
-        "Parameters": [{ "Name": "deletion-protection", "Values": ["UNLESS_EMPTY"] }]
-    }]);
+    let protecting = json!([
+        { "Type": "AWS::EC2::HostManagement" },
+        {
+            "Type": "AWS::ResourceGroups::Generic",
+            "Parameters": [{ "Name": "deletion-protection", "Values": ["UNLESS_EMPTY"] }]
+        }
+    ]);
     let emulator = Emulator::new();
     emulator
         .ok(
@@ -314,7 +355,15 @@ async fn protection_follows_the_group_and_not_the_identifier_form() {
         )
         .await;
     // An unprotected group holding the same resource, in the same store.
-    emulator.ok("/groups", &json!({ "Name": "open" })).await;
+    emulator
+        .ok(
+            "/groups",
+            &json!({
+                "Name": "open",
+                "Configuration": [{ "Type": "AWS::EC2::HostManagement" }]
+            }),
+        )
+        .await;
     emulator
         .ok(
             "/group-resources",
