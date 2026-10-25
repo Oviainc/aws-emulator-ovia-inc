@@ -303,6 +303,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 client_token: input.client_token.clone().filter(|t| !t.is_empty()),
                 created_at: now,
                 updated_at: now,
+                // A new interface is live: only DeleteRouterNetworkInterface owes its
+                // removal.
+                removal_due_at: None,
             },
         );
 
