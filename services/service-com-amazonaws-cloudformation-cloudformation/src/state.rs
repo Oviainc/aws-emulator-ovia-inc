@@ -144,6 +144,11 @@ pub mod template;
 /// before anything reads the template.
 pub mod sam;
 
+/// The `AWS::Include` transform: the Amazon S3 snippet an `Fn::Transform` names, read and
+/// spliced into the template by the operation that submits it, before anything is
+/// provisioned.
+pub mod include;
+
 /// Computing a change set: comparing the stack's template and parameters with the ones a
 /// change set submits, and the resource-level change list that comparison answers.
 pub mod change_plan;
@@ -805,6 +810,15 @@ pub struct StoredStack {
     /// `CREATE` change set creates its stack "with a unique stack ID, but no template or
     /// resources", and the template becomes the stack's when the change set is executed.
     pub template_body: Option<String>,
+    /// The template as CloudFormation PROCESSED it, where processing needed something only
+    /// the stack operation could read: the `AWS::Include` snippets its `Fn::Transform`s
+    /// name, spliced in ([`include::process`]). `None` when the submitted body needed no
+    /// such processing, which is every template that names no such transform.
+    ///
+    /// This is the body the stack DEPLOYS from ([`Self::template_scope`]): a snippet is
+    /// read once, by the operation that submits the template, and every later read of the
+    /// stack sees the processed template rather than reaching into Amazon S3 again.
+    pub processed_template_body: Option<String>,
     /// The template's own `Description`, parsed once when the body is stored rather than
     /// on every read: this is where CloudFormation takes both `Stack$Description` and
     /// `StackSummary$TemplateDescription` from, and a read must not re-parse a
@@ -893,6 +907,7 @@ impl StoredStack {
             region: DEFAULT_REGION.to_string(),
             template_description: template_body.as_deref().and_then(template::description),
             template_body,
+            processed_template_body: None,
             change_set_id: None,
             parameters: Vec::new(),
             capabilities: Vec::new(),
@@ -930,6 +945,28 @@ impl StoredStack {
     pub fn set_template_body(&mut self, template_body: String) {
         self.template_description = template::description(&template_body);
         self.template_body = Some(template_body);
+        // The processed body belonged to the body that was there: a new one has not been
+        // processed yet, and the operation that submitted it is what records its
+        // processing ([`Self::set_processed_template_body`]).
+        self.processed_template_body = None;
+    }
+
+    /// Record the template as CloudFormation processed it, which is the one this stack
+    /// deploys from. Called by the operation that submitted the body, once the snippets its
+    /// transforms name have been read ([`include::process`]).
+    pub fn set_processed_template_body(&mut self, processed: String) {
+        self.processed_template_body = Some(processed);
+    }
+
+    /// Record that this deployment deploys NOTHING: its template could not be processed, so
+    /// no resource was computed from it and none is asked of any owning service.
+    ///
+    /// The stack is left owning no resources and no outputs rather than the ones an
+    /// unprocessed template would have declared — "CloudFormation processes the template
+    /// fragments" first, so a template whose processing failed never reached the stage that
+    /// provisions anything.
+    pub fn deploy_nothing(&mut self) {
+        self.pending_deployment = Some(PendingDeployment::default());
     }
 
     /// Materialise what the stored template declares: one record per declared resource,
@@ -1098,7 +1135,13 @@ impl StoredStack {
     /// `None` for a stack with no template, or one this service cannot read: there is
     /// nothing to evaluate then.
     fn template_scope(&self) -> Option<(template::Template, BTreeMap<String, String>)> {
-        let declared = self.template_body.as_deref().and_then(template::parse)?;
+        // The PROCESSED template where there is one: that is the template CloudFormation
+        // deploys, and the one whose resources and outputs the stack reports.
+        let body = self
+            .processed_template_body
+            .as_deref()
+            .or(self.template_body.as_deref())?;
+        let declared = template::parse(body)?;
         let mut parameters = declared.parameter_defaults();
         for parameter in &self.parameters {
             parameters.insert(parameter.key.clone(), parameter.value.clone());

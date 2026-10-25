@@ -47,7 +47,9 @@
 //! one. What is left unevaluated is an expression whose INPUT this emulator does not
 //! hold — a `Ref` to a name the template never declares, a `Fn::ImportValue` (nothing
 //! here resolves an import against the exports `ListExports` reports), a
-//! `Fn::Transform` macro, or a
+//! `Fn::Transform` naming a macro this emulator runs nothing for (the `AWS::Include`
+//! snippets it DOES read are spliced in before this module sees the template —
+//! [`super::include`]), or a
 //! `Fn::GetAtt` for an attribute that is neither published for the type, declared as a
 //! property of the resource, nor one of the conventional names — never a function whose
 //! value follows from the template and the stack.
@@ -720,6 +722,25 @@ pub fn description(body: &str) -> Option<String> {
     parse(body).and_then(|template| template.description)
 }
 
+/// The scheme an Amazon S3 URI carries (`s3://bucket/key`).
+pub(crate) const S3_URI_SCHEME: &str = "s3://";
+
+/// The bucket, key and object version an Amazon S3 URI names: `s3://bucket/key`, with the
+/// optional `?versionId=` a versioned object is addressed by.
+///
+/// `None` for text that is not one — a local path, or a URL of any other scheme. The ONE
+/// reading of that spelling in this crate, so the places a template may carry such a URI (a
+/// SAM resource's code or definition location, an `AWS::Include` snippet's `Location`)
+/// cannot drift apart about what one is.
+pub(crate) fn s3_uri_parts(uri: &str) -> Option<(&str, &str, Option<&str>)> {
+    let (bucket, key) = uri.strip_prefix(S3_URI_SCHEME)?.split_once('/')?;
+    let (key, version) = match key.split_once("?versionId=") {
+        Some((key, version)) => (key, Some(version)),
+        None => (key, None),
+    };
+    (!bucket.is_empty() && !key.is_empty()).then_some((bucket, key, version))
+}
+
 /// The template body as one JSON value: `serde_json` for a JSON body, the YAML reader
 /// otherwise.
 ///
@@ -731,7 +752,7 @@ pub fn description(body: &str) -> Option<String> {
 /// tree costs several times the bytes it was read from (the sections below are cloned out
 /// of it), and `serde_json`'s own limit bounds nesting depth rather than size, so a large
 /// FLAT body would otherwise be read and copied unbounded.
-fn document(body: &str) -> Option<Value> {
+pub(crate) fn document(body: &str) -> Option<Value> {
     if body.len() > super::TEMPLATE_BODY_MAX_BYTES {
         return None;
     }
