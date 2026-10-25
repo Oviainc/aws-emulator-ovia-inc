@@ -63,6 +63,8 @@ mod response_members;
 mod rule_group_lifecycle;
 #[path = "all/sampled_requests.rs"]
 mod sampled_requests;
+#[path = "all/settlement_records.rs"]
+mod settlement_records;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/top_path_statistics.rs"]
