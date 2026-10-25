@@ -23,7 +23,10 @@
 //! add past it.
 //!
 //! The source types come from `CreateEventSubscriptionMessage$SourceType`'s published
-//! value list, and the rows include types the issue cited none of.
+//! value list, and the rows include types the issue cited none of: one table walks the
+//! WHOLE published list, asserting that an identifier naming no stored resource of the
+//! subscription's type is refused for every type this service resolves against, and that
+//! a DB proxy — a type the issue cited none of — round-trips through the store.
 
 use service_com_amazonaws_rds_amazonrdsv19::state::{
     EVENT_SUBSCRIPTION_SOURCE_TYPES, MAX_SOURCE_IDS_PER_SUBSCRIPTION,
@@ -525,6 +528,161 @@ async fn a_source_type_a_subscription_may_not_name_never_reaches_the_resolution(
         add_source(&router, "emu-add-sub-shard-group", "emu-src-shard-group-a").await,
         404,
         "SubscriptionNotFound",
+    );
+}
+
+/// One row of the published-source-type catalog: the type a subscription may name, and
+/// whether this service holds records a source identifier of that type is resolved
+/// against.
+struct CatalogCase {
+    source_type: &'static str,
+    /// True when an identifier of this type is resolved against stored resources, so one
+    /// that names none is refused; false for a type this service holds no records of, for
+    /// which there is nothing to resolve against.
+    resolved: bool,
+}
+
+/// Every value `CreateEventSubscriptionMessage$SourceType` publishes, in the order
+/// `EVENT_SUBSCRIPTION_SOURCE_TYPES` carries them — including the four the issue cited
+/// none of (`db-cluster-snapshot`, `db-proxy`, `zero-etl`, `blue-green-deployment`).
+const CATALOG_CASES: &[CatalogCase] = &[
+    CatalogCase {
+        source_type: "db-instance",
+        resolved: true,
+    },
+    CatalogCase {
+        source_type: "db-cluster",
+        resolved: true,
+    },
+    CatalogCase {
+        source_type: "db-parameter-group",
+        resolved: true,
+    },
+    CatalogCase {
+        source_type: "db-security-group",
+        resolved: false,
+    },
+    CatalogCase {
+        source_type: "db-snapshot",
+        resolved: true,
+    },
+    CatalogCase {
+        source_type: "db-cluster-snapshot",
+        resolved: true,
+    },
+    CatalogCase {
+        source_type: "db-proxy",
+        resolved: true,
+    },
+    CatalogCase {
+        source_type: "zero-etl",
+        resolved: true,
+    },
+    CatalogCase {
+        source_type: "custom-engine-version",
+        resolved: false,
+    },
+    CatalogCase {
+        source_type: "blue-green-deployment",
+        resolved: true,
+    },
+];
+
+#[tokio::test]
+async fn an_absent_identifier_is_refused_for_every_source_type_that_resolves_one() {
+    let router = emulator();
+
+    // The table spans the WHOLE published catalog, so a value added to it cannot quietly
+    // go untested.
+    let covered: Vec<&str> = CATALOG_CASES.iter().map(|row| row.source_type).collect();
+    assert_eq!(
+        covered,
+        EVENT_SUBSCRIPTION_SOURCE_TYPES.to_vec(),
+        "case the published catalog: expected one row per published source type \
+         ({EVENT_SUBSCRIPTION_SOURCE_TYPES:?}), got {covered:?}"
+    );
+
+    for (index, row) in CATALOG_CASES.iter().enumerate() {
+        let name = format!("emu-add-sub-catalog-{index}");
+        expect_ok(
+            row.source_type,
+            create_subscription(&router, REGION, &name, Some(row.source_type), &[]).await,
+        );
+        // An identifier of the subscription's own source type that names no stored
+        // resource of it.
+        let absent = format!("emu-absent-source-{index}");
+        let answer = add_source(&router, &name, &absent).await;
+        let expected: Vec<String> = if row.resolved {
+            expect_error(row.source_type, answer, 404, "SourceNotFound");
+            Vec::new()
+        } else {
+            let body = expect_ok(row.source_type, answer);
+            assert!(
+                texts(&body, "SourceId").contains(&absent),
+                "case {:?}: expected the added source {absent} in the answer, got {body}",
+                row.source_type
+            );
+            vec![absent.clone()]
+        };
+        let reported = described_source_ids(&router, row.source_type, &name).await;
+        assert_eq!(
+            reported, expected,
+            "case {:?}: expected the subscription's stored sources to be {expected:?}, \
+             got {reported:?}",
+            row.source_type
+        );
+    }
+}
+
+/// An IAM role ARN of the form `CreateDBProxy$RoleArn` takes.
+const PROXY_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/rds-proxy";
+
+/// A VPC subnet id of the form `CreateDBProxy$VpcSubnetIds` takes.
+const PROXY_SUBNET_ID: &str = "subnet-0a1b2c3d";
+
+#[tokio::test]
+async fn a_db_proxy_source_is_resolved_against_the_stored_proxies() {
+    let router = emulator();
+    let proxy = "emu-src-proxy-a";
+    expect_ok(
+        proxy,
+        call(
+            &router,
+            "CreateDBProxy",
+            &[
+                ("DBProxyName", proxy),
+                ("EngineFamily", "MYSQL"),
+                ("RoleArn", PROXY_ROLE_ARN),
+                ("VpcSubnetIds.member.1", PROXY_SUBNET_ID),
+                ("Auth.member.1.UserName", "appuser"),
+                ("Auth.member.1.AuthScheme", "SECRETS"),
+            ],
+        )
+        .await,
+    );
+
+    let name = "emu-add-sub-proxy";
+    expect_ok(
+        "a db-proxy subscription",
+        create_subscription(&router, REGION, name, Some("db-proxy"), &[]).await,
+    );
+    expect_error(
+        "a DB proxy nothing created",
+        add_source(&router, name, "emu-absent-proxy").await,
+        404,
+        "SourceNotFound",
+    );
+    let added = expect_ok("the stored DB proxy", add_source(&router, name, proxy).await);
+    assert_eq!(
+        texts(&added, "SourceId"),
+        vec![proxy.to_string()],
+        "expected the added proxy as the subscription's only source, got {added}"
+    );
+    let reported = described_source_ids(&router, "after the add", name).await;
+    assert_eq!(
+        reported,
+        vec![proxy.to_string()],
+        "expected the added proxy to be persisted, got {reported:?}"
     );
 }
 
