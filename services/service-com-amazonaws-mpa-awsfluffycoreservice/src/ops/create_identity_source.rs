@@ -31,6 +31,11 @@
 //!
 //! The cross-account ARN gate does not apply: this request names no resource ARN.
 //!
+//! `Tags` naming a key in the namespace AWS reserves for its own tags
+//! ([`crate::state::RESERVED_TAG_KEY_PREFIX`]) earns `ValidationException` (400), the
+//! same rule `create_approval_team.rs` and `tag_resource.rs` hold: such a key is AWS's,
+//! not the caller's, so no path that writes tags writes one.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -289,6 +294,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // A tag key in the namespace reserved for Amazon Web Services belongs to AWS,
+        // not to the caller, so no path that writes tags may write one: create is one of
+        // those paths, and refuses such a request with the `ValidationException` (400) it
+        // declares before any identity source is stored.
+        if let Some(tags) = input.tags.as_ref() {
+            if crate::state::names_reserved_tag_key(tags.keys().map(String::as_str)) {
+                return Err(CreateIdentitySourceErrorModeled::ValidationException(
+                    crate::state::reserved_tag_key(),
+                )
+                .into());
+            }
         }
 
         // The identity source is a regional resource of the caller's account, so its ARN

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/arn_validation_errors.rs"]
 mod arn_validation_errors;
+#[path = "all/child_listing_cursor_scope.rs"]
+mod child_listing_cursor_scope;
 #[path = "all/child_listing_error_set.rs"]
 mod child_listing_error_set;
 #[path = "all/missing_resource_lookups.rs"]
