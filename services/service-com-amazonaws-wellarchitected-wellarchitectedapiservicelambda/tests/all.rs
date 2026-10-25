@@ -42,6 +42,9 @@ mod answer_updates;
 #[path = "all/custom_lens_import.rs"]
 mod custom_lens_import;
 
+#[path = "all/custom_lens_review_answers.rs"]
+mod custom_lens_review_answers;
+
 #[path = "all/custom_lens_versions.rs"]
 mod custom_lens_versions;
 
