@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeFleetInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeFleetInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the RUNNING instances of the EC2 Fleet the request names, read out
+//! of [`crate::state`] — the fleet's launched instances as the instance store holds them —
+//! narrowed by the documented `instance-type` filter and paged by `MaxResults`/`NextToken`.
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeFleetInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A fleet id that is not a fleet id at all is refused with `InvalidFleetId.Malformed` and
+//! one this account holds no fleet for with `InvalidFleetId.NotFound`, in that order; a
+//! fleet of type `instant` is refused with `UnsupportedOperation`, because this operation
+//! "does not support fleets of type instant" (see the modelled contract below).
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +146,246 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeFleetInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeFleetInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            CompiledFilter, FLEET_TYPE_INSTANT, MAX_FILTERS, MAX_FILTER_MATCH_STEPS,
+            MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE, MatchBudget,
+            decode_page_token, encode_page_token, fleet_active_instances,
+            invalid_pagination_token_for, matches_every_filter, require_known_fleet,
+            require_service_state, require_well_formed_fleet_id, unsupported_operation,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it. The store is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The ID of the EC2 Fleet" (`DescribeFleetInstancesRequest$FleetId`): something
+        // that is not a fleet id at all is refused before any lookup, so a caller can tell
+        // "not a fleet id" from "no such fleet". The lookup below asks the same question
+        // again through [`require_known_fleet`], so neither path can skip it.
+        require_well_formed_fleet_id(&input.fleet_id)?;
+
+        // The model declares no `@range` on `MaxResults`
+        // (`smithy_query(query="operation",operation="DescribeFleetInstances")` targets a
+        // plain `Integer`), so the handler is the only place a page size can be bounded —
+        // and an unbounded one is how a caller asks for the whole fleet in one answer.
+        if let Some(max_results) = input.max_results {
+            if max_results < 1 {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{max_results}' for maxResults. It must be at least 1"
+                )));
+            }
+            if usize::try_from(max_results).unwrap_or(0) > MAX_PAGE_SIZE {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{max_results}' for maxResults. It must be at most \
+                     {MAX_PAGE_SIZE}"
+                )));
+            }
+        }
+
+        // Matching cost is filters x values x held values x the fleet's instances and the
+        // model bounds none of them, so the request-controlled factors are capped here,
+        // before any work proportional to them is done — and their PRODUCT is charged to one
+        // [`MatchBudget`] below, which is the bound the per-factor caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name this operation does not document is refused whether or not any
+        // instance would have matched it, so an unsupported filter can never read as "no
+        // results".
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let canonical = canonical_filter_name(name).ok_or_else(|| {
+                Scaffolded::invalid_parameter_value(format!("The filter '{name}' is invalid"))
+            })?;
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(canonical.to_string(), values.to_vec()));
+        }
+
+        // "The token returned from a previous paginated request"
+        // (`DescribeFleetInstancesRequest$NextToken`) — anything else is refused rather than
+        // read as an instance id.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                Some(decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?)
+            }
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // The clock first: an instance whose `pending` -> `running` or `shutting-down` ->
+        // `terminated` move has fallen due is already in that state, so which of the fleet's
+        // instances are RUNNING is asked of the states they are ACTUALLY in. Each move was
+        // owed at this instant whether or not anybody called, so this read changes nothing a
+        // later caller would otherwise have seen.
+        store.materialize_due_transitions();
+
+        // "The ID of the EC2 Fleet": an id that names no fleet of the account is an error,
+        // not an empty report.
+        let record = require_known_fleet(&store, &input.fleet_id)?;
+
+        // "Currently, DescribeFleetInstances does not support fleets of type instant.
+        // Instead, use DescribeFleets, specifying the instant fleet ID in the request"
+        // (`DescribeFleetInstances`) — so an `instant` fleet is refused with EC2's code for a
+        // request the service does not serve for the resource it named, rather than answered
+        // with an instance list this operation does not report for it.
+        if record.fleet_type() == FLEET_TYPE_INSTANT {
+            return Err(unsupported_operation(format!(
+                "DescribeFleetInstances does not support the fleet '{}', which is of type \
+                 '{FLEET_TYPE_INSTANT}'; describe it with DescribeFleets instead",
+                record.fleet_id()
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and the named fleet resolved:
+        // the flag asks whether the request WOULD have succeeded, so one that would have been
+        // refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // "The running instances" (`DescribeFleetInstancesResult$ActiveInstances`), projected
+        // from the instance store so the type reported here is the one `DescribeInstances`
+        // reports for the same instance.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeFleetInstances"))
+        // Every comparison is charged to ONE budget — one step per instance as well, so even
+        // an unfiltered report is counted — so the PRODUCT of the fleet's instances, filters,
+        // values, held values and value length is bounded however the caller combines them,
+        // which is also what bounds how long this holds the state lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<ActiveInstance> = Vec::new();
+        // Whether the walk stopped before it had looked at every instance. Checked together
+        // with the budget after the loop, so neither an early stop nor a comparison aborted
+        // on the last instance can be answered as a complete page.
+        let mut stopped_early = false;
+        for active in fleet_active_instances(&store, record) {
+            if budget.exhausted() {
+                stopped_early = true;
+                break;
+            }
+            // The AND/OR rule EC2 defines for every `Filters` member is evaluated by the one
+            // shared evaluator; only the per-operation lookup is local.
+            if matches_every_filter(&selectors, &mut budget, &|name| {
+                filter_values(&active, name)
+            }) {
+                selected.push(active);
+            }
+        }
+        // A walk that stopped early, or a budget spent while the last instance was being
+        // compared, answers an INCOMPLETE set, which is not something to report as a result:
+        // the request asked for more filtering than one call will do, and is told so rather
+        // than given a silently truncated page.
+        if stopped_early || budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them"
+            )));
+        }
+
+        // Page in `InstanceId` order, which the cursor below names a position in: an instance
+        // id is the one value every active instance carries, so it is what a token can name.
+        selected.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected
+                .partition_point(|active| active.instance_id.as_deref().unwrap_or_default() < cursor),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // A request that names no page size gets the largest page this service serves, so the
+        // `NextToken` path behaves the same whether or not a page size was asked for.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // A token only when an instance follows this page: "This value is null when there are
+        // no more items to return" (`DescribeFleetInstancesResult$NextToken`). The id is read
+        // the way the cursor comparison above reads it, so a token is issued whenever an
+        // instance follows, rather than the report being truncated without one.
+        let next_token = page
+            .get(limit)
+            .map(|active| encode_page_token(active.instance_id.as_deref().unwrap_or_default()));
+
+        Ok(DescribeFleetInstancesOutput {
+            active_instances: Some(page.iter().take(limit).cloned().collect()),
+            next_token,
+            // "The ID of the EC2 Fleet" (`DescribeFleetInstancesResult$FleetId`): the fleet
+            // the report is of, as the store holds it.
+            fleet_id: Some(record.fleet_id().to_string()),
+        })
+    }
+}
+
+/// The one filter name this operation documents, from
+/// `DescribeFleetInstancesRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeFleetInstancesRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// "The filters. `instance-type` - The instance type." — ONE name, which is therefore the
+/// only name [`filter_values`] answers with any value at all.
+const INSTANCE_TYPE_FILTER: &str = "instance-type";
+
+/// The name [`filter_values`] answers for the filter the request called `name`, or `None`
+/// when this operation documents no such filter.
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so the comparison is exact.
+fn canonical_filter_name(name: &str) -> Option<&str> {
+    (name == INSTANCE_TYPE_FILTER).then_some(name)
+}
+
+/// The values the EC2 filter `name` compares against this active instance.
+///
+/// `name` is a name [`canonical_filter_name`] resolved, and an instance that carries no
+/// value for it compares against NO values, so it selects nothing. This is the one
+/// per-operation half of the shared AND/OR evaluator
+/// ([`crate::state::matches_every_filter`]).
+fn filter_values<'a>(active: &'a ActiveInstance, name: &str) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    match name {
+        // "`instance-type` - The instance type."
+        INSTANCE_TYPE_FILTER => active
+            .instance_type
+            .as_deref()
+            .map(Cow::Borrowed)
+            .into_iter()
+            .collect(),
+        // An attribute an active instance does not have holds no value for a filter to
+        // match, so a filter naming one selects nothing.
+        _ => Vec::new(),
     }
 }
