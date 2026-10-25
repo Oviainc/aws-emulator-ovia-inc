@@ -130,7 +130,10 @@ fn id_of(created: &[(&'static str, String)], name: &str) -> String {
 }
 
 /// One `ListHostedZonesByVPC` request.
-async fn list_by_vpc(
+///
+/// `pub(crate)` so the suite asserting this operation's pagination-token refusal
+/// TEXT sends the same request this one does.
+pub(crate) async fn list_by_vpc(
     router: &MultiServiceRouter,
     vpc_id: &str,
     vpc_region: &str,

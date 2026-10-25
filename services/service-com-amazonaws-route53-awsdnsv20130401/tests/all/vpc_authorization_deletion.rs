@@ -42,7 +42,14 @@ use crate::vpc_associations::{
 
 /// Send one `DeleteVPCAssociationAuthorization` request carrying `vpc` (a
 /// [`vpc_block`]).
-async fn deauthorize(router: &MultiServiceRouter, zone_id: &str, vpc: &str) -> Reply {
+///
+/// `pub(crate)` so the suite asserting this operation's refusal TEXT drives it
+/// through the same request builder rather than growing a second copy of it.
+pub(crate) async fn deauthorize(
+    router: &MultiServiceRouter,
+    zone_id: &str,
+    vpc: &str,
+) -> Reply {
     let body = format!(
         "<DeleteVPCAssociationAuthorizationRequest \
          xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\">{vpc}\
@@ -59,7 +66,7 @@ async fn deauthorize(router: &MultiServiceRouter, zone_id: &str, vpc: &str) -> R
 
 /// Remove the authorization of `vpc_id` in `region` and assert the request was
 /// accepted with the empty response the operation models.
-async fn deauthorize_ok(
+pub(crate) async fn deauthorize_ok(
     router: &MultiServiceRouter,
     zone_id: &str,
     vpc_id: &str,
