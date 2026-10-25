@@ -43,8 +43,9 @@
 //!
 //! And it holds the Bedrock Marketplace model endpoints
 //! `ops/create_marketplace_model_endpoint.rs` mints,
-//! `ops/update_marketplace_model_endpoint.rs` reconfigures and
-//! `ops/get_marketplace_model_endpoint.rs` reads back, together with the instant each
+//! `ops/update_marketplace_model_endpoint.rs` reconfigures,
+//! `ops/get_marketplace_model_endpoint.rs` reads back and
+//! `ops/deregister_marketplace_model_endpoint.rs` drops, together with the instant each
 //! endpoint's non-terminal `endpointStatus` is owed its move to `InService`.
 //!
 //! And it holds the Provisioned Throughputs `ops/create_provisioned_model_throughput.rs`
@@ -1791,7 +1792,9 @@ pub struct EnforcedGuardrailConfiguration {
 ///   `CreateMarketplaceModelEndpoint` enforces (the entry is keyed by the endpoint ARN,
 ///   which carries the endpoint name, so two creates of one name in one region cannot add
 ///   two entries), `marketplace_endpoint_create_tokens` holds at most one entry per live
-///   endpoint for the same reason `create_tokens` does, and each endpoint's
+///   endpoint for the same reason `create_tokens` does — including across a
+///   deregistration, which drops the entries naming the endpoint it removed — and each
+///   endpoint's
 ///   [`MarketplaceModelEndpointRecord::last_update_token`] is ONE token rather than a map,
 ///   so repeated updates cannot grow the store either.
 ///
@@ -1911,9 +1914,16 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// How many prompt router ids this store has minted; the uniqueness half of a
     /// minted id.
     pub minted_prompt_routers: u64,
-    /// Every stored Bedrock Marketplace model endpoint, keyed by its `endpointArn` — the
-    /// one identifier `GetMarketplaceModelEndpoint`, `UpdateMarketplaceModelEndpoint` and
-    /// `DeleteMarketplaceModelEndpoint` address an endpoint by.
+    /// Every Bedrock Marketplace model endpoint this account has REGISTERED with Amazon
+    /// Bedrock, keyed by its `endpointArn` — the one identifier
+    /// `GetMarketplaceModelEndpoint`, `UpdateMarketplaceModelEndpoint`,
+    /// `DeregisterMarketplaceModelEndpoint` and `DeleteMarketplaceModelEndpoint` address an
+    /// endpoint by.
+    ///
+    /// Membership here IS the registration: an endpoint
+    /// `DeregisterMarketplaceModelEndpoint` removed is no longer one Amazon Bedrock knows,
+    /// whatever became of the SageMaker endpoint behind it, which this emulator holds no
+    /// state for.
     ///
     /// The ARN carries both the region and the endpoint name
     /// ([`marketplace_model_endpoint_arn`]), so this one map is also the per-region name
@@ -2336,6 +2346,24 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     ) -> Option<&mut MarketplaceModelEndpointRecord> {
         let endpoint = self.marketplace_model_endpoints.get_mut(arn)?;
         endpoint.settle(now);
+        Some(endpoint)
+    }
+
+    /// Drop the marketplace model endpoint an `endpointArn` names, handing back the record
+    /// that was removed (`None` when this store held none under that ARN).
+    ///
+    /// The create tokens that minted it go with it, the way
+    /// [`Self::remove_inference_profile`] drops the tokens that minted a profile: the token
+    /// map stays bounded by the LIVE endpoints rather than by every create this store has
+    /// ever admitted, and a token whose endpoint is gone cannot replay an endpoint back
+    /// into being.
+    pub fn remove_marketplace_model_endpoint(
+        &mut self,
+        arn: &str,
+    ) -> Option<MarketplaceModelEndpointRecord> {
+        let endpoint = self.marketplace_model_endpoints.remove(arn)?;
+        self.marketplace_endpoint_create_tokens
+            .retain(|_, minted| minted != arn);
         Some(endpoint)
     }
 
@@ -3209,8 +3237,9 @@ fn minted_uuid(ordinal: u64, now: SystemTime) -> String {
     )
 }
 
-/// What `UpdateMarketplaceModelEndpoint` answers as the `ResourceNotFoundException` message
-/// for a Bedrock Marketplace model endpoint ARN it holds no endpoint for.
+/// What `UpdateMarketplaceModelEndpoint` and `DeregisterMarketplaceModelEndpoint` answer
+/// as the `ResourceNotFoundException` message for a Bedrock Marketplace model endpoint ARN
+/// this account holds no endpoint for.
 ///
 /// RECORDED behaviour, not a modelled sentence (the model's own doc for the error reads
 /// "The specified resource Amazon Resource Name (ARN) was not found. …"): the corpus
@@ -3220,7 +3249,7 @@ fn minted_uuid(ordinal: u64, now: SystemTime) -> String {
 /// resource is not there and nothing about which ARN was asked for, so the message cannot
 /// be used to probe the store.
 ///
-/// Scoped to the operation the corpus records it for. The same corpus records
+/// Scoped to the operations the corpus records it for. The same corpus records
 /// `GetMarketplaceModelEndpoint` refusing the SAME ARN with 400 `ValidationException`
 /// instead, so the code and the sentence are per-operation; and this service's guardrail
 /// and prompt router handlers keep the sentences they already word, because no recording

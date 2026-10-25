@@ -381,6 +381,24 @@ pub const CONCURRENT_EXECUTIONS_LIMIT: i32 = 1_000;
 /// `AccountLimit$UnreservedConcurrentExecutions` below this floor is refused.
 pub const MIN_UNRESERVED_CONCURRENT_EXECUTIONS: i32 = 100;
 
+/// Lambda's sentence for a write that would leave the account's
+/// `AccountLimit$UnreservedConcurrentExecutions` below
+/// [`MIN_UNRESERVED_CONCURRENT_EXECUTIONS`].
+///
+/// A COMPLETE sentence: every word outside the brackets is fixed, the terminating period
+/// included, and the only value interpolated is the floor the account's limits hold — so
+/// nothing of the request appears in it. `specified` is how the sentence names the
+/// capacity the request asked to commit (the reservation a `PutFunctionConcurrency`
+/// requests, the concurrency a provisioning call allocates); every operation that
+/// enforces the floor states it through here so one wording answers for the one rule.
+#[must_use]
+pub fn unreserved_floor_message(specified: &str, floor: i32) -> String {
+    format!(
+        "Specified {specified} for function decreases account's UnreservedConcurrentExecution \
+         below its minimum value of [{floor}]."
+    )
+}
+
 /// The IAM policy language version a resource-based policy document carries.
 /// `2012-10-17` is the current version of the language every AWS policy document is
 /// written in.

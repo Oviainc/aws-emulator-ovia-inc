@@ -51,6 +51,10 @@ hex = { workspace = true }
 # Generates the real certificates and key pairs the import tests feed the service,
 # independently of the DER this crate reads.
 rcgen = "0.13"
+# The API Gateway V2 service, so one test can drive the cross-service flow a client
+# performs with an imported certificate: import it here, then build a regional custom
+# domain on the ARN this service answered. TEST-ONLY — nothing in `src/` reaches it.
+service-com-amazonaws-apigatewayv2-apigatewayv2 = { workspace = true }
 
 [lints]
 workspace = true

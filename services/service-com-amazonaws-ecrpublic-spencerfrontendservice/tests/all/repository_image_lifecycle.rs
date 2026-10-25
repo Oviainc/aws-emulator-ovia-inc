@@ -53,8 +53,9 @@ pub(crate) fn service() -> MultiServiceRouter {
 
 /// One `awsJson1_1` call, returning the HTTP status and the parsed response body.
 ///
-/// Signed for the one Region ECR Public serves its API from
-/// (`state::API_REGION`), which is what every case but the Region-gate suite wants.
+/// Signed for a Region this registry's whole surface — including the Region-scoped
+/// catalog write — is served from (`state::API_REGION`), which is what every case but the
+/// Region-gate suite wants.
 pub(crate) async fn call(
     router: &MultiServiceRouter,
     operation: &str,

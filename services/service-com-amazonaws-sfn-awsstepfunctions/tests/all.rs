@@ -39,6 +39,8 @@ mod execution_alias_routing;
 mod execution_interpreter;
 #[path = "all/execution_redrive.rs"]
 mod execution_redrive;
+#[path = "all/list_state_machine_aliases_pages.rs"]
+mod list_state_machine_aliases_pages;
 #[path = "all/map_run_updates.rs"]
 mod map_run_updates;
 #[path = "all/map_runs.rs"]

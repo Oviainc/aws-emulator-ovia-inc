@@ -12,6 +12,11 @@
 //!
 //! It lives in its own module, re-exported from [`crate::state`], so the seam is one
 //! file to read rather than a section at the end of the store.
+//!
+//! The DATA plane's half is [`publish_item_changes`]: an item write records what it
+//! changed on this service's store and the handler hands the queue to the streams
+//! registry at the end of the request, so the records a consumer reads are appended
+//! THERE too.
 
 use std::time::SystemTime;
 
@@ -155,6 +160,116 @@ pub fn register_table_stream<Eng: Send + Sync + 'static>(
         view_type: view_type.to_string(),
         enabled: true,
     })
+}
+
+/// Hand every item-level change the writes of this request made to the DynamoDB
+/// Streams store, in the order they were made.
+///
+/// This is the DATA plane's half of the publishing seam: a write landed an item in
+/// THIS service's store and queued what it changed
+/// ([`crate::state::PendingStreamRecord`]); the records themselves are the streams
+/// service's resources, so they are appended THERE, which is where every stream
+/// consumer reads them.
+///
+/// Which modification a record describes is derived from the images the write queued:
+/// an item that was not there before is an `INSERT`, one that was and still is a
+/// `MODIFY`, and one that is gone a `REMOVE` (the model's `OperationType`). The
+/// stream drops the images its own `StreamViewType` does not capture, so what a
+/// consumer sees is never more than the stream was created to capture.
+///
+/// Publication cannot fail the write that made the change — the item is already
+/// stored and the response is already decided, and DynamoDB publishes to a stream
+/// asynchronously — so a change the registry will not take is LOGGED rather than
+/// turned into an error for the caller.
+///
+/// LOCKING: like [`register_table_stream`], this takes the STREAMS store's lock while
+/// the caller holds this service's own, which is the one order the emulator uses. The
+/// work is bounded by the queue, and the queue by one request's writes.
+pub fn publish_item_changes<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    store: &mut crate::state::ComAmazonawsDynamodbDynamodb20120810State,
+    at: SystemTime,
+) {
+    use ::service_com_amazonaws_dynamodbstreams_dynamodbstreams_20120810 as streams;
+
+    let changes = store.take_stream_records();
+    if changes.is_empty() {
+        return;
+    }
+    let Some(registry) = streams::state::service_state(engine) else {
+        ::tracing::error!(
+            changes = changes.len(),
+            "the DynamoDB Streams store is unreachable, so item changes reached no stream"
+        );
+        return;
+    };
+    let mut registry = registry.lock();
+    for change in changes {
+        let event_name = match (&change.old_image, &change.new_image) {
+            (None, Some(_)) => streams::state::OperationType::Insert,
+            (Some(_), Some(_)) => streams::state::OperationType::Modify,
+            (Some(_), None) => streams::state::OperationType::Remove,
+            // A queued change with neither image describes no modification, so there
+            // is nothing to publish; no write path queues one.
+            (None, None) => continue,
+        };
+        let event = streams::state::RecordAppend {
+            event_name,
+            keys: streams_image(&change.keys),
+            new_image: change.new_image.as_ref().map(streams_image),
+            old_image: change.old_image.as_ref().map(streams_image),
+        };
+        if let Err(rejected) = registry.append_record(&change.stream_arn, &event, at) {
+            ::tracing::error!(
+                stream_arn = %change.stream_arn,
+                event_name = event_name.as_str(),
+                reason = ?rejected,
+                "an item change could not be appended to its stream"
+            );
+        }
+    }
+}
+
+/// One stored image, as the STREAMS service's own attribute map.
+///
+/// The two services model the same `AttributeValue` union, but each generates its own
+/// type from its own model, so an image crossing the seam is rebuilt member for member
+/// rather than transmuted. Recursion is bounded by the nesting limit every image is
+/// held to before it is stored ([`crate::state::check_attribute_value`]), and the
+/// registry checks the same limit again on append.
+fn streams_image(
+    image: &crate::state::Item,
+) -> ::service_com_amazonaws_dynamodbstreams_dynamodbstreams_20120810::state::AttributeMap {
+    image
+        .iter()
+        .map(|(name, value)| (name.clone(), streams_value(value)))
+        .collect()
+}
+
+/// One stored attribute value, as the STREAMS service's own `AttributeValue`.
+fn streams_value(
+    value: &crate::ops::types::AttributeValue,
+) -> ::service_com_amazonaws_dynamodbstreams_dynamodbstreams_20120810::ops::types::AttributeValue {
+    use crate::ops::types::AttributeValue as Stored;
+    use ::service_com_amazonaws_dynamodbstreams_dynamodbstreams_20120810::ops::types::AttributeValue as Published;
+
+    match value {
+        Stored::S(text) => Published::S(text.clone()),
+        Stored::N(number) => Published::N(number.clone()),
+        Stored::B(bytes) => Published::B(bytes.clone()),
+        Stored::Ss(members) => Published::Ss(members.clone()),
+        Stored::Ns(members) => Published::Ns(members.clone()),
+        Stored::Bs(members) => Published::Bs(members.clone()),
+        Stored::M(members) => Published::M(
+            members
+                .iter()
+                .map(|(name, nested)| (name.clone(), streams_value(nested)))
+                .collect(),
+        ),
+        Stored::L(members) => Published::L(members.iter().map(streams_value).collect()),
+        Stored::Null(is_null) => Published::Null(*is_null),
+        Stored::Bool(flag) => Published::Bool(*flag),
+    }
 }
 
 /// Turn a table's stream OFF in the DynamoDB Streams store.
