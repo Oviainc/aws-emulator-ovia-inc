@@ -51,6 +51,8 @@ mod login_profiles;
 mod managed_policies;
 #[path = "all/open_id_connect_providers.rs"]
 mod open_id_connect_providers;
+#[path = "all/policy_listing.rs"]
+mod policy_listing;
 #[path = "all/policy_simulation.rs"]
 mod policy_simulation;
 #[path = "all/policy_version_listing.rs"]
@@ -99,6 +101,8 @@ mod service_specific_credentials;
 mod state_roundtrip;
 #[path = "all/user_attached_policies.rs"]
 mod user_attached_policies;
+#[path = "all/user_attached_policy_listing.rs"]
+mod user_attached_policy_listing;
 #[path = "all/user_lifecycle.rs"]
 mod user_lifecycle;
 #[path = "all/user_permissions_boundary.rs"]

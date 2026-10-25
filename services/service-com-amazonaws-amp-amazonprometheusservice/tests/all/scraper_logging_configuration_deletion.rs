@@ -7,10 +7,10 @@
 //!
 //! The store is seeded directly here, through the same engine the mounted service reads
 //! ([`Amp::store`]) and with the same scraper builder the listing and deletion suites use
-//! ([`crate::scraper_listing::scraper`]): `CreateScraper` and
-//! `UpdateScraperLoggingConfiguration` are both still scaffolded (each its own stub
-//! issue), so seeding is how a scraper with a logging configuration exists to delete at
-//! all — and it is the same record the handler reads, not a second copy of it.
+//! ([`crate::scraper_listing::scraper`]): `UpdateScraperLoggingConfiguration` is still
+//! scaffolded (its own stub issue), so seeding is how a scraper with a logging
+//! configuration exists to delete at all — and it is the same record the handler reads,
+//! not a second copy of it.
 
 use crate::scraper_listing::{dataset_destination, eks_source, scraper, seed, workspace_destination};
 use crate::workspace_lifecycle::{text, wait_for_due_transition, Amp, Reply};

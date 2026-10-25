@@ -26,10 +26,11 @@
 //! The account-level Incident Manager precondition lives here too
 //! ([`ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`]): it is the
 //! same gate for every replication-set-scoped operation, so it is written once and
-//! consulted from each handler. The emulated account SATISFIES it from the start
-//! ([`ComAmazonawsSsmcontactsSsmcontactsState::default`]) — the API that mints the set is
-//! withdrawn, so no request can supply what the gate wants and an account that began
-//! without it would be refused every operation forever.
+//! consulted from each handler. The emulated account does NOT satisfy it to begin with
+//! ([`ComAmazonawsSsmcontactsSsmcontactsState::default`]): the account holds a replication
+//! set only once Incident Manager minted one for it, and Incident Manager's own registry of
+//! sets starts empty, so every gated operation is refused until something puts a set in
+//! this record.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::SystemTime;
@@ -301,12 +302,13 @@ pub struct AccountReplicationSet {
 }
 
 impl AccountReplicationSet {
-    /// The ACTIVE set this emulated account is onboarded with.
+    /// The record an account that COMPLETED Incident Manager onboarding holds: a set that
+    /// has finished replicating, so the contact data plane is open.
     ///
-    /// The emulated account is an account that ALREADY completed Incident Manager
-    /// onboarding, which is the only kind of account that can reach this API at all: the
-    /// one call that mints a set is withdrawn, so an account without one could never
-    /// acquire one and every operation of the service would be permanently unreachable.
+    /// It is what the gate wants, not what an account starts with
+    /// ([`ComAmazonawsSsmcontactsSsmcontactsState::default`] holds none): minting a set is
+    /// Incident Manager's own call, not one of this service's, so nothing in this crate
+    /// writes this record for an account.
     pub fn onboarded_account() -> Self {
         Self {
             arn: default_replication_set_arn(),
@@ -318,13 +320,14 @@ impl AccountReplicationSet {
 /// Per-service state for com-amazonaws-ssmcontacts-ssmcontacts. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsSsmcontactsSsmcontactsState {
-    /// The account's Incident Manager replication set, which it holds — ACTIVE — from the
-    /// moment this store exists (see [`ComAmazonawsSsmcontactsSsmcontactsState::default`]).
+    /// The account's Incident Manager replication set: `None` until Incident Manager has
+    /// minted one for the account, which is how this store starts (see
+    /// [`ComAmazonawsSsmcontactsSsmcontactsState::default`]).
     ///
     /// Every replication-set-scoped operation consults it through
     /// [`ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`]. A set
-    /// that is absent or not yet active closes the data plane, so those two values are the
-    /// states the gate refuses — they are not what a usable account starts in.
+    /// that is absent or not yet active closes the data plane, so an account in either of
+    /// those two states is refused every gated call.
     pub replication_set: Option<AccountReplicationSet>,
     /// Contacts and escalation plans, keyed by `ContactArn`.
     pub contacts: BTreeMap<String, ContactRecord>,
@@ -399,19 +402,19 @@ pub struct ComAmazonawsSsmcontactsSsmcontactsState {
 }
 
 impl Default for ComAmazonawsSsmcontactsSsmcontactsState {
-    /// The store's initial value: an ONBOARDED account that owns nothing yet.
+    /// The store's initial value: an account that owns nothing yet and is not onboarded to
+    /// Incident Manager.
     ///
     /// Every resource map starts empty — only a create puts a contact, channel, rotation,
-    /// override, engagement or page in one — but the account-level prerequisite the data
-    /// plane is gated on starts PRESENT and ACTIVE
-    /// ([`AccountReplicationSet::onboarded_account`]). An account-level prerequisite whose
-    /// minting call the API no longer accepts cannot be acquired by any request, so an
-    /// account that starts without it could never be served a single gated operation,
-    /// while the account AWS serves — one onboarded while that call still existed — is
-    /// served all of them.
+    /// override, engagement or page in one — and so does the account-level prerequisite the
+    /// data plane is gated on: a replication set is Incident Manager's resource, minted for
+    /// an account by Incident Manager, and that service's own registry of sets starts empty
+    /// too. An account whose record is absent is refused every gated operation
+    /// ([`ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`]) while
+    /// the precondition-exempt listings are served, which is what a client meets.
     fn default() -> Self {
         Self {
-            replication_set: Some(AccountReplicationSet::onboarded_account()),
+            replication_set: None,
             contacts: BTreeMap::new(),
             alias_index: BTreeMap::new(),
             contact_channels: BTreeMap::new(),
@@ -1004,7 +1007,7 @@ pub fn request_region(parts: &http::request::Parts) -> String {
 /// The ARN namespace this service's ARNs carry (`awsService.arnNamespace` in the model).
 const ARN_NAMESPACE: &str = "ssm-contacts";
 
-/// The ARN of the Incident Manager replication set this account is onboarded with:
+/// The ARN of the Incident Manager replication set an account is onboarded with:
 /// `arn:aws:ssm-incidents::<account>:replication-set/<id>`.
 ///
 /// The namespace is `ssm-incidents` because the set is Incident Manager's resource, not

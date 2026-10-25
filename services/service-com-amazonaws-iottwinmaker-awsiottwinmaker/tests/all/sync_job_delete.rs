@@ -34,7 +34,7 @@ use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
     SYNC_JOB_SETTLE_SPAN, SYNC_JOB_STATE_DELETING, SYNC_SOURCE_SITEWISE,
 };
 
-use crate::harness::{seed_sync_job, sync_job_arn, Emulator, Resp, SYNC_ROLE};
+use crate::harness::{seed_sync_job, sync_job_arn, Emulator, Resp, SYNC_ROLE, REGION};
 
 /// Block until the outcome an accepted job owes has fallen due, so a row that
 /// deletes a SETTLED job really is deleting one the clock has already moved.
@@ -79,6 +79,7 @@ fn stored_job_count(emulator: &Emulator) -> usize {
     emulator
         .state()
         .lock()
+        .region(REGION)
         .workspaces
         .values()
         .map(|workspace| workspace.sync_jobs.len())

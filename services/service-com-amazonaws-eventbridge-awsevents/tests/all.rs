@@ -33,6 +33,8 @@ mod missing_resource_wording;
 mod partner_event_source;
 #[path = "all/pattern_and_connection_filters.rs"]
 mod pattern_and_connection_filters;
+#[path = "all/replay_cancellation.rs"]
+mod replay_cancellation;
 #[path = "all/reserved_event_source.rs"]
 mod reserved_event_source;
 #[path = "all/resource_tagging.rs"]

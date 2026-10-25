@@ -26,7 +26,9 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Value};
 
-use crate::emulator::{code, create_with_tags, message, placements, tags_of, text, Emulator};
+use crate::emulator::{
+    code, create_with_tags, message, placements, remote_account_for, tags_of, text, Emulator,
+};
 
 /// `TagKey` is modelled `@length(min: 1, max: 128)`.
 const TAG_KEY_MAX: usize = 128;
@@ -54,8 +56,9 @@ async fn untag(emulator: &Emulator, arn: &str, keys: &[String]) -> (u16, Value) 
 }
 
 /// `CreateConnection` on `placement` carrying `tags`, as a `(status, body)` pair so
-/// the tag-on-create refusal is readable. `seed` keeps each row's attach point
-/// distinct.
+/// the tag-on-create refusal is readable. `seed` keeps each row's description
+/// distinct; the attach point is one of the account's own gateways, because a
+/// Connection is only provisioned onto an attach point that exists.
 async fn create(
     emulator: &Emulator,
     placement: &(String, String),
@@ -67,12 +70,15 @@ async fn create(
     request.insert("bandwidth".to_string(), json!(placement.1));
     request.insert(
         "attachPoint".to_string(),
-        json!({ "directConnectGateway": format!("aaaaaaaa-bbbb-4ccc-8ddd-{seed:012}") }),
+        json!({ "directConnectGateway": emulator.attach_point().await }),
     );
     request.insert(
         "description".to_string(),
         json!(format!("reserved tag case {seed}")),
     );
+    if let Some(remote_account) = remote_account_for(&emulator.environment(&placement.0).await) {
+        request.insert("remoteAccount".to_string(), remote_account);
+    }
     request.insert("tags".to_string(), json!(tags));
     emulator.ic("CreateConnection", Value::Object(request)).await
 }

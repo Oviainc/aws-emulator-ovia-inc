@@ -19,7 +19,8 @@
 //!   model spells it with are that model's way of demanding a whole-string match and are
 //!   not part of the expression a caller has to satisfy.
 //! * [`crate::state::validation_exception`] — a rule the model CANNOT express: a
-//!   combination of members, an ordering between two of them, or a continuation token
+//!   combination of members, an ordering between two of them, which chain an address
+//!   member has to belong to ([`ChainAddresses`]), or a continuation token
 //!   this service never issued. The top-level `message` is the generic
 //!   [`crate::state::INVALID_PARAMETER_VALUES_MESSAGE`] sentinel and the explanation
 //!   moves into `fieldList`, which is the machine-readable half of the error: a client
@@ -78,7 +79,7 @@ use crate::ops::types::{
     GetTransactionInput, ListAssetContractsInput, ListFilteredTransactionEventsInput,
     ListFilteredTransactionEventsSort, ListTokenBalancesInput, ListTransactionEventsInput,
     ListTransactionsInput, ListTransactionsSort, OwnerFilter, OwnerIdentifier, TokenFilter,
-    TokenIdentifier, ValidationException,
+    TokenIdentifier, ValidationException, ValidationExceptionField,
 };
 
 // ---------------------------------------------------------------------------
@@ -573,6 +574,60 @@ fn element(path: &str, position: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// The one rule about an address the model cannot state
+// ---------------------------------------------------------------------------
+
+/// Every `ChainAddress`-targeting member of a request, checked against the chain the
+/// request names it on.
+///
+/// `ChainAddress` is ONE type for every chain this service indexes, so its `@pattern`
+/// cannot say which strings are addresses of the chain a request asked about: a base58
+/// Bitcoin address, an EVM address and a 13-character label satisfy it equally. Which
+/// ones are addresses of a chain is fixed by that chain's own encodings
+/// ([`crate::state::address`]), and which chain a member has to carry an address of is
+/// fixed by the `QueryNetwork` the SAME request carries — so the check is this service's,
+/// and it is made here, in the one place every operation's input is checked, rather than
+/// in the handlers.
+///
+/// Each entry names the member a caller would repair and says which chain's address it
+/// had to be, which is all the request got wrong; the entries ACCUMULATE, so a request
+/// whose owner and whose contract address are both of the wrong chain learns about both
+/// in one answer.
+#[derive(Debug, Default)]
+struct ChainAddresses {
+    refused: Vec<ValidationExceptionField>,
+}
+
+impl ChainAddresses {
+    /// One `ChainAddress`-targeting member, against the chain `network` runs.
+    fn member(&mut self, path: &str, network: &str, address: &str) {
+        if !crate::state::address::is_address_of_network(network, address) {
+            self.refused.push(crate::state::validation_field(
+                path,
+                crate::state::address::invalid_address_message(network),
+            ));
+        }
+    }
+
+    /// `TokenIdentifier`'s and `TokenFilter`'s shared address member, against the network
+    /// the identifier itself names.
+    fn contract_address(&mut self, path: &str, network: &str, contract: Option<&String>) {
+        if let Some(contract) = contract {
+            self.member(&format!("{path}.contractAddress"), network, contract);
+        }
+    }
+
+    /// `Ok(())` when every address member carried an address of its own chain, else this
+    /// service's modelled `ValidationException` naming each one that did not.
+    fn report(self) -> Result<(), ValidationException> {
+        if self.refused.is_empty() {
+            return Ok(());
+        }
+        Err(crate::state::validation_exception(self.refused))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // One checker per operation input
 // ---------------------------------------------------------------------------
 
@@ -603,17 +658,47 @@ pub fn batch_get_token_balance_input(
     report(violations)
 }
 
-/// Every modelled constraint on one `BatchGetTokenBalanceInputItem`, reported against
-/// the item's OWN members: the item's failure travels in the response beside the
-/// identifiers it echoes, so the caller already knows which item it was.
-pub fn batch_get_token_balance_item(item: &BatchGetTokenBalanceInputItem) -> Violations {
+/// Every rule one `BatchGetTokenBalanceInputItem` has to satisfy — the modelled
+/// constraints and the chain each address member has to belong to — reported against the
+/// item's OWN members: the item's failure travels in the response beside the identifiers
+/// it echoes, so the caller already knows which item it was.
+///
+/// `None` when the item breaks no rule. An item is checked exactly as
+/// [`get_token_balance_input`] checks the single read's input, so the batch and the single
+/// read cannot disagree about one item.
+pub fn batch_get_token_balance_item(
+    item: &BatchGetTokenBalanceInputItem,
+) -> Option<ValidationException> {
     let mut violations = Violations::new();
     token_identifier(&mut violations, "tokenIdentifier", &item.token_identifier);
     owner_identifier(&mut violations, "ownerIdentifier", &item.owner_identifier);
-    violations
+    if !violations.is_empty() {
+        return Some(constraint_exception(&violations));
+    }
+    token_balance_addresses(&item.token_identifier, &item.owner_identifier).err()
 }
 
-/// Every modelled constraint on `GetAssetContractInput`.
+/// The chain-address rule over the pair of identifiers a token-balance read names, which
+/// `GetTokenBalance` and one `BatchGetTokenBalance` item declare identically: the owner,
+/// and the contract the token lives at, both on the network the `TokenIdentifier` names.
+fn token_balance_addresses(
+    token: &TokenIdentifier,
+    owner: &OwnerIdentifier,
+) -> Result<(), ValidationException> {
+    let mut addresses = ChainAddresses::default();
+    addresses.contract_address("tokenIdentifier", &token.network, token.contract_address.as_ref());
+    addresses.member("ownerIdentifier.address", &token.network, &owner.address);
+    addresses.report()
+}
+
+/// Every modelled constraint on `GetAssetContractInput`, and the chain its contract
+/// address has to belong to.
+///
+/// The address check is made only on the networks this operation SERVES: "The Bitcoin
+/// blockchain networks do not support this operation", so on a Bitcoin network what is
+/// wrong with the request is the network itself
+/// ([`crate::state::contracts_unsupported_on_network`], raised by the handler) and not the
+/// address it carries.
 pub fn get_asset_contract_input(input: &GetAssetContractInput) -> Result<(), ValidationException> {
     let mut violations = Violations::new();
     contract_identifier(
@@ -621,15 +706,27 @@ pub fn get_asset_contract_input(input: &GetAssetContractInput) -> Result<(), Val
         "contractIdentifier",
         &input.contract_identifier,
     );
-    report(violations)
+    report(violations)?;
+    let requested = &input.contract_identifier;
+    let mut addresses = ChainAddresses::default();
+    if !crate::state::is_bitcoin(&requested.network) {
+        addresses.member(
+            "contractIdentifier.contractAddress",
+            &requested.network,
+            &requested.contract_address,
+        );
+    }
+    addresses.report()
 }
 
-/// Every modelled constraint on `GetTokenBalanceInput`.
+/// Every modelled constraint on `GetTokenBalanceInput`, and the chain each of its address
+/// members has to belong to.
 pub fn get_token_balance_input(input: &GetTokenBalanceInput) -> Result<(), ValidationException> {
     let mut violations = Violations::new();
     token_identifier(&mut violations, "tokenIdentifier", &input.token_identifier);
     owner_identifier(&mut violations, "ownerIdentifier", &input.owner_identifier);
-    report(violations)
+    report(violations)?;
+    token_balance_addresses(&input.token_identifier, &input.owner_identifier)
 }
 
 /// Every modelled constraint on `GetTransactionInput`.
@@ -645,7 +742,9 @@ pub fn get_transaction_input(input: &GetTransactionInput) -> Result<(), Validati
     report(violations)
 }
 
-/// Every modelled constraint on `ListAssetContractsInput`.
+/// Every modelled constraint on `ListAssetContractsInput`, and the chain its deployer
+/// address has to belong to — on the networks this operation serves, for the reason
+/// [`get_asset_contract_input`] gives.
 pub fn list_asset_contracts_input(
     input: &ListAssetContractsInput,
 ) -> Result<(), ValidationException> {
@@ -653,7 +752,17 @@ pub fn list_asset_contracts_input(
     contract_filter(&mut violations, "contractFilter", &input.contract_filter);
     next_token(&mut violations, input.next_token.as_deref());
     max_results(&mut violations, input.max_results);
-    report(violations)
+    report(violations)?;
+    let filter = &input.contract_filter;
+    let mut addresses = ChainAddresses::default();
+    if !crate::state::is_bitcoin(&filter.network) {
+        addresses.member(
+            "contractFilter.deployerAddress",
+            &filter.network,
+            &filter.deployer_address,
+        );
+    }
+    addresses.report()
 }
 
 /// Every modelled constraint on `ListFilteredTransactionEventsInput`.
@@ -681,7 +790,11 @@ pub fn list_filtered_transaction_events_input(
     report(violations)
 }
 
-/// Every modelled constraint on `ListTokenBalancesInput`.
+/// Every modelled constraint on `ListTokenBalancesInput`, and the chain each of its
+/// address members has to belong to.
+///
+/// `OwnerFilter` carries no network of its own, so the chain both members are checked
+/// against is the one `tokenFilter` names — the network the listing reads.
 pub fn list_token_balances_input(
     input: &ListTokenBalancesInput,
 ) -> Result<(), ValidationException> {
@@ -692,7 +805,18 @@ pub fn list_token_balances_input(
     token_filter(&mut violations, "tokenFilter", &input.token_filter);
     next_token(&mut violations, input.next_token.as_deref());
     max_results(&mut violations, input.max_results);
-    report(violations)
+    report(violations)?;
+    let network = input.token_filter.network.as_str();
+    let mut addresses = ChainAddresses::default();
+    addresses.contract_address(
+        "tokenFilter",
+        network,
+        input.token_filter.contract_address.as_ref(),
+    );
+    if let Some(owner) = &input.owner_filter {
+        addresses.member("ownerFilter.address", network, &owner.address);
+    }
+    addresses.report()
 }
 
 /// Every modelled constraint on `ListTransactionEventsInput`.
@@ -712,7 +836,8 @@ pub fn list_transaction_events_input(
     report(violations)
 }
 
-/// Every modelled constraint on `ListTransactionsInput`.
+/// Every modelled constraint on `ListTransactionsInput`, and the chain its address has to
+/// belong to.
 pub fn list_transactions_input(input: &ListTransactionsInput) -> Result<(), ValidationException> {
     let mut violations = Violations::new();
     chain_address(&mut violations, "address", &input.address);
@@ -725,7 +850,10 @@ pub fn list_transactions_input(input: &ListTransactionsInput) -> Result<(), Vali
     }
     next_token(&mut violations, input.next_token.as_deref());
     max_results(&mut violations, input.max_results);
-    report(violations)
+    report(violations)?;
+    let mut addresses = ChainAddresses::default();
+    addresses.member("address", &input.network, &input.address);
+    addresses.report()
 }
 
 /// `Ok(())` when nothing was violated, else the modelled `ValidationException`.

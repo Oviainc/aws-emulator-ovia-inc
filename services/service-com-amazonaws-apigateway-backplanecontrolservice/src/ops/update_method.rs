@@ -117,20 +117,11 @@ use crate::state::{
     patch_string_set, MethodEntry, Patch, PatchFailure, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
 };
 
-/// The `path` values `UpdateMethod` accepts: one per updateable member of the `Method`
-/// shape. `httpMethod` is the method's identity, and `methodResponses` and
-/// `methodIntegration` are sub-resources with their own operations
-/// (`UpdateMethodResponse`, `UpdateIntegration`), so none of them is patchable here.
-const SUPPORTED_PATHS: &[&str] = &[
-    "/apiKeyRequired",
-    "/authorizationScopes",
-    "/authorizationType",
-    "/authorizerId",
-    "/operationName",
-    "/requestModels/<content-type>",
-    "/requestParameters/<parameter-name>",
-    "/requestValidatorId",
-];
+// The `path` values `UpdateMethod` accepts are the ones `apply_patch` below has an arm
+// for: one per updateable member of the `Method` shape. `httpMethod` is the method's
+// identity, and `methodResponses` and `methodIntegration` are sub-resources with their own
+// operations (`UpdateMethodResponse`, `UpdateIntegration`), so none of them is patchable
+// here.
 
 /// Apply one patch to a COPY of a stored method.
 fn apply_patch(entry: &mut MethodEntry, patch: &Patch) -> Result<(), PatchFailure> {
@@ -188,7 +179,7 @@ fn apply_patch(entry: &mut MethodEntry, patch: &Patch) -> Result<(), PatchFailur
                 MAX_STRING_CHARS,
             )
         }
-        _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
+        _ => Err(patch.unsupported_path()),
     }
 }
 

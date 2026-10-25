@@ -167,7 +167,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteVocabularyFilterErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -180,18 +179,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The Region this request is served in: only the filters created through this
+        // Region's endpoint are this call's to delete.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // A custom vocabulary filter has no `VocabularyState` in the model, so it is
         // never in a non-terminal state and the only thing that refuses this delete is
         // the entity not being there: "This can occur when the entity you're trying to
         // delete doesn't exist or if it's in a non-terminal state (such as IN
         // PROGRESS)" (`BadRequestException`'s own documentation). A delete is NOT
-        // idempotent, so a name this account holds no filter under takes the service's
+        // idempotent, so a name this Region holds no filter under takes the service's
         // absent-resource branch (`crate::state::not_found_message`), as every reader
         // of the family does, and removes nothing.
         if store
             .vocabulary_filters
-            .remove(&input.vocabulary_filter_name)
+            .remove(&region, &input.vocabulary_filter_name)
             .is_none()
         {
             ::tracing::info!(

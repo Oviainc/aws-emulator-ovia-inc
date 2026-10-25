@@ -315,14 +315,16 @@ async fn an_address_no_contract_is_deployed_at_is_not_found() {
     let emulator = Emulator::new();
     let contracts = seeded_contracts(&emulator);
 
-    // Well-formed `ChainAddress` values no contract is deployed at: both published
-    // length bounds, an EVM-shaped address, and an address the ledger DOES know as a
-    // wallet but not as a contract.
+    // Addresses of an EVM chain — the chain these operations serve — that no contract is
+    // deployed at: the zero account, the all-nines one, a mixed-case spelling (EIP-55
+    // spends the letter case on a checksum, so any case names one account) and the bare
+    // digits without the `0x` prefix, plus an address the ledger DOES know as a wallet
+    // but not as a contract.
     let mut absent: Vec<String> = vec![
-        "a".repeat(13),
-        "a".repeat(74),
-        "0x0000000000000000000000000000000000000000".to_string(),
-        "-0deadbeefcafe".to_string(),
+        format!("0x{}", "0".repeat(40)),
+        format!("0x{}", "9".repeat(40)),
+        format!("0x{}", "aB".repeat(20)),
+        "f".repeat(40),
     ];
     for contract in &contracts {
         absent.push(contract.deployer_address.clone());

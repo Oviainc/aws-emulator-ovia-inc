@@ -198,12 +198,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The Region this request is signed for picks the store it writes to,
+        // and the Region the scene's ARN carries: the workspace it is created
+        // in is the one THIS Region holds under that id.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateSceneErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the iottwinmaker store is unavailable".to_string()),
             })
         })?;
         let mut state = state.lock();
+        let state = state.region_mut(&region);
 
         // A scene lives INSIDE a workspace (`/workspaces/{workspaceId}/scenes`),
         // so a create naming a workspace this service does not hold is refused
@@ -251,7 +256,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let region = crate::state::request_region(ctx.parts());
         let arn = crate::state::scene_arn(&region, &input.workspace_id, &input.scene_id);
         let now = ::std::time::SystemTime::now();
         let scene = crate::state::Scene {

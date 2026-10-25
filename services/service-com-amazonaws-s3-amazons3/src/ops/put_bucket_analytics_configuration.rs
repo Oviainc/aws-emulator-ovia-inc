@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutBucketAnalyticsConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutBucketAnalyticsConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: records a storage class analysis configuration on an existing bucket under
+//! the id the request identifies it by, replacing in full whatever configuration the bucket
+//! carried under THAT id and leaving every other id untouched. The payload IS the
+//! configuration, so what the request names becomes the stored configuration — every member
+//! of it, down to the export destination's own account id — and
+//! `GetBucketAnalyticsConfiguration` reports it back. Refused before anything is written
+//! when the request is not one S3 records: an id outside the published length, an id that
+//! disagrees with the payload's own `Id`, or an `And` filter naming fewer than two
+//! predicates (`InvalidArgument`), and a NEW configuration past
+//! [`crate::state::MAX_ANALYTICS_CONFIGURATIONS_PER_BUCKET`] (`TooManyConfigurations`).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutBucketAnalyticsConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The read side is `GetBucketAnalyticsConfiguration`, implemented in the same change so a
+//! put can be read back; `DeleteBucketAnalyticsConfiguration` and
+//! `ListBucketAnalyticsConfigurations` are still the scaffold's 501 and are their own stub
+//! issues.
 //!
 //! ## Shape of an operation
 //!
@@ -123,14 +129,21 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutBucketAnalyticsConfig
     fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
 }
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `PutBucketAnalyticsConfigurationError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#PutBucketAnalyticsConfiguration")]
+// The operation's MODELED errors, widened by `NoSuchBucket` for the reason
+// `PutBucketMetricsConfiguration` widens it: the model's error list for this operation is
+// empty (`smithy_query(query="operation",operation="PutBucketAnalyticsConfiguration")`
+// reports `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket that
+// does not exist and AWS answers the service-wide `NoSuchBucket` ("The specified bucket does
+// not exist", `httpError 404`). `extra_errors` widens the set with that shape, which the
+// SERVICE models, so this handler answers the same 404 every other bucket-scoped operation
+// does rather than inventing a second rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#PutBucketAnalyticsConfiguration",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum PutBucketAnalyticsConfigurationErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -184,18 +197,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutBucketAnalyticsConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutBucketAnalyticsConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutBucketAnalyticsConfiguration"))
+        // Everything this write needs is in its deserialized input: the expected owner, the
+        // id and the configuration travel as members, not as raw headers.
+        let _ = ctx;
+
+        // "The account ID of the expected bucket owner. If the account ID that you provide
+        // does not match the actual owner of the bucket, the request fails with the HTTP
+        // status code 403 Forbidden (access denied)"
+        // (`PutBucketAnalyticsConfigurationRequest$ExpectedBucketOwner`), judged the way
+        // every other bucket-scoped operation in this crate judges it: this emulator serves
+        // one account, so that account owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                ACCESS_DENIED_STATUS,
+                "Access Denied",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The store is unreachable only when this service is mounted on an engine that
+            // is not the shared `InMemoryEngine`; nothing can then be persisted, and this
+            // operation models no server-fault error to say so, so the scaffold's 501
+            // carries "this emulator cannot serve it" rather than a false success.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutBucketAnalyticsConfiguration",
+            ));
+        };
+
+        // Every refusal below is decided BEFORE anything is written, so a refused put leaves
+        // the bucket's stored configurations exactly as they were; and the bucket is looked
+        // up FIRST, so a request naming a bucket this emulator does not hold answers that
+        // rather than reporting whatever is wrong with a configuration the bucket could
+        // never have carried.
+        let mut store = state.lock();
+        if store.bucket(&input.bucket).is_none() {
+            return Err(
+                PutBucketAnalyticsConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {}).into(),
+            );
+        }
+
+        // An id is what the configuration is addressable by, bounded by the length every
+        // bucket configuration id shares: a value outside it identifies no configuration the
+        // service can record, which is what this operation's own `InvalidArgument` reports.
+        if !crate::state::is_valid_analytics_id(&input.id) {
+            return Err(invalid_analytics_id(&input.id));
+        }
+
+        // The configuration a put "specified by the analytics configuration ID" sets and the
+        // `Id` that "identifies the analytics configuration" in the payload name ONE
+        // configuration, so two different values name no configuration the service can
+        // record.
+        if input.analytics_configuration.id != input.id {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_ARGUMENT_CODE,
+                crate::state::INVALID_ARGUMENT_STATUS,
+                format!(
+                    "AnalyticsConfiguration.Id {:?} does not identify the analytics \
+                     configuration the request names, {:?}",
+                    input.analytics_configuration.id, input.id
+                ),
+            ));
+        }
+
+        // "A conjunction (logical AND) of predicates … The operator must have at least two
+        // predicates" (`AnalyticsFilter$And`): a prefix and each tag are one predicate each,
+        // so an `And` carrying fewer than two is a filter the service cannot evaluate rather
+        // than a payload it cannot parse.
+        if let Some(AnalyticsFilter::And(operator)) = &input.analytics_configuration.filter {
+            let predicates =
+                usize::from(operator.prefix.is_some()) + operator.tags.as_ref().map_or(0, Vec::len);
+            if predicates < MIN_AND_OPERATOR_PREDICATES {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    format!(
+                        "AnalyticsConfiguration.Filter.And names {predicates} predicate(s); the \
+                         operator must have at least {MIN_AND_OPERATOR_PREDICATES}"
+                    ),
+                ));
+            }
+        }
+
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            // Unreachable: the lookup above ran under this same guard.
+            return Err(
+                PutBucketAnalyticsConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {}).into(),
+            );
+        };
+
+        // The payload is the whole configuration, so the stored container is exactly the one
+        // this request carried, under the id it names: a second put under the same id
+        // replaces it rather than merging into it.
+        match bucket.put_analytics_configuration(input.id, input.analytics_configuration) {
+            crate::state::BucketConfigurationWrite::Stored
+            | crate::state::BucketConfigurationWrite::Replaced => Ok(
+                // `Unit` output: success is the modelled 200 and an empty body.
+                PutBucketAnalyticsConfigurationOutput,
+            ),
+            // "You are attempting to create a new configuration but have already reached the
+            // 1,000-configuration limit" — this operation's own special error, with the
+            // status it documents. A REPLACEMENT never reaches here: it creates no new
+            // configuration.
+            crate::state::BucketConfigurationWrite::QuotaReached => {
+                Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::TOO_MANY_CONFIGURATIONS_CODE,
+                    crate::state::TOO_MANY_CONFIGURATIONS_STATUS,
+                    crate::state::TOO_MANY_CONFIGURATIONS_MESSAGE,
+                ))
+            }
+        }
     }
 }
+
+/// The refusal for an `Id` whose value is not an analytics configuration id, naming the
+/// member and the rule it broke — what a caller has to fix the request from.
+fn invalid_analytics_id(value: &str) -> PutBucketAnalyticsConfigurationError {
+    crate::scaffolded::Scaffolded::unmodeled(
+        crate::state::INVALID_ARGUMENT_CODE,
+        crate::state::INVALID_ARGUMENT_STATUS,
+        format!(
+            "Id {value:?} is not an analytics configuration id: between 1 and {} characters",
+            crate::state::MAX_ANALYTICS_ID_CHARS
+        ),
+    )
+}
+
+/// The fewest predicates `AnalyticsFilter$And` may carry: "The operator must have at least
+/// two predicates" (that member's own documentation).
+const MIN_AND_OPERATOR_PREDICATES: usize = 2;
+
+/// The status `ExpectedBucketOwner` names for a mismatch: "the request fails with the HTTP
+/// status code 403 Forbidden (access denied)".
+const ACCESS_DENIED_STATUS: u16 = 403;

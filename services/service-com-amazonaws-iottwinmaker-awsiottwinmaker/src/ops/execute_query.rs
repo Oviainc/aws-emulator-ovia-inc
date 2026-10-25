@@ -215,7 +215,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             workspace_id = %input.workspace_id,
             "serving a request"
         );
-        let _ = ctx;
+        // The Region this request is signed for picks the store that answers
+        // it: a workspace created through another Region's endpoint is not in
+        // it, so its entities are not what this query walks.
+        let region = crate::state::request_region(ctx.parts());
 
         let invalid = |message: String| {
             ExecuteQueryErrorModeled::ValidationException(ValidationException {
@@ -268,6 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })?;
             let state = state.lock();
+            let state = state.region(&region);
             // The model declares no `ResourceNotFoundException` for this operation, so an
             // unknown workspace is refused the way `ListEntities` refuses one.
             let Some(workspace) = state.workspaces.get(&input.workspace_id) else {

@@ -29,7 +29,7 @@ use service_com_amazonaws_managedblockchainquery_tietonchainqueryservice::ops::t
     SORT_ORDER_VALUES,
 };
 
-use crate::chain_query_slice::{error_code, Emulator, NetworkFixture};
+use crate::chain_query_slice::{error_code, unseeded_address, Emulator, NetworkFixture};
 
 // ---------------------------------------------------------------------------
 // The modelled constraints, from the model rather than from the implementation
@@ -628,11 +628,12 @@ async fn a_request_with_many_bad_values_is_answered_with_a_bounded_report() {
 #[tokio::test]
 async fn a_value_the_published_bounds_admit_is_not_refused() {
     let emulator = Emulator::new();
-    let (ethereum, _) = networks(&emulator);
+    let (ethereum, bitcoin) = networks(&emulator);
     let address = ethereum.busiest_address();
 
-    // Both published `@range` bounds of `maxResults`, and the shortest and longest
-    // value `ChainAddress` admits — the rows one past which are refused above.
+    // Both published `@range` bounds of `maxResults`, and an address at each end of what
+    // the queried chain's own encodings admit inside `ChainAddress`'s 13..74 window —
+    // the rows one past which are refused above.
     for max_results in [MAX_RESULTS_RANGE.0, MAX_RESULTS_RANGE.1] {
         emulator
             .ok(
@@ -645,17 +646,22 @@ async fn a_value_the_published_bounds_admit_is_not_refused() {
             )
             .await;
     }
-    for length in [13usize, 74] {
-        let admitted = "a".repeat(length);
+    // base58 (BIP-13) spells a Bitcoin address in 26 characters at its shortest, bech32
+    // (BIP-173) in up to the 74 the model's pattern leaves; the pattern's own lower bound
+    // of 13 is not a row, because no chain spells an address that short and an address of
+    // no chain is refused on this service's own rule (`cross_chain_address.rs`).
+    for admitted in [format!("1{}", "z".repeat(25)), format!("bc1q{}", "z".repeat(70))] {
         let (status, body) = emulator
             .post(
                 "/list-transactions",
-                &json!({"network": ethereum.network, "address": admitted}),
+                &json!({"network": bitcoin.network, "address": admitted}),
             )
             .await;
         assert_eq!(
             status, 200,
-            "case {length}-character address: inside ChainAddress, got {status} with {body:?}"
+            "case {admitted}: a {}-character address inside ChainAddress, got {status} with \
+             {body:?}",
+            admitted.len()
         );
     }
 }
@@ -868,7 +874,10 @@ async fn batch_get_token_balance_answers_the_good_items_and_reports_the_bad_ones
             "case {}: the seeded ledger holds no balance",
             network.network
         );
-        let stranger = "0x0000000000000000000000000000000000000000";
+        // An owner that is a well-formed address of this network's own chain and holds
+        // nothing: the item cannot be answered because the ledger has no such holding,
+        // not because the address is of another chain.
+        let stranger = unseeded_address(&network.network);
         let bad = [
             (
                 json!({
@@ -1020,7 +1029,9 @@ async fn every_not_found_states_the_same_message_and_carries_the_identity() {
         // nothing, and (on the networks that have contracts) a well-formed contract
         // address the ledger does not know.
         let unknown_hash = format!("0x{}", "0".repeat(64));
-        let stranger = "0x0000000000000000000000000000000000000000";
+        // A well-formed address of this network's own chain that the ledger does not
+        // hold: what is missing is the resource, not an address of the right chain.
+        let stranger = unseeded_address(&network.network);
         let mut rows = vec![
             (
                 "GetTransaction".to_string(),

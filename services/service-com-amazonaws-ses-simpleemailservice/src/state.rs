@@ -434,49 +434,24 @@ fn domain_suffixes(domain: &str) -> impl Iterator<Item = &str> {
 /// support the SMTPUTF8 extension, as described in RFC6531. For this reason, the
 /// email address string must be 7-bit ASCII."
 ///
-/// The local part is a dot-atom: one or more atoms of the 7-bit-ASCII atom
-/// characters, separated by single `.`s — so a leading, trailing or doubled dot
-/// (which would make an EMPTY atom) is not an address, the same way an empty
-/// label is not a domain label.
+/// That is the form every service whose model documents a member as an email
+/// address reads, so it is read through the ONE shared reading of one
+/// (`service_common::email_address`) rather than stated again here: a dot-atom
+/// local part of 7-bit-ASCII atom characters — so a leading, trailing or doubled
+/// dot, which would make an EMPTY atom, is not an address — an `@`, and a domain
+/// name ([`is_domain_name`]).
 pub fn is_email_address(value: &str) -> bool {
-    let Some((local, domain)) = value.split_once('@') else {
-        return false;
-    };
-    let atoms: Vec<&str> = local.split('.').collect();
-    atoms
-        .iter()
-        .all(|atom| !atom.is_empty() && atom.chars().all(is_ascii_atom_char))
-        && is_domain_name(domain)
+    ::service_common::email_address::is_email_address(value)
 }
 
 /// Whether `value` is a domain name with at least two non-empty labels, the
 /// `[SubDomain.]Domain.TopLevelDomain` form SES documents.
 ///
-/// A label is 7-bit ASCII letters, digits and hyphens; the top-level label must
-/// carry a letter, which admits an internationalised (`xn--…`) TLD and refuses
-/// an all-numeric one.
+/// The shared reading again: a label is 7-bit ASCII letters, digits and hyphens,
+/// and the top-level label must carry a letter, which admits an
+/// internationalised (`xn--…`) TLD and refuses an all-numeric one.
 pub fn is_domain_name(value: &str) -> bool {
-    let labels: Vec<&str> = value.split('.').collect();
-    if labels.len() < 2 {
-        return false;
-    }
-    let label_ok = |label: &&str| {
-        !label.is_empty()
-            && label
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-')
-    };
-    labels.iter().all(label_ok)
-        && labels
-            .last()
-            .is_some_and(|tld| tld.chars().any(|c| c.is_ascii_alphabetic()))
-}
-
-/// The characters one atom of a SES 7-bit-ASCII local part may carry: the RFC
-/// 5322 atom characters. The `.` that separates atoms is not one of them — it is
-/// the separator [`is_email_address`] splits on.
-fn is_ascii_atom_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || "!#$%&'*+-/=?^_`{|}~".contains(c)
+    ::service_common::email_address::is_domain_name(value)
 }
 
 /// `text` as a log entry keeps it: at most [`MAX_LOGGED_TEXT`] characters, and

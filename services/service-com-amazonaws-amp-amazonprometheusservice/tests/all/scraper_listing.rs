@@ -6,9 +6,10 @@
 //! filtered and paged the way the model documents.
 //!
 //! The store is seeded directly here, through the same engine the mounted service reads
-//! ([`Amp::store`]): `CreateScraper` is still scaffolded (its own stub issue), so seeding
-//! is how a listing of MORE than the empty page is exercised at all — and it is the same
-//! record the handler reads, not a second copy of it.
+//! ([`Amp::store`]): seeding is how a listing of records with CHOSEN ids, statuses and
+//! shapes is exercised — and it is the same record the handler reads, not a second copy of
+//! it. `CreateScraper` is driven in `crate::scraper_creation`, whose own listing assertion
+//! reads back the scrapers it created.
 
 use crate::workspace_lifecycle::{text, Amp};
 use service_com_amazonaws_amp_amazonprometheusservice::ops::types::{
@@ -71,7 +72,7 @@ fn scrape_configuration(yaml: &str) -> ScrapeConfiguration {
 
 /// Seed one scraper into the store the mounted service reads — the SAME record the
 /// handlers read, not a second copy of it. `pub(crate)` for the reason the builder above
-/// is: `CreateScraper` is still scaffolded (its own stub issue), so every suite that
+/// is: a seeded record pins the id, status and shape a suite needs, so every suite that
 /// needs a stored scraper seeds one, and they all seed it the one way.
 pub(crate) fn seed(amp: &Amp, record: &Scraper) {
     amp.store()

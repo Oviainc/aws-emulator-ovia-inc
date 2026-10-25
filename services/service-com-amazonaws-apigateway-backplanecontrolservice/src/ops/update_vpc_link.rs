@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateVpcLink
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateVpcLink`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateVpcLink::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: applies the request's `patchOperations` to the stored `VpcLink` record
+//! the `vpcLinkId` names, in request order, and reports the patched record — the same one
+//! a later `GetVpcLink` reads back.
 //!
 //! ## Shape of an operation
 //!
@@ -92,6 +86,36 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    patch_optional_string, patch_required_string, Patch, PatchFailure, VpcLinkEntry,
+    MAX_STRING_CHARS,
+};
+
+// The `path` values `UpdateVpcLink` accepts are the ones `apply_patch` below has an arm
+// for: one per updateable member of the `VpcLink` shape.
+//
+// `id`, `status` and `statusMessage` are the service's own — the id is minted by the
+// create and the status is the provisioning state the clock moves — and `tags` are
+// changed through `TagResource`/`UntagResource`, so none of them is patchable.
+// `targetArns` is not either: it is "The ARN of the network load balancer of the VPC
+// targeted by the VPC link" (`VpcLink$targetArns`), which is what the link was
+// provisioned against when it was created, so retargeting it is a new link rather than
+// an edit of this one.
+
+/// Apply one patch to a COPY of a stored link.
+fn apply_patch(entry: &mut VpcLinkEntry, patch: &Patch) -> Result<(), PatchFailure> {
+    match patch.member() {
+        // A link always reports a name — `name` is "The name used to label and identify
+        // the VPC link" (`VpcLink$name`) and `CreateVpcLink` requires it — so the member
+        // can be replaced but neither removed nor emptied.
+        "name" => patch_required_string(&mut entry.name, patch, MAX_STRING_CHARS),
+        // The description is optional, so a `remove` clears it back to the state a link
+        // created without one is in.
+        "description" => patch_optional_string(&mut entry.description, patch, MAX_STRING_CHARS),
+        _ => Err(patch.unsupported_path()),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -165,18 +189,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateVpcLink` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateVpcLinkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateVpcLink"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The list is read BEFORE the store lock is taken, so a malformed patch never
+        // reaches the records at all.
+        let patches =
+            crate::state::parse_patches(input.patch_operations.as_ref()).map_err(patch_failure)?;
+
+        let mut store = state.lock();
+        // A VPC link belongs to the account, so the id is resolved against the account's
+        // links; one that names no stored link is the modelled not-found.
+        let mut updated = store
+            .vpc_links
+            .get(&input.vpc_link_id)
+            .ok_or_else(|| {
+                UpdateVpcLinkErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::NO_SUCH_VPC_LINK.to_string()),
+                })
+            })?
+            .clone();
+
+        // Applied to the COPY: a list whose later op is refused leaves the stored record
+        // untouched, rather than keeping the ops before it.
+        for patch in &patches {
+            apply_patch(&mut updated, patch).map_err(patch_failure)?;
+        }
+
+        // The answer is rendered from the record that is about to be stored, by the one
+        // `VpcLink` renderer the create and the read use, so what the caller is told is
+        // what the store holds — `status` included, which stays the one the clock owes
+        // rather than being moved by this update.
+        let body: Self::Output = super::create_vpc_link::vpc_link_body(&updated).into();
+        store.vpc_links.insert(input.vpc_link_id.clone(), updated);
+        // The lock covers the state change only; everything below is owned.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        // Metadata only — never a patch value or a target ARN.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            vpc_link_id = ?input.vpc_link_id,
+            patch_operations = patches.len(),
+            outcome = "updated",
+            "vpc link updated",
+        );
+        Ok(body)
+    }
+}
+
+/// The modelled failure for a patch this operation cannot apply.
+fn patch_failure(failure: PatchFailure) -> UpdateVpcLinkError {
+    match failure {
+        PatchFailure::BadRequest(message) => {
+            UpdateVpcLinkErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::NotFound(message) => {
+            UpdateVpcLinkErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::Conflict(message) => {
+            UpdateVpcLinkErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
+}
+
+/// The same `VpcLink` the create reports, as THIS operation's output shape.
+///
+/// Both shapes are the model's `VpcLink` (`smithy_query(query="operation",
+/// operation="CreateVpcLink,UpdateVpcLink")`: one output shape, generated once per
+/// operation), so the conversion is member for member and lives in ONE place — a member
+/// added to the modelled shape fails to compile here instead of being quietly dropped
+/// from the update's answer.
+impl From<CreateVpcLinkOutput> for UpdateVpcLinkOutput {
+    fn from(body: CreateVpcLinkOutput) -> Self {
+        let CreateVpcLinkOutput {
+            id,
+            name,
+            description,
+            target_arns,
+            status,
+            status_message,
+            tags,
+        } = body;
+        Self {
+            id,
+            name,
+            description,
+            target_arns,
+            status,
+            status_message,
+            tags,
+        }
     }
 }

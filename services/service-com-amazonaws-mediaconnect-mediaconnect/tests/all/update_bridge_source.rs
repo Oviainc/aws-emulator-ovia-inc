@@ -16,7 +16,7 @@
 //! network), WHICH members of the wrapper one request names (one, several, all of them,
 //! an empty wrapper, no wrapper at all), whether the member being merged into already has
 //! a stored value or not, and WHICH source of the bridge is addressed (the only one, the
-//! first, the middle, the last of three).
+//! first and the last of a failover pair).
 //!
 //! Every value a row writes is one the store can resolve — a network the placement gateway
 //! declares, a flow the account holds — because a reference that resolves to nothing is
@@ -92,25 +92,39 @@ fn flow_source(name: &str, flow_arn: &str) -> Value {
     json!({ "flowSource": { "flowArn": flow_arn, "name": name }})
 }
 
-/// Create one ingress bridge carrying `sources`, placed on `placement_arn`, and answer its
-/// ARN. The create is the subject of `bridge_lifecycle`; here it is only the fixture every
-/// update addresses.
+/// Create one bridge carrying `sources`, placed on `placement_arn`, and answer its ARN.
+///
+/// The bridge TYPE is the one the sources belong on: a flow source "originates in
+/// MediaConnect as an existing cloud flow", which is what a cloud-to-ground (egress)
+/// bridge carries, and a network source "originates at your premises", which is what a
+/// ground-to-cloud (ingress) bridge carries. A bridge carrying a PAIR of sources also
+/// carries the failover config that lets it hold one ("if the state is active, [it] can
+/// have one or two sources", `FailoverConfig$State`). The create is the subject of
+/// `bridge_lifecycle` and the pairing rule of `crate::bridge_source_admission`; here this
+/// is only the fixture every update addresses.
 async fn bridge_with(
     emulator: &Emulator,
     name: &str,
     placement_arn: &str,
     sources: Vec<Value>,
 ) -> (String, Value) {
-    let (status, code, created) = create_bridge(
-        emulator,
-        json!({
-            "name": name,
-            "placementArn": placement_arn,
-            "ingressGatewayBridge": { "maxBitrate": 20_000_000, "maxOutputs": 8 },
-            "sources": sources,
-        }),
-    )
-    .await;
+    let egress = sources
+        .first()
+        .is_some_and(|source| source.get("flowSource").is_some());
+    let mut body = json!({
+        "name": name,
+        "placementArn": placement_arn,
+        "sources": sources,
+    });
+    if egress {
+        body["egressGatewayBridge"] = json!({ "maxBitrate": 20_000_000 });
+    } else {
+        body["ingressGatewayBridge"] = json!({ "maxBitrate": 20_000_000, "maxOutputs": 8 });
+    }
+    if sources.len() > 1 {
+        body["sourceFailoverConfig"] = json!({ "state": mc::STATE_ENABLED });
+    }
+    let (status, code, created) = create_bridge(emulator, body).await;
     assert_eq!(
         (status, code.as_deref()),
         (201, None),
@@ -305,10 +319,9 @@ fn update_cases(flow_a: &str, flow_b: &str) -> Vec<UpdateCase> {
             }}),
         },
         UpdateCase {
-            case: "the FIRST of three sources: the other two are left alone",
+            case: "the FIRST of a failover pair of network sources: the other is left alone",
             sources: vec![
                 network_source("first", 5100, "rtp"),
-                flow_source("middle", flow_a),
                 network_source("last", 5102, "udp"),
             ],
             source_name: "first",
@@ -322,21 +335,9 @@ fn update_cases(flow_a: &str, flow_b: &str) -> Vec<UpdateCase> {
             }}),
         },
         UpdateCase {
-            case: "the MIDDLE of three sources, which is a flow source among network ones",
+            case: "the LAST of a failover pair of network sources",
             sources: vec![
                 network_source("first", 5100, "rtp"),
-                flow_source("middle", flow_a),
-                network_source("last", 5102, "udp"),
-            ],
-            source_name: "middle",
-            update: json!({ "flowSource": { "flowArn": flow_b } }),
-            expected: json!({ "flowSource": { "flowArn": flow_b, "name": "middle" } }),
-        },
-        UpdateCase {
-            case: "the LAST of three sources",
-            sources: vec![
-                network_source("first", 5100, "rtp"),
-                flow_source("middle", flow_a),
                 network_source("last", 5102, "udp"),
             ],
             source_name: "last",
@@ -348,6 +349,13 @@ fn update_cases(flow_a: &str, flow_b: &str) -> Vec<UpdateCase> {
                 "port": 5102,
                 "protocol": "srt-listener",
             }}),
+        },
+        UpdateCase {
+            case: "the FIRST of a failover pair of flow sources",
+            sources: vec![flow_source("first", flow_a), flow_source("last", flow_b)],
+            source_name: "first",
+            update: json!({ "flowSource": { "flowArn": flow_b } }),
+            expected: json!({ "flowSource": { "flowArn": flow_b, "name": "first" } }),
         },
     ]
 }
@@ -571,14 +579,21 @@ async fn an_update_bridge_source_request_the_source_cannot_satisfy_is_refused_an
         flow_a: flow_arn,
         ..
     } = fixture(&emulator, "source-refusals").await;
-    let (bridge_arn, created) = bridge_with(
+    // One bridge per kind of source, because a bridge ingests the one kind its direction
+    // admits: the flow source lives on the cloud-to-ground bridge and the network source on
+    // the ground-to-cloud one (see `crate::bridge_source_admission`).
+    let (egress_arn, egress_created) = bridge_with(
         &emulator,
-        "bridge-source-refusals",
+        "bridge-source-refusals-egress",
         &placement_arn,
-        vec![
-            flow_source("flow-src", &flow_arn),
-            network_source("net-src", 5000, "rtp"),
-        ],
+        vec![flow_source("flow-src", &flow_arn)],
+    )
+    .await;
+    let (ingress_arn, ingress_created) = bridge_with(
+        &emulator,
+        "bridge-source-refusals-ingress",
+        &placement_arn,
+        vec![network_source("net-src", 5000, "rtp")],
     )
     .await;
     // A bridge ARN of the form this service mints, for a bridge nothing ever created.
@@ -591,7 +606,7 @@ async fn an_update_bridge_source_request_the_source_cannot_satisfy_is_refused_an
     let cases: Vec<(&str, &str, &str, Value, u16, &str, &str)> = vec![
         (
             "FlowSource on a source that is a network source",
-            &bridge_arn,
+            &ingress_arn,
             "net-src",
             json!({ "flowSource": { "flowArn": flow_arn } }),
             400,
@@ -600,7 +615,7 @@ async fn an_update_bridge_source_request_the_source_cannot_satisfy_is_refused_an
         ),
         (
             "NetworkSource on a source that is a flow source",
-            &bridge_arn,
+            &egress_arn,
             "flow-src",
             json!({ "networkSource": { "port": 9 } }),
             400,
@@ -609,7 +624,7 @@ async fn an_update_bridge_source_request_the_source_cannot_satisfy_is_refused_an
         ),
         (
             "both wrappers at once: a source is one kind or the other",
-            &bridge_arn,
+            &ingress_arn,
             "net-src",
             json!({
                 "flowSource": { "flowArn": flow_arn },
@@ -621,7 +636,7 @@ async fn an_update_bridge_source_request_the_source_cannot_satisfy_is_refused_an
         ),
         (
             "a source name this bridge holds no source for",
-            &bridge_arn,
+            &ingress_arn,
             "no-such-source",
             json!({ "networkSource": { "port": 9 } }),
             404,
@@ -655,17 +670,22 @@ async fn an_update_bridge_source_request_the_source_cannot_satisfy_is_refused_an
         );
     }
 
-    // A refused update writes nothing: the bridge is exactly as it was created.
-    let (status, _, described) = describe_bridge(&emulator, &bridge_arn).await;
-    assert_eq!(
-        status, 200,
-        "describe expected 200 after the refusals, got {status}: {described}"
-    );
-    for member in ["sources", "outputs", "bridgeArn", "name", "placementArn"] {
+    // A refused update writes nothing: each bridge is exactly as it was created.
+    for (case, arn, created) in [
+        ("the cloud-to-ground bridge", &egress_arn, &egress_created),
+        ("the ground-to-cloud bridge", &ingress_arn, &ingress_created),
+    ] {
+        let (status, _, described) = describe_bridge(&emulator, arn).await;
         assert_eq!(
-            described["bridge"][member], created["bridge"][member],
-            "a refused update leaves {member} alone, got {:?}",
-            described["bridge"][member]
+            status, 200,
+            "case {case:?}: describe expected 200 after the refusals, got {status}: {described}"
         );
+        for member in ["sources", "outputs", "bridgeArn", "name", "placementArn"] {
+            assert_eq!(
+                described["bridge"][member], created["bridge"][member],
+                "case {case:?}: a refused update leaves {member} alone, got {:?}",
+                described["bridge"][member]
+            );
+        }
     }
 }

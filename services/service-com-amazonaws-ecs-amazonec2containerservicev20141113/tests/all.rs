@@ -73,6 +73,8 @@ mod state_roundtrip;
 mod tag_set_reads;
 #[path = "all/tagging_writes.rs"]
 mod tagging_writes;
+#[path = "all/task_definition_deletion.rs"]
+mod task_definition_deletion;
 #[path = "all/task_definition_deregistration.rs"]
 mod task_definition_deregistration;
 #[path = "all/task_definition_projection.rs"]

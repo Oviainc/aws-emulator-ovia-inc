@@ -157,7 +157,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DescribeLanguageModelErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -170,10 +169,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The Region this request is served in: a regional endpoint reports only the
+        // models created through it.
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        let Some(record) = store.language_model_mut(&input.model_name, now) else {
-            // A custom language model this account does not hold is this service's
+        let Some(record) = store.language_model_mut(&region, &input.model_name, now) else {
+            // A custom language model this Region does not hold is this service's
             // `BadRequestException`, as it is for every other reader here
             // (`GetVocabulary`, `GetMedicalVocabulary`): the shape whose own
             // documentation covers an entity that "doesn't exist", and the one this

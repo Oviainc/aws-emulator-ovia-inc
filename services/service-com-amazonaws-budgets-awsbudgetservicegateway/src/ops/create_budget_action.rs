@@ -252,6 +252,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
+        // "Either an Amazon SNS topic or an email address" (`Subscriber`), and "the value
+        // of `Address` can't contain line breaks" (`Subscriber$Address`) — the form of
+        // every address this write establishes, the same rule a notification's
+        // subscribers are held to, since both sets are the one modelled `Subscribers`
+        // shape. Checked before the budget is looked up, so nothing is persisted by a
+        // refused create.
+        crate::state::subscriber_address_violation(&input.subscribers).map_err(|message| {
+            CreateBudgetActionErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(message),
+            })
+        })?;
+
         // "A notification can have one SNS subscriber and up to 10 email subscribers,
         // for a total of 11 subscribers" — the PER-TYPE halves of the subscriber set
         // this write establishes, which no constraint trait can express. The total and

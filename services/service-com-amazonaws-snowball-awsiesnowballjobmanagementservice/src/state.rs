@@ -2,12 +2,12 @@
 
 //! Engine state for the com-amazonaws-snowball-awsiesnowballjobmanagementservice service.
 //!
-//! Besides the state struct itself this module holds the helpers the job and address
-//! handlers share — id minting in the modelled formats, the record-to-modelled-shape
-//! conversions and the list cursor codec — so the handlers agree on one implementation
-//! of each instead of carrying a copy apiece that can drift apart.
+//! Besides the state struct itself this module holds the helpers the job, address and
+//! long-term-pricing handlers share — id minting in the modelled formats, the
+//! record-to-modelled-shape conversions and the list cursor codec — so the handlers agree
+//! on one implementation of each instead of carrying a copy apiece that can drift apart.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -89,6 +89,22 @@ pub const MAX_STORED_ADDRESSES: usize = 1_000;
 /// not remove it, so the ceiling is what keeps repeated job creation from growing the
 /// process without limit.
 pub const MAX_STORED_JOBS: usize = 1_000;
+
+/// The most long-term pricing contracts this store holds.
+///
+/// Bounds the same way `MAX_STORED_ADDRESSES` and `MAX_STORED_JOBS` do:
+/// `CreateLongTermPricing` persists one record per call and nothing in this API deletes
+/// one, so the ceiling is what keeps repeated creates from growing the process without
+/// limit.
+pub const MAX_STORED_LONG_TERM_PRICING: usize = 1_000;
+
+/// The status a long-term pricing contract carries from the moment it is created.
+///
+/// `LongTermPricingListEntry$LongTermPricingStatus` is modelled as a plain string with no
+/// catalog (`smithy_query(query="shape", shape="LongTermPricingListEntry")`), and a
+/// contract AWS has taken the upfront payment for and is holding to is reported as
+/// `ACTIVE`.
+pub const LONG_TERM_PRICING_STATUS_ACTIVE: &str = "ACTIVE";
 
 /// The most clusters this store holds.
 ///
@@ -672,6 +688,31 @@ impl StoredJob {
     }
 }
 
+/// One stored long-term pricing contract: the id the service minted for it, the term and
+/// device type it was bought for, and the window it runs over — everything
+/// `ListLongTermPricing` reports about a contract that has no job associated with it yet.
+///
+/// `CurrentActiveJob`, `ReplacementJob` and `JobIds` are deliberately absent: each names a
+/// job associated with the contract, which only `CreateJob` and `UpdateLongTermPricing`
+/// can produce, and neither associates one yet.
+#[derive(Debug, Clone)]
+pub struct StoredLongTermPricing {
+    pub long_term_pricing_id: String,
+    /// The term the contract was bought for, spelled as `LongTermPricingType` spells it.
+    pub long_term_pricing_type: String,
+    /// The device type the contract covers, spelled as `SnowballType` spells it.
+    pub snowball_type: String,
+    /// Whether the contract renews itself when it reaches its end date. Absent on the
+    /// create means "do not renew", so every stored contract answers the question.
+    pub is_long_term_pricing_auto_renew: bool,
+    /// The instant the contract was created, which is the instant its term starts.
+    pub long_term_pricing_start_date: SystemTime,
+    /// The instant the term bought ends: the start plus the whole calendar months
+    /// `LongTermPricingType` names.
+    pub long_term_pricing_end_date: SystemTime,
+    pub long_term_pricing_status: String,
+}
+
 /// One stored cluster: the id and state the service minted for it plus every
 /// `CreateCluster` input a cluster keeps, so `DescribeCluster` reports what was persisted
 /// and a node job created for the cluster inherits it.
@@ -1056,6 +1097,21 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_default()
 }
 
+/// How this service refuses `value`, submitted for the modelled member `member`, when it
+/// is outside the enum catalog `catalog`: the wording the boundary validator uses for a
+/// value a modelled constraint rejects.
+///
+/// One implementation for every handler that checks an enum member against its catalog —
+/// `CreateAddress` for `Address$Type`, `CreateLongTermPricing` for `LongTermPricingType`
+/// and `SnowballType` — so the wire wording cannot drift between them.
+pub fn outside_catalog_message(member: &str, value: &str, catalog: &[&str]) -> String {
+    format!(
+        "Value '{value}' at '{member}' failed to satisfy constraint: Member must satisfy \
+         enum value set: [{}]",
+        catalog.join(", ")
+    )
+}
+
 /// Mint an id in the `<prefix><8-4-4-4-12 lowercase hex>` form this service's modelled
 /// id patterns admit.
 ///
@@ -1307,16 +1363,25 @@ pub struct ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     pub jobs: HashMap<String, StoredJob>,
     /// Every cluster `CreateCluster` stored, keyed by the `ClusterId` it minted.
     pub clusters: HashMap<String, StoredCluster>,
-    /// The `LongTermPricingId` of every long-term pricing record this store holds — the
-    /// ids a job or cluster order can be billed under.
-    ///
-    /// A record is created by `CreateLongTermPricing`, which is what puts an id here, so
-    /// a store in which none has been created holds none and no id names a record. An
-    /// order naming one is checked against this set rather than against the id's form,
-    /// so exactly the ids this emulator minted are the ones it accepts.
-    pub long_term_pricing_ids: BTreeSet<String>,
     /// The ids in `jobs` in creation order, so `ListJobs` pages deterministically.
     pub job_order: Vec<String>,
+    /// Every long-term pricing contract `CreateLongTermPricing` stored, keyed by the
+    /// `LongTermPricingId` it minted — the ONE record of which contracts this store holds,
+    /// and so of which ids a job or cluster order can be billed under.
+    ///
+    /// A contract is created by `CreateLongTermPricing`, which is what puts a record here,
+    /// so a store in which none has been created holds none and no id names a contract. An
+    /// order naming one is checked against this map (through
+    /// [`Self::holds_long_term_pricing`]) rather than against the id's form, so exactly the
+    /// ids this emulator minted are the ones it accepts.
+    pub long_term_pricing: HashMap<String, StoredLongTermPricing>,
+    /// The ids in `long_term_pricing` in creation order, so a listing of the contracts
+    /// pages deterministically the way `job_order` lets `ListJobs` page over jobs.
+    ///
+    /// `ListLongTermPricing` is the reader this order is for and is still a scaffold stub,
+    /// so until it is implemented the order is maintained by the insertion point and read
+    /// only by this crate's tests.
+    pub long_term_pricing_order: Vec<String>,
     /// The ids in `clusters` in creation order, so `ListClusters` pages deterministically.
     pub cluster_order: Vec<String>,
     /// The versions of each Snow on-device service this emulator supports, keyed by the
@@ -1335,10 +1400,12 @@ pub struct ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     /// current return shipping label" — so this holds at most one record per stored job
     /// and is bounded by [`MAX_STORED_JOBS`] without a ceiling of its own.
     return_shipping_labels: HashMap<String, StoredReturnShippingLabel>,
-    /// How many addresses this store has ever minted an id for, and how many jobs: the
-    /// per-store sequence [`mint_id`] hashes, so two records never share an id.
+    /// How many addresses this store has ever minted an id for, how many jobs, how many
+    /// clusters and how many long-term pricing contracts: the per-store sequence
+    /// [`mint_id`] hashes, so two records never share an id.
     next_address_seq: u64,
     next_job_seq: u64,
+    next_long_term_pricing_seq: u64,
     next_cluster_seq: u64,
     /// How many published-file grants this store has ever issued: the per-store sequence
     /// the grant token hashes, so two grants never share a token.
@@ -1352,21 +1419,24 @@ pub struct ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
 }
 
 impl Default for ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
-    /// A store holding no address and no job, and the on-device service version catalog
-    /// this emulator supports — the one state the engine builds on first touch.
+    /// A store holding no address, no job and no long-term pricing contract, and the
+    /// on-device service version catalog this emulator supports — the one state the engine
+    /// builds on first touch.
     fn default() -> Self {
         Self {
             addresses: HashMap::new(),
             jobs: HashMap::new(),
             clusters: HashMap::new(),
-            long_term_pricing_ids: BTreeSet::new(),
             job_order: Vec::new(),
+            long_term_pricing: HashMap::new(),
+            long_term_pricing_order: Vec::new(),
             cluster_order: Vec::new(),
             service_versions: seed_service_versions(),
             job_file_grants: Vec::new(),
             return_shipping_labels: HashMap::new(),
             next_address_seq: 0,
             next_job_seq: 0,
+            next_long_term_pricing_seq: 0,
             next_cluster_seq: 0,
             next_job_file_grant_seq: 0,
             next_return_shipping_label_seq: 0,
@@ -1382,10 +1452,13 @@ impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
         self.service_versions.get(service_name).map(Vec::as_slice)
     }
 
-    /// Whether this store holds the long-term pricing record `long_term_pricing_id`
+    /// Whether this store holds the long-term pricing contract `long_term_pricing_id`
     /// names.
+    ///
+    /// Asked of the stored contracts themselves, so the ids an order may be billed under
+    /// are exactly the ones `CreateLongTermPricing` minted a contract for.
     pub fn holds_long_term_pricing(&self, long_term_pricing_id: &str) -> bool {
-        self.long_term_pricing_ids.contains(long_term_pricing_id)
+        self.long_term_pricing.contains_key(long_term_pricing_id)
     }
 
     /// Whether this store can hold another address, i.e. is below
@@ -1416,6 +1489,46 @@ impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     pub fn mint_job_id(&mut self) -> String {
         self.next_job_seq += 1;
         mint_id("JID", self.next_job_seq, SystemTime::now())
+    }
+
+    /// Whether this store can hold another long-term pricing contract, i.e. is below
+    /// [`MAX_STORED_LONG_TERM_PRICING`].
+    pub fn can_store_another_long_term_pricing(&self) -> bool {
+        self.long_term_pricing.len() < MAX_STORED_LONG_TERM_PRICING
+    }
+
+    /// Mint the next `LongTermPricingId`: the 41-character form the modelled pattern
+    /// `^LTPID[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$` admits.
+    pub fn mint_long_term_pricing_id(&mut self) -> String {
+        self.next_long_term_pricing_seq += 1;
+        mint_id("LTPID", self.next_long_term_pricing_seq, SystemTime::now())
+    }
+
+    /// Store `pricing` under its minted id as the newest contract, or answer `false`,
+    /// storing nothing, when storing it would take this store past
+    /// [`MAX_STORED_LONG_TERM_PRICING`].
+    ///
+    /// The ceiling is enforced HERE, at the insertion point, so a handler cannot exceed it
+    /// by forgetting to ask [`Self::can_store_another_long_term_pricing`] first. It bounds
+    /// GROWTH, so it is asked only of a contract whose id the store does not hold yet. This
+    /// is also the only place a contract is recorded, so the map and the creation order it
+    /// is paged in cannot disagree about which contracts the store holds: a contract stored
+    /// under an id the store already holds replaces that record and keeps its place in the
+    /// order rather than appearing in it twice.
+    pub fn insert_long_term_pricing(&mut self, pricing: StoredLongTermPricing) -> bool {
+        if !self
+            .long_term_pricing
+            .contains_key(&pricing.long_term_pricing_id)
+        {
+            if !self.can_store_another_long_term_pricing() {
+                return false;
+            }
+            self.long_term_pricing_order
+                .push(pricing.long_term_pricing_id.clone());
+        }
+        self.long_term_pricing
+            .insert(pricing.long_term_pricing_id.clone(), pricing);
+        true
     }
 
     /// Mint the next job's unlock code: the form `GetJobUnlockCode` documents, minted

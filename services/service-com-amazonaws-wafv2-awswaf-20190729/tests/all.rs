@@ -21,6 +21,8 @@ mod check_capacity;
 mod exception_messages;
 #[path = "all/firewall_manager_rule_groups.rs"]
 mod firewall_manager_rule_groups;
+#[path = "all/get_web_acl_for_resource.rs"]
+mod get_web_acl_for_resource;
 #[path = "all/ip_set_mutations.rs"]
 mod ip_set_mutations;
 #[path = "all/list_resources_for_web_acl.rs"]

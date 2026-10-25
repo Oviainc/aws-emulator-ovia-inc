@@ -36,7 +36,7 @@ use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
     PricingPlanRecord, PRICING_MODE_BASIC, UPDATE_REASON_DEFAULT,
 };
 
-use crate::harness::Emulator;
+use crate::harness::{Emulator, REGION};
 
 /// An instant a whole number of seconds after the epoch, so a seeded plan's
 /// timestamps are exact on the wire rather than compared with a tolerance.
@@ -161,6 +161,7 @@ fn at_secs(instant: SystemTime) -> f64 {
 fn seed(emulator: &Emulator, current: &PricingPlanRecord, pending: Option<&PricingPlanRecord>) {
     let state = emulator.state();
     let mut state = state.lock();
+    let state = state.region_mut(REGION);
     state.pricing_plan = current.clone();
     state.pending_pricing_plan = pending.cloned();
 }

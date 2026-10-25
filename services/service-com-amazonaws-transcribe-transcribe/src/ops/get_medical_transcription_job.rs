@@ -157,7 +157,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 GetMedicalTranscriptionJobErrorModeled::InternalFailureException(
@@ -172,17 +171,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // The Region this request is served in: a regional endpoint reports only the
+        // jobs started through it.
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // The lookup materialises the transition the clock already owed this job, so
         // the status reported here is the one it had at `now`. That is the only write
         // this reporting operation performs.
-        let Some(record) =
-            store.medical_transcription_job_mut(&input.medical_transcription_job_name, now)
-        else {
+        let Some(record) = store.medical_transcription_job_mut(
+            &region,
+            &input.medical_transcription_job_name,
+            now,
+        ) else {
             return Err(GetMedicalTranscriptionJobErrorModeled::BadRequestException(
                 BadRequestException {
-                    // A job this account never started is this service's
+                    // A job this Region never started is this service's
                     // `BadRequestException`, not the modelled `NotFoundException`:
                     // the shape its recorded not-found responses carry, the one whose
                     // documentation covers an entity that "doesn't exist", and the one

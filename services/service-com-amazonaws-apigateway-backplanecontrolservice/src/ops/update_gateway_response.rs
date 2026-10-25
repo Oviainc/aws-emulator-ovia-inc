@@ -104,17 +104,12 @@ use crate::state::{
     patch_string_map, Patch, PatchFailure, PatchOpKind, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
 };
 
-/// The `path` values `UpdateGatewayResponse` accepts: one per updateable member of the
-/// `GatewayResponse` shape. `responseType` is the response's identity — it is the URI
-/// label that addresses this very record — so it is reported but not patchable, the way
-/// `UpdateMethodResponse` treats a method response's `statusCode`; `defaultResponse` is
-/// the service's own report of whether the response is generated or customized, not a
-/// member a caller sets.
-const SUPPORTED_PATHS: &[&str] = &[
-    "/responseParameters/<parameter-name>",
-    "/responseTemplates/<content-type>",
-    "/statusCode",
-];
+// The `path` values `UpdateGatewayResponse` accepts are the ones `apply_patch` below has
+// an arm for: one per updateable member of the `GatewayResponse` shape. `responseType` is
+// the response's identity — it is the URI label that addresses this very record — so it is
+// reported but not patchable, the way `UpdateMethodResponse` treats a method response's
+// `statusCode`; `defaultResponse` is the service's own report of whether the response is
+// generated or customized, not a member a caller sets.
 
 /// Apply one patch to a COPY of the gateway response `response_type` reports.
 ///
@@ -194,7 +189,7 @@ fn apply_patch(
             entry.response_templates = crate::state::stored_map(templates);
             Ok(())
         }
-        _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
+        _ => Err(patch.unsupported_path()),
     }
 }
 

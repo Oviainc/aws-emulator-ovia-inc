@@ -239,10 +239,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(record) = store
             .vocabulary_filters
-            .get_mut(&input.vocabulary_filter_name)
+            .get_mut(&region, &input.vocabulary_filter_name)
         else {
-            // As `UpdateVocabulary`: a resource that does not exist is this service's
-            // `BadRequestException`, whose documentation covers an entity that
+            // As `UpdateVocabulary`: a resource this Region does not hold is this
+            // service's `BadRequestException`, whose documentation covers an entity that
             // "doesn't exist", and not the modelled `NotFoundException`.
             return Err(bad_request(&crate::state::not_found_message(
                 crate::state::KIND_VOCABULARY_FILTER,
@@ -255,7 +255,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.words = words;
         record.file_uri = file_uri;
         record.last_modified_time = now;
-        record.region = region;
+        // As `UpdateVocabulary`: the Region a resource lives in is fixed when it is
+        // created, because the store is keyed by it, so an update never migrates one.
         record.data_access_role_arn = input.data_access_role_arn;
         record.encryption_configuration = input.encryption_configuration;
 

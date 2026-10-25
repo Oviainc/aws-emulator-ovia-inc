@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_settings.rs"]
 mod account_settings;
+#[path = "all/application_group_identity.rs"]
+mod application_group_identity;
 #[path = "all/delete_group_protection.rs"]
 mod delete_group_protection;
 #[path = "all/get_tag_sync_task.rs"]

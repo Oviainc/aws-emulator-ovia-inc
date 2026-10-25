@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelReplay
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelReplay`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Cancels a replay that is still running: the replay stops re-publishing and
+//! settles cancelled rather than completed.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelReplay::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Cancels the specified replay" (this operation's documentation), so the call
+//! MUTATES the replay [`crate::state::ReplayRecord`] the `ReplayName` names — the
+//! replay's identity is its name, which is what `StartReplay` created it under and
+//! what `DescribeReplay` reads it back under, so a name this account holds no
+//! replay for is the modelled `ResourceNotFoundException`.
+//!
+//! The cancellation is accepted in [`crate::state::REPLAY_STATE_CANCELLING`] and
+//! the replay reaches [`crate::state::REPLAY_STATE_CANCELLED`]
+//! [`crate::state::REPLAY_TRANSITION`] later
+//! ([`crate::state::ComAmazonawsEventbridgeAwseventsState::settle_replays`]),
+//! earning the `ReplayEndTime` every terminal replay carries, so a caller polling
+//! `DescribeReplay` straight after the call still observes the transient state.
+//! That cancelled state REPLACES the `COMPLETED` the clock owed the replay: a
+//! replay that was stopped did not finish its window.
+//!
+//! "An error occurred because a replay can be canceled only when the state is
+//! Running or Starting" (`IllegalStatusException`): a replay that has already
+//! settled — or is already cancelling — is in a state this call cannot change, so
+//! it is refused with that modelled error rather than answered as if it had been
+//! cancelled again. The name stays held either way, so `StartReplay` reusing it is
+//! still `ResourceAlreadyExistsException`.
 //!
 //! ## Shape of an operation
 //!
@@ -147,20 +162,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelReplay` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelReplayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelReplay"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CancelReplayErrorModeled::InternalException(InternalException {
+                message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+            })
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // What the clock already owed the replays is settled first, so the state
+        // this call guards on is the state the replay is in at this instant —
+        // never the one the last write left behind.
+        store.settle_replays(now);
+
+        // `replay_mut` CREATES nothing — a replay comes into existence only
+        // through `StartReplay` — so resolving the mutable record first is what
+        // lets this one call both guard on the state it finds and write the
+        // cancellation, without reading the record twice.
+        let Some(replay) = store.replay_mut(&input.replay_name) else {
+            return Err(CancelReplayErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::no_such_replay(&input.replay_name)),
+                },
+            )
+            .into());
+        };
+        // "A replay can be canceled only when the state is Running or Starting"
+        // (`IllegalStatusException`).
+        if !replay.is_cancellable() {
+            return Err(CancelReplayErrorModeled::IllegalStatusException(
+                IllegalStatusException {
+                    message: Some(crate::state::replay_not_cancellable(&replay.name)),
+                },
+            )
+            .into());
+        }
+        replay.cancel(now);
+        // Reported from the STORED record rather than from the request, so this
+        // response and `DescribeReplay`'s cannot disagree.
+        Ok(CancelReplayOutput {
+            replay_arn: Some(replay.arn.clone()),
+            state: Some(replay.state.clone()),
+            state_reason: replay.state_reason.clone(),
+        })
     }
 }

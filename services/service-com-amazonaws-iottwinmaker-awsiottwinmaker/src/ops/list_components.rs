@@ -191,7 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             entity_id = %input.entity_id,
             "serving a request"
         );
-        let _ = ctx;
+        // The Region this request is signed for picks the store that answers
+        // it: a workspace created through another Region's endpoint is not in
+        // it, so neither are its entities' components.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListComponentsErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the iottwinmaker store is unavailable".to_string()),
@@ -202,6 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so this call has no transition to materialise and nothing a later
         // caller sees changes because a page was served.
         let state = state.lock();
+        let state = state.region(&region);
 
         let invalid = |message: String| {
             ListComponentsErrorModeled::ValidationException(ValidationException {

@@ -890,6 +890,18 @@
 //! clock and the same [`TRANSITION_DELAY`] as an instance's [`PendingTransition`], and
 //! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies them.
 //!
+//! A FUTURE-DATED reservation is one of these records too: it carries the `StartDate` the
+//! request asked for, the [`CapacityReservationCommitment`] it committed to and its
+//! `DeliveryPreference`, and it starts in `assessing` — "Amazon EC2 is assessing your
+//! request for a future-dated Capacity Reservation" (`CapacityReservation$State`) — with
+//! the move to `scheduled` owed one [`TRANSITION_DELAY`] later, the span every other move
+//! above is owed. That move and the delivery after it are both reported off the WALL clock
+//! rather than from a word a writer stored, because the instants a read compares them
+//! against are wall-clock ones ([`ClockTransition::at`] and the reservation's own
+//! `StartDate`): [`CapacityReservationRecord::state_at`] reports a reservation whose
+//! assessment has fallen due as `scheduled`, and one whose `StartDate` has arrived as
+//! `active`, the way it reports one whose `EndDate` has passed as `expired`.
+//!
 //! ## Capacity Reservation Fleets
 //!
 //! [`ComAmazonawsEc2Amazonec2State::capacity_reservation_fleets`] holds the account's
@@ -1070,7 +1082,8 @@ use crate::ops::types::{
     Byoasn, ByoipCidr,
     DhcpConfiguration, DhcpOptions,
     CapacityBlock, CapacityReservation, CapacityReservationBillingRequest,
-    CapacityReservationInfo, ExportTask, FpgaImage, FpgaImageState, ImageUsageReport,
+    CapacityReservationCommitmentInfo, CapacityReservationInfo, ExportTask, FpgaImage,
+    FpgaImageState, ImageUsageReport,
     LoadPermission,
     CapacityReservationFleet, FleetCapacityReservation,
     StorageLocation, VolumeRecycleBinInfo,
@@ -2389,9 +2402,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// request" (`CreateInterruptibleCapacityReservationAllocationRequest$ClientToken`).
     pub interruptible_allocation_client_tokens: HashMap<String, String>,
     /// A `CreateCapacityReservation` `ClientToken` and the `CapacityReservationId` it
-    /// minted, so a repeat of the same request answers with that reservation instead of
-    /// reserving capacity twice.
-    pub capacity_reservation_client_tokens: HashMap<String, String>,
+    /// minted, keyed by the Region the create was signed for and that token, so a repeat of
+    /// the same request answers with that reservation instead of reserving capacity twice —
+    /// and the same token signed for ANOTHER Region is a different request rather than a
+    /// replay of this one, an idempotency key being scoped to one Region.
+    pub capacity_reservation_client_tokens: HashMap<(String, String), String>,
     /// What each instance's application health status is derived from, by `InstanceId` —
     /// see [`InstanceApplicationStatusRecord`] and the module docs. An instance with no
     /// entry has had no application status check reported for it, which is exactly the
@@ -5559,6 +5574,9 @@ impl ComAmazonawsEc2Amazonec2State {
                 CapacityReservationMove::Active => {
                     record.view.state = Some(CAPACITY_RESERVATION_STATE_ACTIVE.to_string());
                 }
+                CapacityReservationMove::Scheduled => {
+                    record.view.state = Some(CAPACITY_RESERVATION_STATE_SCHEDULED.to_string());
+                }
                 CapacityReservationMove::AllocationActive => {
                     if let Some(allocation) = record.view.interruptible_capacity_allocation.as_mut()
                     {
@@ -8567,6 +8585,21 @@ pub fn matches_every_filter<'a>(
                 .any(|value| pattern.matches_within(value, budget))
         })
     })
+}
+
+/// A modelled timestamp as a filter value compares against it: the ISO 8601 UTC rendering
+/// the wire carries it as. A member that is not set carries no value for the filter to
+/// match, like any other absent attribute.
+///
+/// Beside [`matches_every_filter`] because every describe that filters on a timestamp needs
+/// exactly this rendering, and two copies of it could drift.
+pub fn filter_timestamp_values(
+    at: Option<::aws_smithy_types::DateTime>,
+) -> Vec<Cow<'static, str>> {
+    at.and_then(|at| at.fmt(::aws_smithy_types::date_time::Format::DateTime).ok())
+        .map(Cow::Owned)
+        .into_iter()
+        .collect()
 }
 
 /// Refuse a request member's value the way EC2 does: HTTP 400 `InvalidParameterValue`,
@@ -16421,6 +16454,10 @@ pub fn capacity_reservation_payload_bytes(reservation: &CapacityReservation) -> 
 pub enum CapacityReservationMove {
     /// `pending` -> `active`: the capacity the reservation was minted for is provisioned.
     Active,
+    /// `assessing` -> `scheduled`: the future-dated request Amazon EC2 was "assessing" is
+    /// approved, so the reservation is "scheduled for delivery on the requested start date"
+    /// (`CapacityReservation$State`).
+    Scheduled,
     /// The interruptible allocation the reservation carries reaches `active` with the whole
     /// `TargetInstanceCount` allocated — the completion of the `pending` move
     /// `CreateInterruptibleCapacityReservationAllocation` starts on the SOURCE reservation.
@@ -16457,25 +16494,58 @@ impl CapacityReservationRecord {
 
     /// The reservation's state at `now`.
     ///
-    /// "The Capacity Reservation's state changes to `expired` when it reaches its end date
-    /// and time" (`CapacityReservation$EndDate`), so an `active` reservation whose end date
-    /// the WALL clock has passed is `expired` whether or not anybody called — the same
-    /// arrangement [`CapacityBlockRecord::state_at`] gives a Capacity Block's reserved
-    /// window. Every other state is a word a writer stored, and no passage of time moves a
+    /// Three facts of the clock are derived here rather than stored, so a read reports what
+    /// was already due without writing anything:
+    ///
+    /// * The approval of a future-dated request. It is created `assessing` — "Amazon EC2 is
+    ///   assessing your request for a future-dated Capacity Reservation" — and the move to
+    ///   `scheduled` fell due at the WALL-clock instant its
+    ///   [`CapacityReservationTransition`] names ([`ClockTransition::at`], which is what
+    ///   `now` is compared against here), whether or not anybody called again.
+    /// * The delivery of a future-dated reservation: one that is `scheduled` is "scheduled
+    ///   for delivery on the requested start date" (`CapacityReservation$State`), so it is
+    ///   `active` from that date on. A future-dated reservation is the one that carries a
+    ///   `DeliveryPreference`, which is how a reservation delivered on a date is told from
+    ///   one whose capacity was there from the start.
+    /// * The expiry of any reservation: "The Capacity Reservation's state changes to
+    ///   `expired` when it reaches its end date and time" (`CapacityReservation$EndDate`) —
+    ///   the same arrangement [`CapacityBlockRecord::state_at`] gives a Capacity Block's
+    ///   reserved window.
+    ///
+    /// Every other state is a word a writer stored, and no passage of time moves a
     /// cancelled or failed reservation anywhere.
     pub fn state_at(&self, now: SystemTime) -> &str {
         let stored = self.state();
-        if stored != CAPACITY_RESERVATION_STATE_ACTIVE {
+        let now_key = date_time_key(system_time_to_date_time(now));
+        let assessed = stored == CAPACITY_RESERVATION_STATE_ASSESSING
+            && self.pending.as_ref().is_some_and(|pending| {
+                matches!(pending.to, CapacityReservationMove::Scheduled) && now >= pending.at
+            });
+        let stored = if assessed {
+            CAPACITY_RESERVATION_STATE_SCHEDULED
+        } else {
+            stored
+        };
+        let delivered = stored == CAPACITY_RESERVATION_STATE_SCHEDULED
+            && self.view.delivery_preference.is_some()
+            && self
+                .view
+                .start_date
+                .map(date_time_key)
+                .is_some_and(|start| now_key >= start);
+        if stored != CAPACITY_RESERVATION_STATE_ACTIVE && !delivered {
             return stored;
         }
-        let now = date_time_key(system_time_to_date_time(now));
         if self
             .view
             .end_date
             .map(date_time_key)
-            .is_some_and(|end| now >= end)
+            .is_some_and(|end| now_key >= end)
         {
             return CAPACITY_RESERVATION_STATE_EXPIRED;
+        }
+        if delivered {
+            return CAPACITY_RESERVATION_STATE_ACTIVE;
         }
         stored
     }
@@ -16533,8 +16603,20 @@ pub struct CapacityReservationSpec {
     /// "Indicates the type of instance launches that the Capacity Reservation accepts"
     /// (`CapacityReservation$InstanceMatchCriteria`).
     pub instance_match_criteria: String,
-    /// When the reservation was created, which is also when its capacity starts.
+    /// When the reservation was created, which is also when its capacity starts unless the
+    /// request asked for a future-dated one.
     pub created_at: SystemTime,
+    /// The `StartDate` a FUTURE-DATED reservation was requested for — "The date and time at
+    /// which the future-dated Capacity Reservation should become available for use"
+    /// (`CreateCapacityReservationRequest$StartDate`) — or `None` for capacity for immediate
+    /// use, whose start date is `created_at`.
+    pub start_date: Option<SystemTime>,
+    /// What a future-dated reservation committed to ([`CapacityReservationCommitment`]), or
+    /// `None` for one created for immediate use, which commits to nothing.
+    pub commitment: Option<CapacityReservationCommitment>,
+    /// "The delivery method for a future-dated Capacity Reservation"
+    /// (`CapacityReservation$DeliveryPreference`), or `None` for an immediate one.
+    pub delivery_preference: Option<String>,
     /// The `CapacityReservationState` the reservation is created in. A `&'static str` so
     /// only a member of the modelled enum can be stored, never text from a request.
     pub state: &'static str,
@@ -16612,8 +16694,12 @@ impl ComAmazonawsEc2Amazonec2State {
             // request asked for it rather than dropped.
             ephemeral_storage: Some(spec.ephemeral_storage),
             state: Some(spec.state.to_string()),
-            // "The date and time the Capacity Reservation was started."
-            start_date: Some(system_time_to_date_time(spec.created_at)),
+            // "The date and time the Capacity Reservation was started." For capacity for
+            // immediate use that is when it was created; a future-dated reservation starts
+            // on the date the request asked for.
+            start_date: Some(system_time_to_date_time(
+                spec.start_date.unwrap_or(spec.created_at),
+            )),
             end_date: spec.end_date.map(system_time_to_date_time),
             // "You must provide an EndDate value if EndDateType is limited. Omit EndDate if
             // EndDateType is unlimited" (`CreateCapacityReservationRequest$EndDate`), so the
@@ -16643,10 +16729,24 @@ impl ComAmazonawsEc2Amazonec2State {
             // Billing of the unused capacity is assigned to another account only by
             // `AssociateCapacityReservationBillingOwner`, which is still a scaffold.
             unused_reservation_billing_owner_id: None,
-            // A commitment and a delivery preference are members of a future-dated
-            // reservation only, and a reservation starts here for immediate use.
-            commitment_info: None,
-            delivery_preference: None,
+            // "Information about the commitment for the Capacity Reservation"
+            // (`CapacityReservation$CommitmentInfo`) and "The delivery method"
+            // (`$DeliveryPreference`): members of a future-dated reservation only, so a
+            // reservation created for immediate use carries neither.
+            commitment_info: spec.commitment.map(|commitment| {
+                CapacityReservationCommitmentInfo {
+                    // "The instance capacity that you committed to when you requested the
+                    // future-dated Capacity Reservation"
+                    // (`CapacityReservationCommitmentInfo$CommittedInstanceCount`), which is
+                    // the capacity the request reserved.
+                    committed_instance_count: Some(spec.instance_count),
+                    // "The date and time at which the commitment duration expires"
+                    // (`$CommitmentEndDate`), computed by the writer from the start date.
+                    commitment_end_date: Some(system_time_to_date_time(commitment.end_date)),
+                    commitment_duration: Some(commitment.duration_seconds),
+                }
+            }),
+            delivery_preference: spec.delivery_preference,
             capacity_block_id: None,
             interruptible: Some(spec.interruption_info.is_some()),
             // Filled in by the allocation path on the SOURCE reservation, which is the
@@ -16659,8 +16759,11 @@ impl ComAmazonawsEc2Amazonec2State {
             adjustment_status: None,
             adjustment_details: None,
             // "This value doesn't change when you push out the start date"
-            // (`CapacityReservation$OriginalStartDate`): the start date it was created with.
-            original_start_date: Some(system_time_to_date_time(spec.created_at)),
+            // (`CapacityReservation$OriginalStartDate`): the start date it was created with,
+            // which for a future-dated reservation is the one the request asked for.
+            original_start_date: Some(system_time_to_date_time(
+                spec.start_date.unwrap_or(spec.created_at),
+            )),
             zero_size_preference: spec.zero_size_preference.map(str::to_string),
             // "Only supported for UltraServers" (`CapacityReservation$LaunchStatus`), and
             // this reservation is of plain instances.
@@ -27930,6 +28033,153 @@ pub fn spot_datafeed_store_full<E>(requested: usize) -> Scaffolded<E> {
     invalid_parameter_value(format!(
         "The data feed subscription needs {requested} more bytes, which this emulator has no \
          room for: it stores at most {MAX_STORED_BYTES} bytes of caller-supplied data"
+    ))
+}
+
+// =============================================================================
+// Future-dated Capacity Reservations
+// =============================================================================
+
+// A future-dated reservation is a record of the Capacity Reservation store above, not a
+// resource of its own, so the id prefix, the stored shape, the ceilings and the
+// `Invalid<Resource>Id.NotFound` refusal are the ones that section already declares. What
+// is only a future-dated reservation's lives here: the two states only it reaches, the
+// commitment it must carry, how far ahead it may start, the delivery method AWS supports
+// and the instance families it may reserve. The Region a reservation belongs to is here
+// too, because a future-dated create and the report of one ask the same question of it.
+
+/// "`assessing` - (*Future-dated Capacity Reservations*) Amazon EC2 is assessing your request
+/// for a future-dated Capacity Reservation" (that same member): where a future-dated
+/// reservation sits until the request is approved.
+pub const CAPACITY_RESERVATION_STATE_ASSESSING: &str = "assessing";
+
+/// "`scheduled` - (*Future-dated Capacity Reservations*) The future-dated Capacity
+/// Reservation request was approved and the Capacity Reservation is scheduled for delivery on
+/// the requested start date" (that same member).
+pub const CAPACITY_RESERVATION_STATE_SCHEDULED: &str = "scheduled";
+
+/// The `targeted` member of the modelled `InstanceMatchCriteria` enum — the one a
+/// future-dated Capacity Reservation must carry: "If you are requesting a future-dated
+/// Capacity Reservation, you must specify `targeted`"
+/// (`CreateCapacityReservationRequest$InstanceMatchCriteria`). The other member, `open`, is
+/// spelled by [`DEFAULT_INSTANCE_MATCH_CRITERIA`], which is the default of that same member.
+pub const INSTANCE_MATCH_CRITERIA_TARGETED: &str = "targeted";
+
+/// The `incremental` member of the modelled `CapacityReservationDeliveryPreference` enum —
+/// the only one a create may ask for: "The only supported value is `incremental`"
+/// (`CreateCapacityReservationRequest$DeliveryPreference`).
+pub const CAPACITY_RESERVATION_DELIVERY_PREFERENCE_INCREMENTAL: &str = "incremental";
+
+/// The soonest a future-dated Capacity Reservation may start: "You can request a future-dated
+/// Capacity Reservation between 5 and 120 days in advance"
+/// (`CreateCapacityReservationRequest$StartDate`).
+pub const MIN_FUTURE_CAPACITY_RESERVATION_LEAD_DAYS: u32 = 5;
+
+/// The furthest ahead one may start, from that same sentence.
+pub const MAX_FUTURE_CAPACITY_RESERVATION_LEAD_DAYS: u32 = 120;
+
+/// One day, as the lead-time bounds above are published in days.
+pub const ONE_DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The instance families a future-dated Capacity Reservation may reserve: "You can request
+/// future-dated Capacity Reservations for instance types in the C, M, R, I, T, and G instance
+/// families only" (`CreateCapacityReservationRequest$InstanceType`).
+///
+/// A family is the LETTERS an instance type starts with, before its generation digit
+/// (`m5.xlarge` -> `m`, `r6g.medium` -> `r`, `inf1.xlarge` -> `inf`), so the whole alphabetic
+/// prefix is what a type is matched by and a family outside this set — `inf`, `trn`, `im` —
+/// is not one of these six because it merely starts with one of their letters. Lowercase, as
+/// every member of the modelled `InstanceType` catalog is
+/// ([`family_letters_of_instance_type`] folds case before matching).
+pub const FUTURE_CAPACITY_RESERVATION_INSTANCE_FAMILIES: [&str; 6] =
+    ["c", "m", "r", "i", "t", "g"];
+
+/// The instance family `instance_type` belongs to, WITHOUT its generation: the letters the
+/// family starts with — `m5.xlarge` -> `m`, `im4gn.large` -> `im`, `inf1.xlarge` -> `inf`.
+///
+/// [`instance_family_of`] is the other reading of a family in this crate, the one
+/// `HostProperties$InstanceFamily` publishes (`m5` of `m5.large`), and this is built on top
+/// of it so the two cannot disagree about where a family ends. A rule published per family
+/// letter ([`FUTURE_CAPACITY_RESERVATION_INSTANCE_FAMILIES`]) is matched against the whole
+/// alphabetic prefix rather than a single character, which would admit any family merely
+/// starting with the same letter.
+pub fn family_letters_of_instance_type(instance_type: &str) -> String {
+    instance_family_of(instance_type)
+        .chars()
+        .take_while(|character| character.is_ascii_alphabetic())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// What a caller committed to when it requested a future-dated Capacity Reservation, for
+/// [`CapacityReservationSpec::commitment`].
+///
+/// Both members are decided by the handler — the duration is a value of the request, held to
+/// [`MIN_CAPACITY_RESERVATION_COMMITMENT_SECONDS`]..=[`MAX_CAPACITY_RESERVATION_COMMITMENT_SECONDS`]
+/// before it gets here, and the instant it expires is computed from the reservation's start
+/// date with checked arithmetic — so the store does no clock arithmetic of its own on a
+/// caller-supplied number.
+#[derive(Debug, Clone, Copy)]
+pub struct CapacityReservationCommitment {
+    /// "The commitment duration, in seconds, for the future-dated Capacity Reservation"
+    /// (`CapacityReservationCommitmentInfo$CommitmentDuration`).
+    pub duration_seconds: i64,
+    /// "The date and time at which the commitment duration expires"
+    /// (`$CommitmentEndDate`): the start date plus that duration.
+    pub end_date: SystemTime,
+}
+
+/// The fewest seconds a commitment may run: the minimum of the modelled `@range` on
+/// `CapacityReservationCommitmentDuration`
+/// (`smithy_query(query="operation",operation="CreateCapacityReservation")` reports
+/// `range 1..200000000`).
+///
+/// Enforced by the handler rather than relied on from the model: the generated input member
+/// is a plain `Option<i64>`, and a handler must not depend on where the request walk happens
+/// to apply a range — without it a negative duration would reach the store.
+pub const MIN_CAPACITY_RESERVATION_COMMITMENT_SECONDS: i64 = 1;
+
+/// The most seconds a commitment may run, from the maximum of that same modelled `@range`.
+pub const MAX_CAPACITY_RESERVATION_COMMITMENT_SECONDS: i64 = 200_000_000;
+
+/// Is this Capacity Reservation one of the Region whose Availability Zones are `zones`?
+///
+/// "The results describe only the Capacity Reservations in the Amazon Web Services Region
+/// that you're currently using" (`DescribeCapacityReservations`): a reservation reserves
+/// capacity in ONE Availability Zone, so the Region it belongs to is the Region that zone is
+/// in. `zones` is that Region's [`availability_zones_in_region`], passed in so a scan over
+/// the store derives it once rather than per candidate.
+pub fn capacity_reservation_is_in_region(
+    reservation: &CapacityReservation,
+    zones: &[AvailabilityZoneRecord],
+) -> bool {
+    reservation.availability_zone.as_deref().is_some_and(|zone| {
+        zones
+            .iter()
+            .any(|in_region| in_region.zone_name.as_str() == zone)
+    })
+}
+
+/// Refuse a Capacity Reservation id the request named that this store holds no reservation
+/// for IN THAT REGION.
+///
+/// Region-scoped on purpose, where [`require_known_capacity_reservation`] resolves an id
+/// whatever Region it was created in: a reservation of another Region is not one this
+/// request can name, so it is reported not found rather than resolved across Regions.
+pub fn require_capacity_reservation_in_region<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    zones: &[AvailabilityZoneRecord],
+    capacity_reservation_id: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    if store
+        .capacity_reservations
+        .get(capacity_reservation_id)
+        .is_some_and(|record| capacity_reservation_is_in_region(&record.view, zones))
+    {
+        return Ok(());
+    }
+    Err(invalid_capacity_reservation_id_not_found(
+        capacity_reservation_id,
     ))
 }
 

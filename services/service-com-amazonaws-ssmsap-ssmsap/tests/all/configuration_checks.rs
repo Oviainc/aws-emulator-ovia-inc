@@ -29,7 +29,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use service_com_amazonaws_ssmsap_ssmsap::ops::types::CONFIGURATION_CHECK_TYPE_VALUES;
 use service_com_amazonaws_ssmsap_ssmsap::state::{
-    application_not_found_message, CONFIGURATION_CHECK_NOT_EVALUATED_MESSAGE, TRANSITION_SPAN,
+    application_not_found_message, CONFIGURATION_CHECK_NOT_EVALUATED_MESSAGE,
+    MAX_CONFIGURATION_CHECKS_PER_REQUEST, TRANSITION_SPAN,
 };
 
 use crate::application_lifecycle::{is_operation_id, valid_registration, Emulator, Reply};
@@ -508,6 +509,93 @@ async fn a_check_outside_the_modelled_catalogue_is_refused_and_starts_nothing() 
         started(&reply).len(),
         CONFIGURATION_CHECK_TYPE_VALUES.len(),
         "expected the whole catalogue to start, got {reply:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_check_is_one_check_and_a_list_past_the_ceiling_starts_nothing() {
+    let emulator = Emulator::new();
+    emulator.with_application("HDB-TEST").await;
+
+    let catalogue = whole_catalogue();
+    let repeat = catalogue
+        .first()
+        .cloned()
+        .expect("the catalogue holds at least one check");
+
+    // A check named twice in one request is ONE check to perform, so a list of repeats
+    // — including one filling the whole ceiling — is accepted and starts one operation
+    // per DISTINCT check, not one per entry.
+    for entries in [
+        catalogue.len() + 1,
+        2 * catalogue.len(),
+        MAX_CONFIGURATION_CHECKS_PER_REQUEST,
+    ] {
+        let emulator = Emulator::new();
+        emulator.with_application("HDB-TEST").await;
+        let checks: Vec<String> = catalogue
+            .iter()
+            .cloned()
+            .cycle()
+            .take(entries)
+            .collect();
+        let reply = emulator
+            .start_checks(json!({
+                "ApplicationId": "HDB-TEST",
+                "ConfigurationCheckIds": checks,
+            }))
+            .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {entries} entries: a list of repeats is accepted, got {reply:?}"
+        );
+        assert_eq!(
+            started(&reply).len(),
+            catalogue.len().min(entries),
+            "case {entries} entries: expected one operation per distinct check, got \
+             {reply:?}"
+        );
+    }
+
+    // Past the ceiling the request is refused, and nothing is started: the checks the
+    // refused request named are still free afterwards.
+    for over in [1usize, 2, 50] {
+        let checks: Vec<String> = std::iter::repeat_n(
+            repeat.clone(),
+            MAX_CONFIGURATION_CHECKS_PER_REQUEST + over,
+        )
+        .collect();
+        let reply = emulator
+            .start_checks(json!({
+                "ApplicationId": "HDB-TEST",
+                "ConfigurationCheckIds": checks,
+            }))
+            .await;
+        assert_eq!(
+            reply.status, 400,
+            "case {over} past the ceiling: expected 400, got {reply:?}"
+        );
+        assert_eq!(
+            reply.code(),
+            VALIDATION_EXCEPTION,
+            "case {over} past the ceiling: expected {VALIDATION_EXCEPTION}, got {reply:?}"
+        );
+    }
+
+    let reply = emulator
+        .start_checks(json!({
+            "ApplicationId": "HDB-TEST",
+            "ConfigurationCheckIds": catalogue.clone(),
+        }))
+        .await;
+    assert_eq!(
+        reply.status, 200,
+        "a refused request must leave every check free to start, got {reply:?}"
+    );
+    assert_eq!(
+        started(&reply).len(),
+        catalogue.len(),
+        "expected one operation per named check, got {reply:?}"
     );
 }
 

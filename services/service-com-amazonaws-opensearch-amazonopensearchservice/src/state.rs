@@ -43,7 +43,8 @@ use crate::ops::types::{
     EBSOptionsStatus,
     EncryptionAtRestOptions, EncryptionAtRestOptionsStatus, EngineModeStatus,
     IAMFederationOptionsOutput, IPAddressTypeStatus, IdentityCenterOptions,
-    IdentityCenterOptionsInput, IdentityCenterOptionsStatus, InstanceCountLimits, InstanceLimits,
+    IdentityCenterOptionsInput, IdentityCenterOptionsStatus, Insight, InsightEntity,
+    InstanceCountLimits, InstanceLimits,
     InstanceTypeDetails,
     InvalidPaginationTokenException, JWTOptionsOutput, LimitExceededException, Limits,
     LogPublishingOption,
@@ -1201,6 +1202,81 @@ impl ScheduledChange {
     }
 }
 
+/// One insight, as this emulator persists it.
+///
+/// An insight is "a notification about a domain event or recommendation that helps
+/// you optimize your Amazon OpenSearch Service domain": a record with an identity of
+/// its own — a `GUID`, a display name, a type, a priority, a status and the instants
+/// it was created and last changed at — so this is the ONE copy `ListInsights`
+/// reports and the one `DescribeInsightDetails` and `InsightFeedback` address by id.
+/// The service itself raises an insight; no operation of this emulator does yet, so
+/// today the only writer is whatever puts a record here directly.
+///
+/// Its members are kept as the values the model's own enums admit (`InsightType`,
+/// `InsightPriorityLevel`, `InsightStatus`) so a listing reports the stored record
+/// rather than a second derivation of it.
+#[derive(Debug, Clone)]
+pub struct InsightRecord {
+    /// `Insight$InsightId`: "the unique identifier of the insight", a [`new_guid`].
+    /// Unique across the account's insights, so it is the key the set holds the
+    /// record under and the place a pagination token names.
+    pub insight_id: String,
+    /// `Insight$DisplayName`: "the display name of the insight".
+    pub display_name: String,
+    /// `Insight$Type`, one of `InsightType`'s values: whether the insight reports a
+    /// domain event or a recommendation.
+    pub insight_type: String,
+    /// `Insight$Priority`, one of `InsightPriorityLevel`'s values.
+    pub priority: String,
+    /// `Insight$Status`, one of `InsightStatus`'s values: where the insight is in its
+    /// own lifecycle.
+    pub status: String,
+    /// The instant the insight was raised, reported as `Insight$CreationTime` — and
+    /// the instant a listing's time range and sort order are measured on.
+    pub created_at: SystemTime,
+    /// The instant the insight last changed, reported as `Insight$UpdateTime`.
+    pub updated_at: SystemTime,
+    /// `Insight$IsExperimental`: "indicates whether the insight is experimental".
+    pub is_experimental: bool,
+}
+
+impl InsightRecord {
+    /// This record as `Insight` — the ONE projection of it, so every operation that
+    /// reports an insight reports the same values.
+    pub fn to_insight(&self) -> Insight {
+        Insight {
+            insight_id: Some(self.insight_id.clone()),
+            display_name: Some(self.display_name.clone()),
+            r#type: Some(self.insight_type.clone()),
+            priority: Some(self.priority.clone()),
+            status: Some(self.status.clone()),
+            creation_time: Some(datetime(self.created_at)),
+            update_time: Some(datetime(self.updated_at)),
+            is_experimental: Some(self.is_experimental),
+        }
+    }
+}
+
+/// The entity type values `InsightEntityType` admits: an insight is held either for
+/// one domain or for the account itself.
+pub const INSIGHT_ENTITY_ACCOUNT: &str = "Account";
+/// See [`INSIGHT_ENTITY_ACCOUNT`].
+pub const INSIGHT_ENTITY_DOMAIN_NAME: &str = "DomainName";
+
+/// Why the entity a request names has no insights to report, as the modelled
+/// exception payload the refusal is reported through.
+///
+/// Each operation declares its OWN error enum, so this names the payload and the
+/// handler lifts it into its own channel: resolving an `InsightEntity` is ONE
+/// decision even though the error channels of the operations that make it are not.
+#[derive(Debug)]
+pub enum InsightEntityRefusal {
+    /// The entity names a resource this account does not hold.
+    NotFound(ResourceNotFoundException),
+    /// The entity itself is not one this service can resolve.
+    Validation(ValidationException),
+}
+
 /// `at` as the epoch-millisecond count a `Long` timestamp of this service carries —
 /// the unit the model states for its epoch timestamps (`InsightTimeRange`'s members
 /// are "epoch millisecond timestamps"), negative for an instant before the epoch.
@@ -1325,6 +1401,15 @@ pub struct Domain {
     /// The configuration changes scheduled on this domain, keyed by their action id
     /// — unique per domain, so the id IS the key. See [`ScheduledChange`].
     pub scheduled_actions: BTreeMap<String, ScheduledChange>,
+    /// The insights this domain holds, keyed by their `InsightId` — unique across
+    /// the account's insights, so the id IS the key. See [`InsightRecord`].
+    ///
+    /// Held on the domain rather than beside it, because an insight of a
+    /// `DomainName` entity is an insight ABOUT a domain: the record goes when
+    /// `DeleteDomain` releases the domain it belongs to. Iterating a `BTreeMap` is
+    /// order-stable, which is what lets two reads report the same insights in the
+    /// same order.
+    pub insights: BTreeMap<String, InsightRecord>,
 }
 
 impl Domain {
@@ -3200,6 +3285,11 @@ pub struct ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// lets a paged read of the set resume where the previous page stopped without
     /// repeating or skipping a record.
     pub packages: BTreeMap<String, Package>,
+    /// The insights held for the ACCOUNT itself — the ones an `Account` entity and
+    /// no domain answers for — keyed by their `InsightId`. The insights of a domain
+    /// live on that domain ([`Domain::insights`]), so an insight has exactly one
+    /// home whichever entity holds it. See [`InsightRecord`].
+    pub account_insights: BTreeMap<String, InsightRecord>,
 }
 
 impl Default for ComAmazonawsOpensearchAmazonopensearchserviceState {
@@ -3218,6 +3308,7 @@ impl Default for ComAmazonawsOpensearchAmazonopensearchserviceState {
             reserved_instances: BTreeMap::new(),
             billing_subscription_seq: 0,
             packages: BTreeMap::new(),
+            account_insights: BTreeMap::new(),
         }
     }
 }
@@ -3318,6 +3409,62 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     pub fn settle_packages(&mut self, now: SystemTime) {
         for package in self.packages.values_mut() {
             package.settle(now);
+        }
+    }
+
+    /// The insights the entity a request names holds.
+    ///
+    /// "An entity can be an Amazon OpenSearch Service domain or an Amazon Web
+    /// Services account": a `DomainName` entity holds the insights of that one
+    /// domain, and an `Account` entity holds the account's insights — its own and
+    /// those of every domain it holds, because an insight about a domain is an
+    /// insight of the account the domain belongs to.
+    ///
+    /// Reads ONLY, and refuses rather than reporting an empty set where the entity
+    /// names nothing this account holds, so every operation that resolves an
+    /// `InsightEntity` resolves it the same way.
+    pub fn insights_of_entity(
+        &self,
+        entity: &InsightEntity,
+    ) -> Result<Vec<&InsightRecord>, InsightEntityRefusal> {
+        match entity.r#type.as_str() {
+            INSIGHT_ENTITY_DOMAIN_NAME => {
+                // "For `DomainName`, this is the domain name": an entity of this type
+                // names its domain in `Value`, so one that names none resolves to no
+                // entity at all rather than to every domain.
+                let name = insight_entity_value(entity)
+                    .ok_or_else(|| InsightEntityRefusal::Validation(insight_value_required()))?;
+                let domain = self
+                    .domains
+                    .get(name)
+                    .ok_or_else(|| InsightEntityRefusal::NotFound(domain_not_found(name)))?;
+                Ok(domain.insights.values().collect())
+            }
+            INSIGHT_ENTITY_ACCOUNT => {
+                // "For `Account`, this is the Amazon Web Services account ID": the
+                // only account whose insights this emulator holds is the one its
+                // requests are made for, so any other account id names an entity it
+                // cannot report on.
+                if let Some(value) = insight_entity_value(entity) {
+                    if value != ::engine::emulator_account_id() {
+                        return Err(InsightEntityRefusal::Validation(foreign_account_entity(
+                            value,
+                        )));
+                    }
+                }
+                Ok(self
+                    .account_insights
+                    .values()
+                    .chain(
+                        self.domains
+                            .values()
+                            .flat_map(|domain| domain.insights.values()),
+                    )
+                    .collect())
+            }
+            other => Err(InsightEntityRefusal::Validation(unknown_insight_entity(
+                other,
+            ))),
         }
     }
 
@@ -3875,6 +4022,48 @@ pub fn offering_not_found(offering_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!(
             "Reserved Instance offering not found: {offering_id}"
+        )),
+    }
+}
+
+/// `entity`'s `Value`, or `None` where the request named none — an absent value and
+/// a blank one name the same nothing.
+fn insight_entity_value(entity: &InsightEntity) -> Option<&str> {
+    entity
+        .value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// The `ValidationException` payload for an insight entity that names a domain but
+/// no domain name.
+pub fn insight_value_required() -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "Entity value is required when Entity type is {INSIGHT_ENTITY_DOMAIN_NAME}."
+        )),
+    }
+}
+
+/// The `ValidationException` payload for an `Account` insight entity naming an
+/// account other than the one the request was made for.
+pub fn foreign_account_entity(account_id: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "Entity value {account_id} is not the Amazon Web Services account ID this request \
+             was made for."
+        )),
+    }
+}
+
+/// The `ValidationException` payload for an insight entity whose type is outside
+/// `InsightEntityType`.
+pub fn unknown_insight_entity(entity_type: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "Entity type {entity_type} is not supported. Supported values are \
+             {INSIGHT_ENTITY_ACCOUNT} and {INSIGHT_ENTITY_DOMAIN_NAME}."
         )),
     }
 }

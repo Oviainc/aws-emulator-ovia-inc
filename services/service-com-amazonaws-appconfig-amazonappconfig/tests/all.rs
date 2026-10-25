@@ -15,6 +15,8 @@
 mod account_settings_document;
 #[path = "all/appconfig_workflow.rs"]
 mod appconfig_workflow;
+#[path = "all/application_name_uniqueness.rs"]
+mod application_name_uniqueness;
 #[path = "all/aws_authored_extensions.rs"]
 mod aws_authored_extensions;
 #[path = "all/configuration_profile_type.rs"]

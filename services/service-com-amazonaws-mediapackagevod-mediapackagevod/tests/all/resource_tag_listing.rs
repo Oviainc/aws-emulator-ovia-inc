@@ -151,24 +151,7 @@ pub(crate) async fn call(
     path: &str,
     body: Option<Value>,
 ) -> Answer {
-    let host = format!("mediapackage-vod.{region}.amazonaws.com");
-    let payload = body.map(|value| value.to_string()).unwrap_or_default();
-    let request = http::Request::builder()
-        .method(method)
-        .uri(format!("https://{host}{path}"))
-        .header("host", host.clone())
-        .header("content-type", "application/json")
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTESTONLY/20260101/{region}\
-                 /mediapackage-vod/aws4_request, SignedHeaders=host, Signature=unverified"
-            ),
-        )
-        .body(bytes::Bytes::from(payload))
-        .expect("a well-formed test request");
-
-    let response = router.dispatch(request).await;
+    let response = dispatch(router, region, method, path, body).await;
     let status = response.status().as_u16();
     let errortype = response
         .headers()
@@ -187,6 +170,36 @@ pub(crate) async fn call(
         errortype,
         body,
     }
+}
+
+/// The same round trip as [`call`], with the WHOLE response handed back — status, headers
+/// and the body as bytes — for a case that asserts something about the response a parsed
+/// [`Answer`] does not carry, such as how an empty body is framed.
+pub(crate) async fn dispatch(
+    router: &MultiServiceRouter,
+    region: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> http::Response<bytes::Bytes> {
+    let host = format!("mediapackage-vod.{region}.amazonaws.com");
+    let payload = body.map(|value| value.to_string()).unwrap_or_default();
+    let request = http::Request::builder()
+        .method(method)
+        .uri(format!("https://{host}{path}"))
+        .header("host", host.clone())
+        .header("content-type", "application/json")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDTESTONLY/20260101/{region}\
+                 /mediapackage-vod/aws4_request, SignedHeaders=host, Signature=unverified"
+            ),
+        )
+        .body(bytes::Bytes::from(payload))
+        .expect("a well-formed test request");
+
+    router.dispatch(request).await
 }
 
 /// The `GET /tags/{ResourceArn}` route for `arn`.

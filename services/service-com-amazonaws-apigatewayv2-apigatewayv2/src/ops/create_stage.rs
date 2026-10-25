@@ -261,10 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stages with the same name.
         if api.stages.contains_key(&input.stage_name) {
             return Err(CreateStageErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Stage with name {} already exists for this API.",
-                    input.stage_name
-                )),
+                message: Some(crate::state::STAGE_ALREADY_EXISTS_MESSAGE.to_string()),
             })
             .into());
         }

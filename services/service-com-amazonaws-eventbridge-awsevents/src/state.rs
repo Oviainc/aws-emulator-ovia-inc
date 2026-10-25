@@ -64,8 +64,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::ops::types::{
     Connection, ConnectionAuthResponseParameters, DeadLetterConfig, DescribeApiDestinationOutput,
     DescribeArchiveOutput, DescribeConnectionOutput, DescribeReplayOutput, LogConfig,
-    PartnerEventSourceAccount, ReplayDestination, Rule as RuleSummary, Tag, Target,
-    INCLUDE_DETAIL_VALUES, LEVEL_VALUES, RULE_STATE_VALUES,
+    PartnerEventSourceAccount, Replay as ReplaySummary, ReplayDestination, Rule as RuleSummary,
+    Tag, Target, INCLUDE_DETAIL_VALUES, LEVEL_VALUES, RULE_STATE_VALUES,
 };
 
 /// The event bus a request lands on when it names none.
@@ -1132,18 +1132,46 @@ impl ArchiveRecord {
 /// determine the progress of a replay").
 pub const REPLAY_STATE_STARTING: &str = "STARTING";
 
+/// The `ReplayState` of a replay that is re-publishing its window.
+pub const REPLAY_STATE_RUNNING: &str = "RUNNING";
+
 /// The `ReplayState` of a replay that has finished re-publishing its window.
 pub const REPLAY_STATE_COMPLETED: &str = "COMPLETED";
 
-/// How long after `StartReplay` the replay's `COMPLETED` state becomes due.
+/// The `ReplayState` a `CancelReplay` puts a replay in: the cancellation is
+/// accepted and under way, and the replay has not settled yet.
+pub const REPLAY_STATE_CANCELLING: &str = "CANCELLING";
+
+/// The `ReplayState` a cancelled replay settles in — terminal, and NOT
+/// `COMPLETED`: a replay that was stopped did not finish its window.
+pub const REPLAY_STATE_CANCELLED: &str = "CANCELLED";
+
+/// The `ReplayState` of a replay that stopped on a failure.
+pub const REPLAY_STATE_FAILED: &str = "FAILED";
+
+/// Whether `state` is a `ReplayState` no further transition leaves.
+///
+/// `CancelReplay` "can be canceled only when the state is Running or Starting"
+/// (`IllegalStatusException`), so this is also what tells a replay that can still
+/// be cancelled from one that cannot, and a terminal state is the one that earns
+/// the replay its `ReplayEndTime`.
+pub fn is_terminal_replay_state(state: &str) -> bool {
+    matches!(
+        state,
+        REPLAY_STATE_COMPLETED | REPLAY_STATE_CANCELLED | REPLAY_STATE_FAILED
+    )
+}
+
+/// How long after the call that starts it a replay's next state becomes due.
 ///
 /// A replay is asynchronous in AWS — the call answers a non-terminal state and
 /// the caller polls `DescribeReplay` — so a replay answered `STARTING` reaches
-/// `COMPLETED` a moment later rather than instantly, and a caller reading
-/// straight after the call still observes the transient state. AWS publishes no
-/// duration for it (it depends on the window replayed); this is the emulator's
-/// own span, chosen inside the 250–750 ms window the project fixes for a
-/// clock-owed transition, and it is stored as a DUE INSTANT rather than waited
+/// `COMPLETED` a moment later rather than instantly, and one answered
+/// `CANCELLING` reaches `CANCELLED` a moment after the cancel; a caller reading
+/// straight after either call still observes the transient state. AWS publishes
+/// no duration for either (both depend on the window replayed); this is the
+/// emulator's own span, chosen inside the 250–750 ms window the project fixes for
+/// a clock-owed transition, and it is stored as a DUE INSTANT rather than waited
 /// for.
 pub const REPLAY_TRANSITION: Duration = Duration::from_millis(400);
 
@@ -1153,6 +1181,19 @@ pub const REPLAY_TRANSITION: Duration = Duration::from_millis(400);
 /// answers the modelled `LimitExceededException` instead of growing memory
 /// without limit. It is far above any realistic fixture's needs.
 pub const MAX_REPLAYS: usize = 100;
+
+/// A `ReplayState` the clock already owes a replay, and the instant it falls due.
+///
+/// A replay's progress is driven by the clock alone once a call has started or
+/// cancelled it, so the next state is STORED as a due instant rather than waited
+/// for: whichever operation next touches the store materialises it
+/// ([`ComAmazonawsEventbridgeAwseventsState::settle_replays`]).
+#[derive(Debug, Clone)]
+pub struct PendingReplayState {
+    pub due: SystemTime,
+    /// One of `ReplayState`'s values: what the replay becomes at `due`.
+    pub state: String,
+}
 
 /// A replay as this emulator persists it.
 ///
@@ -1180,9 +1221,9 @@ pub struct ReplayRecord {
     pub state: String,
     pub state_reason: Option<String>,
     pub replay_start_time: SystemTime,
-    /// When the clock owes this replay its `COMPLETED` state, or `None` once it
-    /// has settled.
-    pub completed_due: Option<SystemTime>,
+    /// The state the clock already owes this replay, or `None` when it is in the
+    /// state it will stay in until a caller changes it.
+    pub pending: Option<PendingReplayState>,
     pub replay_end_time: Option<SystemTime>,
     /// "The value returned for EventLastReplayedTime indicates the time within
     /// the specified time range associated with the last event replayed"
@@ -1216,10 +1257,37 @@ impl ReplayRecord {
             state: REPLAY_STATE_STARTING.to_string(),
             state_reason: None,
             replay_start_time: started,
-            completed_due: Some(started + REPLAY_TRANSITION),
+            pending: Some(PendingReplayState {
+                due: started + REPLAY_TRANSITION,
+                state: REPLAY_STATE_COMPLETED.to_string(),
+            }),
             replay_end_time: None,
             event_last_replayed_time: None,
         }
+    }
+
+    /// Whether a `CancelReplay` may still stop this replay: "a replay can be
+    /// canceled only when the state is Running or Starting"
+    /// (`IllegalStatusException`), so a replay that has settled — or is already
+    /// cancelling — is not one this call can change.
+    pub fn is_cancellable(&self) -> bool {
+        matches!(
+            self.state.as_str(),
+            REPLAY_STATE_STARTING | REPLAY_STATE_RUNNING
+        )
+    }
+
+    /// Accept a cancellation at `now`: the replay moves to
+    /// [`REPLAY_STATE_CANCELLING`] and the clock owes it
+    /// [`REPLAY_STATE_CANCELLED`] [`REPLAY_TRANSITION`] later, REPLACING the
+    /// `COMPLETED` transition it was owed — a replay that was stopped settles
+    /// cancelled, not completed.
+    pub fn cancel(&mut self, now: SystemTime) {
+        self.state = REPLAY_STATE_CANCELLING.to_string();
+        self.pending = Some(PendingReplayState {
+            due: now + REPLAY_TRANSITION,
+            state: REPLAY_STATE_CANCELLED.to_string(),
+        });
     }
 
     /// Whether `time` — one archived event's own event time — lies in the window
@@ -1243,6 +1311,24 @@ impl ReplayRecord {
             state_reason: self.state_reason.clone(),
             event_source_arn: Some(self.event_source_arn.clone()),
             destination: Some(self.destination.clone()),
+            event_start_time: Some(to_wire_timestamp(self.event_start_time)),
+            event_end_time: Some(to_wire_timestamp(self.event_end_time)),
+            event_last_replayed_time: self.event_last_replayed_time.map(to_wire_timestamp),
+            replay_start_time: Some(to_wire_timestamp(self.replay_start_time)),
+            replay_end_time: self.replay_end_time.map(to_wire_timestamp),
+        }
+    }
+
+    /// The `Replay` projection `ListReplays` returns, read off the SAME stored
+    /// record [`Self::to_describe_output`] reports — so a listing and a read of
+    /// one replay cannot disagree. The summary carries every member of the
+    /// `Replay` shape except the destination, which the shape does not have.
+    pub fn to_summary(&self) -> ReplaySummary {
+        ReplaySummary {
+            replay_name: Some(self.name.clone()),
+            event_source_arn: Some(self.event_source_arn.clone()),
+            state: Some(self.state.clone()),
+            state_reason: self.state_reason.clone(),
             event_start_time: Some(to_wire_timestamp(self.event_start_time)),
             event_end_time: Some(to_wire_timestamp(self.event_end_time)),
             event_last_replayed_time: self.event_last_replayed_time.map(to_wire_timestamp),
@@ -1847,21 +1933,27 @@ impl ComAmazonawsEventbridgeAwseventsState {
     /// Materialise every replay change the clock has ALREADY made due at `now`,
     /// and answer how many replays one was applied to.
     ///
-    /// One change is owed by the clock alone: the non-terminal ->
-    /// [`REPLAY_STATE_COMPLETED`] transition [`REPLAY_TRANSITION`] after the
-    /// replay started. It was owed at the same instant even if nobody had
-    /// called, which is why a reporting operation may finish it.
+    /// Each change is owed by the clock alone: the non-terminal state a call left
+    /// the replay in moves on [`REPLAY_TRANSITION`] after that call —
+    /// `STARTING` -> [`REPLAY_STATE_COMPLETED`] after `StartReplay`,
+    /// `CANCELLING` -> [`REPLAY_STATE_CANCELLED`] after `CancelReplay`. It was
+    /// owed at the same instant even if nobody had called, which is why a
+    /// reporting operation may finish it.
     pub fn settle_replays(&mut self, now: SystemTime) -> usize {
         let mut settled = 0usize;
         for replay in self.replays.values_mut() {
-            let Some(due) = replay.completed_due.filter(|due| *due <= now) else {
+            let Some(pending) = replay.pending.clone().filter(|owed| owed.due <= now) else {
                 continue;
             };
             // The state moves to the instant the transition fell DUE, not to the
             // instant it was noticed, so two reads agree.
-            replay.completed_due = None;
-            replay.state = REPLAY_STATE_COMPLETED.to_string();
-            replay.replay_end_time = Some(due);
+            replay.pending = None;
+            replay.state = pending.state;
+            // A replay that has reached a state nothing leaves ended when that
+            // state fell due; one still on its way reports no end yet.
+            if is_terminal_replay_state(&replay.state) {
+                replay.replay_end_time = Some(pending.due);
+            }
             settled += 1;
         }
         settled
@@ -2785,6 +2877,17 @@ pub fn no_such_archive(archive_name: &str) -> String {
 /// built from the request. Written once, for the reason [`no_such_rule`] gives.
 pub fn no_such_replay(replay_name: &str) -> String {
     format!("Replay {replay_name} does not exist.")
+}
+
+/// Why a replay cannot be cancelled in the state it is in.
+///
+/// "An error occurred because a replay can be canceled only when the state is
+/// Running or Starting" (`IllegalStatusException`): the refusal names the replay
+/// — read from the request's `ReplayName`, which is the replay's identity — and
+/// says that the state it was found in is not one this call can act on, whichever
+/// of them it is.
+pub fn replay_not_cancellable(replay_name: &str) -> String {
+    format!("Replay {replay_name} is not in a valid state for this operation.")
 }
 
 /// What a tagging path reports for a well-formed ARN naming a resource this
