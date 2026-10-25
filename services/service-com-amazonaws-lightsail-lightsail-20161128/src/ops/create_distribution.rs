@@ -426,6 +426,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .clone(),
                 default_root_object: input.default_root_object.clone(),
                 custom_error_responses,
+                // A new distribution has cached nothing yet, so nothing has
+                // been reset: `ResetDistributionCache` is what records one.
+                latest_cache_reset: None,
             });
             let view = store
                 .distribution(&name)

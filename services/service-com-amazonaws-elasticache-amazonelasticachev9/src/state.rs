@@ -7269,6 +7269,27 @@ fn password_authentication(passwords: &[String]) -> Result<AuthenticationRecord,
     })
 }
 
+/// Why an `AuthenticationMode` cannot stand beside one of the older
+/// authentication members, stated from what the request submitted.
+///
+/// The two statements of how a user authenticates contradict each other, and the
+/// refusal is the only place the caller is told WHICH two it sent: so it names
+/// the older directive it carried — the submitted value of the
+/// `NoPasswordRequired` flag, or the passwords it supplied — together with the
+/// `AuthenticationMode$Type` the same request asked for. `no_password_required`
+/// is `None` only when the older directive was `Passwords`; one of the two is
+/// always present, since that is what makes this a conflict at all.
+fn conflicting_authentication_message(no_password_required: Option<bool>, mode_type: &str) -> String {
+    match no_password_required {
+        Some(flag) => format!(
+            "No password required flag is {flag} but provided authentication type is {mode_type}"
+        ),
+        None => {
+            format!("Passwords are provided but provided authentication type is {mode_type}")
+        }
+    }
+}
+
 /// The `Authentication` a request's authentication members describe, or why they
 /// are refused.
 ///
@@ -7290,27 +7311,46 @@ pub fn authentication_from_request(
 ) -> Result<AuthenticationRecord, AuthRefusal> {
     let passwords = passwords.unwrap_or(&[]);
     if let Some(mode) = mode {
-        if !passwords.is_empty() || no_password_required.is_some() {
-            return Err(AuthRefusal::Combination(
-                "AuthenticationMode cannot be combined with Passwords or NoPasswordRequired: \
-                 either states how the user authenticates on its own."
-                    .to_string(),
-            ));
-        }
         let mode_passwords = mode.passwords.as_deref().unwrap_or(&[]);
-        return match mode.r#type.as_deref().unwrap_or_default() {
+        // The authentication type the mode asks for, resolved BEFORE anything
+        // else about the mode: every refusal below reports it back, so a request
+        // that names no type to report is refused for that first.
+        let mode_type = match mode.r#type.as_deref().unwrap_or_default() {
+            token @ (input_authentication_type::PASSWORD
+            | input_authentication_type::NO_PASSWORD_REQUIRED
+            | input_authentication_type::IAM) => token,
+            other => {
+                return Err(AuthRefusal::Value(format!(
+                    "AuthenticationMode.Type must be one of {} — got {other:?}.",
+                    // The GENERATED catalog, so a refusal cannot name a
+                    // different set from the one the model declares.
+                    // `InputAuthenticationType` IS a modelled enum, so the
+                    // boundary validator normally refuses an unknown token
+                    // before a handler runs; this arm is what keeps an absent
+                    // `Type` from being read as one of the three.
+                    crate::ops::types::INPUT_AUTHENTICATION_TYPE_VALUES.join(", ")
+                )))
+            }
+        };
+        if !passwords.is_empty() || no_password_required.is_some() {
+            // Two statements of how the user authenticates: the refusal is built
+            // from the pair the request submitted, not from the rule alone.
+            return Err(AuthRefusal::Combination(conflicting_authentication_message(
+                no_password_required,
+                mode_type,
+            )));
+        }
+        return match mode_type {
             input_authentication_type::PASSWORD => {
                 if mode_passwords.is_empty() {
                     return Err(AuthRefusal::Combination(format!(
                         "AuthenticationMode.Passwords is required when AuthenticationMode.Type \
-                         is {}.",
-                        input_authentication_type::PASSWORD
+                         is {mode_type}."
                     )));
                 }
                 password_authentication(mode_passwords)
             }
-            token @ (input_authentication_type::NO_PASSWORD_REQUIRED
-            | input_authentication_type::IAM) => {
+            token => {
                 if !mode_passwords.is_empty() {
                     return Err(AuthRefusal::Combination(format!(
                         "AuthenticationMode.Passwords cannot be supplied when \
@@ -7328,15 +7368,6 @@ pub fn authentication_from_request(
                     password_count: None,
                 })
             }
-            other => Err(AuthRefusal::Value(format!(
-                "AuthenticationMode.Type must be one of {} — got {other:?}.",
-                // The GENERATED catalog, so a refusal cannot name a different
-                // set from the one the model declares. `InputAuthenticationType`
-                // IS a modelled enum, so the boundary validator normally refuses
-                // an unknown token before a handler runs; this arm is what keeps
-                // an absent `Type` from being read as one of the three.
-                crate::ops::types::INPUT_AUTHENTICATION_TYPE_VALUES.join(", ")
-            ))),
         };
     }
     if no_password_required == Some(true) {

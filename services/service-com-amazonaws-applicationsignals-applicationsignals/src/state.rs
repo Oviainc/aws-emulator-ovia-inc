@@ -19,12 +19,12 @@ use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
     ConflictException, DependencyConfig, ExclusionWindow, Goal, GroupingAttributeDefinition,
-    GroupingConfiguration, Interval, MetricDataQuery, MetricSource,
+    GroupingConfiguration, Interval, Metric, MetricDataQuery, MetricSource, MetricStat,
     MonitoredRequestCountMetricDataQueries,
     RequestBasedServiceLevelIndicator, RequestBasedServiceLevelIndicatorConfig,
     RequestBasedServiceLevelIndicatorMetric, ResourceNotFoundException, RollingInterval,
     ServiceLevelIndicator, ServiceLevelIndicatorConfig, ServiceLevelIndicatorMetric,
-    ServiceLevelObjective, ServiceLevelObjectiveSummary, Tag,
+    ServiceLevelIndicatorMetricConfig, ServiceLevelObjective, ServiceLevelObjectiveSummary, Tag,
 };
 // The shapes the time-ranged topology reads project, on their own `use` so this set and the
 // SLO lifecycle's above are edited on separate lines.
@@ -134,6 +134,27 @@ const DEFAULT_SLI_METRIC_THRESHOLD: f64 = 0.0;
 
 /// `ServiceLevelIndicatorConfig.ComparisonOperator`'s modelled `@default` of `"LessThan"`.
 const DEFAULT_SLI_COMPARISON_OPERATOR: &str = "LessThan";
+
+/// The `Id` of the one `MetricDataQuery` an SLI config's own metric description is
+/// materialised into ([`materialised_sli_metric_data_queries`]).
+///
+/// `MetricDataQuery.Id` is `@required` and its doc states the rules an id must meet: it
+/// "must be unique within a `MetricDataQueries` array" and "the valid characters are
+/// letters, numbers, and underscore. The first character must be a lowercase letter." A
+/// materialised list holds exactly ONE query, so a single fixed id that starts with a
+/// lowercase letter satisfies both.
+const MATERIALISED_SLI_QUERY_ID: &str = "m1";
+
+/// The `Period` of a materialised query when the config names a statistic but no
+/// `PeriodSeconds`.
+///
+/// `MetricStat.Period` is `@required` while the config's `PeriodSeconds` is optional, so one
+/// period has to be reported. It is the minimum of the modelled `SLIPeriodSeconds`
+/// (`smithy_query(shape="ServiceLevelIndicatorMetricConfig")`, member `PeriodSeconds`:
+/// `range 60..900`) — the shortest period an SLO evaluation may use — which is also the
+/// shortest period `MetricStat.Period` documents for a regular-resolution CloudWatch metric
+/// ("a period can be as short as one minute (60 seconds) and must be a multiple of 60").
+const MIN_SLI_PERIOD_SECONDS: i32 = 60;
 
 /// The marker every `NextToken` this service issues carries, so a well-formed token this
 /// service did not issue is refused instead of being read as a cursor. The `/` cannot occur
@@ -854,23 +875,89 @@ fn reported_metric_type(
     requested.filter(|_| selects_standard_metric).cloned()
 }
 
+/// The `MetricDataQueries` the indicator of a period-based SLI config reports.
+///
+/// An SLI config describes the metric the SLO evaluates in one of two ways, and the
+/// indicator has ONE member for both — its `@required` `MetricDataQueries`:
+///
+/// * a config that spells the queries out is reported with those queries verbatim, each
+///   already carrying its own `Period` and `Stat`; or
+/// * a config that instead names the metric's parts — `MetricName` ("the name of the
+///   CloudWatch metric to use for the SLO, when using a custom metric rather than
+///   Application Signals standard metrics"), `Statistic` ("the statistic to use for
+///   comparison to the threshold") and `PeriodSeconds` ("the number of seconds to use as the
+///   period for SLO evaluation") — names exactly the three parts of a `MetricStat` (its
+///   `Metric`, its `Stat` and its `Period`), so they are MATERIALISED into the single query
+///   they describe. The output shape declares no member of its own for any of the three
+///   (`smithy_query(shape="ServiceLevelIndicatorMetric")`), so the query list is the only
+///   place they can surface: without this a read could not tell a client which metric, which
+///   statistic or which evaluation period the SLO it returns is measured by.
+///
+/// A materialised query reports only what the request stated. The metric's `Namespace` and
+/// `Dimensions` stay ABSENT: nothing in the request names them, the real service takes them
+/// from its own standard-metric catalogue, and a namespace or dimension set invented here
+/// would name a metric nothing selected.
+///
+/// A config that names NO `Statistic` materialises nothing and the required list is reported
+/// EMPTY, whichever other members it names: `MetricStat.Stat` is `@required` with no default,
+/// nothing else in the request states a statistic, and a query carrying an invented one would
+/// report an evaluation the caller never asked for. That is the standard-metric case —
+/// `KeyAttributes` with a `MetricType` — where the whole query comes from the catalogue this
+/// emulator cannot compute.
+fn materialised_sli_metric_data_queries(
+    metric: &ServiceLevelIndicatorMetricConfig,
+) -> Vec<MetricDataQuery> {
+    if let Some(queries) = metric
+        .metric_data_queries
+        .as_ref()
+        .filter(|queries| !queries.is_empty())
+    {
+        return queries.clone();
+    }
+    let Some(stat) = metric.statistic.clone() else {
+        return Vec::new();
+    };
+    vec![MetricDataQuery {
+        id: MATERIALISED_SLI_QUERY_ID.to_string(),
+        metric_stat: Some(MetricStat {
+            metric: Metric {
+                namespace: None,
+                metric_name: metric.metric_name.clone(),
+                dimensions: None,
+            },
+            period: metric.period_seconds.unwrap_or(MIN_SLI_PERIOD_SECONDS),
+            stat,
+            unit: None,
+        }),
+        // `ReturnData` is documented for metric MATH ("use this only if you are using a
+        // metric math expression for the SLO"), and this query is a single metric rather
+        // than an expression, so the member stays absent. `Expression` is mutually exclusive
+        // with `MetricStat`, and nothing in the config names a `Label` or an `AccountId`.
+        expression: None,
+        label: None,
+        return_data: None,
+        period: None,
+        account_id: None,
+    }]
+}
+
 /// The `ServiceLevelIndicator` a period-based `SliConfig` describes.
 ///
 /// Every member of the indicator is the corresponding member of the config, with the
 /// config's own modelled defaults applied to `MetricThreshold` and `ComparisonOperator`,
 /// except `MetricType`, which is reported only when the config selected an Application
-/// Signals standard metric (see [`reported_metric_type`]).
-/// `SliMetric.MetricDataQueries` is `@required` on the indicator but optional on the
-/// config: when the request supplies no queries it stays EMPTY rather than being filled
-/// with a synthesised CloudWatch query — the real service builds that query from its own
-/// standard-metric catalogue (namespace, dimension set and query id), none of which this
-/// emulator can compute, and inventing one would report a metric nothing selected.
+/// Signals standard metric (see [`reported_metric_type`]), and
+/// `SliMetric.MetricDataQueries`, which is where the metric the config describes surfaces
+/// (see [`materialised_sli_metric_data_queries`]).
 pub fn sli_from_config(config: &ServiceLevelIndicatorConfig) -> ServiceLevelIndicator {
     let metric = &config.sli_metric_config;
     ServiceLevelIndicator {
         sli_metric: ServiceLevelIndicatorMetric {
             key_attributes: metric.key_attributes.clone(),
             operation_name: metric.operation_name.clone(),
+            // Judged from the members the CONFIG carries, not from the query materialised
+            // below: a config that states a statistic and a period for the standard metric
+            // it selected has still selected that standard metric.
             metric_type: reported_metric_type(
                 metric.metric_type.as_ref(),
                 metric.key_attributes.as_ref(),
@@ -881,7 +968,7 @@ pub fn sli_from_config(config: &ServiceLevelIndicatorConfig) -> ServiceLevelIndi
                     .as_ref()
                     .is_some_and(|queries| !queries.is_empty()),
             ),
-            metric_data_queries: metric.metric_data_queries.clone().unwrap_or_default(),
+            metric_data_queries: materialised_sli_metric_data_queries(metric),
             dependency_config: metric.dependency_config.clone(),
             metric_source: metric.metric_source.clone(),
             composite_sli_config: metric.composite_sli_config.clone(),
@@ -902,9 +989,16 @@ pub fn sli_from_config(config: &ServiceLevelIndicatorConfig) -> ServiceLevelIndi
 /// declares them only "required if this SLO is tracking the Latency metric"), so they are
 /// stored exactly as supplied, and `MetricType` follows the same standard-metric rule as
 /// the period-based indicator (see [`reported_metric_type`]).
-/// `MonitoredRequestCountMetric` is `@required` on the
-/// indicator but optional on the config; as with the period-based queries it is kept at an
-/// empty good-count list rather than being filled with a synthesised query.
+///
+/// `TotalRequestCountMetric` and `MonitoredRequestCountMetric` are `@required` on the
+/// indicator but optional on the config, and this config states NO statistic and NO period
+/// to evaluate a metric with (unlike the period-based one, it declares neither `Statistic`
+/// nor `PeriodSeconds`), so a config that supplies neither list describes no query that
+/// could be materialised: `MetricStat` needs a `Stat` and a `Period` that nothing in the
+/// request names. Both required members are therefore reported with what the config
+/// supplied, and the union keeps the good-count variant when the config named neither — the
+/// member admits no absent value, and a query filled in from the service's own
+/// standard-metric catalogue is not something this emulator can compute.
 pub fn request_based_sli_from_config(
     config: &RequestBasedServiceLevelIndicatorConfig,
 ) -> RequestBasedServiceLevelIndicator {

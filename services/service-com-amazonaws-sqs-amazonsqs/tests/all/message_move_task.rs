@@ -19,67 +19,20 @@
 //! the refusal rows walk every way a `SourceArn`/`DestinationArn` can fail to name a
 //! queue of this account plus each bound of the rate range and one value past it.
 
-use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::state::MESSAGE_MOVE_TASK_START_DELAY;
 
 use super::support::{
-    account, all_attributes, call, create_ok, dead_letter_queue, emulator, error_code,
-    expected_arn, messages, ok, redrives_to, send_all, OTHER_ACCOUNT,
+    account, attribute_count as count, call, create_ok, dead_letter_queue, emulator, error_code,
+    expected_arn, messages, ok, receive_until, redrives_to, send_all, OTHER_ACCOUNT,
 };
-use smithy_server_runtime::MultiServiceRouter;
 
 /// How long a delivery loop waits for the messages a task owes before giving up. Far
 /// longer than any row's own schedule, so a slow machine cannot fail a row that the
 /// emulator is still working through.
 const DELIVERY_DEADLINE: Duration = Duration::from_secs(20);
-
-/// The longest a receive waits for one message in the delivery loop, in seconds. Inside
-/// the documented `ReceiveMessageRequest$WaitTimeSeconds` range ("an integer from 0 to
-/// 20").
-const RECEIVE_WAIT_SECONDS: u64 = 1;
-
-/// One queue attribute as an integer, which is how every `ApproximateNumberOfMessages*`
-/// attribute is reported.
-async fn count(router: &MultiServiceRouter, url: &str, attribute: &str) -> i64 {
-    let attributes: BTreeMap<String, String> = all_attributes(router, url).await;
-    attributes
-        .get(attribute)
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or_else(|| panic!("case {attribute} of {url}: not an integer in {attributes:?}"))
-}
-
-/// Receive from `url` until `wanted` messages have come over or the deadline passes, and
-/// return `(message id, body)` in the order they were handed over.
-async fn receive_until(
-    router: &MultiServiceRouter,
-    url: &str,
-    wanted: usize,
-    deadline: Instant,
-) -> Vec<(String, String)> {
-    let mut delivered: Vec<(String, String)> = Vec::with_capacity(wanted);
-    while delivered.len() < wanted && Instant::now() < deadline {
-        let reply = ok(
-            router,
-            "ReceiveMessage",
-            json!({
-                "QueueUrl": url,
-                "MaxNumberOfMessages": 10,
-                "WaitTimeSeconds": RECEIVE_WAIT_SECONDS,
-            }),
-        )
-        .await;
-        for message in messages(&reply) {
-            delivered.push((
-                message["MessageId"].as_str().unwrap_or_default().to_string(),
-                message["Body"].as_str().unwrap_or_default().to_string(),
-            ));
-        }
-    }
-    delivered
-}
 
 /// A started task hands every message its dead-letter queue can give to the destination
 /// queue, in the order the dead-letter queue held them, with the id and body each message

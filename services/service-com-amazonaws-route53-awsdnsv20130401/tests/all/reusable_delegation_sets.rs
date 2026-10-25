@@ -74,7 +74,11 @@ fn create_set_body(caller_reference: &str, hosted_zone_id: Option<&str>) -> Stri
 }
 
 /// Send one `CreateReusableDelegationSet` request.
-async fn create_set(
+///
+/// `pub(crate)` so a sibling suite asserting the wording of this operation's
+/// zone refusal drives the same request rather than growing a second copy of
+/// its body.
+pub(crate) async fn create_set(
     router: &MultiServiceRouter,
     caller_reference: &str,
     hosted_zone_id: Option<&str>,

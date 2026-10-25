@@ -181,6 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A pure read: nothing below writes, so two callers reading the same model in
         // either order see the same properties.
+        let now = ::std::time::SystemTime::now();
         let store = state.lock();
         // The label is either the raw UUID or the `externalId:<externalId>` alias form.
         let id = store
@@ -192,12 +193,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| not_found(&input.asset_model_id))?;
 
         // `assetModelVersion` (LATEST | ACTIVE) picks which version of the model to
-        // report the properties of. This store keeps exactly ONE version per asset
-        // model — `UpdateAssetModel`, the only operation that could supersede it, is
-        // still a 501 scaffold — and that version is both the latest and the active
-        // one, so either alias selects the same property definitions. Nothing is
-        // fabricated for a version history that does not exist.
-        let _ = &input.asset_model_version;
+        // report the properties of: the LATEST one (the default) or the ACTIVE one,
+        // which is a DIFFERENT definition while a write the model already accepted
+        // is still settling. The selector is resolved on the record, so this list
+        // and the reads of the model itself answer from the same version, and a
+        // version the model does not have is the modelled 404 rather than another
+        // version's property definitions under its name.
+        let record = record
+            .version_view(input.asset_model_version.as_deref(), now)
+            .ok_or_else(|| no_active_version(&id, record.state(now)))?;
+        let record = &*record;
 
         // The enumeration order: the model's own properties in definition order, then
         // each composite model's properties, composite models in their stored order.
@@ -292,11 +297,13 @@ fn summarize(
         r#type: property.r#type.clone(),
         asset_model_composite_model_id: composite.and_then(|composite| composite.id.clone()),
         path: Some(path),
-        // Which interfaces a property belongs to is written only by
-        // `PutAssetModelInterfaceRelationship`, still a 501 scaffold, so this store
-        // holds no interface relationship to report. Left ABSENT rather than reported
-        // as an empty list: the emulator has nothing to say here, which is not the
-        // same claim as "this property belongs to no interface".
+        // Which interfaces a property belongs to is reported by no member this
+        // enumeration derives: the store records an applied interface as a
+        // relationship between two asset models, and which of a model's
+        // properties each mapping covers is the subject of the interface reads,
+        // not of this list. Left ABSENT rather than reported as an empty list:
+        // the emulator has nothing to say here, which is not the same claim as
+        // "this property belongs to no interface".
         interface_summaries: None,
     }
 }
@@ -328,6 +335,18 @@ fn invalid_token() -> ListAssetModelPropertiesError {
         ListAssetModelPropertiesErrorModeled::InvalidRequestException(InvalidRequestException {
             message: "The nextToken is not a token this operation issued.".to_string(),
         }),
+    )
+}
+
+/// HTTP 404 `ResourceNotFoundException` for a list scoped to the ACTIVE version
+/// of a model that has none, in this service's one wording for that absence.
+fn no_active_version(asset_model_id: &str, state: &str) -> ListAssetModelPropertiesError {
+    ListAssetModelPropertiesError::Modeled(
+        ListAssetModelPropertiesErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException {
+                message: crate::state::no_active_version_message(asset_model_id, state),
+            },
+        ),
     )
 }
 

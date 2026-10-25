@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateResolverDnssecConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateResolverDnssecConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateResolverDnssecConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +148,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateResolverDnssecConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateResolverDnssecConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateResolverDnssecConfig"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateResolverDnssecConfigErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The statuses the requested setting moves the configuration through.
+        // The modelled `Validation` enum is enforced before a handler runs, so
+        // this is where the three values it declares are turned into the status
+        // pair each one moves the configuration through — and an unmodelled
+        // value is refused rather than silently treated as one of them.
+        let Some((in_flight, settled)) =
+            crate::state::dnssec_validation_transition(input.validation.as_str())
+        else {
+            return Err(
+                UpdateResolverDnssecConfigErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: format!(
+                            "Validation must be one of {:?}",
+                            crate::ops::types::VALIDATION_VALUES
+                        ),
+                        field_name: Some("Validation".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+
+        if let Some(record) = store.resolver_dnssec_configs.get_mut(&input.resource_id) {
+            // "Updates an existing DNSSEC validation configuration": the
+            // configuration keeps its `Id` and its owner, and only the
+            // validation setting moves. A request asking for the setting the
+            // configuration is already settled in, or already moving to,
+            // writes nothing — so it neither drives a settled configuration
+            // back out of its settled status nor pushes the move an earlier
+            // call made due back into the future.
+            if record.settled_status != settled {
+                record.status = in_flight.to_string();
+                record.settled_status = settled.to_string();
+                record.settled_at = now + crate::state::PROVISIONING_DELAY;
+            }
+            return Ok(UpdateResolverDnssecConfigOutput {
+                resolver_dnssec_config: Some(record.to_dnssec_config(now)),
+            });
+        }
+
+        // The store is bounded: a request that would carry it past the bound is
+        // refused before anything is written. An update of a `ResourceId`
+        // already stored is handled above and so is never refused here.
+        if !store.can_store_another_dnssec_config() {
+            return Err(
+                UpdateResolverDnssecConfigErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "This emulator stores at most {} configurations for DNSSEC validation; update one of the resources it already holds a configuration for",
+                            crate::state::MAX_STORED_DNSSEC_CONFIGS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "If there is no existing DNSSEC validation configuration, one is
+        // created": the VPC gets a configuration whose status is the transient
+        // one, and the move to the settled status is the one the clock owes, so
+        // a caller reading straight after this call still observes the
+        // transient status.
+        let seq = store.next_seq();
+        let record = crate::state::ResolverDnssecConfigRecord {
+            seq,
+            id: crate::state::mint_dnssec_config_id(seq),
+            owner_id: ::engine::emulator_account_id().to_string(),
+            resource_id: input.resource_id.clone(),
+            status: in_flight.to_string(),
+            settled_status: settled.to_string(),
+            settled_at: now + crate::state::PROVISIONING_DELAY,
+        };
+        let reported = record.to_dnssec_config(now);
+        store
+            .resolver_dnssec_configs
+            .insert(input.resource_id.clone(), record);
+
+        Ok(UpdateResolverDnssecConfigOutput {
+            resolver_dnssec_config: Some(reported),
+        })
     }
 }

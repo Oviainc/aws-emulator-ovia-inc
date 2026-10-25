@@ -43,7 +43,10 @@ struct Case {
 }
 
 /// A `Tags` map of `count` generated entries, used for the entry-count rows.
-fn generated_tags(count: usize) -> serde_json::Value {
+///
+/// `pub(crate)` so the untagging suite builds its tag sets the same way rather than
+/// restating the generator.
+pub(crate) fn generated_tags(count: usize) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     for index in 0..count {
         map.insert(
@@ -138,7 +141,10 @@ fn cases() -> Vec<Case> {
 }
 
 /// Create a workflow carrying `tags` and report its ARN.
-async fn workflow_with_tags(
+///
+/// `pub(crate)` so every suite that needs a tagged resource creates it through the one
+/// wire path.
+pub(crate) async fn workflow_with_tags(
     harness: &Harness,
     label: &str,
     name: &str,
@@ -164,7 +170,10 @@ async fn workflow_with_tags(
 }
 
 /// Call `ListTagsForResource` and report its status and `Tags` member.
-async fn list_tags(harness: &Harness, arn: &str) -> (u16, serde_json::Value) {
+///
+/// `pub(crate)` so every suite reads a resource's tag set back through the same
+/// implemented reader.
+pub(crate) async fn list_tags(harness: &Harness, arn: &str) -> (u16, serde_json::Value) {
     let (status, answered) = harness
         .call(
             "ListTagsForResource",

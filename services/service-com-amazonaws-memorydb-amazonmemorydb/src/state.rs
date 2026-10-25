@@ -2016,6 +2016,28 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
         }
         left_behind
     }
+
+    /// Why the first of `user_names` this store holds no user for cannot be a member of
+    /// an ACL, or `None` when every one of them names a stored user.
+    ///
+    /// An ACL's members ARE users ([`Self::user_membership`] derives `User$ACLNames`
+    /// from them, and [`Self::acl_minimum_engine_version`] derives the ACL's engine
+    /// floor from what they require), so every write path of a membership
+    /// (`CreateACL$UserNames`, `UpdateACL$UserNamesToAdd`) resolves each name it is
+    /// given against the user store before the membership is persisted: neither can
+    /// leave an ACL listing a member no user exists for. The names are expected FOLDED,
+    /// the way this store is keyed, and the message is the one sentence every operation
+    /// reports an absent user with ([`not_found_message`]). The caller maps it onto its
+    /// modelled `UserNotFoundFault`.
+    pub fn absent_member_rejection<'a>(
+        &self,
+        user_names: impl IntoIterator<Item = &'a str>,
+    ) -> Option<String> {
+        user_names
+            .into_iter()
+            .find(|name| !self.users.contains_key(*name))
+            .map(|name| not_found_message(ResourceKind::User, name))
+    }
 }
 
 /// A cluster as this emulator persists it: every member `CreateCluster` accepted, plus
@@ -2625,6 +2647,115 @@ pub fn default_user_membership_rejection<'a>(
     .then(|| format!("{DEFAULT_USER_NAME} user can't be added to another ACL."))
 }
 
+/// What the service answers a `User$AccessString` that is not a rule list of the
+/// engine's ACL syntax with. Fixed text: the rule is stated, not the value the request
+/// carried.
+pub const INVALID_ACCESS_STRING_MESSAGE: &str = "The access-string is invalid.";
+
+/// Why `access_string` is not an access string the engine can apply, or `None` when it
+/// is one.
+///
+/// The model types `AccessString` as a plain string and only requires it to carry a
+/// non-whitespace character (`CreateUser$AccessString` is `@pattern("\\S")`), while the
+/// VALUE is a Redis OSS / Valkey ACL rule list: a whitespace-separated sequence of
+/// rules, each either one of the keywords that set a whole permission at once
+/// ([`ACCESS_KEYWORD_RULES`]), a key pattern, a pub/sub channel pattern, or a command
+/// permission. A string carrying anything else names no permission the engine could
+/// apply, so it is a value the service cannot serve and EVERY write path of a user's
+/// access string (`CreateUser`, `UpdateUser`) refuses it with the same sentence, mapped
+/// onto the modelled `InvalidParameterValueException` both declare.
+///
+/// Checked BEFORE [`normalise_access_string`] canonicalises one, so no user is ever
+/// stored holding a rule list the engine does not define.
+pub fn access_string_rejection(access_string: &str) -> Option<String> {
+    let mut rules = access_string.split_whitespace().peekable();
+    // A string of no rules grants nothing: there is no permission to apply, so it is
+    // refused like any other value the engine cannot read.
+    let empty = rules.peek().is_none();
+    (empty || !rules.all(is_access_rule)).then(|| INVALID_ACCESS_STRING_MESSAGE.to_string())
+}
+
+/// The ACL rules that are a KEYWORD, each setting one whole permission at once: the
+/// enabled flag, the key permission, the pub/sub channel permission, the command set,
+/// and the reset that clears every one of them.
+const ACCESS_KEYWORD_RULES: &[&str] = &[
+    "on",
+    "off",
+    "allkeys",
+    "resetkeys",
+    "allchannels",
+    "resetchannels",
+    "allcommands",
+    "nocommands",
+    "reset",
+];
+
+/// Whether one rule of an access string is a rule the engine's ACL syntax defines.
+///
+/// The password rules of the engine's own syntax are NOT among them: a MemoryDB user's
+/// credentials are set through `AuthenticationMode` ([`authentication_from_mode`]), not
+/// through its access string, so a rule naming a password is not a rule this service's
+/// access string can carry.
+fn is_access_rule(rule: &str) -> bool {
+    if ACCESS_KEYWORD_RULES
+        .iter()
+        .any(|keyword| rule.eq_ignore_ascii_case(keyword))
+    {
+        return true;
+    }
+    if let Some(pattern) = key_rule_pattern(rule) {
+        return !pattern.is_empty();
+    }
+    // A pub/sub channel rule is its pattern after `&`.
+    if let Some(pattern) = rule.strip_prefix('&') {
+        return !pattern.is_empty();
+    }
+    // A command rule grants (`+`) or revokes (`-`) one command set.
+    if let Some(selector) = rule.strip_prefix('+').or_else(|| rule.strip_prefix('-')) {
+        return is_command_selector(selector);
+    }
+    false
+}
+
+/// The key pattern of a key rule, or `None` when `rule` is no key rule: the pattern
+/// after `~`, optionally preceded by the access the rule grants over the keys the
+/// pattern matches (`%R~`, `%W~`, `%RW~`).
+fn key_rule_pattern(rule: &str) -> Option<&str> {
+    if let Some(pattern) = rule.strip_prefix('~') {
+        return Some(pattern);
+    }
+    let (access, pattern) = rule.strip_prefix('%')?.split_once('~')?;
+    matches!(
+        access.to_ascii_uppercase().as_str(),
+        "R" | "W" | "RW" | "WR"
+    )
+    .then_some(pattern)
+}
+
+/// Whether `selector` names a command set a command rule can grant or revoke: a command
+/// category (`@<category>`) or a single command, which may be narrowed to one of its
+/// subcommands (`<command>|<subcommand>`). Only a container command has subcommands, so
+/// a category carrying one names nothing.
+fn is_command_selector(selector: &str) -> bool {
+    let (named, subcommand) = match selector.split_once('|') {
+        Some((named, subcommand)) => (named, Some(subcommand)),
+        None => (selector, None),
+    };
+    let Some(word) = named.strip_prefix('@') else {
+        return is_engine_word(named) && subcommand.is_none_or(is_engine_word);
+    };
+    subcommand.is_none() && is_engine_word(word)
+}
+
+/// Whether `word` is spelled the way the engine spells a command, a subcommand or a
+/// command category: at least one character, each a letter, a digit, `-` or `_`.
+fn is_engine_word(word: &str) -> bool {
+    !word.is_empty()
+        && word.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        })
+}
+
 /// The canonical form of an access string, which is what the service stores and
 /// reports for `User$AccessString`.
 ///
@@ -2734,6 +2865,38 @@ pub fn engine_rejection(engine: Option<&str>) -> Option<String> {
         .any(|candidate| candidate.engine == engine);
     (!offered).then(|| format!("Invalid engine name {engine} specified for the cluster"))
 }
+
+/// The longest `Description` this service accepts on a resource that carries one.
+///
+/// A description is FREE TEXT the model puts no `@length` on, and it is stored and
+/// echoed back by every describe of the resource, so the service bounds it: a longer
+/// one is a value it cannot serve. The bound and the sentence a longer value is refused
+/// with are the service's own, as the recorded `CreateParameterGroup` refusal carries
+/// them.
+pub const MAX_DESCRIPTION_LEN: usize = 255;
+
+/// Why `description` is too long to be stored, or `None` when it fits (and when the
+/// request carried none at all).
+///
+/// Read by EVERY write path that takes a `Description` — `CreateCluster`,
+/// `UpdateCluster`, `CreateParameterGroup` — before anything is persisted, so one
+/// request cannot grow a stored description past the bound whichever operation it was
+/// sent to. The caller maps the refusal onto its modelled
+/// `InvalidParameterValueException`.
+pub fn description_rejection(description: Option<&str>) -> Option<String> {
+    (description?.chars().count() > MAX_DESCRIPTION_LEN).then(|| {
+        format!("Description is too long. Maximum length is {MAX_DESCRIPTION_LEN}")
+    })
+}
+
+/// What the service answers a `UserName` sent together with `Filters` with. Fixed text:
+/// the rule the two members break is stated, not the values the request carried.
+pub const USER_NAME_WITH_FILTERS_MESSAGE: &str =
+    "User name can't be specified at the same time as filters.";
+
+/// What a cluster write answers a `SubnetGroupName` this store holds no subnet group
+/// for with. Fixed text: the condition is stated, not the name the request carried.
+pub const SUBNET_GROUP_NOT_FOUND_MESSAGE: &str = "Subnet Group not found.";
 
 /// What `DeleteCluster` answers a `ClusterName` this store does not hold with: the
 /// service's own sentence for the condition, which quotes no value of the request.

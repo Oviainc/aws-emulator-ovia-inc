@@ -17,6 +17,8 @@ mod agent_lifecycle;
 mod data_source_lifecycle;
 #[path = "all/flow_lifecycle.rs"]
 mod flow_lifecycle;
+#[path = "all/ingestion_job_lifecycle.rs"]
+mod ingestion_job_lifecycle;
 #[path = "all/knowledge_base_lifecycle.rs"]
 mod knowledge_base_lifecycle;
 #[path = "all/state_roundtrip.rs"]

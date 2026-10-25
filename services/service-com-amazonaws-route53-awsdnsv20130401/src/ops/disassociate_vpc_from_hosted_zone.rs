@@ -93,6 +93,7 @@ use super::types::*;
 
 use crate::state::{
     no_such_hosted_zone, normalize_zone_id, vpc_id_is_well_formed, vpc_region_is_modelled,
+    LAST_VPC_ASSOCIATION_MESSAGE,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -238,15 +239,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You can't disassociate the last Amazon VPC from a private hosted
         // zone": a private zone resolves names only for the VPCs associated with
         // it, so removing the only one would leave a zone no VPC could reach,
-        // and the model declares a refusal for exactly this request.
+        // and the model declares a refusal for exactly this request. The wording
+        // is a CONSTANT (`crate::state::LAST_VPC_ASSOCIATION_MESSAGE`), naming
+        // neither the VPC nor the zone of the request it refuses.
         if zone.vpcs.len() == 1 {
             return Err(DisassociateVPCFromHostedZoneErrorModeled::LastVPCAssociation(
                 LastVPCAssociation {
-                    message: Some(format!(
-                        "The VPC {vpc_id} is the last VPC associated with the hosted zone \
-                         {zone_id}. Route 53 doesn't support disassociating the last VPC from a \
-                         hosted zone."
-                    )),
+                    message: Some(LAST_VPC_ASSOCIATION_MESSAGE.to_string()),
                 },
             )
             .into());

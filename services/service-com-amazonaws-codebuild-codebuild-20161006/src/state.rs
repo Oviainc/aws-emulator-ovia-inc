@@ -139,6 +139,17 @@ pub const MAX_FLEETS: usize = 1_000;
 /// `InvalidInputException`.
 pub const MIN_FLEET_CAPACITY: i32 = 1;
 
+/// What CodeBuild states as the reason a `FleetCapacity` member is below
+/// [`MIN_FLEET_CAPACITY`], carried by the modelled `InvalidInputException`.
+///
+/// The sentence names neither the member nor the value the request sent, so every
+/// capacity member of a request reports the same text and a client can key on it; only
+/// the bound itself is interpolated, from the one constant that holds it. Recorded
+/// behaviour — the model states no message for the error.
+pub fn capacity_below_floor_message() -> String {
+    format!("Capacity must be greater or equal to {MIN_FLEET_CAPACITY}")
+}
+
 /// How long after `CreateFleet` the clock owes a fleet's transition out of
 /// `CREATING`.
 ///
@@ -353,6 +364,14 @@ pub const SANDBOX_STATUS_TIMED_OUT: &str = "TIMED_OUT";
 /// The terminal status a sandbox `StopSandbox` ended reaches. `STOPPED` is a
 /// `StatusType` value, like [`SANDBOX_STATUS_TIMED_OUT`].
 pub const SANDBOX_STATUS_STOPPED: &str = "STOPPED";
+
+/// What CodeBuild states as the reason a sandbox-addressing request names no sandbox
+/// of this account, carried by the modelled `ResourceNotFoundException`.
+///
+/// The sentence is FIXED: it names neither the identifier the request gave nor an ARN,
+/// so every operation that resolves a sandbox reports the same text and a client can
+/// key on it. Recorded behaviour — the model states no message for the error.
+pub const SANDBOX_NOT_FOUND_MESSAGE: &str = "Sandbox does not exist";
 
 /// The outcome of a phase that ran to completion, from `StatusType`.
 const PHASE_SUCCEEDED: &str = "SUCCEEDED";
@@ -1933,29 +1952,21 @@ pub fn webhook_filter_groups_violation(
 ///   source type projects", and is the only webhook such a project takes;
 /// * every other build type is a repository-event webhook, so it needs a source whose
 ///   provider sends repository events ([`WEBHOOK_SOURCE_TYPES`]).
-pub fn webhook_build_type_violation(
-    source_type: &str,
-    build_type: Option<&str>,
-    project_arn: &str,
-) -> Option<String> {
+///
+/// Both are the same pairing of a build type with a source type, and CodeBuild states
+/// that refusal as ONE fixed clause whose only variable part is the project's stored
+/// source type: it quotes neither the project, its ARN nor the source types that would
+/// be accepted, so both rules answer with the same sentence. Recorded behaviour — the
+/// model states no message for the error.
+pub fn webhook_build_type_violation(source_type: &str, build_type: Option<&str>) -> Option<String> {
     let runner = build_type.is_some_and(|build_type| build_type == RUNNER_WEBHOOK_BUILD_TYPE);
-    if runner {
-        (source_type != RUNNER_WEBHOOK_SOURCE_TYPE).then(|| {
-            format!(
-                "Value at 'buildType' failed to satisfy constraint: {RUNNER_WEBHOOK_BUILD_TYPE} \
-                 is only available for {RUNNER_WEBHOOK_SOURCE_TYPE} source type projects, and \
-                 project {project_arn} has source type {source_type}"
-            )
-        })
+    let takes_this_webhook = if runner {
+        source_type == RUNNER_WEBHOOK_SOURCE_TYPE
     } else {
-        (!WEBHOOK_SOURCE_TYPES.contains(&source_type)).then(|| {
-            format!(
-                "A webhook cannot be connected to project {project_arn}: its source type \
-                 {source_type} does not support webhooks. Supported source types are {}",
-                WEBHOOK_SOURCE_TYPES.join(", "),
-            )
-        })
-    }
+        WEBHOOK_SOURCE_TYPES.contains(&source_type)
+    };
+    (!takes_this_webhook)
+        .then(|| format!("Invalid build type provided for {source_type} type webhook"))
 }
 
 /// `arn:aws:codebuild:<region>:<account>:build-batch/<id>`.
@@ -2556,9 +2567,16 @@ pub fn inline_buildspec_violation(
         .as_ref()
         .is_none_or(|buildspec| buildspec.trim().is_empty());
     (source.r#type == NO_SOURCE_TYPE && no_inline_buildspec).then(|| {
+        // CodeBuild words this class of `InvalidInputException` with an `Invalid input: `
+        // prefix and states the rule in one fixed clause whose only variable part is the
+        // source type, which is read from the source under check rather than written
+        // here — the branch is reachable for the one type that declares no input source
+        // code, so that read is what the message names today and stays correct if the
+        // model ever declares another such type. Recorded behaviour — the model states
+        // no message for the error.
         format!(
-            "A buildspec must be provided when the project source type is {NO_SOURCE_TYPE}, \
-             which has no source code to hold a buildspec file"
+            "Invalid input: a buildspec is required for source type {}",
+            source.r#type
         )
     })
 }

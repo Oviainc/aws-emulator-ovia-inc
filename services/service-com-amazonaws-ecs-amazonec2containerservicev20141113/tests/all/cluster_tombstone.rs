@@ -381,6 +381,10 @@ async fn a_cluster_delete_is_refused_only_while_it_holds_something_unreleased() 
             Holding::Nothing => {}
             Holding::ActiveService | Holding::DeletedService => {
                 register_definition(&router, &format!("{name}family"), case).await;
+                // The EC2 launch type places a task on an instance registered to the
+                // cluster, so the cluster needs one before the scheduler places the
+                // service's task set.
+                register_capacity(&router, name, case).await;
                 ok(
                     &router,
                     "CreateService",
@@ -708,6 +712,9 @@ async fn deleting_a_service_drains_its_tasks_and_settles_on_the_clock() {
         )
         .await;
         register_definition(&router, &format!("{cluster}family"), case).await;
+        // The EC2 launch type places a task on an instance registered to the cluster, so
+        // the cluster needs one before the scheduler places the service's task set.
+        register_capacity(&router, &cluster, case).await;
         ok(
             &router,
             "CreateService",
@@ -811,6 +818,7 @@ async fn deleting_a_service_drains_its_tasks_and_settles_on_the_clock() {
     )
     .await;
     register_definition(&router, "settlingfamily", case).await;
+    register_capacity(&router, "settling", case).await;
     ok(
         &router,
         "CreateService",

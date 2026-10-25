@@ -191,6 +191,12 @@ mod keyspaces_streams_routing;
 mod lambda_bundled_wire_operations;
 #[path = "all/lambda_signing_name_routing.rs"]
 mod lambda_signing_name_routing;
+// Declared in this span of the sorted list, beside the other `l…` suites, rather than at
+// the head of this file or in its appended tail: both of those are where concurrently
+// landing suites put their line, so a declaration there loses a squash merge to every one
+// of them, while these neighbouring lines are stable.
+#[path = "all/lakeformation_catalog_resource_resolution.rs"]
+mod lakeformation_catalog_resource_resolution;
 // Declared HERE, in the sorted list, rather than appended at the end of this file: the
 // tail is where every concurrently landing router suite appends its line, so a
 // declaration placed there conflicts with every one of them. (The build script requires

@@ -446,9 +446,10 @@ async fn stop_sandbox_ends_a_sandbox_from_whichever_phase_it_is_in() {
             error_type(&body).contains("ResourceNotFoundException"),
             "{case}: expected ResourceNotFoundException, got {body}"
         );
-        assert!(
-            text(&body, "message").contains(id),
-            "{case}: the refusal must name the id asked for, got {body}"
+        assert_eq!(
+            text(&body, "message"),
+            state::SANDBOX_NOT_FOUND_MESSAGE,
+            "{case}: expected CodeBuild's fixed sandbox-not-found sentence, got {body}"
         );
     }
 }

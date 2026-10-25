@@ -374,6 +374,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             active_at: now + crate::state::ACTIVATION_DELAY,
             settling_state: crate::state::STATE_CREATING.to_string(),
             version: 1,
+            // Nothing is superseded yet, and this first version is not active
+            // until the transition above falls due, so the model has no ACTIVE
+            // version at all for that span.
+            superseded_active: None,
             tags: input.tags.clone().unwrap_or_default(),
         };
 

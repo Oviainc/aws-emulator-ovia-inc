@@ -119,6 +119,8 @@ mod state_roundtrip;
 mod template_outputs;
 #[path = "all/template_quotas.rs"]
 mod template_quotas;
+#[path = "all/type_testing.rs"]
+mod type_testing;
 #[path = "all/unprovisioned_resources.rs"]
 mod unprovisioned_resources;
 #[path = "all/unrecognized_resource_types.rs"]

@@ -166,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // has owed it since `StartSandbox` is materialised before this request judges
         // its state — the same record a reporting call would see.
         let Some(stored) = guard.settled_sandbox(store_id, now) else {
-            return Err(sandbox_not_found(&region, store_id));
+            return Err(sandbox_not_found());
         };
         // A command execution runs inside the sandbox's live session, so a sandbox
         // that is still queued has no session to run it in yet and one that has ended
@@ -238,12 +238,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The modelled refusal for a `sandboxId` no sandbox of this account answers to.
-fn sandbox_not_found(region: &str, sandbox_id: &str) -> StartCommandExecutionError {
+///
+/// Worded by the one sentence CodeBuild answers an unresolvable sandbox with
+/// ([`crate::state::SANDBOX_NOT_FOUND_MESSAGE`]), which names no identifier — so nothing
+/// about the request, and no ARN for a sandbox that does not exist, reaches the wire.
+fn sandbox_not_found() -> StartCommandExecutionError {
     StartCommandExecutionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!(
-            "Sandbox cannot be found: {}",
-            crate::state::sandbox_arn(region, sandbox_id)
-        )),
+        message: Some(crate::state::SANDBOX_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

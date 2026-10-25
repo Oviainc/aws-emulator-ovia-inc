@@ -41,6 +41,8 @@ mod managed_rule_group_versions;
 mod managed_rule_groups;
 #[path = "all/parameter_validation.rs"]
 mod parameter_validation;
+#[path = "all/permission_policy.rs"]
+mod permission_policy;
 #[path = "all/regex_pattern_set_lifecycle.rs"]
 mod regex_pattern_set_lifecycle;
 #[path = "all/regex_pattern_set_listing.rs"]

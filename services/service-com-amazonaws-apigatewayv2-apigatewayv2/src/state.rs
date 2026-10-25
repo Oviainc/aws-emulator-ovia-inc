@@ -2306,6 +2306,17 @@ pub struct PortalProduct {
     /// the same reason [`Api::route_id_seed`] is per-api: the id only has to be unique
     /// within the product that owns the page.
     pub product_rest_endpoint_page_id_seed: u64,
+    /// This product's product pages, keyed by `ProductPageId`. A product page is
+    /// addressed UNDER its product
+    /// (`/v2/portalproducts/{PortalProductId}/productpages/{ProductPageId}`), so the
+    /// product OWNS its product pages the way it owns its product REST endpoint pages:
+    /// removing the product takes them with it, and no second map can drift out of step
+    /// with it. `BTreeMap` for the stable key order a paginated listing resumes through.
+    pub product_pages: BTreeMap<String, ProductPage>,
+    /// Drives [`PortalProduct::mint_product_page_id`]. Per-product, and separate from
+    /// [`Self::product_rest_endpoint_page_id_seed`], so minting one kind of page never
+    /// shifts the ids the other kind gets.
+    pub product_page_id_seed: u64,
 }
 
 /// The members `CreatePortalProduct`, `GetPortalProduct` and `UpdatePortalProduct`
@@ -2342,6 +2353,15 @@ impl PortalProduct {
         mint_id(self.product_rest_endpoint_page_id_seed)
     }
 
+    /// Mint a fresh `ProductPageId` for this product: ten lowercase alphanumerics, never
+    /// one this product already minted. The member targets
+    /// `__stringMin10Max30PatternAZ09` (len 10..30, pattern `^[a-z0-9]+$`), which
+    /// [`mint_id`]'s ten-character lowercase alphanumeric id satisfies by construction.
+    pub fn mint_product_page_id(&mut self) -> String {
+        self.product_page_id_seed = self.product_page_id_seed.wrapping_add(1);
+        mint_id(self.product_page_id_seed)
+    }
+
     /// Project the record onto the members every portal-product reader reports.
     pub fn to_wire(&self) -> PortalProductView {
         PortalProductView {
@@ -2357,6 +2377,86 @@ impl PortalProduct {
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect(),
             ),
+        }
+    }
+}
+
+/// The most product pages one portal product may hold, after which CreateProductPage is
+/// refused.
+///
+/// An EMULATOR growth bound, not a figure AWS publishes: it keeps a loop of
+/// CreateProductPage calls from growing one product without end, and is set to the
+/// per-parent bound this service already uses for the other child collections it mints
+/// ids into ([`MAX_PRODUCT_REST_ENDPOINT_PAGES_PER_PRODUCT`]). `TooManyRequestsException`
+/// ("A limit has been exceeded") is the modelled error the operation refuses with. Do not
+/// cite this as a published quota.
+pub const MAX_PRODUCT_PAGES_PER_PRODUCT: usize = 300;
+
+/// The resource portion a product page's ARN carries after its product's: API Gateway
+/// names a resource by its own REST path, and a product page's path is
+/// `/portalproducts/{portalProductId}/productpages/{productPageId}`.
+pub const PRODUCT_PAGE_RESOURCE_SEGMENT: &str = "/productpages/";
+
+/// The ARN of a stored product page.
+///
+/// Built like every other ARN this store names — through [`::engine::emulator_arn`] under
+/// [`ARN_SERVICE`], with the resource portion the page's own REST path (see
+/// [`PRODUCT_PAGE_RESOURCE_SEGMENT`]) — so it names the page's product as well as the
+/// page, and satisfies the modelled `len 20..2048` of `ProductPageArn`.
+pub fn product_page_arn(region: &str, portal_product_id: &str, product_page_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!(
+            "{PORTAL_PRODUCT_RESOURCE_PREFIX}{portal_product_id}\
+             {PRODUCT_PAGE_RESOURCE_SEGMENT}{product_page_id}"
+        ),
+    )
+}
+
+/// A persisted `ProductPage` resource: one page of free-form content a published portal
+/// shows for a portal product.
+///
+/// Owned by its [`PortalProduct`] (see [`PortalProduct::product_pages`]). The record
+/// keeps what the write RESOLVED — the id and ARN it minted, the display content the
+/// request carried, the instant the page was last modified — so every reader of the page
+/// reports one value.
+#[derive(Debug, Clone)]
+pub struct ProductPage {
+    pub product_page_id: String,
+    /// Built once at write time by [`product_page_arn`] from the Region the creating
+    /// request addressed: an ARN names the Region its resource was created in, so it
+    /// cannot be rebuilt per read from whatever Region a later caller signs for.
+    pub product_page_arn: String,
+    /// "The content of the product page" (`CreateProductPage$DisplayContent`): a title
+    /// and a body, both required on the modelled `DisplayContent`, so the record always
+    /// carries both.
+    pub display_content: wire::DisplayContent,
+    /// "The timestamp when the product page was last modified" — the creation instant
+    /// until something rewrites the record.
+    pub last_modified: SystemTime,
+}
+
+/// The members `CreateProductPage`, `GetProductPage` and `UpdateProductPage` each report
+/// for one product page — the three modelled responses carry exactly the same set — so
+/// [`ProductPage::to_wire`] projects the record ONCE and every reader serializes that
+/// projection rather than assembling its own.
+#[derive(Debug, Clone)]
+pub struct ProductPageView {
+    pub display_content: Option<wire::DisplayContent>,
+    pub last_modified: Option<::aws_smithy_types::DateTime>,
+    pub product_page_arn: Option<String>,
+    pub product_page_id: Option<String>,
+}
+
+impl ProductPage {
+    /// Project the record onto the members every product-page reader reports.
+    pub fn to_wire(&self) -> ProductPageView {
+        ProductPageView {
+            display_content: Some(self.display_content.clone()),
+            last_modified: Some(to_timestamp(self.last_modified)),
+            product_page_arn: Some(self.product_page_arn.clone()),
+            product_page_id: Some(self.product_page_id.clone()),
         }
     }
 }

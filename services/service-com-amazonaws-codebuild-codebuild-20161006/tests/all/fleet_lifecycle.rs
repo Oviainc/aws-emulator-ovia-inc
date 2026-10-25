@@ -262,70 +262,91 @@ async fn a_fleet_settles_to_active_from_stored_state_and_never_changes_again() {
     );
 }
 
+/// What one row of the capacity table expects back.
+enum CapacityOutcome {
+    /// The request is accepted and the fleet created.
+    Accepted,
+    /// Refused by the `FleetCapacity` floor, which CodeBuild words with one fixed
+    /// sentence naming neither the member nor the value sent.
+    BelowFloor,
+    /// Refused by this emulator's own cross-field rule (the range `maxCapacity` opens
+    /// has to contain `baseCapacity`), whose refusal names the member it is about.
+    NamesMember(&'static str),
+}
+
 /// RULE: every member of the model's `FleetCapacity` shape counts machines
 /// (`baseCapacity` is "the initial number of machines allocated to the fleet",
 /// `maxCapacity` "the maximum number of instances in the fleet when auto-scaling"), so a
-/// value below one is refused with the modelled `InvalidInputException`; one is the
-/// smallest accepted count. The model declares no `@range` on `FleetCapacity`, so the
-/// boundary validator passes every row below through to the handler.
+/// value below one is refused with the modelled `InvalidInputException` carrying
+/// CodeBuild's own fixed sentence for a capacity below the floor; one is the smallest
+/// accepted count. The model declares no `@range` on `FleetCapacity`, so the boundary
+/// validator passes every row below through to the handler.
 #[tokio::test]
 async fn a_capacity_below_one_machine_is_refused_on_every_capacity_member() {
     let router = emulator();
 
-    // (case, members merged into the request, the refused member or "" when accepted)
-    let cases: [(&str, Value, &str); 11] = [
-        ("baseCapacity at the bound", json!({"baseCapacity": 1}), ""),
-        ("baseCapacity well inside", json!({"baseCapacity": 64}), ""),
+    // (case, members merged into the request, what the answer must be)
+    let cases: [(&str, Value, CapacityOutcome); 11] = [
+        (
+            "baseCapacity at the bound",
+            json!({"baseCapacity": 1}),
+            CapacityOutcome::Accepted,
+        ),
+        (
+            "baseCapacity well inside",
+            json!({"baseCapacity": 64}),
+            CapacityOutcome::Accepted,
+        ),
         (
             "baseCapacity one past the bound",
             json!({"baseCapacity": 0}),
-            "baseCapacity",
+            CapacityOutcome::BelowFloor,
         ),
         (
             "baseCapacity negative",
             json!({"baseCapacity": -7}),
-            "baseCapacity",
+            CapacityOutcome::BelowFloor,
         ),
         (
             "maxCapacity at the bound",
             json!({"baseCapacity": 1, "scalingConfiguration": {"maxCapacity": 1}}),
-            "",
+            CapacityOutcome::Accepted,
         ),
         (
             "maxCapacity well inside",
             json!({"baseCapacity": 2, "scalingConfiguration": {"maxCapacity": 40}}),
-            "",
+            CapacityOutcome::Accepted,
         ),
         (
             "maxCapacity one past the bound",
             json!({"baseCapacity": 2, "scalingConfiguration": {"maxCapacity": 0}}),
-            "scalingConfiguration.maxCapacity",
+            CapacityOutcome::BelowFloor,
         ),
         (
             "maxCapacity negative",
             json!({"baseCapacity": 2, "scalingConfiguration": {"maxCapacity": -1}}),
-            "scalingConfiguration.maxCapacity",
+            CapacityOutcome::BelowFloor,
         ),
         (
-            "both members past the bound: the first one named wins",
+            "both members past the bound",
             json!({"baseCapacity": 0, "scalingConfiguration": {"maxCapacity": -3}}),
-            "baseCapacity",
+            CapacityOutcome::BelowFloor,
         ),
         // The range `maxCapacity` opens has to contain `baseCapacity`: a fleet cannot
         // be told to scale no higher than fewer machines than it is provisioned with.
         (
             "maxCapacity equal to baseCapacity",
             json!({"baseCapacity": 5, "scalingConfiguration": {"maxCapacity": 5}}),
-            "",
+            CapacityOutcome::Accepted,
         ),
         (
             "maxCapacity below baseCapacity",
             json!({"baseCapacity": 5, "scalingConfiguration": {"maxCapacity": 4}}),
-            "scalingConfiguration.maxCapacity",
+            CapacityOutcome::NamesMember("scalingConfiguration.maxCapacity"),
         ),
     ];
 
-    for (index, (case, members, refused)) in cases.into_iter().enumerate() {
+    for (index, (case, members, outcome)) in cases.into_iter().enumerate() {
         let name = format!("capacity-fleet-{index}");
         let (status, body) = call(
             &router,
@@ -333,7 +354,7 @@ async fn a_capacity_below_one_machine_is_refused_on_every_capacity_member() {
             create_fleet_body(&name, members.clone()),
         )
         .await;
-        if refused.is_empty() {
+        if matches!(outcome, CapacityOutcome::Accepted) {
             assert_eq!(
                 status, 200,
                 "case {case:?}: expected 200, got {status} with {body}"
@@ -350,10 +371,18 @@ async fn a_capacity_below_one_machine_is_refused_on_every_capacity_member() {
             "case {case:?}: expected InvalidInputException, got {body}"
         );
         let message = body["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains(refused),
-            "case {case:?}: the refusal must name {refused:?}, got {body}"
-        );
+        match outcome {
+            CapacityOutcome::Accepted => unreachable!("handled above"),
+            CapacityOutcome::BelowFloor => assert_eq!(
+                message,
+                state::capacity_below_floor_message(),
+                "case {case:?}: expected the capacity-floor refusal, got {message:?}"
+            ),
+            CapacityOutcome::NamesMember(member) => assert!(
+                message.contains(member),
+                "case {case:?}: the refusal must name {member:?}, got {message:?}"
+            ),
+        }
 
         // A refused request persists nothing.
         let read = batch_get_fleets(&router, &[&name]).await;
@@ -560,5 +589,143 @@ async fn creating_a_fleet_past_the_account_quota_is_refused() {
         read["fleets"],
         json!([]),
         "a refused CreateFleet must persist nothing, got {read}"
+    );
+}
+
+/// RULE: `ListFleets` reports the ARNs of the fleets the account holds, ordered by the
+/// criterion `sortBy` names ("CREATED_TIME: List based on when each compute fleet was
+/// created. LAST_MODIFIED_TIME: ... NAME: List based on each compute fleet's name"),
+/// reversed when `sortOrder` asks for `DESCENDING`, a page at a time — and a fleet a
+/// refused `CreateFleet` never created is in none of those listings.
+#[tokio::test]
+async fn list_fleets_reports_the_stored_fleets_by_the_requested_criterion() {
+    let router = emulator();
+
+    // Created in an order that is NEITHER name order nor its reverse, so a listing by
+    // name cannot be mistaken for a listing by creation time. Each create advances the
+    // service clock's millisecond stamp, so creation order is observable.
+    let created_order = ["m-fleet", "a-fleet", "z-fleet"];
+    let mut arn_of = std::collections::BTreeMap::new();
+    for name in created_order {
+        let fleet = create_fleet(&router, name, json!({})).await;
+        arn_of.insert(
+            name,
+            fleet["arn"].as_str().expect("an arn").to_string(),
+        );
+        // `lastModified` is stamped per write, so a later update would reorder the
+        // LAST_MODIFIED_TIME listing; nothing updates these, so it matches creation
+        // order.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let by_name: Vec<String> = ["a-fleet", "m-fleet", "z-fleet"]
+        .iter()
+        .map(|name| arn_of[name].clone())
+        .collect();
+    let by_creation: Vec<String> = created_order
+        .iter()
+        .map(|name| arn_of[name].clone())
+        .collect();
+
+    // A refused create must leave nothing for any listing to report.
+    let (status, body) = call(
+        &router,
+        "CreateFleet",
+        create_fleet_body("refused-fleet", json!({"baseCapacity": 0})),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a capacity below the floor expects 400, got {status} with {body}"
+    );
+
+    // (case, the request, the ARNs expected back in order)
+    let cases: Vec<(&str, Value, Vec<String>)> = vec![
+        ("no sortBy: by name", json!({}), by_name.clone()),
+        (
+            "sortBy NAME",
+            json!({"sortBy": "NAME"}),
+            by_name.clone(),
+        ),
+        (
+            "sortBy NAME, DESCENDING",
+            json!({"sortBy": "NAME", "sortOrder": "DESCENDING"}),
+            by_name.iter().rev().cloned().collect(),
+        ),
+        (
+            "sortBy CREATED_TIME",
+            json!({"sortBy": "CREATED_TIME"}),
+            by_creation.clone(),
+        ),
+        (
+            "sortBy CREATED_TIME, DESCENDING",
+            json!({"sortBy": "CREATED_TIME", "sortOrder": "DESCENDING"}),
+            by_creation.iter().rev().cloned().collect(),
+        ),
+        (
+            "sortBy LAST_MODIFIED_TIME",
+            json!({"sortBy": "LAST_MODIFIED_TIME"}),
+            by_creation.clone(),
+        ),
+        (
+            "one per page",
+            json!({"maxResults": 1}),
+            by_name[..1].to_vec(),
+        ),
+        (
+            "two per page",
+            json!({"maxResults": 2}),
+            by_name[..2].to_vec(),
+        ),
+    ];
+
+    for (case, request, expected) in cases {
+        let (status, body) = call(&router, "ListFleets", request).await;
+        assert_eq!(status, 200, "{case}: expected 200, got {status} with {body}");
+        assert_eq!(
+            body["fleets"],
+            json!(expected),
+            "{case}: expected {expected:?}, got {body}"
+        );
+        assert!(
+            !body["fleets"]
+                .as_array()
+                .expect("a fleets list")
+                .iter()
+                .any(|arn| arn.as_str().unwrap_or_default().contains("refused-fleet")),
+            "{case}: a refused create must appear in no listing, got {body}"
+        );
+    }
+
+    // The page token walks the rest of the listing and stops.
+    let mut walked: Vec<String> = Vec::new();
+    let mut token = Value::Null;
+    loop {
+        let mut request = json!({"maxResults": 2});
+        if let (Value::Object(members), Value::String(_)) = (&mut request, &token) {
+            members.insert("nextToken".to_string(), token.clone());
+        }
+        let (status, body) = call(&router, "ListFleets", request).await;
+        assert_eq!(status, 200, "paging: expected 200, got {status} with {body}");
+        for arn in body["fleets"].as_array().expect("a fleets list") {
+            walked.push(arn.as_str().unwrap_or_default().to_string());
+        }
+        token = body["nextToken"].clone();
+        if !token.is_string() {
+            break;
+        }
+    }
+    assert_eq!(
+        walked, by_name,
+        "paging must walk every fleet once, in order, got {walked:?}"
+    );
+
+    // An account holding no fleet reports an empty listing rather than refusing.
+    let empty = emulator();
+    let (status, body) = call(&empty, "ListFleets", json!({})).await;
+    assert_eq!(status, 200, "an empty account: expected 200, got {body}");
+    assert_eq!(
+        body["fleets"],
+        json!([]),
+        "an account holding no fleet lists none, got {body}"
     );
 }
