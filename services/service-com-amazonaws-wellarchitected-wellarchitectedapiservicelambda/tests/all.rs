@@ -119,6 +119,9 @@ mod no_op_updates;
 #[path = "all/official_lens_catalog.rs"]
 mod official_lens_catalog;
 
+#[path = "all/profile_deletion.rs"]
+mod profile_deletion;
+
 #[path = "all/profile_lifecycle.rs"]
 mod profile_lifecycle;
 

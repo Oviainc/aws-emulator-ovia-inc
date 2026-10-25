@@ -873,10 +873,6 @@ pub struct Monitor {
     pub activates_at: Option<SystemTime>,
     pub created_at: SystemTime,
     pub modified_at: SystemTime,
-    /// The `clientToken` of the `CreateMonitor` that made it, when one was
-    /// given — what makes a repeat of that exact request a retry rather than a
-    /// conflict.
-    pub client_token: Option<String>,
 }
 
 impl Monitor {
@@ -956,6 +952,11 @@ pub struct ComAmazonawsNetworkmonitorNetworkmonitorState {
     /// (region, `clientToken`) -> what it replays. A token is scoped to the
     /// region it was sent to, like the monitor it minted. Bounded by
     /// [`MAX_CLIENT_TOKENS`] and [`CLIENT_TOKEN_TTL`].
+    ///
+    /// The ONLY record of which token minted which resource: a monitor and a
+    /// probe keep no token of their own, so there is nothing for this map to
+    /// disagree with once a record is forgotten (TTL, ceiling, or the delete of
+    /// the monitor it named).
     client_tokens: BTreeMap<(String, String), ClientTokenRecord>,
     /// Monotonic counter behind [`Self::next_probe_id`]; never reused within a
     /// run.
@@ -1012,9 +1013,55 @@ impl ComAmazonawsNetworkmonitorNetworkmonitorState {
 
     /// What a `clientToken` sent to `region` replays, when that region holds a
     /// record for it.
-    pub fn client_token_record(&self, region: &str, token: &str) -> Option<&ClientTokenRecord> {
+    ///
+    /// Private: which token minted which resource is recorded in ONE place, and
+    /// [`Self::monitor_minted_by_token`] / [`Self::probe_minted_by_token`] are
+    /// the whole of what a create asks of it, so no caller outside this module
+    /// re-derives the retry decision from the raw record.
+    fn client_token_record(&self, region: &str, token: &str) -> Option<&ClientTokenRecord> {
         self.client_tokens
             .get(&(region.to_string(), token.to_string()))
+    }
+
+    /// The monitor a `clientToken` sent to `region` already minted under
+    /// `monitor_name`, when that token makes the repeat a RETRY of the create
+    /// that minted it: this region holds a record for the token, that record was
+    /// made by a monitor create (it names no probe) and it names this monitor,
+    /// and the monitor it names is still stored.
+    ///
+    /// `None` for every other token — one this region never saw, one the store
+    /// has since forgotten, one that minted a probe, one that minted a
+    /// differently named monitor, or one whose monitor is gone — so the repeat
+    /// is judged on its own, as a request carrying no token is.
+    pub fn monitor_minted_by_token(
+        &self,
+        region: &str,
+        token: &str,
+        monitor_name: &str,
+    ) -> Option<&Monitor> {
+        let record = self.client_token_record(region, token)?;
+        if record.probe_id.is_some() || record.monitor_name != monitor_name {
+            return None;
+        }
+        self.monitor(region, monitor_name)
+    }
+
+    /// The probe a `clientToken` sent to `region` already minted on
+    /// `monitor_name`, under the same rule as
+    /// [`Self::monitor_minted_by_token`]: the record has to name a probe of this
+    /// monitor, and that probe has to be stored still.
+    pub fn probe_minted_by_token(
+        &self,
+        region: &str,
+        token: &str,
+        monitor_name: &str,
+    ) -> Option<&Probe> {
+        let record = self.client_token_record(region, token)?;
+        if record.monitor_name != monitor_name {
+            return None;
+        }
+        let probe_id = record.probe_id.as_deref()?;
+        self.monitor(region, monitor_name)?.probes.get(probe_id)
     }
 
     /// Record what a `clientToken` sent to `region` replays.

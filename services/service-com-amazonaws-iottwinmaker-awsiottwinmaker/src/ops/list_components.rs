@@ -271,28 +271,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         };
 
-        // The page size served. THIS member's documentation publishes a default
-        // of 25 and no minimum, so a zero is served as what it says — a page of
-        // no rows — rather than refused, and a request naming no `maxResults` is
-        // served this service's own default instead of every component the scope
-        // holds. Whatever is asked for, the service serves at most
-        // `crate::state::MAX_PAGE_SIZE`, so the page this call BUILDS is bounded
-        // by this code and not only by the boundary validator.
-        let page_size = match input.max_results {
-            None => crate::state::DEFAULT_PAGE_SIZE,
-            // The conversion can only fail on a NEGATIVE value, which the
-            // modelled range refuses before this handler runs — so this arm is
-            // belt-and-braces. It fails CLOSED (the modelled refusal, naming the
-            // member and the published range) rather than falling back to the
-            // largest page.
-            Some(requested) => usize::try_from(requested)
-                .map_err(|_| {
-                    invalid(format!(
-                        "maxResults must be between 0 and {MODELLED_MAX_RESULTS}, got {requested}"
-                    ))
-                })?
-                .min(crate::state::MAX_PAGE_SIZE),
-        };
+        // The page size served, under the rule every paginated operation of this
+        // service shares (`crate::state::page_size`): THIS member's
+        // documentation publishes a default of 25 and no minimum, so a zero is
+        // served as what it says — a page of no rows — rather than refused, and a
+        // request naming no `maxResults` is served this service's own default
+        // instead of every component the scope holds. Whatever is asked for, the
+        // service serves at most `crate::state::MAX_PAGE_SIZE`, so the page this
+        // call BUILDS is bounded by that code and not only by the boundary
+        // validator.
+        let page_size = crate::state::page_size(
+            input.max_results,
+            crate::state::PageSizeRule::minimum_zero(crate::state::DEFAULT_PAGE_SIZE),
+        )
+        .map_err(invalid)?;
 
         // A component has no lifecycle of its own in this service, so it reports
         // the status of the entity that holds it — the status `GetEntity`

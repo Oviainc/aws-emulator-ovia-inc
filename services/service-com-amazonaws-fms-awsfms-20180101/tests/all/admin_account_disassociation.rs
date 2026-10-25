@@ -64,8 +64,10 @@ fn role_status(name: &str) -> &'static str {
 
 /// How long a requested disassociation stays pending, from the handler's own
 /// constant, plus a margin so a waiting test is not racing it. `pub(crate)` so
-/// the sibling `tagging_administrator_gate` suite waits out the SAME span
-/// rather than keeping a second copy of the wait rule.
+/// the sibling suites that drive an operation on the far side of a completed
+/// tear-down (`policy_administrator_gate`, `admin_accounts_for_organization`,
+/// `list_tags_across_administrator_states`) wait out the SAME span rather than
+/// keeping a second copy of the wait rule.
 ///
 /// A blocking `std::thread::sleep` on purpose: this workspace's `tokio` is built
 /// without the `time` feature (root `Cargo.toml` enables only `macros`, `rt` and

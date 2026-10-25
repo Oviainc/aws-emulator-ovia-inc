@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TestHypervisorConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TestHypervisorConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Tests whether the gateway a request names can connect to a hypervisor at the host it
+//! names, answering from [`crate::state`] alone. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TestHypervisorConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation decides, and from what
+//!
+//! A connection test is answered from the records this service holds: the `GatewayArn`
+//! has to name a gateway in the store, and the `Host` has to be one the store holds a
+//! hypervisor configuration for
+//! ([`crate::state::ComAmazonawsBackupgatewayBackuponpremisesV20210101State::hypervisors_for_host`]).
+//! A host no record of this service names is a host nothing here serves, so the test
+//! cannot pass for it — and answering 200 for every well-formed host would report a
+//! connection that was never made. The two lookups are independent: the gateway's own
+//! association ([`crate::state::StoredGateway::hypervisor_arn`]) is not consulted,
+//! because a test of a configuration is what a caller runs BEFORE associating a gateway
+//! with the server it will serve.
+//!
+//! The hypervisor's `Username` and `Password` decide nothing and are not persisted: they
+//! are `@sensitive` credentials of the hypervisor, no record of this service holds a
+//! hypervisor's credentials to resolve them against (see
+//! [`crate::state::StoredHypervisor`]), and a credential a store does not hold cannot
+//! leak out of one. Their modelled length and pattern are refused at the boundary before
+//! this handler runs.
+//!
+//! Nothing is written. This operation TESTS a configuration — it mints no resource and
+//! moves no status — so a test leaves the store exactly as it found it and every later
+//! read reports what the last write left.
 //!
 //! ## Shape of an operation
 //!
@@ -84,11 +102,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupgateway-backuponp
 // here — hence the `TestHypervisorConfigurationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.backupgateway#TestHypervisorConfiguration")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.backupgateway#TestHypervisorConfiguration",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum TestHypervisorConfigurationErrorModeled {
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -142,18 +164,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TestHypervisorConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TestHypervisorConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Request metadata only; the store is reached through `self.engine`.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TestHypervisorConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    error_code: None,
+                    message: Some(
+                        "Backup gateway state is unavailable on this engine.".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        // ONE guard spans both lookups, so what the test reports is the pair of records
+        // the store really held at one instant. Nothing here writes, so no later caller
+        // can tell that a test ran.
+        let store = state.lock();
+
+        // `GatewayArn`'s length and pattern, `Host`'s, and the credentials' are refused by
+        // the boundary validator before `handle` runs, so reaching here means every
+        // modelled constraint holds; whether the ARN names a gateway is a fact of the
+        // STORE, which is what this lookup asks. A gateway that was never created and one
+        // already deleted are both simply absent, and the member asked for is a
+        // `GatewayArn`, so the resource that is missing is the GATEWAY whatever the ARN's
+        // resource type reads — refused the way every other gateway operation of this
+        // service refuses it: the 404 `ResourceNotFoundException`'s `@httpError` declares,
+        // and no `ErrorCode`.
+        if store.gateway(&input.gateway_arn).is_none() {
+            return Err(
+                TestHypervisorConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        error_code: None,
+                        message: Some(format!(
+                            "The gateway '{}' was not found.",
+                            input.gateway_arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The hypervisor this test is to reach is named by its HOST and not by an ARN, so
+        // it is resolved through the host lookup — a host may name several records, and any
+        // one of them is a configuration this service holds for that host. A host with none
+        // is a resource the action requires and this service does not have.
+        if store.hypervisors_for_host(&input.host).is_empty() {
+            // This service answers a missing hypervisor with the modelled
+            // `ResourceNotFoundException` at HTTP 400 carrying `ErrorCode`
+            // `HypervisorNotFound` (`crate::state::MissingResource`), the one place that
+            // status and that code are chosen together — whichever member named the
+            // hypervisor that is missing. The sentence that case states names no value, so
+            // the host the caller sent is not echoed back.
+            let missing = crate::state::MissingResource::Hypervisor;
+            let error = TestHypervisorConfigurationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    error_code: missing.error_code().map(str::to_string),
+                    message: Some(crate::state::HYPERVISOR_NOT_FOUND_MESSAGE.to_string()),
+                },
+            );
+            return Err(match missing.status_override() {
+                Some(status) => crate::scaffolded::Scaffolded::modeled_with_status(error, status),
+                None => error.into(),
+            });
+        }
+
+        // The gateway exists and this service holds a configuration for the host, so the
+        // test passed. The modelled output carries no members: the answer IS the 200.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TestHypervisorConfiguration"))
+        // No case here answers this operation's `ConflictException` — "the operation cannot
+        // proceed because it is not supported" — because nothing about testing a
+        // configuration this service can resolve is unsupported: a gateway already serving
+        // another server may still be asked to reach a host, which is why the association
+        // is not consulted above.
+        Ok(TestHypervisorConfigurationOutput {})
     }
 }

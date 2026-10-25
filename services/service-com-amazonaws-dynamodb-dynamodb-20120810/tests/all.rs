@@ -27,6 +27,8 @@ mod emulator;
 mod endpoint_discovery;
 #[path = "all/global_secondary_indexes.rs"]
 mod global_secondary_indexes;
+#[path = "all/global_tables.rs"]
+mod global_tables;
 #[path = "all/index_capacity_and_item_collections.rs"]
 mod index_capacity_and_item_collections;
 #[path = "all/index_key_types_and_range_refusals.rs"]

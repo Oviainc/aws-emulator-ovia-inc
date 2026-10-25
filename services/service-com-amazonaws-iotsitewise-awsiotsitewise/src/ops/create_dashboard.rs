@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDashboard
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDashboard`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDashboard::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: creates an IoT SiteWise Monitor dashboard from the request and
+//! persists it in this service's state; `DescribeDashboard` reads it back.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +169,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDashboard` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDashboardErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDashboardError::Modeled(CreateDashboardErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // `TagMap`'s KEYS target `TagKey` (@length 1..128), which the framework's
+        // constraint walk does not reach — it validates a map's values only — so the
+        // bound is enforced here, in the same wording `TagResource` uses, and as the
+        // client-input error this operation MODELS: its error list declares no
+        // `ValidationException`, so a malformed request can only be
+        // `InvalidRequestException` (400).
+        for tag_key in input.tags.iter().flatten().map(|(tag_key, _)| tag_key) {
+            crate::state::check_tag_key(tag_key).map_err(invalid_request)?;
+        }
+
+        // `clientToken` is NOT honoured for idempotent replay: this change stores no
+        // token -> created-id mapping, so a retry with the same token mints a second
+        // dashboard rather than replaying the first answer. Deliberately left to the
+        // idempotency issue rather than half-done here, exactly as `CreatePortal`
+        // leaves it; nothing is fabricated for it.
+        let mut store = state.lock();
+
+        // A dashboard is created IN a project, so a `projectId` that resolves to no
+        // stored project names no container for the dashboard to live in — the
+        // absence this operation's modelled 404 states, in the one wording every
+        // not-found refusal in this service carries. The same check `CreateProject`
+        // makes of the portal it is given.
+        if !store.projects.contains_key(&input.project_id) {
+            return Err(CreateDashboardError::Modeled(
+                CreateDashboardErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: crate::state::not_found_message(
+                        crate::state::RESOURCE_PROJECT,
+                        &input.project_id,
+                    ),
+                }),
+            ));
+        }
+
+        // The store is bounded: a create is the only thing that adds a dashboard and
+        // only `DeleteDashboard` removes one, so past the cap this is a quota refusal.
+        if store.dashboards.len() >= crate::state::MAX_DASHBOARDS {
+            return Err(CreateDashboardError::Modeled(
+                CreateDashboardErrorModeled::LimitExceededException(LimitExceededException {
+                    message: format!(
+                        "This emulator holds at most {} dashboards.",
+                        crate::state::MAX_DASHBOARDS
+                    ),
+                }),
+            ));
+        }
+
+        let dashboard_id = loop {
+            let candidate = crate::state::new_id();
+            if !store.dashboards.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+
+        // The project the dashboard belongs to is held on the record, which is what
+        // every read of the dashboard reports, and is not an update's to change.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDashboard"))
+        // The caller-owned members are MOVED out of the request rather than cloned:
+        // a definition literal runs to 204800 characters, so a copy of it would be
+        // the largest allocation this handler makes and nothing reads `input` again.
+        let record = crate::state::DashboardRecord {
+            id: dashboard_id.clone(),
+            arn: crate::state::dashboard_arn(&region, &dashboard_id),
+            project_id: input.project_id,
+            name: input.dashboard_name,
+            description: input.dashboard_description,
+            definition: input.dashboard_definition,
+            creation_date: now,
+            last_update_date: now,
+            tags: input.tags.unwrap_or_default(),
+        };
+
+        let output = CreateDashboardOutput {
+            dashboard_id: record.id.clone(),
+            dashboard_arn: record.arn.clone(),
+        };
+
+        store.dashboards.insert(record.id.clone(), record);
+
+        Ok(output)
     }
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message` — the client-input error
+/// this operation declares, the way every sibling handler reports a malformed
+/// request.
+fn invalid_request(message: String) -> CreateDashboardError {
+    CreateDashboardError::Modeled(CreateDashboardErrorModeled::InvalidRequestException(
+        InvalidRequestException { message },
+    ))
 }
