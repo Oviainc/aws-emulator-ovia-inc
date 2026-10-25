@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePackages
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribePackages`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribePackages::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored [`crate::state::Package`] records — the ones `CreatePackage`
+//! minted — through the same `PackageDetails` projection the create answers with,
+//! narrowed by the request's filters and answered one page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +80,36 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{invalid_next_token, Package};
+
+/// The largest page this operation answers with, and the page size a request that
+/// names none gets: `MaxResults` is `@range(max: 100)`, so 100 results is the most
+/// any request can ask for.
+const MAX_PAGE: usize = 100;
+
+/// `DescribePackagesFilterName`'s `PackageID`.
+///
+/// This and the five below are that enum's whole value set
+/// (`smithy_query(query="shape",shape="DescribePackagesFilterName")`), and each one
+/// names the `PackageDetails` member it selects on — `DescribePackagesFilter$Name` is
+/// documented as "any field from `PackageDetails`".
+const FILTER_PACKAGE_ID: &str = "PackageID";
+
+/// `DescribePackagesFilterName`'s `PackageName`.
+const FILTER_PACKAGE_NAME: &str = "PackageName";
+
+/// `DescribePackagesFilterName`'s `PackageStatus`.
+const FILTER_PACKAGE_STATUS: &str = "PackageStatus";
+
+/// `DescribePackagesFilterName`'s `PackageType`.
+const FILTER_PACKAGE_TYPE: &str = "PackageType";
+
+/// `DescribePackagesFilterName`'s `EngineVersion`.
+const FILTER_ENGINE_VERSION: &str = "EngineVersion";
+
+/// `DescribePackagesFilterName`'s `PackageOwner`.
+const FILTER_PACKAGE_OWNER: &str = "PackageOwner";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -157,18 +182,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribePackages` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribePackagesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribePackages"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let filters = input.filters.unwrap_or_default();
+
+        let mut store = state.lock();
+        // The ONLY write this report makes, and it writes only what the clock already
+        // owed every package at this instant had nobody called: a package whose copy
+        // has fallen due is reported in the status it is then in.
+        store.settle_packages(now);
+
+        // Order-stable, because the store is keyed by package id: the same request
+        // reports the same order twice, which is what lets a token name a place in the
+        // set. Bounded by the store itself — [`crate::state::PACKAGE_QUOTA`] — rather
+        // than unbounded.
+        let matching: Vec<&Package> = store
+            .packages
+            .values()
+            .filter(|package| matches_every_filter(package, &filters))
+            .collect();
+
+        // A token names the package the next page starts at, so paging is resumed from
+        // a place in the set rather than from an offset a create or a delete would
+        // have shifted. A token that names no package of THIS filtered set — one this
+        // service never minted, one whose package has since been released, or one
+        // carried over to a request with different filters — names no such place, which
+        // is a malformed request rather than an empty page. This operation models no
+        // pagination-token error, so the refusal is its `ValidationException`.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => matching
+                .iter()
+                .position(|package| package.package_id == token)
+                .ok_or_else(|| {
+                    DescribePackagesErrorModeled::ValidationException(invalid_next_token())
+                })?,
+        };
+
+        // `MaxResults` is "an optional parameter": the model defaults it to 0, so a
+        // request that asks for no particular page size gets the largest page the
+        // model allows rather than an empty one.
+        let page_size = match usize::try_from(input.max_results) {
+            Ok(0) | Err(_) => MAX_PAGE,
+            Ok(size) => size.min(MAX_PAGE),
+        };
+        let end = start.saturating_add(page_size).min(matching.len());
+
+        Ok(DescribePackagesOutput {
+            package_details_list: Some(
+                matching[start..end]
+                    .iter()
+                    .map(|package| package.to_details())
+                    .collect(),
+            ),
+            // "When nextToken is returned, there are more results available": the
+            // token is the next package in the set, and there is none once this page
+            // ended the set.
+            next_token: matching
+                .get(end)
+                .map(|package| package.package_id.clone()),
+        })
+    }
+}
+
+/// Whether `package` is reported under `filters`.
+///
+/// A package must match EVERY filter given, and at least one of each filter's values
+/// (`DescribePackagesFilter$Value` is "a non-empty list of values for the specified
+/// filter field"), so the values within one filter are alternatives and the filters
+/// themselves are cumulative. A filter naming a field the package has no value for —
+/// including a name outside the enum's set — matches nothing.
+fn matches_every_filter(package: &Package, filters: &[DescribePackagesFilter]) -> bool {
+    filters.iter().all(|filter| {
+        let values = filter.value.as_deref().unwrap_or_default();
+        filtered_field(package, filter.name.as_deref().unwrap_or_default())
+            .is_some_and(|actual| values.contains(&actual))
+    })
+}
+
+/// The value of the `PackageDetails` field `name` filters on, or `None` when the
+/// package has no value for it.
+fn filtered_field(package: &Package, name: &str) -> Option<String> {
+    match name {
+        FILTER_PACKAGE_ID => Some(package.package_id.clone()),
+        FILTER_PACKAGE_NAME => Some(package.package_name.clone()),
+        FILTER_PACKAGE_STATUS => Some(package.status.clone()),
+        FILTER_PACKAGE_TYPE => Some(package.package_type.clone()),
+        FILTER_ENGINE_VERSION => package.engine_version.clone(),
+        FILTER_PACKAGE_OWNER => Some(package.owner.clone()),
+        _ => None,
     }
 }
