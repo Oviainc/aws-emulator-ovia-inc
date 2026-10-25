@@ -10,8 +10,10 @@
 //! the created profile's resource identity (`resourceArn`, `internalId`) — see
 //! [`PutSigningProfileOutput`] for why it is declared by hand.
 //!
-//! A request whose `tags` name a key inside AWS's reserved namespace is refused
-//! 400 `ValidationException` and stores no profile: those keys are the ones
+//! A request whose `tags` name a key the modelled `TagKey` shape does not admit
+//! — one outside its length bounds, one inside AWS's reserved namespace or one
+//! carrying a character outside the alphabet its pattern states — is refused 400
+//! `ValidationException` and stores no profile: those keys are the ones
 //! `TagResource` writes, held to the same modelled `TagKey` rule.
 //!
 //! ## Shape of an operation
@@ -205,12 +207,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The tags this create carries are the same keys the tagging operations
-        // write, so they are held to the same modelled rule: AWS reserves the
-        // `aws:` prefix for its own tags, which `TagKey`'s pattern states as a
-        // negative lookahead the boundary validator cannot compile. Refused
-        // HERE, before anything is written, so one reserved key refuses the
-        // whole create and no profile is stored.
-        if let Some(key) = crate::state::reserved_tag_key(
+        // write, so they are held to the same modelled rule: a key is one the
+        // `TagKey` shape admits — inside its length bounds, outside AWS's
+        // reserved `aws:` namespace and made only of the characters its pattern's
+        // alphabet admits. Refused HERE, before anything is written, so one key
+        // the model does not admit refuses the whole create and no profile is
+        // stored.
+        if let Some((key, problem)) = crate::state::invalid_tag_key(
             input
                 .tags
                 .iter()
@@ -219,7 +222,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(PutSigningProfileErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(crate::state::reserved_tag_key_message(key)),
+                    message: Some(crate::state::invalid_tag_key_message(key, problem)),
                     code: Some(crate::state::ERROR_CODE_VALIDATION.to_string()),
                 },
             )
