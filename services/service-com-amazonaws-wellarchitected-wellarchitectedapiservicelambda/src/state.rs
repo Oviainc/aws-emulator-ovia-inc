@@ -266,6 +266,59 @@ impl FrameworkQuestion {
         format!("{}-bp-{:02}", self.question_id, index.saturating_add(1))
     }
 
+    /// This catalog row as the question a LENS REVIEW asks
+    /// ([`ReviewQuestion`]): the one projection of a static catalog entry into the
+    /// question set every answer operation reads and pages over, so an official lens's
+    /// questions and a custom lens's are reported through the same shape.
+    ///
+    /// Each best practice becomes a choice whose `ChoiceId` is derived from the question
+    /// and the practice's position ([`Self::choice_id`]), because an official lens's wire
+    /// choice ids are this emulator's own; a custom lens's choices carry the ids ITS
+    /// document names them by.
+    pub fn to_review_question(&self) -> ReviewQuestion {
+        ReviewQuestion {
+            pillar_id: self.pillar_id.to_string(),
+            question_id: self.question_id.to_string(),
+            title: self.title.to_string(),
+            best_practices: self
+                .best_practices
+                .iter()
+                .enumerate()
+                .map(|(index, best_practice)| LensChoice {
+                    id: self.choice_id(index),
+                    title: (*best_practice).to_string(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// ONE question of ONE lens review, whatever lens the review is of: the pillar it belongs
+/// to, the id it is named by on the wire, its title and the best practices it asks about,
+/// each with the `ChoiceId` the lens names it by.
+///
+/// A lens review's question set is the LENS's own content, and this emulator holds that
+/// content two ways: an AWS-official lens's questions are the static catalog's rows
+/// ([`FrameworkQuestion`], projected by [`FrameworkQuestion::to_review_question`]), and a
+/// custom lens's are the pillars and questions its imported document defines
+/// ([`LensDefinition::review_questions`]). Every operation that reports or resolves a
+/// question of a review speaks THIS type, so neither half of the catalog is reported
+/// differently from the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewQuestion {
+    /// `AnswerSummary$PillarId` — the pillar of the lens this question belongs to.
+    pub pillar_id: String,
+    /// `AnswerSummary$QuestionId` (`@length(1, 128)`), stable for the life of the lens's
+    /// content.
+    pub question_id: String,
+    /// `AnswerSummary$QuestionTitle` (`@length(1, 512)`).
+    pub title: String,
+    /// The best practices this question asks about, in the lens's own order: each
+    /// choice's `ChoiceId` and `Choice$Title`.
+    pub best_practices: Vec<LensChoice>,
+}
+
+impl ReviewQuestion {
     /// This question's CHOICE catalog — `AnswerSummary$Choices` /
     /// `ReviewTemplateAnswerSummary$Choices` / `Answer$Choices`: one `Choice` per best
     /// practice the question asks about, in the lens's order.
@@ -273,16 +326,16 @@ impl FrameworkQuestion {
     /// It is the only place a client can discover the `ChoiceId`s that
     /// `UpdateAnswer$SelectedChoices` and `ChoiceUpdates` name, so every projection of a
     /// question reports it from here and they cannot disagree. `HelpfulResource`,
-    /// `ImprovementPlan` and `AdditionalResources` are left off: each "only applies to
-    /// custom lenses" / "does not apply to Amazon Web Services official lenses"
-    /// (`smithy_query(query="shape", shape="Choice")`), and this is an official lens.
+    /// `ImprovementPlan` and `AdditionalResources` are left off: none of them is content
+    /// this emulator holds for a question — the official catalog carries a best practice's
+    /// title and the lens document format's per-choice prose is not recorded
+    /// ([`parse_lens_json`]) — and every one of them is optional.
     pub fn choices(&self) -> Vec<Choice> {
         self.best_practices
             .iter()
-            .enumerate()
-            .map(|(index, best_practice)| Choice {
-                choice_id: Some(self.choice_id(index)),
-                title: Some((*best_practice).to_string()),
+            .map(|best_practice| Choice {
+                choice_id: Some(best_practice.id.clone()),
+                title: Some(best_practice.title.clone()),
                 // `Choice$Description` is per-choice prose this emulator's lens content
                 // does not carry, and the member is optional, so it is omitted rather
                 // than filled with the title again.
@@ -306,8 +359,10 @@ impl FrameworkQuestion {
     ///
     /// Lazy, so a caller that only has to RECOGNISE an id, or that consumes the ids one at
     /// a time, does not build the whole list to do it.
-    fn each_choice_id(&self) -> impl Iterator<Item = String> + '_ {
-        (0..self.best_practices.len()).map(|index| self.choice_id(index))
+    fn each_choice_id(&self) -> impl Iterator<Item = &str> + '_ {
+        self.best_practices
+            .iter()
+            .map(|best_practice| best_practice.id.as_str())
     }
 }
 
@@ -1154,14 +1209,14 @@ impl AnswerRecord {
     /// The whole choice set is recorded rather than only the choices a request speaks
     /// about, so an answered question reports one `ChoiceAnswers` entry per choice of the
     /// question however it was answered.
-    pub fn for_question(question: &FrameworkQuestion) -> Self {
+    pub fn for_question(question: &ReviewQuestion) -> Self {
         Self {
             selected_choices: Vec::new(),
             choice_answers: question
                 .each_choice_id()
                 .map(|choice_id| {
                     (
-                        choice_id,
+                        choice_id.to_string(),
                         ChoiceAnswerRecord {
                             status: CHOICE_STATUS_UNSELECTED.to_string(),
                             reason: None,
@@ -1183,16 +1238,16 @@ impl AnswerRecord {
     ///
     /// Only each choice's STATUS is written: a choice's reason and notes are what a
     /// `ChoiceUpdate` carries, so they are left as stored.
-    pub fn select_only(&mut self, question: &FrameworkQuestion, selected: &[String]) {
+    pub fn select_only(&mut self, question: &ReviewQuestion, selected: &[String]) {
         let selected: BTreeSet<&str> = selected.iter().map(String::as_str).collect();
         for choice_id in question.each_choice_id() {
-            let status = if selected.contains(choice_id.as_str()) {
+            let status = if selected.contains(choice_id) {
                 CHOICE_STATUS_SELECTED
             } else {
                 CHOICE_STATUS_UNSELECTED
             };
             self.choice_answers
-                .entry(choice_id)
+                .entry(choice_id.to_string())
                 .and_modify(|choice| choice.status = status.to_string())
                 .or_insert_with(|| ChoiceAnswerRecord {
                     status: status.to_string(),
@@ -1208,14 +1263,15 @@ impl AnswerRecord {
     ///
     /// Run after every write to an answer, so the two members a client reads back cannot
     /// contradict each other whichever of them the request wrote through.
-    pub fn resolve_selected_choices(&mut self, question: &FrameworkQuestion) {
+    pub fn resolve_selected_choices(&mut self, question: &ReviewQuestion) {
         self.selected_choices = question
             .each_choice_id()
             .filter(|choice_id| {
                 self.choice_answers
-                    .get(choice_id)
+                    .get(*choice_id)
                     .is_some_and(|choice| choice.status == CHOICE_STATUS_SELECTED)
             })
+            .map(str::to_string)
             .collect();
     }
 
@@ -1259,13 +1315,13 @@ impl AnswerRecord {
 /// this emulator's lens content does not carry, and the members are optional, so they
 /// are left off rather than filled with something else.
 pub fn answer_projection(
-    question: &FrameworkQuestion,
+    question: &ReviewQuestion,
     answer: Option<&AnswerRecord>,
 ) -> crate::ops::types::Answer {
     crate::ops::types::Answer {
-        question_id: Some(question.question_id.to_string()),
-        pillar_id: Some(question.pillar_id.to_string()),
-        question_title: Some(question.title.to_string()),
+        question_id: Some(question.question_id.clone()),
+        pillar_id: Some(question.pillar_id.clone()),
+        question_title: Some(question.title.clone()),
         question_description: None,
         improvement_plan_url: None,
         helpful_resource_url: None,
@@ -1654,11 +1710,11 @@ impl WorkloadRecord {
     /// spelling is the same answer ([`lens_alias`]) — the mirror of
     /// [`ReviewTemplateRecord::answer_mut`], because a workload's lens review and a review
     /// template's record an answer the same way.
-    pub fn answer_mut(&mut self, lens: &str, question: &FrameworkQuestion) -> &mut AnswerRecord {
+    pub fn answer_mut(&mut self, lens: &str, question: &ReviewQuestion) -> &mut AnswerRecord {
         self.answers
             .entry(lens_alias(lens).to_string())
             .or_default()
-            .entry(question.question_id.to_string())
+            .entry(question.question_id.clone())
             .or_insert_with(|| AnswerRecord::for_question(question))
     }
 
@@ -2041,11 +2097,11 @@ impl ReviewTemplateRecord {
     /// ([`Self::question_counts`]), so this is the one place a template's answer comes
     /// into existence. `lens` is a lens as a request names it, so an answer written by
     /// either spelling is the same answer ([`lens_alias`]).
-    pub fn answer_mut(&mut self, lens: &str, question: &FrameworkQuestion) -> &mut AnswerRecord {
+    pub fn answer_mut(&mut self, lens: &str, question: &ReviewQuestion) -> &mut AnswerRecord {
         self.answers
             .entry(lens_alias(lens).to_string())
             .or_default()
-            .entry(question.question_id.to_string())
+            .entry(question.question_id.clone())
             .or_insert_with(|| AnswerRecord::for_question(question))
     }
 
@@ -2306,13 +2362,13 @@ impl ReviewTemplateRecord {
 /// does not carry, and every one of them is optional, so they are omitted rather than
 /// guessed at.
 pub fn review_template_answer(
-    question: &FrameworkQuestion,
+    question: &ReviewQuestion,
     answer: Option<&AnswerRecord>,
 ) -> ReviewTemplateAnswer {
     ReviewTemplateAnswer {
-        question_id: Some(question.question_id.to_string()),
-        pillar_id: Some(question.pillar_id.to_string()),
-        question_title: Some(question.title.to_string()),
+        question_id: Some(question.question_id.clone()),
+        pillar_id: Some(question.pillar_id.clone()),
+        question_title: Some(question.title.clone()),
         question_description: None,
         improvement_plan_url: None,
         helpful_resource_url: None,
@@ -2360,7 +2416,14 @@ pub fn review_template_answer(
     }
 }
 
-/// One choice a lens question offers: "choices" in the lens JSON format specification.
+/// One choice a lens question offers: "choices" in the lens JSON format specification —
+/// the `ChoiceId` a client passes back when it answers the question, and the
+/// `Choice$Title` the question reports for it.
+///
+/// It is also how a [`ReviewQuestion`] carries a best practice, whichever half of the
+/// catalog the lens comes from: an official lens's choice id is derived from the question
+/// and the practice's position ([`FrameworkQuestion::choice_id`]), a custom lens's is the
+/// one its document names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LensChoice {
     pub id: String,
@@ -2369,9 +2432,9 @@ pub struct LensChoice {
 
 /// One rule that maps the choices selected for a question to the risk the answer
 /// carries. `condition` is the format specification's own expression over the
-/// question's choice ids, kept VERBATIM: evaluating it is the business of the answer
-/// operations (`UpdateAnswer`, `GetAnswer`, `ListAnswers`), each still a stub with its
-/// own issue, so this store records the rule rather than interpreting it.
+/// question's choice ids, kept VERBATIM: this store records the rule rather than
+/// interpreting it, and an answer's `Risk` is derived from the best practices it leaves
+/// out ([`AnswerRecord::risk`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LensRiskRule {
     pub condition: String,
@@ -2420,6 +2483,28 @@ impl LensDefinition {
         self.pillars
             .iter()
             .map(|pillar| pillar.id.clone())
+            .collect()
+    }
+
+    /// The questions a review of this lens asks, in the document's own order: pillar by
+    /// pillar, each pillar's questions in the order it lists them, each carrying the
+    /// pillar it belongs to and the choices the document defines for it.
+    ///
+    /// This is the custom half of a lens review's question set — the counterpart of
+    /// [`FrameworkQuestion::to_review_question`] for the AWS-official catalog — so a
+    /// review of an imported lens reports the content its document supplies rather than
+    /// nothing.
+    pub fn review_questions(&self) -> Vec<ReviewQuestion> {
+        self.pillars
+            .iter()
+            .flat_map(|pillar| {
+                pillar.questions.iter().map(|question| ReviewQuestion {
+                    pillar_id: pillar.id.clone(),
+                    question_id: question.id.clone(),
+                    title: question.title.clone(),
+                    best_practices: question.choices.clone(),
+                })
+            })
             .collect()
     }
 }
@@ -2572,6 +2657,20 @@ impl LensRecord {
                     .then_with(|| left_name.cmp(right_name))
             })
             .map(|(version, published)| (version.as_str(), published))
+    }
+
+    /// The content a REVIEW of this lens asks: the content of its latest published
+    /// version, and nothing while no version has been published from it.
+    ///
+    /// A custom lens "cannot be applied to workloads … until it's published with
+    /// CreateLensVersion" (`ImportLens` doc) and a published version is immutable, so what
+    /// a review of this lens asks is PUBLISHED content and never the draft an import left
+    /// behind: re-importing a lens must not move the questions a review of it already asks.
+    /// [`Self::latest_version`] is which published version that is, for the reason stated
+    /// there.
+    pub fn reviewed_content(&self) -> Option<&LensContent> {
+        self.latest_version()
+            .map(|(_, published)| &published.content)
     }
 
     /// The `LensType` of this lens, as the account that reaches it sees it.
@@ -4453,6 +4552,43 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         alias_names_lens(alias, record).then_some(record)
     }
 
+    /// The questions the lens a request named asks, in the lens's own order — the ONE
+    /// question set every read of a lens review's answers reports and pages over.
+    ///
+    /// A lens review asks what the LENS's content defines, and this store holds that
+    /// content in two halves that never overlap: an AWS-official lens (named by its alias
+    /// or by its account-less ARN, [`is_aws_official_lens`]) asks its catalog entry's
+    /// questions ([`lens_questions`]), and a custom lens asks the pillars and questions
+    /// its imported document defines, as published ([`LensRecord::reviewed_content`] →
+    /// [`LensDefinition::review_questions`]).
+    ///
+    /// Empty only for a lens this emulator holds no content for at all: an official alias
+    /// the catalog carries no questions for, a custom lens this store does not hold, or
+    /// one no version has been published from — and an unpublished custom lens cannot be
+    /// applied to a workload or a review template in the first place
+    /// ([`Self::unapplicable_lenses_refusal`]).
+    pub fn lens_review_questions(&self, lens: &str) -> Vec<ReviewQuestion> {
+        if is_aws_official_lens(lens) {
+            return lens_questions(lens)
+                .iter()
+                .map(FrameworkQuestion::to_review_question)
+                .collect();
+        }
+        self.lens_by_alias(lens)
+            .and_then(LensRecord::reviewed_content)
+            .map(|content| content.definition.review_questions())
+            .unwrap_or_default()
+    }
+
+    /// The ONE question the lens a request named asks under `question_id`, when it asks
+    /// it: [`Self::lens_review_questions`] resolved by id, which is how every operation
+    /// that reads a single answer names the question.
+    pub fn lens_review_question(&self, lens: &str, question_id: &str) -> Option<ReviewQuestion> {
+        self.lens_review_questions(lens)
+            .into_iter()
+            .find(|question| question.question_id == question_id)
+    }
+
     /// The `LensArn` the lens a request named is reported by, in the Region the request
     /// was signed for.
     ///
@@ -5211,7 +5347,7 @@ pub fn decode_question_token(token: &str) -> Option<String> {
 #[derive(Debug)]
 pub struct QuestionPage<'a> {
     /// The questions this page reports, in the LENS's own order.
-    pub questions: Vec<&'a FrameworkQuestion>,
+    pub questions: Vec<&'a ReviewQuestion>,
     /// The cursor a caller follows for the rest of the selection, `None` on the last
     /// page.
     pub next_token: Option<String>,
@@ -5229,13 +5365,13 @@ pub struct QuestionPage<'a> {
 /// `None` when `resume_after` names a question the lens does not ask: that is not a
 /// cursor this review issued, so it is as undecodable as a malformed token and the
 /// caller answers it with its own modelled refusal.
-pub fn question_page<'a, Select: Fn(&FrameworkQuestion) -> bool>(
-    catalog: &'a [FrameworkQuestion],
+pub fn question_page<'a, Select: Fn(&ReviewQuestion) -> bool>(
+    catalog: &'a [ReviewQuestion],
     select: Select,
     resume_after: Option<&str>,
     page_size: usize,
 ) -> Option<QuestionPage<'a>> {
-    let selected: Vec<(usize, &FrameworkQuestion)> = catalog
+    let selected: Vec<(usize, &ReviewQuestion)> = catalog
         .iter()
         .enumerate()
         .filter(|(_, question)| select(question))
@@ -5253,7 +5389,7 @@ pub fn question_page<'a, Select: Fn(&FrameworkQuestion) -> bool>(
     let page = &remaining[..remaining.len().min(page_size)];
     let next_token = match page.last() {
         Some((_, question)) if remaining.len() > page.len() => {
-            Some(encode_question_token(question.question_id))
+            Some(encode_question_token(&question.question_id))
         }
         _ => None,
     };
@@ -5441,7 +5577,7 @@ pub fn answer_enum_refusal(
 /// differently; the offending ids are sorted and deduplicated, so the refusal does not
 /// depend on the order the request listed them in.
 pub fn undefined_choice_refusal(
-    question: &FrameworkQuestion,
+    question: &ReviewQuestion,
     selected_choices: Option<&[String]>,
     choice_updates: Option<&HashMap<String, crate::ops::types::ChoiceUpdate>>,
 ) -> Option<crate::ops::types::ValidationException> {
@@ -5899,8 +6035,8 @@ pub const QUESTION_RESOURCE_TYPE: &str = "QUESTION";
 /// An answer is identified by the review template, the lens and the question together, so
 /// — as for a lens review — the `ResourceId` is that composite and the message names all
 /// three. `lens` and `question_id` are AS SENT, which is how the caller named them. A lens
-/// this emulator holds no question set for asks nothing HERE ([`lens_questions`]), so
-/// every `QuestionId` of such a lens resolves here.
+/// this emulator holds no content for asks nothing, so every `QuestionId` of such a lens
+/// resolves here.
 pub fn review_template_answer_not_found(
     template_arn: &str,
     lens: &str,

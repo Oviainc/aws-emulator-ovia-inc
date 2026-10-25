@@ -1455,6 +1455,32 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         self.private_endpoints.get_mut(graph_id)?.get_mut(vpc_id)
     }
 
+    /// The private endpoints of ONE graph, in VPC-id order, resuming after
+    /// `after_vpc_id` when a pagination token named a position: the listing
+    /// `ListPrivateGraphEndpoints` pages over.
+    ///
+    /// The same shape as [`Self::graphs_in`] and [`Self::snapshots_in`], for the same
+    /// reason: the endpoints of a graph are held in a `BTreeMap` keyed by the VPC id an
+    /// endpoint is addressed by, so one stable total order underlies every page and a
+    /// token can name a position in it. A graph holding no endpoint at all yields
+    /// nothing rather than being distinguished from one whose endpoints are all gone.
+    pub fn private_endpoints_of<'store>(
+        &'store self,
+        graph_id: &str,
+        after_vpc_id: Option<&str>,
+    ) -> impl Iterator<Item = &'store PrivateGraphEndpoint> {
+        let lower = match after_vpc_id {
+            Some(vpc_id) => ::std::ops::Bound::Excluded(vpc_id.to_string()),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        self.private_endpoints
+            .get(graph_id)
+            .map(|endpoints| endpoints.range((lower, ::std::ops::Bound::Unbounded)))
+            .into_iter()
+            .flatten()
+            .map(|(_, endpoint)| endpoint)
+    }
+
     /// Store a newly accepted query, under the graph it runs on.
     ///
     /// Fallible at the GROWTH SITE, the way the graph and snapshot caps are enforced by
@@ -2009,6 +2035,21 @@ pub fn is_graph_id(value: &str) -> bool {
 /// Whether `value` matches the modelled `SnapshotId` pattern `^gs-[a-z0-9]{10}$`.
 pub fn is_snapshot_id(value: &str) -> bool {
     is_resource_id(value, "gs-")
+}
+
+/// Whether `value` matches the modelled `VpcId` pattern `^vpc-[a-z0-9]+$`
+/// (`smithy_query(query="shape",shape="VpcId")`).
+///
+/// Unlike this service's own resource ids, a VPC id is minted by another service, so
+/// the pattern bounds only its prefix and alphabet and not its length: anything from
+/// one character after the prefix upwards is a position in that id space.
+pub fn is_vpc_id(value: &str) -> bool {
+    value.strip_prefix("vpc-").is_some_and(|suffix| {
+        !suffix.is_empty()
+            && suffix
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    })
 }
 
 /// Whether `value` matches the modelled `TaskId` pattern `^t-[a-z0-9]{10}$`.
@@ -2584,10 +2625,12 @@ export_task_record_output!(
     CancelExportTaskOutput(task) {},
 );
 
-/// The three `*Output` shapes that carry a whole private-graph-endpoint record are
-/// structurally identical, so one macro renders the stored endpoint into each rather
-/// than one hand-copied field list per operation, which could drift apart.
-/// `PrivateGraphEndpointSummary` joins this list with `ListPrivateGraphEndpoints`.
+/// The shapes that carry a whole private-graph-endpoint record are structurally
+/// identical, so one macro renders the stored endpoint into each rather than one
+/// hand-copied field list per operation, which could drift apart. The three `*Output`
+/// shapes of the single-endpoint operations are joined here by
+/// `PrivateGraphEndpointSummary`, the entry `ListPrivateGraphEndpoints` reports, so a
+/// listed endpoint cannot differ from what a read of it answers.
 macro_rules! private_graph_endpoint_output {
     ($($ty:ident),+ $(,)?) => {$(
         impl From<&PrivateGraphEndpoint> for crate::ops::types::$ty {
@@ -2607,6 +2650,7 @@ private_graph_endpoint_output!(
     CreatePrivateGraphEndpointOutput,
     GetPrivateGraphEndpointOutput,
     DeletePrivateGraphEndpointOutput,
+    PrivateGraphEndpointSummary,
 );
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

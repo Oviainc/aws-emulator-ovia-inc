@@ -18,6 +18,7 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     Filter, IdentityProvider, IdentityProviderSummary, InstanceSummary, InstanceUserSummary,
     LicenseServerEndpoint, LicenseServerSettings, ProductUserSummary, ServerEndpoint, Settings,
+    SERVER_TYPE_VALUES,
 };
 
 /// The status a registration carries while its VPC endpoints are being provisioned.
@@ -155,6 +156,17 @@ const ENDPOINT_DELETION_SPAN: Duration = Duration::from_millis(500);
 /// straight away still observes that status, and a later read materialises the removal the
 /// clock already owed.
 const DEREGISTRATION_SPAN: Duration = Duration::from_millis(500);
+
+/// How long the license a license server endpoint issues for a product subscription is
+/// valid: the term counted from the instant the subscription started.
+///
+/// A CHOSEN term — AWS publishes no validity period for the license such a subscription
+/// holds — and 30 days is a month of the monthly billing a user-based subscription is
+/// charged on. It is not a status transition the clock owes, so it is deliberately not
+/// one of the spans above: nothing falls due when it passes, it is only the date
+/// `ProductUserSummary.LicenseExpirationDate` reports, derived from what the subscription
+/// persisted so every read of one subscription answers the same instant.
+const LICENSE_TERM: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// The most endpoints whose deletion has completed that the store keeps reporting.
 ///
@@ -476,13 +488,12 @@ pub struct ProductUserRecord {
     pub status_message: Option<String>,
     /// The Active Directory domain the user information came from.
     pub domain: Option<String>,
-    /// ISO-8601 instant the subscription started.
-    pub subscription_start_date: Option<String>,
-    /// ISO-8601 instant the subscription ended, once it has.
-    pub subscription_end_date: Option<String>,
-    /// Only products backed by a license server endpoint carry one, so this stays
-    /// `None` for a subscription this slice creates.
-    pub license_expiration_date: Option<String>,
+    /// When the subscription started — also the instant the license term of a
+    /// license-based subscription is counted from (see
+    /// [`license_expiration_date`](ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::license_expiration_date)).
+    pub subscribed_at: SystemTime,
+    /// When the subscription ended, once it has.
+    pub unsubscribed_at: Option<SystemTime>,
 }
 
 /// A user association to an EC2 instance, as `AssociateUser` stored it.
@@ -1538,6 +1549,85 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             .collect()
     }
 
+    /// Whether the registration `identity_provider_arn` names is backed by a license
+    /// server endpoint: the license-based configuration whose licenses carry an expiry.
+    ///
+    /// The `(IdentityProviderArn, ServerType)` index is exactly the LIVE endpoints — an
+    /// endpoint gives up its entry the moment a deletion is accepted — so a registration
+    /// whose endpoint is being deleted is no longer license-backed. Which provisioning
+    /// status the endpoint is in says whether its network address can be reached yet, not
+    /// whether the registration it was created for is license-based, so it is not read
+    /// here.
+    ///
+    /// One indexed lookup per server type the MODEL defines, so this costs the same
+    /// whatever the store holds: it is asked once per product user reported, and a scan of
+    /// the endpoints would make a list cost the PRODUCT of the two.
+    pub fn license_backed(&self, identity_provider_arn: &str) -> bool {
+        SERVER_TYPE_VALUES.iter().any(|server_type| {
+            self.license_server_endpoint_index.contains_key(&(
+                identity_provider_arn.to_string(),
+                (*server_type).to_string(),
+            ))
+        })
+    }
+
+    /// Store one product user: the record, its place in the subscription order and the
+    /// `(IdentityProviderArn, product, username)` index that reaches it.
+    ///
+    /// The ONE writer of a product user, so no path can leave the three stores disagreeing
+    /// about what is subscribed.
+    pub fn insert_product_user(&mut self, record: ProductUserRecord) {
+        let key = (
+            record.identity_provider_arn.clone(),
+            record.product.clone(),
+            record.username.clone(),
+        );
+        self.product_user_order.push(record.arn.clone());
+        self.product_user_index.insert(key, record.arn.clone());
+        self.product_users.insert(record.arn.clone(), record);
+    }
+
+    /// The expiration date of the license a product subscription holds, or `None` when the
+    /// registration it was subscribed through uses no license server endpoint.
+    ///
+    /// A subscription served through a license server endpoint holds a license for
+    /// [`LICENSE_TERM`] counted from the instant the subscription started, so the value is
+    /// computed from what the store holds and every read of one subscription answers the
+    /// same instant.
+    pub fn license_expiration_date(&self, record: &ProductUserRecord) -> Option<String> {
+        if !self.license_backed(&record.identity_provider_arn) {
+            return None;
+        }
+        // `checked_add`, so an instant the term cannot be added to answers no expiry
+        // instead of unwinding the request.
+        record.subscribed_at.checked_add(LICENSE_TERM).map(iso8601)
+    }
+
+    /// The `ProductUserSummary` the model requires, built from the stored product user,
+    /// the provider union of the registration it was subscribed through, and that
+    /// registration's license backing.
+    ///
+    /// The ONE reader every operation that reports a product user goes through, so a
+    /// subscription answers the same summary wherever it is reported.
+    pub fn product_user_summary(
+        &self,
+        record: &ProductUserRecord,
+        identity_provider: &IdentityProvider,
+    ) -> ProductUserSummary {
+        ProductUserSummary {
+            username: record.username.clone(),
+            product: record.product.clone(),
+            identity_provider: identity_provider.clone(),
+            status: record.status.clone(),
+            product_user_arn: Some(record.arn.clone()),
+            status_message: record.status_message.clone(),
+            domain: record.domain.clone(),
+            subscription_start_date: Some(iso8601(record.subscribed_at)),
+            subscription_end_date: record.unsubscribed_at.map(iso8601),
+            license_expiration_date: self.license_expiration_date(record),
+        }
+    }
+
     /// Resolve a registration from the two ways every operation can address one: its
     /// ARN, or the `(IdentityProvider, Product)` pair it was registered with.
     ///
@@ -1931,26 +2021,6 @@ pub fn instance_summary(record: &InstanceRecord) -> InstanceSummary {
         status_message: record.status_message.clone(),
         owner_account_id: Some(record.owner_account_id.clone()),
         identity_provider: record.identity_provider.clone(),
-    }
-}
-
-/// The `ProductUserSummary` the model requires, built from the stored product user and
-/// the provider union of the registration it was subscribed through.
-pub fn product_user_summary(
-    record: &ProductUserRecord,
-    identity_provider: &IdentityProvider,
-) -> ProductUserSummary {
-    ProductUserSummary {
-        username: record.username.clone(),
-        product: record.product.clone(),
-        identity_provider: identity_provider.clone(),
-        status: record.status.clone(),
-        product_user_arn: Some(record.arn.clone()),
-        status_message: record.status_message.clone(),
-        domain: record.domain.clone(),
-        subscription_start_date: record.subscription_start_date.clone(),
-        subscription_end_date: record.subscription_end_date.clone(),
-        license_expiration_date: record.license_expiration_date.clone(),
     }
 }
 

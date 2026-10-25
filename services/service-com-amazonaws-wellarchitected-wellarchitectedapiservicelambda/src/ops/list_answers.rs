@@ -226,9 +226,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The lens's questions, in the lens's own order, narrowed by the request's
-        // filters and paged through the service's shared question cursor. `PillarId` and
-        // `QuestionPriority` FILTER the question set rather than resolving anything, so
-        // a value that matches no question is an empty page.
+        // filters and paged through the service's shared question cursor. The question set
+        // is the LENS's own content — an AWS-official lens's catalog entry or a custom
+        // lens's imported document — which is what
+        // `crate::state::...::lens_review_questions` resolves. `PillarId` and
+        // `QuestionPriority` FILTER that set rather than resolving anything, so a value
+        // that matches no question is an empty page.
         //
         // Every question of a workload lens review here carries
         // `crate::state::DEFAULT_QUESTION_TYPE`, so the priority filter selects all of
@@ -236,8 +239,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let priority_selects = input.question_priority.as_deref().is_none_or(|priority| {
             priority == crate::state::question_priority_of(crate::state::DEFAULT_QUESTION_TYPE)
         });
+        let questions = store.lens_review_questions(&input.lens_alias);
         let page = crate::state::question_page(
-            crate::state::lens_questions(&input.lens_alias),
+            &questions,
             |question| {
                 priority_selects
                     && input
@@ -254,7 +258,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .questions
             .iter()
             .map(|question| {
-                answer_summary(question, workload.answer(&input.lens_alias, question.question_id))
+                answer_summary(
+                    question,
+                    workload.answer(&input.lens_alias, &question.question_id),
+                )
             })
             .collect();
 
@@ -284,13 +291,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// selected — that is what an unanswered question of an attached lens means, and it is
 /// also what the workload's risk roll-up counts it as.
 fn answer_summary(
-    question: &crate::state::FrameworkQuestion,
+    question: &crate::state::ReviewQuestion,
     answer: Option<&crate::state::AnswerRecord>,
 ) -> AnswerSummary {
     AnswerSummary {
-        question_id: Some(question.question_id.to_string()),
-        pillar_id: Some(question.pillar_id.to_string()),
-        question_title: Some(question.title.to_string()),
+        question_id: Some(question.question_id.clone()),
+        pillar_id: Some(question.pillar_id.clone()),
+        question_title: Some(question.title.clone()),
         // The per-question CHOICE CATALOG the lens defines: the best practices the
         // question asks about, each with the `ChoiceId` a client passes back in
         // `UpdateAnswer$SelectedChoices`. It describes the QUESTION, so it is reported

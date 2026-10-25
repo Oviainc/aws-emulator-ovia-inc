@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAccountSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAccountSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAccountSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Turns one of this account's optional Resource Groups features on or off in the
+//! region the request was signed for: it stores the status the request asks for as
+//! the DESIRED status and reports the feature as in flight, because the model
+//! documents the switch as asynchronous — a caller polls `GetAccountSettings` for
+//! the effective status to become the one it asked for. The switch falls due
+//! [`crate::state::LIFECYCLE_EVENTS_SETTLE_DELAY`] after this call, as a stored
+//! instant: nothing sleeps, and the next caller of either operation materialises it
+//! once the clock has passed it.
+//!
+//! A request that carries no desired status at all asks for no change: the stored
+//! record is left exactly as it stands — not even created, for a region that has
+//! none — and reported back.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +158,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAccountSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAccountSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAccountSettings"))
+        // Authorization is not emulated: the emulator verifies request signatures
+        // centrally but holds no principals or policies, so the modelled
+        // `ForbiddenException` is deliberately unreachable here and a success says
+        // nothing about the caller's permissions. `ctx` is read for the region this
+        // write is keyed under and for the audit record it emits.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateAccountSettingsErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: Some("the resource-groups store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The desired status is judged before anything is written, so a value the
+        // model does not admit changes nothing. The member is optional, and a request
+        // that omits it asks for no change at all.
+        let requested = input.group_lifecycle_events_desired_status.clone();
+        if let Some(desired) = requested.as_deref() {
+            crate::state::check_desired_status(desired).map_err(bad_request)?;
+        }
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A request that asks for no change takes the reporting path, so it neither
+        // stores a record for a region that has none nor consumes a slot against the
+        // store's ceiling: a no-op is answered from what is already there.
+        let settings = match requested.as_deref() {
+            Some(desired) => {
+                let record = store
+                    .account_settings_mut(&region, now)
+                    .map_err(bad_request)?;
+                record.request(desired, now);
+                record.to_account_settings()
+            }
+            None => store.account_settings_at(&region, now).to_account_settings(),
+        };
+        // Everything below is owned, so the store lock is released before the record
+        // is formatted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, where, what, and the
+        // outcome. Metadata only, and request-derived values are `Debug`-escaped so
+        // none can split a record.
+        tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            region = ?region,
+            desired_status = ?requested,
+            outcome = if requested.is_some() { "requested" } else { "unchanged" },
+            "resource groups account settings updated",
+        );
+        Ok(UpdateAccountSettingsOutput {
+            // The settings as the store now holds them, read back out of the record:
+            // a caller is told what was persisted, not what it sent.
+            account_settings: Some(settings),
+        })
     }
 }
+
+/// A `BadRequestException` (HTTP 400) — the modelled refusal for a request whose
+/// parameters violate this operation's validation rules.
+fn bad_request(message: impl Into<String>) -> UpdateAccountSettingsError {
+    UpdateAccountSettingsErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+

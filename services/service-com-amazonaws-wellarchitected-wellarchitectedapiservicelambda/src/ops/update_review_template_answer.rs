@@ -234,6 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the answer to one of the questions that lens asks, so a `QuestionId` it does not
         // ask names no answer of this lens review.
         let question = crate::state::lens_question(&input.lens_alias, &input.question_id)
+            .map(crate::state::FrameworkQuestion::to_review_question)
             .ok_or_else(|| {
                 UpdateReviewTemplateAnswerErrorModeled::ResourceNotFoundException(
                     crate::state::review_template_answer_not_found(
@@ -261,7 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // only place a client discovers them), so one that names no choice of it belongs
         // to no answer of this question and is refused rather than stored.
         if let Some(exception) = crate::state::undefined_choice_refusal(
-            question,
+            &question,
             input.selected_choices.as_deref(),
             input.choice_updates.as_ref(),
         ) {
@@ -270,13 +271,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let answer = template.answer_mut(&input.lens_alias, question);
+        let answer = template.answer_mut(&input.lens_alias, &question);
 
         // "The values entered replace the previously selected choices"
         // (`SelectedChoices` doc): the choices named are the ones in place, so every other
         // choice of the question is not.
         if let Some(selected) = input.selected_choices.as_deref() {
-            answer.select_only(question, selected);
+            answer.select_only(&question, selected);
         }
 
         // Each `ChoiceUpdate` carries one choice's answer in full — `Status` is
@@ -311,7 +312,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The selected choices of an answer ARE the choices it records `SELECTED` for, so
         // the two members a client reads back agree whichever of them the request wrote
         // through.
-        answer.resolve_selected_choices(question);
+        answer.resolve_selected_choices(&question);
 
         // Answering a question changes the template and the lens review that asks it, so
         // both report this write as the instant they were last updated.
@@ -328,7 +329,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             template_arn: Some(template.template_arn.clone()),
             lens_alias: Some(input.lens_alias.clone()),
             answer: Some(crate::state::review_template_answer(
-                question,
+                &question,
                 template.answer(&input.lens_alias, &input.question_id),
             )),
         })

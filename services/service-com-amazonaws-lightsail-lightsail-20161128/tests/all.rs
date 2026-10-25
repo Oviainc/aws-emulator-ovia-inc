@@ -131,6 +131,8 @@ mod relational_database_start_stop;
 mod relational_database_update;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/setup_history_reporting.rs"]
+mod setup_history_reporting;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/static_ip_allocation.rs"]

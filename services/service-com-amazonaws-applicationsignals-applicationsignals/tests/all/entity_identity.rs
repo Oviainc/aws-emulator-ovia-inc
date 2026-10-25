@@ -7,17 +7,22 @@
 //! The rule under test: a key-attribute map that is supposed to identify an entity must name
 //! the `Type` attribute that "designates the type of object this is", with one of the entity
 //! types the member's doc names — `Service`, `RemoteService`, `AWS::Service`, `Resource`,
-//! `AWS::Resource`
+//! `AWS::Resource` — AND every attribute that `Type` makes applicable to the identity:
+//! `Name` and `Environment` for the service types, `ResourceType` and `Identifier` for the
+//! resource types
 //! (`smithy_query(query="doc",shape="GetServiceInput",member="KeyAttributes")`, the same text
 //! on `ListServiceOperationsInput`, `ListServiceDependenciesInput` and
-//! `ListServiceDependentsInput`). A map that names no `Type`, or a `Type` outside that set,
-//! identifies no entity and is refused with the modelled `ValidationException` (HTTP 400)
-//! rather than answered 200 with the caller's own map echoed back as a discovered entity.
+//! `ListServiceDependentsInput`: "You must specify at least the Type, Name, and Environment
+//! attributes", followed by the per-type applicability list). A map that falls short of that
+//! minimum identifies no single entity and is refused with the modelled `ValidationException`
+//! (HTTP 400) rather than answered 200 with the caller's own map echoed back as a discovered
+//! entity.
 //!
 //! The boundary matters too: the same member is NOT an entity lookup everywhere it appears.
 //! `ListServiceLevelObjectives` takes it as an optional FILTER whose doc drops the "must
-//! specify" sentence, and an SLO's own indicator records the object the SLO relates to — so
-//! neither carries the rule, which the last test here pins.
+//! specify" sentence, an SLO's own indicator records the object the SLO relates to, and
+//! `ListEntityEvents` takes its entity under a member whose doc carries no "must specify"
+//! sentence either — so none of them carries the minimum, which the last two tests here pin.
 //!
 //! Every case drives the real `restJson1` surface through the router production mounts, so
 //! the statuses and bodies asserted here are the ones a client sees. (The harness below is
@@ -287,21 +292,23 @@ async fn an_identity_that_names_no_entity_type_is_refused_by_every_entity_read()
     }
 }
 
-/// An identity that DOES name a documented entity type is served by every entity read, so the
-/// rule refuses only what identifies no entity.
+/// An identity that names a documented entity type AND the attributes that type makes
+/// applicable is served by every entity read, so the rule refuses only what identifies no
+/// single entity.
 ///
 /// The rows differ along the `Type` itself — all five values the member's doc names, each
 /// tested here including the ones the issue did not cite — and along the SIZE and shape of
-/// the identity: the type on its own, a two-attribute identity, the three attributes the doc
-/// names for a service, and the modelled maximum of four for a resource.
+/// the identity: the documented minimum for a service (three attributes), the documented
+/// minimum for a resource (three), a resource identity placed in an environment as well (the
+/// modelled maximum of four) and a resource identity that also carries the `Name` its type
+/// makes no use of.
 #[tokio::test]
-async fn an_identity_that_names_a_documented_entity_type_is_served() {
+async fn an_identity_that_names_the_documented_minimum_is_served() {
     // The documented entity types, from
     // `smithy_query(query="doc",shape="GetServiceInput",member="KeyAttributes")`: `Name` is
     // used for `Service`, `RemoteService` and `AWS::Service`, and `ResourceType`/`Identifier`
     // for `Resource` and `AWS::Resource`.
     let cases: Vec<(&str, Value)> = vec![
-        ("the entity type on its own", json!({ "Type": "Service" })),
         (
             "Service, with the three attributes the doc names",
             json!({ "Type": "Service", "Name": "checkout", "Environment": "eks:prod/default" }),
@@ -311,16 +318,15 @@ async fn an_identity_that_names_a_documented_entity_type_is_served() {
             json!({ "Type": "RemoteService", "Name": "payments", "Environment": "eks:prod/default" }),
         ),
         (
-            "AWS::Service, by name alone beside its type",
-            json!({ "Type": "AWS::Service", "Name": "sqs" }),
+            "AWS::Service, named and placed",
+            json!({ "Type": "AWS::Service", "Name": "sqs", "Environment": "eks:prod/default" }),
         ),
         (
             "Resource, by the attributes its type makes applicable",
             json!({
                 "Type": "Resource",
                 "ResourceType": "AWS::DynamoDB::Table",
-                "Identifier": "orders-table",
-                "Environment": "eks:prod/default"
+                "Identifier": "orders-table"
             }),
         ),
         (
@@ -330,6 +336,15 @@ async fn an_identity_that_names_a_documented_entity_type_is_served() {
                 "ResourceType": "AWS::Logs::LogGroup",
                 "Identifier": "app-logs",
                 "Environment": "eks:prod/default"
+            }),
+        ),
+        (
+            "a resource identity that also carries a Name its type makes no use of",
+            json!({
+                "Type": "AWS::Resource",
+                "ResourceType": "AWS::Logs::LogGroup",
+                "Identifier": "app-logs",
+                "Name": "app-logs"
             }),
         ),
     ];
@@ -371,6 +386,161 @@ async fn an_identity_that_names_a_documented_entity_type_is_served() {
                     body[member]
                 ),
             }
+        }
+    }
+}
+
+/// An identity that names a documented entity type but falls SHORT OF THE MINIMUM that type
+/// documents is refused by every entity read, with one clause per applicable attribute it
+/// does not carry.
+///
+/// The rows differ along what the rule generalises over: the `Type` (all five documented
+/// values, so both halves of the member's per-type list are covered), WHICH applicable
+/// attribute is missing (`Name`, `Environment`, `ResourceType`, `Identifier`, and both of a
+/// pair at once), the SIZE of the map (one entry to the modelled maximum of four), whether
+/// the attributes it does carry are ones its own `Type` makes applicable (a service identity
+/// carrying a resource's pair, and the reverse), and the CASING of an applicable attribute's
+/// key (`name` is not `Name`). Each row is sent to all four reads.
+#[tokio::test]
+async fn an_identity_short_of_the_documented_minimum_is_refused_by_every_entity_read() {
+    /// The requirement a map that does not carry `attribute` violates.
+    fn missing(attribute: &str) -> String {
+        format!("Member must contain the entity identity attribute '{attribute}'")
+    }
+
+    let cases: Vec<(&str, Value, Vec<String>)> = vec![
+        (
+            "a service type on its own",
+            json!({ "Type": "Service" }),
+            vec![missing("Name"), missing("Environment")],
+        ),
+        (
+            "RemoteService on its own",
+            json!({ "Type": "RemoteService" }),
+            vec![missing("Name"), missing("Environment")],
+        ),
+        (
+            "AWS::Service named but not placed",
+            json!({ "Type": "AWS::Service", "Name": "sqs" }),
+            vec![missing("Environment")],
+        ),
+        (
+            "a service placed but not named",
+            json!({ "Type": "Service", "Environment": "eks:prod/default" }),
+            vec![missing("Name")],
+        ),
+        (
+            "a service identity whose Name key is lower-case, a different attribute",
+            json!({ "Type": "Service", "name": "checkout", "Environment": "eks:prod/default" }),
+            vec![missing("Name")],
+        ),
+        (
+            "a service identity carrying a resource's attributes instead",
+            json!({
+                "Type": "Service",
+                "ResourceType": "AWS::DynamoDB::Table",
+                "Identifier": "orders-table"
+            }),
+            vec![missing("Name"), missing("Environment")],
+        ),
+        (
+            "a resource type on its own",
+            json!({ "Type": "AWS::Resource" }),
+            vec![missing("ResourceType"), missing("Identifier")],
+        ),
+        (
+            "a resource with a type but no identifier",
+            json!({
+                "Type": "Resource",
+                "ResourceType": "AWS::DynamoDB::Table",
+                "Environment": "eks:prod/default"
+            }),
+            vec![missing("Identifier")],
+        ),
+        (
+            "a resource with an identifier but no resource type",
+            json!({
+                "Type": "Resource",
+                "Identifier": "orders-table",
+                "Environment": "eks:prod/default"
+            }),
+            vec![missing("ResourceType")],
+        ),
+        (
+            "a resource identity carrying a service's attributes instead",
+            json!({
+                "Type": "AWS::Resource",
+                "Name": "orders-table",
+                "Environment": "eks:prod/default"
+            }),
+            vec![missing("ResourceType"), missing("Identifier")],
+        ),
+        (
+            "a four-attribute resource identity still missing its resource type",
+            json!({
+                "Type": "Resource",
+                "Identifier": "orders-table",
+                "Name": "orders-table",
+                "Environment": "eks:prod/default"
+            }),
+            vec![missing("ResourceType")],
+        ),
+    ];
+
+    let router = router();
+    // A store that holds a real entity, so a refusal cannot be the "nothing is stored" path.
+    create_slo(
+        &router,
+        "checkout-latency",
+        &json!({ "Type": "Service", "Name": "checkout", "Environment": "eks:prod/default" }),
+    )
+    .await;
+
+    for (label, key_attributes, requirements) in cases {
+        // The envelope counts the constraints the request violated, so a map short of two
+        // applicable attributes earns two clauses rather than being refused on the first.
+        let count = match requirements.len() {
+            1 => "1 validation error detected".to_string(),
+            n => format!("{n} validation errors detected"),
+        };
+        for (operation, path, _) in ENTITY_READS {
+            let case = format!("{operation}: {label}");
+            let (status, body, errortype) = call(
+                &router,
+                "POST",
+                &format!("{path}?{}", window()),
+                Some(json!({ "KeyAttributes": key_attributes })),
+            )
+            .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected 400, got {status} with {body}"
+            );
+            assert!(
+                errortype.starts_with("ValidationException"),
+                "case {case:?}: expected a ValidationException errortype, got {errortype:?}"
+            );
+            let message = body["message"].as_str().unwrap_or_default();
+            assert!(
+                message.starts_with(&count) && message.contains("'keyAttributes'"),
+                "case {case:?}: expected a validation envelope opening with {count:?} and \
+                 naming 'keyAttributes', got {message:?}"
+            );
+            for requirement in &requirements {
+                assert!(
+                    message.contains(requirement),
+                    "case {case:?}: expected the refusal to state {requirement:?}, got {message:?}"
+                );
+            }
+            // A refusal names the requirement and NOT the value it rejected, which is caller
+            // input every client log of the failure would otherwise copy.
+            assert!(
+                !message.contains("checkout")
+                    && !message.contains("sqs")
+                    && !message.contains("orders-table")
+                    && !message.contains("eks:prod/default"),
+                "case {case:?}: expected the refusal to name no rejected value, got {message:?}"
+            );
         }
     }
 }
@@ -445,6 +615,61 @@ async fn a_filter_and_an_slos_own_identity_need_no_entity_type() {
             answer["SloSummaries"].is_array(),
             "case {label:?}: expected a present SloSummaries, got {}",
             answer["SloSummaries"]
+        );
+    }
+}
+
+/// `ListEntityEvents` takes the entity to report on under a member whose doc lists the same
+/// attributes per `Type` but carries no "must specify" sentence
+/// (`smithy_query(query="doc",shape="ListEntityEventsInput",member="Entity")`, whose own
+/// resource example is `{ "Type": "AWS::Resource", "ResourceType": "AWS::DynamoDB::Table",
+/// "Identifier": "Customers" }`), so the MINIMUM does not reach it: it reads its entity by the
+/// entity-type rule alone, and an `Entity` short of any minimum is served rather than refused.
+///
+/// The rows differ along why the map carries less than an entity read's minimum: a service
+/// type on its own, a service named but not placed, and a resource named by only one of its
+/// pair — each of them refused by the four `KeyAttributes` reads above.
+#[tokio::test]
+async fn the_minimum_identity_does_not_reach_the_entity_member_of_list_entity_events() {
+    let router = router();
+    create_slo(
+        &router,
+        "checkout-latency",
+        &json!({ "Type": "Service", "Name": "checkout", "Environment": "eks:prod/default" }),
+    )
+    .await;
+
+    let now = now_seconds();
+    for (label, entity) in [
+        ("a service type on its own", json!({ "Type": "Service" })),
+        (
+            "a service named but not placed",
+            json!({ "Type": "Service", "Name": "checkout" }),
+        ),
+        (
+            "a resource named by only one of its pair",
+            json!({ "Type": "AWS::Resource", "Identifier": "orders-table" }),
+        ),
+    ] {
+        let (status, answer, _) = call(
+            &router,
+            "POST",
+            "/events",
+            Some(json!({
+                "Entity": entity,
+                "StartTime": now - 3_600,
+                "EndTime": now + 3_600
+            })),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: expected ListEntityEvents to answer 200, got {status} with {answer}"
+        );
+        assert!(
+            answer["ChangeEvents"].is_array(),
+            "case {label:?}: expected a present ChangeEvents, got {}",
+            answer["ChangeEvents"]
         );
     }
 }
