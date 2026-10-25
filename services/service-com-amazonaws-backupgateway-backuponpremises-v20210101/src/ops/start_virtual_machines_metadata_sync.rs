@@ -4,7 +4,12 @@
 //! Starts a metadata sync on the hypervisor an ARN names and PERSISTS it in
 //! [`crate::state`]: the record keeps the instant the sync was requested, and every later
 //! read of the hypervisor reports the `SyncMetadataStatus` the clock has reached since —
-//! `CREATED`, then `RUNNING`, then `SUCCEEDED` with the time it succeeded at. A sync runs
+//! `CREATED`, then `RUNNING`, then `SUCCEEDED` with the time it succeeded at. The sync is
+//! also what MATERIALISES the hypervisor's virtual-machine inventory: it records the
+//! machines the hypervisor reports
+//! ([`crate::state::ComAmazonawsBackupgatewayBackuponpremisesV20210101State::start_metadata_sync`]),
+//! dated at the instant the sync falls due, so from that instant `ListVirtualMachines` and
+//! `GetVirtualMachine` report them. A sync runs
 //! under the IAM role the hypervisor's PROPERTY MAPPINGS name, so a request for an ARN no
 //! mappings are set for is refused with the modelled `AccessDeniedException` (HTTP 403)
 //! before any resource lookup — that gate answers alike whether or not the ARN names a
@@ -13,8 +18,9 @@
 //! [`crate::state::MAPPINGS_NOT_CONFIGURED`]). A client sets those mappings through
 //! `PutHypervisorPropertyMappings` on a hypervisor a gateway is associated with, so the
 //! whole workflow is reachable with wire calls alone —
-//! `tests/all/metadata_sync_over_the_wire.rs` walks it. This is the ONLY file to touch for
-//! this operation.
+//! `tests/all/metadata_sync_over_the_wire.rs` walks it and
+//! `tests/all/virtual_machine_inventory_sync.rs` walks it through to the listing. This is
+//! the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -201,6 +207,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::state::MissingResource` choice of status and `ErrorCode` every other
         // operation of this service refuses a missing hypervisor with, so a sync asked
         // for a record the store does not hold can only ever answer that one way.
+        //
+        // The one write: the sync's own instant, and the inventory it discovers on the
+        // hypervisor — the machines `ListVirtualMachines` and `GetVirtualMachine` report
+        // once it falls due.
         let started = store.start_metadata_sync(
             &input.hypervisor_arn,
             ::std::time::SystemTime::now(),

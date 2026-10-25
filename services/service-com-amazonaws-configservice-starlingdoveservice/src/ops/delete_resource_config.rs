@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResourceConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResourceConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResourceConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the DELETION of one custom resource in the discovered-resource inventory in
+//! [`crate::state`]: the resource keeps its entry, carrying the instant it went away,
+//! and gains a new configuration item whose status is `ResourceDeleted`, so the states
+//! it went through stay readable through `GetResourceConfigHistory` while the reads
+//! that report only live resources stop reporting it.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +159,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResourceConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResourceConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResourceConfig"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // This API records the deletion of a CUSTOM resource, named the way the
+        // operation that recorded its configuration names one, so what a custom
+        // resource type is is decided in ONE place for both halves of the lifecycle.
+        if let Some(message) =
+            crate::ops::put_resource_config::custom_resource_type_refusal(&input.resource_type)
+        {
+            return Err(DeleteResourceConfigErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A deletion is recorded as a configuration item like any other, so Config
+        // records it only while a configuration recorder is recording.
+        if store.recording_recorder().is_none() {
+            return Err(
+                DeleteResourceConfigErrorModeled::NoRunningConfigurationRecorderException(
+                    NoRunningConfigurationRecorderException {
+                        message: Some(
+                            crate::state::no_running_configuration_recorder_message(Self::NAME),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let key = (input.resource_type.clone(), input.resource_id.clone());
+        let Some(held) = store.discovered_resources.get(&key) else {
+            // Config holds no configuration state for this resource, so there is none
+            // whose deletion could be recorded, and this operation models no error for
+            // a resource that was never recorded: the call is accepted and the
+            // inventory is left exactly as it was, rather than gaining an entry for a
+            // resource Config never saw.
+            return Ok(DeleteResourceConfigOutput);
+        };
+        if held.deleted_at.is_some() {
+            // The resource's current configuration item ALREADY records its deletion.
+            // Recording it again would move that item's capture instant without the
+            // resource having gone through another state, so the deletion that is
+            // already recorded stands.
+            return Ok(DeleteResourceConfigOutput);
+        }
+
+        // "This API records a new ConfigurationItem with a ResourceDeleted status": the
+        // new item is the resource as it was last recorded, now carrying the instant it
+        // went away — which is what
+        // [`crate::state::DiscoveredResourceEntry::configuration_item_status`] reports
+        // `ResourceDeleted` from — while the item it replaces becomes one of the states
+        // the resource has left, so the configuration recorded for it stays readable in
+        // its history.
+        let deleted = crate::state::DiscoveredResourceEntry {
+            deleted_at: Some(now),
+            last_recorded_at: Some(now),
+            ..held.clone()
+        };
+        store.record_discovered_resource(deleted);
+
+        Ok(DeleteResourceConfigOutput)
     }
 }

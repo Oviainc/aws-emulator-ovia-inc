@@ -402,7 +402,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
 
         // Both specifiers are required, so the boundary already refused an absent
         // one; a blank one names no commit either.
@@ -798,6 +797,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The name of the author who created the commit. This information is used
         // as both the author and committer for the commit."
         let now = std::time::SystemTime::now();
+        // The identity whose call writes the commit, which is the actor a pull
+        // request reading from the target branch attributes the update to.
+        let actor = crate::state::caller_identity_arn(ctx.parts());
         let user = UserInfo {
             name: input.author_name.clone(),
             email: input.email.clone(),
@@ -826,14 +828,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
         // "The branch where the merge is applied" is left at the merge commit,
-        // which is what makes the merged content readable there by a later caller.
-        repository.branches.insert(
-            target.clone(),
-            crate::state::Branch {
-                name: target,
-                commit_id: commit_id.clone(),
-            },
-        );
+        // which is what makes the merged content readable there by a later caller
+        // — through the one place a branch tip moves, so every OPEN pull request
+        // reading from it follows the new tip.
+        repository.set_branch_tip(&target, &commit_id, now, Some(&actor));
         // Writing a commit and moving a reference modifies the repository, so
         // `lastModifiedDate` moves with it, exactly as it does for `PutFile` or
         // `CreateCommit`.

@@ -33,7 +33,7 @@ use crate::rest_api_lifecycle::{create_api, create_resource, string_member, Answ
 /// The account segment is the emulator's one account (`engine::emulator_account_id`),
 /// never a literal, so this expectation stays true of whatever account the runtime
 /// presents.
-fn no_such_api(rest_api_id: &str) -> String {
+pub(crate) fn no_such_api(rest_api_id: &str) -> String {
     format!(
         "Invalid API identifier specified {}:{rest_api_id}",
         engine::emulator_account_id()

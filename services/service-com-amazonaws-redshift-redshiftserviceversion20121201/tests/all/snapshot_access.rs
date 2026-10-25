@@ -29,29 +29,32 @@ use crate::cluster_lifecycle::{all_text, Answer, Emulator};
 const REGION: &str = "us-west-2";
 
 /// The cluster every case takes its snapshot of.
-const CLUSTER: &str = "share-source";
+///
+/// `pub(crate)` so the revoke suite shares this suite's seed and helpers rather
+/// than keeping a second copy of them.
+pub(crate) const CLUSTER: &str = "share-source";
 
 /// The snapshot every case shares, deliberately in MIXED case: a request names a
 /// snapshot case-insensitively, so the stored spelling has to differ from the
 /// one the locator rows send.
-const SNAPSHOT: &str = "Share-Source-Snap";
+pub(crate) const SNAPSHOT: &str = "Share-Source-Snap";
 
 /// A second snapshot of the same cluster, so "the grant lands on the snapshot the
 /// request named" is observable rather than vacuous.
-const OTHER_SNAPSHOT: &str = "share-source-other";
+pub(crate) const OTHER_SNAPSHOT: &str = "share-source-other";
 
 /// One row of the refusal table: the case name, the request parameters, and the
 /// `(status, error code)` the service must answer with.
-type RefusalCase<'a> = (&'a str, Vec<(&'a str, &'a str)>, u16, &'a str);
+pub(crate) type RefusalCase<'a> = (&'a str, Vec<(&'a str, &'a str)>, u16, &'a str);
 
 /// One row of a locator table: the case name, the account the row grants access
 /// to, and the parameters that name the snapshot.
-type LocatorCase<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str)>);
+pub(crate) type LocatorCase<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str)>);
 
 /// An emulator holding [`CLUSTER`] and a snapshot of it that is still
 /// `creating` — the clock-owed `creating` -> `available` transition has not
 /// fallen due yet. Returns the snapshot's ARN, which the locator rows name it by.
-async fn creating_emulator(snapshots: &[&str]) -> (Emulator, String) {
+pub(crate) async fn creating_emulator(snapshots: &[&str]) -> (Emulator, String) {
     let emulator = Emulator::new();
     let created = emulator
         .call(
@@ -103,7 +106,7 @@ async fn creating_emulator(snapshots: &[&str]) -> (Emulator, String) {
 }
 
 /// An emulator holding [`CLUSTER`] and an AVAILABLE snapshot of it.
-async fn seeded_emulator() -> (Emulator, String) {
+pub(crate) async fn seeded_emulator() -> (Emulator, String) {
     let (emulator, arn) = creating_emulator(&[SNAPSHOT]).await;
     // Only an `available` snapshot can be shared, and the transition is due a
     // span after the call that minted it.
@@ -112,14 +115,18 @@ async fn seeded_emulator() -> (Emulator, String) {
 }
 
 /// `AuthorizeSnapshotAccess` for `account`, naming the snapshot with `locator`.
-async fn authorize(emulator: &Emulator, account: &str, locator: &[(&str, &str)]) -> Answer {
+pub(crate) async fn authorize(
+    emulator: &Emulator,
+    account: &str,
+    locator: &[(&str, &str)],
+) -> Answer {
     let mut params: Vec<(&str, &str)> = vec![("AccountWithRestoreAccess", account)];
     params.extend_from_slice(locator);
     emulator.call("AuthorizeSnapshotAccess", &params).await
 }
 
 /// The snapshot `identifier` as `DescribeClusterSnapshots` reports it.
-async fn describe(emulator: &Emulator, identifier: &str) -> Answer {
+pub(crate) async fn describe(emulator: &Emulator, identifier: &str) -> Answer {
     emulator
         .call(
             "DescribeClusterSnapshots",
@@ -130,18 +137,18 @@ async fn describe(emulator: &Emulator, identifier: &str) -> Answer {
 
 /// Every `AccountId` an answer's `AccountsWithRestoreAccess` list reports, in
 /// the order the record holds them.
-fn granted_ids(answer: &Answer) -> Vec<String> {
+pub(crate) fn granted_ids(answer: &Answer) -> Vec<String> {
     all_text(&answer.body, "AccountId")
 }
 
 /// Every `AccountAlias` an answer's `AccountsWithRestoreAccess` list reports, in
 /// the order the record holds them.
-fn granted_aliases(answer: &Answer) -> Vec<String> {
+pub(crate) fn granted_aliases(answer: &Answer) -> Vec<String> {
     all_text(&answer.body, "AccountAlias")
 }
 
 /// Assert one refusal row: the answer's status and `<Code>`.
-fn assert_refused(case: &str, answer: &Answer, status: u16, code: &str) {
+pub(crate) fn assert_refused(case: &str, answer: &Answer, status: u16, code: &str) {
     assert_eq!(
         answer.status, status,
         "case {case}: expected status {status}, got {} with body {}",

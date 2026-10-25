@@ -192,7 +192,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `hosted_versions` is a `BTreeMap` keyed by version number, so walking it in
         // REVERSE yields the versions newest first — which is the order AppConfig lists
-        // them in, and (through the complement key below) ascending cursor order, which is
+        // them in, and (through the complement key shared with every listing this service
+        // orders newest first) ascending cursor order, which is
         // what `paginate` walks. Version numbers are unique within a profile, so that key
         // is a TOTAL order — what a pagination cursor needs to resume exactly once.
         let ordered: Vec<(String, HostedConfigurationVersionSummary)> = profile
@@ -207,7 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .map(|version| {
                 (
-                    descending_version_key(version.version_number),
+                    crate::state::descending_number_key(version.version_number),
                     summary_of(profile, version),
                 )
             })
@@ -238,20 +239,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_token: page.next_token,
         })
     }
-}
-
-/// The sort key of one version, built so that ASCENDING key order is DESCENDING version
-/// order: AppConfig lists a profile's hosted configuration versions newest first, and
-/// [`crate::state::paginate`] walks its input in ascending key order.
-///
-/// A version number is a positive `Integer`, so complementing it against `i32::MAX` keeps
-/// it non-negative, and the fixed width makes the string comparison agree with the
-/// numeric one (`"10"` must not sort before `"9"`).
-fn descending_version_key(version_number: i32) -> String {
-    format!(
-        "{:010}",
-        i64::from(i32::MAX).saturating_sub(i64::from(version_number))
-    )
 }
 
 /// Whether `filter` — the request's `VersionLabel` — selects `version`.

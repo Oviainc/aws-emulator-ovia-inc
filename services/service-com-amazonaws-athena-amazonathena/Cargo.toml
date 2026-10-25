@@ -8,6 +8,10 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# Athena's `AwsDataCatalog` IS the account's Glue Data Catalog, so the metadata
+# operations read the databases and tables out of Glue's own store rather than keeping a
+# second copy of them here.
+service-com-amazonaws-glue-awsglue = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
