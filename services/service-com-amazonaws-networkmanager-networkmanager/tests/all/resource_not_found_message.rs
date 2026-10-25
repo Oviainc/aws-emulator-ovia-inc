@@ -28,7 +28,7 @@ const NOT_FOUND_MESSAGE: &str = "Resource not found.";
 
 /// The ARN resource types this service holds, which are also the `ResourceType` values a
 /// not-found refusal reports.
-const GLOBAL_NETWORK: &str = "global-network";
+pub(crate) const GLOBAL_NETWORK: &str = "global-network";
 /// See [`GLOBAL_NETWORK`].
 const SITE: &str = "site";
 /// See [`GLOBAL_NETWORK`].
@@ -58,7 +58,35 @@ async fn assert_not_found(emulator: &Emulator, row: &NotFoundCase) {
         resource_id,
         resource_type,
     } = row;
-    let (status, answer) = emulator.call(method, uri, body.clone()).await;
+    assert_not_found_answer(
+        emulator,
+        case,
+        method,
+        uri,
+        body.clone(),
+        resource_id,
+        resource_type,
+    )
+    .await;
+}
+
+/// The assertion above, over arguments rather than a row, answering the parsed body so a
+/// caller can assert whatever else its own operation owes.
+///
+/// Shared with the suites that pin ONE operation's not-found refusal
+/// (`crate::describe_global_networks_id_resolution`), so the message rule — the constant
+/// text plus the identifying detail in `ResourceId` / `ResourceType` — is asserted in
+/// exactly one place.
+pub(crate) async fn assert_not_found_answer(
+    emulator: &Emulator,
+    case: &str,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    resource_id: &str,
+    resource_type: &str,
+) -> Value {
+    let (status, answer) = emulator.call(method, uri, body).await;
     assert_eq!(
         status, 404,
         "case {case}: expected 404, got {status} with {answer}"
@@ -75,14 +103,15 @@ async fn assert_not_found(emulator: &Emulator, row: &NotFoundCase) {
     );
     assert_eq!(
         answer["ResourceId"].as_str(),
-        Some(resource_id.as_str()),
+        Some(resource_id),
         "case {case}: expected ResourceId {resource_id:?}, got {answer}"
     );
     assert_eq!(
         answer["ResourceType"].as_str(),
-        Some(*resource_type),
+        Some(resource_type),
         "case {case}: expected ResourceType {resource_type:?}, got {answer}"
     );
+    answer
 }
 
 #[tokio::test]
@@ -131,6 +160,14 @@ async fn every_not_found_refusal_carries_the_constant_message_and_identifies_the
             case: "DeleteGlobalNetwork on a deleted global network",
             method: "DELETE",
             uri: format!("/global-networks/{gone_network}"),
+            body: None,
+            resource_id: gone_network.clone(),
+            resource_type: GLOBAL_NETWORK,
+        },
+        NotFoundCase {
+            case: "DescribeGlobalNetworks naming a deleted global network",
+            method: "GET",
+            uri: format!("/global-networks?globalNetworkIds={gone_network}"),
             body: None,
             resource_id: gone_network.clone(),
             resource_type: GLOBAL_NETWORK,
