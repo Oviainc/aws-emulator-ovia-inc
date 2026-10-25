@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RespondDecisionTaskCompleted
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RespondDecisionTaskCompleted`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RespondDecisionTaskCompleted::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Closes the one decision task a decider's `taskToken` addresses and applies the
+//! decisions it came back with to the run's stored state.
+//!
+//! The completion itself is a `DecisionTaskCompleted` event naming the task's scheduled
+//! and started events and carrying the `executionContext` the decider attached, as the
+//! operation's own doc says ("A DecisionTaskCompleted event is added to the workflow
+//! history. The executionContext specified is attached to the event in the workflow
+//! execution history"). Each decision then records the event `Decision`'s own doc gives
+//! it — a task scheduled, a timer started or cancelled, a marker recorded, a signal or
+//! a cancel sent to another run, a child run started, a Lambda task scheduled, or the
+//! run closed — or, when the decision cannot be applied to the run as it stands, the
+//! matching `*Failed` event carrying the modelled cause that says why. Nothing is
+//! echoed back: the answer is the modelled empty one, and everything this call produces
+//! is read out of the run afterwards through `GetWorkflowExecutionHistory` and
+//! `DescribeWorkflowExecution`.
 //!
 //! ## Shape of an operation
 //!
@@ -22,13 +29,7 @@
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request — so
 //! engine access is guaranteed by the time any request runs. Reach the store through
-//! [`crate::state::service_state`] and read and write it through the guard it hands back:
-//!
-//! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
-//!         .ok_or(/* a modelled server error */)?;
-//!     state.lock().your_field = /* ... */;
-//! ```
+//! [`crate::state::service_state`] and read and write it through the guard it hands back.
 //!
 //! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only —
 //! headers, URI, method, and anything middleware placed in `ctx.parts().extensions`.
@@ -96,11 +97,142 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::aws_smithy_types::DateTime;
+
+use crate::state::{Domain, EventAttributes};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
 // `RespondDecisionTaskCompletedError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-swf-simpleworkflowservice.json");
+
+/// How many events of the answering run ONE decision can record: the event the decision
+/// itself produces, plus the result the service resolves for it straight away (the
+/// cancellation of an activity task nobody took, the failure of a Lambda task with no
+/// role to assume, the acknowledgement of a signal delivered to another run).
+///
+/// Used only to reserve room in the run's bounded history before the decisions are
+/// applied, so a completion either records all of its events or closes the run for the
+/// history quota before recording any.
+const EVENTS_PER_DECISION: usize = 3;
+
+/// The cause a `ScheduleActivityTaskFailed` event carries when the decision named an
+/// activity type the domain holds no registration of. One of
+/// [`crate::ops::types::SCHEDULE_ACTIVITY_TASK_FAILED_CAUSE_VALUES`].
+const CAUSE_ACTIVITY_TYPE_DOES_NOT_EXIST: &str = "ACTIVITY_TYPE_DOES_NOT_EXIST";
+
+/// The cause a `ScheduleActivityTaskFailed` event carries when the activity type is
+/// registered but deprecated. One of
+/// [`crate::ops::types::SCHEDULE_ACTIVITY_TASK_FAILED_CAUSE_VALUES`].
+const CAUSE_ACTIVITY_TYPE_DEPRECATED: &str = "ACTIVITY_TYPE_DEPRECATED";
+
+/// The cause a `ScheduleActivityTaskFailed` event carries when an activity task with
+/// the decision's `activityId` is already in flight in this run. One of
+/// [`crate::ops::types::SCHEDULE_ACTIVITY_TASK_FAILED_CAUSE_VALUES`].
+const CAUSE_ACTIVITY_ID_ALREADY_IN_USE: &str = "ACTIVITY_ID_ALREADY_IN_USE";
+
+/// The cause a `RequestCancelActivityTaskFailed` event carries when the run has no
+/// activity task in flight under the decision's `activityId`. One of
+/// [`crate::ops::types::REQUEST_CANCEL_ACTIVITY_TASK_FAILED_CAUSE_VALUES`].
+const CAUSE_ACTIVITY_ID_UNKNOWN: &str = "ACTIVITY_ID_UNKNOWN";
+
+/// The cause a `StartTimerFailed` event carries when a timer with the decision's
+/// `timerId` is already running. One of
+/// [`crate::ops::types::START_TIMER_FAILED_CAUSE_VALUES`].
+const CAUSE_TIMER_ID_ALREADY_IN_USE: &str = "TIMER_ID_ALREADY_IN_USE";
+
+/// The cause a `CancelTimerFailed` event carries when the run has no timer running
+/// under the decision's `timerId`. One of
+/// [`crate::ops::types::CANCEL_TIMER_FAILED_CAUSE_VALUES`].
+const CAUSE_TIMER_ID_UNKNOWN: &str = "TIMER_ID_UNKNOWN";
+
+/// The cause a closing decision's `*Failed` event carries when the history grew an
+/// event the decider had not seen while it was deciding: "An `UnhandledDecision` fault
+/// is returned if a workflow closing decision is specified and a signal or activity
+/// event had been added to the history while the decision task was being performed by
+/// the decider." One of each closing decision's own `*_FAILED_CAUSE_VALUES`.
+const CAUSE_UNHANDLED_DECISION: &str = "UNHANDLED_DECISION";
+
+/// The cause a `StartChildWorkflowExecutionFailed` or
+/// `ContinueAsNewWorkflowExecutionFailed` event carries when the decision named a
+/// workflow type the domain holds no registration of. One of
+/// [`crate::ops::types::START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_VALUES`].
+const CAUSE_WORKFLOW_TYPE_DOES_NOT_EXIST: &str = "WORKFLOW_TYPE_DOES_NOT_EXIST";
+
+/// The cause those same events carry when the workflow type is registered but
+/// deprecated. One of
+/// [`crate::ops::types::START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_VALUES`].
+const CAUSE_WORKFLOW_TYPE_DEPRECATED: &str = "WORKFLOW_TYPE_DEPRECATED";
+
+/// The cause a `StartChildWorkflowExecutionFailed` event carries when the domain
+/// already holds an OPEN run under the child's `workflowId`. One of
+/// [`crate::ops::types::START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_VALUES`].
+const CAUSE_WORKFLOW_ALREADY_RUNNING: &str = "WORKFLOW_ALREADY_RUNNING";
+
+/// The cause a `StartChildWorkflowExecutionFailed` event carries when the domain cannot
+/// hold another run. One of
+/// [`crate::ops::types::START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_VALUES`].
+const CAUSE_OPEN_WORKFLOWS_LIMIT_EXCEEDED: &str = "OPEN_WORKFLOWS_LIMIT_EXCEEDED";
+
+/// The cause a `ContinueAsNewWorkflowExecutionFailed` event carries when the domain
+/// cannot hold the run that would carry on. One of
+/// [`crate::ops::types::CONTINUE_AS_NEW_WORKFLOW_EXECUTION_FAILED_CAUSE_VALUES`].
+const CAUSE_CONTINUE_AS_NEW_RATE_EXCEEDED: &str =
+    "CONTINUE_AS_NEW_WORKFLOW_EXECUTION_RATE_EXCEEDED";
+
+/// The cause a `SignalExternalWorkflowExecutionFailed` or
+/// `RequestCancelExternalWorkflowExecutionFailed` event carries when the decision
+/// addressed a run the domain does not hold open. One of
+/// [`crate::ops::types::SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_VALUES`].
+const CAUSE_UNKNOWN_EXTERNAL_WORKFLOW_EXECUTION: &str = "UNKNOWN_EXTERNAL_WORKFLOW_EXECUTION";
+
+/// The cause a `ScheduleLambdaFunctionFailed` event carries when a Lambda task with the
+/// decision's `id` is already in flight in this run. One of
+/// [`crate::ops::types::SCHEDULE_LAMBDA_FUNCTION_FAILED_CAUSE_VALUES`].
+const CAUSE_LAMBDA_ID_ALREADY_IN_USE: &str = "ID_ALREADY_IN_USE";
+
+/// The cause a `StartLambdaFunctionFailed` event carries when the IAM role the Lambda
+/// task would run under cannot be assumed — the only member of
+/// [`crate::ops::types::START_LAMBDA_FUNCTION_FAILED_CAUSE_VALUES`], and the one way a
+/// scheduled Lambda task fails to start.
+const CAUSE_ASSUME_ROLE_FAILED: &str = "ASSUME_ROLE_FAILED";
+
+/// The cause a run-starting decision's `*Failed` event carries when neither it nor the
+/// workflow type defines the task list the new run would use. One of
+/// [`crate::ops::types::START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_VALUES`] and of
+/// [`crate::ops::types::CONTINUE_AS_NEW_WORKFLOW_EXECUTION_FAILED_CAUSE_VALUES`].
+const CAUSE_DEFAULT_TASK_LIST_UNDEFINED: &str = "DEFAULT_TASK_LIST_UNDEFINED";
+
+/// The same, for the new run's decision-task start-to-close timeout.
+const CAUSE_DEFAULT_TASK_START_TO_CLOSE_TIMEOUT_UNDEFINED: &str =
+    "DEFAULT_TASK_START_TO_CLOSE_TIMEOUT_UNDEFINED";
+
+/// The same, for the new run's own start-to-close timeout.
+const CAUSE_DEFAULT_EXECUTION_START_TO_CLOSE_TIMEOUT_UNDEFINED: &str =
+    "DEFAULT_EXECUTION_START_TO_CLOSE_TIMEOUT_UNDEFINED";
+
+/// The same, for the new run's child policy.
+const CAUSE_DEFAULT_CHILD_POLICY_UNDEFINED: &str = "DEFAULT_CHILD_POLICY_UNDEFINED";
+
+/// The cause a `ScheduleActivityTaskFailed` event carries when neither the decision nor
+/// the activity type defines the task list the task would wait in. One of
+/// [`crate::ops::types::SCHEDULE_ACTIVITY_TASK_FAILED_CAUSE_VALUES`].
+const CAUSE_ACTIVITY_DEFAULT_TASK_LIST_UNDEFINED: &str = "DEFAULT_TASK_LIST_UNDEFINED";
+
+/// The same, for the activity task's schedule-to-start timeout: "A schedule-to-start
+/// timeout for this activity task must be specified either as a default for the
+/// activity type or through this field."
+const CAUSE_DEFAULT_SCHEDULE_TO_START_TIMEOUT_UNDEFINED: &str =
+    "DEFAULT_SCHEDULE_TO_START_TIMEOUT_UNDEFINED";
+
+/// The same, for its schedule-to-close timeout.
+const CAUSE_DEFAULT_SCHEDULE_TO_CLOSE_TIMEOUT_UNDEFINED: &str =
+    "DEFAULT_SCHEDULE_TO_CLOSE_TIMEOUT_UNDEFINED";
+
+/// The same, for its start-to-close timeout.
+const CAUSE_DEFAULT_START_TO_CLOSE_TIMEOUT_UNDEFINED: &str =
+    "DEFAULT_START_TO_CLOSE_TIMEOUT_UNDEFINED";
 
 #[derive(Debug, Clone, Default)]
 pub struct RespondDecisionTaskCompletedOutput;
@@ -182,20 +314,1445 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RespondDecisionTaskCompleted` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RespondDecisionTaskCompletedErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RespondDecisionTaskCompleted"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RespondDecisionTaskCompletedErrorModeled::OperationNotPermittedFault(
+                OperationNotPermittedFault {
+                    message: Some("the SWF domain store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // The task-list override and every decision are checked BEFORE anything is
+        // recorded, so a request this service cannot act on leaves the run untouched.
+        let overridden_task_list = match &input.task_list {
+            Some(task_list) if !task_list.name.is_empty() => {
+                crate::state::validate_name("taskList.name", &task_list.name)
+                    .map_err(crate::scaffolded::Scaffolded::validation)?;
+                Some(task_list.name.clone())
+            }
+            _ => None,
+        };
+        let override_timeout = crate::state::non_empty(&input.task_list_schedule_to_start_timeout);
+        if let Some(timeout) = &override_timeout {
+            crate::state::validate_task_duration("taskListScheduleToStartTimeout", timeout)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+        let decisions = input.decisions.clone().unwrap_or_default();
+        for (index, decision) in decisions.iter().enumerate() {
+            validate_decision(index, decision)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+
+        let now = crate::state::now();
+        let mut guard = state.lock();
+
+        // `taskToken` is "the opaque string used as a handle on the task" and is derived
+        // from the task's own identity, so it is resolved by looking for the outstanding
+        // decision task whose identity produces it.
+        let unknown_token = || {
+            RespondDecisionTaskCompletedErrorModeled::UnknownResourceFault(UnknownResourceFault {
+                message: Some(
+                    "Unknown decision task: the taskToken does not address a decision task \
+                     that is still outstanding"
+                        .to_string(),
+                ),
+            })
+        };
+        let Some((domain_name, workflow_id, run_id, started_event_id)) =
+            resolve_task_token(&guard, &input.task_token)
+        else {
+            return Err(unknown_token().into());
+        };
+
+        // The service's own sweeps, materialised before the token is honoured: a run the
+        // clock closed, and a decision task the clock timed out, were over at their own
+        // instant whether or not anybody called, so a token that lost that race is
+        // refused instead of recording a completion into a history that moved on.
+        guard.materialise_due_timeouts_in(&domain_name, now);
+        let Some(domain) = guard.domains.get_mut(&domain_name) else {
+            return Err(unknown_token().into());
+        };
+        domain.expire_due_decision_tasks(now);
+
+        let key = (workflow_id, run_id);
+        let Some(execution) = domain.executions.get_mut(&key) else {
+            return Err(unknown_token().into());
+        };
+        if !execution.is_open() || !execution.decision_task_is_outstanding(started_event_id) {
+            return Err(unknown_token().into());
+        }
+
+        // Amazon SWF Quotas bounds one run's history, and a run that reaches it is
+        // TERMINATED by the service rather than grown further. This completion records
+        // one event plus whatever its decisions record, so a run without room for them
+        // is closed instead — and a closed run has no decision task to complete.
+        if !execution.has_history_room_for(2 + decisions.len() * EVENTS_PER_DECISION) {
+            domain.close_run(&key, crate::state::RunClose::event_limit_exceeded(), now);
+            return Err(unknown_token().into());
+        }
+
+        let scheduled_event_id = execution
+            .outstanding_decision_tasks()
+            .into_iter()
+            .find(|(_, started, _)| *started == started_event_id)
+            .map(|(scheduled, _, _)| scheduled)
+            .unwrap_or(0);
+
+        // What the decider CANNOT have seen: whatever was recorded after the task it is
+        // answering was handed over.
+        let unseen_events = execution.needs_decision_since(started_event_id);
+
+        let completed_event_id = execution.append_event(
+            now,
+            EventAttributes::DecisionTaskCompleted(DecisionTaskCompletedEventAttributes {
+                execution_context: crate::state::non_empty(&input.execution_context),
+                scheduled_event_id,
+                started_event_id,
+                task_list: overridden_task_list
+                    .clone()
+                    .map(|name| TaskList { name }),
+                // The timeout is the OVERRIDE's ("specifies a timeout (in seconds) for
+                // the task list override"), so it is recorded only where there is an
+                // override for it to bound.
+                task_list_schedule_to_start_timeout: override_timeout
+                    .clone()
+                    .filter(|_| overridden_task_list.is_some()),
+            }),
+        );
+        execution.open_decision_tasks = 0;
+        // "latestExecutionContext: The latest executionContext provided by the decider
+        // ... from the last decision task completed" — which is now this one, whether or
+        // not it attached a context.
+        execution.latest_execution_context = crate::state::non_empty(&input.execution_context);
+
+        if let Some(name) = overridden_task_list {
+            // "The task list to use for the FUTURE decision tasks of this workflow
+            // execution. This list overrides the original task list you specified while
+            // starting the workflow execution." With a timeout the override is temporary
+            // and the list to go back to is kept with it; "when this parameter is
+            // missing, the task list override is permanent".
+            let revert_to = ::std::mem::replace(&mut execution.effective_config.task_list, name);
+            execution.task_list_override =
+                override_timeout.map(|schedule_to_start_timeout| crate::state::TaskListOverride {
+                    revert_to,
+                    schedule_to_start_timeout,
+                });
+        }
+
+        for decision in &decisions {
+            // A closed run's history takes no further events, so the decisions after one
+            // that closed the run are not applied.
+            if domain
+                .executions
+                .get(&key)
+                .is_none_or(|execution| !execution.is_open())
+            {
+                break;
+            }
+            apply_decision(domain, &key, decision, completed_event_id, unseen_events, now);
+        }
+
+        // The events this decider has not seen — the ones that arrived while it was
+        // deciding, and whatever its own decisions failed on — are what the NEXT decision
+        // task carries: "The right action here is to call RespondDecisionTaskCompleted
+        // without any decisions. This would result in another decision task with these
+        // new events included in the history."
+        if let Some(execution) = domain.executions.get_mut(&key) {
+            if execution.needs_decision_since(started_event_id) {
+                execution.schedule_decision_task_if_idle(now);
+            }
+        }
+
+        Ok(RespondDecisionTaskCompletedOutput)
+    }
+}
+
+/// The decision task a `taskToken` is the handle on: `(domain, workflowId, runId,
+/// startedEventId)`, or `None` when no outstanding decision task of any stored run
+/// produces that token.
+///
+/// The token is derived from exactly that identity
+/// ([`crate::state::decision_task_token`]), so the stored history IS the record of which
+/// tokens are live: a token whose task has been completed or timed out addresses nothing.
+///
+/// The search is over the runs this service holds, which is bounded by
+/// [`crate::state::MAX_DOMAINS`] domains of [`crate::state::MAX_EXECUTIONS_PER_DOMAIN`]
+/// runs each, and only over the runs that have a decision task in flight at all.
+fn resolve_task_token(
+    guard: &crate::state::ComAmazonawsSwfSimpleworkflowserviceState,
+    token: &str,
+) -> Option<(String, String, String, i64)> {
+    guard.domains.iter().find_map(|(name, domain)| {
+        domain
+            .executions
+            .values()
+            .filter(|execution| execution.is_open() && execution.open_decision_tasks != 0)
+            .find_map(|execution| {
+                execution
+                    .outstanding_decision_tasks()
+                    .into_iter()
+                    .find(|(_, started_event_id, _)| {
+                        crate::state::decision_task_token(
+                            name,
+                            &execution.workflow_id,
+                            &execution.run_id,
+                            *started_event_id,
+                        ) == token
+                    })
+                    .map(|(_, started_event_id, _)| {
+                        (
+                            name.clone(),
+                            execution.workflow_id.clone(),
+                            execution.run_id.clone(),
+                            started_event_id,
+                        )
+                    })
+            })
+    })
+}
+
+/// Refuse a decision this service cannot read as one: a `decisionType` outside the
+/// modelled enumeration, a decision that does not carry the attributes member its own
+/// type names, or a value inside those attributes that SWF's documented form rejects.
+///
+/// "You code a decision by first setting the decision type field to one of the above
+/// decision values, and then set the corresponding attributes field" — so a decision
+/// missing that field says nothing about what to do, which is a bad request rather than
+/// a decision that failed.
+fn validate_decision(index: usize, decision: &Decision) -> Result<(), String> {
+    let member = match decision.decision_type.as_str() {
+        "ScheduleActivityTask" => "scheduleActivityTaskDecisionAttributes",
+        "RequestCancelActivityTask" => "requestCancelActivityTaskDecisionAttributes",
+        "CompleteWorkflowExecution" => "completeWorkflowExecutionDecisionAttributes",
+        "FailWorkflowExecution" => "failWorkflowExecutionDecisionAttributes",
+        "CancelWorkflowExecution" => "cancelWorkflowExecutionDecisionAttributes",
+        "ContinueAsNewWorkflowExecution" => "continueAsNewWorkflowExecutionDecisionAttributes",
+        "RecordMarker" => "recordMarkerDecisionAttributes",
+        "StartTimer" => "startTimerDecisionAttributes",
+        "CancelTimer" => "cancelTimerDecisionAttributes",
+        "SignalExternalWorkflowExecution" => "signalExternalWorkflowExecutionDecisionAttributes",
+        "RequestCancelExternalWorkflowExecution" => {
+            "requestCancelExternalWorkflowExecutionDecisionAttributes"
+        }
+        "StartChildWorkflowExecution" => "startChildWorkflowExecutionDecisionAttributes",
+        "ScheduleLambdaFunction" => "scheduleLambdaFunctionDecisionAttributes",
+        other => {
+            return Err(format!(
+                "decisions[{index}].decisionType must be one of {}, got {other:?}",
+                crate::ops::types::DECISION_TYPE_VALUES.join(", ")
+            ))
+        }
+    };
+    let at = |suffix: &str| format!("decisions[{index}].{member}.{suffix}");
+
+    match decision.decision_type.as_str() {
+        "ScheduleActivityTask" => {
+            let attributes = decision
+                .schedule_activity_task_decision_attributes
+                .as_ref()
+                .ok_or_else(|| missing(index, member))?;
+            crate::state::validate_name(&at("activityId"), &attributes.activity_id)?;
+            crate::state::validate_name(
+                &at("activityType.name"),
+                &attributes.activity_type.name,
+            )?;
+            crate::state::validate_name(
+                &at("activityType.version"),
+                &attributes.activity_type.version,
+            )?;
+            if let Some(task_list) = requested_task_list(&attributes.task_list) {
+                crate::state::validate_name(&at("taskList.name"), &task_list)?;
+            }
+            for (suffix, value) in [
+                ("scheduleToStartTimeout", &attributes.schedule_to_start_timeout),
+                ("scheduleToCloseTimeout", &attributes.schedule_to_close_timeout),
+                ("startToCloseTimeout", &attributes.start_to_close_timeout),
+                ("heartbeatTimeout", &attributes.heartbeat_timeout),
+            ] {
+                if let Some(duration) = crate::state::non_empty(value) {
+                    crate::state::validate_task_duration(&at(suffix), &duration)?;
+                }
+            }
+        }
+        "RequestCancelActivityTask" => {
+            let attributes = decision
+                .request_cancel_activity_task_decision_attributes
+                .as_ref()
+                .ok_or_else(|| missing(index, member))?;
+            crate::state::validate_name(&at("activityId"), &attributes.activity_id)?;
+        }
+        "CompleteWorkflowExecution" => {
+            decision
+                .complete_workflow_execution_decision_attributes
+                .as_ref()
+                .ok_or_else(|| missing(index, member))?;
+        }
+        "FailWorkflowExecution" => {
+            decision
+                .fail_workflow_execution_decision_attributes
+                .as_ref()
+                .ok_or_else(|| missing(index, member))?;
+        }
+        "CancelWorkflowExecution" => {
+            decision
+                .cancel_workflow_execution_decision_attributes
+                .as_ref()
+                .ok_or_else(|| missing(index, member))?;
+        }
+        "ContinueAsNewWorkflowExecution" => {
+            let attributes = decision
+                .continue_as_new_workflow_execution_decision_attributes
+                .as_ref()
+                .ok_or_else(|| missing(index, member))?;
+            if let Some(version) = crate::state::non_empty(&attributes.workflow_type_version) {
+                crate::state::validate_name(&at("workflowTypeVersion"), &version)?;
+            }
+            if let Some(task_list) = requested_task_list(&attributes.task_list) {
+                crate::state::validate_name(&at("taskList.name"), &task_list)?;
+            }
+            validate_run_durations(
+                &at("taskStartToCloseTimeout"),
+                &attributes.task_start_to_close_timeout,
+                &at("executionStartToCloseTimeout"),
+                &attributes.execution_start_to_close_timeout,
+                &at("childPolicy"),
+                &attributes.child_policy,
+            )?;
+        }
+        "RecordMarker" => {
+            let attributes = decision
+                .record_marker_decision_attributes
+                .as_ref()
+                .ok_or_else(|| missing(index, member))?;
+            crate::state::validate_name(&at("markerName"), &attributes.marker_name)?;
+        }
+        "StartTimer" => {
+            let attributes = decision
+                .start_timer_decision_attributes
+                .as_ref()
+                .ok_or_else(|| missing(index, member))?;
+            crate::state::validate_name(&at("timerId"), &attributes.timer_id)?;
+            // `startToFireTimeout` is "the duration to wait before firing the timer ...
+            // specified in seconds, an integer greater than or equal to 0", with no
+            // unlimited sentinel: a timer that never fires is not a timer.
+            crate::state::validate_execution_duration(
+                &at("startToFireTimeout"),
+                &attributes.start_to_fire_timeout,
+            )?;
+        }
+        "CancelTimer" => {
+            let attributes = decision
+                .cancel_timer_decision_attributes
+                .as_ref()
+                .ok_or_else(|| missing(index, member))?;
+            crate::state::validate_name(&at("timerId"), &attributes.timer_id)?;
+        }
+        "SignalExternalWorkflowExecution" => {
+            let attributes = decision
+                .signal_external_workflow_execution_decision_attributes
+                .as_ref()
+                .ok_or_else(|| missing(index, member))?;
+            crate::state::validate_name(&at("workflowId"), &attributes.workflow_id)?;
+        }
+        "RequestCancelExternalWorkflowExecution" => {
+            let attributes = decision
+                .request_cancel_external_workflow_execution_decision_attributes
+                .as_ref()
+                .ok_or_else(|| missing(index, member))?;
+            crate::state::validate_name(&at("workflowId"), &attributes.workflow_id)?;
+        }
+        "StartChildWorkflowExecution" => {
+            let attributes = decision
+                .start_child_workflow_execution_decision_attributes
+                .as_ref()
+                .ok_or_else(|| missing(index, member))?;
+            crate::state::validate_name(&at("workflowId"), &attributes.workflow_id)?;
+            crate::state::validate_name(
+                &at("workflowType.name"),
+                &attributes.workflow_type.name,
+            )?;
+            crate::state::validate_name(
+                &at("workflowType.version"),
+                &attributes.workflow_type.version,
+            )?;
+            if let Some(task_list) = requested_task_list(&attributes.task_list) {
+                crate::state::validate_name(&at("taskList.name"), &task_list)?;
+            }
+            validate_run_durations(
+                &at("taskStartToCloseTimeout"),
+                &attributes.task_start_to_close_timeout,
+                &at("executionStartToCloseTimeout"),
+                &attributes.execution_start_to_close_timeout,
+                &at("childPolicy"),
+                &attributes.child_policy,
+            )?;
+        }
+        "ScheduleLambdaFunction" => {
+            let attributes = decision
+                .schedule_lambda_function_decision_attributes
+                .as_ref()
+                .ok_or_else(|| missing(index, member))?;
+            // `id` "identifies the Lambda function execution in the event history", so
+            // it is one of SWF's own ids and obeys its naming rule. `name` is not: it is
+            // "the name, or ARN, of the Lambda function", and an ARN carries the colons
+            // that rule forbids.
+            crate::state::validate_name(&at("id"), &attributes.id)?;
+            if let Some(duration) = crate::state::non_empty(&attributes.start_to_close_timeout) {
+                crate::state::validate_task_duration(&at("startToCloseTimeout"), &duration)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The message for a decision that names a type but carries no attributes for it.
+fn missing(index: usize, member: &str) -> String {
+    format!("decisions[{index}] must carry the {member} its own decisionType names")
+}
+
+/// The durations and child policy a run-starting decision may override, each in the form
+/// its own member documents.
+fn validate_run_durations(
+    task_member: &str,
+    task_timeout: &Option<String>,
+    execution_member: &str,
+    execution_timeout: &Option<String>,
+    policy_member: &str,
+    child_policy: &Option<String>,
+) -> Result<(), String> {
+    if let Some(duration) = crate::state::non_empty(task_timeout) {
+        crate::state::validate_task_duration(task_member, &duration)?;
+    }
+    if let Some(duration) = crate::state::non_empty(execution_timeout) {
+        crate::state::validate_execution_duration(execution_member, &duration)?;
+    }
+    if let Some(policy) = crate::state::non_empty(child_policy) {
+        crate::state::validate_child_policy(policy_member, &policy)?;
+    }
+    Ok(())
+}
+
+/// The task list a decision asked for, with an empty name read as "not specified" — the
+/// same reading [`crate::state::non_empty`] gives every optional string member.
+fn requested_task_list(task_list: &Option<TaskList>) -> Option<String> {
+    task_list
+        .as_ref()
+        .map(|task_list| task_list.name.clone())
+        .filter(|name| !name.is_empty())
+}
+
+/// Apply ONE decision of a completed decision task to the run `key` names.
+///
+/// Every outcome is an event of a stored history: the one the decision's own doc gives
+/// it, or the `*Failed` event whose modelled `cause` says why the decision could not be
+/// applied to the run as it stands.
+fn apply_decision(
+    domain: &mut Domain,
+    key: &(String, String),
+    decision: &Decision,
+    completed_event_id: i64,
+    unseen_events: bool,
+    at: DateTime,
+) {
+    match decision.decision_type.as_str() {
+        "ScheduleActivityTask" => {
+            if let Some(attributes) = &decision.schedule_activity_task_decision_attributes {
+                schedule_activity_task(domain, key, attributes, completed_event_id, at);
+            }
+        }
+        "RequestCancelActivityTask" => {
+            if let Some(attributes) = &decision.request_cancel_activity_task_decision_attributes {
+                request_cancel_activity_task(domain, key, attributes, completed_event_id, at);
+            }
+        }
+        "CompleteWorkflowExecution" => {
+            if let Some(attributes) = &decision.complete_workflow_execution_decision_attributes {
+                if unseen_events {
+                    record(
+                        domain,
+                        key,
+                        at,
+                        EventAttributes::CompleteWorkflowExecutionFailed(
+                            CompleteWorkflowExecutionFailedEventAttributes {
+                                cause: CAUSE_UNHANDLED_DECISION.to_string(),
+                                decision_task_completed_event_id: completed_event_id,
+                            },
+                        ),
+                    );
+                    return;
+                }
+                domain.close_run(
+                    key,
+                    crate::state::RunClose::Completed {
+                        result: attributes.result.clone(),
+                        decision_task_completed_event_id: completed_event_id,
+                    },
+                    at,
+                );
+            }
+        }
+        "FailWorkflowExecution" => {
+            if let Some(attributes) = &decision.fail_workflow_execution_decision_attributes {
+                if unseen_events {
+                    record(
+                        domain,
+                        key,
+                        at,
+                        EventAttributes::FailWorkflowExecutionFailed(
+                            FailWorkflowExecutionFailedEventAttributes {
+                                cause: CAUSE_UNHANDLED_DECISION.to_string(),
+                                decision_task_completed_event_id: completed_event_id,
+                            },
+                        ),
+                    );
+                    return;
+                }
+                domain.close_run(
+                    key,
+                    crate::state::RunClose::Failed {
+                        reason: attributes.reason.clone(),
+                        details: attributes.details.clone(),
+                        decision_task_completed_event_id: completed_event_id,
+                    },
+                    at,
+                );
+            }
+        }
+        "CancelWorkflowExecution" => {
+            if let Some(attributes) = &decision.cancel_workflow_execution_decision_attributes {
+                if unseen_events {
+                    record(
+                        domain,
+                        key,
+                        at,
+                        EventAttributes::CancelWorkflowExecutionFailed(
+                            CancelWorkflowExecutionFailedEventAttributes {
+                                cause: CAUSE_UNHANDLED_DECISION.to_string(),
+                                decision_task_completed_event_id: completed_event_id,
+                            },
+                        ),
+                    );
+                    return;
+                }
+                domain.close_run(
+                    key,
+                    crate::state::RunClose::Canceled {
+                        details: attributes.details.clone(),
+                        decision_task_completed_event_id: completed_event_id,
+                    },
+                    at,
+                );
+            }
+        }
+        "ContinueAsNewWorkflowExecution" => {
+            if let Some(attributes) =
+                &decision.continue_as_new_workflow_execution_decision_attributes
+            {
+                continue_as_new(
+                    domain,
+                    key,
+                    attributes,
+                    completed_event_id,
+                    unseen_events,
+                    at,
+                );
+            }
+        }
+        "RecordMarker" => {
+            if let Some(attributes) = &decision.record_marker_decision_attributes {
+                // "Records a MarkerRecorded event in the history. Markers can be used
+                // for adding custom information in the history" — nothing about the run
+                // changes, which is why a marker has no in-flight work of its own.
+                record(
+                    domain,
+                    key,
+                    at,
+                    EventAttributes::MarkerRecorded(MarkerRecordedEventAttributes {
+                        marker_name: attributes.marker_name.clone(),
+                        details: attributes.details.clone(),
+                        decision_task_completed_event_id: completed_event_id,
+                    }),
+                );
+            }
+        }
+        "StartTimer" => {
+            if let Some(attributes) = &decision.start_timer_decision_attributes {
+                start_timer(domain, key, attributes, completed_event_id, at);
+            }
+        }
+        "CancelTimer" => {
+            if let Some(attributes) = &decision.cancel_timer_decision_attributes {
+                cancel_timer(domain, key, attributes, completed_event_id, at);
+            }
+        }
+        "SignalExternalWorkflowExecution" => {
+            if let Some(attributes) =
+                &decision.signal_external_workflow_execution_decision_attributes
+            {
+                signal_external(domain, key, attributes, completed_event_id, at);
+            }
+        }
+        "RequestCancelExternalWorkflowExecution" => {
+            if let Some(attributes) =
+                &decision.request_cancel_external_workflow_execution_decision_attributes
+            {
+                request_cancel_external(domain, key, attributes, completed_event_id, at);
+            }
+        }
+        "StartChildWorkflowExecution" => {
+            if let Some(attributes) = &decision.start_child_workflow_execution_decision_attributes {
+                start_child_workflow_execution(domain, key, attributes, completed_event_id, at);
+            }
+        }
+        "ScheduleLambdaFunction" => {
+            if let Some(attributes) = &decision.schedule_lambda_function_decision_attributes {
+                schedule_lambda_function(domain, key, attributes, completed_event_id, at);
+            }
+        }
+        // Every modelled `DecisionType` is handled above, and a type outside the
+        // enumeration was refused as a bad request before anything was recorded.
+        _ => {}
+    }
+}
+
+/// Append one event to the run `key` names and answer its `eventId` (`0` when the run is
+/// gone, which only a store that lost the run between two steps of one call can produce).
+fn record(
+    domain: &mut Domain,
+    key: &(String, String),
+    at: DateTime,
+    attributes: EventAttributes,
+) -> i64 {
+    domain
+        .executions
+        .get_mut(key)
+        .map(|execution| execution.append_event(at, attributes))
+        .unwrap_or(0)
+}
+
+/// A `ScheduleActivityTask` decision: "Schedules an activity task."
+///
+/// The task waits in a task list for a worker, so everything it needs must be defined —
+/// a registered, undeprecated activity type, a free `activityId`, and the task list and
+/// the three timeouts each member documents as "specified either as a default for the
+/// activity type or through this field. If neither this field is set nor a default ...
+/// was specified at registration time then a fault is returned".
+fn schedule_activity_task(
+    domain: &mut Domain,
+    key: &(String, String),
+    attributes: &ScheduleActivityTaskDecisionAttributes,
+    completed_event_id: i64,
+    at: DateTime,
+) {
+    let failed = |domain: &mut Domain, cause: &str| {
+        record(
+            domain,
+            key,
+            at,
+            EventAttributes::ScheduleActivityTaskFailed(ScheduleActivityTaskFailedEventAttributes {
+                activity_type: attributes.activity_type.clone(),
+                activity_id: attributes.activity_id.clone(),
+                cause: cause.to_string(),
+                decision_task_completed_event_id: completed_event_id,
+            }),
+        );
+    };
+
+    let type_key = (
+        attributes.activity_type.name.clone(),
+        attributes.activity_type.version.clone(),
+    );
+    let Some(registered) = domain.activity_types.get(&type_key).cloned() else {
+        failed(domain, CAUSE_ACTIVITY_TYPE_DOES_NOT_EXIST);
+        return;
+    };
+    if registered.is_deprecated() {
+        failed(domain, CAUSE_ACTIVITY_TYPE_DEPRECATED);
+        return;
+    }
+    if domain
+        .executions
+        .get(key)
+        .is_some_and(|execution| execution.open_activity_task(&attributes.activity_id).is_some())
+    {
+        failed(domain, CAUSE_ACTIVITY_ID_ALREADY_IN_USE);
+        return;
+    }
+
+    let Some(task_list) =
+        requested_task_list(&attributes.task_list).or_else(|| registered.default_task_list.clone())
+    else {
+        failed(domain, CAUSE_ACTIVITY_DEFAULT_TASK_LIST_UNDEFINED);
+        return;
+    };
+    let Some(schedule_to_start) = crate::state::non_empty(&attributes.schedule_to_start_timeout)
+        .or_else(|| registered.default_task_schedule_to_start_timeout.clone())
+    else {
+        failed(domain, CAUSE_DEFAULT_SCHEDULE_TO_START_TIMEOUT_UNDEFINED);
+        return;
+    };
+    let Some(schedule_to_close) = crate::state::non_empty(&attributes.schedule_to_close_timeout)
+        .or_else(|| registered.default_task_schedule_to_close_timeout.clone())
+    else {
+        failed(domain, CAUSE_DEFAULT_SCHEDULE_TO_CLOSE_TIMEOUT_UNDEFINED);
+        return;
+    };
+    let Some(start_to_close) = crate::state::non_empty(&attributes.start_to_close_timeout)
+        .or_else(|| registered.default_task_start_to_close_timeout.clone())
+    else {
+        failed(domain, CAUSE_DEFAULT_START_TO_CLOSE_TIMEOUT_UNDEFINED);
+        return;
+    };
+
+    let Some(execution) = domain.executions.get_mut(key) else {
+        return;
+    };
+    execution.append_event(
+        at,
+        EventAttributes::ActivityTaskScheduled(Box::new(ActivityTaskScheduledEventAttributes {
+            activity_type: attributes.activity_type.clone(),
+            activity_id: attributes.activity_id.clone(),
+            input: attributes.input.clone(),
+            control: attributes.control.clone(),
+            schedule_to_start_timeout: Some(schedule_to_start),
+            schedule_to_close_timeout: Some(schedule_to_close),
+            start_to_close_timeout: Some(start_to_close),
+            task_list: TaskList { name: task_list },
+            task_priority: crate::state::non_empty(&attributes.task_priority)
+                .or_else(|| registered.default_task_priority.clone()),
+            decision_task_completed_event_id: completed_event_id,
+            // "If set, specifies the maximum time before which a worker processing a
+            // task of this type must report progress": the one timeout a task may have
+            // none of at all.
+            heartbeat_timeout: crate::state::non_empty(&attributes.heartbeat_timeout)
+                .or_else(|| registered.default_task_heartbeat_timeout.clone()),
+        })),
+    );
+    execution.open_activity_tasks += 1;
+    execution.latest_activity_task_timestamp = Some(at);
+}
+
+/// A `RequestCancelActivityTask` decision: "Attempts to cancel a previously scheduled
+/// activity task. If the activity task was scheduled but has not been assigned to a
+/// worker, then it is canceled." A run with no activity task in flight under that
+/// `activityId` has nothing to cancel, which is what `ACTIVITY_ID_UNKNOWN` says.
+fn request_cancel_activity_task(
+    domain: &mut Domain,
+    key: &(String, String),
+    attributes: &RequestCancelActivityTaskDecisionAttributes,
+    completed_event_id: i64,
+    at: DateTime,
+) {
+    let Some(execution) = domain.executions.get_mut(key) else {
+        return;
+    };
+    let Some(scheduled_event_id) = execution.open_activity_task(&attributes.activity_id) else {
+        execution.append_event(
+            at,
+            EventAttributes::RequestCancelActivityTaskFailed(
+                RequestCancelActivityTaskFailedEventAttributes {
+                    activity_id: attributes.activity_id.clone(),
+                    cause: CAUSE_ACTIVITY_ID_UNKNOWN.to_string(),
+                    decision_task_completed_event_id: completed_event_id,
+                },
+            ),
+        );
+        return;
+    };
+    let requested_event_id = execution.append_event(
+        at,
+        EventAttributes::ActivityTaskCancelRequested(ActivityTaskCancelRequestedEventAttributes {
+            decision_task_completed_event_id: completed_event_id,
+            activity_id: attributes.activity_id.clone(),
+        }),
+    );
+    // A task no worker has been handed is cancelled outright; one already assigned is
+    // told through its heartbeat instead, and reports back itself.
+    if !execution.activity_task_is_started(scheduled_event_id) {
+        execution.append_event(
+            at,
+            EventAttributes::ActivityTaskCanceled(ActivityTaskCanceledEventAttributes {
+                details: None,
+                scheduled_event_id,
+                // No `ActivityTaskStarted` event closes with it; the member's own
+                // modelled default says so.
+                started_event_id: 0,
+                latest_cancel_requested_event_id: requested_event_id,
+            }),
+        );
+        execution.open_activity_tasks = execution.open_activity_tasks.saturating_sub(1);
+    }
+}
+
+/// A `StartTimer` decision: "Starts a timer for this workflow execution and records a
+/// `TimerStarted` event in the history. This timer fires after the specified delay and
+/// record a `TimerFired` event." A `timerId` already running is
+/// `TIMER_ID_ALREADY_IN_USE`.
+fn start_timer(
+    domain: &mut Domain,
+    key: &(String, String),
+    attributes: &StartTimerDecisionAttributes,
+    completed_event_id: i64,
+    at: DateTime,
+) {
+    let Some(execution) = domain.executions.get_mut(key) else {
+        return;
+    };
+    if execution.open_timer(&attributes.timer_id).is_some() {
+        execution.append_event(
+            at,
+            EventAttributes::StartTimerFailed(StartTimerFailedEventAttributes {
+                timer_id: attributes.timer_id.clone(),
+                cause: CAUSE_TIMER_ID_ALREADY_IN_USE.to_string(),
+                decision_task_completed_event_id: completed_event_id,
+            }),
+        );
+        return;
+    }
+    execution.append_event(
+        at,
+        EventAttributes::TimerStarted(TimerStartedEventAttributes {
+            timer_id: attributes.timer_id.clone(),
+            control: attributes.control.clone(),
+            // The delay keeps the value the decider asked for; the clock is what fires
+            // the timer at the instant it names.
+            start_to_fire_timeout: attributes.start_to_fire_timeout.clone(),
+            decision_task_completed_event_id: completed_event_id,
+        }),
+    );
+    execution.open_timers += 1;
+}
+
+/// A `CancelTimer` decision: "Cancels a previously started timer and records a
+/// `TimerCanceled` event in the history." A `timerId` with no timer running is
+/// `TIMER_ID_UNKNOWN`.
+fn cancel_timer(
+    domain: &mut Domain,
+    key: &(String, String),
+    attributes: &CancelTimerDecisionAttributes,
+    completed_event_id: i64,
+    at: DateTime,
+) {
+    let Some(execution) = domain.executions.get_mut(key) else {
+        return;
+    };
+    match execution.open_timer(&attributes.timer_id) {
+        Some(started_event_id) => {
+            execution.append_event(
+                at,
+                EventAttributes::TimerCanceled(TimerCanceledEventAttributes {
+                    timer_id: attributes.timer_id.clone(),
+                    started_event_id,
+                    decision_task_completed_event_id: completed_event_id,
+                }),
+            );
+            execution.open_timers = execution.open_timers.saturating_sub(1);
+        }
+        None => {
+            execution.append_event(
+                at,
+                EventAttributes::CancelTimerFailed(CancelTimerFailedEventAttributes {
+                    timer_id: attributes.timer_id.clone(),
+                    cause: CAUSE_TIMER_ID_UNKNOWN.to_string(),
+                    decision_task_completed_event_id: completed_event_id,
+                }),
+            );
+        }
+    }
+}
+
+/// A `SignalExternalWorkflowExecution` decision: "Requests a signal to be delivered to
+/// the specified external workflow execution and records a
+/// `SignalExternalWorkflowExecutionInitiated` event in the history."
+///
+/// The signal is then delivered the same way `SignalWorkflowExecution` delivers one — a
+/// `WorkflowExecutionSignaled` event on the target and a decision task for it — and this
+/// run is told it arrived (`ExternalWorkflowExecutionSignaled`). A target the domain does
+/// not hold open is `UNKNOWN_EXTERNAL_WORKFLOW_EXECUTION`, which "could happen if the
+/// workflowID specified in the decision was incorrect".
+fn signal_external(
+    domain: &mut Domain,
+    key: &(String, String),
+    attributes: &SignalExternalWorkflowExecutionDecisionAttributes,
+    completed_event_id: i64,
+    at: DateTime,
+) {
+    let initiated_event_id = record(
+        domain,
+        key,
+        at,
+        EventAttributes::SignalExternalWorkflowExecutionInitiated(
+            SignalExternalWorkflowExecutionInitiatedEventAttributes {
+                workflow_id: attributes.workflow_id.clone(),
+                run_id: crate::state::non_empty(&attributes.run_id),
+                signal_name: attributes.signal_name.clone(),
+                input: attributes.input.clone(),
+                decision_task_completed_event_id: completed_event_id,
+                control: attributes.control.clone(),
+            },
+        ),
+    );
+
+    let Some(target) = deliverable_target(domain, &attributes.workflow_id, &attributes.run_id, at)
+    else {
+        record(
+            domain,
+            key,
+            at,
+            EventAttributes::SignalExternalWorkflowExecutionFailed(
+                SignalExternalWorkflowExecutionFailedEventAttributes {
+                    workflow_id: attributes.workflow_id.clone(),
+                    run_id: crate::state::non_empty(&attributes.run_id),
+                    cause: CAUSE_UNKNOWN_EXTERNAL_WORKFLOW_EXECUTION.to_string(),
+                    initiated_event_id,
+                    decision_task_completed_event_id: completed_event_id,
+                    control: attributes.control.clone(),
+                },
+            ),
+        );
+        return;
+    };
+
+    let sender = WorkflowExecution {
+        workflow_id: key.0.clone(),
+        run_id: key.1.clone(),
+    };
+    if let Some(execution) = domain.executions.get_mut(&target) {
+        execution.append_event(
+            at,
+            EventAttributes::WorkflowExecutionSignaled(WorkflowExecutionSignaledEventAttributes {
+                signal_name: attributes.signal_name.clone(),
+                input: attributes.input.clone(),
+                // "externalWorkflowExecution: The workflow execution that sent the
+                // signal. This is set only of the signal was sent by another workflow
+                // execution" — which is exactly this decision.
+                external_workflow_execution: Some(sender),
+                external_initiated_event_id: initiated_event_id,
+            }),
+        );
+        execution.schedule_decision_task_if_idle(at);
+    }
+    record(
+        domain,
+        key,
+        at,
+        EventAttributes::ExternalWorkflowExecutionSignaled(
+            ExternalWorkflowExecutionSignaledEventAttributes {
+                workflow_execution: WorkflowExecution {
+                    workflow_id: target.0.clone(),
+                    run_id: target.1.clone(),
+                },
+                initiated_event_id,
+            },
+        ),
+    );
+}
+
+/// A `RequestCancelExternalWorkflowExecution` decision: "Requests that a request be made
+/// to cancel the specified external workflow execution and records a
+/// `RequestCancelExternalWorkflowExecutionInitiated` event in the history."
+///
+/// The request reaches the target as the `WorkflowExecutionCancelRequested` event and a
+/// decision task — the same thing `RequestCancelWorkflowExecution` records — and this run
+/// is told it was delivered. A target the domain does not hold open is
+/// `UNKNOWN_EXTERNAL_WORKFLOW_EXECUTION`.
+fn request_cancel_external(
+    domain: &mut Domain,
+    key: &(String, String),
+    attributes: &RequestCancelExternalWorkflowExecutionDecisionAttributes,
+    completed_event_id: i64,
+    at: DateTime,
+) {
+    let initiated_event_id = record(
+        domain,
+        key,
+        at,
+        EventAttributes::RequestCancelExternalWorkflowExecutionInitiated(
+            RequestCancelExternalWorkflowExecutionInitiatedEventAttributes {
+                workflow_id: attributes.workflow_id.clone(),
+                run_id: crate::state::non_empty(&attributes.run_id),
+                decision_task_completed_event_id: completed_event_id,
+                control: attributes.control.clone(),
+            },
+        ),
+    );
+
+    let Some(target) = deliverable_target(domain, &attributes.workflow_id, &attributes.run_id, at)
+    else {
+        record(
+            domain,
+            key,
+            at,
+            EventAttributes::RequestCancelExternalWorkflowExecutionFailed(
+                RequestCancelExternalWorkflowExecutionFailedEventAttributes {
+                    workflow_id: attributes.workflow_id.clone(),
+                    run_id: crate::state::non_empty(&attributes.run_id),
+                    cause: CAUSE_UNKNOWN_EXTERNAL_WORKFLOW_EXECUTION.to_string(),
+                    initiated_event_id,
+                    decision_task_completed_event_id: completed_event_id,
+                    control: attributes.control.clone(),
+                },
+            ),
+        );
+        return;
+    };
+
+    let requester = WorkflowExecution {
+        workflow_id: key.0.clone(),
+        run_id: key.1.clone(),
+    };
+    if let Some(execution) = domain.executions.get_mut(&target) {
+        execution.cancel_requested = true;
+        execution.append_event(
+            at,
+            EventAttributes::WorkflowExecutionCancelRequested(
+                WorkflowExecutionCancelRequestedEventAttributes {
+                    external_workflow_execution: Some(requester),
+                    external_initiated_event_id: initiated_event_id,
+                    // `cause` records a cancellation the SERVICE asked for under a
+                    // parent's child policy; this one is another run's decision.
+                    cause: None,
+                },
+            ),
+        );
+        execution.schedule_decision_task_if_idle(at);
+    }
+    record(
+        domain,
+        key,
+        at,
+        EventAttributes::ExternalWorkflowExecutionCancelRequested(
+            ExternalWorkflowExecutionCancelRequestedEventAttributes {
+                workflow_execution: WorkflowExecution {
+                    workflow_id: target.0.clone(),
+                    run_id: target.1.clone(),
+                },
+                initiated_event_id,
+            },
+        ),
+    );
+}
+
+/// The stored run a decision addressed by `workflowId` and optional `runId`, when the
+/// service can deliver to it: an omitted `runId` addresses the one open run of that
+/// `workflowId`, the same resolution every execution-scoped operation of this service
+/// makes.
+///
+/// A run whose history has no room for what a delivery records is not deliverable: it has
+/// reached the quota, so the service terminates it here exactly as every other writer
+/// does, and the decision then fails on a target the domain no longer holds open rather
+/// than leaving its `*Initiated` event with no outcome.
+fn deliverable_target(
+    domain: &mut Domain,
+    workflow_id: &str,
+    run_id: &Option<String>,
+    at: DateTime,
+) -> Option<(String, String)> {
+    let run_id = domain.resolve_run_id(workflow_id, run_id.as_deref())?;
+    let key = (workflow_id.to_string(), run_id);
+    let execution = domain.executions.get(&key)?;
+    if !execution.is_open() {
+        return None;
+    }
+    // The delivery records the event the target receives and the decision task it acts
+    // on it in.
+    if !execution.has_history_room_for(2) {
+        domain.close_run(&key, crate::state::RunClose::event_limit_exceeded(), at);
+        return None;
+    }
+    Some(key)
+}
+
+/// A `StartChildWorkflowExecution` decision: "Requests that a child workflow execution
+/// be started and records a `StartChildWorkflowExecutionInitiated` event in the history.
+/// The child workflow execution is a separate workflow execution with its own history."
+///
+/// The child is a real run of this domain, started through the same path as any other,
+/// carrying this run as its parent — so what becomes of it is reported back here when it
+/// closes. A decision the service cannot start a run from is
+/// `StartChildWorkflowExecutionFailed` with the cause that says which part was missing,
+/// taken, or not registered.
+fn start_child_workflow_execution(
+    domain: &mut Domain,
+    key: &(String, String),
+    attributes: &StartChildWorkflowExecutionDecisionAttributes,
+    completed_event_id: i64,
+    at: DateTime,
+) {
+    let failed = |domain: &mut Domain, cause: &str, initiated_event_id: i64| {
+        record(
+            domain,
+            key,
+            at,
+            EventAttributes::StartChildWorkflowExecutionFailed(
+                StartChildWorkflowExecutionFailedEventAttributes {
+                    workflow_type: attributes.workflow_type.clone(),
+                    cause: cause.to_string(),
+                    workflow_id: attributes.workflow_id.clone(),
+                    initiated_event_id,
+                    decision_task_completed_event_id: completed_event_id,
+                    control: attributes.control.clone(),
+                },
+            ),
+        );
+    };
+
+    let type_key = (
+        attributes.workflow_type.name.clone(),
+        attributes.workflow_type.version.clone(),
+    );
+    let Some(registered) = domain.workflow_types.get(&type_key).cloned() else {
+        // No `StartChildWorkflowExecutionInitiated` event is recorded for a decision the
+        // service cannot resolve a run from, so the failure names none.
+        failed(domain, CAUSE_WORKFLOW_TYPE_DOES_NOT_EXIST, 0);
+        return;
+    };
+    if registered.is_deprecated() {
+        failed(domain, CAUSE_WORKFLOW_TYPE_DEPRECATED, 0);
+        return;
+    }
+    let config = match resolve_run_config(
+        RequestedRunConfig {
+            task_list: requested_task_list(&attributes.task_list),
+            task_priority: crate::state::non_empty(&attributes.task_priority),
+            task_start_to_close_timeout: crate::state::non_empty(
+                &attributes.task_start_to_close_timeout,
+            ),
+            execution_start_to_close_timeout: crate::state::non_empty(
+                &attributes.execution_start_to_close_timeout,
+            ),
+            child_policy: crate::state::non_empty(&attributes.child_policy),
+            lambda_role: crate::state::non_empty(&attributes.lambda_role),
+        },
+        &registered,
+    ) {
+        Ok(config) => config,
+        Err(cause) => {
+            failed(domain, cause, 0);
+            return;
+        }
+    };
+
+    let initiated_event_id = record(
+        domain,
+        key,
+        at,
+        EventAttributes::StartChildWorkflowExecutionInitiated(Box::new(
+            StartChildWorkflowExecutionInitiatedEventAttributes {
+                workflow_id: attributes.workflow_id.clone(),
+                workflow_type: registered.workflow_type(),
+                control: attributes.control.clone(),
+                input: attributes.input.clone(),
+                execution_start_to_close_timeout: Some(
+                    config.execution_start_to_close_timeout.clone(),
+                ),
+                task_list: TaskList {
+                    name: config.task_list.clone(),
+                },
+                task_priority: config.task_priority.clone(),
+                decision_task_completed_event_id: completed_event_id,
+                child_policy: config.child_policy.clone(),
+                task_start_to_close_timeout: Some(config.task_start_to_close_timeout.clone()),
+                tag_list: attributes.tag_list.clone(),
+                lambda_role: config.lambda_role.clone(),
+            },
+        )),
+    );
+
+    // One OPEN run per `workflowId` per domain, and a domain holds at most so many runs:
+    // the same two limits a client's own start is refused by, reported here as the
+    // decision's own failure. A closed run stays stored — its history is what the readers
+    // answer from — so the second limit counts every run the domain has ever held.
+    if domain
+        .open_by_workflow_id
+        .contains_key(&attributes.workflow_id)
+    {
+        failed(domain, CAUSE_WORKFLOW_ALREADY_RUNNING, initiated_event_id);
+        return;
+    }
+
+    let parent = WorkflowExecution {
+        workflow_id: key.0.clone(),
+        run_id: key.1.clone(),
+    };
+    let Some(child_run_id) = domain.start_run(
+        crate::state::NewRun {
+            workflow_id: attributes.workflow_id.clone(),
+            workflow_type: registered.workflow_type(),
+            input: attributes.input.clone(),
+            tag_list: attributes.tag_list.clone().unwrap_or_default(),
+            config,
+            continued_execution_run_id: None,
+            parent: Some((parent, initiated_event_id)),
+        },
+        at,
+    ) else {
+        failed(
+            domain,
+            CAUSE_OPEN_WORKFLOWS_LIMIT_EXCEEDED,
+            initiated_event_id,
+        );
+        return;
+    };
+
+    if let Some(execution) = domain.executions.get_mut(key) {
+        execution.append_event(
+            at,
+            EventAttributes::ChildWorkflowExecutionStarted(
+                ChildWorkflowExecutionStartedEventAttributes {
+                    workflow_execution: WorkflowExecution {
+                        workflow_id: attributes.workflow_id.clone(),
+                        run_id: child_run_id,
+                    },
+                    workflow_type: registered.workflow_type(),
+                    initiated_event_id,
+                },
+            ),
+        );
+        execution.open_child_executions += 1;
+    }
+}
+
+/// A `ContinueAsNewWorkflowExecution` decision: "Closes the workflow execution and starts
+/// a new workflow execution of the same type using the same workflow ID and a unique run
+/// Id. A `WorkflowExecutionContinuedAsNew` event is recorded in the history."
+///
+/// The new run is started first so the closing event can name its `runId`, and it carries
+/// whatever the decision did not override down from the workflow type's registered
+/// defaults. A decision the service cannot start a run from is
+/// `ContinueAsNewWorkflowExecutionFailed`.
+fn continue_as_new(
+    domain: &mut Domain,
+    key: &(String, String),
+    attributes: &ContinueAsNewWorkflowExecutionDecisionAttributes,
+    completed_event_id: i64,
+    unseen_events: bool,
+    at: DateTime,
+) {
+    let failed = |domain: &mut Domain, cause: &str| {
+        record(
+            domain,
+            key,
+            at,
+            EventAttributes::ContinueAsNewWorkflowExecutionFailed(
+                ContinueAsNewWorkflowExecutionFailedEventAttributes {
+                    cause: cause.to_string(),
+                    decision_task_completed_event_id: completed_event_id,
+                },
+            ),
+        );
+    };
+    if unseen_events {
+        failed(domain, CAUSE_UNHANDLED_DECISION);
+        return;
+    }
+
+    let Some(current) = domain.executions.get(key) else {
+        return;
+    };
+    let tag_list = attributes
+        .tag_list
+        .clone()
+        .unwrap_or_else(|| current.tag_list.clone());
+    // "workflowTypeVersion": the version of the SAME type to continue as, defaulting to
+    // the one this run is already of.
+    let version = crate::state::non_empty(&attributes.workflow_type_version)
+        .unwrap_or_else(|| current.workflow_type.1.clone());
+    let type_key = (current.workflow_type.0.clone(), version);
+    let parent = current
+        .parent
+        .clone()
+        .map(|parent| (parent, current.parent_initiated_event_id));
+
+    let Some(registered) = domain.workflow_types.get(&type_key).cloned() else {
+        failed(domain, CAUSE_WORKFLOW_TYPE_DOES_NOT_EXIST);
+        return;
+    };
+    if registered.is_deprecated() {
+        failed(domain, CAUSE_WORKFLOW_TYPE_DEPRECATED);
+        return;
+    }
+    let config = match resolve_run_config(
+        RequestedRunConfig {
+            task_list: requested_task_list(&attributes.task_list),
+            task_priority: crate::state::non_empty(&attributes.task_priority),
+            task_start_to_close_timeout: crate::state::non_empty(
+                &attributes.task_start_to_close_timeout,
+            ),
+            execution_start_to_close_timeout: crate::state::non_empty(
+                &attributes.execution_start_to_close_timeout,
+            ),
+            child_policy: crate::state::non_empty(&attributes.child_policy),
+            lambda_role: crate::state::non_empty(&attributes.lambda_role),
+        },
+        &registered,
+    ) {
+        Ok(config) => config,
+        Err(cause) => {
+            failed(domain, cause);
+            return;
+        }
+    };
+
+    // The run that carries on is started first: the closing event has to name its
+    // `runId`, and the `workflowId` index moves to it rather than being freed. A closed
+    // run stays stored, so every continue-as-new adds to the domain's bounded store: past
+    // that bound the decision fails and THIS run stays open, rather than closing a run
+    // with nothing to carry on from it.
+    let Some(new_run_id) = domain.start_run(
+        crate::state::NewRun {
+            workflow_id: key.0.clone(),
+            workflow_type: registered.workflow_type(),
+            input: attributes.input.clone(),
+            tag_list: tag_list.clone(),
+            config: config.clone(),
+            continued_execution_run_id: Some(key.1.clone()),
+            // A run continued as new keeps the parent of the run it continues, so a
+            // parent waiting on this child is told when the work it started finishes.
+            parent,
+        },
+        at,
+    ) else {
+        failed(domain, CAUSE_CONTINUE_AS_NEW_RATE_EXCEEDED);
+        return;
+    };
+
+    domain.close_run(
+        key,
+        crate::state::RunClose::ContinuedAsNew(Box::new(
+            WorkflowExecutionContinuedAsNewEventAttributes {
+                input: attributes.input.clone(),
+                decision_task_completed_event_id: completed_event_id,
+                new_execution_run_id: new_run_id,
+                execution_start_to_close_timeout: Some(
+                    config.execution_start_to_close_timeout.clone(),
+                ),
+                task_list: TaskList {
+                    name: config.task_list.clone(),
+                },
+                task_priority: config.task_priority.clone(),
+                task_start_to_close_timeout: Some(config.task_start_to_close_timeout.clone()),
+                child_policy: config.child_policy.clone(),
+                tag_list: (!tag_list.is_empty()).then_some(tag_list),
+                workflow_type: registered.workflow_type(),
+                lambda_role: config.lambda_role.clone(),
+            },
+        )),
+        at,
+    );
+}
+
+/// What a run-starting decision asked for, before the workflow type's registered
+/// defaults are filled in underneath it.
+struct RequestedRunConfig {
+    task_list: Option<String>,
+    task_priority: Option<String>,
+    task_start_to_close_timeout: Option<String>,
+    execution_start_to_close_timeout: Option<String>,
+    child_policy: Option<String>,
+    lambda_role: Option<String>,
+}
+
+/// The configuration a run started by a decision runs under: the decision's own value
+/// where it set one, else the workflow type's registered default.
+///
+/// Each of the four that a run cannot run without must come from one of those two
+/// places, so the error is the `DEFAULT_*_UNDEFINED` cause naming the one that was
+/// defined in neither — the same resolution, and the same failure, as a client's own
+/// `StartWorkflowExecution`.
+fn resolve_run_config(
+    requested: RequestedRunConfig,
+    registered: &crate::state::WorkflowTypeRecord,
+) -> Result<crate::state::ExecutionConfig, &'static str> {
+    Ok(crate::state::ExecutionConfig {
+        task_list: requested
+            .task_list
+            .or_else(|| registered.default_task_list.clone())
+            .ok_or(CAUSE_DEFAULT_TASK_LIST_UNDEFINED)?,
+        task_priority: requested
+            .task_priority
+            .or_else(|| registered.default_task_priority.clone()),
+        task_start_to_close_timeout: requested
+            .task_start_to_close_timeout
+            .or_else(|| registered.default_task_start_to_close_timeout.clone())
+            .ok_or(CAUSE_DEFAULT_TASK_START_TO_CLOSE_TIMEOUT_UNDEFINED)?,
+        execution_start_to_close_timeout: requested
+            .execution_start_to_close_timeout
+            .or_else(|| registered.default_execution_start_to_close_timeout.clone())
+            .ok_or(CAUSE_DEFAULT_EXECUTION_START_TO_CLOSE_TIMEOUT_UNDEFINED)?,
+        child_policy: requested
+            .child_policy
+            .or_else(|| registered.default_child_policy.clone())
+            .ok_or(CAUSE_DEFAULT_CHILD_POLICY_UNDEFINED)?,
+        lambda_role: requested
+            .lambda_role
+            .or_else(|| registered.default_lambda_role.clone()),
+    })
+}
+
+/// A `ScheduleLambdaFunction` decision: the Lambda task is recorded as scheduled
+/// (`LambdaFunctionScheduled`), and an `id` already in flight is `ID_ALREADY_IN_USE`.
+///
+/// A Lambda task runs under the IAM role attached to the execution — `lambdaRole`, "the
+/// IAM role to attach to this workflow execution ... In order for this workflow execution
+/// to invoke AWS Lambda functions, an appropriate IAM role must be specified". A run with
+/// no such role has none to assume, so the scheduled task cannot start: that is
+/// `StartLambdaFunctionFailed` with the one modelled cause for a role that cannot be
+/// assumed, and the task is no longer in flight.
+fn schedule_lambda_function(
+    domain: &mut Domain,
+    key: &(String, String),
+    attributes: &ScheduleLambdaFunctionDecisionAttributes,
+    completed_event_id: i64,
+    at: DateTime,
+) {
+    let Some(execution) = domain.executions.get_mut(key) else {
+        return;
+    };
+    if execution.open_lambda_function(&attributes.id).is_some() {
+        execution.append_event(
+            at,
+            EventAttributes::ScheduleLambdaFunctionFailed(
+                ScheduleLambdaFunctionFailedEventAttributes {
+                    id: attributes.id.clone(),
+                    name: attributes.name.clone(),
+                    cause: CAUSE_LAMBDA_ID_ALREADY_IN_USE.to_string(),
+                    decision_task_completed_event_id: completed_event_id,
+                },
+            ),
+        );
+        return;
+    }
+
+    let scheduled_event_id = execution.append_event(
+        at,
+        EventAttributes::LambdaFunctionScheduled(LambdaFunctionScheduledEventAttributes {
+            id: attributes.id.clone(),
+            name: attributes.name.clone(),
+            control: attributes.control.clone(),
+            input: attributes.input.clone(),
+            start_to_close_timeout: crate::state::non_empty(&attributes.start_to_close_timeout),
+            decision_task_completed_event_id: completed_event_id,
+        }),
+    );
+    execution.open_lambda_functions += 1;
+
+    if execution.effective_config.lambda_role.is_none() {
+        execution.append_event(
+            at,
+            EventAttributes::StartLambdaFunctionFailed(StartLambdaFunctionFailedEventAttributes {
+                scheduled_event_id,
+                cause: Some(CAUSE_ASSUME_ROLE_FAILED.to_string()),
+                message: Some(
+                    "no IAM role is attached to this workflow execution, so none can be \
+                     assumed to invoke the Lambda function"
+                        .to_string(),
+                ),
+            }),
+        );
+        execution.open_lambda_functions = execution.open_lambda_functions.saturating_sub(1);
     }
 }
