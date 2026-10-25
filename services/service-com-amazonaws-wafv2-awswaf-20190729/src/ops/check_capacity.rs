@@ -223,6 +223,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // These are "the rules you want to use in a RuleGroup or WebACL", so a rule
+        // pinning a managed rule group version the publishing vendor has retired is
+        // refused here exactly as the save path refuses it: a version WAF would not
+        // run cannot be priced. No audit record, because this call changes nothing.
+        if let Some(expired) = crate::state::expired_managed_rule_group_version(&input.rules) {
+            return Err(
+                CheckCapacityErrorModeled::WAFExpiredManagedRuleGroupVersionException(expired)
+                    .into(),
+            );
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CheckCapacityErrorModeled::WAFInternalErrorException(
                 WAFInternalErrorException {

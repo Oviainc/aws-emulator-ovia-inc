@@ -19,6 +19,8 @@ mod activity_create_admission;
 mod activity_heartbeats;
 #[path = "all/activity_lifecycle.rs"]
 mod activity_lifecycle;
+#[path = "all/activity_listing.rs"]
+mod activity_listing;
 #[path = "all/activity_tasks.rs"]
 mod activity_tasks;
 #[path = "all/alias_order_and_redrive_context.rs"]

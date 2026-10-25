@@ -163,7 +163,6 @@ impl Emulator {
         self.ic_ok_in(DEFAULT_SIGNING_REGION, operation, body).await
     }
 
-
     /// One Interconnect operation signed for `region`, required to succeed.
     pub(crate) async fn ic_ok_in(&self, region: &str, operation: &str, body: Value) -> Value {
         let (status, decoded) = self.ic_in(region, operation, body).await;
