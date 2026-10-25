@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAssetProperties
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAssetProperties`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAssetProperties::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation enumerates the properties stored for one asset in the
+//! shared engine store (`crate::state`); this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +156,208 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAssetProperties` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAssetPropertiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAssetProperties"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal_failure)?;
+        let _ = ctx;
+
+        // `filter` defaults to BASE — "The list includes only base asset properties" —
+        // which are the asset's own properties, the ones materialised from its model's
+        // top-level property definitions. ALL also walks the properties each composite
+        // model of that model contributes. The modelled enum admits no other value, and
+        // the runtime refuses one before this handler runs.
+        let include_composite = input.filter.as_deref().unwrap_or(DEFAULT_FILTER) == FILTER_ALL;
+
+        // A pure read: nothing below writes, so two callers reading the same asset in
+        // either order see the same properties.
+        let store = state.lock();
+        // The label is either the raw UUID or the `externalId:<externalId>` alias form.
+        let id = store
+            .resolve_asset_id(&input.asset_id)
+            .ok_or_else(|| not_found(&input.asset_id))?;
+        let asset = store
+            .assets
+            .get(&id)
+            .ok_or_else(|| not_found(&input.asset_id))?;
+
+        // The enumeration order: the asset's own properties in definition order, then
+        // each composite model's properties, composite models in their stored order.
+        // Stable across calls, which is what makes `nextToken` resumable.
+        let mut summaries: Vec<AssetPropertySummary> = asset
+            .properties
+            .iter()
+            .map(|property| summarize(property, None, &[]))
+            .collect();
+        if include_composite {
+            // An asset composite model is an INSTANCE of a composite model of the
+            // asset's model, so its properties are materialised from that model's
+            // stored definitions — exactly as `CreateAsset` materialises the
+            // top-level ones, through the one shared rule. An asset cannot exist
+            // without the model it was created from, so a model that is not there is
+            // a server-side failure rather than a refusal of this request.
+            let model = store
+                .asset_models
+                .get(&asset.asset_model_id)
+                .ok_or_else(internal_failure)?;
+            // `composite_models` is the FLAT list of every composite model the
+            // asset model holds, at any nesting depth — a nested one is linked to
+            // its parent through `composite_model_links` rather than held inside
+            // it — so walking it once reaches every composite model's properties,
+            // and the path prefix below carries the whole chain each sits in.
+            for composite in &model.composite_models {
+                // A composite model and a property definition both carry an id in
+                // every stored record: a create either takes the caller's id or
+                // mints one, and a record without one would be unaddressable — no
+                // request could name it and no asset property could inherit its
+                // id, which is the same rule `CreateAsset` and
+                // `DescribeAssetCompositeModel` materialise asset properties
+                // under. So neither skip below can drop a property this store
+                // actually holds; they only keep this walk total.
+                let Some(composite_id) = composite.id.as_deref() else {
+                    continue;
+                };
+                let prefix = model.asset_composite_model_path(composite_id);
+                for definition in store.composite_model_properties(model, composite_id) {
+                    let Some(property) = crate::state::asset_property_from_model(&definition)
+                    else {
+                        continue;
+                    };
+                    summaries.push(summarize(&property, Some(composite_id), &prefix));
+                }
+            }
+        }
+
+        // `nextToken` is this enumeration's resume point: the key of the first summary
+        // of the next page, hex-encoded so the token matches the modelled
+        // `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this enumeration is
+        // refused rather than answered with an empty page, which would report absence
+        // as success.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                summaries
+                    .iter()
+                    .position(|summary| page_key(summary) == resume)
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        // `maxResults` carries the modelled range 1..250, which the runtime validates
+        // BEFORE this handler runs, so a value that arrives here is already in range
+        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic below
+        // total. The default is the one AWS documents for this operation.
+        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
+        let end = start.saturating_add(max_results).min(summaries.len());
+
+        let next_token = summaries
+            .get(end)
+            .map(|summary| ::hex::encode(page_key(summary)));
+
+        Ok(ListAssetPropertiesOutput {
+            asset_property_summaries: summaries[start..end].to_vec(),
+            next_token,
+        })
     }
+}
+
+/// The page size AWS documents for this operation when the caller gives no
+/// `maxResults`.
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// The `filter` AWS documents as this operation's default.
+const DEFAULT_FILTER: &str = "BASE";
+
+/// The `filter` value that widens the list past the asset's own properties.
+const FILTER_ALL: &str = "ALL";
+
+/// One stored asset property as a `ListAssetProperties` summary.
+///
+/// `composite_id` is the asset composite model the property belongs to, or `None`
+/// for one of the asset's own (base) properties; `prefix` is that composite
+/// model's path from the root of the asset, empty for a base property.
+fn summarize(
+    property: &AssetProperty,
+    composite_id: Option<&str>,
+    prefix: &[AssetCompositeModelPathSegment],
+) -> AssetPropertySummary {
+    // `path` is "the structured path to the property from the root of the asset":
+    // the composite models the property sits inside, outermost first, then the
+    // property itself. Derived from the same stored records the summary's other
+    // members come from, so the two cannot disagree.
+    let mut path: Vec<AssetPropertyPathSegment> = prefix
+        .iter()
+        .map(|segment| AssetPropertyPathSegment {
+            id: segment.id.clone(),
+            name: segment.name.clone(),
+        })
+        .collect();
+    path.push(AssetPropertyPathSegment {
+        id: Some(property.id.clone()),
+        name: Some(property.name.clone()),
+    });
+
+    AssetPropertySummary {
+        id: property.id.clone(),
+        external_id: property.external_id.clone(),
+        // The alias and the notification are set per asset property, by
+        // `UpdateAssetProperty`, so they are reported from the stored property
+        // rather than from the definition it was materialised from. A composite
+        // model's property is not alias-bearing yet — `UpdateAssetProperty`
+        // addresses only the asset's own properties — which is why the composite
+        // rows come from a freshly materialised property and report neither.
+        alias: property.alias.clone(),
+        unit: property.unit.clone(),
+        notification: property.notification.clone(),
+        asset_composite_model_id: composite_id.map(ToString::to_string),
+        path: Some(path),
+    }
+}
+
+/// This enumeration's resume key for one summary: unique, because a property id is
+/// minted unique and a composite model's properties are scoped to it. Both halves
+/// are modelled `ID` members — a hyphenated UUID — so neither can hold the
+/// separator and no pair of summaries can share a key.
+fn page_key(summary: &AssetPropertySummary) -> String {
+    format!(
+        "{}|{}",
+        summary
+            .asset_composite_model_id
+            .as_deref()
+            .unwrap_or_default(),
+        summary.id
+    )
+}
+
+/// Decode a `nextToken` back into the resume key it names.
+fn decode_token(token: &str) -> Result<String, ListAssetPropertiesError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 500 `InternalFailureException`: this service's store is not reachable.
+fn internal_failure() -> ListAssetPropertiesError {
+    ListAssetPropertiesErrorModeled::InternalFailureException(InternalFailureException {
+        message: "the IoT SiteWise store is unavailable".to_string(),
+    })
+    .into()
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
+///
+/// The wording every paginated operation of this service refuses an unusable
+/// token with, so a client matching on the message sees one string whichever
+/// listing it was paging.
+fn invalid_token() -> ListAssetPropertiesError {
+    ListAssetPropertiesErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: "The nextToken is not a token this operation issued.".to_string(),
+    })
+    .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the label that resolved to nothing.
+fn not_found(label: &str) -> ListAssetPropertiesError {
+    ListAssetPropertiesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: crate::state::not_found_message(crate::state::RESOURCE_ASSET, label),
+    })
+    .into()
 }
