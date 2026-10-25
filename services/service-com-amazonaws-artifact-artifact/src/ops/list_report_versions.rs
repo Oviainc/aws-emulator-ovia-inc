@@ -175,20 +175,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // issued for another report — and anything that does not decode to one of this
         // operation's own cursors — is refused rather than honoured as an offset, with
         // the service's one fixed invalid-token text, which does not say which it was.
-        let resume_at = match input.next_token.as_deref() {
-            None => 0usize,
-            Some(token) => {
-                match crate::state::parse_report_versions_token(token, &input.report_id) {
-                    Some(position) => position,
-                    None => {
-                        return Err(ListReportVersionsErrorModeled::ValidationException(
-                            crate::state::invalid_token(),
-                        )
-                        .into())
-                    }
-                }
-            }
-        };
+        let resume_at = crate::state::resume_position(input.next_token.as_deref(), |token| {
+            crate::state::parse_report_versions_token(token, &input.report_id)
+        })
+        .map_err(ListReportVersionsErrorModeled::ValidationException)?;
 
         let region = crate::state::request_region(ctx.parts());
         let page_size = crate::state::page_size(input.max_results);
@@ -201,24 +191,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::unauthorized());
         };
 
-        let mut reports = Vec::with_capacity(page_size.min(report.versions.len()));
-        let mut next_token = None;
-        let mut position = 0usize;
-        for record in report.versions.values() {
-            // Resume at the cursor's POSITION in this operation's own ascending order, so
-            // a page is still served when the version the cursor was cut after was
-            // withdrawn meanwhile.
-            if position < resume_at {
-                position += 1;
-                continue;
-            }
-            if reports.len() >= page_size {
-                next_token = Some(crate::state::report_versions_token(&report.id, position));
-                break;
-            }
-            reports.push(report.to_summary(record, &region));
-            position += 1;
-        }
+        // The service's one page-walk rule: resume at the cursor's POSITION in this
+        // operation's own ascending order — so a page is still served when the version the
+        // cursor was cut after was withdrawn meanwhile — and cut the page at `maxResults`.
+        let (reports, next_token) = crate::state::walk_page(
+            report.versions.values(),
+            resume_at,
+            page_size,
+            |position| crate::state::report_versions_token(&report.id, position),
+            |record| report.to_summary(record, &region),
+        );
 
         Ok(ListReportVersionsOutput {
             reports,

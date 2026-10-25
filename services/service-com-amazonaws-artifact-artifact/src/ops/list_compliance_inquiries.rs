@@ -178,45 +178,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // own cursors. Anything that does not decode to one was never issued here — a bare
         // `InquiryId` included — and is refused with the service's one fixed invalid-token
         // text, the same as every other token member.
-        let resume_at = match input.next_token.as_deref() {
-            None => 0usize,
-            Some(token) => match crate::state::parse_inquiries_page_token(token) {
-                Some(position) => position,
-                None => {
-                    return Err(ListComplianceInquiriesErrorModeled::ValidationException(
-                        crate::state::invalid_token(),
-                    )
-                    .into())
-                }
-            },
-        };
+        let resume_at = crate::state::resume_position(
+            input.next_token.as_deref(),
+            crate::state::parse_inquiries_page_token,
+        )
+        .map_err(ListComplianceInquiriesErrorModeled::ValidationException)?;
 
         let page_size = crate::state::page_size(input.max_results);
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
-        let capacity = page_size.min(store.inquiries.len());
-        let mut compliance_inquiries = Vec::with_capacity(capacity);
-        let mut next_token = None;
-        let mut position = 0usize;
-        for inquiry in store.inquiries.values_mut() {
-            // Resume at the cursor's position in this operation's own reported order, so a
-            // page is still served when the inquiry it was cut after left the store.
-            if position < resume_at {
-                position += 1;
-                continue;
-            }
-            if compliance_inquiries.len() >= page_size {
-                next_token = Some(crate::state::inquiries_page_token(position));
-                break;
-            }
-            // The only write a read may make: the transition the clock had already made
-            // due. Applied here so this listing and a `GetComplianceInquiryMetadata` of
-            // the same inquiry at the same instant report the same status.
-            inquiry.materialise(now);
-            compliance_inquiries.push(inquiry.to_summary());
-            position += 1;
-        }
+        // The service's one page-walk rule: resume at the cursor's position in this
+        // operation's own reported order — so a page is still served when the inquiry it
+        // was cut after left the store — and cut the page at `maxResults`.
+        let (compliance_inquiries, next_token) = crate::state::walk_page(
+            store.inquiries.values_mut(),
+            resume_at,
+            page_size,
+            crate::state::inquiries_page_token,
+            |inquiry| {
+                // The only write a read may make: the transition the clock had already
+                // made due. Applied here so this listing and a
+                // `GetComplianceInquiryMetadata` of the same inquiry at the same instant
+                // report the same status. Only the inquiries this page reports are
+                // projected, so only they are materialised.
+                inquiry.materialise(now);
+                inquiry.to_summary()
+            },
+        );
 
         Ok(ListComplianceInquiriesOutput {
             compliance_inquiries: Some(compliance_inquiries),
