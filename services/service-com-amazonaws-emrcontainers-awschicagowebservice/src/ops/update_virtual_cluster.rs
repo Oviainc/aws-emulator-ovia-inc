@@ -164,13 +164,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let mut state = store.lock();
         state.settle();
 
         // The cluster is resolved out of state, never assumed: an id that names no stored
-        // cluster is the modelled not-found.
-        let Some(record) = state.virtual_clusters.get(&input.id) else {
+        // cluster of the region this request is signed for is the modelled not-found.
+        let Some(record) = state.virtual_cluster(&region, &input.id) else {
             return Err(UpdateVirtualClusterErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!("Virtual cluster {} was not found", input.id)),
@@ -205,6 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let replayed = record.has_applied_update_token(&input.client_token);
         if !replayed {
             state.apply_scheduler_configuration(
+                &region,
                 &input.id,
                 input.scheduler_configuration,
                 &input.client_token,
@@ -216,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state.settle();
         }
 
-        let virtual_cluster = state.virtual_cluster_view(&input.id).ok_or_else(|| {
+        let virtual_cluster = state.virtual_cluster_view(&region, &input.id).ok_or_else(|| {
             UpdateVirtualClusterError::Modeled(
                 UpdateVirtualClusterErrorModeled::InternalServerException(
                     InternalServerException {

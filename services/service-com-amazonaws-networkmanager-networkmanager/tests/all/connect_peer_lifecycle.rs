@@ -33,7 +33,10 @@ use crate::resource_tagging::{list_tags, tag};
 
 /// The id prefix and ARN resource type of a Connect peer: the model's own
 /// `^connect-peer-([0-9a-f]{8,17})$` (`smithy_query shape=ConnectPeerId`).
-const CONNECT_PEER: &str = "connect-peer";
+///
+/// `pub(crate)` because `tests/all/connect_peer_delete.rs` drives the same resource, so one
+/// definition of the peer table and its harness serves both suites.
+pub(crate) const CONNECT_PEER: &str = "connect-peer";
 
 /// The largest page a caller may ask for: `MaxResults` is modelled `range 1..500`
 /// (`smithy_query query="operation" operation="ListConnectPeers"`).
@@ -87,14 +90,14 @@ fn policy_document(edges: &[(&str, i64)]) -> String {
 /// One Connect attachment of the subject: the Region it sits at and the tunnel protocol its
 /// options ask for (`TunnelProtocol` is GRE or NO_ENCAP, `smithy_query
 /// shape=TunnelProtocol`).
-struct Transport {
-    region: &'static str,
+pub(crate) struct Transport {
+    pub(crate) region: &'static str,
     protocol: &'static str,
 }
 
 /// The Connect attachments every row below hangs a peer off: both protocols, and three edge
 /// locations between them.
-const TRANSPORTS: [Transport; 4] = [
+pub(crate) const TRANSPORTS: [Transport; 4] = [
     Transport {
         region: "us-west-2",
         protocol: "GRE",
@@ -124,15 +127,15 @@ fn edge_asn(region: &str) -> i64 {
 
 /// A built subject: a global network, its core network, and one Connect attachment per
 /// entry of [`TRANSPORTS`], in that order.
-struct Subject {
-    global_network: String,
-    core_network: String,
-    attachments: Vec<String>,
+pub(crate) struct Subject {
+    pub(crate) global_network: String,
+    pub(crate) core_network: String,
+    pub(crate) attachments: Vec<String>,
 }
 
 /// Build a subject. `base` offsets the VPC and subnet ARNs its transports attach, so two
 /// subjects of one emulator attach different VPCs.
-async fn subject(emulator: &Emulator, name: &str, base: usize) -> Subject {
+pub(crate) async fn subject(emulator: &Emulator, name: &str, base: usize) -> Subject {
     let global_network = emulator.create_global_network(name).await;
     let (status, created) = create_core_network(
         emulator,
@@ -197,11 +200,11 @@ async fn subject(emulator: &Emulator, name: &str, base: usize) -> Subject {
 }
 
 /// One row of the table: the peer one `CreateConnectPeer` asks for.
-struct PeerCase {
+pub(crate) struct PeerCase {
     /// Names the case in every assertion message.
-    name: &'static str,
+    pub(crate) name: &'static str,
     /// Which entry of [`TRANSPORTS`] the peer is carried over.
-    transport: usize,
+    pub(crate) transport: usize,
     /// The appliance's address, which every peering requires.
     peer_address: &'static str,
     /// The core network's address, which only a GRE peering needs.
@@ -211,15 +214,15 @@ struct PeerCase {
     /// The `BgpOptions$PeerAsn` the request names, or `None` for a request naming none.
     peer_asn: Option<i64>,
     /// Whether the request names a subnet (one in the transport's own Region).
-    subnet: bool,
+    pub(crate) subnet: bool,
     /// The tags the create carries.
-    tags: &'static [(&'static str, &'static str)],
+    pub(crate) tags: &'static [(&'static str, &'static str)],
 }
 
 /// The table: rows differing along everything the rule generalises over — the protocol and
 /// edge of the attachment the peer hangs off, the address family of its two ends, how many
 /// inside CIDR blocks it peers over, its peer ASN, whether it names a subnet, and its tags.
-const PEER_CASES: [PeerCase; 6] = [
+pub(crate) const PEER_CASES: [PeerCase; 6] = [
     PeerCase {
         name: "a GRE peer with both tunnel addresses, one inside CIDR block and a peer ASN",
         transport: 0,
@@ -283,12 +286,12 @@ const PEER_CASES: [PeerCase; 6] = [
 ];
 
 /// The subnet ARN a row that names one carries: one in the Region its transport sits at.
-fn case_subnet(case: &PeerCase) -> String {
+pub(crate) fn case_subnet(case: &PeerCase) -> String {
     subnet_arn(TRANSPORTS[case.transport].region, 900 + case.transport)
 }
 
 /// The `CreateConnectPeer` request body a row asks for.
-fn request_of(case: &PeerCase, attachment: &str) -> Value {
+pub(crate) fn request_of(case: &PeerCase, attachment: &str) -> Value {
     let mut body = json!({
         "ConnectAttachmentId": attachment,
         "PeerAddress": case.peer_address,
@@ -320,7 +323,7 @@ fn request_of(case: &PeerCase, attachment: &str) -> Value {
 }
 
 /// `CreateConnectPeer`.
-async fn create_connect_peer(emulator: &Emulator, body: Value) -> (u16, Value) {
+pub(crate) async fn create_connect_peer(emulator: &Emulator, body: Value) -> (u16, Value) {
     emulator.post("/connect-peers", body).await
 }
 

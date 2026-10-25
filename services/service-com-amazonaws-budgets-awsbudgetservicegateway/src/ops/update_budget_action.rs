@@ -6,9 +6,11 @@
 //! members it did not name as they were, and records the `UPDATE_ACTION` event in the
 //! action's history. Reports the action as it was before the call (`OldAction`) and as
 //! it is after it (`NewAction`). A replacement `Definition` must match the type the
-//! action was created with, and a replacement `Subscribers` set is held to the same
-//! per-type split as a create's ([`crate::state::subscriber_limit_violation`]); either
-//! is refused with `InvalidParameterException`, the client-error this operation models.
+//! action was created with, a replacement `ExecutionRoleArn` must name a role in the
+//! account the action lives in ([`crate::state::validate_execution_role_account`]), and a
+//! replacement `Subscribers` set is held to the same per-type split as a create's
+//! ([`crate::state::subscriber_limit_violation`]); each is refused with
+//! `InvalidParameterException`, the client-error this operation models.
 //! An action whose work this service started and has not settled yet
 //! ([`crate::state::action_is_in_progress`]) is the locked resource
 //! `ResourceLockedException` names, so an update of it is refused and the stored action
@@ -257,6 +259,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                 },
             )?;
+        }
+
+        // "Roles and actions must be in the same account" (`Action$ExecutionRoleArn`) —
+        // a rule over two members of the request, which no constraint trait can express,
+        // so a replacement role is held to it exactly as the role a create establishes
+        // is.
+        if let Some(execution_role_arn) = &input.execution_role_arn {
+            crate::state::validate_execution_role_account(&input.account_id, execution_role_arn)
+                .map_err(|message| {
+                    UpdateBudgetActionErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(message),
+                        },
+                    )
+                })?;
         }
 
         // A replacement subscriber set is held to the same per-type split as the set a

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/agentcore_stack_outputs.rs"]
 mod agentcore_stack_outputs;
+#[path = "all/appconfig_resource_types.rs"]
+mod appconfig_resource_types;
 #[path = "all/callback_signature.rs"]
 mod callback_signature;
 #[path = "all/change_set_lifecycle.rs"]

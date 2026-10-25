@@ -19,6 +19,8 @@ mod attach_points;
 mod connection_lifecycle;
 #[path = "all/connection_proposal.rs"]
 mod connection_proposal;
+#[path = "all/connection_state_progression.rs"]
+mod connection_state_progression;
 #[path = "all/emulator.rs"]
 mod emulator;
 #[path = "all/list_tags_for_resource.rs"]

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the tag keys a request names from the resource its ARN names, leaving the
+//! resource's other tags as they were, so every later read of that resource reports
+//! what this call left.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +156,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // A resource reports the ARN it carries in the region the request is signed
+        // for, so that region is what `ResourceArn` is resolved against. Nothing
+        // here derives an ARN itself.
+        let region = crate::state::request_region(ctx.parts());
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceError::from(UntagResourceErrorModeled::InternalServerErrorException(
+                crate::state::internal_error(),
+            ))
+        })?;
+        // ONE lock for the resolve-then-write, so the tag set the keys are removed
+        // from is the one the resolve found.
+        let mut state = store.lock();
+
+        // Which tag set the call writes to is the ARN's to say — the same ARN a read
+        // of these tags resolves — and only one in a registry the caller owns may be
+        // written to: every other answer is the refusal `refuse` words.
+        let tags = state
+            .writable_tags_for_arn(&input.resource_arn, &region)
+            .map_err(|refusal| refuse(&input.resource_arn, refusal))?;
+
+        // The point of the call: the keys the request names stop being tags of the
+        // resource, and every tag it holds under another key stays exactly as it
+        // was. A key the resource does not carry leaves nothing to remove — the
+        // request asks for a state the resource is already in, which is not a
+        // failure — so the same request repeated answers the same way.
+        for key in &input.tag_keys {
+            tags.remove(key);
+        }
+
+        // A `Unit` output: the removal is the whole answer, at the modelled 204.
+        Ok(UntagResourceOutput)
     }
+}
+
+/// Word a `ResourceArn` that names no tag set this call may write as the variant of
+/// this operation's modelled error set that carries it.
+///
+/// The resolve states WHY the ARN names no writable tag set; this only chooses the
+/// modelled shape — and so the status — for each: a value that is no resource ARN of
+/// this service is a bad request (400), one naming a resource this store does not
+/// hold is not found (404), and one naming AWS-owned content is forbidden (403),
+/// which is the refusal every other write to a service-owned registry gets.
+fn refuse(
+    resource_arn: &str,
+    refusal: crate::state::ResourceArnWriteError,
+) -> UntagResourceError {
+    match refusal {
+        crate::state::ResourceArnWriteError::NotAResourceArn => {
+            UntagResourceErrorModeled::BadRequestException(
+                crate::state::resource_arn_not_a_resource_arn(),
+            )
+        }
+        crate::state::ResourceArnWriteError::NoSuchResource => {
+            UntagResourceErrorModeled::NotFoundException(crate::state::tagged_resource_not_found(
+                resource_arn,
+            ))
+        }
+        crate::state::ResourceArnWriteError::ServiceOwned(registry) => {
+            UntagResourceErrorModeled::ForbiddenException(
+                crate::state::managed_registry_is_read_only(&registry),
+            )
+        }
+    }
+    .into()
 }
