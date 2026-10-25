@@ -2084,9 +2084,10 @@ pub struct Detector {
     /// This is state rather than a constant because both the refusal and the
     /// report are a lookup: an invitation this store holds is accepted by one and
     /// reported by the other, read through [`Self::received_invitations_in`] and
-    /// projected through [`invitation_view`]. The rest of the operations that
-    /// report or drop one (`GetInvitationsCount`, `DeclineInvitations`,
-    /// `DeleteInvitations`) are scaffolds with issues of their own.
+    /// projected through [`invitation_view`]. `GetInvitationsCount` reports the
+    /// SIZE of that same inbox, through the same reader. The operations that DROP
+    /// one (`DeclineInvitations`, `DeleteInvitations`) are scaffolds with issues of
+    /// their own.
     ///
     /// BOUNDED by [`MAX_INVITATIONS_PER_DETECTOR`], so a future writer cannot
     /// grow it without limit: the key is an account id, which is request-chosen.
