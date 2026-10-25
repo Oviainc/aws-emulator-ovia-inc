@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartColumnStatisticsTaskRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartColumnStatisticsTaskRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartColumnStatisticsTaskRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a column statistics task run for one stored table: the run is recorded in
+//! [`crate::state`] under a freshly minted `ColumnStatisticsTaskRunId`, and that id is
+//! what this answers with. `GetColumnStatisticsTaskRun` then reports the run until it
+//! reaches a terminal `ColumnStatisticsState`.
+//!
+//! The run is recorded in `STARTING`, and the clock owes it its terminal status one span
+//! later ([`crate::state::COLUMN_STATISTICS_TASK_RUN_SETTLES_AFTER`]) — so a caller that
+//! reads the run straight after this call still sees it in flight, and a second start for
+//! the same table while that run is in flight is refused with the operation's modelled
+//! `ColumnStatisticsTaskRunningException`. Because this emulator reads none of the
+//! table's underlying data, the status the clock owes is the modelled failure status
+//! carrying [`crate::state::COLUMN_STATISTICS_TASK_RUN_NOT_EXECUTED_MESSAGE`] rather than
+//! statistics nothing computed.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +173,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartColumnStatisticsTaskRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartColumnStatisticsTaskRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartColumnStatisticsTaskRun"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so an unreachable store is reported
+            // as the operation's own timeout error, the same way `GetCrawler` reports it.
+            return Err(
+                StartColumnStatisticsTaskRunErrorModeled::OperationTimeoutException(
+                    OperationTimeoutException {
+                        message: Some("the Glue Data Catalog store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `DatabaseName`, `TableName` and `Role` are `@required` with `length 1..255`, and
+        // `SampleSize`'s `range 0..100` is refused at the boundary — so reaching here, the
+        // only questions are whether the catalog holds that table and whether a run of it
+        // is already in flight.
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Everything the clock already owed the stored runs is materialised before they
+        // are consulted, so a run the clock has already finished does not count as one in
+        // flight.
+        store.settle_due_column_statistics_task_runs(now);
+
+        let (run_id, run) = {
+            let Some(database) = store.database(&catalog_id, &input.database_name) else {
+                return Err(not_found(crate::state::messages::database_not_found(
+                    &input.database_name,
+                )));
+            };
+            let Some(table) = database
+                .tables
+                .get(&crate::state::fold_name(&input.table_name))
+            else {
+                return Err(not_found(crate::state::messages::table_not_found(
+                    &input.table_name,
+                )));
+            };
+
+            // "An exception thrown when you try to start another job while running a
+            // column stats generation job" (`ColumnStatisticsTaskRunningException`): the
+            // statistics of ONE table are what a run generates, so a run in flight for
+            // this table is what blocks another, and a run for any other table does not.
+            if let Some(running) = store.running_column_statistics_task_run(
+                &catalog_id,
+                &input.database_name,
+                &input.table_name,
+            ) {
+                return Err(
+                    StartColumnStatisticsTaskRunErrorModeled::ColumnStatisticsTaskRunningException(
+                        ColumnStatisticsTaskRunningException {
+                            message: Some(
+                                crate::state::messages::column_statistics_task_already_running(
+                                    &running.database_name,
+                                    &running.table_name,
+                                ),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // The id is minted only once the request is going to be served, so a
+            // refusal above hands out none.
+            let run_id = crate::state::new_column_statistics_task_run_id();
+            // The columns the run covers are the ones the request listed, else every
+            // column the STORED table declares — so the default is read from the
+            // catalog, not echoed from the request. A column the request names that the
+            // table does not declare is recorded as asked for: the service documents no
+            // rule that refuses one, and the run reports the columns it was started for.
+            let run = crate::state::ColumnStatisticsTaskRunEntry::start(
+                &input,
+                table,
+                &catalog_id,
+                run_id.clone(),
+                now,
+            );
+            (run_id, run)
+        };
+
+        store.record_column_statistics_task_run(run);
+        ::tracing::info!(
+            operation = "StartColumnStatisticsTaskRun",
+            database = %input.database_name,
+            table = %input.table_name,
+            run = %run_id,
+            "started a Glue column statistics task run"
+        );
+
+        Ok(StartColumnStatisticsTaskRunOutput {
+            // "The identifier for the column statistics task run."
+            column_statistics_task_run_id: Some(run_id),
+        })
     }
+}
+
+/// This operation's modelled miss: "A specified entity does not exist".
+fn not_found(message: String) -> StartColumnStatisticsTaskRunError {
+    StartColumnStatisticsTaskRunErrorModeled::EntityNotFoundException(EntityNotFoundException {
+        message: Some(message),
+        from_federation_source: None,
+    })
+    .into()
 }
