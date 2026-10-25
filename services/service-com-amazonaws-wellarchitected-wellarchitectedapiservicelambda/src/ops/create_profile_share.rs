@@ -2,7 +2,8 @@
 
 //! @op CreateProfileShare
 //! IMPLEMENTED: grants one principal access to one Well-Architected Tool profile and
-//! persists the share in [`crate::state`], so `ListProfileShares` reads it back. A profile
+//! persists the share in [`crate::state`], so `ListProfileShares` reads it back and
+//! `DeleteProfileShare` revokes it by the `ShareId` this operation answers. A profile
 //! is shared BY its owning account — the caller — so a request whose `SharedWith` names
 //! that same principal is refused with `ValidationException` (400) and records nothing;
 //! the path `ProfileArn` is resolved by lookup (`ResourceNotFoundException`, 404), a
@@ -205,9 +206,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The token names a share that is no longer stored, so there is no original
             // result to return: forget the token and let this request share afresh, which
             // is what the caller asked for — the same fall-through `CreateProfile` makes
-            // for a profile its token no longer resolves to. (Unreachable while
-            // `DeleteProfileShare` is a stub; handled here so the create stays well
-            // defined once it lands.)
+            // for a profile its token no longer resolves to (reachable once
+            // `DeleteProfileShare` has revoked the share the token named).
             store
                 .create_profile_share_tokens
                 .forget(&input.client_request_token);

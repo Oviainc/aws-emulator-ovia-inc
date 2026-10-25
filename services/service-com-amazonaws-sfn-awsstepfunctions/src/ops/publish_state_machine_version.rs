@@ -276,16 +276,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // updated carries no revision ID, which a caller pins with `INITIAL`.
         if let Some(requested) = input.revision_id.as_deref() {
             if !crate::state::revision_matches(revision_id.as_deref(), requested) {
-                let current = revision_id.as_deref().map_or_else(
-                    || crate::state::INITIAL_REVISION_ID.to_string(),
-                    |current| format!("'{current}'"),
-                );
+                // The refusal names the revision the caller asked to publish and then
+                // the one the state machine holds, which is what a caller re-driving
+                // the publish reads out of it — see
+                // [`crate::state::stale_revision_message`].
                 return Err(PublishStateMachineVersionErrorModeled::ConflictException(
                     ConflictException {
-                        message: Some(format!(
-                            "the revision ID of '{}' is {current}, not the specified \
-                             '{requested}'",
-                            input.state_machine_arn
+                        message: Some(crate::state::stale_revision_message(
+                            requested,
+                            revision_id.as_deref(),
                         )),
                     },
                 )

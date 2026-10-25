@@ -18,7 +18,7 @@
 //!   trust leaving `Creating` or `Verifying` (and a deleted one leaving the store), an
 //!   assessment leaving `IN_PROGRESS`, a directory's data access leaving `Enabling`, a
 //!   registered certificate leaving `Registering`, an organization directory share
-//!   leaving `Sharing`).
+//!   leaving `Sharing` (and an unshared one leaving the store)).
 //!   Every handler calls it before reading or writing, so a reporting operation reports
 //!   what the clock already owed and nothing more.
 //! * [`Directory::to_description`], the one place a stored directory is rendered as the
@@ -567,6 +567,16 @@ pub const SHARE_STATUS_SHARING: &str = "Sharing";
 /// The `ShareStatus` a share reaches once it is in service: the `Shared` value of the
 /// modelled `ShareStatus` enum.
 pub const SHARE_STATUS_SHARED: &str = "Shared";
+
+/// The `ShareStatus` a share carries between `UnshareDirectory` and [`TRANSITION_SPAN`]:
+/// the `Deleting` value of the modelled `ShareStatus` enum.
+///
+/// `UnshareDirectory` answers while the shared directory in the consumer account is still
+/// being torn down, so the move out of this status is owed by the clock. There is no
+/// settled status to move to: unsharing takes the consumer's shared directory away, so
+/// once the teardown falls due the share is gone from this service — the same way
+/// [`TrustRecord`] handles [`TRUST_STATE_DELETING`].
+pub const SHARE_STATUS_DELETING: &str = "Deleting";
 
 /// The most consumer accounts one directory can be shared with in this emulator.
 ///
@@ -1531,6 +1541,17 @@ pub fn domain_key(remote_domain_name: &str) -> String {
     remote_domain_name.trim_end_matches('.').to_lowercase()
 }
 
+/// Whether `candidate` is an Amazon Web Services account id: the twelve decimal digits
+/// the modelled `CustomerId` pattern `^(\d{12})$` admits
+/// (`smithy_query(query="shape",shape="SharedDirectory")`), which is what
+/// `SharedDirectory$SharedAccountId` reports a share's consumer account in.
+///
+/// One function, so `ShareDirectory` and `UnshareDirectory` cannot disagree about which
+/// `Id` of an `ACCOUNT` target names a consumer account.
+pub fn is_account_id(candidate: &str) -> bool {
+    candidate.len() == 12 && candidate.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 /// A stored list as an optional modelled list: absent when this emulator holds no
 /// entries for it, so an empty list is never reported as though one had been recorded.
 fn optional_list(values: &[String]) -> Option<Vec<String>> {
@@ -1800,6 +1821,14 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                 share.share_status_due_at = None;
             }
         }
+        // The teardown `UnshareDirectory` owes: a share being deleted has no settled
+        // status to move to, because unsharing takes the consumer account's shared
+        // directory away — so once the teardown falls due the share leaves the store and
+        // the pairing can be shared again.
+        self.shared_directories.retain(|_, share| {
+            share.share_status != SHARE_STATUS_DELETING
+                || share.share_status_due_at.is_some_and(|due| now < due)
+        });
         for assessment in self.assessments.values_mut() {
             let Some(due) = assessment.status_due_at else {
                 continue;
@@ -1889,6 +1918,19 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
         shared_account_id: &str,
     ) -> Option<&SharedDirectoryRecord> {
         self.shared_directories.values().find(|share| {
+            share.owner_directory_id == owner_directory_id
+                && share.shared_account_id == shared_account_id
+        })
+    }
+
+    /// The same share as [`Self::share_of`], for a caller that changes it: what
+    /// `UnshareDirectory` resolves as the one share its call stops.
+    pub fn share_mut(
+        &mut self,
+        owner_directory_id: &str,
+        shared_account_id: &str,
+    ) -> Option<&mut SharedDirectoryRecord> {
+        self.shared_directories.values_mut().find(|share| {
             share.owner_directory_id == owner_directory_id
                 && share.shared_account_id == shared_account_id
         })
@@ -2126,6 +2168,7 @@ modeled_failures!(
     DirectoryDoesNotExistException,
     DirectoryInDesiredStateException,
     DirectoryLimitExceededException,
+    DirectoryNotSharedException,
     DirectoryUnavailableException,
     EntityAlreadyExistsException,
     EntityDoesNotExistException,
@@ -2199,6 +2242,18 @@ fn refusal_restating_its_request_id<E: ModeledFailure>(diagnostic: &str) -> E {
 /// caller has to fix, and nothing else. [`refusal`] appends the request id, once.
 pub fn no_such_directory(directory_id: &str) -> String {
     format!("Directory: '{directory_id}' does not exist.")
+}
+
+/// The `DirectoryNotSharedException` message for a directory that is not shared with the
+/// consumer account the request named.
+///
+/// The error shape's own documentation states the failure ("The specified directory has
+/// not been shared with this Amazon Web Services account."); this says it of the pairing
+/// the call asked about, worded the way this service's lookup family is
+/// ([`no_such_directory`]): the quoted id the request sent, the quoted account it named,
+/// and nothing else. [`refusal`] appends the request id, once.
+pub fn directory_not_shared(directory_id: &str, shared_account_id: &str) -> String {
+    format!("Directory: '{directory_id}' is not shared with account: '{shared_account_id}'.")
 }
 
 /// The `EntityDoesNotExistException` message for a remote domain a directory forwards

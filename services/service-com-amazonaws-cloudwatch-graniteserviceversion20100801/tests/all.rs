@@ -45,6 +45,8 @@ mod log_alarms;
 mod managed_insight_rules;
 #[path = "all/metric_data.rs"]
 mod metric_data;
+#[path = "all/metric_math.rs"]
+mod metric_math;
 #[path = "all/metric_streams.rs"]
 mod metric_streams;
 #[path = "all/metrics_and_alarms.rs"]

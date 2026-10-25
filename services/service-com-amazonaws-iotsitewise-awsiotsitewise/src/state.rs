@@ -35,6 +35,9 @@
 //! execution of an action lives in
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::executions`], keyed by its own
 //! id, which is what `ListExecutions` summarises for the target resource a
+//! request names. An action taken on a target resource lives in
+//! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::actions`], keyed by its own
+//! `actionId`, which is what `ListActions` summarises for the target resource a
 //! request names. The service's own settings live here too:
 //! the logging options, one entry per scope a call named
 //! ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::logging_options`]), and the
@@ -75,8 +78,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    ActionDefinition, AggregatedValue, Aggregates, Alarms, AssetCompositeModelPathSegment,
-    AssetCompositeModelSummary, AssetHierarchy, AssetModelCompositeModel,
+    ActionDefinition, ActionSummary, AggregatedValue, Aggregates, Alarms,
+    AssetCompositeModelPathSegment, AssetCompositeModelSummary, AssetHierarchy,
+    AssetModelCompositeModel,
     AssetModelCompositeModelPathSegment, AssetModelCompositeModelSummary, AssetModelHierarchy,
     AssetModelProperty, AssetModelPropertyDefinition, AssetModelStatus, AssetProperty,
     AssetPropertyValue, AssetStatus, AssetSummary, ComputationModelConfiguration,
@@ -2685,17 +2689,7 @@ impl ExecutionRecord {
     /// `true` when `resource_type` and `resource_id` address THIS execution's
     /// target resource — the pairing `ListExecutions` scopes its listing by.
     pub fn targets(&self, resource_type: &str, resource_id: &str) -> bool {
-        let addressed = match resource_type {
-            TARGET_RESOURCE_TYPE_ASSET => self.target_resource.asset_id.as_deref(),
-            // An execution of a computation model is addressed by that model's
-            // own id, the same way an execution of an asset is addressed by the
-            // asset's.
-            TARGET_RESOURCE_TYPE_COMPUTATION_MODEL => {
-                self.target_resource.computation_model_id.as_deref()
-            }
-            _ => None,
-        };
-        addressed == Some(resource_id)
+        target_resource_addresses(&self.target_resource, resource_type, resource_id)
     }
 
     /// This execution as the summary a listing reports for it, at `now`.
@@ -2715,6 +2709,72 @@ impl ExecutionRecord {
                 state: self.state(now).to_string(),
             },
             execution_entity_version: self.execution_entity_version.clone(),
+        }
+    }
+}
+
+/// `true` when the `(TargetResourceType, ID)` pair a request carries addresses
+/// `target_resource`.
+///
+/// One place, so every listing scoped to a target resource — the executions of
+/// one and the actions taken on one — resolves that pair the same way: a
+/// `TargetResource` names an asset or a computation model, and the pair
+/// addresses it only when the type picks the member the id matches.
+pub fn target_resource_addresses(
+    target_resource: &TargetResource,
+    resource_type: &str,
+    resource_id: &str,
+) -> bool {
+    let addressed = match resource_type {
+        TARGET_RESOURCE_TYPE_ASSET => target_resource.asset_id.as_deref(),
+        // A record of a computation model is addressed by that model's own id,
+        // the same way a record of an asset is addressed by the asset's.
+        TARGET_RESOURCE_TYPE_COMPUTATION_MODEL => target_resource.computation_model_id.as_deref(),
+        _ => None,
+    };
+    addressed == Some(resource_id)
+}
+
+/// One action taken on a target resource: what `ListActions` summarises, keyed
+/// by its own `actionId` in
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::actions`].
+///
+/// An action is a record of a request to act on a resource, so the instant it
+/// ran ([`Self::execution_time`]) is stored rather than derived: it is what
+/// orders the enumeration a listing pages through, and what the read form of a
+/// single action reports.
+#[derive(Debug, Clone)]
+pub struct ActionRecord {
+    /// The id this action is addressed by.
+    pub action_id: String,
+    /// The action definition this action runs.
+    pub action_definition_id: String,
+    /// The resource the action was taken on: an asset or a computation model.
+    pub target_resource: TargetResource,
+    /// The detailed resource this action resolves to, which only an action whose
+    /// target resolves through a data binding carries.
+    pub resolve_to: Option<ResolveTo>,
+    /// When the action ran.
+    pub execution_time: SystemTime,
+}
+
+impl ActionRecord {
+    /// `true` when `resource_type` and `resource_id` address THIS action's
+    /// target resource — the pairing `ListActions` scopes its listing by.
+    pub fn targets(&self, resource_type: &str, resource_id: &str) -> bool {
+        target_resource_addresses(&self.target_resource, resource_type, resource_id)
+    }
+
+    /// This action as the summary a listing reports for it.
+    ///
+    /// Derived here rather than in the handler so every view of one stored
+    /// action reports the same identifiers and references.
+    pub fn summary(&self) -> ActionSummary {
+        ActionSummary {
+            action_id: Some(self.action_id.clone()),
+            action_definition_id: Some(self.action_definition_id.clone()),
+            target_resource: Some(self.target_resource.clone()),
+            resolve_to: self.resolve_to.clone(),
         }
     }
 }
@@ -3386,6 +3446,9 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// Executions of actions by `executionId`, which `ListExecutions`
     /// summarises for the target resource a request names.
     pub executions: HashMap<String, ExecutionRecord>,
+    /// Actions taken on a target resource by `actionId`, which `ListActions`
+    /// summarises for the target resource a request names.
+    pub actions: HashMap<String, ActionRecord>,
     /// The account's default encryption configuration, as the last
     /// `PutDefaultEncryptionConfiguration` left it. `None` is an account nothing
     /// has configured, which reports [`ENCRYPTION_TYPE_SITEWISE_DEFAULT`] without storing

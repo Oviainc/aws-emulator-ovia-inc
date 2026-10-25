@@ -31,6 +31,8 @@ mod list_tags_for_resource;
 mod metric_definitions;
 #[path = "all/metric_destination_summary_members.rs"]
 mod metric_destination_summary_members;
+#[path = "all/metrics_destination_pass_role.rs"]
+mod metrics_destination_pass_role;
 #[path = "all/metrics_destination_removal.rs"]
 mod metrics_destination_removal;
 #[path = "all/metrics_destinations.rs"]

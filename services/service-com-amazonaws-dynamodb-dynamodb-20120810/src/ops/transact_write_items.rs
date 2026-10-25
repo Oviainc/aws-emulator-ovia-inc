@@ -14,7 +14,10 @@
 //! The writes land through the same store write sites `PutItem`, `UpdateItem` and
 //! `DeleteItem` use, so numbers are canonicalized and capacity is accounted the same way
 //! on this path as on the single-item one, and an `Update` applies the same
-//! `UpdateExpression` language ([`crate::state::ParsedUpdate`]).
+//! `UpdateExpression` language ([`crate::state::ParsedUpdate`]). A transaction that
+//! COMMITS publishes one record per change it made on the stream of the table that
+//! change was made to ([`crate::state::publish_item_changes`]); a cancelled one made no
+//! modification, so its tables' streams carry none.
 //!
 //! "Transaction requests cannot include multiple operations on one item" and each entry
 //! carries exactly one action: both are a `ValidationException`, as are an item past the
@@ -541,6 +544,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut ledger = crate::state::WriteLedger::default();
         let mut undo: Vec<(String, crate::state::ItemKey, Option<crate::state::Item>)> = Vec::new();
         let mut refused: Option<Self::Error> = None;
+        // Where the streams of the tables this transaction writes stood before it
+        // started: a transaction that is rolled back below made no modification, so its
+        // queued changes go back with the items.
+        let stream_mark = store.queued_stream_record_count();
         for action in &planned {
             let after = match &action.write {
                 PlannedWrite::Put(item) | PlannedWrite::Update(item) => Some(item.clone()),
@@ -620,6 +627,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     );
                 }
             }
+            // The restoring writes above queued changes of their own, so the queue is
+            // put back where it stood: the streams of these tables carry neither the
+            // cancelled modifications nor their undo.
+            store.rewind_stream_records(stream_mark);
             return Err(refused);
         }
 
@@ -637,6 +648,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             );
         }
+        // Every change the transaction made reaches its table's stream before the
+        // response does, in the order the transaction applied them.
+        crate::state::publish_item_changes(&*self.engine, &mut store, now);
 
         Ok(TransactWriteItemsOutput {
             consumed_capacity: ledger.consumed_capacity(input.return_consumed_capacity.as_deref()),

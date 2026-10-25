@@ -89,7 +89,10 @@ fn error_code(payload: &Value) -> String {
 }
 
 /// The error message, whichever casing the envelope carries it under.
-fn error_message(payload: &Value) -> String {
+///
+/// `pub(crate)` so every suite in this test target reads a refusal's message through one
+/// helper rather than its own copy of the casing fallback.
+pub(crate) fn error_message(payload: &Value) -> String {
     payload
         .get("Message")
         .or_else(|| payload.get("message"))

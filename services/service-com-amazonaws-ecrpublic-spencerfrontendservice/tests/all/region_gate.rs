@@ -6,10 +6,13 @@
 //! its registry and repository surface — repositories, images, layer uploads, tags,
 //! policies and the catalog READS — from whichever of them a caller signed for, so none of
 //! those calls may be refused for its Region. The one Region-scoped call is the write of
-//! the account-global registry catalog data (`PutRegistryCatalogData`), which is accepted
-//! only from `state::API_REGION` and refused from any other Region with the service-common
-//! `UnsupportedCommandException` (HTTP 400) naming the operation — before the record is
-//! touched, so the stored display name is left as the served Region wrote it.
+//! the account-global registry catalog data (`PutRegistryCatalogData`): it is served when
+//! the request reaches this instance as a Region the instance serves as — the Region its
+//! deployment names, or any Region ECR Public publishes an endpoint in when the deployment
+//! names none — and refused for any other Region with the service-common
+//! `UnsupportedCommandException` (HTTP 400) naming the operation and the Region the write
+//! IS served from here, before the record is touched, so the stored display name is left
+//! as the served Region wrote it.
 //!
 //! `UnsupportedCommandException` ("The action isn't supported in this Region", client,
 //! httpError 400) is declared service-wide rather than per operation —
@@ -20,26 +23,40 @@
 //! The tables below span the class each half of the rule generalises over: EVERY
 //! implemented operation (a registry read and write, a repository create, read and delete,
 //! both policy legs, both catalog legs, the tag read, the push, and all three layer-upload
-//! legs) crossed with Regions from several partitions, plus the Region the catalog write is
-//! served from in both letter cases and a request with no credential scope at all.
+//! legs) crossed with Regions from several partitions, every published endpoint Region in
+//! three letter cases, a deployment that names a Region of its own, and a request with no
+//! credential scope at all.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_ecrpublic_spencerfrontendservice::state::API_REGION;
+use service_com_amazonaws_ecrpublic_spencerfrontendservice::state::{
+    serves_region, API_REGION, ENDPOINT_REGIONS,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::repository_image_lifecycle::{call_signed_for, ok, service, ARN_PREFIX};
 
-/// Regions other than the one the registry catalog write is served from, one per shape an
-/// AWS Region name takes (another `us-` Region, Europe, Asia Pacific, and the China and
-/// GovCloud partitions).
-const OTHER_REGIONS: &[&str] = &[
-    "us-west-2",
+/// Regions no ECR Public endpoint is published in, one per shape an AWS Region name takes
+/// (another `us-` Region, Europe, Asia Pacific, and the China and GovCloud partitions).
+const UNSERVED_REGIONS: &[&str] = &[
     "us-east-2",
     "eu-west-1",
     "ap-southeast-2",
     "cn-north-1",
     "us-gov-west-1",
 ];
+
+/// Every published endpoint Region in the three letter cases a Region name can arrive in:
+/// a Region name is case-insensitive, so all of them name the same Region.
+fn served_region_spellings() -> Vec<String> {
+    ENDPOINT_REGIONS
+        .iter()
+        .flat_map(|region| {
+            let mut capitalized = region.to_string();
+            capitalized[..1].make_ascii_uppercase();
+            [region.to_string(), region.to_uppercase(), capitalized]
+        })
+        .collect()
+}
 
 /// The one operation whose Region is part of its contract.
 const REGION_SCOPED_OPERATION: &str = "PutRegistryCatalogData";
@@ -167,10 +184,11 @@ async fn every_operation_but_the_registry_catalog_write_is_served_whatever_regio
     // does not exist is refused by the operation's own checks, which is a DIFFERENT error
     // from the Region one. The Region field is compared without ASCII case, so the served
     // Region in capitals is the same Region.
-    let regions: Vec<&str> = OTHER_REGIONS
+    let spellings = served_region_spellings();
+    let regions: Vec<&str> = UNSERVED_REGIONS
         .iter()
         .copied()
-        .chain([API_REGION, "US-EAST-1", "Us-East-1"])
+        .chain(spellings.iter().map(String::as_str))
         .collect();
     for region in regions {
         for (operation, body) in operations() {
@@ -195,7 +213,7 @@ async fn every_operation_but_the_registry_catalog_write_is_served_whatever_regio
 async fn the_registry_catalog_write_is_refused_outside_the_region_it_is_served_from() {
     let router = service();
 
-    for region in OTHER_REGIONS {
+    for region in UNSERVED_REGIONS {
         refused_for_its_region(
             &router,
             REGION_SCOPED_OPERATION,
@@ -205,8 +223,9 @@ async fn the_registry_catalog_write_is_refused_outside_the_region_it_is_served_f
         .await;
     }
 
-    // The same write from the Region it IS served from, in either letter case, is served.
-    for region in [API_REGION, "US-EAST-1", "Us-East-1"] {
+    // The same write from a Region it IS served from, in any letter case, is served.
+    for region in served_region_spellings() {
+        let region = region.as_str();
         let case = format!("the catalog write signed for {region}");
         let (status, parsed) = call_signed_for(
             &router,
@@ -311,7 +330,7 @@ async fn a_refused_catalog_write_changes_nothing_a_later_read_sees() {
         case,
     )
     .await;
-    for region in OTHER_REGIONS {
+    for region in UNSERVED_REGIONS {
         refused_for_its_region(
             &router,
             REGION_SCOPED_OPERATION,
@@ -343,7 +362,7 @@ async fn a_refused_catalog_write_changes_nothing_a_later_read_sees() {
         case,
     )
     .await;
-    for region in OTHER_REGIONS {
+    for region in UNSERVED_REGIONS {
         let name = format!("made-in-{region}");
         let (status, created) =
             call_signed_for(&router, "CreateRepository", json!({"repositoryName": name}), region)
@@ -373,4 +392,90 @@ async fn a_refused_catalog_write_changes_nothing_a_later_read_sees() {
         names, expected_names,
         "case {case:?}: every repository created from any Region exists, got {names:?}"
     );
+}
+
+#[tokio::test]
+async fn the_write_is_served_as_every_published_region_and_as_the_one_this_deployment_names() {
+    // Which Region an endpoint is reached as is a property of the deployment, so the rule
+    // is stated over (the Region this instance is deployed as, the Region a request reaches
+    // it as) and spans: no deployment Region at all, a deployment Region that is one of the
+    // published ones, and a deployment Region that is not published at all. Each is crossed
+    // with a published Region, the deployment's own Region, a Region neither names, and the
+    // letter cases a Region name can arrive in.
+    //
+    // (case, the Region this instance is deployed as, the Region the request reaches it as,
+    //  whether the Region-scoped write is served)
+    let deployed_elsewhere = "eu-central-1";
+    let mut rows: Vec<(String, Option<&str>, String, bool)> = vec![
+        (
+            "a deployment naming no Region, reached as a Region with no ECR Public endpoint"
+                .to_string(),
+            None,
+            deployed_elsewhere.to_string(),
+            false,
+        ),
+        (
+            "a deployment naming its own Region, reached as that Region".to_string(),
+            Some(deployed_elsewhere),
+            deployed_elsewhere.to_string(),
+            true,
+        ),
+        (
+            "a deployment naming its own Region, reached as that Region in upper case"
+                .to_string(),
+            Some(deployed_elsewhere),
+            deployed_elsewhere.to_uppercase(),
+            true,
+        ),
+        (
+            "a deployment naming its own Region, reached as a third Region".to_string(),
+            Some(deployed_elsewhere),
+            "sa-east-1".to_string(),
+            false,
+        ),
+        (
+            "a deployment naming a published Region, reached as another published one"
+                .to_string(),
+            Some(API_REGION),
+            ENDPOINT_REGIONS[ENDPOINT_REGIONS.len() - 1].to_string(),
+            true,
+        ),
+    ];
+    // Every published endpoint Region, in every letter case, is served whatever the
+    // deployment names — including a deployment that names another Region entirely.
+    for region in served_region_spellings() {
+        for deployed in [None, Some(deployed_elsewhere)] {
+            rows.push((
+                format!("a published Region ({region}), deployed as {deployed:?}"),
+                deployed,
+                region.clone(),
+                true,
+            ));
+        }
+    }
+    // A Region no ECR Public endpoint is published in is refused unless the deployment
+    // itself names it.
+    for region in UNSERVED_REGIONS {
+        rows.push((
+            format!("{region}, which publishes no ECR Public endpoint"),
+            None,
+            region.to_string(),
+            false,
+        ));
+        rows.push((
+            format!("{region}, which is also what this deployment names"),
+            Some(region),
+            region.to_string(),
+            true,
+        ));
+    }
+
+    for (case, deployed, region, served) in rows {
+        let actual = serves_region(deployed, &region);
+        assert_eq!(
+            actual, served,
+            "case {case:?}: deployed as {deployed:?} and reached as {region:?}, expected \
+             served={served}, got {actual}"
+        );
+    }
 }

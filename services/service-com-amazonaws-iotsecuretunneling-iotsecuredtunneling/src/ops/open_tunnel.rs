@@ -9,7 +9,10 @@
 //! A request whose `destinationConfig.services` names more streams than a
 //! tunnel is multiplexed over ([`crate::state::MAX_SERVICES_PER_TUNNEL`]) is
 //! refused with HTTP 400 `ValidationException` before anything is minted,
-//! stored or handed out.
+//! stored or handed out. A request past an exhausted limit — the tunnels this
+//! account holds ([`crate::state::MAX_TUNNELS`]) or the tags one tunnel would
+//! carry ([`crate::state::MAX_TAGS_PER_TUNNEL`]) — is refused with the modelled
+//! `LimitExceededException` (HTTP 403), equally before anything is minted.
 //!
 //! ## Shape of an operation
 //!
@@ -183,11 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.is_at_tunnel_limit() {
             return Err(OpenTunnelErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "Tunnel limit of {} exceeded; close a tunnel with delete set before \
-                         opening another",
-                        crate::state::MAX_TUNNELS
-                    )),
+                    message: Some(crate::state::tunnel_limit_message()),
                 },
             )
             .into());
@@ -216,20 +215,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // entry points agree because both count through
         // `state::merged_tag_count`: refused here as well as in `TagResource`,
         // before anything is stored. The modelled `TagList` length bounds one
-        // request's list; this bounds what one tunnel accumulates.
+        // request's list; this bounds what one tunnel accumulates, and an
+        // exhausted limit is reported with the same modelled
+        // `LimitExceededException` (HTTP 403) as the tunnel count above.
         let tag_count = store.merged_tag_count(&tunnel_arn, input.tags.as_deref().unwrap_or(&[]));
         if tag_count > crate::state::MAX_TAGS_PER_TUNNEL {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "tags carries {tag_count} tags; a tunnel carries at most {}",
-                crate::state::MAX_TAGS_PER_TUNNEL
-            )));
+            return Err(OpenTunnelErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(crate::state::tag_limit_message(tag_count)),
+                },
+            )
+            .into());
         }
+
+        // The instant this tunnel's lifetime runs out. Computed with checked
+        // arithmetic: `SystemTime`'s `+` PANICS on an instant it cannot
+        // represent, and the summand comes from the request, so the sum is
+        // refused rather than taken on an addition that cannot be represented.
+        let Some(expires_at) =
+            now.checked_add(crate::state::max_lifetime(max_lifetime_timeout_minutes))
+        else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::unrepresentable_expiry_message(
+                    "timeoutConfig.maxLifetimeTimeoutMinutes",
+                    max_lifetime_timeout_minutes,
+                ),
+            ));
+        };
 
         // Two independently minted tokens: the source and destination proxies each
         // authenticate with their own.
         let source_access_token = crate::state::mint_access_token();
         let destination_access_token = crate::state::mint_access_token();
-        let expires_at = now + crate::state::max_lifetime(max_lifetime_timeout_minutes);
 
         let creation_seq = store.next_creation_seq();
         let tunnel = crate::state::StoredTunnel {

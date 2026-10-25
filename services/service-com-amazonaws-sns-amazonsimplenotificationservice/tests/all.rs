@@ -32,6 +32,9 @@ mod platform_endpoint_deletion;
 #[path = "all/publish_batch.rs"]
 mod publish_batch;
 
+#[path = "all/put_data_protection_policy.rs"]
+mod put_data_protection_policy;
+
 #[path = "all/refusal_sentences.rs"]
 mod refusal_sentences;
 

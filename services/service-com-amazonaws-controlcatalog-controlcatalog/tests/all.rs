@@ -25,6 +25,8 @@ mod ontology_listing;
 mod published_controls;
 #[path = "all/published_ontology.rs"]
 mod published_ontology;
+#[path = "all/refusal_wording.rs"]
+mod refusal_wording;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/validation_messages.rs"]

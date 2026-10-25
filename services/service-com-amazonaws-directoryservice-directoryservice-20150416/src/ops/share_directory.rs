@@ -189,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // demands. An `Id` that cannot be reported in that member is not a target this
         // service can share with, which is the modelled refusal for exactly that.
         let consumer_account_id = input.share_target.id.clone();
-        if !is_account_id(&consumer_account_id) {
+        if !crate::state::is_account_id(&consumer_account_id) {
             return Err(ShareDirectoryErrorModeled::InvalidTargetException(
                 crate::state::refusal(format!(
                     "ShareTarget.Id '{id}' is not an Amazon Web Services account id; a \
@@ -333,12 +333,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             shared_directory_id: Some(shared_directory_id),
         })
     }
-}
-
-/// Whether `candidate` is an Amazon Web Services account id: the twelve decimal digits
-/// the modelled `CustomerId` pattern `^(\d{12})$` admits
-/// (`smithy_query(query="shape",shape="SharedDirectory")`), which is what
-/// `SharedDirectory$SharedAccountId` reports a share's consumer account in.
-fn is_account_id(candidate: &str) -> bool {
-    candidate.len() == 12 && candidate.bytes().all(|byte| byte.is_ascii_digit())
 }

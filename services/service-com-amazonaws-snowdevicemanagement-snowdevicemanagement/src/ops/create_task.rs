@@ -263,6 +263,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The same bound over every Region at once. The Region a record is
+        // partitioned by is the one the request was signed for, so the per-Region
+        // count above bounds a partition and not what the process holds: a caller
+        // naming a Region it has never used would otherwise get another empty
+        // budget. This one lifts as tasks finish, exactly like the one above.
+        if store.tasks_in_flight() >= crate::state::STORE_IN_FLIGHT_TASK_QUOTA {
+            return Err(CreateTaskErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this emulator already holds the maximum of {} tasks in progress \
+                         across every region",
+                        crate::state::STORE_IN_FLIGHT_TASK_QUOTA
+                    ),
+                },
+            )
+            .into());
+        }
+
         let task_id = store.mint_task_id();
         let task = crate::state::Task {
             task_arn: crate::state::task_arn(&task_id, &region),
@@ -318,8 +336,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store's retention bound, applied where the store grows: this API
         // models no operation that deletes a task, so past the records one Region
         // keeps, the oldest TERMINAL tasks make room for this one. Nothing in flight
-        // is dropped, and nothing is refused.
+        // is dropped, and nothing is refused. The second call applies the same bound
+        // over every Region at once, so the records the process keeps are bounded by
+        // what it holds rather than by how many Regions a caller names.
         store.trim_task_history(&region, crate::state::TASK_HISTORY_LIMIT);
+        store.trim_store_task_history(crate::state::STORE_TASK_HISTORY_LIMIT);
+        // The `clientToken` index is added to by a request too, so it carries the
+        // same kind of bound: an entry whose task the trims above forgot indexes
+        // nothing, and past the bound the entries of the oldest tasks go.
+        store.trim_idempotency(crate::state::IDEMPOTENCY_LIMIT);
 
         Ok(CreateTaskOutput {
             task_id: Some(task_id),

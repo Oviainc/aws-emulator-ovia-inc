@@ -108,11 +108,10 @@ struct Row {
     body: fn(&Fixture) -> Value,
 }
 
-/// Every implemented domain operation. `GetDomains` is not here because it is
-/// still a scaffold stub answering 501 — its own issue owns it. The distribution
-/// operations the same documentation covers are pinned where they live:
-/// `CreateDistribution` and `GetDistributions` in `distribution_cdn.rs`, and the
-/// rest are stubs under their own issues.
+/// Every implemented domain operation. The distribution operations the same
+/// documentation covers are pinned where they live: `CreateDistribution` and
+/// `GetDistributions` in `distribution_cdn.rs`, and the rest are stubs under
+/// their own issues.
 ///
 /// The zone delete comes LAST, so the rows before it still find the fixture zone
 /// in the serving case below.
@@ -126,6 +125,11 @@ const ROWS: &[Row] = &[
         case: "reading a zone",
         operation: "GetDomain",
         body: |fixture| json!({"domainName": fixture.zone}),
+    },
+    Row {
+        case: "listing the zones",
+        operation: "GetDomains",
+        body: |_| json!({}),
     },
     Row {
         case: "adding a recordset entry",
@@ -359,6 +363,22 @@ async fn the_domain_apis_are_served_in_the_domain_region() {
             .as_str()
             .unwrap_or_else(|| panic!("case {case}: expected an entry id, got {entry:?}"))
             .to_string();
+
+        // The listing is served through the same endpoint, and reports the zone
+        // this account holds.
+        let (status, body) = emulator
+            .call_in(region, "GetDomains", json!({}))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: GetDomains must be served, got {status} {body:?}"
+        );
+        assert_eq!(
+            body["domains"][0]["name"].as_str(),
+            Some(zone),
+            "case {case}: expected the created zone to be listed, got {:?}",
+            body["domains"]
+        );
 
         let (status, body) = emulator
             .call_in(

@@ -218,18 +218,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let all: Vec<(String, TokenBalance)> = state
             .ledger(&filter.network)
             .into_iter()
-            .flat_map(|ledger| ledger.holdings.iter())
-            .filter(|(key, _)| key.matches_token(contract.as_deref(), filter.token_id.as_deref()))
-            .filter(|(key, _)| {
+            // The ledger travels with each holding because the unit a balance is quoted
+            // in is published by the token's own contract, which the ledger holds
+            // (`state::NetworkLedger::amount_decimals`).
+            .flat_map(|ledger| {
+                ledger
+                    .holdings
+                    .iter()
+                    .map(move |(key, holding)| (ledger, key, holding))
+            })
+            .filter(|(_, key, _)| {
+                key.matches_token(contract.as_deref(), filter.token_id.as_deref())
+            })
+            .filter(|(_, key, _)| {
                 owner
                     .as_deref()
                     .is_none_or(|wanted| key.owner_address == wanted)
             })
-            .filter_map(|(key, holding)| {
+            .filter_map(|(ledger, key, holding)| {
                 let record = holding.balance_at(None)?;
                 Some((
                     key.resource_id(),
-                    holding.token_balance(&filter.network, key, asked_at, record),
+                    holding.token_balance(ledger, key, asked_at, record),
                 ))
             })
             .collect();

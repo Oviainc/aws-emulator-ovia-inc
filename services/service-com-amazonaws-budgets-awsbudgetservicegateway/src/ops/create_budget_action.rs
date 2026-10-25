@@ -10,9 +10,11 @@
 //! outside the account the action is created in is another
 //! ([`crate::state::validate_execution_role_account`]); a subscriber set past the
 //! documented per-type split is the subscriber limit `CreationLimitExceededException`
-//! names ([`crate::state::subscriber_limit_violation`]); a budget this account does not
-//! hold is a `NotFoundException`. The call is recorded as the action's `CREATE_ACTION`
-//! event, which `DescribeBudgetActionHistories` reports.
+//! names ([`crate::state::subscriber_limit_violation`]); a `ResourceTags` list naming one
+//! key twice is an `InvalidParameterException` again, since "each key must be unique for
+//! the resource" ([`crate::state::duplicate_tag_key_violation`]); a budget this account
+//! does not hold is a `NotFoundException`. The call is recorded as the action's
+//! `CREATE_ACTION` event, which `DescribeBudgetActionHistories` reports.
 //!
 //! Nothing here applies the action's `Definition` to IAM, Organizations or Systems
 //! Manager: that work belongs to other services and no request in this emulator runs
@@ -278,6 +280,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
+
+        // "Each tag consists of a key and a value, and each key must be unique for the
+        // resource" (`ResourceTags`) — the tag set this create ESTABLISHES on the action
+        // is held to the same rule a later `TagResource` is, so a list naming one key
+        // twice states no value for it and is refused
+        // ([`crate::state::duplicate_tag_key_violation`]). Checked before the budget is
+        // looked up, so nothing is persisted by a refused create.
+        let supplied_tags = input.resource_tags.as_deref().unwrap_or_default();
+        if let Some(message) = crate::state::duplicate_tag_key_violation(supplied_tags) {
+            return Err(CreateBudgetActionErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         let now = ::std::time::SystemTime::now();
         let mut store = crate::state::store_at(&state, now);
