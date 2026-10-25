@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddCustomAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddCustomAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddCustomAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! APPENDS schema attributes to a stored user pool. Each requested attribute is stored
+//! under the prefix Amazon Cognito gives it (`custom:` for a custom attribute, `dev:`
+//! for a developer-only one), after the entries the schema already holds, and an entry
+//! the schema already holds is never changed or removed: a request naming one is refused
+//! WHOLE, so the schema only ever grows and only by whole requests. The pool's
+//! `LastModifiedDate` advances, and a later `DescribeUserPool` renders the STORED schema.
+//! `src/state.rs` owns the pool record and the defaults a custom attribute carries; this
+//! file owns this request's own refusals.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +166,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddCustomAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddCustomAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddCustomAttributes"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // Every requested attribute becomes the schema entry `state.rs` derives for a
+        // custom attribute, so an attribute added here and one a create requested are
+        // stored the same way. The whole request is judged BEFORE anything is stored:
+        // the schema is append-only, so a request that would rewrite an entry the pool
+        // already holds stores none of its attributes.
+        let mut additions: ::std::vec::Vec<(String, SchemaAttributeType)> =
+            ::std::vec::Vec::with_capacity(input.custom_attributes.len());
+        for requested in &input.custom_attributes {
+            let Some((stored_name, addition)) = crate::state::custom_schema_attribute(requested)
+            else {
+                return Err(invalid_parameter(
+                    "Invalid attributes given, an attribute must carry a Name".to_string(),
+                ));
+            };
+            // An attribute the pool already declares, or one this same request already
+            // names: either way the name is taken, and a taken name is never rewritten.
+            let taken = pool.schema_attribute(&stored_name).is_some()
+                || additions
+                    .iter()
+                    .any(|(earlier, _)| *earlier == stored_name);
+            if taken {
+                return Err(invalid_parameter(format!(
+                    "Invalid attributes given, {stored_name} already exists in the schema of \
+                     this user pool"
+                )));
+            }
+            additions.push((stored_name, addition));
+        }
+
+        // Amazon Cognito's per-pool quota for custom attributes, which the whole
+        // request has to fit inside: a partly applied request would leave the schema in
+        // a state no single call could have produced.
+        if pool.custom_attribute_count() + additions.len()
+            > crate::state::MAX_CUSTOM_ATTRIBUTES_PER_POOL
+        {
+            return Err(invalid_parameter(format!(
+                "User pool {} holds at most {} custom attributes.",
+                input.user_pool_id,
+                crate::state::MAX_CUSTOM_ATTRIBUTES_PER_POOL
+            )));
+        }
+
+        // Appended in request order, after what the schema already holds, so the stored
+        // schema reads in the order its attributes were added.
+        pool.schema
+            .extend(additions.into_iter().map(|(_, addition)| addition));
+        // The pool changed, so its last-modified instant advances; its creation instant
+        // does not.
+        pool.last_modified_date = now;
+
+        // `AddCustomAttributesResponse` models no members: the grown schema is read back
+        // through `DescribeUserPool`.
+        Ok(AddCustomAttributesOutput {})
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> AddCustomAttributesError {
+    AddCustomAttributesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException`, which reports what about the
+/// request it refuses.
+fn invalid_parameter(message: String) -> AddCustomAttributesError {
+    AddCustomAttributesErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> AddCustomAttributesError {
+    AddCustomAttributesErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }
