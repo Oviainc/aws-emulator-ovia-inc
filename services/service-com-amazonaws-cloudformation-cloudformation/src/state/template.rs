@@ -2172,6 +2172,16 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // (cognito-idp's own Smithy model), which a generated name is already inside —
         // letters, digits and the hyphen are all admitted — but may be longer than.
         COGNITO_USER_POOL_GROUP => rules(128, Characters::AsGenerated),
+        // Elastic Beanstalk `CreateApplication.ApplicationName` (`ApplicationName`) and
+        // `CreateApplicationVersion.VersionLabel` (`VersionLabel`): each
+        // `@length(min: 1, max: 100)` in that service's own Smithy model.
+        ELASTIC_BEANSTALK_APPLICATION | ELASTIC_BEANSTALK_APPLICATION_VERSION => {
+            rules(100, Characters::AsGenerated)
+        }
+        // Elastic Beanstalk `CreateEnvironment.EnvironmentName`: `EnvironmentName`,
+        // `@length(min: 4, max: 40)` (that service's own Smithy model) — the tightest
+        // bound of the three, and one a generated name would otherwise break.
+        ELASTIC_BEANSTALK_ENVIRONMENT => rules(40, Characters::AsGenerated),
         // Amazon MSK `CreateCluster.clusterName` and `CreateClusterV2.clusterName`:
         // `__stringMin1Max64`, `@length(min: 1, max: 64)` (that service's own Smithy
         // model), which a generated name is already inside but may be longer than.
@@ -3727,6 +3737,29 @@ pub const COGNITO_USER_POOL_GROUP: &str = "AWS::Cognito::UserPoolGroup";
 /// An Amazon ECS cluster's resource type (ECS's model: `cloudFormationName: ECS`). This
 /// is the type `super::provisioning` creates in Amazon ECS itself.
 pub const ECS_CLUSTER: &str = "AWS::ECS::Cluster";
+
+/// The three AWS Elastic Beanstalk resource types `super::provisioning` creates in
+/// Elastic Beanstalk itself (that model: `cloudFormationName: ElasticBeanstalk`).
+///
+/// Each deliberately carries NO [`return_values`] arm, so the default applies and the
+/// physical resource id is the resource's NAME — which is what each type's published
+/// return value is ("Ref returns the Elastic Beanstalk application name", "Ref returns
+/// the Elastic Beanstalk environment name", "Ref returns the auto-generated version
+/// label") and what every Elastic Beanstalk operation addresses the resource by. The
+/// environment's one published attribute, `EndpointURL`, is not computed here either: it
+/// is the endpoint Elastic Beanstalk itself answered the create with, which the
+/// provisioner records on the resource.
+///
+/// `AWS::ElasticBeanstalk::ConfigurationTemplate` is NOT among them: this emulator's
+/// `DeleteConfigurationTemplate` is still a stub, so a stack that created one could never
+/// delete it, and the type is left declared-only (which `super::provisioning` documents)
+/// rather than provisioned into a resource no stack deletion could remove.
+pub const ELASTIC_BEANSTALK_APPLICATION: &str = "AWS::ElasticBeanstalk::Application";
+/// See [`ELASTIC_BEANSTALK_APPLICATION`].
+pub const ELASTIC_BEANSTALK_APPLICATION_VERSION: &str =
+    "AWS::ElasticBeanstalk::ApplicationVersion";
+/// See [`ELASTIC_BEANSTALK_APPLICATION`].
+pub const ELASTIC_BEANSTALK_ENVIRONMENT: &str = "AWS::ElasticBeanstalk::Environment";
 
 /// An Amazon ECS task definition's resource type.
 pub const ECS_TASK_DEFINITION: &str = "AWS::ECS::TaskDefinition";

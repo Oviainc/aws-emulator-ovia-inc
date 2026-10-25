@@ -333,11 +333,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ARN, and this service's catalog publishes both, so either form
         // resolves the one published version — the same resolution
         // `CreateConfigurationTemplate` and `CreateEnvironment` make.
-        let stack = crate::state::configuration_platform(
+        let named = crate::state::named_platform_version(
             &region,
             solution_stack_name.as_deref(),
             platform_arn.as_deref(),
         );
+        // The option catalog is the BRANCH's, so it is read off the catalog row
+        // whichever of the branch's published versions was named.
+        let stack = named.as_ref().map(|version| version.stack);
 
         // A platform version the request named OUTRIGHT has to be one this
         // account can read: a version this service publishes, or a custom
@@ -370,8 +373,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the catalog, and a version the catalog does not publish — a custom
         // one — reports only the form it is named by rather than a made-up
         // second name.
-        platform_arn = platform_arn.or_else(|| stack.map(|stack| stack.platform_arn(&region)));
-        solution_stack_name = solution_stack_name.or_else(|| stack.map(|stack| stack.name()));
+        platform_arn =
+            platform_arn.or_else(|| named.as_ref().map(|version| version.platform_arn(&region)));
+        solution_stack_name =
+            solution_stack_name.or_else(|| named.as_ref().map(|version| version.name()));
 
         // "Options: if specified, restricts the descriptions to only the
         // specified options." A request that restricts to nothing restricts
