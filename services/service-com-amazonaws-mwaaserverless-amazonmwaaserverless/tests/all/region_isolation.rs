@@ -142,6 +142,23 @@ struct ReferenceCase {
     operation: &'static str,
     /// `(WorkflowArn, RunId, TaskInstanceId)` -> request body.
     body: fn(&str, &str, &str) -> serde_json::Value,
+    /// What the FOREIGN endpoint must answer: the reference resolves to nothing there,
+    /// and each operation reports that in the vocabulary its own modelled error set
+    /// allows.
+    foreign: ForeignAnswer,
+}
+
+/// How an operation reports a reference its endpoint does not hold.
+#[derive(Debug, Clone, Copy)]
+enum ForeignAnswer {
+    /// The operation declares `ResourceNotFoundException`, so it refuses
+    /// (`smithy_query(query="operation", operation="GetWorkflow")` and its siblings).
+    LookupMiss,
+    /// The operation declares no not-found error — both child-resource listings
+    /// (`smithy_query(query="operation",
+    /// operation="ListWorkflowRuns,ListWorkflowVersions")`) — so it answers 200 with
+    /// this output member empty.
+    EmptyPage(&'static str),
 }
 
 /// Every implemented operation of this service that resolves a workflow by ARN
@@ -154,26 +171,31 @@ fn reference_cases() -> Vec<ReferenceCase> {
             case: "GetWorkflow reads the workflow",
             operation: "GetWorkflow",
             body: |arn, _run, _task| serde_json::json!({"WorkflowArn": arn}),
+            foreign: ForeignAnswer::LookupMiss,
         },
         ReferenceCase {
             case: "ListWorkflowVersions pages over its versions",
             operation: "ListWorkflowVersions",
             body: |arn, _run, _task| serde_json::json!({"WorkflowArn": arn}),
+            foreign: ForeignAnswer::EmptyPage("WorkflowVersions"),
         },
         ReferenceCase {
             case: "ListTagsForResource reads its tags",
             operation: "ListTagsForResource",
             body: |arn, _run, _task| serde_json::json!({"ResourceArn": arn}),
+            foreign: ForeignAnswer::LookupMiss,
         },
         ReferenceCase {
             case: "ListWorkflowRuns pages over its runs",
             operation: "ListWorkflowRuns",
             body: |arn, _run, _task| serde_json::json!({"WorkflowArn": arn}),
+            foreign: ForeignAnswer::EmptyPage("WorkflowRuns"),
         },
         ReferenceCase {
             case: "GetWorkflowRun reads one of its runs",
             operation: "GetWorkflowRun",
             body: |arn, run, _task| serde_json::json!({"WorkflowArn": arn, "RunId": run}),
+            foreign: ForeignAnswer::LookupMiss,
         },
         ReferenceCase {
             case: "GetTaskInstance reads a task instance of one of its runs",
@@ -183,11 +205,13 @@ fn reference_cases() -> Vec<ReferenceCase> {
                 "RunId": run,
                 "TaskInstanceId": task,
             }),
+            foreign: ForeignAnswer::LookupMiss,
         },
         ReferenceCase {
             case: "StartWorkflowRun starts a run under it",
             operation: "StartWorkflowRun",
             body: |arn, _run, _task| serde_json::json!({"WorkflowArn": arn}),
+            foreign: ForeignAnswer::LookupMiss,
         },
         ReferenceCase {
             case: "UpdateWorkflow appends a version to it",
@@ -197,11 +221,13 @@ fn reference_cases() -> Vec<ReferenceCase> {
                 "DefinitionS3Location": {"Bucket": "defs", "ObjectKey": "dags/updated.py"},
                 "RoleArn": role_arn(),
             }),
+            foreign: ForeignAnswer::LookupMiss,
         },
         ReferenceCase {
             case: "DeleteWorkflow tears it down",
             operation: "DeleteWorkflow",
             body: |arn, _run, _task| serde_json::json!({"WorkflowArn": arn}),
+            foreign: ForeignAnswer::LookupMiss,
         },
     ]
 }
@@ -246,23 +272,44 @@ async fn a_workflow_reference_resolves_to_nothing_outside_the_region_that_create
         let (status, refused) = harness
             .call_in(foreign, row.operation, request.clone())
             .await;
-        assert_eq!(
-            status,
-            LOOKUP_MISS_STATUS,
-            "case {:?} signed for {foreign:?}: expected a lookup miss for a {home:?} workflow, \
-             got {status} {refused:?}",
-            row.case
-        );
-        assert!(
-            refused["__type"]
-                .as_str()
-                .is_some_and(|kind| kind.contains("ResourceNotFoundException")),
-            "case {:?} signed for {foreign:?}: expected a ResourceNotFoundException, got {:?}",
-            row.case,
-            refused["__type"]
-        );
+        match row.foreign {
+            ForeignAnswer::LookupMiss => {
+                assert_eq!(
+                    status,
+                    LOOKUP_MISS_STATUS,
+                    "case {:?} signed for {foreign:?}: expected a lookup miss for a {home:?} \
+                     workflow, got {status} {refused:?}",
+                    row.case
+                );
+                assert!(
+                    refused["__type"]
+                        .as_str()
+                        .is_some_and(|kind| kind.contains("ResourceNotFoundException")),
+                    "case {:?} signed for {foreign:?}: expected a ResourceNotFoundException, \
+                     got {:?}",
+                    row.case,
+                    refused["__type"]
+                );
+            }
+            ForeignAnswer::EmptyPage(items) => {
+                assert_eq!(
+                    status, 200,
+                    "case {:?} signed for {foreign:?}: a listing that declares no not-found \
+                     error answers an empty page, got {status} {refused:?}",
+                    row.case
+                );
+                assert_eq!(
+                    refused[items].as_array().map(Vec::len),
+                    Some(0),
+                    "case {:?} signed for {foreign:?}: expected no {items} of a {home:?} \
+                     workflow, got {:?}",
+                    row.case,
+                    refused[items]
+                );
+            }
+        }
 
-        // The refused call changed nothing: the home endpoint still holds the workflow,
+        // The foreign call changed nothing: the home endpoint still holds the workflow,
         // with the one run the setup started.
         let (status, still_there) = harness
             .call_in(home, "GetWorkflow", serde_json::json!({"WorkflowArn": arn}))

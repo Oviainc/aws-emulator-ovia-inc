@@ -1,15 +1,50 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeParameters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeParameters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! List the metadata of the parameters an account and Region hold — the metadata read of
+//! Parameter Store. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeParameters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The answer is computed from the parameters `PutParameter` persisted (see
+//! [`crate::state`]): every parameter of the Region this request was signed for, in
+//! ascending name order, each reported at its newest version. The store is keyed by
+//! Region and name, so which principal of the account signed the request selects
+//! nothing: a parameter one identity wrote is described for every other identity in the
+//! account. Nothing here mutates the store — a read must not change what a later caller
+//! sees.
+//!
+//! ## Filters
+//!
+//! `ParameterFilters` accepts the keys this operation publishes — `Name`, `Type`,
+//! `KeyId`, `Path`, `Tier`, `DataType` and `tag:<key>`
+//! ([`crate::state::DESCRIBE_PARAMETERS_FILTER_KEYS`]) — and refuses `Label`, the one key
+//! the modelled pattern allows that this operation's `Key` doc excludes, with
+//! `InvalidFilterKey`. An option outside `Equals` / `BeginsWith` (plus `Contains` for
+//! `Name`, and `Recursive` / `OneLevel` for `Path`) is `InvalidFilterOption`, and a
+//! filter carrying no value, a `Path` value that names no hierarchy, or an equality no
+//! value of a modelled enum can satisfy, is `InvalidFilterValue`. The deprecated
+//! `Filters` member is the same comparison under the key it names
+//! ([`crate::state::LEGACY_PARAMETERS_FILTER_KEYS`]), and a request carrying both is
+//! served the parameters satisfying all of them — at most
+//! [`crate::state::MAX_DESCRIBE_PARAMETERS_FILTERS`] of them between the two members.
+//! That last bound is this emulator's own, not the model's: neither filter list carries
+//! a modelled length, and every filter in one is compared against every parameter the
+//! Region holds, so a longer list is refused with a validation error naming the
+//! constraint rather than walked.
+//!
+//! ## `Shared`
+//!
+//! `Shared` "lists parameters that are shared with you", which a parameter becomes
+//! through a resource share — and `PutResourcePolicy`, the operation that shares one, is
+//! still a scaffold, so nothing in the store is shared with this account and the shared
+//! listing reports the nothing it holds.
+//!
+//! ## Paging
+//!
+//! As for `GetParametersByPath`: the token this operation hands out is the `Name` of the
+//! parameter the next page starts at, so a resume is a position in the store's own total
+//! order rather than an offset into a list that may have changed between two pages. A
+//! token that is not shaped like a parameter name was not issued here: that is the
+//! modelled `InvalidNextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +208,202 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeParameters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeParametersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeParameters"))
+        use crate::state::{
+            canonical_name, describe_filter_enum_values, describe_parameter_matches,
+            describe_parameters_default_filter_option, describe_parameters_filter_options,
+            describe_parameters_page_size, is_describe_parameters_filter_key, name_rejection,
+            parameter_path, request_region, FILTER_KEY_PATH, FILTER_OPTION_EQUALS,
+            INVALID_NEXT_TOKEN, LEGACY_PARAMETERS_FILTER_KEYS, MAX_DESCRIBE_PARAMETERS_FILTERS,
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeParametersErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // One filter as the walk below applies it: the attribute it names, the
+        // comparison it asks for, and the values it searches for. The deprecated
+        // `Filters` member and `ParameterFilters` are two spellings of that same triple,
+        // so a request carrying both is served the parameters satisfying all of them.
+        let mut filters: Vec<(&str, &str, &[String])> = Vec::new();
+
+        // "This data type is deprecated. Instead, use `ParameterStringFilter`": the
+        // legacy filter carries no option, so it compares whole values. Its `Key` is a
+        // modelled enum and its `Values` a required 1..50 list, so the boundary walk has
+        // already refused anything outside those — these two arms are backstops.
+        for filter in input.filters.as_deref().unwrap_or_default() {
+            if !LEGACY_PARAMETERS_FILTER_KEYS.contains(&filter.key.as_str()) {
+                // The shape declares no members, so the refusal carries no message.
+                return Err(
+                    DescribeParametersErrorModeled::InvalidFilterKey(InvalidFilterKey {}).into(),
+                );
+            }
+            if filter.values.is_empty() {
+                return Err(invalid_filter_value(format!(
+                    "Filter key '{}' carries no value to search for",
+                    filter.key
+                )));
+            }
+            filters.push((
+                filter.key.as_str(),
+                FILTER_OPTION_EQUALS,
+                filter.values.as_slice(),
+            ));
+        }
+
+        for filter in input.parameter_filters.as_deref().unwrap_or_default() {
+            if !is_describe_parameters_filter_key(&filter.key) {
+                return Err(
+                    DescribeParametersErrorModeled::InvalidFilterKey(InvalidFilterKey {}).into(),
+                );
+            }
+            let option = filter
+                .option
+                .as_deref()
+                .unwrap_or_else(|| describe_parameters_default_filter_option(&filter.key));
+            let allowed = describe_parameters_filter_options(&filter.key);
+            if !allowed.contains(&option) {
+                return Err(DescribeParametersErrorModeled::InvalidFilterOption(
+                    InvalidFilterOption {
+                        message: Some(format!(
+                            "Option '{option}' at filter key '{}' isn't valid: valid options are {}",
+                            filter.key,
+                            allowed.join(" and ")
+                        )),
+                    },
+                )
+                .into());
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.is_empty() {
+                return Err(invalid_filter_value(format!(
+                    "Filter key '{}' carries no value to search for",
+                    filter.key
+                )));
+            }
+            filters.push((&filter.key, option, values));
+        }
+
+        // Every filter is compared against every parameter of the Region, so the work one
+        // request asks for grows with the number of filters it carries times the number
+        // of parameters the Region holds. The second factor is bounded by the store's own
+        // per-Region quota (`crate::state::MAX_PARAMETERS_PER_REGION`) and the values one
+        // filter carries by the modelled list length (1..50); the number of filters
+        // carries no modelled length, so it is bounded here, before the walk.
+        if filters.len() > MAX_DESCRIBE_PARAMETERS_FILTERS {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Value '{}' at 'parameterFilters' failed to satisfy constraint: a describe \
+                 carries at most {MAX_DESCRIBE_PARAMETERS_FILTERS} filters across 'filters' and \
+                 'parameterFilters'",
+                filters.len()
+            )));
+        }
+
+        for (key, option, values) in &filters {
+            // An attribute whose modelled target is an enum can hold only a value of
+            // that enum, so an equality on anything else asks for an attribute value no
+            // parameter can carry. A prefix is not a value, so a prefix comparison is
+            // not checked against the enum.
+            if *option == FILTER_OPTION_EQUALS {
+                if let Some(allowed) = describe_filter_enum_values(key) {
+                    if let Some(unknown) = values
+                        .iter()
+                        .find(|value| !allowed.contains(&value.as_str()))
+                    {
+                        return Err(invalid_filter_value(format!(
+                            "Value '{unknown}' at filter key '{key}' isn't a parameter {key}: \
+                             valid values are {}",
+                            allowed.join(", ")
+                        )));
+                    }
+                }
+            }
+            // A `Path` filter value names a hierarchy, which carries the parameter-name
+            // rules: trimmed, no spaces between characters, and a leading forward slash.
+            if *key == FILTER_KEY_PATH {
+                if let Some(why) = values.iter().find_map(|value| parameter_path(value).err()) {
+                    return Err(invalid_filter_value(why));
+                }
+            }
+        }
+
+        let page_size = describe_parameters_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // The token is the name of the parameter the next page starts at, so a token
+        // that is not a parameter name at all was not issued here.
+        let resume_from = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) if name_rejection(token).is_none() => Some(canonical_name(token)),
+            Some(_) => {
+                return Err(DescribeParametersErrorModeled::InvalidNextToken(
+                    InvalidNextToken {
+                        message: Some(INVALID_NEXT_TOKEN.to_string()),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // Parameter Store is regional, and a parameter is reached through the endpoint it
+        // was created against, which is the Region this request was signed for. The store
+        // is keyed by that Region and the parameter's name — never by the credential the
+        // put was signed with — so this listing reports what any principal of the account
+        // wrote, and yields it in ascending canonical-name order, which is what makes the
+        // resume cursor total.
+        let region = request_region(ctx.parts());
+        let store = state.lock();
+        let mut parameters = Vec::new();
+        let mut next_token = None;
+        // `Shared` asks for "parameters that are shared with you", which a parameter
+        // becomes through a resource share rather than by being created here.
+        // `PutResourcePolicy` — the operation that shares one — is still a scaffold, so
+        // no parameter in this store is shared with anybody, and a shared listing walks
+        // none of the account's own parameters.
+        if !input.shared.unwrap_or(false) {
+            for (name, record) in store.parameters_of_region(&region) {
+                if resume_from.is_some_and(|from| name < from) {
+                    continue;
+                }
+                // A metadata listing names no `name:selector`, so each parameter is
+                // reported at its newest version, as a read with no selector is.
+                let Some(version) = record.latest() else {
+                    continue;
+                };
+                if !filters.iter().all(|(key, option, values)| {
+                    describe_parameter_matches(record, version, key, option, values)
+                }) {
+                    continue;
+                }
+                if parameters.len() == page_size {
+                    // The page is full and a parameter is still waiting: hand the caller
+                    // the name it resumes at, so the next request continues where this
+                    // stopped.
+                    next_token = Some(record.name.clone());
+                    break;
+                }
+                parameters.push(version.to_parameter_metadata(record));
+            }
+        }
+
+        Ok(DescribeParametersOutput {
+            parameters: Some(parameters),
+            next_token,
+        })
     }
+}
+
+/// The modelled refusal for a filter value this operation cannot search on: "The filter
+/// value isn't valid. Verify the value and try again".
+fn invalid_filter_value(message: String) -> DescribeParametersError {
+    DescribeParametersErrorModeled::InvalidFilterValue(InvalidFilterValue {
+        message: Some(message),
+    })
+    .into()
 }

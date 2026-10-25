@@ -280,45 +280,175 @@ impl ConverseRow {
     }
 }
 
-/// One `InvokeModel` request, per response family.
+/// One `InvokeModel` request, per response family, with where that family's
+/// response envelope reports the turn.
 struct InvokeRow {
     case: &'static str,
     model_id: &'static str,
     body: &'static str,
+    /// The event name of every chunk the stream must carry, in order, for a
+    /// family whose streaming protocol NAMES its events (see [`event_name`]);
+    /// empty for a family whose chunks are a flat envelope and name none.
+    events: &'static [&'static str],
+    /// Where the unary `InvokeModel` body reports the generated text, the stop
+    /// reason and the two token counts — JSON pointers into that family's own
+    /// response envelope.
+    text_pointer: &'static str,
+    stop_pointer: &'static str,
+    input_tokens_pointer: &'static str,
+    output_tokens_pointer: &'static str,
 }
 
-/// Model ids from "Amazon Bedrock base model IDs (on-demand throughput)" and the
-/// request envelopes from "Inference request parameters and response fields for
-/// foundation models", both in the Amazon Bedrock User Guide. The last row is a
-/// model the Converse API does NOT serve, so response streaming must still serve
-/// it.
+/// Model ids from "Amazon Bedrock base model IDs (on-demand throughput)", the
+/// request and response envelopes from "Inference request parameters and response
+/// fields for foundation models" and each family's streaming event sequence from
+/// that same page, all in the Amazon Bedrock User Guide. One row per response
+/// family the registry serves; the last row is a model the Converse API does NOT
+/// serve, so response streaming must still serve it.
 const INVOKE_ROWS: &[InvokeRow] = &[
     InvokeRow {
         case: "anthropic messages",
         model_id: "anthropic.claude-3-haiku-20240307-v1:0",
         body: r#"{"anthropic_version":"bedrock-2023-05-31","max_tokens":256,"messages":[{"role":"user","content":[{"type":"text","text":"Name one planet."}]}]}"#,
+        events: &[
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ],
+        text_pointer: "/content/0/text",
+        stop_pointer: "/stop_reason",
+        input_tokens_pointer: "/usage/input_tokens",
+        output_tokens_pointer: "/usage/output_tokens",
     },
     InvokeRow {
         case: "titan text",
         model_id: "amazon.titan-text-premier-v1:0",
         body: r#"{"inputText":"Write a haiku about persistent state.","textGenerationConfig":{"maxTokenCount":512}}"#,
+        // Titan's chunks are one flat envelope whose terminal one fills in the
+        // completion reason and the output token count.
+        events: &[],
+        text_pointer: "/results/0/outputText",
+        stop_pointer: "/results/0/completionReason",
+        input_tokens_pointer: "/inputTextTokenCount",
+        output_tokens_pointer: "/results/0/tokenCount",
     },
     InvokeRow {
         case: "nova",
         model_id: "amazon.nova-lite-v1:0",
         body: r#"{"system":[{"text":"You are terse."}],"messages":[{"role":"user","content":[{"text":"Name two planets."}]}]}"#,
+        events: &[
+            "messageStart",
+            "contentBlockDelta",
+            "contentBlockStop",
+            "messageStop",
+            "metadata",
+        ],
+        text_pointer: "/output/message/content/0/text",
+        stop_pointer: "/stopReason",
+        input_tokens_pointer: "/usage/inputTokens",
+        output_tokens_pointer: "/usage/outputTokens",
     },
     InvokeRow {
         case: "llama, generation capped at three tokens",
         model_id: "meta.llama3-70b-instruct-v1:0",
         body: r#"{"prompt":"Explain idempotency to a cat.","max_gen_len":3}"#,
+        events: &[],
+        text_pointer: "/generation",
+        stop_pointer: "/stop_reason",
+        input_tokens_pointer: "/prompt_token_count",
+        output_tokens_pointer: "/generation_token_count",
+    },
+    InvokeRow {
+        case: "mistral",
+        model_id: "mistral.mixtral-8x7b-instruct-v0:1",
+        body: r#"{"prompt":"List two idempotent verbs.","max_tokens":128}"#,
+        events: &[],
+        text_pointer: "/outputs/0/text",
+        stop_pointer: "/outputs/0/stop_reason",
+        input_tokens_pointer: "",
+        output_tokens_pointer: "",
     },
     InvokeRow {
         case: "cohere command, which Converse does not serve",
         model_id: "cohere.command-text-v14",
         body: r#"{"prompt":"Describe a page token.","max_tokens":64}"#,
+        events: &["text-generation", "stream-end"],
+        text_pointer: "/generations/0/text",
+        stop_pointer: "/generations/0/finish_reason",
+        input_tokens_pointer: "",
+        output_tokens_pointer: "",
     },
 ];
+
+/// The key Amazon Bedrock itself adds to the terminal chunk of a response stream.
+const INVOCATION_METRICS: &str = "amazon-bedrock-invocationMetrics";
+
+/// The name a streaming client reads a chunk's event identity from.
+///
+/// The Anthropic Messages API carries it in the payload's `type` member and the
+/// Cohere stream in `event_type`; the Converse-shaped Amazon Nova events are each
+/// a single named key. A family whose chunks are a flat envelope (Amazon Titan,
+/// Meta Llama, Mistral) names no event, which is `None`.
+fn event_name(payload: &Value) -> Option<String> {
+    for member in ["type", "event_type"] {
+        if let Some(name) = payload.get(member).and_then(Value::as_str) {
+            return Some(name.to_string());
+        }
+    }
+    let keys: Vec<&String> = payload
+        .as_object()
+        .map(|object| {
+            object
+                .keys()
+                .filter(|key| key.as_str() != INVOCATION_METRICS)
+                .collect()
+        })
+        .unwrap_or_default();
+    match keys.as_slice() {
+        [only] => Some((*only).clone()),
+        _ => None,
+    }
+}
+
+/// The `chunk` payloads of a response-stream body: every frame is a `chunk`, and
+/// `PayloadPart$bytes` is a blob, so restJson1 renders it base64.
+fn chunk_payloads(case: &str, body: &[u8]) -> Vec<Value> {
+    let frames = decode_frames(case, body);
+    let order: Vec<&str> = frames.iter().map(|(name, _)| name.as_str()).collect();
+    assert!(
+        order.iter().all(|name| *name == "chunk"),
+        "case {case:?}: a response stream carries only chunk events, got {order:?}"
+    );
+    frames
+        .iter()
+        .map(|(_, frame)| {
+            let encoded = frame["bytes"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: a chunk carried no bytes: {frame}"));
+            let decoded = aws_smithy_types::base64::decode(encoded)
+                .unwrap_or_else(|error| panic!("case {case:?}: chunk bytes must be base64: {error}"));
+            serde_json::from_slice(&decoded).unwrap_or_else(|error| {
+                panic!(
+                    "case {case:?}: a chunk payload must be JSON: {error} ({})",
+                    String::from_utf8_lossy(&decoded)
+                )
+            })
+        })
+        .collect()
+}
+
+/// Whether `payload` mentions `needle` as a string value anywhere inside it.
+fn mentions(payload: &Value, needle: &str) -> bool {
+    match payload {
+        Value::String(value) => value == needle,
+        Value::Array(items) => items.iter().any(|item| mentions(item, needle)),
+        Value::Object(members) => members.values().any(|member| mentions(member, needle)),
+        _ => false,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ConverseStream
@@ -557,11 +687,15 @@ async fn converse_stream_refuses_a_bad_request_with_the_modelled_error() {
 // ---------------------------------------------------------------------------
 
 /// RULE: `InvokeModelWithResponseStream` serves the same inference `InvokeModel`
-/// serves and returns the model's response payload as `ResponseStream` `chunk`
-/// events in a `application/vnd.amazon.eventstream` body, reporting the payload's
-/// MIME type in the required `X-Amzn-Bedrock-Content-Type` response header.
+/// serves, but delivers it as a SEQUENCE of `ResponseStream` `chunk` events, each
+/// carrying one incremental event of the invoked model family's own streaming
+/// protocol — the generated content arriving before a terminal event that reports
+/// the stop reason — with the service's `amazon-bedrock-invocationMetrics`
+/// accounting on the terminal chunk exactly once, and never the unary
+/// `InvokeModel` response body as a chunk payload. The payload's MIME type is
+/// reported in the required `X-Amzn-Bedrock-Content-Type` response header.
 #[tokio::test]
-async fn response_stream_chunks_the_payload_invoke_model_returns() {
+async fn response_stream_delivers_the_turn_as_the_model_families_streaming_events() {
     let router = emulator();
 
     for row in INVOKE_ROWS {
@@ -581,7 +715,18 @@ async fn response_stream_chunks_the_payload_invoke_model_returns() {
             invoke.status,
             String::from_utf8_lossy(&invoke.body)
         );
-        let expected: Value = invoke.json();
+        let unary: Value = invoke.json();
+        let at = |pointer: &str| {
+            unary
+                .pointer(pointer)
+                .cloned()
+                .unwrap_or_else(|| panic!("case {case:?}: InvokeModel answered no {pointer}: {unary}"))
+        };
+        let expected_text = at(row.text_pointer)
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let expected_stop = at(row.stop_pointer).as_str().unwrap_or_default().to_string();
 
         let stream = send(
             &router,
@@ -618,31 +763,229 @@ async fn response_stream_chunks_the_payload_invoke_model_returns() {
             stream.header("x-amzn-bedrock-performanceconfig-latency")
         );
 
-        let frames = decode_frames(case, &stream.body);
-        let order: Vec<&str> = frames.iter().map(|(name, _)| name.as_str()).collect();
-        assert_eq!(
-            order,
-            vec!["chunk"],
-            "case {case:?}: the response stream carries chunk events, got {order:?}"
+        let chunks = chunk_payloads(case, &stream.body);
+        assert!(
+            chunks.len() >= 2,
+            "case {case:?}: an incremental stream carries the content and a terminal event \
+             in separate chunks, got {chunks:?}"
         );
 
-        // `PayloadPart$bytes` is a blob, so restJson1 renders it base64.
-        let encoded = frames[0].1["bytes"]
-            .as_str()
-            .unwrap_or_else(|| panic!("case {case:?}: the chunk carried no bytes: {}", frames[0].1));
-        let decoded = aws_smithy_types::base64::decode(encoded)
-            .unwrap_or_else(|error| panic!("case {case:?}: chunk bytes must be base64: {error}"));
-        let streamed: Value = serde_json::from_slice(&decoded).unwrap_or_else(|error| {
-            panic!(
-                "case {case:?}: the chunk payload must be the model's JSON response: {error} \
-                 ({})",
-                String::from_utf8_lossy(&decoded)
-            )
-        });
+        // The defect this rule replaces: the unary response body, delivered as a
+        // chunk payload, is never an event of a model's streaming protocol.
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert_ne!(
+                chunk, &unary,
+                "case {case:?}: chunk {index} carries the unary InvokeModel body instead of a \
+                 streaming event"
+            );
+        }
+
+        // Where the family's streaming protocol names its events, the stream
+        // carries exactly those, in order.
+        if !row.events.is_empty() {
+            let names: Vec<String> = chunks
+                .iter()
+                .map(|chunk| {
+                    event_name(chunk).unwrap_or_else(|| {
+                        panic!("case {case:?}: a chunk named no event: {chunk}")
+                    })
+                })
+                .collect();
+            assert_eq!(
+                names,
+                row.events.to_vec(),
+                "case {case:?}: expected the event sequence {:?}, got {names:?}",
+                row.events
+            );
+        }
+
+        // The generated content arrives before the terminal event, and the stop
+        // reason closes the turn once — the same text and stop reason the unary
+        // operation reports for this request.
+        let terminal = chunks.len() - 1;
+        let content_chunk = chunks
+            .iter()
+            .position(|chunk| mentions(chunk, &expected_text))
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: no chunk carries the text InvokeModel answers \
+                     ({expected_text:?}): {chunks:?}"
+                )
+            });
+        assert!(
+            content_chunk < terminal,
+            "case {case:?}: the generated content must arrive before the terminal chunk, \
+             got it at {content_chunk} of {terminal}"
+        );
+        let closing: Vec<usize> = chunks
+            .iter()
+            .enumerate()
+            .filter(|(_, chunk)| mentions(chunk, &expected_stop))
+            .map(|(index, _)| index)
+            .collect();
         assert_eq!(
-            streamed, expected,
-            "case {case:?}: the chunks must carry the payload InvokeModel returns ({expected}), \
-             got {streamed}"
+            closing.len(),
+            1,
+            "case {case:?}: the stop reason {expected_stop:?} closes the stream exactly once, \
+             got it on chunks {closing:?}"
+        );
+        assert!(
+            closing[0] > 0,
+            "case {case:?}: the stream must not open with the turn already stopped, got the \
+             stop reason on chunk {}",
+            closing[0]
+        );
+
+        // The service's own accounting: once, on the terminal chunk, reporting
+        // the counts the unary operation reports for the same request.
+        let carrying: Vec<usize> = chunks
+            .iter()
+            .enumerate()
+            .filter(|(_, chunk)| chunk.get(INVOCATION_METRICS).is_some())
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            carrying,
+            vec![terminal],
+            "case {case:?}: {INVOCATION_METRICS} belongs on the terminal chunk exactly once, \
+             got it on chunks {carrying:?}"
+        );
+        let metrics = chunks[terminal][INVOCATION_METRICS].clone();
+        for (field, pointer) in [
+            ("inputTokenCount", row.input_tokens_pointer),
+            ("outputTokenCount", row.output_tokens_pointer),
+        ] {
+            let counted = metrics[field].as_u64();
+            assert!(
+                counted.is_some_and(|count| count > 0),
+                "case {case:?}: {field} must report the tokens counted, got {metrics}"
+            );
+            // Only a family whose own envelope reports the count can be checked
+            // against it; Mistral's and Cohere's report none.
+            if !pointer.is_empty() {
+                assert_eq!(
+                    counted,
+                    at(pointer).as_u64(),
+                    "case {case:?}: {field} must match the {pointer} InvokeModel reports ({}), \
+                     got {metrics}",
+                    at(pointer)
+                );
+            }
+        }
+        for field in ["invocationLatency", "firstByteLatency"] {
+            assert!(
+                metrics[field].as_i64().is_some_and(|millis| millis >= 0),
+                "case {case:?}: {field} must report the latency measured, got {metrics}"
+            );
+        }
+        assert!(
+            metrics["firstByteLatency"].as_i64() <= metrics["invocationLatency"].as_i64(),
+            "case {case:?}: the first byte cannot be later than the whole invocation, got \
+             {metrics}"
+        );
+    }
+}
+
+/// RULE: for a model whose body is the Converse-shaped Amazon Nova one, the chunk
+/// sequence is that message protocol's own — it opens with `messageStart`, closes
+/// each content block with `contentBlockStop`, and ends the turn with exactly one
+/// `messageStop`, after which no `contentBlockDelta` follows.
+#[tokio::test]
+async fn a_nova_response_stream_opens_with_message_start_and_closes_with_message_stop() {
+    let router = emulator();
+
+    // (case, modelId, body) — every Nova text model the registry serves, over the
+    // request shapes the body schema allows: with and without a system prompt,
+    // with and without a generation cap, and a non-ascii prompt.
+    let rows = vec![
+        (
+            "nova micro, bare conversation",
+            "amazon.nova-micro-v1:0",
+            json!({"messages": [{"role": "user", "content": [{"text": "Reply with one word."}]}]}),
+        ),
+        (
+            "nova lite, with a system prompt and a cap",
+            "amazon.nova-lite-v1:0",
+            json!({
+                "system": [{"text": "You are terse."}],
+                "messages": [{"role": "user", "content": [{"text": "Name two planets."}]}],
+                "inferenceConfig": {"max_new_tokens": 20},
+            }),
+        ),
+        (
+            "nova pro, a cap of one token",
+            "amazon.nova-pro-v1:0",
+            json!({
+                "messages": [{"role": "user", "content": [{"text": "Explain idempotency."}]}],
+                "inferenceConfig": {"max_new_tokens": 1},
+            }),
+        ),
+        (
+            "nova premier, several turns and non-ascii content",
+            "amazon.nova-premier-v1:0",
+            json!({"messages": [
+                {"role": "user", "content": [{"text": "Übersetze: 木星 ist groß."}]},
+                {"role": "assistant", "content": [{"text": "Jupiter is large."}]},
+                {"role": "user", "content": [{"text": "Und der Mond?"}]},
+            ]}),
+        ),
+    ];
+
+    for (case, model_id, body) in rows {
+        let stream = send(
+            &router,
+            "POST",
+            &format!("/model/{model_id}/invoke-with-response-stream"),
+            &[("content-type", "application/json")],
+            serde_json::to_vec(&body).expect("a serializable test body"),
+        )
+        .await;
+        assert_eq!(
+            stream.status,
+            200,
+            "case {case:?}: expected 200, got {} / {}",
+            stream.status,
+            String::from_utf8_lossy(&stream.body)
+        );
+
+        let chunks = chunk_payloads(case, &stream.body);
+        let events: Vec<String> = chunks
+            .iter()
+            .map(|chunk| {
+                event_name(chunk)
+                    .unwrap_or_else(|| panic!("case {case:?}: a chunk named no event: {chunk}"))
+            })
+            .collect();
+
+        assert_eq!(
+            events.first().map(String::as_str),
+            Some("messageStart"),
+            "case {case:?}: the stream must open with messageStart, got {events:?}"
+        );
+        let stops = events.iter().filter(|name| *name == "messageStop").count();
+        assert_eq!(
+            stops, 1,
+            "case {case:?}: exactly one messageStop closes the turn, got {events:?}"
+        );
+        let stop_at = events
+            .iter()
+            .position(|name| name == "messageStop")
+            .expect("a messageStop, just counted");
+        assert!(
+            !events[stop_at..].iter().any(|name| name == "contentBlockDelta"),
+            "case {case:?}: no contentBlockDelta may follow messageStop, got {events:?}"
+        );
+        let last_block = events
+            .iter()
+            .rposition(|name| name.starts_with("contentBlock"))
+            .unwrap_or_else(|| panic!("case {case:?}: no content-block event at all: {events:?}"));
+        assert_eq!(
+            events[last_block], "contentBlockStop",
+            "case {case:?}: the last content-block event closes the block, got {events:?}"
+        );
+        assert!(
+            last_block < stop_at,
+            "case {case:?}: the content blocks close before the message stops, got {events:?}"
         );
     }
 }

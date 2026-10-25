@@ -19,6 +19,8 @@ mod error_message_rendering;
 mod export_task_cancellation;
 #[path = "all/export_task_lifecycle.rs"]
 mod export_task_lifecycle;
+#[path = "all/export_task_listing.rs"]
+mod export_task_listing;
 #[path = "all/graph_deletion.rs"]
 mod graph_deletion;
 #[path = "all/graph_lifecycle.rs"]

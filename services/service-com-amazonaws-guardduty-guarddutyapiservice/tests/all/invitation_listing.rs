@@ -603,7 +603,7 @@ async fn list_invitations(router: &Router, region: &str, query: &str) -> (u16, V
 }
 
 /// The `Invitations` of one page, failing the test if the list did not succeed.
-async fn page_invitations(
+pub(crate) async fn page_invitations(
     router: &Router,
     region: &str,
     query: &str,
@@ -676,7 +676,7 @@ async fn walk_pages(
 
 /// Create an enabled detector through `region`'s endpoint and return its id — the
 /// inbox the seeds are written into hangs off it.
-async fn enabled_detector_in(router: &Router, region: &str) -> String {
+pub(crate) async fn enabled_detector_in(router: &Router, region: &str) -> String {
     let (status, body) = call_in(
         router,
         region,

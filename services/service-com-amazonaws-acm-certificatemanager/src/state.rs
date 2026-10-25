@@ -34,8 +34,8 @@
 //! exactly as a freshly created endpoint is `CREATING`.
 //!
 //! Every URL those two records carry is minted here, on the Region's ACME enrollment
-//! host ([`ACME_ENROLLMENT_HOST_LABEL`]) with the endpoint's own id in the path
-//! ([`acme_endpoint_url`], [`acme_account_url`]) — and read back by
+//! host ([`ACME_ENROLLMENT_HOST_LABEL`]) with the endpoint's own id as the first path
+//! segment ([`acme_endpoint_url`], [`acme_account_url`]) — and read back by
 //! [`parse_acme_request_path`] and [`acme_enrollment_region`], so the ACME HTTP surface
 //! `crate::service::acme_http` serves resolves a published URL to the record behind it.
 //!
@@ -330,10 +330,15 @@ pub const ACME_DOMAIN_VALIDATION_STATUS_VALID: &str = "VALID";
 pub const ACME_DOMAIN_VALIDATION_STATUS_INVALID: &str = "INVALID";
 
 /// `PrevalidationType` of a domain validation configured with
-/// `PrevalidationOptions$DnsPrevalidation`: the only member either union declares
-/// (`smithy_query(query="shape", shape="com.amazonaws.acm#PrevalidationType")` declares
-/// `DNS_PREVALIDATION` alone).
-pub const PREVALIDATION_TYPE_DNS: &str = "DNS_PREVALIDATION";
+/// `PrevalidationOptions$DnsPrevalidation` — the only member either union declares.
+///
+/// The WIRE value, which is what a client branches on to find the DNS challenge record
+/// it has to publish: ACM answers `DNS` for a DNS-prevalidated domain validation, while
+/// the model's enum declares the older spelling `DNS_PREVALIDATION`
+/// (`smithy_query(query="shape", shape="com.amazonaws.acm#PrevalidationType")`). Where
+/// the two disagree the value the service really returns is the contract, so every
+/// projection of this member reports it from here.
+pub const PREVALIDATION_TYPE_DNS: &str = "DNS";
 
 /// How long after `CreateAcmeDomainValidation` — or after an update replaced the
 /// prevalidation configuration the domain was proved against — the validation reaches
@@ -1211,6 +1216,12 @@ pub fn certificate_arn(region: &str, certificate_id: &str) -> String {
     )
 }
 
+/// The ARN resource type every ACME endpoint ARN carries, as `AcmeEndpointArn`'s own
+/// `@pattern` fixes it (`...:[0-9]{12}:acme-endpoint/[a-zA-Z0-9-]+$`): the one spelling
+/// the member admits, so it is both what this service MINTS and what it names a request
+/// whose ARN it will not resolve.
+pub const ACME_ENDPOINT_RESOURCE_TYPE: &str = "acme-endpoint";
+
 /// `arn:aws:acm:<region>:<account>:acme-endpoint/<endpoint_id>`, the form
 /// `AcmeEndpointArn`'s `@pattern` requires
 /// (`^arn:aws[a-z-]*:acm:[a-z0-9-]+:[0-9]{12}:acme-endpoint/[a-zA-Z0-9-]+$`).
@@ -1218,7 +1229,7 @@ pub fn acme_endpoint_arn(region: &str, endpoint_id: &str) -> String {
     ::engine::emulator_arn(
         SIGNING_NAME,
         region,
-        &format!("acme-endpoint/{endpoint_id}"),
+        &format!("{ACME_ENDPOINT_RESOURCE_TYPE}/{endpoint_id}"),
     )
 }
 
@@ -1275,10 +1286,17 @@ pub const ACME_ENROLLMENT_HOST_LABEL: &str = "acm-acme-enroll";
 /// The DNS suffix of the AWS endpoint hosts this emulator publishes.
 pub const AWS_DNS_SUFFIX: &str = "amazonaws.com";
 
-/// The path prefix every ACME resource of every endpoint sits under, so one
-/// enrollment host serves every endpoint in its Region and a path that is not an ACME
-/// resource path is told apart from one that is.
-pub const ACME_PATH_PREFIX: &str = "/acme/";
+/// The path the ACME resources of every endpoint hang off: the ROOT of the enrollment
+/// host, since an endpoint's own id is the first path segment and nothing of this
+/// service's own naming sits between the host and that id.
+///
+/// It carries no service-specific segment, so it does no filtering on the parse side: what
+/// tells an ACME resource path apart from any other path on this host is that its first
+/// segment is an endpoint id and a resource follows it ([`parse_acme_request_path`]). The
+/// constant remains so the minting and the parsing of a path are written against one
+/// place, which is what keeps the URLs this service publishes and the URLs it resolves the
+/// same set.
+pub const ACME_PATH_ROOT: &str = "/";
 
 /// The ACME `directory` resource: the single URL an ACME client is configured with and
 /// starts from, which answers the resource map (RFC 8555 §7.1.1).
@@ -1354,14 +1372,14 @@ pub fn is_acme_endpoint_id(endpoint_id: &str) -> bool {
 }
 
 /// The base URL of one endpoint's ACME surface:
-/// `https://acm-acme-enroll.<region>.amazonaws.com/acme/<endpoint_id>`.
+/// `https://acm-acme-enroll.<region>.amazonaws.com/<endpoint_id>`.
 ///
 /// Every ACME resource of that endpoint hangs off it, which is why the endpoint's own
 /// id sits here — in the path on the Region's one enrollment host — rather than in the
 /// host name.
 pub fn acme_endpoint_base_url(region: &str, endpoint_id: &str) -> String {
     format!(
-        "https://{}{ACME_PATH_PREFIX}{endpoint_id}",
+        "https://{}{ACME_PATH_ROOT}{endpoint_id}",
         acme_enrollment_host(region)
     )
 }
@@ -1420,7 +1438,7 @@ pub struct AcmeRequestPath {
 /// minted, so a URL this service hands out is a URL it can resolve back to an endpoint
 /// record.
 pub fn parse_acme_request_path(path: &str) -> Option<AcmeRequestPath> {
-    let rest = path.strip_prefix(ACME_PATH_PREFIX)?;
+    let rest = path.strip_prefix(ACME_PATH_ROOT)?;
     let (endpoint_id, resource) = rest.split_once('/')?;
     if !is_acme_endpoint_id(endpoint_id) || resource.is_empty() {
         return None;
@@ -1449,6 +1467,34 @@ pub fn acme_endpoint_not_found_message(acme_endpoint_arn: &str) -> String {
 /// Every ACM resource is addressed by an ARN of that one form, so the framing is parsed
 /// in one place and each resource type only names its own `<type>/` prefix.
 fn acm_arn_resource(arn: &str) -> Option<&str> {
+    acm_arn_fields(arn).map(|(_account, resource)| resource)
+}
+
+/// The account segment of an ACM ARN, or `None` when `arn` is not an ACM ARN at all.
+///
+/// Every ARN a caller addresses an ACM resource by carries the account that holds it
+/// (`^arn:aws[a-z-]*:acm:[a-z0-9-]+:[0-9]{12}:...`), so this is the half of the framing
+/// that says WHOSE resource the ARN names.
+pub fn acm_arn_account(arn: &str) -> Option<&str> {
+    acm_arn_fields(arn).map(|(account, _resource)| account)
+}
+
+/// Whether `arn` names a resource of the account this emulator serves.
+///
+/// An ARN carries the account that holds the resource, and a caller can address only
+/// their own: an ARN whose account segment is another account's names nothing this
+/// caller could reach, whatever is in the store. Judged against the one account every
+/// ARN this emulator mints carries (`::engine::emulator_account_id`), never against a
+/// literal, so this agrees with [`acme_endpoint_arn`] and [`certificate_arn`] by
+/// construction.
+pub fn arn_is_in_caller_account(arn: &str) -> bool {
+    acm_arn_account(arn).is_some_and(|account| account == ::engine::emulator_account_id())
+}
+
+/// The account and the resource part of an ACM ARN
+/// (`arn:<partition>:acm:<region>:<account>:<type>/<id>`), or `None` when `arn` is not
+/// an ACM ARN at all.
+fn acm_arn_fields(arn: &str) -> Option<(&str, &str)> {
     let mut fields = arn.split(':');
     let (
         Some("arn"),
@@ -1473,7 +1519,7 @@ fn acm_arn_resource(arn: &str) -> Option<&str> {
     if partition.is_empty() || !account.bytes().all(|b| b.is_ascii_digit()) || account.is_empty() {
         return None;
     }
-    Some(resource)
+    Some((account, resource))
 }
 
 /// The id in an ACM ARN whose resource type is `resource_type`, or `None` when `arn`
@@ -1500,7 +1546,7 @@ pub fn certificate_id_from_arn(arn: &str) -> Option<&str> {
 /// service persists, and what tells an opaque `ListAcmeEndpoints` pagination token this
 /// service issued apart from one it did not.
 pub fn acme_endpoint_id_from_arn(arn: &str) -> Option<&str> {
-    acm_resource_id(arn, "acme-endpoint")
+    acm_resource_id(arn, ACME_ENDPOINT_RESOURCE_TYPE)
 }
 
 /// The `InvalidArnException` message for an ARN that is not an ACM certificate ARN,

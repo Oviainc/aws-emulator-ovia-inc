@@ -23,6 +23,8 @@ mod composite_alarms;
 mod ec2_alarm_actions;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/insight_rules.rs"]
+mod insight_rules;
 #[path = "all/log_alarms.rs"]
 mod log_alarms;
 #[path = "all/metric_data.rs"]

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRuleGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRuleGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRuleGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts and deletes `ActivatedRule`s in a stored `RuleGroup`, consuming the caller's
+//! change token, so `ListActivatedRulesInRuleGroup` reports what this call applied. An
+//! inserted activation points at a `Rule` this service stores, and only a REGULAR one:
+//! "You can only insert REGULAR rules into a rule group."
 //!
 //! ## Shape of an operation
 //!
@@ -160,6 +156,45 @@ impl From<UpdateRuleGroupErrorModeled> for UpdateRuleGroupError {
     }
 }
 
+/// The modelled `WAFNonexistentItemException`: the `Rule` an inserted activation points
+/// at does not exist. "The operation failed because the referenced object doesn't
+/// exist."
+fn nonexistent_item() -> UpdateRuleGroupError {
+    UpdateRuleGroupErrorModeled::WAFNonexistentItemException(WAFNonexistentItemException {
+        message: Some(crate::state::MESSAGE_NONEXISTENT_ITEM.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `WAFLimitsExceededException`: the request, or the rule group it would
+/// leave behind, is past a resource limit.
+fn limits_exceeded() -> UpdateRuleGroupError {
+    UpdateRuleGroupErrorModeled::WAFLimitsExceededException(WAFLimitsExceededException {
+        message: Some(crate::state::MESSAGE_LIMITS_EXCEEDED.to_string()),
+    })
+    .into()
+}
+
+/// A `WAFInvalidParameterException` naming the member AWS WAF did not recognise.
+///
+/// `field` is a `ParameterExceptionField` value and `reason` a
+/// `ParameterExceptionReason` value (the model's `PARAMETER_EXCEPTION_FIELD_VALUES` /
+/// `PARAMETER_EXCEPTION_REASON_VALUES`), so a client branching on them sees what the
+/// real service sends. `field` is an `Option` because `ParameterExceptionField` declares
+/// a value for an activation's rule type (`RULE_TYPE`) and for each of its actions
+/// (`WAF_ACTION`, `WAF_OVERRIDE_ACTION`) but none for its priority: naming one of those
+/// for the priority would invent a wire value the model does not declare, so that
+/// refusal leaves it unset, as the `SizeConstraintSet` twin does for its own unnamed
+/// members.
+fn invalid_parameter(field: Option<&str>, parameter: &str, reason: &str) -> UpdateRuleGroupError {
+    UpdateRuleGroupErrorModeled::WAFInvalidParameterException(WAFInvalidParameterException {
+        field: field.map(str::to_string),
+        parameter: Some(parameter.to_string()),
+        reason: Some(reason.to_string()),
+    })
+    .into()
+}
+
 /// The `UpdateRuleGroup` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -196,18 +231,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRuleGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRuleGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRuleGroup"))
+        let _ = ctx;
+        // The number of updates one request carries is the caller's choice, so it is
+        // bounded BEFORE the shared store's lock is taken: no request can make the
+        // service do an amount of work it picked, nor hold the lock for it.
+        if input.updates.len() > crate::state::MAX_RULE_GROUP_UPDATES_PER_REQUEST {
+            return Err(limits_exceeded());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateRuleGroupErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
+                message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // The RuleGroup is the CONTAINER the updates go into, and the model reserves
+        // `WAFNonexistentContainerException` for exactly this: "You tried to add an
+        // object to or delete an object from another object that doesn't exist."
+        let Some(stored) = state.rule_groups.get(&input.rule_group_id) else {
+            return Err(UpdateRuleGroupErrorModeled::WAFNonexistentContainerException(
+                WAFNonexistentContainerException {
+                    message: Some(crate::state::MESSAGE_NONEXISTENT_CONTAINER.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Every update is applied to a WORKING COPY first, so a request that is refused
+        // part-way through leaves the stored RuleGroup (and the change token) exactly as
+        // they were.
+        let mut working = stored.clone();
+        for update in &input.updates {
+            let activated = &update.activated_rule;
+            // `ChangeAction` is an enum shape, so a value outside its set is refused
+            // before this handler runs.
+            let changed = if update.action == crate::state::CHANGE_ACTION_INSERT {
+                // "You can only insert REGULAR rules into a rule group." `Type` is
+                // optional and "the default is REGULAR", so an activation naming none
+                // activates a regular rule.
+                let rule_type = activated
+                    .r#type
+                    .as_deref()
+                    .unwrap_or(crate::state::WAF_RULE_TYPE_REGULAR);
+                if rule_type != crate::state::WAF_RULE_TYPE_REGULAR {
+                    return Err(invalid_parameter(
+                        Some("RULE_TYPE"),
+                        rule_type,
+                        "INVALID_OPTION",
+                    ));
+                }
+                // "ActivatedRule|OverrideAction applies only when updating or adding a
+                // RuleGroup to a WebACL. In this case you do not use
+                // ActivatedRule|Action. For all other update requests,
+                // ActivatedRule|Action is used instead of ActivatedRule|OverrideAction."
+                // This request is one of those others, so the action it takes is
+                // `Action`, and an `OverrideAction` beside it is a combination this
+                // operation does not accept.
+                if let Some(override_action) = &activated.override_action {
+                    return Err(invalid_parameter(
+                        Some("WAF_OVERRIDE_ACTION"),
+                        &override_action.r#type,
+                        "ILLEGAL_COMBINATION",
+                    ));
+                }
+                if activated.action.is_none() {
+                    return Err(invalid_parameter(
+                        Some("WAF_ACTION"),
+                        rule_type,
+                        "ILLEGAL_COMBINATION",
+                    ));
+                }
+                // An activated rule names "the RuleId for a Rule […] returned by
+                // CreateRule and by ListRules", so an id no stored regular Rule carries
+                // is the modelled "referenced object doesn't exist" — including the id
+                // of a rate-based rule, which is not a REGULAR rule.
+                if !state.rules.contains_key(&activated.rule_id) {
+                    return Err(nonexistent_item());
+                }
+                // "You can have a maximum of ten rules per rule group", so the
+                // activation state a caller can accumulate over many requests is
+                // bounded, not just the number of updates one request may carry.
+                if working.holds_rule(&activated.rule_id) {
+                    // An insert for a rule the group already activates changes nothing
+                    // whatever the rest of the activation carries, so that refusal is
+                    // decided before the quota and the priority: neither is what is
+                    // wrong with this update.
+                    false
+                } else {
+                    if working.rules.len() >= crate::state::MAX_RULE_GROUP_RULES {
+                        return Err(limits_exceeded());
+                    }
+                    // `Priority` "must be a unique integer", so no two activations of
+                    // one rule group share one.
+                    if working.priority_taken(activated.priority) {
+                        return Err(invalid_parameter(
+                            None,
+                            &activated.priority.to_string(),
+                            "ILLEGAL_ARGUMENT",
+                        ));
+                    }
+                    working.insert_rule(activated)
+                }
+            } else {
+                working.remove_rule(&activated.rule_id)
+            };
+            // "The operation failed because there was nothing to do" covers both ways an
+            // update can leave the rule group as it was: deleting an activation it does
+            // not hold, and inserting one for a rule it already activates. "If you want
+            // to replace one Rule with another, you delete the existing one and add the
+            // new one."
+            if !changed {
+                return Err(UpdateRuleGroupErrorModeled::WAFInvalidOperationException(
+                    WAFInvalidOperationException {
+                        message: Some(crate::state::MESSAGE_INVALID_OPERATION.to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Only a request that will be applied consumes the caller's change token.
+        if !state.consume_change_token(&input.change_token) {
+            return Err(UpdateRuleGroupErrorModeled::WAFStaleDataException(
+                WAFStaleDataException {
+                    message: Some(crate::state::MESSAGE_STALE_DATA.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let rule_group_id = working.rule_group_id.clone();
+        state.rule_groups.insert(rule_group_id, working);
+
+        Ok(UpdateRuleGroupOutput {
+            change_token: Some(input.change_token),
+        })
     }
 }

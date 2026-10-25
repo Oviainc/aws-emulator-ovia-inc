@@ -3,8 +3,10 @@
 //! @op ListWorkflowVersions
 //! IMPLEMENTED: one `WorkflowVersionSummary` per immutable version the named workflow
 //! holds in this service's store (`crate::state`), in the order the versions were
-//! appended, at most `MaxResults` per page. A workflow the store does not hold is the
-//! service's lookup miss, not an empty page. The only write is the change the clock
+//! appended, at most `MaxResults` per page. A workflow this endpoint does not hold
+//! contributes no version, so the page it answers is empty: the operation's modelled
+//! error set declares no not-found error, and an operation answers only the errors it
+//! declares. The only write is the change the clock
 //! already owed — the teardown of a workflow past its `DELETING` span — so a read never
 //! changes what a later caller sees. The `NextToken` this operation returns is the only
 //! one it accepts back; anything else is refused as a `ValidationException`.
@@ -116,26 +118,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mwaaserverless-amazonmw
 // here — hence the `ListWorkflowVersionsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-// Widened with `ResourceNotFoundException`: `WorkflowArn` is this operation's
-// `@httpLabel` — the parent resource the listing walks, `GET
-// /workflows/{WorkflowArn}/versions` — and every sibling operation that resolves that
-// same ARN (`GetWorkflow`, `DeleteWorkflow`, `StartWorkflowRun`, `ListWorkflowRuns`,
-// `ListTagsForResource`) declares `ResourceNotFoundException` for a workflow the store
-// does not hold. This operation's own `errors` list omits it, so it is widened in here
-// through `extra_errors` rather than answered as an empty page, which would report
-// "this workflow has no versions" for a workflow that does not exist. The shape is this
-// service's own (`com.amazonaws.mwaaserverless#ResourceNotFoundException`), served at
-// `crate::state::LOOKUP_MISS_STATUS` like every other lookup miss here.
-#[smithy_macros::operation_error(
-    "com.amazonaws.mwaaserverless#ListWorkflowVersions",
-    extra_errors = ["ResourceNotFoundException"]
-)]
+// This set is EXACTLY what the model declares for this operation
+// (`smithy_query(query="operation", operation="ListWorkflowVersions")`): no
+// `ResourceNotFoundException`, unlike every single-resource operation that resolves the
+// same `WorkflowArn` (`GetWorkflow`, `DeleteWorkflow`, `StartWorkflowRun`,
+// `GetWorkflowRun`, `ListTagsForResource`), which all declare it. A child-resource
+// listing therefore cannot answer a workflow it does not hold with that shape — an SDK
+// client has no modelled type to map it onto — so the absent parent is an empty page
+// instead.
+#[smithy_macros::operation_error("com.amazonaws.mwaaserverless#ListWorkflowVersions")]
 #[derive(Debug)]
 pub enum ListWorkflowVersionsErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
     OperationTimeoutException(OperationTimeoutException),
-    ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
 }
@@ -247,22 +243,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // The entity this listing walks is the workflow its `@httpLabel` names: one the
-        // store does not hold has no versions to page over, and an empty page for it
-        // would claim the workflow exists. A workflow of ANOTHER region is not one this
+        // The entity this listing walks is the workflow its `@httpLabel` names: one this
+        // endpoint does not hold contributes no version, so the walk is over an empty
+        // set. The listing reports that as the empty page its output models, because the
+        // only failures it may answer are the ones its own error set declares, and a
+        // not-found error is not among them. A workflow of ANOTHER region is not one this
         // endpoint holds either.
-        let workflow = store
-            .workflow_in(&region, &input.workflow_arn)
-            .ok_or_else(|| {
-                crate::state::lookup_miss(
-                    ListWorkflowVersionsErrorModeled::ResourceNotFoundException(
-                        crate::state::unresolved(
-                            crate::state::UnresolvedEntity::Workflow,
-                            &input.workflow_arn,
-                        ),
-                    ),
-                )
-            })?;
+        let Some(workflow) = store.workflow_in(&region, &input.workflow_arn) else {
+            return Ok(ListWorkflowVersionsOutput {
+                workflow_versions: Some(Vec::new()),
+                next_token: None,
+            });
+        };
 
         // `MaxResults` carries `@default: 20` and `@range(1..100)`, both applied before
         // this handler runs, so the value is already a usable page size; it is held to

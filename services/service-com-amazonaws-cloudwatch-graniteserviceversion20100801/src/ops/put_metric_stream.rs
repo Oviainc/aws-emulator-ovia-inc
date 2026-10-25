@@ -387,9 +387,6 @@ const MAX_ADDITIONAL_STATISTICS: usize = 20;
 /// (`MetricStreamStatisticsConfiguration$IncludeMetrics`)
 const MAX_INCLUDE_METRICS: usize = 100;
 
-/// "You can associate as many as 50 tags with a metric stream." (`PutMetricStreamInput$Tags`)
-const MAX_TAGS: usize = 50;
-
 /// How CloudWatch opens its refusal of an additional statistic the selected output format
 /// cannot carry: `Unsupported statistic <statistic> for selected OutputFormat`. The
 /// sentence is fixed and parameterized by the request's own statistic, so the statistic
@@ -450,15 +447,14 @@ fn validate_statistics_configurations(
     Ok(())
 }
 
-/// At most [`MAX_TAGS`] tags may be associated with a metric stream.
+/// "You can associate as many as 50 tags with a metric stream."
+/// (`PutMetricStreamInput$Tags`) — the bound and its sentence live in `crate::state`, so this
+/// operation and `PutInsightRule` refuse an over-tagged resource by one rule.
 fn validate_tags(tags: Option<&[Tag]>) -> Result<(), PutMetricStreamError> {
-    let count = tags.map_or(0, <[Tag]>::len);
-    if count > MAX_TAGS {
-        return Err(invalid_parameter_value(format!(
-            "a metric stream can be associated with at most {MAX_TAGS} tags; got {count}"
-        )));
+    match crate::state::tag_count_error("metric stream", tags) {
+        None => Ok(()),
+        Some(message) => Err(invalid_parameter_value(message)),
     }
-    Ok(())
 }
 
 /// Whether `format` is one of the OpenTelemetry output formats, which carry percentile

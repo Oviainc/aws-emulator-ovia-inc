@@ -27,6 +27,8 @@ mod error_contract;
 mod error_message_rule;
 #[path = "all/feed_association.rs"]
 mod feed_association;
+#[path = "all/feed_association_retry.rs"]
+mod feed_association_retry;
 #[path = "all/feed_lifecycle.rs"]
 mod feed_lifecycle;
 #[path = "all/feed_policy.rs"]

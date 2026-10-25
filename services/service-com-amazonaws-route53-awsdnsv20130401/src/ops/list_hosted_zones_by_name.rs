@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListHostedZonesByName
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListHostedZonesByName`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListHostedZonesByName::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -134,6 +125,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{dns_name_problem, dns_sort_key, normalize_zone_id, DnsNameKey, StoredZone};
+
+/// The most hosted zones one response carries.
+///
+/// The operation's own documentation: "Route 53 returns up to 100 items in each
+/// response. If you have a lot of hosted zones, use the MaxItems parameter to
+/// list them in groups of up to 100."
+const MAX_PAGE_SIZE: i32 = 100;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -201,20 +201,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListHostedZonesByName` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListHostedZonesByNameErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListHostedZonesByName"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            ListHostedZonesByNameErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        // `DNSName` is `len 0..1024`, so an empty one satisfies every modelled
+        // constraint; it names no position, exactly as omitting it does.
+        let start_name = input.dns_name.as_deref().filter(|name| !name.is_empty());
+        let start_zone_id = input
+            .hosted_zone_id
+            .as_deref()
+            .map(normalize_zone_id)
+            .filter(|id| !id.is_empty());
+
+        // "For your first request to ListHostedZonesByName, do not include the
+        // hostedzoneid parameter. … To get the next group of maxitems hosted
+        // zones, submit another request … and include BOTH dnsname and
+        // hostedzoneid parameters." The zone id only breaks the tie between
+        // zones that share the name `dnsname` positions the page at, so on its
+        // own it identifies no position at all.
+        if start_name.is_none() && start_zone_id.is_some() {
+            return Err(ListHostedZonesByNameErrorModeled::InvalidInput(InvalidInput {
+                message: Some(
+                    "hostedzoneid was specified without dnsname; the hosted zone id only \
+                     positions the listing among the zones that share the dnsname it starts at"
+                        .to_string(),
+                ),
+            })
+            .into());
+        }
+
+        // A name that is no domain name positions nothing, however well it fits
+        // the modelled length of the field.
+        if let Some(name) = start_name {
+            if let Some(problem) = dns_name_problem(name) {
+                return Err(ListHostedZonesByNameErrorModeled::InvalidDomainName(
+                    InvalidDomainName {
+                        message: Some(format!("{name:?} is not a valid domain name: {problem}")),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let page_size = input
+            .max_items
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+        // Route 53 echoes the `maxitems` the caller asked for; the clamped
+        // `page_size` above only bounds the work and the response size.
+        let reported_max_items = input.max_items.unwrap_or(MAX_PAGE_SIZE);
+
+        // "The results begin with the first hosted zone whose name is greater
+        // than or equal to dnsname": the page starts at the requested name, and
+        // at the requested zone id among the zones carrying that name.
+        let start = start_name.map(|name| (dns_sort_key(name), start_zone_id.unwrap_or_default()));
+
+        let store = state.lock();
+        // "ListHostedZonesByName sorts hosted zones by name with the labels
+        // reversed", which is the order `dns_sort_key` keys a name in. Two
+        // zones may carry the SAME name (each create mints its own zone), so
+        // the zone id breaks that tie and the whole order is total — which is
+        // what lets `NextDNSName`/`NextHostedZoneId` resume at one place.
+        let mut ordered: Vec<(DnsNameKey, &StoredZone)> = store
+            .zones
+            .values()
+            .map(|zone| (dns_sort_key(&zone.name), zone))
+            .collect();
+        ordered.sort_by(|(left_key, left), (right_key, right)| {
+            left_key.cmp(right_key).then_with(|| left.id.cmp(&right.id))
+        });
+
+        let mut hosted_zones = Vec::new();
+        let mut next: Option<&StoredZone> = None;
+        for (_, zone) in ordered.iter().filter(|(key, zone)| {
+            start
+                .as_ref()
+                .is_none_or(|(from_key, from_id)| (key, zone.id.as_str()) >= (from_key, *from_id))
+        }) {
+            if hosted_zones.len() >= page_size as usize {
+                // "the value of NextDNSName is the name of the first hosted
+                // zone in the next group of maxitems hosted zones", and
+                // NextHostedZoneId identifies that same zone.
+                next = Some(zone);
+                break;
+            }
+            hosted_zones.push(zone.to_hosted_zone());
+        }
+
+        Ok(ListHostedZonesByNameOutput {
+            hosted_zones,
+            // "The DNSName and HostedZoneId elements in the response contain
+            // the values, if any, specified for the dnsname and hostedzoneid
+            // parameters in the request that produced the current response."
+            dns_name: input.dns_name.clone(),
+            hosted_zone_id: input.hosted_zone_id.clone(),
+            is_truncated: next.is_some(),
+            next_dns_name: next.map(|zone| zone.name.clone()),
+            next_hosted_zone_id: next.map(|zone| zone.id.clone()),
+            // Route 53 echoes the `maxitems` the caller asked for, so a request
+            // outside the documented range reads its own value back while the
+            // page itself stays clamped to MAX_PAGE_SIZE.
+            max_items: reported_max_items,
+        })
     }
 }
