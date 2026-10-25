@@ -221,7 +221,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "log group",
                     )));
                 };
-                let requested = input.policy_name.as_deref();
+                // A name that is only blank space identifies nothing, so it counts as a
+                // name the request did not supply — the rule the account-scoped branch
+                // below and `PutResourcePolicy` hold a `policyName` to.
+                let requested = input
+                    .policy_name
+                    .as_deref()
+                    .filter(|name| !name.trim().is_empty());
                 let Some(policy) = group.resource_policy.as_ref() else {
                     // Nothing is attached, so a policy the request names is not there;
                     // with no name in the request there is no request member to build
@@ -233,10 +239,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         )),
                     });
                 };
-                // A `policyName` that names a different policy names nothing attached
-                // to this resource, and the refusal names the policy the caller asked
-                // for rather than a string that identifies nothing.
-                if let Some(name) = requested.filter(|name| *name != policy.policy_name) {
+                // A `policyName` that names a different policy — or any name at all,
+                // when the attached policy carries none — names nothing attached to this
+                // resource, and the refusal names the policy the caller asked for rather
+                // than a string that identifies nothing.
+                if let Some(name) =
+                    requested.filter(|name| policy.policy_name.as_deref() != Some(*name))
+                {
                     return Err(not_found(&crate::state::policy_not_found_message(name)));
                 }
                 // "Required when deleting a resource-scoped policy to prevent concurrent

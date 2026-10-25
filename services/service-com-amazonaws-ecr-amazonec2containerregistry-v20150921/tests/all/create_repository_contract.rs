@@ -141,23 +141,24 @@ async fn a_value_outside_a_modelled_constraint_is_refused_as_an_invalid_paramete
             "Member must have length less than or equal to 5".to_string(),
         ),
         (
-            // The refusal names the parameter the REQUEST carries, not the validating
-            // walk's path to the element that carried the value, so a refused element is
-            // reported against its list: an element is one value of that same parameter,
-            // and ECR validates a repository name itself (the recorded clause for a
-            // top-level `repositoryName` is ECR's own, naming no path). A member of a
-            // structure NESTED in the request is the other half of the rule and keeps the
-            // walk's path — see `parameter_constraint_clauses.rs`. The element step is
-            // recognised through `service_common::validation::list_of_element`, whose own
-            // documentation states the same precedent — "a service that states a clause
-            // at the LIST member when one of its ELEMENTS failed".
+            // The refusal names the parameter whose VALUE failed, not the validating
+            // walk's path to it: an element of a top-level list is one value of that
+            // parameter, and ECR names that parameter — the list is named by the plural of
+            // it, so one value of it is the singular `repositoryName` (the recorded
+            // clause). A member of a structure NESTED in the request is the other half of
+            // the rule and keeps the walk's path — see `parameter_constraint_clauses.rs`.
+            // The element step is recognised through
+            // `service_common::validation::list_of_element`, the one place in the tree that
+            // spells it.
             "an invalid name inside a describe's name list",
             "DescribeRepositories",
             json!({"repositoryNames": ["well-formed", "ALSO-Upper"]}),
-            "repositoryNames",
+            "repositoryName",
             REPOSITORY_NAME_CLAUSE.to_string(),
         ),
         (
+            // The list's own `@length`, which the COLLECTION failed rather than any value
+            // in it, so the clause names the collection.
             "an empty describe name list — below the modelled minimum of one",
             "DescribeRepositories",
             json!({"repositoryNames": []}),

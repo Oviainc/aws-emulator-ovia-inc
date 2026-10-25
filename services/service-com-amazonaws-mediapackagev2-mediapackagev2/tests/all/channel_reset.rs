@@ -16,6 +16,9 @@
 //!    `CreatedAt`, `ModifiedAt` and the ETag all survive it.
 //! 4. A reset addressing a channel whose parent chain does not resolve answers
 //!    `ResourceNotFoundException` (404) and records nothing.
+//!
+//! Which channels have an ingest state to reset at all is covered next door, in
+//! [`crate::channel_reset_multiview`].
 
 use std::time::Duration;
 
@@ -33,8 +36,9 @@ struct ResetCase {
     channel_body: fn() -> Value,
 }
 
-/// The rows. `InputType` values come from the model's `InputType` enum (CMAF, HLS,
-/// MULTIVIEW); the recorded case the issue was filed from is just one of them.
+/// The rows. `InputType` values come from the model's `InputType` enum, restricted here
+/// to the types whose channels ingest a stream of their own (CMAF, HLS, and the absent
+/// case the member's doc defaults to HLS).
 fn reset_cases() -> Vec<ResetCase> {
     vec![
         ResetCase {

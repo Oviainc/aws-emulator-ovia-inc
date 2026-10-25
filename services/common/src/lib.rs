@@ -190,6 +190,9 @@ pub mod event_stream;
 pub mod feature_store_groups;
 pub mod front_door;
 pub mod iam_authorization;
+/// The ONE construction of the in-process IAM client a service resolves a caller-supplied
+/// IAM entity through, so that hop is configured once rather than per service.
+pub mod iam_client;
 /// The ONE grammar of an IAM JSON resource-based policy document, for every service whose
 /// API takes one as a string and has to decide whether to accept it — so two services
 /// handed the same document cannot disagree about whether it is a policy at all.

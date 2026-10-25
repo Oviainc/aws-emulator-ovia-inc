@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListApplicationGrants
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListApplicationGrants`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the OAuth 2.0 grants an application carries, one `GrantItem` per
+//! stored `GrantType`, read from this service's state (`crate::state`). This is the ONLY
+//! file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListApplicationGrants::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORT (`@readonly`): it enumerates
+//! [`crate::state::ApplicationRecord::grants`] — what the puts of this application
+//! stored — in `GrantType` order, and changes nothing a later caller sees. An
+//! `ApplicationArn` this account holds no application for is the modelled
+//! `ResourceNotFoundException`, never an empty page; an application that carries no
+//! grant is an empty `Grants` list. The `NextToken` is this service's own cursor, so one
+//! it never issued for THIS enumeration is the modelled `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +162,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListApplicationGrants` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListApplicationGrantsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListApplicationGrants"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListApplicationGrantsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the SSO Admin state store is unavailable".to_string()),
+            })
+        })?;
+
+        // The cursor is scoped to THIS enumeration: the operation and the application
+        // whose grants it walks, so a token issued for another read — or never issued at
+        // all — cannot silently resume inside this one.
+        let scope = crate::state::cursor_application_grants(&input.application_arn);
+        let after = crate::state::cursor_after(&scope, input.next_token.as_deref()).map_err(
+            |message| {
+                ListApplicationGrantsErrorModeled::ValidationException(ValidationException {
+                    message: Some(message.to_string()),
+                    reason: None,
+                })
+            },
+        )?;
+
+        let ordered: Vec<(String, GrantItem)> = {
+            let region = crate::state::request_region(ctx.parts());
+            let mut store = state.lock();
+            // A REPORT, so the only thing it writes is what the CLOCK already owes every
+            // instance at this instant — the same transitions a read made a moment later
+            // would have applied anyway.
+            store.on_request(&region, ::std::time::SystemTime::now());
+
+            // The grants live ON the application record, so an `ApplicationArn` nothing
+            // holds is the modelled `ResourceNotFoundException` rather than an empty page,
+            // which would read as "this application carries no grant".
+            let application = store.application(&input.application_arn).ok_or_else(|| {
+                ListApplicationGrantsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::application_not_found_message(
+                            &input.application_arn,
+                        )),
+                        // The model's `ResourceNotFoundExceptionReason` enum carries only
+                        // `KMS_NotFoundException`, which this is not.
+                        reason: None,
+                    },
+                )
+            })?;
+            // Exactly the grants the puts of this application stored, one `GrantItem` per
+            // stored type: the grants are keyed by `GrantType`, which is both the page
+            // order and the cursor order, and `GrantItem$GrantType` is that key — the
+            // type is a property OF the stored grant, never a value this read invents.
+            application
+                .grants
+                .iter()
+                .map(|(grant_type, grant)| {
+                    (
+                        grant_type.clone(),
+                        GrantItem {
+                            grant_type: grant_type.clone(),
+                            grant: grant.clone(),
+                        },
+                    )
+                })
+                .collect()
+        };
+
+        // This operation models no `MaxResults`, so a page is the service's own size.
+        let (grants, next_token) = crate::state::page(&scope, ordered, after.as_deref(), None);
+        Ok(ListApplicationGrantsOutput { grants, next_token })
     }
 }
