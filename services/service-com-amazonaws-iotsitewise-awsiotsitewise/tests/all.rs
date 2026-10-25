@@ -216,6 +216,8 @@ mod execute_query_follows_the_store;
 mod gateway_lifecycle;
 #[path = "all/hierarchies_etags_and_refusals.rs"]
 mod hierarchies_etags_and_refusals;
+#[path = "all/list_asset_models.rs"]
+mod list_asset_models;
 #[path = "all/logging_options.rs"]
 mod logging_options;
 #[path = "all/portal_lifecycle.rs"]

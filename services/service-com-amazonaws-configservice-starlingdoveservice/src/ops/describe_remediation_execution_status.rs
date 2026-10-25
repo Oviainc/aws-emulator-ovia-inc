@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeRemediationExecutionStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeRemediationExecutionStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the remediation executions one Config rule has: exactly the executions the
+//! store holds for that rule, each with the state the clock has made due — `QUEUED`,
+//! `IN_PROGRESS` or `SUCCEEDED` — and the one step its remediation target runs,
+//! narrowed to the `ResourceKeys` the request lists and cut into pages of the requested
+//! `Limit`, where 0 asks for the documented default of the maximum.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeRemediationExecutionStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! It is a REPORT: it writes nothing, so the executions a later caller sees are the ones
+//! this call saw. A rule with no remediation configuration is refused with
+//! `NoSuchRemediationConfigurationException`, the same precondition
+//! `StartRemediationExecution` refuses; a rule that has one but has never been executed
+//! reports an empty list.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +159,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeRemediationExecutionStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeRemediationExecutionStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeRemediationExecutionStatus"))
+        // `ctx` carries request metadata only; this report is computed from state.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // A resource key names ONE resource by its type and its id, so a key missing
+        // either names no resource to report on. The type is judged here rather than at
+        // the boundary (`skip_validation` on `ResourceKey`, see
+        // `super::types::shared_types`).
+        let selected = input.resource_keys.unwrap_or_default();
+        if let Some(incomplete) = selected
+            .iter()
+            .find(|key| key.resource_type.trim().is_empty() || key.resource_id.trim().is_empty())
+        {
+            return Err(
+                DescribeRemediationExecutionStatusErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "A ResourceKey must name both a resourceType and a resourceId; got \
+                             resourceType '{}' and resourceId '{}'.",
+                            incomplete.resource_type, incomplete.resource_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_remediation_execution_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(
+                        DescribeRemediationExecutionStatusErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    "the specified NextToken is not valid; use the NextToken a \
+                                     previous DescribeRemediationExecutionStatus response \
+                                     returned"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // "The default is maximum" (`Limit`), whose modelled range tops out at 100.
+        let page_size = usize::try_from(input.limit)
+            .ok()
+            .filter(|limit| *limit > 0)
+            .unwrap_or(REMEDIATION_EXECUTION_STATUS_MAX_PAGE_SIZE);
+
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+
+        // A rule with no remediation configuration has no remediation whose execution
+        // could be reported, which is the precondition
+        // `NoSuchRemediationConfigurationException` documents. This READ words it as the
+        // recorded refusal of this operation does — naming the rule and nothing else —
+        // which is not how `StartRemediationExecution` words the same precondition.
+        if !store
+            .remediation_configurations
+            .contains_key(&input.config_rule_name)
+        {
+            return Err(
+                DescribeRemediationExecutionStatusErrorModeled::NoSuchRemediationConfigurationException(
+                    NoSuchRemediationConfigurationException {
+                        message: Some(format!(
+                            "There is no RemediationConfiguration setup for AWS Config rule {}.",
+                            input.config_rule_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Page over the store's own key ordering, so a token holds the resource key the
+        // next page resumes at and survives executions started between pages. The key
+        // carries the rule first, so one rule's executions are a contiguous run of it.
+        let mut page = Vec::new();
+        let mut next_token = None;
+        for (key, execution) in &store.remediation_executions {
+            let (rule_name, resource_type, resource_id) = key;
+            if rule_name != &input.config_rule_name {
+                continue;
+            }
+            if resume_at
+                .as_ref()
+                .is_some_and(|(from_type, from_id)| (resource_type, resource_id) < (from_type, from_id))
+            {
+                continue;
+            }
+            if !selected.is_empty()
+                && !selected.iter().any(|named| {
+                    &named.resource_type == resource_type && &named.resource_id == resource_id
+                })
+            {
+                continue;
+            }
+            if page.len() == page_size {
+                next_token = Some(crate::state::encode_remediation_execution_token(&(
+                    resource_type.clone(),
+                    resource_id.clone(),
+                )));
+                break;
+            }
+            page.push(execution.to_shape(now));
+        }
+
+        Ok(DescribeRemediationExecutionStatusOutput {
+            remediation_execution_statuses: Some(page),
+            next_token,
+        })
     }
 }
+
+/// The largest page this report serves, which is also what a request that asks for no
+/// size of its own gets (`DescribeRemediationExecutionStatusRequest$Limit`: "The maximum
+/// number of RemediationExecutionStatuses returned on each page. The default is
+/// maximum", with the modelled `Limit` range topping out at 100).
+const REMEDIATION_EXECUTION_STATUS_MAX_PAGE_SIZE: usize = 100;

@@ -37,6 +37,8 @@ mod error_messages;
 mod list_attributes;
 #[path = "all/list_clusters.rs"]
 mod list_clusters;
+#[path = "all/list_daemon_task_definitions.rs"]
+mod list_daemon_task_definitions;
 #[path = "all/list_service_deployments.rs"]
 mod list_service_deployments;
 #[path = "all/list_services.rs"]

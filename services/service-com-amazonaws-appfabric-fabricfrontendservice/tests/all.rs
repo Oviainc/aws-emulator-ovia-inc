@@ -21,6 +21,8 @@ mod app_bundle_ingestion_lifecycle;
 mod app_bundle_refusal_wording;
 #[path = "all/app_bundle_region_quota.rs"]
 mod app_bundle_region_quota;
+#[path = "all/chain_read_not_found_attribution.rs"]
+mod chain_read_not_found_attribution;
 #[path = "all/create_app_authorization_contract.rs"]
 mod create_app_authorization_contract;
 #[path = "all/ingestion_deletion.rs"]

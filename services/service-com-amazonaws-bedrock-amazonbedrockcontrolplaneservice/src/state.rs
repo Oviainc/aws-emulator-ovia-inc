@@ -68,6 +68,12 @@
 //! definition it was created with and the hash of that definition, so the hash the create
 //! answered is the hash the read reports.
 //!
+//! And it holds the Automated Reasoning policy tests
+//! `ops/create_automated_reasoning_policy_test_case.rs` mints and
+//! `ops/get_automated_reasoning_policy_test_case.rs` reads back, each keyed by the policy it
+//! was created under, so a test created by one request is the test every later request
+//! sees.
+//!
 //! And it holds the account's acknowledged use case for model access — the single form
 //! `ops/put_use_case_for_model_access.rs` submits and `ops/get_use_case_for_model_access.rs`
 //! reads back, so the form one request submits is the form the next request gets.
@@ -103,7 +109,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AutomatedReasoningPolicyDefinition, CustomModelDataSource, CustomModelDeploymentSummary,
+    AutomatedReasoningPolicyDefinition, AutomatedReasoningPolicyTestCase, CustomModelDataSource,
+    CustomModelDeploymentSummary,
     CustomModelSummary, CustomizationConfig, EndpointConfig, EvaluationConfig,
     EvaluationInferenceConfig, EvaluationOutputDataConfig, FoundationModelDetails,
     FoundationModelLifecycle, FoundationModelSummary, GuardrailAutomatedReasoningPolicy,
@@ -1526,6 +1533,44 @@ pub struct AutomatedReasoningPolicyRecord {
     pub updated_at: SystemTime,
 }
 
+/// The most tests one Automated Reasoning policy may hold at once, past which a create is
+/// refused with `ServiceQuotaExceededException`.
+///
+/// `AutomatedReasoningPolicyTestCaseList` is `@length(0, 1000)`
+/// (`smithy_query(query="operation",operation="ListAutomatedReasoningPolicyTestCases")`), so
+/// a policy holding more tests than this could not be listed; the bound is also what keeps
+/// this part of the store from growing without end, since a test carries no name a second
+/// create of it could collide with.
+pub const MAX_AUTOMATED_REASONING_POLICY_TEST_CASES_PER_POLICY: usize = 1000;
+
+/// One stored Automated Reasoning policy test: the identity
+/// `CreateAutomatedReasoningPolicyTestCase` minted, and the sample input and expected
+/// outcome every later read of that test reports.
+///
+/// Every member is held exactly as the request carried it, because the test is what a
+/// policy is validated against: `guardContent` and `queryContent` are opaque text whose
+/// characters are the test, so they are stored byte for byte rather than normalised.
+#[derive(Debug, Clone)]
+pub struct AutomatedReasoningPolicyTestCaseRecord {
+    /// `testCaseId` — the `^[0-9A-Z]{12}$` identity minted by
+    /// [`ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::mint_automated_reasoning_policy_test_case_id`].
+    pub id: String,
+    /// `guardContent` — the output content the policy validates, as the request spelled it.
+    pub guard_content: String,
+    /// `queryContent` — the query that produced that content, absent when the request
+    /// carried none.
+    pub query_content: Option<String>,
+    /// `expectedAggregatedFindingsResult` — the `AutomatedReasoningCheckResult` the test
+    /// expects. Required on the create, so a stored test always carries one.
+    pub expected_aggregated_findings_result: String,
+    /// `confidenceThreshold` — the minimum translation confidence this test validates at,
+    /// absent when the request carried none.
+    pub confidence_threshold: Option<f64>,
+    pub created_at: SystemTime,
+    /// When the test was last written. The creation instant until an update rewrites it.
+    pub updated_at: SystemTime,
+}
+
 /// One stored application inference profile: the identity `CreateInferenceProfile`
 /// minted, the model source that request named, and what a read reports.
 ///
@@ -1675,6 +1720,13 @@ pub struct EnforcedGuardrailConfiguration {
 ///   `CreateAutomatedReasoningPolicy` enforces, and
 ///   `automated_reasoning_policy_create_tokens` holds at most one entry per live policy for
 ///   the same reason `create_tokens` does.
+///
+/// * `automated_reasoning_policy_test_cases` holds one entry per stored test, capped per
+///   policy at [`MAX_AUTOMATED_REASONING_POLICY_TEST_CASES_PER_POLICY`] by the quota
+///   `CreateAutomatedReasoningPolicyTestCase` enforces — and the policies those tests hang
+///   off are themselves capped — and
+///   `automated_reasoning_policy_test_case_create_tokens` holds at most one entry per
+///   stored test for the same reason `create_tokens` does.
 ///
 /// * `inference_profiles` holds one entry per live application inference profile, capped
 ///   at [`MAX_INFERENCE_PROFILES_PER_ACCOUNT`] by the quota `CreateInferenceProfile`
@@ -1878,6 +1930,20 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// How many Automated Reasoning policy ids this store has minted; the uniqueness half
     /// of a minted id.
     pub minted_automated_reasoning_policies: u64,
+    /// Every stored Automated Reasoning policy test, keyed by
+    /// `(AutomatedReasoningPolicyArn, testCaseId)` — the pair
+    /// `GetAutomatedReasoningPolicyTestCase` addresses a test by, because a test belongs to
+    /// the policy it was created under and is only ever read through it.
+    pub automated_reasoning_policy_test_cases:
+        HashMap<(String, String), AutomatedReasoningPolicyTestCaseRecord>,
+    /// `CreateAutomatedReasoningPolicyTestCase` idempotency:
+    /// `(AutomatedReasoningPolicyArn, clientRequestToken)` -> the `testCaseId` that token
+    /// minted. Scoped to that one operation, and to the policy the request addressed, the
+    /// way the test store itself is.
+    pub automated_reasoning_policy_test_case_create_tokens: HashMap<(String, String), String>,
+    /// How many Automated Reasoning policy test ids this store has minted; the uniqueness
+    /// half of a minted id.
+    pub minted_automated_reasoning_policy_test_cases: u64,
     /// Every stored application inference profile, keyed by its `InferenceProfileArn` —
     /// one of the two spellings an `InferenceProfileIdentifier` carries.
     pub inference_profiles: HashMap<String, InferenceProfileRecord>,
@@ -1988,6 +2054,42 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
         policy_arn: &str,
     ) -> Option<&AutomatedReasoningPolicyRecord> {
         self.automated_reasoning_policies.get(policy_arn)
+    }
+
+    /// Mint a fresh Automated Reasoning policy test id, unique within this store.
+    ///
+    /// Built like a policy id, and for the same two reasons: the leading half is this
+    /// store's mint count so two ids can never collide, and the trailing half is drawn
+    /// from the creation instant so an id is not a guessable sequence number. Rendered in
+    /// UPPER case because `AutomatedReasoningPolicyTestCaseId` is `^[0-9A-Z]{12}$`, which
+    /// is the upper-case spelling of the twelve base-36 digits [`minted_id`] produces.
+    pub fn mint_automated_reasoning_policy_test_case_id(&mut self, now: SystemTime) -> String {
+        self.minted_automated_reasoning_policy_test_cases += 1;
+        minted_id(self.minted_automated_reasoning_policy_test_cases, now).to_ascii_uppercase()
+    }
+
+    /// The test `test_case_id` names under the policy `policy_arn` names.
+    ///
+    /// Keyed by the PAIR, so an id of another policy's test names no test of this one, and
+    /// the policy ARN selects exactly as [`Self::automated_reasoning_policy`] does.
+    #[must_use]
+    pub fn automated_reasoning_policy_test_case(
+        &self,
+        policy_arn: &str,
+        test_case_id: &str,
+    ) -> Option<&AutomatedReasoningPolicyTestCaseRecord> {
+        self.automated_reasoning_policy_test_cases
+            .get(&(policy_arn.to_string(), test_case_id.to_string()))
+    }
+
+    /// How many tests the policy `policy_arn` names holds — what
+    /// [`MAX_AUTOMATED_REASONING_POLICY_TEST_CASES_PER_POLICY`] bounds.
+    #[must_use]
+    pub fn automated_reasoning_policy_test_case_count(&self, policy_arn: &str) -> usize {
+        self.automated_reasoning_policy_test_cases
+            .keys()
+            .filter(|(arn, _)| arn == policy_arn)
+            .count()
     }
 
     /// Mint a fresh inference profile id: the resource half of an
@@ -2999,6 +3101,27 @@ pub fn automated_reasoning_policy_arn(region: &str, id: &str) -> String {
         region,
         &format!("automated-reasoning-policy/{id}"),
     )
+}
+
+/// The `AutomatedReasoningPolicyTestCase` a stored test is reported as.
+///
+/// ONE mapping, so the read of a single test and a listing of a policy's tests report the
+/// same test the same way.
+#[must_use]
+pub fn automated_reasoning_policy_test_case(
+    record: &AutomatedReasoningPolicyTestCaseRecord,
+) -> AutomatedReasoningPolicyTestCase {
+    AutomatedReasoningPolicyTestCase {
+        test_case_id: record.id.clone(),
+        guard_content: record.guard_content.clone(),
+        query_content: record.query_content.clone(),
+        expected_aggregated_findings_result: Some(
+            record.expected_aggregated_findings_result.clone(),
+        ),
+        confidence_threshold: record.confidence_threshold,
+        created_at: date_time(record.created_at),
+        updated_at: date_time(record.updated_at),
+    }
 }
 
 /// The `definitionHash` of an Automated Reasoning policy definition: 128 digits of

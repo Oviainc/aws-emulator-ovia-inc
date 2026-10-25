@@ -258,6 +258,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A `PreferredDayTime` maintenance preference states WHEN the output is maintained
+        // and the window StartRouterOutput schedules is derived from it, so a `Time` that
+        // names no time of day is refused rather than stored — the rule `crate::state` owns
+        // for every operation that takes a maintenance configuration, which is how the
+        // sibling CreateRouterInput refuses the same preference.
+        if let Some(rejection) = input
+            .maintenance_configuration
+            .as_ref()
+            .and_then(crate::state::maintenance_configuration_rejection)
+        {
+            return Err(bad_request(rejection));
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // The state changes and the removals the clock already owes are materialised before
@@ -362,6 +375,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Nothing is routed to an output that has just been created.
                 routed_input_arn: None,
                 messages: Vec::new(),
+                // No maintenance window is scheduled for an output that is not carrying
+                // content yet: StartRouterOutput schedules one when it starts the output.
+                maintenance_schedule: None,
                 client_token: input.client_token.clone().filter(|t| !t.is_empty()),
                 // The router output this call creates is live: only DeleteRouterOutput sets
                 // the instant the clock completes a delete at.

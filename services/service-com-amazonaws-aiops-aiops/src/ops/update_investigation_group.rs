@@ -222,7 +222,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Each member the request carries replaces the stored value; each one it omits
         // leaves the stored value untouched. `name` is not updatable — the model does
-        // not accept it here — so the group keeps its name and its name index entry.
+        // not accept it here — so the group keeps the name it was created with.
         if let Some(role_arn) = input.role_arn {
             group.role_arn = role_arn;
         }

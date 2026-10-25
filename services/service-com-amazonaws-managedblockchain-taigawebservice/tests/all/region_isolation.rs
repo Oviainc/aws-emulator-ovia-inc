@@ -3,9 +3,10 @@
 //! Managed Blockchain is a REGIONAL service: every resource belongs to the Region the call
 //! that created it was signed for, and a request addressed to any other Region resolves
 //! none of it — an id-addressed read, create-on, update or delete answers the modelled
-//! `ResourceNotFoundException` (an operation whose model declares none — `ListMembers`,
-//! `ListNodes`, `ListProposalVotes` — refuses the scope as an invalid request instead),
-//! and a listing reports none of it.
+//! `ResourceNotFoundException`, a listing scoped by a resource of another Region reports
+//! that scope as unresolvable (`ListNodes` and `ListProposalVotes` name the scope they
+//! reach the reported resource through, as an invalid request), and a listing of this
+//! Region's own reports none of it.
 //!
 //! The tables span the classes that rule generalises over:
 //!
@@ -99,14 +100,13 @@ struct Case {
     refusal: (u16, &'static str),
 }
 
-/// The modelled refusal for a resource a Region does not hold, for an operation whose own
-/// error list declares `ResourceNotFoundException`: the same answer as an id that was never
-/// created.
+/// The modelled refusal for a resource a Region does not hold: the same answer as an id
+/// that was never created.
 const NOT_FOUND: (u16, &str) = (404, "ResourceNotFoundException");
 
-/// `ListMembers`, `ListNodes` and `ListProposalVotes` model no `ResourceNotFoundException`
-/// at all, so an unresolvable scope is refused as an invalid request — which is what a
-/// `NetworkId` of another Region is.
+/// `ListNodes` and `ListProposalVotes` name the scope they reach the reported resource
+/// through — the member that owns the nodes, the proposal whose votes are listed — and
+/// report it as an invalid request, which is what a `NetworkId` of another Region makes it.
 const INVALID_REQUEST: (u16, &str) = (400, "InvalidRequestException");
 
 /// The id-addressed READS and listings of one Region's resources: safe to send to any
@@ -161,7 +161,7 @@ fn read_cases(held: &Held) -> Vec<Case> {
             method: "GET",
             path: format!("/networks/{network_id}/members"),
             body: None,
-            refusal: INVALID_REQUEST,
+            refusal: NOT_FOUND,
         },
         Case {
             name: "ListNodes".to_string(),
