@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports, for EACH name in `JobNames` and in the order the request listed them,
+//! either the job definition stored under that name — the same projection
+//! [`crate::state::JobEntry::to_job`] gives `GetJob`, so what `CreateJob` persisted is
+//! what this returns — or that name in `JobsNotFound`. A name is reported in exactly
+//! one of the two lists, so the two together account for every requested name, and a
+//! name no job holds is NOT an error: this operation answers 200 whatever the batch
+//! holds. A read only reads.
+//!
+//! A batch carrying more names than [`MAX_BATCH_JOB_NAMES`] is refused with the modelled
+//! `InvalidInputException` before any name is looked up.
 //!
 //! ## Shape of an operation
 //!
@@ -72,6 +74,24 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// How many names one `BatchGetJobs` request may carry.
+///
+/// This emulator's own REQUEST-SIZE bound, not a modelled quota: `JobNameList` bounds
+/// each element's length (1..255) but says nothing about how many elements the list may
+/// hold, while the answer carries one whole job projection per name the request lists,
+/// repeats included. So what one request can make this operation look up and allocate is
+/// bounded here, at the figure this service's paginated readers already serve in one
+/// answer (`GetTables`' page ceiling, 100 records), so a batch cannot ask for a larger
+/// answer than a page. A batch past it is refused with this operation's own modelled
+/// `InvalidInputException` rather than served.
+pub const MAX_BATCH_JOB_NAMES: usize = 100;
+
+/// The message that refusal carries: the request-size bound a batch has to fit in, built
+/// from [`MAX_BATCH_JOB_NAMES`] so the figure a caller reads back is the one enforced.
+fn batch_limit_message() -> String {
+    format!("JobNames may carry at most {MAX_BATCH_JOB_NAMES} names")
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -143,18 +163,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetJobs"))
+        let _ = ctx;
+        // The batch bound is a property of the REQUEST as a whole, so it is answered
+        // before any name in it is looked up and before the answer allocates anything: a
+        // caller that sent too many names learns that, rather than learning that one of
+        // them is unknown. `JobNameList` bounds each element's length but not the list's,
+        // and the answer carries one whole job projection per listed name (repeats
+        // included), so the bound is this operation's own ([`MAX_BATCH_JOB_NAMES`]).
+        if input.job_names.len() > MAX_BATCH_JOB_NAMES {
+            return Err(BatchGetJobsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(batch_limit_message()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // An unreachable store is an internal mounting fault, reported through
+            // this operation's own server error.
+            return Err(BatchGetJobsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue job store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // Each element of `JobNameList` is bounded `length 1..255`, so a name too long or
+        // too short to address a job is refused at the boundary: reaching here, the only
+        // question per name is whether a job of that name is stored. The walk keeps the
+        // request's order and its repeats, because a batch read answers one entry per
+        // requested name rather than per distinct name. It runs in a critical section
+        // scoped to the lookups alone — bounded above by the batch bound — and the guard
+        // is dropped before the answer is built.
+        let (jobs, jobs_not_found) = {
+            let store = state.lock();
+            let mut jobs = Vec::new();
+            let mut jobs_not_found = Vec::new();
+            for name in &input.job_names {
+                match store.jobs.get(name) {
+                    Some(entry) => jobs.push(entry.to_job()),
+                    None => jobs_not_found.push(name.clone()),
+                }
+            }
+            (jobs, jobs_not_found)
+        };
+
+        // Both lists are reported, empty included: a caller reads `JobsNotFound` to learn
+        // which of its names missed, so an omitted list would make "none missed"
+        // indistinguishable from "not answered".
+        Ok(BatchGetJobsOutput {
+            jobs: Some(jobs),
+            jobs_not_found: Some(jobs_not_found),
+        })
     }
 }

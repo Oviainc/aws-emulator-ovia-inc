@@ -33,6 +33,8 @@ mod error_envelopes;
 mod event_topics;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/ip_route_removal.rs"]
+mod ip_route_removal;
 #[path = "all/microsoft_ad.rs"]
 mod microsoft_ad;
 #[path = "all/shared_directories.rs"]
