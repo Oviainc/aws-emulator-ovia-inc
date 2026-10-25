@@ -220,7 +220,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // key order — which is why their page keys sort after every catalogue key, so one
         // total order still carries the whole report.
         if let Some(state) = crate::state::service_state(&*self.engine) {
-            let store = state.lock();
+            let mut store = state.lock();
+            // A CEV reaches `available` on its own once the media import this service owes
+            // it is due, so the status this report carries is materialised first: the
+            // change was owed at this instant even if nobody had called.
+            store.settle_due_transitions(&region);
             matching.extend(
                 store
                     .custom_db_engine_versions_in(&region)
@@ -2276,6 +2280,10 @@ struct SelectableVersion<'a> {
     major_engine_version: &'a str,
     parameter_group_family: &'a str,
     status: &'a str,
+    /// Whether this entry is a record the account has just created and the service has
+    /// not finished creating: it has reached no availability status at all yet. What
+    /// `IncludeAll` is read against: see [`matches_request`].
+    still_being_created: bool,
     engine_modes: &'static [&'static str],
     default_level: DefaultLevel,
 }
@@ -2289,6 +2297,7 @@ impl<'a> SelectableVersion<'a> {
             major_engine_version: entry.major_engine_version,
             parameter_group_family: entry.parameter_group_family,
             status: entry.status,
+            still_being_created: false,
             engine_modes: entry.profile.engine_modes,
             default_level: entry.default_level,
         }
@@ -2312,6 +2321,8 @@ impl<'a> SelectableVersion<'a> {
             major_engine_version: &record.major_engine_version,
             parameter_group_family: &record.parameter_group_family,
             status: &record.status,
+            still_being_created: record.status
+                == crate::state::CUSTOM_ENGINE_VERSION_STATUS_CREATING,
             engine_modes: profile.engine_modes,
             default_level: DefaultLevel::Neither,
         }
@@ -2325,8 +2336,22 @@ fn matches_request(
     filters: &[Filter],
 ) -> bool {
     // `IncludeAll`: "Specifies whether to also list the engine versions that aren't
-    // available. The default is to list only available engine versions."
-    if input.include_all != Some(true) && entry.status != STATUS_AVAILABLE {
+    // available. The default is to list only available engine versions." An engine version
+    // that is not available is one a caller cannot use: a published version AWS no longer
+    // offers for a new instance, and a custom engine version its account has moved to one
+    // of the other availability statuses. Both are reported only to a request that asks
+    // for them.
+    //
+    // A custom engine version the service has not finished CREATING has reached no
+    // availability status at all. It is the account's own record, it exists only because a
+    // create answered with it, and it is reported so the caller that created it can watch
+    // it reach `available` — the status it will be usable in — without having to ask for
+    // engine versions no caller can use. A request that wants only some statuses narrows
+    // with the `status` filter below.
+    if !entry.still_being_created
+        && input.include_all != Some(true)
+        && entry.status != STATUS_AVAILABLE
+    {
         return false;
     }
     // `Engine`: "The database engine to return version details for."

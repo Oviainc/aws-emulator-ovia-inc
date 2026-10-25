@@ -59,7 +59,11 @@ fn period_from_months(total: i64) -> String {
 
 /// The period `months` after `period` (negative for before), crossing year
 /// boundaries.
-fn shift_period(period: &str, months: i64) -> String {
+///
+/// Shared with the suites that read a period-scoped world from another angle
+/// (`tests/all/account_association_billing_periods.rs`), so one month arithmetic
+/// serves every period-scoped assertion in this crate.
+pub(crate) fn shift_period(period: &str, months: i64) -> String {
     period_from_months(period_months(period) + months)
 }
 

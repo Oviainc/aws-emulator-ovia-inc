@@ -22,6 +22,11 @@
 //! A new authorization is `PendingConnect`; `ConnectAppAuthorization` is what
 //! moves it to `Connected`, so the clock owes no transition here.
 //!
+//! An authorization whose `authType` is the OAuth2 one also reports the URL its
+//! consent step runs at (`authUrl`), derived from the stored record by
+//! [`crate::state::AppAuthorizationRecord::auth_url`]; one authorized by an API
+//! key has no consent step and reports none.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -340,6 +345,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             id: id.clone(),
             arn: arn.clone(),
             app_bundle_arn: app_bundle_arn.clone(),
+            app_bundle_id: bundle_key.clone(),
+            region: region.clone(),
             app: input.app,
             tenant_identifier: input.tenant.tenant_identifier,
             tenant_display_name: input.tenant.tenant_display_name,

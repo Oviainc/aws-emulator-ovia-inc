@@ -53,6 +53,11 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 /// to be real either way.
 pub(crate) const PAST_ACTIVATION: Duration = Duration::from_millis(900);
 
+/// Longer than a probe's whole teardown, so a read after this sleep observes a
+/// probe the clock has already finished tearing down: it is not reported any
+/// more. A blocking sleep, for the reason given on [`PAST_ACTIVATION`].
+pub(crate) const PAST_TEARDOWN: Duration = Duration::from_millis(900);
+
 /// The alphabet the `ResourceName` pattern admits: `^[a-zA-Z0-9_-]+$`.
 const NAME_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
 
@@ -911,7 +916,9 @@ async fn a_monitor_with_probes_activates_when_the_clock_makes_it_due() {
         "case \"a monitor with no probes\": nothing is due, got {idle:?}"
     );
 
-    // Deleting the last probe leaves the monitor with nothing to aggregate.
+    // Deleting the last probe is accepted as the start of its teardown, and the
+    // monitor is left with nothing to aggregate only once that teardown has run
+    // its course; `tests/all/probe_teardown.rs` pins the drain itself.
     let (status, deleted) = call(
         &router,
         "DELETE",
@@ -923,10 +930,11 @@ async fn a_monitor_with_probes_activates_when_the_clock_makes_it_due() {
         status, 200,
         "expected DeleteProbe 200, got {status} {deleted:?}"
     );
+    std::thread::sleep(PAST_TEARDOWN);
     let (_, emptied) = get_monitor(&router, "activating").await;
     assert!(
         probes_of(&emptied).is_empty(),
-        "the deleted probe must be gone from GetMonitor, got {emptied:?}"
+        "the torn-down probe must be gone from GetMonitor, got {emptied:?}"
     );
     assert_eq!(
         string_at(&emptied, "state"),

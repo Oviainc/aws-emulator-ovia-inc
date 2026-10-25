@@ -41,7 +41,7 @@
 //! never changes what a later caller sees and the transient status is observable because
 //! the span is never zero.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 /// The AutoML job V2 slice: the record, its clock and its constants. Re-exported below,
@@ -2417,6 +2417,18 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     /// two spellings. See [`TrialComponent`], at the end of this module with the rest of
     /// the experiment-tracking slice.
     pub trial_components: BTreeMap<String, TrialComponent>,
+    /// Which trial components are part of which trial: the
+    /// `([entity_key] of TrialName, [entity_key] of TrialComponentName)` pair that IS one
+    /// membership's whole identity, the way [`Self::associations`] keys a lineage edge by
+    /// its two ends. A component may be part of several trials, and a trial holds many
+    /// components, so the membership is an edge rather than a member of either record.
+    ///
+    /// Read by `ListTrialComponents`, whose `TrialName` and `ExperimentName` filters are
+    /// exactly "the components part of this trial" and "part of any trial of this
+    /// experiment". `AssociateTrialComponent` — the only call that attaches a component to
+    /// a trial — is a scaffolded stub today, so the index lives here, beside both stores it
+    /// relates, rather than in the listing that reads it.
+    pub trial_component_trials: BTreeSet<(String, String)>,
     /// Keyed by `ProcessingJobName`.
     pub processing_jobs: BTreeMap<String, ProcessingJob>,
     /// Keyed by `ComputeQuotaId` — the identifier SageMaker mints and every
@@ -5161,6 +5173,41 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// types rather than in the one above.
     pub fn trial_components_below_quota(&self) -> bool {
         self.trial_components.len() < TRIAL_COMPONENT_QUOTA
+    }
+
+    /// The [`entity_key`]s of the trial components that are part of the trial `trial_name`
+    /// names, read out of [`Self::trial_component_trials`].
+    ///
+    /// The name is folded the way the trial store folds it, so a filter spelling the trial
+    /// in another case selects the same components.
+    pub fn trial_component_keys_in_trial(&self, trial_name: &str) -> BTreeSet<String> {
+        let trial = entity_key(trial_name);
+        self.trial_component_trials
+            .iter()
+            .filter(|(member_of, _)| member_of == &trial)
+            .map(|(_, component)| component.clone())
+            .collect()
+    }
+
+    /// The [`entity_key`]s of the trial components that are part of ANY trial of the
+    /// experiment `experiment_name` names.
+    ///
+    /// A component is part of an experiment through a trial — a trial names the experiment
+    /// it belongs to ([`Trial::experiment_name`]) and a component is attached to a trial —
+    /// so this is the membership of the experiment's trials taken together.
+    pub fn trial_component_keys_in_experiment(&self, experiment_name: &str) -> BTreeSet<String> {
+        let experiment = entity_key(experiment_name);
+        let trials: BTreeSet<String> = self
+            .trials
+            .values()
+            .filter(|trial| entity_key(&trial.experiment_name) == experiment)
+            .map(|trial| entity_key(&trial.name))
+            .collect();
+        self.trial_component_trials
+            .iter()
+            .filter(|(member_of, _)| trials.contains(member_of))
+            .map(|(_, component)| component.clone())
+            .collect()
     }
 }
 

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutDestinationPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutDestinationPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutDestinationPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates — or, on a destination that already holds one, UPDATES — the access policy of one
+//! logical destination this account holds, storing the IAM policy document the request carries
+//! VERBATIM on that destination ([`crate::state::DestinationRecord::access_policy`]), which is
+//! what `DescribeDestinations` reports for it afterwards. A destination holds at most one
+//! access policy, so a put REPLACES whatever it held.
+//!
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +166,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutDestinationPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutDestinationPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutDestinationPolicy"))
+        // Attaching an access policy names the destination it is attached to and the policy
+        // to attach; nothing else on the request takes part, and the destination carries the
+        // Region and ARN it was created with already.
+        let _ = ctx;
+
+        let invalid = |message: String| {
+            PutDestinationPolicyError::from(
+                PutDestinationPolicyErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                ),
+            )
+        };
+
+        // `accessPolicy` is documented "This can be up to 5120 bytes" — a ceiling the model's
+        // `AccessPolicy` shape does not carry (`@length` min 1 only), so it is held here
+        // (`crate::state::MAX_ACCESS_POLICY_BYTES`). It is checked FIRST, so neither the parse
+        // below nor the store ever takes a document larger than the one the operation accepts.
+        if input.access_policy.len() > crate::state::MAX_ACCESS_POLICY_BYTES {
+            return Err(invalid(format!(
+                "accessPolicy can be up to {} bytes",
+                crate::state::MAX_ACCESS_POLICY_BYTES
+            )));
+        }
+
+        // "An access policy is an IAM policy document": a document that is not a JSON object
+        // is not one. Its statements are not interpreted here — they authorize claims from
+        // other accounts, which nothing in this store makes — so the document is kept and
+        // reported verbatim.
+        if !::serde_json::from_str::<::serde_json::Value>(&input.access_policy)
+            .is_ok_and(|document| document.is_object())
+        {
+            return Err(invalid(
+                "accessPolicy must be an IAM policy document (a JSON object)".to_string(),
+            ));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutDestinationPolicyError::from(
+                PutDestinationPolicyErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // The policy is "associated with an existing destination", so there is nothing to
+        // associate one with until `PutDestination` has created that destination. This
+        // operation models no `ResourceNotFoundException`, so a destination the account does
+        // not hold is refused with the `InvalidParameterException` it does model, carrying
+        // this service's missing-resource sentence for the kind that is missing.
+        let Some(destination) = store.destinations.get_mut(&input.destination_name) else {
+            return Err(invalid(crate::state::resource_not_found_message(
+                "destination",
+            )));
+        };
+
+        // `forceUpdate` is the caller's affirmation for ONE class of update: "Specify true if
+        // you are updating an existing destination policy to grant permission to an
+        // organization ID instead of granting permission to individual Amazon Web Services
+        // accounts [...] By specifying true for forceUpdate, you are affirming that you have
+        // already updated the subscription filters." Without the affirmation that update is
+        // refused, since it is the one that can stop the senders' subscription filters
+        // working; every other put — a first policy, a replacement that keeps granting
+        // accounts, or one whose predecessor already granted the organization — needs no
+        // affirmation, so the parameter does not affect it ("If you omit this parameter, the
+        // default of false is used").
+        let switches_to_organization_grant =
+            crate::state::access_policy_grants_organization(&input.access_policy)
+                && destination.access_policy.as_deref().is_some_and(|held| {
+                    !crate::state::access_policy_grants_organization(held)
+                });
+        if switches_to_organization_grant && input.force_update != Some(true) {
+            return Err(invalid(
+                crate::state::DESTINATION_POLICY_FORCE_UPDATE_REQUIRED.to_string(),
+            ));
+        }
+
+        // "Creates or updates an access policy associated with an existing destination": one
+        // destination holds at most one access policy, so the document this request carries
+        // REPLACES whatever it held, and the rest of the destination — its target, its role,
+        // its ARN, the instant it was created and its tags — is left exactly as it was.
+        destination.access_policy = Some(input.access_policy);
+
+        Ok(PutDestinationPolicyOutput)
     }
 }

@@ -56,6 +56,9 @@ mod boot_serve;
 // merges cleanly beside them.
 #[path = "all/cfn_provisions_declared_resources.rs"]
 mod cfn_provisions_declared_resources;
+// Declared HERE, in the sorted list, for the same reason.
+#[path = "all/chime_family_signing_name_routing.rs"]
+mod chime_family_signing_name_routing;
 // Declared in this span of the sorted list rather than appended at the end of this file,
 // for the reason the notes here give: the tail is the region every concurrently landing
 // suite appends to.

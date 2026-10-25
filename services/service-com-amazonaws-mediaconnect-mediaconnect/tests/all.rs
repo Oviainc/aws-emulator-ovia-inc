@@ -49,6 +49,8 @@ mod flow_source_metadata;
 mod flow_source_thumbnail;
 #[path = "all/flow_sources.rs"]
 mod flow_sources;
+#[path = "all/flow_sub_resource_tag_retention.rs"]
+mod flow_sub_resource_tag_retention;
 #[path = "all/flow_sub_resource_tags.rs"]
 mod flow_sub_resource_tags;
 #[path = "all/gateway_instances.rs"]

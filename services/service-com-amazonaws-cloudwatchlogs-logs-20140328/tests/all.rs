@@ -37,6 +37,8 @@ mod delivery_destination_policy_reads;
 mod delivery_destinations;
 #[path = "all/delivery_sources.rs"]
 mod delivery_sources;
+#[path = "all/destination_policies.rs"]
+mod destination_policies;
 #[path = "all/destinations.rs"]
 mod destinations;
 #[path = "all/harness.rs"]

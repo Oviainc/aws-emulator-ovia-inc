@@ -284,9 +284,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A model name names at most one custom model of this account and region — the
+        // model this call would mint, and the one a customization job is already
+        // customizing under that name, which is the same resource reached before it exists.
         if store
             .custom_model_names
             .contains_key(&(region.clone(), input.model_name.clone()))
+            || store.customizes_model_named(&region, &input.model_name)
         {
             return Err(CreateCustomModelErrorModeled::ConflictException(
                 ConflictException {
@@ -333,6 +337,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             base_model_arn: arn.clone(),
             base_model_name: crate::state::CUSTOM_MODEL_IMPORTED_BASE.to_string(),
             foundation_model_arn: None,
+            // No customization job produced this model: the request named its artifacts.
+            job_arn: None,
             customization_type: crate::state::CUSTOMIZATION_TYPE_IMPORTED,
             model_source_config: input.model_source_config,
             custom_model_data_source: input.custom_model_data_source,

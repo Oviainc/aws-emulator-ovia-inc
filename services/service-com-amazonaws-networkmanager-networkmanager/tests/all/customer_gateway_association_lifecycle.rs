@@ -48,12 +48,12 @@ fn cgw_arn(partition: &str, region: &str, account: &str, hex: &str) -> String {
 }
 
 /// A customer gateway ARN in the shape most requests carry, distinguished by `hex`.
-fn plain_cgw_arn(hex: &str) -> String {
+pub(crate) fn plain_cgw_arn(hex: &str) -> String {
     cgw_arn("aws", "us-west-2", "123456789012", hex)
 }
 
 /// `AssociateCustomerGateway` on `network` with `body`.
-async fn associate(emulator: &Emulator, network: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn associate(emulator: &Emulator, network: &str, body: Value) -> (u16, Value) {
     emulator
         .post(
             &format!("/global-networks/{network}/customer-gateway-associations"),
@@ -64,7 +64,7 @@ async fn associate(emulator: &Emulator, network: &str, body: Value) -> (u16, Val
 
 /// `DisassociateCustomerGateway` for `arn` on `network`. The ARN travels in a NON-greedy
 /// `@httpLabel`, so a client sends its `:` and `/` percent-encoded.
-async fn disassociate(emulator: &Emulator, network: &str, arn: &str) -> (u16, Value) {
+pub(crate) async fn disassociate(emulator: &Emulator, network: &str, arn: &str) -> (u16, Value) {
     emulator
         .delete(&format!(
             "/global-networks/{network}/customer-gateway-associations/{}",
@@ -74,7 +74,11 @@ async fn disassociate(emulator: &Emulator, network: &str, arn: &str) -> (u16, Va
 }
 
 /// `GetCustomerGatewayAssociations` on `network` with `query` appended to the URI.
-async fn get_associations(emulator: &Emulator, network: &str, query: &str) -> (u16, Value) {
+pub(crate) async fn get_associations(
+    emulator: &Emulator,
+    network: &str,
+    query: &str,
+) -> (u16, Value) {
     let uri = if query.is_empty() {
         format!("/global-networks/{network}/customer-gateway-associations")
     } else {
@@ -84,7 +88,7 @@ async fn get_associations(emulator: &Emulator, network: &str, query: &str) -> (u
 }
 
 /// The `CustomerGatewayArn`s a reader page lists, in the order returned.
-fn arns_of(body: &Value) -> Vec<String> {
+pub(crate) fn arns_of(body: &Value) -> Vec<String> {
     body["CustomerGatewayAssociations"]
         .as_array()
         .unwrap_or_else(|| panic!("expected a CustomerGatewayAssociations array in {body}"))
@@ -99,7 +103,7 @@ fn arns_of(body: &Value) -> Vec<String> {
 }
 
 /// The one association the reader answers for `arn`, or `None` when it answers none.
-async fn read_one(emulator: &Emulator, network: &str, arn: &str) -> Option<Value> {
+pub(crate) async fn read_one(emulator: &Emulator, network: &str, arn: &str) -> Option<Value> {
     let (status, body) = get_associations(
         emulator,
         network,
@@ -123,10 +127,10 @@ async fn read_one(emulator: &Emulator, network: &str, arn: &str) -> Option<Value
 
 /// A device of `network`, with a link of a fresh site associated with it, so an associate
 /// naming that link satisfies the documented precondition.
-struct DeviceWithLink {
+pub(crate) struct DeviceWithLink {
     site: String,
-    device: String,
-    link: String,
+    pub(crate) device: String,
+    pub(crate) link: String,
 }
 
 /// Associate `link` with `device` in `network`, which is what makes a customer gateway
@@ -145,7 +149,11 @@ async fn associate_link(emulator: &Emulator, network: &str, device: &str, link: 
 }
 
 /// Create a site of `network`, a device at it and a link at it, and associate the pair.
-async fn device_with_link(emulator: &Emulator, network: &str, label: &str) -> DeviceWithLink {
+pub(crate) async fn device_with_link(
+    emulator: &Emulator,
+    network: &str,
+    label: &str,
+) -> DeviceWithLink {
     let site = emulator.create_site(network, label).await;
     let device = create_device_ok(emulator, network, json!({ "SiteId": site })).await;
     let link = create_link_ok(emulator, network, &site, &plain_link()).await;

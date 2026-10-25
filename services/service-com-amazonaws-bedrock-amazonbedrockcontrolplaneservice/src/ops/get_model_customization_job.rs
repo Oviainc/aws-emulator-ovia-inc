@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetModelCustomizationJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetModelCustomizationJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetModelCustomizationJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the model customization job a `ModelCustomizationJobIdentifier` names — its
+//! ARN or its bare `jobName` — out of the record `ops/create_model_customization_job.rs`
+//! wrote, with the status transition the clock has already made due materialised first.
 //!
 //! ## Shape of an operation
 //!
@@ -196,18 +191,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetModelCustomizationJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetModelCustomizationJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetModelCustomizationJob"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetModelCustomizationJobErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "model customization job state is not available on this engine"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some(job) = store.model_customization_job(&input.job_identifier, &region, now) else {
+            return Err(
+                GetModelCustomizationJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "no model customization job answers to {} in this account in \
+                             {region}",
+                            input.job_identifier
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetModelCustomizationJobOutput {
+            job_arn: job.arn.clone(),
+            job_name: job.name.clone(),
+            output_model_name: job.output_model_name.clone(),
+            output_model_arn: Some(job.output_model_arn.clone()),
+            client_request_token: job.client_request_token.clone(),
+            role_arn: job.role_arn.clone(),
+            status: Some(job.status.to_string()),
+            // "For a Distillation job, the details about the statuses of the sub-tasks of
+            // the customization job": this emulator runs no sub-task, so there is no
+            // sub-task status to report.
+            status_details: None,
+            // "Information about why the job failed": a job that is running, stopping or
+            // that reached a terminal status without failing has none, and this emulator
+            // mints no `Failed` job.
+            failure_message: None,
+            creation_time: crate::state::date_time(job.created_at),
+            last_modified_time: Some(crate::state::date_time(job.last_modified_at)),
+            // "Time that the resource transitioned to terminal state": absent while the job
+            // is still running or winding down.
+            end_time: job.ended_at.map(crate::state::date_time),
+            base_model_arn: job.base_model_arn.clone(),
+            hyper_parameters: job.hyper_parameters.clone(),
+            training_data_config: job.training_data_config.clone(),
+            validation_data_config: job.validation_data_config.clone(),
+            output_data_config: job.output_data_config.clone(),
+            customization_type: Some(job.customization_type.to_string()),
+            output_model_kms_key_arn: job.output_model_kms_key_arn.clone(),
+            // The training and validation metrics are computed BY the customization run;
+            // this emulator runs none, so neither is reported rather than reported as a
+            // fabricated loss.
+            training_metrics: None,
+            validation_metrics: None,
+            vpc_config: job.vpc_config.clone(),
+            customization_config: job.customization_config.clone(),
+        })
     }
 }
