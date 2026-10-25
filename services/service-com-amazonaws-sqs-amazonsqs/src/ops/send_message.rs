@@ -2,8 +2,11 @@
 
 //! @op SendMessage
 //! IMPLEMENTED: this operation appends a message to the queue's arrival-order deque in
-//! [`crate::state`] and answers with its id and content digests. It is the ONLY file to
-//! touch for `SendMessage`.
+//! [`crate::state`] and answers with its id and content digests. On a FIFO queue it
+//! also honours the FIFO members — it requires a `MessageGroupId`, deduplicates on the
+//! `MessageDeduplicationId` (supplied, or derived from the body under
+//! `ContentBasedDeduplication`) and assigns the message a `SequenceNumber`. It is the
+//! ONLY file to touch for `SendMessage`.
 //!
 //! ## Shape of an operation
 //!
@@ -274,45 +277,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let fifo = queue.is_fifo();
 
-        // A FIFO queue delivers in message-group order and deduplicates, neither of
-        // which is written yet: answer the scaffold's 501 for that path rather than
-        // accepting a message this emulator would deliver out of order.
-        if queue.is_fifo() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "SendMessage to a FIFO queue",
+        // A member this emulator does not honour is refused rather than silently
+        // dropped on a 200: `MessageSystemAttributes` carries the X-Ray trace header,
+        // which nothing here propagates.
+        if input
+            .message_system_attributes
+            .as_ref()
+            .is_some_and(|attributes| !attributes.is_empty())
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "The request includes MessageSystemAttributes, which this emulator does not \
+                 support yet: it carries the X-Ray trace header, which nothing here propagates.",
             ));
         }
 
-        // FIFO-only parameters, and members this emulator does not honour, are refused
-        // rather than silently dropped on a 200.
-        for (member, present) in [
-            ("MessageGroupId", input.message_group_id.is_some()),
-            (
-                "MessageDeduplicationId",
-                input.message_deduplication_id.is_some(),
-            ),
-            (
-                "MessageSystemAttributes",
-                input
-                    .message_system_attributes
-                    .as_ref()
-                    .is_some_and(|attributes| !attributes.is_empty()),
-            ),
-        ] {
-            if present {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "The request includes {member}, which this emulator does not support yet: \
-                     MessageGroupId and MessageDeduplicationId apply only to a FIFO queue, and \
-                     MessageSystemAttributes carries the X-Ray trace header, which nothing here \
-                     propagates."
-                )));
+        // "In FIFO queues, MessageGroupId organizes messages into distinct groups ...
+        // If you do not provide a MessageGroupId when sending a message to a FIFO
+        // queue, the action fails." A standard queue may carry one too ("In standard
+        // queues, using MessageGroupId enables fair queues"), where it identifies a
+        // tenant and orders nothing.
+        let group_id = input.message_group_id.clone();
+        match &group_id {
+            Some(given) => {
+                if let Some(reason) = sqs::message_token_refusal("MessageGroupId", given) {
+                    return Err(crate::scaffolded::Scaffolded::validation(reason));
+                }
             }
+            None if fifo => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "The request must carry a MessageGroupId: the queue it addresses is a FIFO \
+                     queue, which hands a group's messages over in strict order.",
+                ));
+            }
+            None => {}
         }
 
-        // The queue's own DelaySeconds applies when the request names none; either way
-        // the value must be inside the range the model documents for the attribute.
+        // The token this message is deduplicated under, on a FIFO queue: the one the
+        // request supplied, or — "if you aren't able to provide a MessageDeduplicationId
+        // and you enable ContentBasedDeduplication for your queue" — a SHA-256 hash of
+        // the body. "If you don't provide a MessageDeduplicationId and the queue doesn't
+        // have ContentBasedDeduplication set, the action fails with an error."
+        let deduplication_id = match input.message_deduplication_id.clone() {
+            Some(given) => {
+                if !fifo {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "The request includes MessageDeduplicationId, which applies only to a \
+                         FIFO queue; the queue it addresses is a standard queue.",
+                    ));
+                }
+                if let Some(reason) = sqs::message_token_refusal("MessageDeduplicationId", &given) {
+                    return Err(crate::scaffolded::Scaffolded::validation(reason));
+                }
+                Some(given)
+            }
+            None if fifo && queue.content_based_deduplication() => {
+                Some(sqs::content_deduplication_token(&input.message_body))
+            }
+            None if fifo => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "The request must carry a MessageDeduplicationId, or the FIFO queue it \
+                     addresses must have ContentBasedDeduplication enabled.",
+                ));
+            }
+            None => None,
+        };
+
+        // "When you set FifoQueue, you can't set DelaySeconds per message. You can set
+        // this parameter only on a queue level." The queue's own value applies when the
+        // request names none; either way the value must be inside the range the model
+        // documents for the attribute.
         let (min_delay, max_delay) = sqs::integer_bounds(sqs::DELAY_SECONDS);
+        if fifo && input.delay_seconds.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "The request includes DelaySeconds, which cannot be set per message on a FIFO \
+                 queue; set the DelaySeconds attribute on the queue instead.",
+            ));
+        }
         let delay = match input.delay_seconds {
             Some(requested) => i64::from(requested),
             None => queue.integer(sqs::DELAY_SECONDS),
@@ -358,6 +400,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        let md5_of_body = sqs::md5_hex(input.message_body.as_bytes());
+        let md5_of_message_attributes = sqs::md5_of_message_attributes(&message_attributes);
+
+        // "If a message with a particular MessageDeduplicationId is sent successfully,
+        // any messages sent with the same MessageDeduplicationId are accepted
+        // successfully but aren't delivered during the 5-minute deduplication
+        // interval": the resend stores nothing and answers for the message the token
+        // already admitted. Checked before the store bounds below, because a resend
+        // adds nothing a bound could refuse.
+        let deduplication_key = deduplication_id
+            .as_ref()
+            .map(|token| queue.deduplication_key(group_id.as_deref().unwrap_or_default(), token));
+        if let Some(admitted) = deduplication_key
+            .as_ref()
+            .and_then(|key| queue.deduplication.get(key))
+        {
+            return Ok(SendMessageOutput {
+                md5_of_message_body: Some(md5_of_body),
+                md5_of_message_attributes,
+                md5_of_message_system_attributes: None,
+                message_id: Some(admitted.message_id.clone()),
+                sequence_number: Some(admitted.sequence_number.clone()),
+            });
+        }
+
         // What this in-memory store can be made to hold is bounded, counting every byte
         // the message retains; a message over the bound is refused rather than accepted
         // and silently evicted later.
@@ -368,28 +435,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let md5_of_body = sqs::md5_hex(input.message_body.as_bytes());
-        let md5_of_message_attributes = sqs::md5_of_message_attributes(&message_attributes);
         let message_id = sqs::new_identifier();
+        // Only a FIFO queue sequences its messages; `SequenceNumber` "applies only to
+        // FIFO (first-in-first-out) queues".
+        let sequence_number = fifo.then(|| queue.next_sequence_number());
 
         queue.messages.push_back(sqs::StoredMessage {
             message_id: message_id.clone(),
             body: input.message_body,
             md5_of_body: md5_of_body.clone(),
             message_attributes,
+            message_group_id: group_id,
+            message_deduplication_id: deduplication_id,
+            sequence_number: sequence_number.clone(),
             sent_at: now,
             available_at: sqs::after(now, delay),
             invisible_until: None,
             receive_count: 0,
             first_received_at: None,
         });
+        if let (Some(key), Some(sequence_number)) = (deduplication_key, sequence_number.clone()) {
+            queue.record_deduplication(
+                key,
+                sqs::Deduplication {
+                    message_id: message_id.clone(),
+                    sequence_number,
+                    accepted_at: now,
+                },
+            );
+        }
 
         Ok(SendMessageOutput {
             md5_of_message_body: Some(md5_of_body),
             md5_of_message_attributes,
             md5_of_message_system_attributes: None,
             message_id: Some(message_id),
-            sequence_number: None,
+            sequence_number,
         })
     }
 }

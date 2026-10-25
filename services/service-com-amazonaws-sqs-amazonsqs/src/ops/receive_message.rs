@@ -3,8 +3,9 @@
 //! @op ReceiveMessage
 //! IMPLEMENTED: this operation hands out the queue's currently visible messages from
 //! [`crate::state`], makes each one invisible for the effective visibility timeout and
-//! mints a receipt handle per delivery. It is the ONLY file to touch for
-//! `ReceiveMessage`.
+//! mints a receipt handle per delivery. On a FIFO queue it hands a message group's
+//! messages over in strict send order, one group member in flight at a time. It is the
+//! ONLY file to touch for `ReceiveMessage`.
 //!
 //! ## Shape of an operation
 //!
@@ -341,14 +342,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     i64::from,
                 ));
 
-                let taking: Vec<usize> = queue
-                    .messages
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, message)| message.visibility(now) == sqs::Visibility::Visible)
-                    .map(|(index, _)| index)
-                    .take(usize::try_from(max_messages).unwrap_or(1))
-                    .collect();
+                let taking: Vec<usize> =
+                    queue.delivery_order(now, usize::try_from(max_messages).unwrap_or(1));
 
                 let mut delivered = Vec::with_capacity(taking.len());
                 let mut minted = Vec::with_capacity(taking.len());
@@ -413,11 +408,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The message system attributes this emulator holds, filtered to the ones `requested`
 /// selects.
 ///
-/// Only the attributes the emulator genuinely records are reported:
-/// `SentTimestamp`, `ApproximateReceiveCount` and `ApproximateFirstReceiveTimestamp`.
+/// Only the attributes the emulator genuinely records are reported: `SentTimestamp`,
+/// `ApproximateReceiveCount`, `ApproximateFirstReceiveTimestamp` and, for a message
+/// that carries them, `MessageGroupId`, `MessageDeduplicationId` and `SequenceNumber`.
 /// The rest of the `MessageSystemAttributeName` set belongs to behaviour that is not
-/// implemented (FIFO sequencing and deduplication, X-Ray trace headers, dead-letter
-/// redrive, caller principals), so it is omitted rather than invented.
+/// implemented (X-Ray trace headers, dead-letter redrive, caller principals), so it is
+/// omitted rather than invented.
 fn system_attributes(
     message: &sqs::StoredMessage,
     requested: &[String],
@@ -435,6 +431,18 @@ fn system_attributes(
     );
     if let Some(first) = message.first_received_at {
         offer("ApproximateFirstReceiveTimestamp", sqs::epoch_millis(first));
+    }
+    // The three a FIFO send records. "The MessageDeduplicationId is available to the
+    // consumer of the message", and a consumer of several interleaved streams needs the
+    // group each message belongs to.
+    if let Some(group_id) = &message.message_group_id {
+        offer("MessageGroupId", group_id.clone());
+    }
+    if let Some(deduplication_id) = &message.message_deduplication_id {
+        offer("MessageDeduplicationId", deduplication_id.clone());
+    }
+    if let Some(sequence_number) = &message.sequence_number {
+        offer("SequenceNumber", sequence_number.clone());
     }
     attributes
 }

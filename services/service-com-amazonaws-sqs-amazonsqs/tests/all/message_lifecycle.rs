@@ -915,8 +915,8 @@ async fn message_attribute_names_select_exactly_what_was_asked_for() {
 
 /// Members `SendMessage` cannot honour are refused by name, not accepted and silently
 /// dropped on a 200: the list-valued message attributes and the value-less one the model
-/// documents as "Not implemented. Reserved for future use.", and the FIFO-only and
-/// trace-header members.
+/// documents as "Not implemented. Reserved for future use.", the FIFO-only member a
+/// standard queue has no meaning for, and the trace-header member.
 #[tokio::test]
 async fn send_message_refuses_the_members_it_cannot_honour() {
     let sqs = Emulator::new();
@@ -953,8 +953,7 @@ async fn send_message_refuses_the_members_it_cannot_honour() {
         );
     }
 
-    let unsupported: [(&str, Value); 3] = [
-        ("MessageGroupId", json!({ "MessageGroupId": "group-1" })),
+    let unsupported: [(&str, Value); 2] = [
         (
             "MessageDeduplicationId",
             json!({ "MessageDeduplicationId": "dedup-1" }),
@@ -1208,37 +1207,49 @@ async fn the_retained_message_bytes_and_count_are_bounded() {
     );
 }
 
-/// A FIFO queue is created (its configuration is real), but sending to one answers the
-/// honest 501: per-message-group ordering and deduplication are not written, and a
-/// message this emulator would deliver out of order is worse than a refusal.
+/// A FIFO queue serves the message plane like any other queue — the FIFO rules
+/// themselves (the tokens a send must carry, the sequence number it is assigned,
+/// per-group order on receive and deduplication) are pinned by `fifo_queue.rs`; what
+/// this suite pins is that a send to one is accepted and that the queue then holds it.
 #[tokio::test]
-async fn sending_to_a_fifo_queue_is_still_answered_as_not_implemented() {
+async fn sending_to_a_fifo_queue_is_accepted_and_held() {
     let sqs = Emulator::new();
     let url = sqs
         .create_queue_with("ordered.fifo", &json!({ "FifoQueue": "true" }))
         .await;
 
-    for body in [
-        json!({ "QueueUrl": url, "MessageBody": "x" }),
-        json!({ "QueueUrl": url, "MessageBody": "x", "MessageGroupId": "g" }),
-    ] {
-        let (status, answer) = sqs.call("SendMessage", &body).await;
-        assert_eq!(
-            (status, error_code(&answer).as_str()),
-            (501, "NotImplemented"),
-            "case {body}: got {status} {answer:?}"
-        );
-    }
+    let (status, answer) = sqs
+        .call(
+            "SendMessage",
+            &json!({
+                "QueueUrl": url,
+                "MessageBody": "x",
+                "MessageGroupId": "g",
+                "MessageDeduplicationId": "d",
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "case send to a FIFO queue: got {status} {answer:?}");
+    assert!(
+        answer["SequenceNumber"]
+            .as_str()
+            .is_some_and(|number| !number.is_empty()),
+        "case send to a FIFO queue: expected a SequenceNumber, got {answer:?}"
+    );
+    assert_eq!(
+        sqs.count(&url, "ApproximateNumberOfMessages").await,
+        "1",
+        "case after the send: the FIFO queue must hold the message"
+    );
 
-    // A FIFO queue therefore holds nothing, and a receive on it is an empty success
-    // rather than an error.
     let (status, received) = sqs
         .call("ReceiveMessage", &json!({ "QueueUrl": url }))
         .await;
     assert_eq!(status, 200, "case ReceiveMessage on a FIFO queue: {received:?}");
-    assert!(
-        received.get("Messages").is_none(),
-        "case ReceiveMessage on a FIFO queue: expected no messages, got {received:?}"
+    assert_eq!(
+        received["Messages"][0]["Body"].as_str(),
+        Some("x"),
+        "case ReceiveMessage on a FIFO queue: expected the message back, got {received:?}"
     );
 }
 

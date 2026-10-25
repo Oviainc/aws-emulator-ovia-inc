@@ -26,14 +26,14 @@ tracing = { workspace = true }
 md-5 = "0.10"
 # Hex rendering of those digests.
 hex = { workspace = true }
+# SHA-256 of a message body, which is the deduplication token a FIFO queue with
+# ContentBasedDeduplication derives for it.
+sha2 = { workspace = true }
 # MessageId / ReceiptHandle identifiers.
 uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
 
 [lints]
 workspace = true
