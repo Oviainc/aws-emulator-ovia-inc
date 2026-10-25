@@ -3310,11 +3310,27 @@ pub fn app_arn(region: &str, key: &AppKey) -> String {
     )
 }
 
+/// The resource policy a resource nothing has shared carries: an IAM policy document with
+/// no statements, which is the empty JSON object.
+///
+/// `GetLineageGroupPolicy` reports a document for every lineage group it finds — both of
+/// its output members are optional, yet a group nobody has granted access to still has a
+/// policy, and an IAM policy document is a JSON object (see
+/// [`resource_policy_violation`]). So this is the document a group starts with, rather than
+/// an absent member a caller would have to read as "there is no policy".
+pub const EMPTY_RESOURCE_POLICY: &str = "{}";
+
+/// The ARN resource kind a lineage group carries, i.e. the `<kind>` in [`resource_arn`].
+/// Fixed by `LineageGroupArn`'s modelled pattern
+/// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:lineage-group/`), and named once
+/// here so the ARN mint and the readers that resolve an ARN back to a name cannot drift.
+pub const LINEAGE_GROUP_KIND: &str = "lineage-group";
+
 /// The ARN of one named lineage group, as `LineageGroupArn` carries it. The single owner
 /// of the `lineage-group` ARN resource kind, so a listing and a describe cannot drift
 /// apart.
 pub fn named_lineage_group_arn(region: &str, name: &str) -> String {
-    resource_arn(region, "lineage-group", name)
+    resource_arn(region, LINEAGE_GROUP_KIND, name)
 }
 
 /// The ARN of the Region's default lineage group (see [`DEFAULT_LINEAGE_GROUP`]), as
@@ -4740,6 +4756,16 @@ pub struct LineageGroup {
     pub last_modified_by: Option<UserContext>,
     pub creation_time: SystemTime,
     pub last_modified_time: SystemTime,
+    /// The resource-based policy document that gives another account access to this
+    /// group, as `GetLineageGroupPolicy` reports it: an IAM policy document, and
+    /// [`EMPTY_RESOURCE_POLICY`] while nothing has shared the group.
+    ///
+    /// Held on the group's own record rather than in a second map, so the policy a group
+    /// carries lives beside the group a describe reports and cannot outlive it. The whole
+    /// SageMaker surface models no operation that attaches one — a lineage group is shared
+    /// with another account by a resource share, not by a call on this service — so a
+    /// group this service materialises carries the empty document.
+    pub resource_policy: String,
 }
 
 impl ComAmazonawsSagemakerSagemakerState {
@@ -4834,6 +4860,9 @@ impl ComAmazonawsSagemakerSagemakerState {
                     last_modified_by: None,
                     creation_time: now,
                     last_modified_time: now,
+                    // Nothing has shared a group the service has just materialised, so it
+                    // carries the empty policy document.
+                    resource_policy: EMPTY_RESOURCE_POLICY.to_string(),
                 });
                 Some(arn)
             }
