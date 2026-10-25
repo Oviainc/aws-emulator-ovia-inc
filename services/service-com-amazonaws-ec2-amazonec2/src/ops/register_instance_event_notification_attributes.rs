@@ -135,7 +135,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             dry_run_operation, instance_event_registration_payload_bytes, request_region,
-            require_service_state, validate_tag_size, InstanceEventTagRegistration,
+            require_service_state, validate_tag_key, InstanceEventTagRegistration,
             MAX_EVENT_NOTIFICATION_REGIONS, MAX_STORED_BYTES,
         };
 
@@ -163,14 +163,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A registered key is a TAG key, so it is bounded the way every other tag key this
         // service accepts is: the model declares no `@length` on `InstanceTagKeySet`'s
         // member, so the handler is the only place the bound can exist, and without one a
-        // single request could store caller-chosen megabytes per Region.
+        // single request could store caller-chosen megabytes per Region. This request
+        // carries keys alone, so it checks exactly the key rule, through the same entry
+        // point the deregister of the same registration checks its keys with.
         for key in requested_keys {
             if key.is_empty() {
                 return Err(Scaffolded::invalid_parameter_value(
                     "A tag key cannot be empty",
                 ));
             }
-            validate_tag_size(key, "")?;
+            validate_tag_key(key)?;
         }
 
         // The registration is a fact of the Region the request was signed for: the
