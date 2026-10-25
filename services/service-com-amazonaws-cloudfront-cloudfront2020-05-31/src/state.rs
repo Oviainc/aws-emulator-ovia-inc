@@ -4008,13 +4008,51 @@ where
 /// ones — both declare the member, so both are walked here and a distribution is associated
 /// with the policy as soon as ONE of them names it.
 pub fn references_cache_policy(config: &DistributionConfig, cache_policy_id: &str) -> bool {
-    behavior_cache_policy_ids(config).any(|id| id == cache_policy_id)
+    behavior_attachments(
+        config,
+        |behavior| behavior.cache_policy_id.as_deref(),
+        |behavior| behavior.cache_policy_id.as_deref(),
+    )
+    .any(|id| id == cache_policy_id)
 }
 
-/// The cache policy id every cache behaviour of `config` names — the default behaviour
-/// first, then each ordered one — skipping the behaviours that name none.
-fn behavior_cache_policy_ids(config: &DistributionConfig) -> impl Iterator<Item = &str> + '_ {
-    std::iter::once(config.default_cache_behavior.cache_policy_id.as_deref())
+/// Whether `config` associates any of its cache behaviours with the origin request policy
+/// `origin_request_policy_id` names.
+///
+/// An origin request policy is attached to a distribution by a cache behaviour's
+/// `OriginRequestPolicyId`, and a distribution's behaviours are its DEFAULT cache behaviour
+/// together with its ordered ones — both declare the member, so both are walked here and a
+/// distribution is associated with the policy as soon as ONE of them names it. The SAME
+/// rule [`references_cache_policy`] states for the other policy a cache behaviour attaches,
+/// over the same walk.
+pub fn references_origin_request_policy(
+    config: &DistributionConfig,
+    origin_request_policy_id: &str,
+) -> bool {
+    behavior_attachments(
+        config,
+        |behavior| behavior.origin_request_policy_id.as_deref(),
+        |behavior| behavior.origin_request_policy_id.as_deref(),
+    )
+    .any(|id| id == origin_request_policy_id)
+}
+
+/// What every cache behaviour of `config` attaches through one of its members — the default
+/// behaviour first, then each ordered one — skipping the behaviours that attach nothing.
+///
+/// A distribution's behaviours are its default cache behaviour and its ordered ones, which
+/// are DIFFERENT shapes carrying the same attachment members, so each is read by its own
+/// accessor and the walk over them is stated once here.
+pub(crate) fn behavior_attachments<'a, D, O>(
+    config: &'a DistributionConfig,
+    from_default: D,
+    from_ordered: O,
+) -> impl Iterator<Item = &'a str> + 'a
+where
+    D: FnOnce(&'a DefaultCacheBehavior) -> Option<&'a str>,
+    O: FnMut(&'a CacheBehavior) -> Option<&'a str> + 'a,
+{
+    std::iter::once(from_default(&config.default_cache_behavior))
         .chain(
             config
                 .cache_behaviors
@@ -4022,7 +4060,7 @@ fn behavior_cache_policy_ids(config: &DistributionConfig) -> impl Iterator<Item 
                 .and_then(|behaviors| behaviors.items.as_deref())
                 .unwrap_or_default()
                 .iter()
-                .map(|behavior| behavior.cache_policy_id.as_deref()),
+                .map(from_ordered),
         )
         .flatten()
 }

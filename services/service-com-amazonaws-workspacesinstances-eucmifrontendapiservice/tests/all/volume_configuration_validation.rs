@@ -156,12 +156,19 @@ fn minimal_body(spec: &VolumeTypeSpec, zone: &str) -> Value {
 async fn the_availability_zone_must_be_one_of_the_signed_regions_zones() {
     let (router, engine) = harness();
 
-    // Three Regions this service publishes (`ListRegions`), one of them the Region the
-    // issue's requests were signed for and two it never cites. The zones of a Region
-    // are `<region><letter>` for each letter the account's Regions carry
-    // (`wsinst::state::AVAILABILITY_ZONE_LETTERS`), which is the set EC2 reports for
-    // the same Region.
-    let regions = ["us-east-1", "eu-west-3", "ap-northeast-2"];
+    // Regions this service publishes (`ListRegions`), one of them the Region the
+    // issue's requests were signed for and the rest ones it never cites. They differ in
+    // how many zones they publish and in which letters those are: six contiguous
+    // letters, four, three, and a Region whose letters have a gap — so the rule is
+    // asserted over Regions of every zone-set shape rather than one.
+    let regions = [
+        "us-east-1",
+        "us-west-2",
+        "eu-west-3",
+        "ap-northeast-2",
+        "ap-northeast-1",
+        "ca-central-1",
+    ];
     for region in regions {
         assert!(
             wsinst::state::SUPPORTED_REGIONS.contains(&region),
@@ -169,7 +176,8 @@ async fn the_availability_zone_must_be_one_of_the_signed_regions_zones() {
              {:?}",
             wsinst::state::SUPPORTED_REGIONS
         );
-        for letter in wsinst::state::AVAILABILITY_ZONE_LETTERS {
+        let letters = wsinst::state::availability_zone_letters(region);
+        for letter in letters.chars() {
             let zone = format!("{region}{letter}");
             assert_created(
                 &router,
@@ -181,25 +189,24 @@ async fn the_availability_zone_must_be_one_of_the_signed_regions_zones() {
             .await;
         }
 
-        // One letter past the zones the Region has, a zone of a DIFFERENT Region, the
-        // Region's own name, text that is not a zone at all, and the empty string the
-        // modelled `len 0..64` admits.
-        let past_the_last = format!(
-            "{region}{}",
-            char::from(
-                wsinst::state::AVAILABILITY_ZONE_LETTERS
-                    .last()
-                    .copied()
-                    .expect("the letter set is not empty") as u8
-                    + 1
-            )
-        );
+        // One letter past the zones the Region has, every letter inside the run that the
+        // Region does NOT publish (Tokyo's `b`, Canada Central's `c`), a zone of a
+        // DIFFERENT Region, the Region's own name, text that is not a zone at all, the
+        // empty string the modelled `len 0..64` admits, and its 64-character maximum.
+        let last = letters
+            .chars()
+            .next_back()
+            .expect("a Region this service serves publishes at least one zone");
+        let past_the_last = format!("{region}{}", char::from(last as u8 + 1));
         let other_region = regions
             .iter()
             .find(|candidate| **candidate != region)
-            .expect("three Regions, so another one exists");
-        let rows: Vec<(String, String)> = vec![
-            ("one letter past the Region's zones".to_string(), past_the_last),
+            .expect("more than one Region, so another one exists");
+        let mut rows: Vec<(String, String)> = vec![
+            (
+                "one letter past the Region's zones".to_string(),
+                past_the_last,
+            ),
             (
                 "a zone of another Region".to_string(),
                 format!("{other_region}a"),
@@ -212,6 +219,12 @@ async fn the_availability_zone_must_be_one_of_the_signed_regions_zones() {
                 "a".repeat(64),
             ),
         ];
+        for skipped in ('a'..=last).filter(|letter| !letters.contains(*letter)) {
+            rows.push((
+                format!("the letter {skipped} this Region does not publish"),
+                format!("{region}{skipped}"),
+            ));
+        }
         for (case, zone) in rows {
             assert_refused(
                 &router,

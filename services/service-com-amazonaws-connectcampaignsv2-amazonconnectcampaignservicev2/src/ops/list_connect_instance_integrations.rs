@@ -151,7 +151,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         /// The page size when the caller names none: the model's `maxResults`
         /// upper bound (`range 1..50`), so an unpaged call sees as much as one
@@ -172,13 +172,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // The instance and its integrations are the ones the region this request was
+        // signed for holds.
+        let region = crate::state::request_region(ctx);
         let store = state.lock();
 
         // Whether the instance exists at all is the instance-onboarding store's
         // answer, the same one the put asks: an instance with no finished onboarding
         // job is not found, which is a different answer from an onboarded instance
         // that holds no integration (an empty list).
-        if !store.is_onboarded(&input.connect_instance_id, now) {
+        if !store.is_onboarded(&region, &input.connect_instance_id, now) {
             return Err(
                 ListConnectInstanceIntegrationsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -192,8 +195,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let integrations: Vec<&crate::state::StoredIntegration> =
-            store.instance_integrations(&input.connect_instance_id).collect();
+        let integrations: Vec<&crate::state::StoredIntegration> = store
+            .instance_integrations(&region, &input.connect_instance_id)
+            .collect();
 
         // The cursor is the sequence number the previous page ended at, so this page
         // is every integration stored after it. An integration removed between two

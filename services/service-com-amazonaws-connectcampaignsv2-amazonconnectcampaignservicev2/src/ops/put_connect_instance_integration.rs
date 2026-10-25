@@ -187,13 +187,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // The instance and its integrations are the ones the region this request was
+        // signed for holds.
+        let region = crate::state::request_region(ctx);
         let mut store = state.lock();
 
         // An integration belongs to a Connect instance onboarded to Campaigns: the
         // instance-onboarding store is the one record of which instances those are,
         // so an instance whose onboarding job has not finished there has nothing to
         // integrate and the put is refused BEFORE anything is stored.
-        if !store.is_onboarded(&input.connect_instance_id, now) {
+        if !store.is_onboarded(&region, &input.connect_instance_id, now) {
             crate::state::audit_onboarding_change(
                 ctx.parts(),
                 Self::NAME,
@@ -218,9 +221,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // record it hands back is what the instance now holds; this operation's
         // modelled output is empty, so `ListConnectInstanceIntegrations` is where it
         // surfaces.
-        let Some(_stored) =
-            store.put_instance_integration(&input.connect_instance_id, input.integration_config)
-        else {
+        let Some(_stored) = store.put_instance_integration(
+            &region,
+            &input.connect_instance_id,
+            input.integration_config,
+        ) else {
             // The store is bounded: past its ceiling the put is refused rather than
             // growing the process without limit. Of the errors this operation models,
             // the conflict is the one that fits — the service's own state, not the

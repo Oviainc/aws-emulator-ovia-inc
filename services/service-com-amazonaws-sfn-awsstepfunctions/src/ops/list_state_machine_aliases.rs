@@ -2,8 +2,8 @@
 
 //! @op ListStateMachineAliases
 //! IMPLEMENTED: lists the alias records of the state machine the ARN names — or, for
-//! a version ARN, the aliases that route to that version — newest first and paged;
-//! this is the ONLY file to touch for this operation.
+//! a version ARN, the aliases that route to that version — in the order they were
+//! created and paged; this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -275,10 +275,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // "Results are sorted by time, with the most recently created aliases listed
-        // first."
+        // The order a client observes is the order the aliases were created in, which
+        // is the order the store accepted the creates: the whole listing is put in it
+        // BEFORE the page is cut, so a page names the aliases that sit at those
+        // positions of the one order.
         let aliases: Vec<&crate::state::StateMachineAlias> = store
-            .aliases_newest_first(&state_machine_arn)
+            .aliases_in_creation_order(&state_machine_arn)
             .into_iter()
             .filter(|alias| {
                 version_arn

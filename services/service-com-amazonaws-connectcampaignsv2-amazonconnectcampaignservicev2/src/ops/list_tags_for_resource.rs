@@ -142,7 +142,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListTagsForResourceErrorModeled::InternalServerException(
@@ -164,8 +164,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The ARN is resolved in the region this request was signed for: a campaign
+        // is only this endpoint's to report on when it was created through it.
+        let region = crate::state::request_region(ctx);
         let store = state.lock();
-        let Some(campaign) = store.campaign_by_arn(&input.arn) else {
+        let Some(campaign) = store.campaign_by_arn(&region, &input.arn) else {
             return Err(crate::scaffolded::Scaffolded::wire_coded(
                 crate::state::TAG_NOT_FOUND_CODE,
                 404,

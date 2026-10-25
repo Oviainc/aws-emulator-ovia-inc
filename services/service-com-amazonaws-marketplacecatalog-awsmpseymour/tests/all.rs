@@ -21,6 +21,8 @@ mod change_set_lifecycle;
 mod delete_resource_policy_existence;
 #[path = "all/entity_reads.rs"]
 mod entity_reads;
+#[path = "all/entity_type_projections.rs"]
+mod entity_type_projections;
 #[path = "all/request_validation.rs"]
 mod request_validation;
 #[path = "all/resource_policy_and_tagging.rs"]

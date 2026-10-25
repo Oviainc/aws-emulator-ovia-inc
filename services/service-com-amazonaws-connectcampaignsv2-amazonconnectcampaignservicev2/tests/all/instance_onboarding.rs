@@ -155,7 +155,7 @@ async fn a_started_job_is_in_progress_and_the_clock_moves_it_to_succeeded() {
                 .state::<ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State>();
             let store = state.lock();
             let stored = store
-                .instance_onboarding(&instance_id)
+                .instance_onboarding(REGION, &instance_id)
                 .unwrap_or_else(|| panic!("case {case:?}: the start call stored no record"));
             assert!(
                 !stored.encryption_config.enabled,
@@ -263,7 +263,7 @@ async fn repeating_the_start_call_keeps_the_job_and_takes_the_new_config() {
             engine.state::<ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State>();
         let store = state.lock();
         let stored = store
-            .instance_onboarding(instance_id)
+            .instance_onboarding(REGION, instance_id)
             .expect("case \"repeated start\": the record is still stored");
         assert!(
             stored.encryption_config.enabled,
@@ -361,7 +361,7 @@ async fn a_kms_key_is_required_exactly_when_encryption_is_enabled() {
                 .state::<ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State>();
             let stored = state
                 .lock()
-                .instance_onboarding(instance_id)
+                .instance_onboarding(REGION, instance_id)
                 .map(|record| {
                     (
                         record.encryption_config.enabled,
