@@ -231,7 +231,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let policy_list: Vec<PolicySummary> = remaining
             .by_ref()
             .take(page_size)
-            .map(|(_, record)| record.summary())
+            // `PolicyStatus` is derived from the store for the summary exactly
+            // as `GetPolicy` derives it for the policy, so a page cannot report
+            // a status a read of the same policy disagrees with.
+            .map(|(_, record)| record.summary(store.policy_status(record)))
             .collect();
         // A token only when a policy is left AFTER this page, so the last page
         // carries none.
