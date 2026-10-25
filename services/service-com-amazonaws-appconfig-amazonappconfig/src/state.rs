@@ -1169,6 +1169,17 @@ pub struct ConfigurationProfile {
 }
 
 impl ConfigurationProfile {
+    /// The bytes of hosted configuration content this profile is holding, which is the
+    /// share of the account's hosted-content budget that goes back when the profile
+    /// stops being stored. Lives here so a caller that drops a whole subtree accounts
+    /// for it the same way `DeleteHostedConfigurationVersion` accounts for one version.
+    pub fn hosted_bytes(&self) -> usize {
+        self.hosted_versions
+            .values()
+            .map(|version| version.content.len())
+            .sum()
+    }
+
     /// The highest hosted version number written to this profile; `0` before the
     /// first write.
     pub fn latest_version_number(&self) -> i32 {

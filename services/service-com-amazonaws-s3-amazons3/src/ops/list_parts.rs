@@ -343,12 +343,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Specifies the part after which listing should begin. Only parts with higher
         // part numbers will be listed" (`ListPartsRequest$PartNumberMarker`), so the page
-        // is the upload's parts above the marker, at most `max_parts` of them. This
-        // emulator records no part — `UploadPart` is still a scaffold stub, so nothing has
-        // ever added one to an upload — and an upload with no parts is exactly what S3
-        // reports with "zero or more Part elements" (`ListPartsOutput$Parts`): the page is
-        // computed from what the upload holds, not asserted to be empty.
-        let parts: Vec<Part> = Vec::new();
+        // is the upload's parts above the marker, at most `max_parts` of them, in
+        // ascending part-number order. The marker is a part NUMBER carried as a string, so
+        // a value that is not one — and a negative one, which no part number can be —
+        // names no position at all: `InvalidArgument` (400), the same code an out-of-range
+        // `max-parts` is refused with, judged by the same rule its own message states.
+        let marker = match input.part_number_marker.as_deref() {
+            Some(requested) => match requested.parse::<i32>() {
+                Ok(marker) if marker >= 0 => marker,
+                _ => {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::INVALID_ARGUMENT_CODE,
+                        crate::state::INVALID_ARGUMENT_STATUS,
+                        format!(
+                            "Argument part-number-marker must be an integer between 0 and \
+                             2147483647: {requested}"
+                        ),
+                    ))
+                }
+            },
+            None => 0,
+        };
+        // Every part the upload holds above the marker, newest page first by number. One
+        // more than the page is taken, so what is left over is what decides whether the
+        // list is truncated rather than a second pass over the map.
+        let above_marker: Vec<&crate::state::UploadedPart> = upload
+            .parts
+            .values()
+            .filter(|part| part.part_number > marker)
+            .collect();
+        let page = usize::try_from(max_parts).unwrap_or(0);
+        let truncated = above_marker.len() > page;
+        // Each part is reported from the RECORDED part: its number, the instant it was
+        // uploaded, the entity tag the upload answered for it and the size of the bytes it
+        // holds (`Part`'s own members). No `Checksum*` member is reported: nothing here
+        // computes a part's checksum, so none is claimed.
+        let parts: Vec<Part> = above_marker
+            .iter()
+            .take(page)
+            .map(|part| Part {
+                part_number: Some(part.part_number),
+                last_modified: Some(::aws_smithy_types::DateTime::from(part.uploaded_at)),
+                e_tag: Some(part.etag.clone()),
+                size: Some(part.size()),
+                ..Part::default()
+            })
+            .collect();
+        // "When a list is truncated, this element specifies the last part in the list, as
+        // well as the value to use for the part-number-marker request parameter in a
+        // subsequent request" (`ListPartsOutput$NextPartNumberMarker`) — so a page that
+        // returned every part above the marker reports no next marker and is not
+        // truncated, and a truncated one reports the last part it carried (the marker it
+        // started from, when the page carried no part at all).
+        let next_marker = truncated.then(|| {
+            parts
+                .last()
+                .and_then(|part| part.part_number)
+                .unwrap_or(marker)
+                .to_string()
+        });
 
         // When the bucket's lifecycle configuration aborts this upload, if any rule does.
         let abort = bucket.multipart_upload_abort(&upload.key, upload.initiated_at);
@@ -364,11 +417,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             max_parts: Some(max_parts),
             // Echoed as the page's starting point; a request that named none reports none.
             part_number_marker: input.part_number_marker.clone(),
-            // "When a list is truncated, this element specifies the last part in the list"
-            // — so a page that returned every part above the marker reports no next
-            // marker, and is not truncated.
-            next_part_number_marker: None,
-            is_truncated: Some(false),
+            next_part_number_marker: next_marker,
+            is_truncated: Some(truncated),
             parts: Some(parts),
             // "Container element that identifies who initiated the multipart upload. If
             // the initiator is an Amazon Web Services account, this element provides the

@@ -172,20 +172,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An ARN this emulator holds no rescore execution plan under names no taggable
         // resource: that is the modelled `ResourceUnavailableException` (HTTP 404), the
-        // only not-found error this operation declares. The ARN is resolved in THIS
-        // request's region, where this service's plans live, so an ARN naming another
-        // region's plan resolves to nothing.
-        let Some(plan) = store.plan_by_arn_mut(&region, &input.resource_arn) else {
-            return Err(TagResourceErrorModeled::ResourceUnavailableException(
-                ResourceUnavailableException {
-                    message: Some(format!(
-                        "Resource {} was not found. Please check you have provided the correct resource information and try again.",
-                        input.resource_arn
-                    )),
-                },
-            )
-            .into());
-        };
+        // only not-found error this operation declares, built by
+        // `state::plan_for_arn_mut` so every ARN-addressed operation resolves the ARN and
+        // states that refusal identically. The ARN is resolved in THIS request's region,
+        // where this service's plans live, so an ARN naming another region's plan
+        // resolves to nothing.
+        let plan = store
+            .plan_for_arn_mut(&region, &input.resource_arn)
+            .map_err(TagResourceErrorModeled::ResourceUnavailableException)?;
 
         // A plan's tag set is bounded ("TagResource" grows it across calls, so the
         // modelled per-request `TagList` length bounds no accumulated set): a request

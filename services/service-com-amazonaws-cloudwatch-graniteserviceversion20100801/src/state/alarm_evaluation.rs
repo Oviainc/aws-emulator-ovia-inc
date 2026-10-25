@@ -36,10 +36,12 @@
 //!   asked for more of them than it has; it is in `OK` when fewer breach, and in
 //!   `INSUFFICIENT_DATA` when no datapoint was evaluated at all;
 //! * the `StateReason` ("An explanation for the alarm state, in text format.") explains how
-//!   the state was decided, so a window that held NO datapoint of the metric is reported as
-//!   the hole it was, naming the missing-data arm that was applied to it, rather than being
-//!   counted as a datapoint the evaluation graded — a client can tell an alarm that saw clean
-//!   data from one that saw none.
+//!   the state was decided: it NAMES the datapoints the evaluation graded — the value the
+//!   statistic took over each window and the instant that window ends — beside the counts it
+//!   made over them, and a window that held NO datapoint of the metric is reported as the hole
+//!   it was, naming the missing-data arm that was applied to it, rather than being counted as a
+//!   datapoint the evaluation graded — a client can tell an alarm that saw clean data from one
+//!   that saw none.
 //!
 //! The evaluation is a pure function of the stored datapoints and the clock, and it writes
 //! only when the state it computes differs from the state the alarm already reports — so
@@ -344,6 +346,9 @@ impl State {
         stored.alarm.state_value = Some(evaluation.state.to_string());
         stored.alarm.state_reason = Some(evaluation.reason);
         stored.alarm.state_reason_data = Some(evaluation.reason_data);
+        // The evaluation owns the alarm's state again: whatever a caller forced has been
+        // taken back over.
+        stored.forced_state_until_secs = None;
         stored.alarm.state_updated_timestamp = Some(to_timestamp(now_secs));
         // "The timestamp of the last change to the alarm's StateValue."
         // (`MetricAlarm$StateTransitionedTimestamp`) — this evaluation changed it.
@@ -372,6 +377,10 @@ impl State {
         if let Some(notification) = notification {
             self.enqueue_notification(notification);
         }
+        // This alarm's new state is an input to every composite alarm whose rule reads it, so
+        // their evaluations are owed from this instant too — and the composite pass that
+        // follows this one in the same settle takes them.
+        self.make_parents_due(name, now_secs);
     }
 
     /// The state the alarm's own comparison puts it in at `now_secs`, or `None` for an alarm
@@ -537,6 +546,7 @@ impl State {
                 missing_data_arm(treat_missing),
                 alarm.comparison_operator.as_deref().unwrap_or_default(),
                 threshold,
+                &cited_datapoints(&evaluated, now_secs, period),
             ),
             reason_data: state_reason_data(&statistic, period, threshold, now_secs, &evaluated),
         })
@@ -683,9 +693,13 @@ fn plural(count: usize) -> (&'static str, &'static str) {
     }
 }
 
-/// The `StateReason` an evaluated state reports: what the evaluation counted, against what it
-/// needed — and, where a window held no datapoint of the metric at all, that the window was
-/// EMPTY and which missing-data arm was applied to it.
+/// The `StateReason` an evaluated state reports: the DATAPOINTS the evaluation graded, what it
+/// counted over them against what it needed — and, where a window held no datapoint of the
+/// metric at all, that the window was EMPTY and which missing-data arm was applied to it.
+///
+/// The datapoints are NAMED, not just counted ([`cited_datapoints`]): the explanation of a
+/// state says which values decided it and when each was measured, so a reader can tell the
+/// evaluation that graded the series it published from one that graded something else.
 ///
 /// A hole is reported as a hole: an evaluation every one of whose datapoints was substituted
 /// by the missing-data treatment graded no data, so it says it received none and names the arm
@@ -693,16 +707,18 @@ fn plural(count: usize) -> (&'static str, &'static str) {
 /// evaluation that mixed real datapoints with substituted ones names the arm beside its
 /// counts.
 ///
-/// Built from the evaluation rather than from any request: the text states the counts, the
-/// comparison and the threshold the alarm is configured with. Well inside the modelled
+/// Built from the evaluation rather than from any request: the text states the datapoints, the
+/// counts, the comparison and the threshold the alarm is configured with. Inside the modelled
 /// `@length 0..1023` of `StateReason` for every alarm, because the only variable parts are
-/// four counts, an operator name of at most 41 characters and one number.
+/// four counts, an operator name of at most 41 characters, one number, and a datapoint list
+/// bounded by [`MAX_CITED_DATAPOINT_CHARS`].
 fn state_reason(
     state: &str,
     counts: EvaluationCounts,
     arm: Option<&str>,
     comparison: &str,
     threshold: f64,
+    cited: &str,
 ) -> String {
     let EvaluationCounts {
         breaching,
@@ -711,6 +727,7 @@ fn state_reason(
         periods,
         required,
     } = counts;
+    let threshold = decimal_text(threshold);
     if state == ALARM_STATE_INSUFFICIENT_DATA {
         // No datapoint was evaluated and the treatment substituted none: the evaluation had
         // nothing to decide on.
@@ -743,17 +760,75 @@ fn state_reason(
     };
     if state == ALARM_STATE_ALARM {
         return format!(
-            "Threshold Crossed: {breaching} out of the last {present} datapoints \
+            "Threshold Crossed: {breaching} out of the last {present} datapoints{cited} \
              satisfied {comparison} with the threshold ({threshold}); {required} datapoints \
              must for the alarm to be in ALARM state.{substituted_clause}"
         );
     }
     // The alarm is in OK, so the comparison did not hold often enough.
     format!(
-        "Threshold Crossed: {breaching} out of the last {present} datapoints satisfied \
+        "Threshold Crossed: {breaching} out of the last {present} datapoints{cited} satisfied \
          {comparison} with the threshold ({threshold}), fewer than the {required} datapoints \
          required for the alarm to be in ALARM state.{substituted_clause}"
     )
+}
+
+/// The most characters the datapoint list a `StateReason` cites may take.
+///
+/// `StateReason` is modelled `@length 0..1023` and the sentence around the list needs room
+/// inside that, so the list is the part that is bounded: an alarm may evaluate as many windows
+/// as [`MAX_EVALUATED_PERIODS`] and each datapoint renders a value of its own width. The
+/// datapoints past the bound are left out rather than the sentence truncated, because the
+/// counts and the threshold are what the state was decided on and `StateReasonData` carries
+/// every evaluated datapoint anyway.
+const MAX_CITED_DATAPOINT_CHARS: usize = 700;
+
+/// The datapoints an evaluation GRADED, newest first, each as the value the statistic took over
+/// its window and the instant that window ends: ` [137.0 (2026-10-25T02:02:00Z), …]`.
+///
+/// Empty when the evaluation graded no real datapoint at all — a slot the missing-data
+/// treatment substituted stands for a window that held nothing, so there is no measured value
+/// to name for it — which is also why the list is prefixed with its own space and can be
+/// dropped from the sentence without leaving a gap.
+fn cited_datapoints(evaluated: &[Evaluated], now_secs: f64, period: f64) -> String {
+    let mut cited = String::new();
+    for slot in evaluated {
+        let (Some(index), Some(value)) = (slot.window, slot.value) else {
+            continue;
+        };
+        let entry = match super::rfc3339(window_end(now_secs, index, period)) {
+            Some(at) => format!("{} ({at})", decimal_text(value)),
+            None => decimal_text(value),
+        };
+        if cited.len() + entry.len() + 2 > MAX_CITED_DATAPOINT_CHARS {
+            break;
+        }
+        if !cited.is_empty() {
+            cited.push_str(", ");
+        }
+        cited.push_str(&entry);
+    }
+    if cited.is_empty() {
+        return cited;
+    }
+    format!(" [{cited}]")
+}
+
+/// The instant the `index`th window back from the evaluation instant ENDS: window 0 ends at
+/// the evaluation instant itself, and each window before it a `period` earlier.
+fn window_end(now_secs: f64, index: usize, period: f64) -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    let windows_back = index as f64;
+    now_secs - windows_back * period
+}
+
+/// One measured quantity as an explanation names it: a decimal that always carries a fraction,
+/// so a value and a threshold read as the measurements they are rather than as counts.
+fn decimal_text(value: f64) -> String {
+    if value.is_finite() && value.fract() == 0.0 {
+        return format!("{value:.1}");
+    }
+    format!("{value}")
 }
 
 /// The `StateReasonData` an evaluated state reports: the query the evaluation made and the
@@ -798,9 +873,10 @@ fn state_reason_data(
         .map(|slot| {
             let mut window = Map::new();
             if let Some(index) = slot.window {
-                #[allow(clippy::cast_precision_loss)]
-                let window_end = now_secs - (index as f64) * period;
-                window.insert("windowEndSeconds".to_string(), Value::from(window_end));
+                window.insert(
+                    "windowEndSeconds".to_string(),
+                    Value::from(window_end(now_secs, index, period)),
+                );
             }
             if let Some(value) = slot.value {
                 window.insert("value".to_string(), Value::from(value));

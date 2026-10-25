@@ -293,6 +293,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Err(supplied) => return Err(crate::state::packaging_refusal(&supplied).into()),
         };
 
+        // `ManifestName` is "a short string appended to the end of the Endpoint URL", and an
+        // absent one takes the documented default the create applies. It is resolved HERE,
+        // before anything is written, because it is the value a CMAF child manifest sent
+        // without a name of its own inherits — so the children cannot be materialised until
+        // it is known.
+        let manifest_name = input
+            .manifest_name
+            .take()
+            .unwrap_or_else(|| crate::state::DEFAULT_MANIFEST_NAME.to_string());
+
         let record = state
             .origin_endpoints
             .get_mut(&id)
@@ -315,14 +325,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Exactly one packaging configuration is stored at a time, so the one the
             // request names REPLACES the stored set rather than merging into it. The CMAF
             // parameter shape is materialised by the same function the create uses, so an
-            // updated CMAF package carries the derived child-manifest URLs and the
-            // documented `SegmentPrefix` default.
+            // updated CMAF package carries the derived child-manifest URLs, the documented
+            // `SegmentPrefix` default and the endpoint `ManifestName` an unnamed child
+            // inherits.
             Some(kind) => {
                 record.hls_package = input.hls_package.take();
                 record.dash_package = input.dash_package.take();
                 record.mss_package = input.mss_package.take();
                 record.cmaf_package = input.cmaf_package.as_ref().map(|params| {
-                    crate::state::stored_cmaf_package(params, &region, &channel_id, &id)
+                    crate::state::stored_cmaf_package(
+                        params,
+                        &region,
+                        &channel_id,
+                        &id,
+                        &manifest_name,
+                    )
                 });
                 kind
             }
@@ -354,13 +371,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.startover_window_seconds = input.startover_window_seconds;
         record.time_delay_seconds = input.time_delay_seconds;
         record.whitelist = input.whitelist.take().unwrap_or_default();
-        // `ManifestName` is "a short string appended to the end of the Endpoint URL", so
-        // the playback URL is re-derived whenever it or the packaging format changes, and
-        // an absent one takes the same documented default the create applies.
-        let manifest_name = input
-            .manifest_name
-            .take()
-            .unwrap_or_else(|| crate::state::DEFAULT_MANIFEST_NAME.to_string());
+        // The playback URL is re-derived from the effective `ManifestName` resolved above
+        // whenever it or the packaging format changes.
         record.url = crate::state::playback_url(&region, &channel_id, &id, &manifest_name, kind);
         record.manifest_name = Some(manifest_name);
 

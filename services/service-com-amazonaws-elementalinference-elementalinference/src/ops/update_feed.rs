@@ -14,7 +14,11 @@
 //! request that disagrees with the stored provenance is refused (`ValidationException`,
 //! HTTP 400) while one that omits it keeps that provenance. A replacement list past the
 //! feed's output quota is refused too (`ServiceQuotaExceededException`, HTTP 402), so a
-//! PUT cannot put the stored list past the bound every writer of it is held to.
+//! PUT cannot put the stored list past the bound every writer of it is held to. A feed
+//! holds at least one output, so a replacement list that is EMPTY is refused
+//! (`ValidationException`, HTTP 400), and an output that names another resource — a
+//! dictionary, or a fixture of the data source — is stored only when that id resolves
+//! (`crate::state::...::unresolved_output_reference`).
 //!
 //! ## Shape of an operation
 //!
@@ -222,6 +226,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A feed HOLDS at least one output ("The key contents of the feed is an array of
+        // outputs"; a create "must specify at least one output"), and this PUT sets the
+        // whole list, so a replacement that would leave the stored feed with no output
+        // at all is refused (HTTP 400) rather than stored — the same rule, and the same
+        // sentence, that answers a create with an empty list. The list shape carries no
+        // `@length`, so the boundary validator cannot decide this.
+        if input.outputs.is_empty() {
+            return Err(UpdateFeedErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::MISSING_OUTPUTS_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
+
         // An output's name identifies it within the feed, so a replacement list that
         // names one output twice describes a feed no output of which is addressable by
         // name. That is a property of the REQUEST, decided before the feed is resolved
@@ -253,6 +272,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle_due_transitions(now);
 
+        // An output may NAME another resource — a dictionary for a subtitling output, a
+        // fixture of the data source for a clipping output's data source — and a stored
+        // feed may not carry a reference to nothing, whichever operation wrote its
+        // outputs: the service keeps that relation in both directions
+        // (`GetDictionary$references`, and `DeleteDictionary`'s refusal while a feed
+        // references the dictionary). So the replacement list's references are resolved
+        // against the store, by the one scan every writer of a feed's outputs goes
+        // through. Resolved here, before the stored feed is borrowed for the write, and
+        // REPORTED below once the feed itself has been resolved, so a request naming a
+        // feed this Region does not hold still earns the not-found refusal.
+        let unresolved_reference = state.unresolved_output_reference(
+            &region,
+            input.outputs.iter().map(|output| &output.output_config),
+        );
+
         // The feed is resolved WITHIN the request's Region: the service is regional, so
         // a feed created through another Region's endpoint is not this endpoint's to
         // mutate and the id naming it earns the modelled not-found refusal.
@@ -273,6 +307,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdateFeedErrorModeled::ConflictException(ConflictException {
                 message: crate::state::FEED_BEING_DELETED_MESSAGE.to_string(),
             })
+            .into());
+        }
+
+        // The reference refusal resolved above, now that the feed and its status have
+        // been checked: nothing has been written, so a refused PUT leaves the feed as it
+        // was.
+        if let Some(message) = unresolved_reference {
+            return Err(UpdateFeedErrorModeled::ValidationException(
+                ValidationException { message },
+            )
             .into());
         }
 

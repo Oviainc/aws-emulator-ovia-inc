@@ -21,6 +21,8 @@ mod dnssec_status;
 mod error_classification;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/health_check_creation.rs"]
+mod health_check_creation;
 #[path = "all/health_check_listing.rs"]
 mod health_check_listing;
 #[path = "all/health_check_updates.rs"]

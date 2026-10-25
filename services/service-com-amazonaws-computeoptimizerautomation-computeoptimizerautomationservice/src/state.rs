@@ -228,6 +228,33 @@ pub const MAX_STORED_EVENTS: usize = 1_000;
 /// the largest page the model's `maxResults` allows.
 pub const MAX_RULES_PER_ACCOUNT: usize = 100;
 
+/// The description a rule holds when neither its create nor any later update
+/// named one.
+///
+/// `description` is "A description of the automation rule"
+/// (`smithy_query(query="doc",shape="AutomationRule",member="description")`) and
+/// the service reports it for every rule it holds, so a rule nobody described
+/// holds the empty description rather than none: free text nobody wrote is text
+/// of no length, and `RuleDescription` admits it (`@length(min: 0)`,
+/// `smithy_query(query="shape",shape="RuleDescription")`).
+pub const DEFAULT_RULE_DESCRIPTION: &str = "";
+
+/// The precedence a rule holds when neither its create nor any later update
+/// named a `priority`.
+///
+/// `priority` is "a string representation of a decimal number between 0 and 1
+/// (having up to 30 digits after the decimal point) that determines the priority
+/// of the rule. When multiple rules match the same recommended action, Compute
+/// Optimizer assigns the action to the rule with the lowest priority value
+/// (highest priority)"
+/// (`smithy_query(query="doc",shape="AutomationRule",member="priority")`), and
+/// the service reports one for every rule it holds, so every rule has a
+/// comparable precedence. CHOSEN value, grounded in that sentence: a rule nobody
+/// prioritised must not outrank one somebody did, so it takes the TOP of the
+/// documented range — the LOWEST precedence — and claims a recommended action
+/// only when no prioritised rule matches the same action.
+pub const DEFAULT_RULE_PRIORITY: &str = "1";
+
 /// How many tags one resource of this service may carry.
 ///
 /// DOCUMENTED, not chosen: the `tags` member of a rule create reads "A list of
@@ -809,21 +836,24 @@ pub struct StoredRule {
     pub rule_id: String,
     pub account_id: String,
     pub name: String,
-    /// What the create or the latest update supplied, and `None` while neither
-    /// has: the member is optional in every rule shape and the service holds no
-    /// value for it, so every read path leaves it out rather than reporting a
-    /// description the caller never set.
-    pub description: Option<String>,
+    /// What the create or the latest update supplied, and
+    /// [`DEFAULT_RULE_DESCRIPTION`] while neither has. The service reports a
+    /// description for every rule it holds, so this is a value and never an
+    /// absence: a rule nobody described is described by the empty string, and
+    /// every read path reports that rather than omitting the member.
+    pub description: String,
     pub rule_type: String,
     pub rule_revision: i64,
     pub organization_configuration: Option<OrganizationConfiguration>,
-    /// What the create or the latest update supplied, and `None` while neither
-    /// has. Neither the model nor the operation docs give a default, and
-    /// `priority` decides which rule claims a recommended action when several
-    /// match ("the rule with the lowest priority value (highest priority)",
-    /// `smithy_query(query="doc",shape="AutomationRule",member="priority")`), so
-    /// a rule whose create named none holds no precedence and reports none.
-    pub priority: Option<String>,
+    /// What the create or the latest update supplied, and
+    /// [`DEFAULT_RULE_PRIORITY`] while neither has. `priority` decides which rule
+    /// claims a recommended action when several match ("the rule with the lowest
+    /// priority value (highest priority)",
+    /// `smithy_query(query="doc",shape="AutomationRule",member="priority")`), and
+    /// the service reports one for every rule it holds, so this is a value and
+    /// never an absence: a rule nobody prioritised holds the bottom of the
+    /// precedence order and every read path reports it.
+    pub priority: String,
     pub recommended_action_types: Vec<String>,
     pub criteria: Option<Criteria>,
     pub schedule: Schedule,
@@ -846,12 +876,12 @@ impl StoredRule {
             rule_arn: Some(self.rule_arn.clone()),
             rule_id: Some(self.rule_id.clone()),
             name: Some(self.name.clone()),
-            description: self.description.clone(),
+            description: Some(self.description.clone()),
             rule_type: Some(self.rule_type.clone()),
             rule_revision: Some(self.rule_revision),
             account_id: Some(self.account_id.clone()),
             organization_configuration: self.organization_configuration.clone(),
-            priority: self.priority.clone(),
+            priority: Some(self.priority.clone()),
             recommended_action_types: Some(self.recommended_action_types.clone()),
             schedule: Some(self.schedule.clone()),
             status: Some(self.status.clone()),

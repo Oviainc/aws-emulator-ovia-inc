@@ -23,15 +23,12 @@
 //! default Region), and resuming from a token the service itself handed out.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
 
-/// The `X-Amz-Target` prefix this service routes on (`OPERATIONS.md`, "Wire
-/// protocol").
-const TARGET_PREFIX: &str = "Lightsail_20161128";
+use crate::instance_lifecycle::Emulator;
+use crate::paging::{expected_page_sizes, names, walk_pages};
 
 /// How many load balancers one page carries
 /// (`crate::state::LOAD_BALANCER_PAGE_SIZE`).
@@ -46,158 +43,41 @@ const MAX_LOAD_BALANCERS_PER_REGION: usize = 10;
 /// endpoint Region.
 const DEFAULT_REGION: &str = "us-east-1";
 
-/// A walk over the pages of one listing cannot need more pages than this: the
-/// per-Region cap bounds how many records exist, so anything past it means the
-/// walk is not advancing.
-const MAX_PAGES: usize = MAX_LOAD_BALANCERS_PER_REGION + 2;
-
-/// One emulator with one Lightsail service mounted on one shared engine.
-struct Emulator {
-    router: MultiServiceRouter,
-}
-
-impl Emulator {
-    fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = MultiServiceRouter::new();
-        // The suite signs nothing; routing is by `X-Amz-Target`, and the
-        // `Authorization` header below carries only the credential SCOPE, which
-        // is what names the Region a request is made in.
-        router.set_request_authentication(false);
-        router.register_service(
-            service_com_amazonaws_lightsail_lightsail_20161128::EmulatedService::new(engine),
-        );
-        Self { router }
-    }
-
-    /// Call `operation` with `body`, in `region` when one is given, answering its
-    /// HTTP status and parsed body.
-    async fn call(&self, region: Option<&str>, operation: &str, body: Value) -> (u16, Value) {
-        let mut builder = ::http::Request::builder()
-            .method("POST")
-            .uri("/")
-            .header("host", "127.0.0.1:9297")
-            .header("x-amz-target", format!("{TARGET_PREFIX}.{operation}"))
-            .header("content-type", "application/x-amz-json-1.1");
-        if let Some(region) = region {
-            builder = builder.header(
-                "authorization",
-                format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261022/{region}/lightsail/\
-                     aws4_request, SignedHeaders=host, Signature=not-verified"
-                ),
-            );
-        }
-        let request = builder
-            .body(bytes::Bytes::from(body.to_string()))
-            .expect("the request is well formed");
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let parsed = if response.body().is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-        };
-        (status, parsed)
-    }
-
-    /// Call `operation` in `region` (or in none at all) and require HTTP 200,
-    /// answering the body.
-    async fn ok(&self, region: Option<&str>, operation: &str, body: Value) -> Value {
-        let (status, parsed) = self.call(region, operation, body).await;
-        assert_eq!(
-            status, 200,
-            "case {operation} in {region:?}: expected HTTP 200, got {status} {parsed:?}"
-        );
-        parsed
-    }
-
-    /// The stored load balancer `name` in `region`, as `GetLoadBalancer` reports
-    /// it.
-    async fn read(&self, region: &str, name: &str) -> Value {
-        self.ok(
+/// The stored load balancer `name` in `region`, as `GetLoadBalancer` reports it.
+async fn read(emulator: &Emulator, region: &str, name: &str) -> Value {
+    emulator
+        .ok_at(
+            None,
             Some(region),
             "GetLoadBalancer",
             json!({"loadBalancerName": name}),
         )
         .await["loadBalancer"]
-            .clone()
-    }
-
-    /// One `GetLoadBalancers` page in `region` (or in no named Region at all),
-    /// resuming from `page_token` when one is given.
-    async fn page(&self, region: Option<&str>, page_token: Option<&str>) -> Value {
-        let body = match page_token {
-            Some(token) => json!({"pageToken": token}),
-            None => json!({}),
-        };
-        self.ok(region, "GetLoadBalancers", body).await
-    }
+        .clone()
 }
 
-/// The names a page reports, in the order it reports them.
-fn names(page: &Value) -> Vec<String> {
-    page["loadBalancers"]
-        .as_array()
-        .unwrap_or_else(|| panic!("expected a loadBalancers array, got {page:?}"))
-        .iter()
-        .map(|balancer| {
-            balancer["name"]
-                .as_str()
-                .unwrap_or_else(|| panic!("expected every entry to carry a name, got {page:?}"))
-                .to_string()
-        })
-        .collect()
+/// One `GetLoadBalancers` page in `region` (or in no named Region at all),
+/// resuming from `page_token` when one is given.
+async fn page(emulator: &Emulator, region: Option<&str>, page_token: Option<&str>) -> Value {
+    let body = match page_token {
+        Some(token) => json!({"pageToken": token}),
+        None => json!({}),
+    };
+    emulator.ok_at(None, region, "GetLoadBalancers", body).await
 }
 
-/// Walk every page of `region`'s listing, answering the records in the order
-/// reported and the size of each page.
-///
-/// Checks the paging contract as it goes: no page carries more than `PAGE_SIZE`
-/// records, a `nextPageToken` names the FIRST record of the page after it, and
-/// the walk terminates because the token is absent rather than because it ran
-/// out of patience.
+/// Every page of this listing, through the shared checked paging walk every
+/// listing suite in this test target uses.
 async fn walk(emulator: &Emulator, case: &str, region: Option<&str>) -> (Vec<Value>, Vec<usize>) {
-    let mut records = Vec::new();
-    let mut page_sizes = Vec::new();
-    let mut token: Option<String> = None;
-    for page_index in 0..MAX_PAGES {
-        let page = emulator.page(region, token.as_deref()).await;
-        let page_names = names(&page);
-        assert!(
-            page_names.len() <= PAGE_SIZE,
-            "case {case}: page {page_index} carries more than the {PAGE_SIZE} of a page, \
-             got {page_names:?}"
-        );
-        if let Some(token) = &token {
-            assert_eq!(
-                page_names.first().map(String::as_str),
-                Some(token.as_str()),
-                "case {case}: a page token names the first record of the page after it, \
-                 got {page_names:?}"
-            );
-        }
-        page_sizes.push(page_names.len());
-        records.extend(
-            page["loadBalancers"]
-                .as_array()
-                .expect("the page carries a loadBalancers array")
-                .iter()
-                .cloned(),
-        );
-        match page["nextPageToken"].as_str() {
-            Some(next) => {
-                assert_eq!(
-                    page_names.len(),
-                    PAGE_SIZE,
-                    "case {case}: a page that is not the last one is full, got {page_names:?}"
-                );
-                token = Some(next.to_string());
-            }
-            None => return (records, page_sizes),
-        }
-    }
-    panic!("case {case}: the walk did not terminate within {MAX_PAGES} pages");
+    walk_pages(
+        emulator,
+        case,
+        region,
+        "GetLoadBalancers",
+        "loadBalancers",
+        PAGE_SIZE,
+    )
+    .await
 }
 
 /// Poll `GetLoadBalancer` until `name` reports `active`.
@@ -209,7 +89,7 @@ async fn walk(emulator: &Emulator, case: &str, region: Option<&str>) -> (Vec<Val
 async fn wait_for_active(emulator: &Emulator, region: &str, name: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let balancer = emulator.read(region, name).await;
+        let balancer = read(emulator, region, name).await;
         if balancer["state"].as_str() == Some("active") {
             return;
         }
@@ -283,22 +163,6 @@ const ROWS: &[Row] = &[
     },
 ];
 
-/// The page sizes a listing of `total` records must report: full pages until the
-/// remainder, and always at least one page — an empty Region still answers once.
-fn expected_page_sizes(total: usize) -> Vec<usize> {
-    if total == 0 {
-        return vec![0];
-    }
-    let mut sizes = Vec::new();
-    let mut left = total;
-    while left > 0 {
-        let page = left.min(PAGE_SIZE);
-        sizes.push(page);
-        left -= page;
-    }
-    sizes
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn get_load_balancers_reports_this_regions_records_in_name_order() {
     let emulator = Emulator::new();
@@ -316,7 +180,8 @@ async fn get_load_balancers_reports_this_regions_records_in_name_order() {
             // The instance port differs per record, so two entries of one page
             // are told apart by what the caller asked for, not only by name.
             emulator
-                .ok(
+                .ok_at(
+                    None,
                     Some(row.region),
                     "CreateLoadBalancer",
                     json!({
@@ -338,15 +203,7 @@ async fn get_load_balancers_reports_this_regions_records_in_name_order() {
         let (records, page_sizes) = walk(&emulator, case, Some(row.region)).await;
 
         // The listing reports this Region's records, in the store's name order.
-        let reported: Vec<String> = records
-            .iter()
-            .map(|balancer| {
-                balancer["name"]
-                    .as_str()
-                    .unwrap_or_else(|| panic!("case {case}: expected a name, got {balancer:?}"))
-                    .to_string()
-            })
-            .collect();
+        let reported: Vec<String> = names(&records);
         let mut expected: Vec<String> = row.created.iter().map(|name| name.to_string()).collect();
         expected.sort();
         assert_eq!(
@@ -366,14 +223,14 @@ async fn get_load_balancers_reports_this_regions_records_in_name_order() {
         // The pages are full until the remainder.
         assert_eq!(
             page_sizes,
-            expected_page_sizes(row.created.len()),
+            expected_page_sizes(row.created.len(), PAGE_SIZE),
             "case {case}: expected full pages until the remainder, got {page_sizes:?}"
         );
 
         // Every listed record is exactly what the single-record read reports.
         for record in &records {
             let name = record["name"].as_str().unwrap_or_default().to_string();
-            let single = emulator.read(row.region, &name).await;
+            let single = read(&emulator, row.region, &name).await;
             assert_eq!(
                 record, &single,
                 "case {case}: the listing of {name} must match GetLoadBalancer, \
@@ -390,7 +247,8 @@ async fn listing_twice_reports_the_same_records() {
     let emulator = Emulator::new();
     for name in ["repeat-a-lb", "repeat-b-lb", "repeat-c-lb"] {
         emulator
-            .ok(
+            .ok_at(
+                None,
                 Some("us-west-1"),
                 "CreateLoadBalancer",
                 json!({"loadBalancerName": name, "instancePort": 80}),
@@ -420,14 +278,16 @@ async fn listing_twice_reports_the_same_records() {
 async fn an_unscoped_request_lists_the_default_region() {
     let emulator = Emulator::new();
     emulator
-        .ok(
+        .ok_at(
+            None,
             Some(DEFAULT_REGION),
             "CreateLoadBalancer",
             json!({"loadBalancerName": "default-region-lb", "instancePort": 80}),
         )
         .await;
     emulator
-        .ok(
+        .ok_at(
+            None,
             Some("eu-west-2"),
             "CreateLoadBalancer",
             json!({"loadBalancerName": "elsewhere-lb", "instancePort": 80}),
@@ -452,7 +312,7 @@ async fn an_unscoped_request_lists_the_default_region() {
 async fn an_empty_region_reports_an_empty_list_and_no_token() {
     let emulator = Emulator::new();
     for region in ["us-east-2", "ap-northeast-1", "ca-central-1"] {
-        let page = emulator.page(Some(region), None).await;
+        let page = page(&emulator, Some(region), None).await;
         assert_eq!(
             page["loadBalancers"].as_array().map(Vec::len),
             Some(0),

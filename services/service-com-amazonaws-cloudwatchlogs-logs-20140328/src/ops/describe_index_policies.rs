@@ -229,16 +229,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 policy_name: None,
                 source: Some(crate::state::INDEX_SOURCE_LOG_GROUP.to_string()),
             }),
-            None => applicable_account_policy(&store.account_policies, group).map(|policy| {
-                IndexPolicy {
-                    log_group_identifier: Some(group.log_group_arn.clone()),
-                    last_update_time: Some(policy.last_updated_time_ms),
-                    policy_document: Some(policy.policy_document.clone()),
-                    // An account-level policy has a name, which is half of what identifies
-                    // it to `DescribeAccountPolicies` and `DeleteAccountPolicy`.
-                    policy_name: Some(policy.policy_name.clone()),
-                    source: Some(crate::state::INDEX_SOURCE_ACCOUNT.to_string()),
-                }
+            None => crate::state::applicable_account_policy(
+                &store.account_policies,
+                crate::state::POLICY_TYPE_FIELD_INDEX,
+                group,
+            )
+            .map(|policy| IndexPolicy {
+                log_group_identifier: Some(group.log_group_arn.clone()),
+                last_update_time: Some(policy.last_updated_time_ms),
+                policy_document: Some(policy.policy_document.clone()),
+                // An account-level policy has a name, which is half of what identifies
+                // it to `DescribeAccountPolicies` and `DeleteAccountPolicy`.
+                policy_name: Some(policy.policy_name.clone()),
+                source: Some(crate::state::INDEX_SOURCE_ACCOUNT.to_string()),
             }),
         };
 
@@ -249,35 +252,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_token: None,
         })
     }
-}
-
-/// The account-level field index policy that applies to one log group, or `None` when none
-/// of the account's does.
-///
-/// An account-level policy applies to a log group when its `selectionCriteria` select that
-/// group, and a policy put without criteria is the one "that applies to all log groups in
-/// the account" ([`crate::state::account_policy_selects_log_group`]). A group can therefore
-/// be selected by both a scoped policy and that account-wide one — `PutAccountPolicy`'s
-/// quota sentence admits "either one account-level policy that applies to all log groups in
-/// the account, or up to 20 policies that are each scoped to a subset", and its overlap rule
-/// ("no two of them can use the same or overlapping log group name prefixes") leaves at most
-/// one SCOPED policy selecting any one group. So the policy that applies to the group is the
-/// scoped one when it has one, and the account-wide one otherwise.
-fn applicable_account_policy<'a>(
-    account_policies: &'a std::collections::BTreeMap<
-        (String, String),
-        crate::state::AccountPolicyRecord,
-    >,
-    group: &crate::state::LogGroupRecord,
-) -> Option<&'a crate::state::AccountPolicyRecord> {
-    let applying: Vec<&crate::state::AccountPolicyRecord> = account_policies
-        .values()
-        .filter(|policy| policy.policy_type == crate::state::POLICY_TYPE_FIELD_INDEX)
-        .filter(|policy| crate::state::account_policy_selects_log_group(policy, group))
-        .collect();
-    applying
-        .iter()
-        .find(|policy| policy.selection_criteria.is_some())
-        .or_else(|| applying.first())
-        .copied()
 }

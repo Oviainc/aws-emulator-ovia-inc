@@ -27,6 +27,8 @@ mod benefit_allocations;
 mod benefit_application_lifecycle;
 #[path = "all/benefit_catalog_record.rs"]
 mod benefit_catalog_record;
+#[path = "all/cancel_client_token_idempotency.rs"]
+mod cancel_client_token_idempotency;
 #[path = "all/client_token_idempotency.rs"]
 mod client_token_idempotency;
 #[path = "all/disassociate_benefit_application_resource.rs"]
