@@ -134,10 +134,14 @@ pub const ACCOUNT_COLOR_NONE: &str = "none";
 /// `appconfig` (under `systems-manager`), `cognito-idp`, `logs` and `sts` — so the
 /// catalog is one namespace throughout.
 ///
-/// It is a DISCOVERY list, not an admission list: this catalog tells a caller
-/// which identifiers exist, and `UpdateAccountCustomizations` accepts any
-/// `visibleServices` member its modelled constraints admit, whether or not this
-/// list happens to name it.
+/// It is the ADMISSION list as well as the discovery list: `ListServices`
+/// "returns a paginated list of ... service identifiers that you can use as
+/// values for the `visibleServices` setting", and the setting's own member doc
+/// sends a caller here for "valid service identifiers", so an identifier this
+/// catalog does not name is not a valid value of the setting and
+/// `UpdateAccountCustomizations` refuses it ([`ComAmazonawsUxcAwsaccountuxsettingState::is_catalog_service`]).
+/// The two lists being one is what makes the refusal workable: everything a
+/// caller can discover here, it can set.
 const SEED_SERVICE_CATALOG: &[&str] = &[
     "account-access",
     "acm",
@@ -406,6 +410,19 @@ impl ComAmazonawsUxcAwsaccountuxsettingState {
     /// The customization record for `account_id`, created empty on first write.
     pub fn customization_mut(&mut self, account_id: &str) -> &mut AccountUxCustomization {
         self.customizations.entry(account_id.to_string()).or_default()
+    }
+
+    /// Whether `identifier` names an entry of the catalog `ListServices`
+    /// enumerates — which is what makes it a valid `visibleServices` value.
+    ///
+    /// A binary search, which [`ComAmazonawsUxcAwsaccountuxsettingState::default`]
+    /// makes valid by sorting and de-duplicating the catalog it builds; the same
+    /// property page tokens depend on. Membership is exact: the catalog publishes
+    /// one spelling of each identifier, so nothing is folded or trimmed here.
+    pub fn is_catalog_service(&self, identifier: &str) -> bool {
+        self.service_catalog
+            .binary_search_by(|entry| entry.as_str().cmp(identifier))
+            .is_ok()
     }
 }
 

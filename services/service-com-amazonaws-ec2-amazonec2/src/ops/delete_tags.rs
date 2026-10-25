@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: removes the tags the request selects from each resource it names,
+//! whatever kind of resource that is — the tags are reached through the one accessor
+//! `CreateTags` writes through
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::resource_tags_mut`]), so the two
+//! operations resolve exactly the same resource ids.
+//!
+//! A tag key given WITHOUT a value removes that key whatever value it holds; a key given
+//! WITH a value removes it only when the stored value is that value (an empty one
+//! included); a request that names no tag at all removes every tag of the resource except
+//! the Amazon Web Services-generated ones. A key the resource does not carry removes
+//! nothing, so the call is idempotent.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +162,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTags"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            deduplicate_ids, instance_id_is_well_formed, require_service_state, validate_tag_size,
+            MAX_RESOURCE_IDS, MAX_TAGS_PER_DELETE_REQUEST, RESERVED_TAG_PREFIX,
+        };
+
+        let _ = ctx;
+
+        if input.resources.is_empty() {
+            return Err(Scaffolded::missing_parameter(
+                "The request must contain the parameter Resources",
+            ));
+        }
+        // Documented on `Resources`: "Up to 1000 resource IDs." The model declares no
+        // `@length`, so this is the only place the bound can exist, and it is what keeps
+        // the work below proportional to a bounded number of resources.
+        if input.resources.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Resources carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                input.resources.len()
+            )));
+        }
+
+        // "If you omit this parameter, we delete all user-defined tags for the specified
+        // resources" (`Tags`). An ec2Query body cannot tell an omitted list from an empty
+        // one — neither carries a `Tag.1.*` field — so both read as the omitted form.
+        let asked = input.tags.as_deref().unwrap_or_default();
+        // Documented on `Tags`: "Up to 1000 tags." A tag named for removal need not be one
+        // any resource holds, so the request's bound is not the per-resource one.
+        if asked.len() > MAX_TAGS_PER_DELETE_REQUEST {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Tags carries {} tags, above the maximum of {MAX_TAGS_PER_DELETE_REQUEST}",
+                asked.len()
+            )));
+        }
+
+        // The selectors, indexed BY KEY: the value for a key is `None` when the request
+        // gave that key with no value at all ("we delete any tag with this key regardless
+        // of its value") and otherwise the set of values it named, so a stored tag is
+        // tested with one lookup instead of a scan over every selector. That is what keeps
+        // the work bounded by the number of STORED tags rather than by the product of the
+        // ids, the stored tags and the selectors the request may carry.
+        let mut selectors: ::std::collections::BTreeMap<
+            String,
+            Option<::std::collections::BTreeSet<String>>,
+        > = ::std::collections::BTreeMap::new();
+        for tag in asked {
+            let Some(key) = tag.key.clone() else {
+                return Err(Scaffolded::missing_parameter(
+                    "Every tag the request names must contain the parameter Key",
+                ));
+            };
+            if key.is_empty() {
+                return Err(Scaffolded::invalid_parameter_value(
+                    "A tag key cannot be empty",
+                ));
+            }
+            // The reserved prefix names the tags AWS generates, and this call does not
+            // remove those: "We do not delete Amazon Web Services-generated tags (tags
+            // that have the aws: prefix)". A request naming one is refused rather than
+            // answered as though the tag had been removed.
+            if key.starts_with(RESERVED_TAG_PREFIX) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Tag key '{key}' is invalid: the '{RESERVED_TAG_PREFIX}' prefix is reserved"
+                )));
+            }
+            // A key or value longer than EC2 accepts names no tag any resource could
+            // carry, and refusing it bounds the comparisons below.
+            validate_tag_size(&key, tag.value.as_deref().unwrap_or_default())?;
+            let selected = selectors
+                .entry(key)
+                .or_insert_with(|| Some(::std::collections::BTreeSet::new()));
+            match tag.value.clone() {
+                // The value-less form of a key subsumes every value-bearing one.
+                None => *selected = None,
+                Some(value) => {
+                    if let Some(values) = selected.as_mut() {
+                        values.insert(value);
+                    }
+                }
+            }
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        store.materialize_due_transitions();
+
+        // One resource is untagged once however many times the request names it.
+        let resource_ids = deduplicate_ids(&input.resources);
+
+        // Every id is resolved BEFORE a single tag is removed: a request naming one id
+        // this account holds no resource for leaves the tags of the others alone.
+        for resource_id in &resource_ids {
+            if store.resource_tags_mut(resource_id).is_none() {
+                return Err(if instance_id_is_well_formed(resource_id) {
+                    Scaffolded::invalid_instance_id_not_found(resource_id)
+                } else {
+                    Scaffolded::invalid_id(resource_id)
+                });
+            }
+        }
+
+        // DryRun sits AFTER every id has been resolved and BEFORE the first write: the
+        // flag asks whether the request would have succeeded, so one naming a resource
+        // that does not exist is refused with that reason instead. The checks above only
+        // read state.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let mut freed: usize = 0;
+        for resource_id in &resource_ids {
+            let Some(mut tags) = store.resource_tags_mut(resource_id) else {
+                continue;
+            };
+            freed = freed.saturating_add(tags.remove(|key, value| {
+                if asked.is_empty() {
+                    // The omitted form: every user-defined tag goes, and only those.
+                    return !key.starts_with(RESERVED_TAG_PREFIX);
+                }
+                match selectors.get(key) {
+                    // A key the request did not name selects nothing.
+                    None => false,
+                    // The key was given with no value: the tag goes whatever it holds.
+                    Some(None) => true,
+                    // The key was given with values: only an exact match goes, which an
+                    // empty value matches exactly as any other value does.
+                    Some(Some(values)) => values.contains(value),
+                }
+            }));
+        }
+        // The bytes those tags held go back to the store's budget, so tagging and
+        // untagging the same resource cannot drift the accounting upwards.
+        store.release_stored_bytes(freed);
+
+        Ok(DeleteTagsOutput)
     }
 }

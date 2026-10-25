@@ -17,6 +17,9 @@
 //! reads) and drive the read over the real wire path, which is what this operation owns;
 //! the absent-instance rows cover what a client actually sees today.
 //!
+//! The listing of the same records is `ListTaskInstances`, covered by the suite
+//! `task_instance_listing`.
+//!
 //! The table spans what the rule generalises over: the `TaskInstanceStatus` value, which
 //! optional members are present, whether the task has started/completed, the length of
 //! the completed span, the number of `Xcom` entries and the form and length of the
@@ -54,7 +57,10 @@ const TASK_INSTANCE_STATUSES: &[&str] = &[
 
 /// A fixed instant plus `offset_millis`, so a seeded timestamp is deterministic and a
 /// test never races the wall clock.
-fn at(offset_millis: u64) -> SystemTime {
+///
+/// `pub(crate)` so `task_instance_listing` seeds the spans a derived duration is read
+/// from through the same clock rather than writing a second one.
+pub(crate) fn at(offset_millis: u64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_000 + offset_millis)
 }
 

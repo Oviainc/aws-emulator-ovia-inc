@@ -268,6 +268,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 state_machine_arn: machine.arn.clone(),
                 state_machine_name: machine.name.clone(),
                 role_arn: machine.role_arn.clone(),
+                // A reply CONTINUES the attempt it was scheduled on rather than
+                // beginning another, so the states it runs on read the count the
+                // record already carries — not one more.
+                redrive_count: execution.redrive_count,
             };
             // The execution runs the definition it was STARTED on, which for one
             // started through a version ARN — or through an alias that routed to a

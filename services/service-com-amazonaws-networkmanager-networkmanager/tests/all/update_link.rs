@@ -13,12 +13,20 @@
 //! documented constraints is refused (400 `ValidationException`) exactly as `CreateLink`
 //! refuses it.
 //!
+//! Because the write lands in the store rather than in the answer alone, every reader of
+//! the record answers from it: a link updated here leaves the listing of the descriptor it
+//! no longer holds and joins the listing of the one it now does, keeps the site and the
+//! global network it was created under, and is the same record however often one update is
+//! repeated — while a later update replaces only the members it carries.
+//!
 //! Nothing reaches into `crate::state`: a link is only ever read back through `GetLinks`.
 //! The harness is the one `global_network_lifecycle` defines.
 
 use serde_json::{json, Value};
 
-use crate::global_network_lifecycle::{error_code, expected_scoped_arn, Emulator, PAST_SETTLE};
+use crate::global_network_lifecycle::{
+    error_code, expected_scoped_arn, ids_of, Emulator, PAST_SETTLE,
+};
 
 /// The members every seeded link starts with, so a row that supplies none of them has
 /// values to leave alone.
@@ -452,6 +460,232 @@ async fn update_link_on_a_link_the_store_does_not_hold_is_not_found_and_stores_n
         json!(BASE_DESCRIPTION),
         "a refused update must store nothing, got {stored}"
     );
+}
+
+/// One row of the reader-visibility table: the update's body, and the descriptors the
+/// stored record must be found under afterwards.
+struct VisibilityCase {
+    case: &'static str,
+    body: Value,
+    link_type: String,
+    provider: String,
+}
+
+/// The descriptors a link of this suite's visibility table is seeded with. They carry no
+/// space, so a row can name them in the query string of a filtered `GetLinks` as they are.
+const FILTERABLE_TYPE: &str = "broadband";
+/// See [`FILTERABLE_TYPE`].
+const FILTERABLE_PROVIDER: &str = "AnyCompanyNetworks";
+
+/// The rows of the reader-visibility table. They differ along WHICH descriptor the update
+/// rewrites (both, `Type` alone, `Provider` alone), and along the form of the new value: a
+/// plain word, one differing from the stored value only in case, and one at the published
+/// maximum length.
+fn visibility_cases() -> Vec<VisibilityCase> {
+    vec![
+        VisibilityCase {
+            case: "both descriptors rewritten",
+            body: json!({ "Type": "mpls", "Provider": "ExampleTelecom" }),
+            link_type: "mpls".to_string(),
+            provider: "ExampleTelecom".to_string(),
+        },
+        VisibilityCase {
+            case: "Type alone rewritten",
+            body: json!({ "Type": "dark-fibre" }),
+            link_type: "dark-fibre".to_string(),
+            provider: FILTERABLE_PROVIDER.to_string(),
+        },
+        VisibilityCase {
+            case: "Provider alone rewritten",
+            body: json!({ "Provider": "Example_Telecom-2" }),
+            link_type: FILTERABLE_TYPE.to_string(),
+            provider: "Example_Telecom-2".to_string(),
+        },
+        VisibilityCase {
+            case: "a Type differing from the stored one only in case",
+            body: json!({ "Type": "BROADBAND" }),
+            link_type: "BROADBAND".to_string(),
+            provider: FILTERABLE_PROVIDER.to_string(),
+        },
+        VisibilityCase {
+            case: "descriptors at their published maximum lengths",
+            body: json!({
+                "Type": "t".repeat(MAX_DESCRIPTOR_CHARS),
+                "Provider": "p".repeat(MAX_DESCRIPTOR_CHARS),
+            }),
+            link_type: "t".repeat(MAX_DESCRIPTOR_CHARS),
+            provider: "p".repeat(MAX_DESCRIPTOR_CHARS),
+        },
+    ]
+}
+
+/// Create a link carrying the given descriptors, and return its minted id.
+async fn create_link_with(
+    emulator: &Emulator,
+    network: &str,
+    site: &str,
+    link_type: &str,
+    provider: &str,
+) -> String {
+    let (status, created) = emulator
+        .post(
+            &format!("/global-networks/{network}/links"),
+            json!({
+                "SiteId": site,
+                "Description": BASE_DESCRIPTION,
+                "Type": link_type,
+                "Provider": provider,
+                "Bandwidth": base_bandwidth(),
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "CreateLink({link_type}/{provider}): expected 200, got {status} with {created}"
+    );
+    created["Link"]["LinkId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreateLink: no LinkId in {created}"))
+        .to_string()
+}
+
+/// The ids a `GetLinks` page carries for one query string.
+async fn listed_links(emulator: &Emulator, network: &str, query: &str) -> Vec<String> {
+    let (status, body) = emulator
+        .get(&format!("/global-networks/{network}/links?{query}"))
+        .await;
+    assert_eq!(
+        status, 200,
+        "GetLinks?{query}: expected 200, got {status} with {body}"
+    );
+    ids_of(&body, "Links", "LinkId")
+}
+
+#[tokio::test]
+async fn an_updated_link_is_what_every_reader_of_the_record_answers() {
+    let emulator = Emulator::new();
+    let network = emulator.create_global_network("update-link").await;
+    let site = emulator.create_site(&network, "hq").await;
+    let rows = visibility_cases();
+
+    // One identically seeded link per row, so a row that rewrites one descriptor leaves a
+    // record that is still found under the other.
+    let mut links = Vec::new();
+    for _ in &rows {
+        links.push(
+            create_link_with(
+                &emulator,
+                &network,
+                &site,
+                FILTERABLE_TYPE,
+                FILTERABLE_PROVIDER,
+            )
+            .await,
+        );
+    }
+
+    for (row, link_id) in rows.iter().zip(&links) {
+        let case = row.case;
+        let (status, answer) = update_link(&emulator, &network, link_id, row.body.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected 200, got {status} with {answer}"
+        );
+
+        // The update wrote the store, so the descriptor filters answer from the NEW record:
+        // the link is listed under what it now holds (the two filters the documentation
+        // lets a request combine), and no longer under the value it held before.
+        let under_new = listed_links(
+            &emulator,
+            &network,
+            &format!("type={}&provider={}", row.link_type, row.provider),
+        )
+        .await;
+        assert!(
+            under_new.contains(link_id),
+            "case {case}: expected the link under its new descriptors, got {under_new:?}"
+        );
+        if row.link_type != FILTERABLE_TYPE {
+            let under_old = listed_links(&emulator, &network, &format!("type={FILTERABLE_TYPE}"))
+                .await;
+            assert!(
+                !under_old.contains(link_id),
+                "case {case}: the link must leave the listing of the Type it no longer holds, \
+                 got {under_old:?}"
+            );
+        }
+        if row.provider != FILTERABLE_PROVIDER {
+            let under_old =
+                listed_links(&emulator, &network, &format!("provider={FILTERABLE_PROVIDER}")).await;
+            assert!(
+                !under_old.contains(link_id),
+                "case {case}: the link must leave the listing of the Provider it no longer \
+                 holds, got {under_old:?}"
+            );
+        }
+
+        // What the update takes no input for is untouched, so the record keeps the site it
+        // was created at and stays in the global network's unfiltered listing.
+        let at_site = listed_links(&emulator, &network, &format!("siteId={site}")).await;
+        assert!(
+            at_site.contains(link_id),
+            "case {case}: an update must not move the link off its site, got {at_site:?}"
+        );
+        let everything = listed_links(&emulator, &network, "").await;
+        assert!(
+            everything.contains(link_id),
+            "case {case}: the link must stay in its global network, got {everything:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn repeating_one_update_leaves_the_same_record_and_a_later_one_wins_per_member() {
+    let emulator = Emulator::new();
+    let network = emulator.create_global_network("update-link").await;
+    let site = emulator.create_site(&network, "hq").await;
+    let link = create_seeded_link(&emulator, &network, &site).await;
+
+    // Applying one update twice is the same record both times: the write depends on the
+    // request alone, not on how often it has been made.
+    let body = json!({ "Description": "settled", "Bandwidth": { "UploadSpeed": 42 } });
+    let (first_status, first) = update_link(&emulator, &network, &link, body.clone()).await;
+    let (second_status, second) = update_link(&emulator, &network, &link, body.clone()).await;
+    for (case, status) in [("first apply", first_status), ("second apply", second_status)] {
+        assert_eq!(status, 200, "case {case}: expected 200, got {status}");
+    }
+    assert_eq!(
+        without_state(&first["Link"]),
+        without_state(&second["Link"]),
+        "repeating one update must answer the same record, got {second}"
+    );
+
+    // A later update replaces only the members it carries, so the earlier write survives
+    // on every member the later request leaves out.
+    let (status, answer) = update_link(
+        &emulator,
+        &network,
+        &link,
+        json!({ "Provider": "Example Telecom" }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the later update: expected 200, got {status} with {answer}"
+    );
+    std::thread::sleep(PAST_SETTLE);
+    let stored = read_link(&emulator, &network, &link).await;
+    for (member, want) in [
+        ("Description", json!("settled")),
+        ("Provider", json!("Example Telecom")),
+        ("Type", json!(BASE_TYPE)),
+        ("Bandwidth", json!({ "UploadSpeed": 42 })),
+    ] {
+        assert_eq!(
+            stored[member], want,
+            "after two updates: expected {member} {want}, got {stored}"
+        );
+    }
 }
 
 #[tokio::test]

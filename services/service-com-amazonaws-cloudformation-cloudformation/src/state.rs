@@ -2663,6 +2663,8 @@ pub enum PageOf {
     ChangeSetSummaries,
     /// `ListHookResults`'s `HookResults`.
     HookResults,
+    /// `ListExports`'s `Exports`.
+    Exports,
     /// `DescribeAccountLimits`'s `AccountLimits`.
     AccountLimits,
 }
@@ -2678,6 +2680,7 @@ impl PageOf {
             Self::Changes => "changes",
             Self::ChangeSetSummaries => "change-set-summaries",
             Self::HookResults => "hookresults",
+            Self::Exports => "exports",
             Self::AccountLimits => "account-limits",
         }
     }

@@ -15,6 +15,8 @@
 mod account_settings;
 #[path = "all/delete_group_protection.rs"]
 mod delete_group_protection;
+#[path = "all/get_tag_sync_task.rs"]
+mod get_tag_sync_task;
 #[path = "all/group_owner_configuration_and_update.rs"]
 mod group_owner_configuration_and_update;
 #[path = "all/group_query.rs"]

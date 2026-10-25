@@ -33,12 +33,12 @@ const QUERY_TYPE_VALUES: [&str; 2] = ["TAG_FILTERS_1_0", "CLOUDFORMATION_STACK_1
 
 /// A role ARN shaped like the modelled `RoleArn`
 /// (`^arn:(aws[a-zA-Z-]*)?:iam::\d{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+$`).
-fn role_arn(name: &str) -> String {
+pub(crate) fn role_arn(name: &str) -> String {
     format!("arn:aws:iam::{ACCOUNT}:role/{name}")
 }
 
 /// The ARN every operation of this service reports for the group `name` in `region`.
-fn group_arn(region: &str, name: &str) -> String {
+pub(crate) fn group_arn(region: &str, name: &str) -> String {
     format!("arn:aws:resource-groups:{region}:{ACCOUNT}:group/{name}")
 }
 
@@ -172,7 +172,7 @@ fn is_modelled_id(id: &str) -> bool {
 /// The 26-character id qualifying `group_arn` inside `task_arn`, when `task_arn` is
 /// shaped like the modelled `TagSyncTaskArn` for a task of that group:
 /// `<group arn>/<26 chars>/tag-sync-task/<26 chars>`.
-fn application_segment(task_arn: &str, group_arn: &str) -> Option<String> {
+pub(crate) fn application_segment(task_arn: &str, group_arn: &str) -> Option<String> {
     let nested = task_arn.strip_prefix(group_arn)?.strip_prefix('/')?;
     let (application, task) = nested.split_once("/tag-sync-task/")?;
     (is_modelled_id(application) && is_modelled_id(task)).then(|| application.to_string())
