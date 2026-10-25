@@ -483,8 +483,10 @@ fn stored_search_offering(config: &crate::state::DestinationConfigKind) -> Optio
 /// The one destination update the request carries, refusing both none and more than one.
 ///
 /// Credentials supplied inside an update (a Redshift password, a Snowflake private key or
-/// passphrase, an HTTP endpoint access key) are dropped rather than stored, exactly as on
-/// the create path: every one is `@sensitive` and no modelled description carries it back.
+/// passphrase) are dropped rather than stored, exactly as on the create path: every one is
+/// `@sensitive` and no modelled description carries it back. An HTTP endpoint's `AccessKey`
+/// is kept for the same reason the create path keeps it — every delivery request to that
+/// endpoint has to carry it — and is reported back by nothing.
 fn sole_update(
     input: &UpdateDestinationInput,
 ) -> Result<DestinationUpdateKind, UpdateDestinationError> {
@@ -510,10 +512,7 @@ fn sole_update(
     if let Some(update) = input.splunk_destination_update.clone() {
         supplied.push(Kind::Splunk(Box::new(update)));
     }
-    if let Some(mut update) = input.http_endpoint_destination_update.clone() {
-        if let Some(endpoint) = update.endpoint_configuration.as_mut() {
-            endpoint.access_key = None;
-        }
+    if let Some(update) = input.http_endpoint_destination_update.clone() {
         supplied.push(Kind::HttpEndpoint(Box::new(update)));
     }
     if let Some(mut update) = input.snowflake_destination_update.clone() {
@@ -1083,7 +1082,8 @@ fn merge_http_endpoint(
     stored: &mut HttpEndpointDestinationConfiguration,
     update: &HttpEndpointDestinationUpdate,
 ) -> Result<(), UpdateDestinationError> {
-    // The update's own `AccessKey` is already dropped by `sole_update`.
+    // An update that supplies an `EndpointConfiguration` supplies the `AccessKey` the
+    // delivery requests to the new endpoint carry with it; no description reports it back.
     merge_required(
         &mut stored.endpoint_configuration,
         &update.endpoint_configuration,

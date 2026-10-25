@@ -247,8 +247,8 @@ pub const STORAGE_LENS_GROUP_QUOTA: usize = 1_000;
 // `CreateJob` records a job here and every job operation reads the one record
 // it stored: `DescribeJob` reports it, `UpdateJobPriority` replaces its
 // priority, the job tagging operations read and replace its tag set, and
-// `UpdateJobStatus` moves its status (those three are still scaffolds with
-// their own gap issues).
+// `UpdateJobStatus` moves its status (that last one is still a scaffold with
+// its own gap issue).
 // ---------------------------------------------------------------------------
 
 /// `JobStatus` of a job the service has accepted and not yet prepared — the
@@ -290,6 +290,14 @@ pub const JOB_PREPARATION: Duration = Duration::from_millis(500);
 /// `ClientRequestToken` adds no record at all.
 pub const JOB_QUOTA: usize = 1_000;
 
+/// How many tags a job's tag set holds: "Amazon S3 limits the maximum number
+/// of tags to 50 tags per job" (`PutJobTagging`), so a tag set past it is one
+/// the real service would not store either.
+///
+/// It is also what bounds the bytes one job record's tag set can hold: at most
+/// this many tags, each a modelled key (len 1..128) and value (len 0..256).
+pub const MAX_JOB_TAGS: usize = 50;
+
 /// How a stored job is keyed: the owning account id and the job id, which is
 /// the pair a job id is unique within.
 pub type JobKey = (String, String);
@@ -326,10 +334,10 @@ pub struct JobRecord {
     pub status_update_reason: Option<String>,
     /// When the job reached a terminal status; `None` while it has not.
     pub termination_date: Option<::aws_smithy_types::DateTime>,
-    /// The job's tag set, as `CreateJob` was given it. The job tagging
-    /// operations (`GetJobTagging`, `PutJobTagging`, `DeleteJobTagging`) are
-    /// still scaffolds with their own gap issues, and will read this field
-    /// rather than a second copy.
+    /// The job's tag set, as `CreateJob` was given it and as the job tagging
+    /// operations last left it: `PutJobTagging` replaces it whole,
+    /// `DeleteJobTagging` empties it and `GetJobTagging` reports it. Bounded
+    /// by [`MAX_JOB_TAGS`], and the one copy all four operations share.
     pub tags: Vec<S3Tag>,
     /// The `ClientRequestToken` the create carried, which is what makes a
     /// repeated create idempotent rather than a second job.
@@ -1494,6 +1502,22 @@ pub fn job_not_found<E>(job_id: &str) -> crate::scaffolded::Scaffolded<E> {
         "InvalidRequest",
         400,
         format!("Job not found: {job_id}"),
+    )
+}
+
+/// `InvalidRequest` (HTTP 400): a submitted job tag set names one key twice, so
+/// it is not a set — "you can associate up to 50 tags with a job as long as
+/// they have unique tag keys" (`PutJobTagging`), and the keys are case
+/// sensitive, so two spellings that differ in case are two keys.
+///
+/// The code and status are the ones the job-id surface already answers a
+/// well-formed request it cannot carry out with (see [`job_not_found`]): the
+/// S3-style XML envelope with code `InvalidRequest` and HTTP 400.
+pub fn duplicate_job_tag_key<E>(key: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "InvalidRequest",
+        400,
+        format!("A job's tag keys must be unique; {key} is named more than once."),
     )
 }
 

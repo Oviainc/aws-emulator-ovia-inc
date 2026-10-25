@@ -61,6 +61,8 @@ mod service_claim;
 mod settings_co_requirements;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tagging_arn_qualifiers.rs"]
+mod tagging_arn_qualifiers;
 #[path = "all/tagging_resource_families.rs"]
 mod tagging_resource_families;
 #[path = "all/transcription_job_redacted_output.rs"]

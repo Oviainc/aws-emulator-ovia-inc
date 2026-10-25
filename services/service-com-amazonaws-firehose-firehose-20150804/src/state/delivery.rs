@@ -26,6 +26,24 @@
 //! * WHAT — the buffered records' data, concatenated in arrival order, encoded as
 //!   `CompressionFormat` asks ([`compressed`]).
 //!
+//! ## An HTTP endpoint destination
+//!
+//! A destination that is an HTTP endpoint is not delivered to by writing an object: the
+//! buffer is POSTed to the URL the destination's `EndpointConfiguration` names, as the
+//! delivery protocol `HttpEndpointConfiguration$Url` points at documents ("review and
+//! follow the instructions in the Appendix - HTTP Endpoint Delivery Request and Response
+//! Specifications"). The request carries a JSON body of `requestId`, `timestamp` and a
+//! `records` array of base64 `data` items, the `RequestConfiguration`'s `ContentEncoding`
+//! and `CommonAttributes`, and the `AccessKey` the configuration carries —
+//! [`post_to_endpoint`]. A buffer the endpoint does not acknowledge is attempted again for
+//! as long as `RetryOptions` allows and is then parked in the destination's Amazon S3
+//! backup ([`backup_object`]), so nothing a put accepted is lost.
+//!
+//! The POST is sent through the IN-PROCESS transport of the emulator this delivery runs
+//! within (the connector of `smithy_server_runtime::OperationContext::callback`, handed to
+//! [`deliver_due`]): the endpoints this emulator can deliver to are the ones it serves
+//! itself, so a delivery opens no socket and reaches nothing outside this process.
+//!
 //! ## The clock
 //!
 //! A flush is a clock-owed change like any other in this crate: [`take_due`] applies only
@@ -46,6 +64,8 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+
+use ::aws_smithy_runtime_api::client::http::{HttpConnector, SharedHttpConnector};
 
 use crate::ops::types::{BufferingHints, ProcessingConfiguration, S3DestinationConfiguration};
 use crate::state::{
@@ -85,6 +105,15 @@ pub const DELIVERY_SPAN: Duration = Duration::from_millis(600);
 /// due sooner than one still filling. Chosen like [`DELIVERY_SPAN`], and never zero for
 /// the same reason.
 pub const FULL_BUFFER_DELIVERY_SPAN: Duration = Duration::from_millis(250);
+
+/// `HttpEndpointRetryOptions$DurationInSeconds` when the configuration names none.
+///
+/// A CHOSEN span: the member states what the duration MEANS ("the total amount of time
+/// that Firehose spends on retries. This duration starts after the initial attempt to send
+/// data to the custom destination via HTTPS endpoint fails") but declares no default, so
+/// this is the emulator's, kept long enough that a destination which is briefly not
+/// answering is retried rather than backed up.
+const DEFAULT_ENDPOINT_RETRY_DURATION: Duration = Duration::from_secs(300);
 
 /// How long a stream whose buffer could not be delivered at all waits before the delivery
 /// is attempted again.
@@ -343,13 +372,69 @@ const METADATA_EXTRACTION_FAILED: DeliveryFailure = DeliveryFailure {
     error_message: "the partition keys of this record could not be determined",
 };
 
+/// What the `firehose:error-output-type` namespace expands to for a record an HTTP endpoint
+/// destination did not take, and the prefix its backup gets when the configuration names
+/// no `ErrorOutputPrefix`.
+const HTTP_ENDPOINT_FAILED_OUTPUT_TYPE: &str = "http-endpoint-failed";
+
+/// The failure of a buffer the HTTP endpoint ANSWERED, but not with a success status — the
+/// destination raised rather than acknowledged the delivery.
+const HTTP_ENDPOINT_DESTINATION_EXCEPTION: DeliveryFailure = DeliveryFailure {
+    output_type: HTTP_ENDPOINT_FAILED_OUTPUT_TYPE,
+    error_code: "HttpEndpoint.DestinationException",
+    error_message: "the HTTP endpoint destination did not acknowledge the delivery",
+};
+
+/// The failure of a buffer whose delivery request could not be made at all: nothing this
+/// emulator serves answers at that URL, or the configuration does not render a request
+/// (a `Url` that is not a URI, an `AccessKey` or a common attribute that is not a header
+/// value).
+const HTTP_ENDPOINT_CONNECTION_FAILED: DeliveryFailure = DeliveryFailure {
+    output_type: HTTP_ENDPOINT_FAILED_OUTPUT_TYPE,
+    error_code: "HttpEndpoint.ConnectionFailed",
+    error_message: "the HTTP endpoint destination could not be reached",
+};
+
+/// The `ContentEncoding` value that asks for the delivery request's body to be gzipped:
+/// "Firehose uses the content encoding to compress the body of a request before sending the
+/// request to the destination" (`HttpEndpointRequestConfiguration$ContentEncoding`, whose
+/// values are `NONE` and `GZIP`).
+const GZIP_CONTENT_ENCODING: &str = "GZIP";
+
+/// The `Content-Encoding` a gzipped delivery request carries, the token that encoding is
+/// named by on the wire.
+const GZIP_CONTENT_ENCODING_TOKEN: &str = "gzip";
+
+/// The version of the delivery request protocol this request is written in, carried on
+/// every request the HTTP endpoint delivery protocol describes.
+const PROTOCOL_VERSION: &str = "1.0";
+
+/// The header carrying [`PROTOCOL_VERSION`].
+const PROTOCOL_VERSION_HEADER: &str = "x-amz-firehose-protocol-version";
+
+/// The header carrying the id of one delivery request — the same value the body's
+/// `requestId` carries, so a destination can tie the two together.
+const REQUEST_ID_HEADER: &str = "x-amz-firehose-request-id";
+
+/// The header naming the Firehose stream the delivered records came from.
+const SOURCE_ARN_HEADER: &str = "x-amz-firehose-source-arn";
+
+/// The header carrying `EndpointConfiguration$AccessKey`: "the access key required for
+/// Kinesis Firehose to authenticate with the HTTP endpoint selected as the destination".
+const ACCESS_KEY_HEADER: &str = "x-amz-firehose-access-key";
+
+/// The header carrying `RequestConfiguration$CommonAttributes`: "describes the metadata
+/// sent to the HTTP endpoint destination".
+const COMMON_ATTRIBUTES_HEADER: &str = "x-amz-firehose-common-attributes";
+
 /// The `S3BackupMode` value that sends a copy of EVERY record to the backup location,
 /// whichever destination kind carries the mode (`S3BackupMode` `Enabled`,
 /// `ElasticsearchS3BackupMode` `AllDocuments`, `SplunkS3BackupMode` `AllEvents`,
 /// `HttpEndpointS3BackupMode` / `SnowflakeS3BackupMode` / `IcebergS3BackupMode`
 /// `AllData`). Under any other mode the Amazon S3 location takes only the records the
-/// primary destination rejected, and this emulator delivers to none of those endpoints, so
-/// it has no rejected record to write there.
+/// primary destination rejected — which for an HTTP endpoint destination is what
+/// [`backup_object`] writes there, and for the endpoints this emulator delivers to none of
+/// is nothing.
 const ALL_RECORDS_BACKUP_MODES: &[&str] = &["Enabled", "AllDocuments", "AllEvents", "AllData"];
 
 /// One Amazon S3 location a stream's buffer is delivered to, with everything the write
@@ -379,17 +464,67 @@ pub struct S3Target {
     pub append_delimiter: bool,
 }
 
+/// One HTTP endpoint destination a stream's buffer is delivered to, with everything the
+/// delivery request needs, read off the destination configuration in force at the moment of
+/// the flush.
+#[derive(Clone)]
+pub struct HttpEndpointTarget {
+    /// `EndpointConfiguration$Url`, the URL the buffer is POSTed to.
+    pub url: String,
+    /// `EndpointConfiguration$AccessKey`, carried on the request so the destination can
+    /// authenticate the delivery. `None` when the configuration names none or names an
+    /// empty one (the member's own length range admits zero).
+    pub access_key: Option<String>,
+    /// Whether `RequestConfiguration$ContentEncoding` asks for a gzipped body.
+    pub gzip: bool,
+    /// `RequestConfiguration$CommonAttributes`, in configuration order.
+    pub common_attributes: Vec<(String, String)>,
+    /// `BufferingHints`, which decide when this endpoint's buffer is due. The same two
+    /// parameters as every other destination's, so one window rule serves both
+    /// ([`delivery_window`]).
+    pub hints: Option<BufferingHints>,
+    /// How long the delivery of one buffer is retried before its records are parked in
+    /// [`Self::backup`] — `RetryOptions$DurationInSeconds`, or
+    /// [`DEFAULT_ENDPOINT_RETRY_DURATION`].
+    pub retry_duration: Duration,
+    /// The Amazon S3 location the destination's required `S3Configuration` names, where a
+    /// record this endpoint never took is parked.
+    pub backup: Option<S3Target>,
+}
+
+impl ::std::fmt::Debug for HttpEndpointTarget {
+    /// Everything this target carries EXCEPT the values the model declares `@sensitive`:
+    /// the URL, the access key and the common attributes are the caller's own, so this form
+    /// says whether one is configured and never what it is. The derived form would put them
+    /// in whatever formatted it.
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        f.debug_struct("HttpEndpointTarget")
+            .field("access_key", &self.access_key.is_some())
+            .field("gzip", &self.gzip)
+            .field("common_attributes", &self.common_attributes.len())
+            .field("hints", &self.hints)
+            .field("retry_duration", &self.retry_duration)
+            .field("backup", &self.backup)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A stream's buffer, taken out of the store and ready to be written to its destination.
 #[derive(Debug)]
 pub struct PendingDelivery {
     /// The stream whose buffer this is, which names the delivered objects.
     pub stream: String,
+    /// The stream's ARN, which the delivery request to an HTTP endpoint names as the
+    /// source the records came from.
+    pub source_arn: String,
     /// The stream's `VersionId`, which a delivered object's name carries.
     pub version_id: u64,
     /// The buffered records, in arrival order.
     pub records: Vec<StoredRecord>,
     /// Every Amazon S3 location this buffer goes to.
     pub targets: Vec<S3Target>,
+    /// Every HTTP endpoint this buffer is POSTed to.
+    pub endpoints: Vec<HttpEndpointTarget>,
 }
 
 /// One object a delivery writes.
@@ -600,14 +735,87 @@ fn stream_targets(stream: &DeliveryStream) -> Vec<S3Target> {
         .collect()
 }
 
+/// The HTTP endpoint a destination configuration delivers to — the URL its
+/// `EndpointConfiguration` names, and nothing for a destination of any other kind.
+///
+/// "Describes the configuration of the HTTP endpoint destination"
+/// (`HttpEndpointDestinationConfiguration`): the endpoint IS the destination, so the
+/// buffer goes to it rather than to an Amazon S3 location, and the configuration's
+/// required `S3Configuration` is the backup the records a delivery could not place end up
+/// in.
+#[must_use]
+pub fn http_endpoint_targets(config: &DestinationConfigKind) -> Vec<HttpEndpointTarget> {
+    let DestinationConfigKind::HttpEndpoint(config) = config else {
+        return Vec::new();
+    };
+    if config.endpoint_configuration.url.is_empty() {
+        return Vec::new();
+    }
+    let request = config.request_configuration.as_ref();
+    vec![HttpEndpointTarget {
+        url: config.endpoint_configuration.url.clone(),
+        access_key: config
+            .endpoint_configuration
+            .access_key
+            .clone()
+            .filter(|key| !key.is_empty()),
+        gzip: request
+            .and_then(|request| request.content_encoding.as_deref())
+            .is_some_and(|encoding| encoding == GZIP_CONTENT_ENCODING),
+        common_attributes: request
+            .and_then(|request| request.common_attributes.as_ref())
+            .map(|attributes| {
+                attributes
+                    .iter()
+                    .map(|attribute| {
+                        (
+                            attribute.attribute_name.clone(),
+                            attribute.attribute_value.clone(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        // The endpoint's own buffering parameters are the same two every other
+        // destination's are, so they are carried as the one shape the window rule reads.
+        hints: config.buffering_hints.as_ref().map(|hints| BufferingHints {
+            size_in_m_bs: hints.size_in_m_bs,
+            interval_in_seconds: hints.interval_in_seconds,
+        }),
+        retry_duration: config
+            .retry_options
+            .as_ref()
+            .and_then(|options| options.duration_in_seconds)
+            .and_then(|seconds| u64::try_from(seconds).ok())
+            .map_or(DEFAULT_ENDPOINT_RETRY_DURATION, Duration::from_secs),
+        backup: plain_target(&config.s3_configuration),
+    }]
+}
+
+/// Every HTTP endpoint this stream's destinations deliver to right now.
+fn stream_endpoints(stream: &DeliveryStream) -> Vec<HttpEndpointTarget> {
+    stream
+        .destinations
+        .iter()
+        .flat_map(|destination| http_endpoint_targets(&destination.config))
+        .collect()
+}
+
 /// When this stream's buffer comes due for delivery, or `None` when nothing is owed — an
-/// empty buffer, or a destination with no Amazon S3 location to deliver to.
+/// empty buffer, or a destination with no location and no endpoint to deliver to.
 #[must_use]
 pub fn due_at(stream: &DeliveryStream) -> Option<SystemTime> {
     let opened_at = stream.records.first()?.received_at;
+    // The destinations are two kinds with one buffering rule between them, and the FIRST
+    // buffer to come due decides when the flush happens.
     let window = stream_targets(stream)
         .iter()
         .map(|target| delivery_window(target.hints.as_ref(), stream.buffered_bytes))
+        .chain(
+            stream_endpoints(stream)
+                .iter()
+                .map(|endpoint| delivery_window(endpoint.hints.as_ref(), stream.buffered_bytes)),
+        )
         .min()?;
     let due = opened_at + window;
     Some(match stream.delivery_retry_at {
@@ -657,7 +865,8 @@ pub fn take_due(
             continue;
         }
         let targets = stream_targets(stream);
-        if targets.is_empty() {
+        let endpoints = stream_endpoints(stream);
+        if targets.is_empty() && endpoints.is_empty() {
             continue;
         }
         if extractions == Extractions::LeaveToThePump
@@ -674,9 +883,11 @@ pub fn take_due(
         freed += bytes;
         due.push(PendingDelivery {
             stream: stream.name.clone(),
+            source_arn: stream.arn.clone(),
             version_id: stream.version_id,
             records,
             targets,
+            endpoints,
         });
     }
     store.buffered_bytes = store.buffered_bytes.saturating_sub(freed);
@@ -714,11 +925,13 @@ fn restore(
 ///
 /// The one entry point: a handler calls it (so a put also materialises what an earlier
 /// buffer was owed), and so does the delivery pump. `extractions` is what separates the
-/// two — see [`Extractions`].
+/// two — see [`Extractions`]. `transport` is the in-process emulator transport an HTTP
+/// endpoint destination is POSTed over; a stream with no such destination never uses it.
 pub async fn deliver_due<Eng: Send + Sync + 'static>(
     engine: &Eng,
     now: SystemTime,
     extractions: Extractions,
+    transport: &SharedHttpConnector,
 ) {
     let Some(state) = service_state(engine) else {
         return;
@@ -729,20 +942,239 @@ pub async fn deliver_due<Eng: Send + Sync + 'static>(
         take_due(&mut store, now, extractions)
     };
     for delivery in pending {
+        // The HTTP endpoints first, because a buffer one of them has not taken and still
+        // has retries for is owed again AS A WHOLE: deciding that before anything is
+        // written keeps the retry from writing the Amazon S3 half of the same buffer twice.
+        let mut parked = Vec::new();
+        let mut owed = false;
+        for (ordinal, endpoint) in delivery.endpoints.iter().enumerate() {
+            let Err(failure) = post_to_endpoint(transport, &delivery, endpoint, now).await else {
+                continue;
+            };
+            if !retries_spent(&delivery, endpoint, now) {
+                owed = true;
+                continue;
+            }
+            // The retry window is spent, so these records are parked in the destination's
+            // backup. One this emulator cannot work out — an `S3Configuration` naming no
+            // bucket, a prefix that does not resolve — leaves the records owed instead of
+            // dropping them.
+            match backup_object(&delivery, endpoint, failure, now, ordinal) {
+                Some(object) => parked.push(object),
+                None => owed = true,
+            }
+        }
+        if owed {
+            let mut store = state.lock();
+            restore(&mut store, delivery, now);
+            continue;
+        }
         // A delivery this emulator could not WORK OUT right now — an encoder that refused
         // the body — is owed again, exactly like one the destination could not take:
         // nothing of it is written and nothing of it is lost.
-        let Some(objects) = objects_of(&delivery, now).await else {
+        let Some(mut objects) = objects_of(&delivery, now).await else {
             let mut store = state.lock();
             restore(&mut store, delivery, now);
             continue;
         };
+        objects.append(&mut parked);
         if write_objects(engine, objects) {
             continue;
         }
+        // The Amazon S3 half of this buffer could not be written, so the whole of it is
+        // owed again — including a POST an endpoint already acknowledged, which a
+        // destination may therefore see twice. Firehose's own delivery is at-least-once
+        // ("Re-invoking the Put API operations […] can result in data duplicates" —
+        // `PutRecord`), and this is the answer that loses nothing.
         let mut store = state.lock();
         restore(&mut store, delivery, now);
     }
+}
+
+/// POST one buffer to an HTTP endpoint destination, answering how the delivery failed when
+/// the endpoint did not acknowledge it.
+///
+/// The request is the one the delivery protocol `HttpEndpointConfiguration$Url` points at
+/// describes: a `POST` of the JSON envelope [`request_envelope`] renders, with the protocol
+/// version, the request id the envelope also carries, the Firehose stream the records came
+/// from, the configured access key and common attributes, and the body gzipped where
+/// `ContentEncoding` asks for it. A `2xx` answer is the acknowledgment; anything else, and
+/// any request that could not be made at all, is a failed delivery.
+///
+/// The request goes through the IN-PROCESS emulator transport and NOTHING else, so a URL a
+/// caller configured reaches only what this emulator serves itself: no socket is opened
+/// and no name is resolved.
+async fn post_to_endpoint(
+    transport: &SharedHttpConnector,
+    delivery: &PendingDelivery,
+    endpoint: &HttpEndpointTarget,
+    now: SystemTime,
+) -> Result<(), DeliveryFailure> {
+    let request_id = ::uuid::Uuid::new_v4().to_string();
+    // The body is this buffer's records, so its size is bounded by the per-stream buffer
+    // budget (`crate::state::MAX_BUFFERED_BYTES_PER_STREAM`) the put already charged
+    // against, plus the base64 expansion of it.
+    let body = ::serde_json::to_vec(&request_envelope(&request_id, delivery, now))
+        .map_err(|_| HTTP_ENDPOINT_CONNECTION_FAILED)?;
+    let body = if endpoint.gzip {
+        gzip(&body).ok_or(HTTP_ENDPOINT_CONNECTION_FAILED)?
+    } else {
+        body
+    };
+    let mut request = ::http::Request::builder()
+        .method(::http::Method::POST)
+        .uri(&endpoint.url)
+        .header(::http::header::CONTENT_TYPE, "application/json")
+        .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
+        .header(REQUEST_ID_HEADER, &request_id)
+        .header(SOURCE_ARN_HEADER, &delivery.source_arn);
+    if let Some(host) = authority_of(&endpoint.url) {
+        request = request.header(::http::header::HOST, host);
+    }
+    if endpoint.gzip {
+        request = request.header(::http::header::CONTENT_ENCODING, GZIP_CONTENT_ENCODING_TOKEN);
+    }
+    if let Some(access_key) = endpoint.access_key.as_deref() {
+        request = request.header(ACCESS_KEY_HEADER, access_key);
+    }
+    if !endpoint.common_attributes.is_empty() {
+        request = request.header(
+            COMMON_ATTRIBUTES_HEADER,
+            common_attributes_header(&endpoint.common_attributes),
+        );
+    }
+    // Every value above comes from the configuration, so a `Url` that is not a URI or an
+    // attribute that is not a header value fails HERE rather than panicking.
+    let request = request
+        .body(::aws_smithy_types::body::SdkBody::from(
+            ::bytes::Bytes::from(body),
+        ))
+        .map_err(|error| error.to_string())
+        .and_then(|request| {
+            ::aws_smithy_runtime_api::http::Request::try_from(request)
+                .map_err(|error| error.to_string())
+        });
+    let request = match request {
+        Ok(request) => request,
+        Err(error) => {
+            ::tracing::warn!(
+                stream = %delivery.stream,
+                error = %error,
+                "the HTTP endpoint destination's configuration does not render a delivery \
+                 request, so nothing was delivered to it"
+            );
+            return Err(HTTP_ENDPOINT_CONNECTION_FAILED);
+        }
+    };
+    let response = HttpConnector::call(transport, request)
+        .await
+        .map_err(|error| {
+            ::tracing::warn!(
+                stream = %delivery.stream,
+                error = %error,
+                "the HTTP endpoint destination could not be reached, so this delivery was \
+                 left for a later one"
+            );
+            HTTP_ENDPOINT_CONNECTION_FAILED
+        })?;
+    let status = response.status().as_u16();
+    if (200..300).contains(&status) {
+        return Ok(());
+    }
+    ::tracing::warn!(
+        stream = %delivery.stream,
+        status,
+        "the HTTP endpoint destination did not acknowledge this delivery"
+    );
+    Err(HTTP_ENDPOINT_DESTINATION_EXCEPTION)
+}
+
+/// The JSON body of one delivery request: the request's own id, the instant it was made and
+/// one entry per buffered record carrying that record's data base64-encoded, in arrival
+/// order.
+fn request_envelope(
+    request_id: &str,
+    delivery: &PendingDelivery,
+    now: SystemTime,
+) -> ::serde_json::Value {
+    let records: Vec<::serde_json::Value> = delivery
+        .records
+        .iter()
+        .map(|record| {
+            ::serde_json::json!({ "data": ::aws_smithy_types::base64::encode(&record.data) })
+        })
+        .collect();
+    ::serde_json::json!({
+        "requestId": request_id,
+        "timestamp": epoch_millis(now),
+        "records": records,
+    })
+}
+
+/// `RequestConfiguration$CommonAttributes` as the one header value that carries them: a
+/// JSON object of name to value, under the `commonAttributes` member the delivery protocol
+/// names. Configuration order is kept, and a name configured twice keeps the last value —
+/// one header member can carry one value for a name.
+fn common_attributes_header(attributes: &[(String, String)]) -> String {
+    let mut common = ::serde_json::Map::new();
+    for (name, value) in attributes {
+        common.insert(name.clone(), ::serde_json::Value::from(value.as_str()));
+    }
+    ::serde_json::json!({ "commonAttributes": common }).to_string()
+}
+
+/// The authority of `url`, which the request names as its `Host`, or `None` when the value
+/// carries none.
+fn authority_of(url: &str) -> Option<String> {
+    let uri: ::http::Uri = url.parse().ok()?;
+    uri.authority().map(::std::string::ToString::to_string)
+}
+
+/// Whether the retry window `endpoint` allows has been spent, so this buffer's records are
+/// parked in the destination's backup rather than attempted again.
+///
+/// "The total amount of time that Firehose spends on retries. This duration starts after
+/// the initial attempt to send data to the custom destination via HTTPS endpoint fails"
+/// (`HttpEndpointRetryOptions$DurationInSeconds`) — and the initial attempt is the one made
+/// when the buffer came due, so the window closes that long after it. A configured ZERO is
+/// a destination that is not retried at all, which its own range (`min: 0`) admits.
+fn retries_spent(
+    delivery: &PendingDelivery,
+    endpoint: &HttpEndpointTarget,
+    now: SystemTime,
+) -> bool {
+    let Some(opened_at) = delivery.records.first().map(|record| record.received_at) else {
+        return true;
+    };
+    let buffered: usize = delivery.records.iter().map(|record| record.data.len()).sum();
+    let first_attempt = opened_at + delivery_window(endpoint.hints.as_ref(), buffered);
+    now >= first_attempt + endpoint.retry_duration
+}
+
+/// The object that parks the records this endpoint never took in the destination's Amazon
+/// S3 backup: "only the documents that Firehose could not deliver to the specified HTTP
+/// endpoint destination (`FailedDataOnly`)" (`S3BackupMode`).
+///
+/// Written under the backup's `ErrorOutputPrefix` as the error-output document of each
+/// record ([`error_envelope`]), so a consumer of that prefix learns how the delivery failed
+/// and still holds the record's own bytes. `None` when the backup cannot be worked out at
+/// all, in which case the records stay owed rather than being dropped.
+fn backup_object(
+    delivery: &PendingDelivery,
+    endpoint: &HttpEndpointTarget,
+    failure: DeliveryFailure,
+    now: SystemTime,
+    ordinal: usize,
+) -> Option<DeliveredObject> {
+    let target = endpoint.backup.as_ref()?;
+    let prefix = error_output_prefix(target, failure, now).ok()?;
+    let records: Vec<&StoredRecord> = delivery.records.iter().collect();
+    let (body, extension) = compressed(error_payload(&records, failure, now), target)?;
+    Some(DeliveredObject {
+        bucket: target.bucket.clone(),
+        key: format!("{prefix}{}{extension}", object_name(delivery, now, ordinal)),
+        body,
+    })
 }
 
 /// Write `objects` into the one object store, answering whether the destination took
@@ -1780,7 +2212,14 @@ fn fit(value: &str, width: usize) -> String {
 /// At most one pump runs per store (the store carries the claim), it is bounded by
 /// [`MAX_DELIVERY_WAKE_UPS`] wake-ups, and with no async runtime to spawn onto there is no
 /// pump — the deliveries are then made by the next operation instead.
-pub fn drive_delivery_clock<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) {
+///
+/// `transport` is the in-process emulator transport the pump POSTs an HTTP endpoint
+/// destination's buffer over, taken from the request that started the pump: the pump
+/// outlives that request, so it holds a clone of the transport rather than borrowing it.
+pub fn drive_delivery_clock<Eng: Send + Sync + 'static>(
+    engine: &Arc<Eng>,
+    transport: SharedHttpConnector,
+) {
     let Some(state) = service_state(&**engine) else {
         return;
     };
@@ -1811,7 +2250,7 @@ pub fn drive_delivery_clock<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) {
                 .unwrap_or_default()
                 .clamp(MIN_DELIVERY_WAIT, MAX_DELIVERY_WAIT);
             ::tokio::time::sleep(wait).await;
-            deliver_due(&*engine, SystemTime::now(), Extractions::Run).await;
+            deliver_due(&*engine, SystemTime::now(), Extractions::Run, &transport).await;
         }
         if capped {
             // Only THIS pump's claim, so a pump started since is left holding its own.

@@ -1414,10 +1414,12 @@ impl CompositionRecord {
 // ([`NO_PUBLISHER_INGEST_CONFIGURATION_STATE`]). So the records below are written by
 // [`join_stage_session`] / [`leave_stage_session`] — the one entry point a stage data
 // plane uses, and the one place the modelled defaults of a joining participant are
-// applied — over the session [`ensure_active_session`] opens, and the reporting
-// operations (`GetParticipant`, `ListParticipants` and `ListStageSessions` today;
-// `GetStageSession`, its own gap issue) answer from exactly what those
-// recorded, never from a value invented for a join that never happened.
+// applied — over the session [`ensure_active_session`] opens, and by the one control-plane
+// call that does put a participant into a stage, a replication starting
+// ([`record_replicated_participant`], which goes through that same entry point); and the
+// reporting operations (`GetParticipant`, `ListParticipants` and `ListStageSessions`
+// today; `GetStageSession`, its own gap issue) answer from exactly what those recorded,
+// never from a value invented for a join that never happened.
 // ---------------------------------------------------------------------------
 
 /// `ParticipantState` of a participant that is in the stage right now.
@@ -1449,9 +1451,62 @@ pub const NOT_RECORDED_PARTICIPANT_RECORDING_STATE: &str = "DISABLED";
 ///
 /// The model documents it on `ParticipantSummary$replicationType`: "Indicates if the
 /// participant has been replicated to another stage or is a replica from another
-/// stage. Default: `NONE`." `StartParticipantReplication` (its own gap issue) is what
-/// moves a participant off it.
+/// stage. Default: `NONE`." `StartParticipantReplication` is what moves a participant
+/// off it, which [`session_participant_replications`] reads back.
 pub const REPLICATION_TYPE_NONE: &str = "NONE";
+
+/// `ReplicationType` of a participant that is being replicated INTO another stage: the
+/// publishing participant a replication names, as the session it publishes in reports
+/// it.
+///
+/// One of the three values the modelled `ReplicationType` carries
+/// (`smithy_query(query="shape",shape="ReplicationType")`), and the "has been
+/// replicated to another stage" half of what the member indicates.
+pub const REPLICATION_TYPE_SOURCE: &str = "SOURCE";
+
+/// `ReplicationType` of a participant that IS a replica from another stage: the record
+/// the DESTINATION stage's session holds for a replicated publisher.
+///
+/// The third value of that enum, the "is a replica from another stage" half of the
+/// member, and the only one whose `sourceStageArn` / `sourceSessionId` the model reports
+/// ("if `replicationType` is `REPLICA`").
+pub const REPLICATION_TYPE_REPLICA: &str = "REPLICA";
+
+/// How one participant of one session takes part in a replication right now: the
+/// `replicationType` it reports, that replication's own state, and — for a replica — the
+/// stage and session it is replicated from.
+///
+/// Held by no [`ParticipantRecord`]: a replication is stored once, as the
+/// [`ParticipantReplicaRecord`] that started it, and these four members are read off it
+/// ([`session_participant_replications`]), so a participant cannot report a replication this store
+/// no longer holds and two readers cannot disagree about one replication.
+#[derive(Debug, Clone)]
+pub struct ParticipantReplication {
+    /// [`REPLICATION_TYPE_NONE`], [`REPLICATION_TYPE_SOURCE`] or
+    /// [`REPLICATION_TYPE_REPLICA`].
+    pub replication_type: String,
+    /// The replication's own state ([`REPLICATION_STATE_ACTIVE`] / `STOPPED`), absent
+    /// when no replication names this participant.
+    pub replication_state: Option<String>,
+    /// Where a replica is replicated from, both reported only "if `replicationType` is
+    /// `REPLICA`", as the two members' docs state.
+    pub source_stage_arn: Option<String>,
+    pub source_session_id: Option<String>,
+}
+
+impl Default for ParticipantReplication {
+    /// What a participant no replication names reports: the default the model documents
+    /// on `replicationType` ("Default: `NONE`"), with the three members that describe a
+    /// replication absent.
+    fn default() -> Self {
+        Self {
+            replication_type: REPLICATION_TYPE_NONE.to_string(),
+            replication_state: None,
+            source_stage_arn: None,
+            source_session_id: None,
+        }
+    }
+}
 
 /// `ParticipantProtocol` of a participant this store holds no broadcast protocol for.
 ///
@@ -1493,15 +1548,6 @@ pub struct ParticipantRecord {
     /// What the recorder reports for it; [`NOT_RECORDED_PARTICIPANT_RECORDING_STATE`]
     /// when nothing records it.
     pub recording_state: String,
-    /// [`REPLICATION_TYPE_NONE`] unless replication made it a `SOURCE` or a `REPLICA`.
-    pub replication_type: String,
-    /// The replication's own state (`ACTIVE` / `STOPPED`), absent while
-    /// [`Self::replication_type`] is [`REPLICATION_TYPE_NONE`].
-    pub replication_state: Option<String>,
-    /// Where a replica was replicated from: both members are reported only "if
-    /// `replicationType` is `REPLICA`", as their docs state.
-    pub source_stage_arn: Option<String>,
-    pub source_session_id: Option<String>,
     /// Whether the publisher reached the stage over redundant ingest.
     pub redundant_ingest: bool,
     /// The ingest configuration the publisher broadcast with, when it used one.
@@ -1715,7 +1761,12 @@ pub fn participant_protocol(
 impl ParticipantRecord {
     /// The modelled `ParticipantSummary` this record reports in a `ListParticipants`
     /// page.
-    pub fn to_summary(&self) -> ParticipantSummary {
+    ///
+    /// `replication` is what the replications this store holds say about this participant
+    /// of this session ([`session_participant_replications`]): the four replication members are a
+    /// fact about a replication, not about the join that recorded this participant, so
+    /// they are reported from the replication itself on every read.
+    pub fn to_summary(&self, replication: &ParticipantReplication) -> ParticipantSummary {
         ParticipantSummary {
             participant_id: Some(self.participant_id.clone()),
             // Reported only when the token named one: the member is optional, and an
@@ -1726,10 +1777,10 @@ impl ParticipantRecord {
             first_join_time: Some(::aws_smithy_types::DateTime::from(self.first_join_time)),
             published: self.published,
             recording_state: Some(self.recording_state.clone()),
-            replication_type: Some(self.replication_type.clone()),
-            replication_state: self.replication_state.clone(),
-            source_stage_arn: self.source_stage_arn.clone(),
-            source_session_id: self.source_session_id.clone(),
+            replication_type: Some(replication.replication_type.clone()),
+            replication_state: replication.replication_state.clone(),
+            source_stage_arn: replication.source_stage_arn.clone(),
+            source_session_id: replication.source_session_id.clone(),
             redundant_ingest: self.redundant_ingest,
             ingest_configuration_arn: self.ingest_configuration_arn.clone(),
         }
@@ -1745,7 +1796,9 @@ impl ParticipantRecord {
     /// the client — except the two that are not stored values but facts about the stage
     /// right now: where the participant's media is being recorded
     /// ([`participant_recording_location`]) and the protocol it broadcasts with
-    /// ([`participant_protocol`]), both computed on every read.
+    /// ([`participant_protocol`]), both computed on every read — and the four replication
+    /// members, read off the replications the store holds
+    /// ([`session_participant_replications`]) exactly as a summary's are.
     pub fn to_participant(
         &self,
         store: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
@@ -1753,6 +1806,9 @@ impl ParticipantRecord {
         session_id: &str,
     ) -> Participant {
         let recording = participant_recording_location(store, stage_arn, session_id, self);
+        let replication = session_participant_replications(store, stage_arn, session_id)
+            .remove(&self.participant_id)
+            .unwrap_or_default();
         Participant {
             participant_id: Some(self.participant_id.clone()),
             // Reported only when the token named one, exactly as on a summary.
@@ -1776,10 +1832,10 @@ impl ParticipantRecord {
             recording_s3_prefix: Some(recording.prefix),
             recording_state: Some(self.recording_state.clone()),
             protocol: Some(participant_protocol(store, stage_arn, self)),
-            replication_type: Some(self.replication_type.clone()),
-            replication_state: self.replication_state.clone(),
-            source_stage_arn: self.source_stage_arn.clone(),
-            source_session_id: self.source_session_id.clone(),
+            replication_type: Some(replication.replication_type),
+            replication_state: replication.replication_state,
+            source_stage_arn: replication.source_stage_arn,
+            source_session_id: replication.source_session_id,
             redundant_ingest: self.redundant_ingest,
             ingest_configuration_arn: self.ingest_configuration_arn.clone(),
         }
@@ -2112,6 +2168,12 @@ pub struct JoinedParticipant {
     pub redundant_ingest: bool,
     /// The ingest configuration it broadcast with, when it used one.
     pub ingest_configuration_arn: Option<String>,
+    /// Whether this participant IS a replica of a participant publishing in another
+    /// stage, which is what `Event$replica` reports of the occurrences it is party to
+    /// ("If true, this indicates the `participantId` is a replicated participant").
+    /// What the participant itself reports about that replication is read off the
+    /// replication ([`session_participant_replications`]), not from here.
+    pub replica: bool,
     /// What the data plane observed about the joining client; see
     /// [`ParticipantClient`]. Nothing observed is the default.
     pub client: ParticipantClient,
@@ -2127,10 +2189,11 @@ pub struct JoinedParticipant {
 ///
 /// The ONE place a participant record is created, so every operation that reports one
 /// answers the same representation: a joining participant is
-/// [`PARTICIPANT_STATE_CONNECTED`], its `firstJoinTime` is the instant it joined, it
+/// [`PARTICIPANT_STATE_CONNECTED`], its `firstJoinTime` is the instant it joined, and it
 /// is recorded with the recording state the recorder reports (or
-/// [`NOT_RECORDED_PARTICIPANT_RECORDING_STATE`]), and it is neither a replication
-/// source nor a replica ([`REPLICATION_TYPE_NONE`]).
+/// [`NOT_RECORDED_PARTICIPANT_RECORDING_STATE`]). What it reports about replication is
+/// not recorded here: it is read off the replications this store holds
+/// ([`session_participant_replications`]).
 ///
 /// A participant the session already holds REJOINS it: the model documents
 /// `firstJoinTime` as the first join and `published` as whether the participant ever
@@ -2159,6 +2222,7 @@ pub fn join_stage_session(
     // Read off before the join is applied, because applying it consumes `joined`.
     let participant_id = joined.participant_id.clone();
     let publishes = joined.published;
+    let replica = joined.replica;
 
     // A participant the session already holds is REJOINING it, so it keeps its id, its
     // first join instant and its page position.
@@ -2207,12 +2271,15 @@ pub fn join_stage_session(
     // Both a first join and a rejoin are a participant joining the session, so each is
     // recorded; a publish is recorded only where the media actually begins, which a
     // rejoin of a participant already publishing is not.
-    record_participant_event(
-        state,
-        stage_arn,
-        &session_id,
-        ParticipantEvent::new(EVENT_JOINED, &participant_id),
-    );
+    //
+    // Every occurrence of a join says whether the participant it happened to is a replica
+    // of a publisher in another stage, which is what `Event$replica` reports.
+    let occurrence = |name: &str| {
+        let mut event = ParticipantEvent::new(name, &participant_id);
+        event.replica = replica;
+        event
+    };
+    record_participant_event(state, stage_arn, &session_id, occurrence(EVENT_JOINED));
     if publishes
         && !state
             .stage_session(stage_arn, &session_id)
@@ -2222,7 +2289,7 @@ pub fn join_stage_session(
             state,
             stage_arn,
             &session_id,
-            ParticipantEvent::new(EVENT_PUBLISH_STARTED, &participant_id),
+            occurrence(EVENT_PUBLISH_STARTED),
         );
     }
     Some(record)
@@ -2253,10 +2320,6 @@ fn new_participant_record(
         recording_state: joined
             .recording_state
             .unwrap_or_else(|| NOT_RECORDED_PARTICIPANT_RECORDING_STATE.to_string()),
-        replication_type: REPLICATION_TYPE_NONE.to_string(),
-        replication_state: None,
-        source_stage_arn: None,
-        source_session_id: None,
         redundant_ingest: joined.redundant_ingest,
         ingest_configuration_arn: joined.ingest_configuration_arn,
         client: joined.client,
@@ -2388,6 +2451,265 @@ pub fn connected_sessions_of(
         })
         .map(|session| session.session_id.clone())
         .collect()
+}
+
+/// The record the session `session_id` of `stage_arn` holds for `participant_id`, if it
+/// holds one.
+///
+/// Keyed by all three, exactly as the reading
+/// [`ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState::stage_session`]
+/// is: a participant is a participant OF one session of one stage.
+fn session_participant<'a>(
+    state: &'a ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    stage_arn: &str,
+    session_id: &str,
+    participant_id: &str,
+) -> Option<&'a ParticipantRecord> {
+    state
+        .stage_session(stage_arn, session_id)?
+        .participants
+        .iter()
+        .find(|participant| participant.participant_id == participant_id)
+}
+
+/// The same lookup mutably, for the one write a caller makes to a participant already in
+/// the session it names.
+fn session_participant_mut<'a>(
+    state: &'a mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    stage_arn: &str,
+    session_id: &str,
+    participant_id: &str,
+) -> Option<&'a mut ParticipantRecord> {
+    session_mut(state, stage_arn, session_id)?
+        .participants
+        .iter_mut()
+        .find(|participant| participant.participant_id == participant_id)
+}
+
+/// Why the participants of a started replication could not both be recorded.
+///
+/// Each names the stage whose session could not take the record, so the operation that
+/// asked can answer the modelled failure that condition is rather than one standing for
+/// both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplicatedParticipantRefusal {
+    /// That stage's session is at [`MAX_PARTICIPANTS_PER_SESSION`] participants — this
+    /// emulator's own resource guard on the records a session holds.
+    SessionFull { stage_arn: String },
+    /// This store holds no OPEN session of that id for that stage to record in.
+    NoSuchSession { stage_arn: String },
+}
+
+/// Record the participants a started replication puts into the two sessions it names.
+///
+/// A replication replicates "a publishing participant from a source stage to a destination
+/// stage", so the replicated publisher is a participant of BOTH sessions `replica` names:
+/// the session it publishes in — which is why its stage has a session at all — and the
+/// destination stage's session, where its replica is. Those are the records
+/// `ListParticipants` reports, created through [`join_stage_session`], the one place a
+/// participant record is created, and each of the two publishes: the participant being
+/// replicated is a publisher, and its replica carries that same media into the destination
+/// stage.
+///
+/// A session that already holds the participant as [`PARTICIPANT_STATE_CONNECTED`] keeps
+/// the record it has, beyond its having published: that participant is in the stage, and a
+/// replication starting is not it joining again. Where that record had not published yet,
+/// the media this replication carries beginning is an occurrence of the session like any
+/// other publish ([`EVENT_PUBLISH_STARTED`]). A record that has LEFT the session is not in
+/// the stage any more, so a replication of that participant IS it joining again, recorded
+/// the way any rejoin is ([`join_stage_session`]), and its state and the session's
+/// occurrences stay in step.
+///
+/// What each record REPORTS about the replication is not written here — it is read off the
+/// replication itself ([`session_participant_replications`]) — so `identity` supplies only what
+/// issued the participant: the name its token or ingest credential carries, and the
+/// attributes a replica's own are merged over.
+///
+/// `Err` — nothing recorded at either end — naming the stage and the condition
+/// ([`ReplicatedParticipantRefusal`]): a stage with no OPEN session of that id to record
+/// in, or one whose session is at [`MAX_PARTICIPANTS_PER_SESSION`] participants. Both ends
+/// are checked before either is written, so one stage cannot end up holding a participant
+/// the other does not, and the session checked is the session written.
+pub fn record_replicated_participant(
+    state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    replica: &ParticipantReplicaRecord,
+    identity: &StageParticipant,
+) -> Result<(), ReplicatedParticipantRefusal> {
+    // The two ends of one replication: the session each record goes into, the attributes
+    // that record carries, and whether the participant there IS the replica. The
+    // publisher carries the attributes its own identity was issued with; the replica
+    // carries the ones the replication merged for it.
+    let ends = [
+        (
+            &replica.source_stage_arn,
+            &replica.source_session_id,
+            &identity.attributes,
+            false,
+        ),
+        (
+            &replica.destination_stage_arn,
+            &replica.destination_session_id,
+            &replica.attributes,
+            true,
+        ),
+    ];
+    // Neither end is written until both can hold the record.
+    for (stage_arn, session_id, _, _) in &ends {
+        // A session that has ENDED is no session to record in: the write below joins the
+        // stage's open session ([`join_stage_session`]), and a stage has an open session
+        // exactly while it has a participant in one, so refusing here is what keeps the
+        // session checked and the session written the same session.
+        let open = state
+            .stage_session(stage_arn, session_id)
+            .filter(|session| session.end_time.is_none());
+        let Some(session) = open else {
+            return Err(ReplicatedParticipantRefusal::NoSuchSession {
+                stage_arn: (*stage_arn).clone(),
+            });
+        };
+        // A session already holding this participant records no further record for it, so
+        // its size is not what stands in the way.
+        let holds = session
+            .participants
+            .iter()
+            .any(|participant| participant.participant_id == replica.participant_id);
+        if !holds && session.participants.len() >= MAX_PARTICIPANTS_PER_SESSION {
+            return Err(ReplicatedParticipantRefusal::SessionFull {
+                stage_arn: (*stage_arn).clone(),
+            });
+        }
+    }
+    for (stage_arn, session_id, attributes, is_replica) in ends {
+        // Only a participant the session holds as present keeps its record untouched: one
+        // whose record has left the session is brought back in by the join below.
+        let present = session_participant(state, stage_arn, session_id, &replica.participant_id)
+            .is_some_and(|present| present.state == PARTICIPANT_STATE_CONNECTED);
+        if present {
+            // The participant is in this stage already, and a replication starting is not
+            // it joining again, so its record keeps what the join recorded. It HAS
+            // published, though: only a publishing participant is replicated, and
+            // `published` is "whether the participant ever published to the stage session",
+            // which stays set once set.
+            if let Some(present) =
+                session_participant_mut(state, stage_arn, session_id, &replica.participant_id)
+            {
+                present.published = true;
+            }
+            // The media this replication carries is beginning where the session had not
+            // seen that participant publishing: [`EVENT_PUBLISH_STARTED`] is what begins
+            // one participant's media and the two publish names alternate
+            // ([`StageSessionRecord::is_publishing`]), so the occurrence is recorded for
+            // exactly that transition and what `ListParticipantEvents` reports cannot
+            // disagree with what `ListParticipants` does.
+            if !state
+                .stage_session(stage_arn, session_id)
+                .is_some_and(|session| session.is_publishing(&replica.participant_id))
+            {
+                let mut event =
+                    ParticipantEvent::new(EVENT_PUBLISH_STARTED, &replica.participant_id);
+                event.replica = is_replica;
+                record_participant_event(state, stage_arn, session_id, event);
+            }
+            continue;
+        }
+        let joined = JoinedParticipant {
+            participant_id: replica.participant_id.clone(),
+            user_id: identity.user_id.clone(),
+            attributes: attributes.clone(),
+            published: true,
+            // How a publisher reached a stage — whether anything records it, which ingest
+            // configuration it broadcast with, whether that used redundant ingest — is
+            // what the stage's DATA plane observes, which a replication starting is not,
+            // so each stays at what a join with nothing observed records.
+            recording_state: None,
+            redundant_ingest: false,
+            ingest_configuration_arn: None,
+            client: ParticipantClient::default(),
+            protocol: None,
+            replica: is_replica,
+        };
+        if join_stage_session(state, stage_arn, joined).is_none() {
+            // The session exists and has room — both checked above — so the records it
+            // holds are the only thing a join of a participant new to it can run out of.
+            return Err(ReplicatedParticipantRefusal::SessionFull {
+                stage_arn: stage_arn.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// What the participants of the session `session_id` of `stage_arn` report about
+/// replication right now, keyed by participant id, read off the replications this store
+/// holds.
+///
+/// The replication members of a participant are a fact about a replication rather than
+/// about the join that recorded the participant, so they are read from the replications
+/// themselves on every report: a participant is a [`REPLICATION_TYPE_REPLICA`] while a
+/// replication runs INTO this session — then also naming the stage and session it is
+/// replicated from, which the model reports "if `replicationType` is `REPLICA`" — a
+/// [`REPLICATION_TYPE_SOURCE`] while one runs FROM this session, and
+/// [`REPLICATION_TYPE_NONE`] when no replication names it, which is the default the model
+/// documents and which a participant absent from this map takes
+/// ([`ParticipantReplication::default`]).
+///
+/// ONE walk over the replications, for the whole session: a reporting operation reads them
+/// once per request and then looks each participant of its page up here, so the work a
+/// page costs is the session's participants plus this store's replications rather than the
+/// product of the two.
+pub fn session_participant_replications(
+    state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    stage_arn: &str,
+    session_id: &str,
+) -> HashMap<String, ParticipantReplication> {
+    let mut replications: HashMap<String, ParticipantReplication> = HashMap::new();
+    for replica in state.participant_replicas.values().flatten() {
+        let candidate = if replica.destination_stage_arn == stage_arn
+            && replica.destination_session_id == session_id
+        {
+            ParticipantReplication {
+                replication_type: REPLICATION_TYPE_REPLICA.to_string(),
+                replication_state: Some(replica.replication_state.clone()),
+                source_stage_arn: Some(replica.source_stage_arn.clone()),
+                source_session_id: Some(replica.source_session_id.clone()),
+            }
+        } else if replica.source_stage_arn == stage_arn && replica.source_session_id == session_id {
+            ParticipantReplication {
+                replication_type: REPLICATION_TYPE_SOURCE.to_string(),
+                replication_state: Some(replica.replication_state.clone()),
+                // Both reported only "if `replicationType` is `REPLICA`", as the two
+                // members' docs state: a participant replicated INTO another stage is not
+                // replicated FROM one.
+                source_stage_arn: None,
+                source_session_id: None,
+            }
+        } else {
+            continue;
+        };
+        let held = replications.get(&replica.participant_id);
+        if held.is_none_or(|held| supersedes(&candidate, held)) {
+            replications.insert(replica.participant_id.clone(), candidate);
+        }
+    }
+    replications
+}
+
+/// Which of two replications a participant of one session reports, when more than one
+/// names it.
+///
+/// Two orderings, so the order this store happens to hold its replications in cannot
+/// decide what a read answers: being a replica IN the session is the stronger statement
+/// about that participant's record than being replicated FROM it, and between two of the
+/// same kind the RUNNING replication is the one reported — a publisher replicated into
+/// several stages is replicating while ANY of those replications is.
+fn supersedes(candidate: &ParticipantReplication, held: &ParticipantReplication) -> bool {
+    let rank = |replication: &ParticipantReplication| {
+        (
+            replication.replication_type == REPLICATION_TYPE_REPLICA,
+            replication.replication_state.as_deref() == Some(REPLICATION_STATE_ACTIVE),
+        )
+    };
+    rank(candidate) > rank(held)
 }
 
 /// Per-service state for com-amazonaws-ivsrealtime-amazoninteractivevideoservicerealtime. A handler reaches it through [`service_state`].
@@ -2872,6 +3194,9 @@ pub struct StageParticipant {
     /// replicated, and only an identity that carries [`PUBLISH_CAPABILITY`] — or an
     /// ingest credential, which exists to broadcast — may publish.
     pub publishes: bool,
+    /// The customer-assigned name the participant's identity carries, when it carries
+    /// one: the `userId` a record of this participant reports.
+    pub user_id: Option<String>,
     /// The attributes the participant's identity carries, which a replica's attributes
     /// are merged over.
     pub attributes: HashMap<String, String>,
@@ -2905,6 +3230,7 @@ pub fn stage_participant(
                 .capabilities
                 .iter()
                 .any(|capability| capability == PUBLISH_CAPABILITY),
+            user_id: record.user_id.clone(),
             attributes: record.attributes.clone(),
         });
     }
@@ -2919,6 +3245,7 @@ pub fn stage_participant(
             // An ingest configuration is a publisher's credential: it carries the ingest
             // key a broadcast is published with, so its participant publishes.
             publishes: true,
+            user_id: configuration.user_id.clone(),
             attributes: configuration.attributes.clone(),
         })
 }

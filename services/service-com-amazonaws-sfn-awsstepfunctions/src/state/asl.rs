@@ -580,10 +580,34 @@ pub struct ActivityReply {
     pub result: Value,
 }
 
+/// The step a redrive continues an execution from: the state the attempt stopped at,
+/// and the raw input it was entered with.
+///
+/// Recorded when an attempt stops at a state rather than getting past it, so a later
+/// `RedriveExecution` continues "the failed execution from the unsuccessful step" with
+/// the data that step saw instead of running the whole definition again.
+#[derive(Debug, Clone)]
+pub struct RedriveStep {
+    /// The state the attempt stopped at, which the redriven attempt re-enters.
+    pub state_name: String,
+    /// The RAW input that state was entered with, as the attempt recorded it: what the
+    /// results of the steps before it produced, so those steps are not re-run to reach
+    /// them.
+    pub state_input: String,
+}
+
+impl RedriveStep {
+    /// The bytes this record retains, counted into the execution's own.
+    pub fn measure(&self) -> usize {
+        std::mem::size_of::<Self>() + self.state_name.len() + self.state_input.len()
+    }
+}
+
 /// What the context object (`$$`) reports about the run being interpreted.
 ///
-/// Every field is a value the caller's own request already fixed, so a definition
-/// that reads `$$.Execution.Id` reads this execution's ARN rather than a placeholder.
+/// Every field is a value the caller's own request or the execution's own record
+/// already fixed, so a definition that reads `$$.Execution.Id` reads this execution's
+/// ARN rather than a placeholder.
 #[derive(Debug, Clone, Default)]
 pub struct Context {
     pub execution_arn: String,
@@ -591,6 +615,12 @@ pub struct Context {
     pub state_machine_arn: String,
     pub state_machine_name: String,
     pub role_arn: String,
+    /// How many times the execution being interpreted has been redriven, which it
+    /// reads through `$$.Execution.RedriveCount`: `0` on the attempt a start began,
+    /// and the count the record carries on an attempt a redrive began. It is the SAME
+    /// integer `DescribeExecution` projects as `redriveCount`, because both come from
+    /// the one execution record.
+    pub redrive_count: i32,
 }
 
 impl Context {
@@ -604,6 +634,7 @@ impl Context {
                 "Name": self.execution_name,
                 "RoleArn": self.role_arn,
                 "StartTime": iso(start),
+                "RedriveCount": self.redrive_count,
             },
             "StateMachine": {
                 "Id": self.state_machine_arn,
@@ -1888,7 +1919,40 @@ fn scan_expression(expression: &str, into: &mut BTreeSet<String>) {
 /// Walk `definition` from its `StartAt` state with `input` as the first state's
 /// input, and report what happened.
 pub fn run(definition: &str, input: &str, start: SystemTime, context: &Context) -> Run {
-    interpret(definition, input, start, context, None, Duration::ZERO).0
+    interpret(definition, input, start, context, Entry::Start, Duration::ZERO).0
+}
+
+/// Walk `definition` again from the step a redriven execution did not get past, and
+/// report what happened.
+///
+/// "When you redrive an execution, it continues the failed execution from the
+/// unsuccessful step and uses the same input. Step Functions preserves the results and
+/// execution history of the successful steps, and doesn't rerun these steps when you
+/// redrive an execution": the walk begins AT the state `from` names, with the raw
+/// input that state was entered with, so no state the attempt already got past is run
+/// a second time and the values those states produced — which `from`'s own input
+/// carries — stand for the redriven attempt.
+///
+/// The state RUNS: it is the unsuccessful step, so a `Task` state there schedules its
+/// work again rather than being handed a result ([`resume`] is the walk that is handed
+/// one).
+pub fn redrive(
+    definition: &str,
+    input: &str,
+    start: SystemTime,
+    context: &Context,
+    from: &RedriveStep,
+) -> Run {
+    let state_input = serde_json::from_str(&from.state_input).unwrap_or(Value::Null);
+    interpret(
+        definition,
+        input,
+        start,
+        context,
+        Entry::At(from.state_name.clone(), state_input),
+        Duration::ZERO,
+    )
+    .0
 }
 
 /// Walk `definition` on from the activity task `reply` answers, and report what
@@ -1925,17 +1989,32 @@ pub fn resume(
         input,
         start,
         context,
-        Some((reply.clone(), state_input)),
+        Entry::Reply(reply.clone(), state_input),
         elapsed,
     );
     applied.then_some(run)
 }
 
-/// One walk of `definition`, and whether the reply `resuming` carries was applied in
-/// it.
+/// Where a walk of a definition begins, and what it does when it gets there.
+enum Entry {
+    /// At the definition's `StartAt`, with the execution's own input: an attempt of
+    /// its own.
+    Start,
+    /// At the state whose activity task a worker's reply answers, with the raw input
+    /// that state was entered with: the reply is that state's RESULT, so the state
+    /// does not run again.
+    Reply(ActivityReply, Value),
+    /// At the state a redriven execution did not get past, with the raw input that
+    /// state was entered with: the state RUNS, because it is the step the attempt
+    /// stopped at.
+    At(String, Value),
+}
+
+/// One walk of `definition`, and whether the reply [`Entry::Reply`] carries was
+/// applied in it.
 ///
-/// `resuming` is the worker's reply and the raw input of the state it answers: a walk
-/// that carries one begins at THAT state rather than at `StartAt`.
+/// `entry` is where the walk begins: at `StartAt`, at the state a reply answers, or at
+/// the step a redrive continues from.
 ///
 /// `elapsed` is the span the execution had already spent before this walk's first
 /// state, which a definition-level `TimeoutSeconds` counts.
@@ -1944,7 +2023,7 @@ fn interpret(
     input: &str,
     start: SystemTime,
     context: &Context,
-    resuming: Option<(ActivityReply, Value)>,
+    entry: Entry,
     elapsed: Duration,
 ) -> (Run, bool) {
     let document: Value = match serde_json::from_str(definition) {
@@ -2008,14 +2087,20 @@ fn interpret(
     };
 
     // A walk that CONTINUES an execution begins at the state whose task the reply
-    // answers, with the raw input that state was entered with; one that is an attempt
-    // of its own begins at `StartAt` with the execution's input.
-    let (reply, start_at, first_input) = match resuming {
-        Some((reply, state_input)) => {
+    // answers, or at the step a redrive continues from, with the raw input that state
+    // was entered with; one that is an attempt of its own begins at `StartAt` with the
+    // execution's input. A state the definition no longer declares — the state machine
+    // an execution started through an unqualified ARN has been updated since — is no
+    // step to continue from, so such a walk is an attempt of its own.
+    let (reply, start_at, first_input) = match entry {
+        Entry::Reply(reply, state_input) => {
             let state_name = reply.state_name.clone();
             (Some(reply), state_name, state_input)
         }
-        None => (None, start_at.to_string(), input_value.clone()),
+        Entry::At(state_name, state_input) if states.contains_key(&state_name) => {
+            (None, state_name, state_input)
+        }
+        Entry::At(..) | Entry::Start => (None, start_at.to_string(), input_value.clone()),
     };
 
     let mut interpreter = Interpreter {

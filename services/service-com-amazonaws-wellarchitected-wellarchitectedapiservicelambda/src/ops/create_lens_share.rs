@@ -3,15 +3,16 @@
 //! @op CreateLensShare
 //! IMPLEMENTED: shares one CUSTOM lens with one principal and persists the share in
 //! [`crate::state`], so the invitation it raises is reported by `ListShareInvitations`
-//! and the share itself is the one `ListLensShares` and `DeleteLensShare` resolve (both
-//! still stubs with their own issues). "Lenses provided by Amazon Web Services (Amazon
-//! Web Services Official Content) cannot be shared" and a lens "cannot be … shared with
-//! other Amazon Web Services accounts until it's published with CreateLensVersion"
-//! (`ImportLens` doc), so both are refused with `ValidationException` (400); a
-//! `LensAlias` naming no stored custom lens is `ResourceNotFoundException` (404), the
-//! lens's own owning account as `SharedWith` is `ValidationException` (400), a principal
-//! the lens is already shared with is `ConflictException` (409), and a share beyond this
-//! emulator's per-lens ceiling is `ServiceQuotaExceededException` (402).
+//! and the share itself is the one `DeleteLensShare` revokes by the `ShareId` this
+//! operation answers (`ListLensShares` is still a stub with its own issue). "Lenses
+//! provided by Amazon Web Services (Amazon Web Services Official Content) cannot be
+//! shared" and a lens "cannot be … shared with other Amazon Web Services accounts until
+//! it's published with CreateLensVersion" (`ImportLens` doc), so both are refused with
+//! `ValidationException` (400); a `LensAlias` naming no stored custom lens is
+//! `ResourceNotFoundException` (404), the lens's own owning account as `SharedWith` is
+//! `ValidationException` (400), a principal the lens is already shared with is
+//! `ConflictException` (409), and a share beyond this emulator's per-lens ceiling is
+//! `ServiceQuotaExceededException` (402).
 //!
 //! ## Shape of an operation
 //!

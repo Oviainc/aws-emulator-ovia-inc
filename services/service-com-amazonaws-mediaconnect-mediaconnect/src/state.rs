@@ -47,7 +47,7 @@ use crate::ops::types::{
     StandardRouterInputStreamDetails, StandardRouterOutputConfiguration,
     StandardRouterOutputStreamDetails, Transport, UpdateEncryption,
     UpdateFailoverConfig, VpcInterface,
-    VpcInterfaceAttachment, WindowMaintenanceSchedule,
+    VpcInterfaceAttachment, VpcInterfaceRequest, WindowMaintenanceSchedule,
 };
 
 /// The `Status` enum the model declares for a flow
@@ -772,6 +772,19 @@ pub const MAX_FLOW_ENTITLEMENTS: usize = 50;
 /// with `BadRequestException`, the error the model describes for "a semantic error" in
 /// the request.
 pub const MAX_FLOW_MEDIA_STREAMS: usize = MAX_FLOW_COLLECTION_ENTRIES;
+
+/// The ceiling on how many VPC interfaces ONE FLOW holds, however many calls fill it.
+///
+/// AWS publishes no count for a flow's VPC interfaces and the model puts no `@length` on
+/// `__listOfVpcInterfaceRequest`, so the number is [`MAX_FLOW_COLLECTION_ENTRIES`] — the
+/// bound CreateFlow applies to one request's `VpcInterfaces` — named once so the create
+/// side and the add side cannot drift apart. Like [`MAX_FLOW_MEDIA_STREAMS`] it is a
+/// different RULE from that per-request bound: this one bounds the STORED flow, so a
+/// sequence of adds cannot grow one past what a single create could store.
+/// AddFlowVpcInterfaces models no count exception, so it refuses past this bound with
+/// `BadRequestException`, the error the model describes for "a semantic error" in the
+/// request.
+pub const MAX_FLOW_VPC_INTERFACES: usize = MAX_FLOW_COLLECTION_ENTRIES;
 
 /// The ceiling on how many sources ONE FLOW holds while its source failover is ACTIVE,
 /// however many calls fill it.
@@ -1850,6 +1863,71 @@ pub fn materialise_media_stream(request: &AddMediaStreamRequest, fmt: i32) -> St
             .flatten()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
+    }
+}
+
+/// The `NetworkInterfaceType` a VPC interface takes when the request that adds it names
+/// none (`smithy_query(query="shape",shape="NetworkInterfaceType")`: ena | efa); `ena` is
+/// the standard elastic network adapter. The member is REQUIRED on the reported
+/// `VpcInterface` and optional on the request, so something has to be stored for a request
+/// that omits it.
+pub const NETWORK_INTERFACE_TYPE_ENA: &str = "ena";
+
+/// Why `request` is not a VPC interface a flow can hold beside the VPC interface names in
+/// `names`, as the message the refusal carries, or `None` when it is.
+///
+/// A VPC interface is addressed by NAME within its flow (RemoveFlowVpcInterface takes
+/// `VpcInterfaceName` as an `@httpLabel`), so an empty name names no VPC interface, and the
+/// name is "immutable and has to be a unique against other VpcInterfaces in this Flow"
+/// (`VpcInterface$Name`; `VpcInterfaceRequest$Name`: "this name must be unique within the
+/// flow") — so a name the flow already holds, or one another entry of the same request
+/// takes, names an interface that already exists. CreateFlow's `VpcInterfaces` and
+/// AddFlowVpcInterfaces both add VPC interfaces to a flow, so both refuse through this one
+/// function and with the same wording: no request can leave a flow in a state the other
+/// operation would never permit.
+pub fn vpc_interface_rejection(
+    request: &VpcInterfaceRequest,
+    names: &BTreeSet<String>,
+) -> Option<String> {
+    if request.name.is_empty() {
+        return Some(
+            "A VPC interface name must not be empty: it is how the VPC interface is \
+             addressed within its flow."
+                .to_string(),
+        );
+    }
+    if names.contains(&request.name) {
+        return Some(format!(
+            "More than one VPC interface of this flow would be named {:?}. A VPC interface \
+             name must be unique within its flow.",
+            request.name
+        ));
+    }
+    None
+}
+
+/// Materialise one `VpcInterfaceRequest` into the VPC interface a flow keeps, with the
+/// unique `suffix` the store minted for the elastic network interface the service creates
+/// in the caller's subnet (`VpcInterface$NetworkInterfaceIds`: "IDs of the network
+/// interfaces created in customer's account by MediaConnect").
+///
+/// Both CreateFlow (`VpcInterfaces`) and AddFlowVpcInterfaces add VPC interfaces to a flow,
+/// and they store the same record: this function is the crate's ONE materialisation of a
+/// `VpcInterfaceRequest`. `VpcInterfaceTags` is not kept, because it tags the network
+/// interface in the caller's own account and no MediaConnect operation reports a VPC
+/// interface's tags (see
+/// [`ComAmazonawsMediaconnectMediaconnectState::tags_of`]).
+pub fn materialise_vpc_interface(request: &VpcInterfaceRequest, suffix: u64) -> VpcInterface {
+    VpcInterface {
+        name: request.name.clone(),
+        network_interface_ids: vec![format!("eni-{suffix:017x}")],
+        network_interface_type: request
+            .network_interface_type
+            .clone()
+            .unwrap_or_else(|| NETWORK_INTERFACE_TYPE_ENA.to_string()),
+        role_arn: request.role_arn.clone(),
+        security_group_ids: request.security_group_ids.clone(),
+        subnet_id: request.subnet_id.clone(),
     }
 }
 

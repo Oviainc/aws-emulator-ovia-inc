@@ -33,5 +33,7 @@ mod ingestion_enablement;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_app_authorization_contract.rs"]
+mod update_app_authorization_contract;
 #[path = "all/user_access_tasks.rs"]
 mod user_access_tasks;

@@ -35,6 +35,13 @@ const AGREEMENT_TYPE: &str = "PurchaseAgreement";
 /// See [`AGREEMENT_TYPE`].
 const CATALOG: &str = "AWSMarketplace";
 
+/// The currency every term of the offer this emulator serves is denominated in,
+/// which is the currency a payment request sent under one carries
+/// (`PaymentRequestSummary$currencyCode` is "the currency code for the charge
+/// amount"). Spelled out here rather than imported so a wrong currency in the
+/// handler fails this test.
+const CURRENCY: &str = "USD";
+
 /// `PaymentRequestStatus`'s values, from
 /// `smithy_query(query="shape", shape="PaymentRequestStatus")`. A new payment
 /// request carries the first one; `SendAgreementPaymentRequest` documents it as
@@ -333,12 +340,12 @@ async fn a_listed_payment_request_is_reported_from_what_was_sent() {
             case.case
         );
         // "The currency code for the charge amount" is the currency of the
-        // accepted term (`VariablePaymentTerm$currencyCode`), which belongs to
-        // the agreement proposal this service does not hold, so none is
-        // reported rather than invented.
-        assert!(
-            item["currencyCode"].is_null(),
-            "case {:?}: no currency is known for the term, got {item:?}",
+        // accepted term (`VariablePaymentTerm$currencyCode`), which the offer
+        // this emulator serves denominates in [`CURRENCY`].
+        assert_eq!(
+            item["currencyCode"].as_str(),
+            Some(CURRENCY),
+            "case {:?}: the currency is the accepted term's, got {item:?}",
             case.case
         );
         let created = item["createdAt"].as_f64();
@@ -1245,11 +1252,11 @@ async fn a_payment_request_is_reported_in_full_from_what_was_sent() {
             answer.body
         );
         // The currency is the accepted term's (`VariablePaymentTerm$currencyCode`),
-        // which belongs to the agreement proposal this service does not hold, so
-        // none is reported rather than invented.
-        assert!(
-            answer.body["currencyCode"].is_null(),
-            "case {:?}: no currency is known for the term, got {:?}",
+        // which the offer this emulator serves denominates in [`CURRENCY`].
+        assert_eq!(
+            answer.body["currencyCode"].as_str(),
+            Some(CURRENCY),
+            "case {:?}: the currency is the accepted term's, got {:?}",
             case.case,
             answer.body
         );

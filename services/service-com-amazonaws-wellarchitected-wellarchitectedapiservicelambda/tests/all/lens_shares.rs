@@ -36,10 +36,11 @@
 //! `super::custom_lens_versions` already spell.
 //!
 //! What a share records is read back through the store, because `CreateLensShare` is the
-//! only operation that reaches a lens share so far — `ListLensShares` and
-//! `DeleteLensShare` are stubs with their own issues — exactly as
-//! `super::custom_lens_versions` reads a published version back. The HTTP read-back of a
-//! recorded share is its idempotent replay and the conflict a second share collides with.
+//! only operation that REPORTS a lens share so far: `ListLensShares` is a stub with its
+//! own issue, and `DeleteLensShare` — whose own suite is `super::lens_share_deletion` —
+//! answers no members. The store is read exactly as `super::custom_lens_versions` reads a
+//! published version back, and the HTTP read-back of a recorded share is its idempotent
+//! replay and the conflict a second share collides with.
 //!
 //! The share a RULE-5 invitation stands for is seeded through `record_lens_share` (see
 //! its doc), for the reason `Client::record_workload_share` gives: an invitation is
@@ -74,21 +75,28 @@ const PRINCIPALS: [(&str, &str); 5] = [
     ("an-organizational-unit", "ou-abcd-1a2b3c4d"),
 ];
 
-/// One share as the store holds it — what `CreateLensShare` recorded.
+/// One share as the store holds it — what `CreateLensShare` recorded. `pub(crate)` because
+/// `super::lens_share_deletion` asserts over the same stored shares.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct StoredShare {
-    share_id: String,
-    shared_with: String,
-    status: String,
-    shared_by: String,
-    invitation_id: String,
-    lens_arn: String,
+pub(crate) struct StoredShare {
+    pub(crate) share_id: String,
+    pub(crate) shared_with: String,
+    pub(crate) status: String,
+    pub(crate) shared_by: String,
+    pub(crate) invitation_id: String,
+    pub(crate) lens_arn: String,
 }
 
 /// `POST /lenses/{LensAlias}/shares`, the wire form of `CreateLensShare`. The alias is
 /// percent-encoded because a custom lens is named by its ARN, which carries `:` and `/`
-/// inside ONE path segment.
-async fn create_share(client: &Client, alias: &str, shared_with: &str, token: &str) -> Answer {
+/// inside ONE path segment. `pub(crate)` because `super::lens_share_deletion` grants the
+/// shares it revokes through this one spelling of the request.
+pub(crate) async fn create_share(
+    client: &Client,
+    alias: &str,
+    shared_with: &str,
+    token: &str,
+) -> Answer {
     client
         .send(
             "POST",
@@ -100,7 +108,7 @@ async fn create_share(client: &Client, alias: &str, shared_with: &str, token: &s
 
 /// The `ShareId` a successful `CreateLensShare` answered with, checked against the
 /// modelled `^[0-9a-f]{32}$` pattern.
-fn created_share_id(answer: &Answer, case: &str) -> String {
+pub(crate) fn created_share_id(answer: &Answer, case: &str) -> String {
     assert_eq!(
         answer.status, 200,
         "case {case:?}: expected CreateLensShare 200, got {answer:?}"
@@ -157,7 +165,7 @@ fn document_name(document: &Value) -> String {
 /// Import every document, wait once for the imports to land and publish a version of each
 /// — a lens can only be shared once a version of it is published. Answers
 /// `(case, lens ARN)` per row, in the order the rows were given.
-async fn publish_lenses(
+pub(crate) async fn publish_lenses(
     client: &Client,
     cases: &[(&'static str, Value)],
 ) -> Vec<(&'static str, String)> {
@@ -186,7 +194,7 @@ async fn publish_lenses(
 }
 
 /// One published lens, for a suite that needs a single lens to share.
-async fn one_published_lens(client: &Client, case: &'static str, name: &str) -> String {
+pub(crate) async fn one_published_lens(client: &Client, case: &'static str, name: &str) -> String {
     let document = lens_document(name, None, &[("governance", 1, 2)]);
     let mut lenses = publish_lenses(client, &[(case, document)]).await;
     lenses
@@ -200,7 +208,7 @@ async fn one_published_lens(client: &Client, case: &'static str, name: &str) -> 
 /// `CreateLensShare` is the only operation that reaches one, and nothing over the wire
 /// lists them yet (`ListLensShares` is a stub with its own issue), so the stored record is
 /// read here — exactly as `custom_lens_versions` reads back a published lens version.
-fn stored_shares(client: &Client, alias: &str) -> Vec<StoredShare> {
+pub(crate) fn stored_shares(client: &Client, alias: &str) -> Vec<StoredShare> {
     let store = client.store();
     let store = store.lock();
     store
