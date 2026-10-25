@@ -218,14 +218,16 @@ const XML_NAMESPACE: &str = "http://ec2.amazonaws.com/doc/2016-11-15";
 ///
 /// [`Ec2QueryEnvelope`] is the one place a serializer's media type is chosen, so
 /// it reaches every response this SERVICE renders: each success and each modelled
-/// error, including the scaffold's 501. It does not reach the responses the
+/// error, including the scaffold's 501 — the same reach the envelope's
+/// `<RequestID>` has. It does not reach the responses the
 /// FRAMEWORK renders in front of the service — the refusal tail that answers a
 /// constraint the model declares, a routing failure, a transport failure — which
 /// `override_protocol` deliberately leaves in the model-derived envelope (its
 /// contract in `vendor/smithy-server-runtime/src/service.rs`) and which therefore
-/// still announce the bare `text/xml`. Those paths are a separate seam
-/// (`override_refusal` / `override_routing_error` / `override_framework_error`)
-/// and are left to the issue that owns them rather than reworded here.
+/// still announce the bare `text/xml` and state no request id. Those paths are a
+/// separate seam (`override_refusal` / `override_routing_error` /
+/// `override_framework_error`) and are
+/// left to the issue that owns them rather than reworded here.
 const RESPONSE_CONTENT_TYPE: &str = "text/xml;charset=UTF-8";
 
 /// The element an ec2Query ERROR envelope names its request id with.

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteChannelMembership
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteChannelMembership`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteChannelMembership::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a member from the stored channel, so `DescribeChannelMembership`,
+//! `ListChannelMemberships`, `SearchChannels` and the send and privacy rules stop
+//! counting them as a member. A member can leave a channel themselves — one of the
+//! capabilities the model lists on `CreateChannelMembership` — and a moderator can remove
+//! any member, the capability the model lists on `CreateChannelModerator`.
 //!
 //! ## Shape of an operation
 //!
@@ -119,10 +116,19 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteChannelMembershipO
 // here — hence the `DeleteChannelMembershipError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.chimesdkmessaging#DeleteChannelMembership")]
+// `extra_errors` widens the set with `NotFoundException`, a shape the SERVICE models
+// (`DescribeChannelMembership` lists it) that this operation's own error list omits: a
+// delete for a channel or a member this service does not hold has to say the resource is
+// not there, and answering 400 would tell the caller its REQUEST was malformed when it
+// was not.
+#[smithy_macros::operation_error(
+    "com.amazonaws.chimesdkmessaging#DeleteChannelMembership",
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum DeleteChannelMembershipErrorModeled {
     BadRequestException(BadRequestException),
+    NotFoundException(NotFoundException),
     ConflictException(ConflictException),
     ForbiddenException(ForbiddenException),
     ServiceFailureException(ServiceFailureException),
@@ -180,20 +186,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteChannelMembership` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteChannelMembershipErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteChannelMembership"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteChannelMembershipErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the channel store is unavailable".to_string()),
+            })
+        })?;
+
+        // Sub-channels exist only on elastic channels, which this slice does not serve.
+        if let Some(sub_channel_id) = &input.sub_channel_id {
+            return Err(DeleteChannelMembershipErrorModeled::BadRequestException(
+                BadRequestException {
+                    code: Some("BadRequest".to_string()),
+                    message: Some(format!(
+                        "SubChannelId {sub_channel_id:?} is not supported: this emulator does not serve elastic channels"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        let channel = store.channels.get_mut(&input.channel_arn).ok_or_else(|| {
+            not_found(format!("channel {} not found", input.channel_arn))
+        })?;
+
+        // A member leaves on their own account; anyone else removing a member has to
+        // moderate the channel.
+        if input.member_arn != input.chime_bearer && !channel.is_moderator(&input.chime_bearer) {
+            return Err(DeleteChannelMembershipErrorModeled::ForbiddenException(
+                ForbiddenException {
+                    code: Some("Forbidden".to_string()),
+                    message: Some(crate::state::INSUFFICIENT_ACCESS_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        if !channel.remove_membership(&input.member_arn) {
+            return Err(not_found(format!(
+                "{} is not a member of channel {}",
+                input.member_arn, channel.arn
+            )));
+        }
+
+        Ok(DeleteChannelMembershipOutput)
     }
+}
+
+/// The modelled 404 for a channel or a membership this service does not hold.
+fn not_found(message: String) -> DeleteChannelMembershipError {
+    DeleteChannelMembershipErrorModeled::NotFoundException(NotFoundException {
+        code: Some("NotFound".to_string()),
+        message: Some(message),
+    })
+    .into()
 }

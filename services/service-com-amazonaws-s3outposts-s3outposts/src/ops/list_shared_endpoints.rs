@@ -154,26 +154,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The cursor is the (Outpost, endpoint) pair the next page starts at.
-        let resume = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => match crate::state::decode_endpoint_cursor(token) {
-                Some(key) => Some(key),
-                None => {
-                    return Err(ListSharedEndpointsErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some(format!(
-                                "NextToken {token:?} is not a token returned by \
-                                 ListSharedEndpoints"
-                            )),
-                        },
-                    )
-                    .into())
-                }
-            },
-        };
+        // The cursor is the (Outpost, endpoint) pair the next page starts at. It is
+        // decoded before the Outpost is resolved, so a token this service never
+        // issued is refused whatever the request named.
+        let resume = crate::state::endpoint_cursor(input.next_token.as_deref(), Self::NAME)
+            .map_err(ListSharedEndpointsErrorModeled::ValidationException)?;
 
-        let page_size = crate::state::page_size(input.max_results);
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
@@ -185,36 +171,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        store.settle_all(now);
-
-        let mut endpoints = Vec::with_capacity(page_size);
-        let mut next_token = None;
-        for (key, endpoint) in &store.endpoints {
-            // The listing is scoped by the Outpost the request named, and by
-            // nothing else: the model states `OutpostId` as the only scoping
-            // member and documents "all endpoints associated with an Outpost",
-            // so every endpoint on it is reported — the caller's own included,
-            // since `CreateEndpoint`/`DeleteEndpoint` are the related actions
-            // and they operate on exactly those.
-            if endpoint.outpost_id != input.outpost_id {
-                continue;
-            }
-            // Resume at the first key at or after the cursor, so a page is
-            // still served when the endpoint the cursor named was deleted
-            // meanwhile.
-            if resume.as_ref().is_some_and(|from| key < from) {
-                continue;
-            }
-            if endpoints.len() == page_size {
-                next_token = Some(crate::state::encode_endpoint_cursor(key));
-                break;
-            }
-            endpoints.push(endpoint.to_endpoint(&region));
-        }
+        // The walk, the page bound and the cursor are the listing rule both
+        // endpoint listings serve, so they live in `crate::state`; what is this
+        // operation's own is which endpoints it reports. The listing is scoped by
+        // the Outpost the request named, and by nothing else: the model states
+        // `OutpostId` as the only scoping member and documents "all endpoints
+        // associated with an Outpost", so every endpoint on it is reported — the
+        // caller's own included, since `CreateEndpoint`/`DeleteEndpoint` are the
+        // related actions and they operate on exactly those.
+        let page = crate::state::endpoint_page(
+            &mut store,
+            now,
+            &region,
+            input.max_results,
+            resume,
+            |endpoint| endpoint.outpost_id == input.outpost_id,
+        );
 
         Ok(ListSharedEndpointsOutput {
-            endpoints: Some(endpoints),
-            next_token,
+            endpoints: Some(page.endpoints),
+            next_token: page.next_token,
         })
     }
 }

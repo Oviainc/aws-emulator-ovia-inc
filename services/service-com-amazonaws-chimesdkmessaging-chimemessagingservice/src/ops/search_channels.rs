@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchChannels
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchChannels`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchChannels::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Searches the stored channels by MEMBERSHIP, the one `SearchFieldKey` the model
+//! declares, and answers with the matching channels as `ChannelSummary` records — so a
+//! channel a `CreateChannelMembership` just added the caller to is found, and one a
+//! `DeleteChannelMembership` or a `CreateChannelBan` removed them from is not.
+//!
+//! The search runs over the channels the `ChimeBearer` BELONGS to, which is what the model
+//! documents for a user or bot. `EQUALS` matches a channel whose member set is exactly the
+//! requested ARNs, `INCLUDES` one whose member set contains them all, and several fields
+//! all have to match.
 //!
 //! ## Shape of an operation
 //!
@@ -160,20 +161,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchChannels` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchChannelsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchChannels"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SearchChannelsErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the channel store is unavailable".to_string()),
+            })
+        })?;
+
+        // The model documents the `x-amz-chime-bearer` header as mandatory for this
+        // operation, and the search is defined relative to it: the channels the bearer
+        // belongs to. Without one there is nothing to search over.
+        let bearer = input.chime_bearer.as_deref().ok_or_else(|| {
+            bad_request("the x-amz-chime-bearer header is required".to_string())
+        })?;
+        for field in &input.fields {
+            if !SEARCH_FIELD_KEY_VALUES.contains(&field.key.as_str()) {
+                return Err(bad_request(format!(
+                    "Fields[].Key must be one of {SEARCH_FIELD_KEY_VALUES:?}; got {:?}",
+                    field.key
+                )));
+            }
+            if !SEARCH_FIELD_OPERATOR_VALUES.contains(&field.operator.as_str()) {
+                return Err(bad_request(format!(
+                    "Fields[].Operator must be one of {SEARCH_FIELD_OPERATOR_VALUES:?}; got {:?}",
+                    field.operator
+                )));
+            }
+        }
+        // `MaxResults` is modelled `range 1..50`; an omitted page size takes that
+        // maximum, so a caller that asks for no size still gets a bounded page.
+        let requested = input.max_results.unwrap_or(MAX_RESULTS_MAX);
+        if !(1..=MAX_RESULTS_MAX).contains(&requested) {
+            return Err(bad_request(format!(
+                "MaxResults must be between 1 and {MAX_RESULTS_MAX}; got {requested}"
+            )));
+        }
+        let page_size = usize::try_from(requested).unwrap_or(0);
+
+        let store = state.lock();
+        // One stable ordered view of the channels the bearer belongs to that match every
+        // requested field; the ARN — unique per channel — is what makes successive pages
+        // agree.
+        let mut view: Vec<&crate::state::ChannelRecord> = store
+            .channels
+            .values()
+            .filter(|channel| channel.is_member(bearer))
+            .filter(|channel| {
+                input
+                    .fields
+                    .iter()
+                    .all(|field| matches_membership(channel, field))
+            })
+            .collect();
+        view.sort_by(|left, right| left.arn.cmp(&right.arn));
+
+        // A `NextToken` names the last channel of the previous page, so this page resumes
+        // at the one after it in THIS ordered view.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let cursor = crate::state::decode_next_token(token).ok_or_else(|| {
+                    bad_request("NextToken is not a token this service issued".to_string())
+                })?;
+                view.iter()
+                    .position(|c| c.arn == cursor)
+                    .ok_or_else(|| {
+                        bad_request(
+                            "NextToken does not resume this view: the channel it names is no longer in it"
+                                .to_string(),
+                        )
+                    })?
+                    + 1
+            }
+        };
+
+        let page: Vec<&crate::state::ChannelRecord> =
+            view.iter().skip(start).take(page_size).copied().collect();
+        let next_token = (start + page.len() < view.len())
+            .then(|| page.last().map(|c| crate::state::encode_next_token(&c.arn)))
+            .flatten();
+
+        Ok(SearchChannelsOutput {
+            channels: Some(page.iter().map(|c| c.to_summary()).collect()),
+            next_token,
+        })
     }
+}
+
+/// Whether `channel`'s membership set satisfies one requested `field`.
+///
+/// `EQUALS` holds when the channel's members are exactly the requested ARNs, `INCLUDES`
+/// when they contain every one of them — the two comparisons the model's
+/// `SearchFieldOperator` documentation describes for a membership search.
+fn matches_membership(channel: &crate::state::ChannelRecord, field: &SearchField) -> bool {
+    let wanted: std::collections::BTreeSet<&str> =
+        field.values.iter().map(String::as_str).collect();
+    let members: std::collections::BTreeSet<&str> = channel
+        .memberships
+        .iter()
+        .map(|m| m.member_arn.as_str())
+        .collect();
+    match field.operator.as_str() {
+        "EQUALS" => members == wanted,
+        _ => wanted.is_subset(&members),
+    }
+}
+
+/// `MaxResults`'s modelled upper bound for this operation (`range 1..50`).
+const MAX_RESULTS_MAX: i32 = 50;
+
+/// Refuse the request with this service's own client-input error, HTTP 400.
+fn bad_request(message: String) -> SearchChannelsError {
+    SearchChannelsErrorModeled::BadRequestException(BadRequestException {
+        code: Some("BadRequest".to_string()),
+        message: Some(message),
+    })
+    .into()
 }

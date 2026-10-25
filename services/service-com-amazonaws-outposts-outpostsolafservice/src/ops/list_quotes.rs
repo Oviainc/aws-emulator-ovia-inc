@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListQuotes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListQuotes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListQuotes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports every quote of the region the request is addressed to, in
+//! creation order, cut into pages of at most `MaxResults` with the modelled
+//! `NextToken` the next page resumes from. A read: the only thing it writes is the
+//! quote expiry the clock has already made due, which every report of a quote
+//! materialises.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +135,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListQuotes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListQuotesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListQuotes"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListQuotesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Outposts store is unavailable".to_string()),
+            })
+        })?;
+        // This service is regional, so the list is the inventory of the region the
+        // request is addressed to — a quote belongs to the region it was created in
+        // and to no other, so a region nothing was created in lists nothing. Every
+        // quote this emulator holds carries this account's own id, so that inventory
+        // is exactly "the quotes for your Amazon Web Services account".
+        let region = crate::state::request_region(ctx.parts());
+
+        // The resume point the caller's token names. A token this service did not
+        // issue for THIS list is a bad request, not an empty page — the rule every
+        // other list in this service applies to theirs. This operation's model
+        // declares no client-input error, so the refusal travels on the service's own
+        // 400 `ValidationException` channel rather than as an invented code.
+        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            Some(token) => Some(
+                crate::state::decode_page_token(crate::state::QUOTE_PAGE, token).ok_or_else(
+                    || {
+                        crate::scaffolded::Scaffolded::validation(crate::state::page_token_report(
+                            Self::NAME,
+                        ))
+                    },
+                )?,
+            ),
+            None => None,
+        };
+        let size = crate::state::page_size(input.max_results);
+
+        let mut store = state.lock();
+        // Report the status each quote holds NOW: a quote whose own `ExpirationDate`
+        // has passed is expired, and that transition is owed at that instant, so it
+        // is materialised before the records are read — exactly as `GetQuote` does,
+        // so a list and a read never disagree about one quote's status.
+        store.settle_quotes();
+        let (quotes, next_token) = crate::state::page(
+            crate::state::QUOTE_PAGE,
+            store
+                .quotes_in(&region)
+                .map(|record| (record.sequence, quote_summary(&record.quote))),
+            after,
+            size,
+        );
+
+        Ok(ListQuotesOutput {
+            quotes: Some(quotes),
+            next_token,
+        })
+    }
+}
+
+/// The `QuoteSummary` a stored quote is reported as.
+///
+/// The modelled `QuoteSummary` is the `Quote` minus the one member it does not
+/// carry (`OrderingRequirements`), each remaining member documented identically on
+/// both shapes — so a summary is the stored quote's own value member for member,
+/// and a list can never say something about a quote that a read of it denies.
+fn quote_summary(quote: &Quote) -> QuoteSummary {
+    QuoteSummary {
+        quote_id: quote.quote_id.clone(),
+        account_id: quote.account_id.clone(),
+        quote_status: quote.quote_status.clone(),
+        status_message: quote.status_message.clone(),
+        outpost_arn: quote.outpost_arn.clone(),
+        country_code: quote.country_code.clone(),
+        requested_capacities: quote.requested_capacities.clone(),
+        requested_constraints: quote.requested_constraints.clone(),
+        requested_payment_options: quote.requested_payment_options.clone(),
+        requested_payment_terms: quote.requested_payment_terms.clone(),
+        quote_options: quote.quote_options.clone(),
+        submitted_order_id: quote.submitted_order_id.clone(),
+        created_date: quote.created_date,
+        expiration_date: quote.expiration_date,
+        description: quote.description.clone(),
     }
 }

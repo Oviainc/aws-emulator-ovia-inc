@@ -337,6 +337,16 @@ pub const APPLICATION_VISIBILITY_ENABLED: &str = "ENABLED";
 /// API."
 pub const APPLICATION_ASSIGNMENT_REQUIRED_DEFAULT: bool = true;
 
+/// `UserBackgroundSessionApplicationStatus::DISABLED` (the enum is `ENABLED | DISABLED`)
+/// — the status an application's SESSION configuration carries before any
+/// `PutApplicationSessionConfiguration` sets one.
+///
+/// CHOSEN default, not the model's: `UserBackgroundSessionApplicationStatus` declares no
+/// `@default` on either side of the pair and AWS publishes no value for an application
+/// nothing has configured, so the emulator reports the resting state — a background
+/// session nothing has enabled is not enabled, which this enum spells `DISABLED`.
+pub const USER_BACKGROUND_SESSION_STATUS_DEFAULT: &str = "DISABLED";
+
 /// `SignInOrigin::APPLICATION` — the origin that redirects the user to the application's
 /// own URL, which is why `SignInOptions$ApplicationUrl` is required with it.
 pub const SIGN_IN_ORIGIN_APPLICATION: &str = "APPLICATION";
@@ -1834,6 +1844,17 @@ pub struct ApplicationRecord {
     /// resolve the same application every other read resolves. An application nothing has
     /// configured carries [`APPLICATION_ASSIGNMENT_REQUIRED_DEFAULT`].
     pub assignment_required: bool,
+    /// `UserBackgroundSessionApplicationStatus` — the application's SESSION
+    /// configuration, as the last `PutApplicationSessionConfiguration` set it and as
+    /// `GetApplicationSessionConfiguration` reports it.
+    ///
+    /// On the application record for the same reason as [`Self::assignment_required`]: an
+    /// application that no longer exists holds no configuration, and the configuration
+    /// operations resolve the same application every other read resolves. `None` means
+    /// nothing has configured this application, which a read reports as
+    /// [`USER_BACKGROUND_SESSION_STATUS_DEFAULT`] — a different statement from a status a
+    /// put stored, so a put that names no status can leave it alone.
+    pub user_background_session_status: Option<String>,
     /// `PortalOptions`, normalised so the stored visibility is always explicit (see
     /// [`APPLICATION_VISIBILITY_ENABLED`]).
     pub portal_options: PortalOptions,
@@ -1890,6 +1911,15 @@ pub struct ApplicationRecord {
 }
 
 impl ApplicationRecord {
+    /// The status `GetApplicationSessionConfiguration` reports for this application: the
+    /// one the last `PutApplicationSessionConfiguration` stored, or
+    /// [`USER_BACKGROUND_SESSION_STATUS_DEFAULT`] while nothing has configured it.
+    pub fn reported_user_background_session_status(&self) -> &str {
+        self.user_background_session_status
+            .as_deref()
+            .unwrap_or(USER_BACKGROUND_SESSION_STATUS_DEFAULT)
+    }
+
     /// The access scopes this application carries, in `Scope` order, as the
     /// `(page key, item)` pairs [`page`] enumerates.
     ///

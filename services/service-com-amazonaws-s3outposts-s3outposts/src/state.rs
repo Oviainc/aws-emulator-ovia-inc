@@ -39,7 +39,9 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{Endpoint, NetworkInterface, Outpost, ResourceNotFoundException};
+use crate::ops::types::{
+    Endpoint, NetworkInterface, Outpost, ResourceNotFoundException, ValidationException,
+};
 
 /// `EndpointStatus`'s transient value: "Pending".
 pub const ENDPOINT_STATUS_PENDING: &str = "Pending";
@@ -520,6 +522,82 @@ pub fn decode_endpoint_cursor(token: &str) -> Option<(String, String)> {
     let (outpost_id, endpoint_id) = token.split_once('/')?;
     (is_outpost_id(outpost_id) && is_endpoint_id(endpoint_id))
         .then(|| (outpost_id.to_string(), endpoint_id.to_string()))
+}
+
+/// The key an endpoint listing resumes its walk at for `next_token`: `None` for a
+/// request that carries no cursor, and the refusal for a token this service never
+/// issued — which is answered rather than served as an arbitrary page.
+///
+/// `operation` is the listing's own name, the one part of the refusal that differs
+/// between the listings; the caller lifts the payload into its own error enum.
+pub fn endpoint_cursor(
+    next_token: Option<&str>,
+    operation: &str,
+) -> Result<Option<(String, String)>, ValidationException> {
+    match next_token {
+        None => Ok(None),
+        Some(token) => match decode_endpoint_cursor(token) {
+            Some(key) => Ok(Some(key)),
+            None => Err(ValidationException {
+                message: Some(format!(
+                    "NextToken {token:?} is not a token returned by {operation}"
+                )),
+            }),
+        },
+    }
+}
+
+/// One page of an endpoint listing: the `Endpoint`s it reports, and the cursor the
+/// caller resumes at when the walk stopped before the end of the listing.
+#[derive(Debug)]
+pub struct EndpointPage {
+    pub endpoints: Vec<Endpoint>,
+    pub next_token: Option<String>,
+}
+
+/// The page every endpoint listing serves: the endpoints `include` accepts, in
+/// [`ComAmazonawsS3outpostsS3outpostsState::endpoints`]'s own key order, starting at
+/// `resume` and at most [`page_size`] of them, plus the cursor naming the first key
+/// the page did not serve.
+///
+/// Each listing differs only in which endpoints it reports — `include` — so the walk
+/// itself lives here: both listings then page over one order, settle what the clock
+/// owes at the same point, and mint the same cursor for the same key.
+pub fn endpoint_page(
+    store: &mut ComAmazonawsS3outpostsS3outpostsState,
+    now: SystemTime,
+    region: &str,
+    max_results: i32,
+    resume: Option<(String, String)>,
+    mut include: impl FnMut(&EndpointRecord) -> bool,
+) -> EndpointPage {
+    // A listing reports every endpoint it serves, so every status change the clock
+    // already owes is materialised before the page is taken.
+    store.settle_all(now);
+
+    let page_size = page_size(max_results);
+    let mut endpoints = Vec::with_capacity(page_size);
+    let mut next_token = None;
+    for (key, endpoint) in &store.endpoints {
+        if !include(endpoint) {
+            continue;
+        }
+        // Resume at the first key at or after the cursor, so a page is still
+        // served when the endpoint the cursor named was deleted meanwhile.
+        if resume.as_ref().is_some_and(|from| key < from) {
+            continue;
+        }
+        if endpoints.len() == page_size {
+            next_token = Some(encode_endpoint_cursor(key));
+            break;
+        }
+        endpoints.push(endpoint.to_endpoint(region));
+    }
+
+    EndpointPage {
+        endpoints,
+        next_token,
+    }
 }
 
 /// The one `ResourceNotFoundException$Message` this service answers an

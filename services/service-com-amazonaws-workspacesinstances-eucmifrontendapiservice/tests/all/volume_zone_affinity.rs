@@ -47,7 +47,8 @@ async fn create_instance(
     case: &str,
     zone: Option<&str>,
 ) -> String {
-    let mut managed_instance = json!({ "InstanceType": "t3.medium" });
+    let mut managed_instance =
+        json!({ "ImageId": "ami-0123456789abcdef0", "InstanceType": "t3.medium" });
     if let Some(zone) = zone {
         managed_instance["Placement"] = json!({ "AvailabilityZone": zone });
     }

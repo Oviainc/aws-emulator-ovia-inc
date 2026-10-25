@@ -31,7 +31,8 @@ use crate::ops::types::{
     ConditionState, CurrentRevision, EncryptionKey, ExecutionDetails, ExecutionTrigger,
     FailureDetails, Job,
     JobData, ListWebhookItem, PipelineContext, PipelineDeclaration, PipelineExecution,
-    PipelineExecutionSummary, PipelineMetadata, PipelineSummary, PipelineVariable,
+    PipelineExecutionSummary, PipelineMetadata, PipelineRollbackMetadata, PipelineSummary,
+    PipelineVariable,
     ResolvedPipelineVariable, RuleState, S3ArtifactLocation, SourceRevision, StageConditionState,
     StageContext, Tag, ThirdPartyJob, TransitionState, WebhookDefinition,
 };
@@ -45,10 +46,10 @@ pub mod jobs;
 
 pub use driver::advance;
 pub use execution::{
-    artifact_store, is_terminal_status, plan_stages, stage_states, ActionRun, ArtifactRef,
-    StageRun, StopRequest, MAX_ARCHIVE_ENTRIES, MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE,
-    MAX_EXTRACTED_BYTES, STATUS_FAILED, STATUS_STOPPED, STATUS_SUCCEEDED, STATUS_SUPERSEDED,
-    TRANSITION_INBOUND, TRANSITION_OUTBOUND,
+    artifact_store, declared_action, declared_stage, is_terminal_status, plan_stage, plan_stages,
+    stage_states, ActionRun, ArtifactRef, StageRun, StopRequest, MAX_ARCHIVE_ENTRIES,
+    MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE, MAX_EXTRACTED_BYTES, STATUS_FAILED, STATUS_STOPPED,
+    STATUS_SUCCEEDED, STATUS_SUPERSEDED, TRANSITION_INBOUND, TRANSITION_OUTBOUND,
 };
 pub use jobs::{JobProblem, MAX_OUTPUT_VARIABLES_BYTES, MAX_OUTPUT_VARIABLE_VALUE_BYTES};
 
@@ -202,6 +203,16 @@ pub const ARTIFACT_LOCATION_TYPE_S3: &str = crate::ops::types::ARTIFACT_LOCATION
 /// model's enum (`smithy_query query="shape" shape="ExecutionType"` -> `STANDARD`,
 /// `ROLLBACK`).
 pub const EXECUTION_TYPE_STANDARD: &str = "STANDARD";
+
+/// The `ExecutionType` of an execution that rolls one stage back to an earlier
+/// execution of it, the other value of the same enum.
+pub const EXECUTION_TYPE_ROLLBACK: &str = "ROLLBACK";
+
+/// The `TriggerType` a rollback a caller asked for carries, from the model's enum
+/// (`smithy_query query="shape" shape="TriggerType"`, as
+/// `crate::ops::types::TRIGGER_TYPE_VALUES` lists it) — the manual counterpart of
+/// `AutomatedRollback`, which only a stage's own failure condition starts.
+pub const TRIGGER_TYPE_MANUAL_ROLLBACK: &str = "ManualRollback";
 
 /// The `StageTransitionType` values the model declares
 /// (`smithy_query query="shape" shape="StageTransitionType"` -> `Inbound`,
@@ -823,9 +834,13 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
     }
 
     /// The action executions a freshly started `execution` begins with: one per
-    /// action the execution's pipeline version runs FIRST — the actions of its first
-    /// stage at that stage's lowest `runOrder` — each `InProgress` as of the
+    /// action the execution runs FIRST — the actions of the first stage of its own
+    /// PLAN at that stage's lowest `runOrder` — each `InProgress` as of the
     /// execution's start.
+    ///
+    /// The first stage of the plan is the pipeline's first stage for an execution that
+    /// runs the pipeline forward, and the rolled-back stage for a stage rollback,
+    /// whose plan holds that stage alone.
     ///
     /// An action execution exists only once the execution has reached that action, so
     /// nothing is minted for a later stage, for a higher `runOrder` in the first
@@ -848,7 +863,11 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
         let Some(declaration) = pipeline.declaration_at(Some(execution.pipeline_version)) else {
             return Vec::new();
         };
-        let Some(stage) = declaration.stages.first() else {
+        let Some(stage) = execution
+            .stages
+            .first()
+            .and_then(|run| declared_stage(declaration, run))
+        else {
             return Vec::new();
         };
         let Some(first_run_order) = stage.actions.iter().map(run_order).min() else {
@@ -3064,6 +3083,9 @@ pub struct PipelineExecutionRecord {
     pub variables_map: BTreeMap<String, String>,
     /// How many times `RetryStageExecution` has retried a stage of this execution.
     pub manual_retry_attempts: i32,
+    /// The execution a stage rollback targeted, when this execution IS that rollback:
+    /// what `PipelineRollbackMetadata$rollbackTargetPipelineExecutionId` reports.
+    pub rollback_target: Option<String>,
 }
 
 impl PipelineExecutionRecord {
@@ -3093,7 +3115,7 @@ impl PipelineExecutionRecord {
             execution_mode: Some(self.execution_mode.clone()),
             execution_type: Some(self.execution_type.clone()),
             // Only a rollback execution carries rollback metadata.
-            rollback_metadata: None,
+            rollback_metadata: self.rollback_metadata(),
         }
     }
 
@@ -3112,8 +3134,18 @@ impl PipelineExecutionRecord {
             }),
             execution_mode: Some(self.execution_mode.clone()),
             execution_type: Some(self.execution_type.clone()),
-            rollback_metadata: None,
+            rollback_metadata: self.rollback_metadata(),
         }
+    }
+
+    /// The rollback metadata this execution carries: the execution a stage rollback
+    /// targeted, and nothing at all for an execution that is not a rollback.
+    fn rollback_metadata(&self) -> Option<PipelineRollbackMetadata> {
+        self.rollback_target
+            .as_ref()
+            .map(|target| PipelineRollbackMetadata {
+                rollback_target_pipeline_execution_id: Some(target.clone()),
+            })
     }
 }
 

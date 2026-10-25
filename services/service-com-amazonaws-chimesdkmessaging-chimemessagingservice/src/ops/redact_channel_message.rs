@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RedactChannelMessage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RedactChannelMessage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RedactChannelMessage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Redacts a stored message: the message STAYS in its channel, and what it carried is
+//! gone from the store, so `GetChannelMessage` and `ListChannelMessages` keep reporting
+//! the message with `Redacted` true and neither its `Content` nor its `Metadata`.
+//!
+//! Redacting is the sender's own message or a moderator's action, one of the capabilities
+//! the model lists for a channel moderator.
 //!
 //! ## Shape of an operation
 //!
@@ -106,10 +104,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-chimesdkmessaging-chime
 // here — hence the `RedactChannelMessageError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.chimesdkmessaging#RedactChannelMessage")]
+// `extra_errors` widens the set with `NotFoundException`, a shape the SERVICE models
+// (`GetChannelMessage` lists it) that this operation's own error list omits: a redaction
+// of a channel or a message this service does not hold has to say the resource is not
+// there, and answering 400 would tell the caller its REQUEST was malformed when it was
+// not.
+#[smithy_macros::operation_error(
+    "com.amazonaws.chimesdkmessaging#RedactChannelMessage",
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum RedactChannelMessageErrorModeled {
     BadRequestException(BadRequestException),
+    NotFoundException(NotFoundException),
     ConflictException(ConflictException),
     ForbiddenException(ForbiddenException),
     ServiceFailureException(ServiceFailureException),
@@ -167,20 +174,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RedactChannelMessage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RedactChannelMessageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RedactChannelMessage"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RedactChannelMessageErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the channel store is unavailable".to_string()),
+            })
+        })?;
+
+        // Sub-channels exist only on elastic channels, which this slice does not serve.
+        if let Some(sub_channel_id) = &input.sub_channel_id {
+            return Err(RedactChannelMessageErrorModeled::BadRequestException(
+                BadRequestException {
+                    code: Some("BadRequest".to_string()),
+                    message: Some(format!(
+                        "SubChannelId {sub_channel_id:?} is not supported: this emulator does not serve elastic channels"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+        let channel = store
+            .channels
+            .get_mut(&input.channel_arn)
+            .ok_or_else(|| not_found(format!("channel {} not found", input.channel_arn)))?;
+        let channel_arn = channel.arn.clone();
+        let caller_moderates = channel.is_moderator(&input.chime_bearer);
+        let message = channel
+            .messages
+            .iter_mut()
+            .find(|m| m.message_id == input.message_id)
+            .ok_or_else(|| {
+                // This operation models no `NotFoundException`, and a message the channel
+                // does not hold is refused at the message level with the modelled
+                // `ForbiddenException`.
+                RedactChannelMessageErrorModeled::ForbiddenException(ForbiddenException {
+                    code: Some("Forbidden".to_string()),
+                    message: Some(crate::state::INSUFFICIENT_ACCESS_MESSAGE.to_string()),
+                })
+            })?;
+
+        if !caller_moderates
+            && message.sender.arn.as_deref() != Some(input.chime_bearer.as_str())
+        {
+            // Only the message's sender or a moderator of the channel redacts it.
+            return Err(RedactChannelMessageErrorModeled::ForbiddenException(
+                ForbiddenException {
+                    code: Some("Forbidden".to_string()),
+                    message: Some(crate::state::INSUFFICIENT_ACCESS_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        // Redacting a message already redacted leaves it exactly as it is: the content is
+        // already gone.
+        message.redact(now);
+
+        Ok(RedactChannelMessageOutput {
+            channel_arn: Some(channel_arn),
+            message_id: Some(input.message_id),
+            // Sub-channels are not served, so no sub-channel is echoed back.
+            sub_channel_id: None,
+        })
     }
+}
+
+/// The modelled 404 for a channel or a message this service does not hold.
+fn not_found(message: String) -> RedactChannelMessageError {
+    RedactChannelMessageErrorModeled::NotFoundException(NotFoundException {
+        code: Some("NotFound".to_string()),
+        message: Some(message),
+    })
+    .into()
 }

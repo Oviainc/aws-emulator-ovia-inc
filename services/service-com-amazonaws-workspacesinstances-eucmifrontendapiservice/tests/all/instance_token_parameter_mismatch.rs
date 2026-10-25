@@ -28,7 +28,10 @@ use serde_json::json;
 use service_com_amazonaws_workspacesinstances_eucmifrontendapiservice as wsinst;
 
 use crate::idempotency_token_reuse::{assert_conflict, TokenRow};
-use crate::workspace_instance_lifecycle::{call, create, harness, ok, DEFAULT_TEST_REGION};
+use crate::workspace_instance_lifecycle::{
+    call, create, harness, launchable_managed_instance, ok, DEFAULT_TEST_REGION, TEST_IMAGE_ID,
+    TEST_INSTANCE_TYPE,
+};
 
 /// Everything the store holds about instance `id` that a create call decided,
 /// rendered field by field.
@@ -74,25 +77,29 @@ fn mismatch_rows() -> Vec<TokenRow> {
             case: "three members at once: a changed InstanceType, a BillingConfiguration \
                    added and the Tags dropped",
             first: json!({
-                "ManagedInstance": { "InstanceType": "t3.medium" },
+                "ManagedInstance": { "ImageId": TEST_IMAGE_ID, "InstanceType": "t3.medium" },
                 "Tags": [{ "Key": "env", "Value": "dev" }],
             }),
             second: json!({
-                "ManagedInstance": { "InstanceType": "m5.large" },
+                "ManagedInstance": { "ImageId": TEST_IMAGE_ID, "InstanceType": "m5.large" },
                 "BillingConfiguration": { "BillingMode": "MONTHLY" },
             }),
         },
         TokenRow {
             case: "one member two levels down: Placement.Tenancy",
+            // `m5`, whose catalog row publishes both tenancies, so either side is a
+            // configuration this service launches.
             first: json!({
                 "ManagedInstance": {
-                    "InstanceType": "t3.medium",
+                    "ImageId": TEST_IMAGE_ID,
+                    "InstanceType": "m5.large",
                     "Placement": { "AvailabilityZone": "us-east-1a", "Tenancy": "default" },
                 },
             }),
             second: json!({
                 "ManagedInstance": {
-                    "InstanceType": "t3.medium",
+                    "ImageId": TEST_IMAGE_ID,
+                    "InstanceType": "m5.large",
                     "Placement": { "AvailabilityZone": "us-east-1a", "Tenancy": "dedicated" },
                 },
             }),
@@ -100,16 +107,21 @@ fn mismatch_rows() -> Vec<TokenRow> {
         TokenRow {
             case: "a member dropped from ManagedInstance",
             first: json!({
-                "ManagedInstance": { "InstanceType": "t3.medium", "SubnetId": "subnet-0a1b2c3d" },
+                "ManagedInstance": {
+                    "ImageId": TEST_IMAGE_ID,
+                    "InstanceType": TEST_INSTANCE_TYPE,
+                    "SubnetId": "subnet-0a1b2c3d",
+                },
             }),
-            second: json!({ "ManagedInstance": { "InstanceType": "t3.medium" } }),
+            second: json!({ "ManagedInstance": launchable_managed_instance() }),
         },
         TokenRow {
             case: "two members added, a boolean and an integer",
-            first: json!({ "ManagedInstance": { "InstanceType": "t3.medium" } }),
+            first: json!({ "ManagedInstance": launchable_managed_instance() }),
             second: json!({
                 "ManagedInstance": {
-                    "InstanceType": "t3.medium",
+                    "ImageId": TEST_IMAGE_ID,
+                    "InstanceType": TEST_INSTANCE_TYPE,
                     "EbsOptimized": true,
                     "Ipv6AddressCount": 2,
                 },
@@ -118,25 +130,39 @@ fn mismatch_rows() -> Vec<TokenRow> {
         TokenRow {
             case: "a list one entry longer and a tag value changed together",
             first: json!({
-                "ManagedInstance": { "SecurityGroupIds": ["sg-0000000a"] },
+                "ManagedInstance": {
+                    "ImageId": TEST_IMAGE_ID,
+                    "InstanceType": TEST_INSTANCE_TYPE,
+                    "SecurityGroupIds": ["sg-0000000a"],
+                },
                 "Tags": [{ "Key": "env", "Value": "dev" }],
             }),
             second: json!({
-                "ManagedInstance": { "SecurityGroupIds": ["sg-0000000a", "sg-0000000b"] },
+                "ManagedInstance": {
+                    "ImageId": TEST_IMAGE_ID,
+                    "InstanceType": TEST_INSTANCE_TYPE,
+                    "SecurityGroupIds": ["sg-0000000a", "sg-0000000b"],
+                },
                 "Tags": [{ "Key": "env", "Value": "staging" }],
             }),
         },
         TokenRow {
-            case: "the whole ManagedInstance replaced by an empty one",
+            case: "the whole ManagedInstance replaced by the minimal launchable one",
             first: json!({
-                "ManagedInstance": { "InstanceType": "t3.medium", "ImageId": "ami-0123456789" },
+                "ManagedInstance": {
+                    "ImageId": "ami-0123456789",
+                    "InstanceType": "c5.large",
+                    "SubnetId": "subnet-0a1b2c3d",
+                },
             }),
-            second: json!({ "ManagedInstance": {} }),
+            second: json!({ "ManagedInstance": launchable_managed_instance() }),
         },
         TokenRow {
             case: "a tag nested inside ManagedInstance.TagSpecifications",
             first: json!({
                 "ManagedInstance": {
+                    "ImageId": TEST_IMAGE_ID,
+                    "InstanceType": TEST_INSTANCE_TYPE,
                     "TagSpecifications": [{
                         "ResourceType": "instance",
                         "Tags": [{ "Key": "team", "Value": "research" }],
@@ -145,6 +171,8 @@ fn mismatch_rows() -> Vec<TokenRow> {
             }),
             second: json!({
                 "ManagedInstance": {
+                    "ImageId": TEST_IMAGE_ID,
+                    "InstanceType": TEST_INSTANCE_TYPE,
                     "TagSpecifications": [{
                         "ResourceType": "instance",
                         "Tags": [{ "Key": "team", "Value": "platform" }],

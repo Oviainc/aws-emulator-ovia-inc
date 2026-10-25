@@ -54,9 +54,10 @@ impl Target {
     /// Every create of this service that accepts a `tags` map and is asserted here
     /// (`smithy_query(query="operation", operation="CreateConfig,CreateMissionProfile,\
     /// CreateDataflowEndpointGroup,ReserveContact")`). `CreateEphemeris`, `RegisterAgent`
-    /// and `TagResource` take one too and are held to the same rules; all three are
-    /// asserted in `crate::resource_tagging`, which creates a tagged ephemeris and a
-    /// tagged agent and runs the tables below through `TagResource`.
+    /// and `TagResource` take one too and are held to the same rules: `CreateEphemeris`
+    /// and `TagResource` in `crate::resource_tagging`, which creates a tagged ephemeris
+    /// and runs the tables below through `TagResource`, and `RegisterAgent` in
+    /// `crate::agent_registration_tags`, which runs them through a registration.
     const ALL: [Target; 4] = [
         Target::Config,
         Target::MissionProfile,

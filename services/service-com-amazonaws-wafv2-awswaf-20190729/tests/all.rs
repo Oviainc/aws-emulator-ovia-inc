@@ -17,6 +17,8 @@ mod api_key_listing;
 mod check_capacity;
 #[path = "all/exception_messages.rs"]
 mod exception_messages;
+#[path = "all/firewall_manager_rule_groups.rs"]
+mod firewall_manager_rule_groups;
 #[path = "all/ip_set_mutations.rs"]
 mod ip_set_mutations;
 #[path = "all/list_rule_groups.rs"]

@@ -379,12 +379,14 @@ fn start_action(
         .collect();
     let produced = record.artifacts.clone();
     // What the action IS comes from the pinned declaration, not from a copy in the
-    // execution record. A plan whose declaration no longer carries that action cannot
-    // be run at all, which the action's own failure reports.
-    let declared = declaration
+    // execution record, and from the declared stage the PLAN names rather than from the
+    // run's position in it (a rollback's plan holds one stage). A plan whose declaration
+    // no longer carries that action cannot be run at all, which the action's own failure
+    // reports.
+    let declared = record
         .stages
         .get(stage)
-        .and_then(|stage| stage.actions.get(index))
+        .and_then(|run| super::execution::declared_action(declaration, run, index))
         .cloned();
     let action = &mut record.stages[stage].actions[index];
     action.status = Some(ACTION_IN_PROGRESS.to_string());
@@ -655,8 +657,10 @@ fn record_outcome(
     let declared = pipelines
         .get(&record.pipeline_name)
         .and_then(|pipeline| pipeline.declaration_at(Some(record.pipeline_version)))
-        .and_then(|declaration| declaration.stages.get(stage))
-        .and_then(|stage| stage.actions.get(index));
+        .zip(record.stages.get(stage))
+        .and_then(|(declaration, run)| {
+            super::execution::declared_action(declaration, run, index)
+        });
     let namespace = declared.and_then(|action| action.namespace.clone());
     let output_names: Vec<String> = declared
         .and_then(|action| action.output_artifacts.clone())

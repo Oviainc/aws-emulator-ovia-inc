@@ -43,7 +43,9 @@ pub(crate) const SIGV4: &str = "AWS4-HMAC-SHA256 Credential=AKIAEMULATOR0000000/
                      trustedadvisor/aws4_request, SignedHeaders=host, Signature=00";
 
 /// The seeded check ids, in the order the store keys them (check id order).
-const CHECK_IDS: &[&str] = &[
+/// Written out by hand; its source is the `SEED` table in `src/state.rs`. Shared
+/// with the sibling suites so the store's catalog is stated once.
+pub(crate) const CHECK_IDS: &[&str] = &[
     "amazon-ebs-snapshots",
     "iam-access-key-rotation",
     "low-utilization-ec2-instances",

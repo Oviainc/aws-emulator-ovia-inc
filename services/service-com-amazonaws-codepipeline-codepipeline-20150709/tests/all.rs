@@ -43,6 +43,8 @@ mod pipeline_lifecycle;
 mod pipeline_state;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/rollback_stage.rs"]
+mod rollback_stage;
 #[path = "all/rule_executions.rs"]
 mod rule_executions;
 #[path = "all/stage_transitions.rs"]

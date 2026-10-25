@@ -198,6 +198,10 @@ pub mod rds_cluster_parameters;
 pub mod agentic_rft_jobs;
 pub mod arn;
 pub mod bedrock;
+/// The app-instance ADMIN directory the Amazon Chime SDK family shares: Chime SDK
+/// Identity promotes an identity to an administrator and Chime SDK Messaging reads the
+/// role, which it reserves two of its actions for.
+pub mod chime_app_instance_admins;
 pub mod chime_family;
 pub mod db_data_sources;
 /// The `vnd.amazon.eventstream` framing and routing seam a service with a

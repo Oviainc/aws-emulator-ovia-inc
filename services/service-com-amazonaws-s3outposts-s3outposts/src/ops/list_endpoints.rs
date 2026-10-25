@@ -153,55 +153,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The cursor is the (Outpost, endpoint) pair the next page starts at.
         // A token this service never issued is refused rather than served as an
         // arbitrary page.
-        let resume = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => match crate::state::decode_endpoint_cursor(token) {
-                Some(key) => Some(key),
-                None => {
-                    return Err(ListEndpointsErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some(format!(
-                                "NextToken {token:?} is not a token returned by ListEndpoints"
-                            )),
-                        },
-                    )
-                    .into())
-                }
-            },
-        };
+        let resume = crate::state::endpoint_cursor(input.next_token.as_deref(), Self::NAME)
+            .map_err(ListEndpointsErrorModeled::ValidationException)?;
 
-        let page_size = crate::state::page_size(input.max_results);
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let caller = crate::state::caller_account();
         let mut store = state.lock();
-        store.settle_all(now);
 
-        let mut endpoints = Vec::with_capacity(page_size);
-        let mut next_token = None;
-        for (key, endpoint) in &store.endpoints {
-            // This listing reports the caller's own endpoints, across every
-            // Outpost it has them on; `ListSharedEndpoints` is the listing
-            // scoped to one named Outpost.
-            if endpoint.owner_account != caller {
-                continue;
-            }
-            // Resume at the first key at or after the cursor, so a page is
-            // still served when the endpoint the cursor named was deleted
-            // meanwhile.
-            if resume.as_ref().is_some_and(|from| key < from) {
-                continue;
-            }
-            if endpoints.len() == page_size {
-                next_token = Some(crate::state::encode_endpoint_cursor(key));
-                break;
-            }
-            endpoints.push(endpoint.to_endpoint(&region));
-        }
+        // The walk, the page bound and the cursor are the listing rule both
+        // endpoint listings serve, so they live in `crate::state`; what is this
+        // operation's own is which endpoints it reports: the caller's own, across
+        // every Outpost it has them on. `ListSharedEndpoints` is the listing
+        // scoped to one named Outpost.
+        let page = crate::state::endpoint_page(
+            &mut store,
+            now,
+            &region,
+            input.max_results,
+            resume,
+            |endpoint| endpoint.owner_account == caller,
+        );
 
         Ok(ListEndpointsOutput {
-            endpoints: Some(endpoints),
-            next_token,
+            endpoints: Some(page.endpoints),
+            next_token: page.next_token,
         })
     }
 }
