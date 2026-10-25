@@ -44,6 +44,9 @@ mod channel_schedule;
 #[path = "all/channel_thumbnails.rs"]
 mod channel_thumbnails;
 
+#[path = "all/channel_update.rs"]
+mod channel_update;
+
 #[path = "all/cloud_watch_alarm_template_datapoints.rs"]
 mod cloud_watch_alarm_template_datapoints;
 
@@ -106,6 +109,9 @@ mod input_device_streaming;
 
 #[path = "all/input_device_thumbnail.rs"]
 mod input_device_thumbnail;
+
+#[path = "all/input_device_transfer_accept.rs"]
+mod input_device_transfer_accept;
 
 #[path = "all/input_device_transfers.rs"]
 mod input_device_transfers;

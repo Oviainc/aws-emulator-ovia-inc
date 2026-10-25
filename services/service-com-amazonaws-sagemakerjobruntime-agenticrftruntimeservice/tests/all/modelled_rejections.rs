@@ -12,11 +12,11 @@
 //!    signing name is shared with every other SageMaker-family service, so a claim on
 //!    the signing name alone makes every sibling claim every request and the router
 //!    answers `500 AmbiguousService` for all of it.
-//! 2. JOB RESOLUTION — this data plane holds no job registry: the `JobArn` a call
-//!    carries is the one the caller's own job execution was handed, so every value the
-//!    member's modelled constraints admit is served. That rule has its own suite in
-//!    `job_arn_is_the_callers_job.rs`; what this one pins is the refusal a value
-//!    OUTSIDE those constraints gets.
+//! 2. JOB RESOLUTION — the `JobArn` a call carries is resolved against the jobs the
+//!    SageMaker control plane created, since this data plane binds no operation that
+//!    creates one. That rule has its own suites in `job_resolution.rs` and
+//!    `job_arn_is_the_callers_job.rs`; what this one pins is the refusal a value OUTSIDE
+//!    the member's modelled constraints gets.
 //! 3. TRAJECTORY RESOLUTION — `CompleteRollout` and `UpdateReward` answer
 //!    `404 ResourceNotFoundException` for a `(JobArn, TrajectoryId)` pair the store
 //!    holds no trajectory for, with a message naming the trajectory and the account.
@@ -36,6 +36,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_sagemakerjobruntime_agenticrftruntimeservice::state;
 use service_com_amazonaws_sagemakerjobruntime_agenticrftruntimeservice::ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState as ServiceState;
 use service_com_amazonaws_sagemakerjobruntime_agenticrftruntimeservice::EmulatedService;
+use service_common::agentic_rft_jobs::{JobDirectory, JobRecord};
 use smithy_server_runtime::{MultiServiceRouter, Service};
 
 /// A SigV4 `Authorization` header whose credential scope names `service` — the primary
@@ -128,6 +129,24 @@ fn mounted_service() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
 /// account.
 fn emulator_job(run: &str) -> String {
     job_arn("us-east-1", "000000000000", "AgentRFT", run)
+}
+
+/// Create the job `job_arn` names in the shared job directory — the registration the
+/// SageMaker control plane's `CreateJob` writes, which is what makes a job addressable in
+/// this data plane. Every job a row of this suite expects to be SERVED is created this
+/// way; a row that expects a refusal about something else creates it too, so the refusal
+/// is about the member under test and not about the job.
+fn create_job(engine: &engine::InMemoryEngine, job_arn: &str) {
+    let resource = ::service_common::arn::resource_id_of_type(job_arn, "job")
+        .expect("a job ARN naming a job resource");
+    let (category, name) = resource
+        .split_once('/')
+        .expect("a job resource of the form <category>/<name>");
+    engine.state::<JobDirectory>().lock().register(JobRecord {
+        name: name.to_string(),
+        category: category.to_string(),
+        arn: job_arn.to_string(),
+    });
 }
 
 async fn send(
@@ -323,6 +342,7 @@ async fn an_unknown_trajectory_is_reported_as_not_found() {
 
     for (case, arn, trajectory_id) in rows {
         let (engine, router) = mounted_service();
+        create_job(&engine, &job);
         // One trajectory exists, under the first job and the id `traj-1`, so a
         // row that is not found is not found because of its own pair.
         let seeded = sample(&router, SAMPLE_PATH, &job, "traj-1", &chat_payload("go")).await;
@@ -401,6 +421,7 @@ async fn a_payload_too_large_to_retain_is_refused_and_captured_bytes_are_counted
     for (case, size, accepted) in rows {
         for path in [SAMPLE_PATH, SAMPLE_STREAM_PATH] {
             let (engine, router) = mounted_service();
+            create_job(&engine, &job);
             let payload = vec![b'x'; size];
             let reply = sample(&router, path, &job, "traj-1", &payload).await;
             let store = engine.state::<ServiceState>();
@@ -632,6 +653,7 @@ async fn a_value_outside_the_model_is_refused_as_invalid() {
     // about the bound and not about length in general.
     let (engine, router) = mounted_service();
     let job = emulator_job("modelled-values-run");
+    create_job(&engine, &job);
     let accepted = sample(&router, SAMPLE_PATH, &job, &at_max, &chat_payload("go")).await;
     assert_eq!(
         accepted.status,
@@ -691,6 +713,7 @@ async fn a_value_outside_the_model_is_refused_as_invalid() {
     // Every value the enum DOES declare is accepted on a trajectory that exists.
     for value in ["ready", "failed"] {
         let (engine, router) = mounted_service();
+        create_job(&engine, &job);
         assert_eq!(
             sample(&router, SAMPLE_PATH, &job, "traj-1", &chat_payload("go"))
                 .await
@@ -727,6 +750,7 @@ async fn a_value_outside_the_model_is_refused_as_invalid() {
         ("empty Rewards, trajectory exists", "traj-1"),
     ] {
         let (engine, router) = mounted_service();
+        create_job(&engine, &job);
         assert_eq!(
             sample(&router, SAMPLE_PATH, &job, "traj-1", &chat_payload("go"))
                 .await

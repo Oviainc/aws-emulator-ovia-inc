@@ -525,6 +525,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A new workload's lens reviews carry no answers yet: every question of
             // every attached lens is UNANSWERED until one is recorded.
             answers: std::collections::BTreeMap::new(),
+            // Nor has anything been written to those reviews: a review carries the notes
+            // and the Jira question selection `UpdateLensReview` records, and no caller
+            // has recorded any against a workload being created.
+            lens_review_records: std::collections::BTreeMap::new(),
             // The profiles the workload is reviewed against: the associations the
             // request's `ProfileArns` resolved to above, each pinned at the version its
             // profile is at. Which lens questions a profile PRIORITISES is decided by the

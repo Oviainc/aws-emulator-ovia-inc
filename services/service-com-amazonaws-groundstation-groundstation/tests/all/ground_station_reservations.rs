@@ -25,7 +25,8 @@
 //! * the placement rule: an antenna serves one pass at a time, so a table of overlapping
 //!   and disjoint windows lands on the antennas the rule requires, maintenance included,
 //!   and a pass at a ground station whose antennas this account HAS been told about is
-//!   placed on one of them;
+//!   placed on one of them — and, since a ground station's antennas are finite, a window
+//!   every one of them is already held for is refused rather than placed;
 //! * paging over a table of page sizes, with `maxResults` on each published bound of
 //!   `PaginationMaxResults` and one past each, and a `nextToken` from another window or
 //!   another listing refused rather than resumed;
@@ -45,7 +46,7 @@ use service_com_amazonaws_groundstation_groundstation::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::minute_usage::STATUS_HOLDS_ANTENNA_TIME;
-use crate::scheduling_loop::{create_mission_profile, harness_with_engine, list_pages, send};
+use crate::scheduling_loop::{create_mission_profile, harness_with_engine, list_pages, send, Reply};
 
 /// The instant every window in this suite is measured from: a round epoch-seconds value
 /// in the future, as the other suites of this target use.
@@ -186,6 +187,31 @@ fn schedule_maintenance(engine: &engine::InMemoryEngine, setting: &str) {
         .maintenance_reservations = windows;
 }
 
+/// Record the antennas `setting` describes at their ground stations, as a handler sees
+/// them — seeded where `state::GROUND_STATIONS_ENV` lands them.
+///
+/// What a ground station HAS is what bounds how much antenna time it can hold at once, so
+/// a suite that reserves overlapping passes at one station says how many antennas that
+/// station has rather than relying on the one a station with no recorded inventory has.
+fn stock_inventory(engine: &engine::InMemoryEngine, setting: &str) {
+    let inventory = parse_ground_stations(setting);
+    service_state(engine)
+        .expect("this service's state store")
+        .lock()
+        .ground_stations = inventory;
+}
+
+/// An inventory setting giving [`STATION`] `antennas` antennas, named as this emulator
+/// numbers them, and [`OTHER_STATION`] one.
+fn inventory_setting(antennas: usize) -> String {
+    let names: Vec<String> = (1..=antennas).map(antenna_name).collect();
+    format!(
+        "{STATION}={},{OTHER_STATION}={}",
+        names.join("+"),
+        antenna_name(1)
+    )
+}
+
 /// One contact to reserve: where its window sits relative to [`WINDOW`], which ground
 /// station holds it, and the antenna the placement rule puts it on.
 struct Pass {
@@ -317,6 +343,10 @@ fn maintenance_rows() -> Vec<(&'static str, Reservation)> {
 async fn stocked_harness() -> (MultiServiceRouter, Vec<(&'static str, Reservation)>) {
     let (router, engine) = harness_with_engine();
     schedule_maintenance(&engine, &maintenance_setting());
+    // Three antennas at the subject station, which is what the table's overlapping passes
+    // need: an antenna serves one pass at a time, and at most three of the table's windows
+    // share an instant.
+    stock_inventory(&engine, &inventory_setting(3));
     let profile_arn = create_mission_profile(&router, "reservations", 1, Some(120), Some(180)).await;
 
     let mut held: Vec<(&'static str, Reservation)> = Vec::new();
@@ -345,15 +375,14 @@ async fn stocked_harness() -> (MultiServiceRouter, Vec<(&'static str, Reservatio
     (router, held)
 }
 
-/// `ReserveContact` for a window at one ground station, answering the `contactId`.
-async fn reserve_pass_at(
+/// `ReserveContact` for a window at one ground station, answering the reply as it came.
+async fn reserve_reply(
     router: &MultiServiceRouter,
     profile_arn: &str,
     ground_station: &str,
-    case: &str,
     window: (i64, i64),
-) -> String {
-    let reply = send(
+) -> Reply {
+    send(
         router,
         "POST",
         "/contact",
@@ -364,7 +393,18 @@ async fn reserve_pass_at(
             "endTime": window.1,
         })),
     )
-    .await;
+    .await
+}
+
+/// `ReserveContact` for a window at one ground station, answering the `contactId`.
+async fn reserve_pass_at(
+    router: &MultiServiceRouter,
+    profile_arn: &str,
+    ground_station: &str,
+    case: &str,
+    window: (i64, i64),
+) -> String {
+    let reply = reserve_reply(router, profile_arn, ground_station, window).await;
     assert_eq!(
         reply.status, 200,
         "case {case}: ReserveContact expected 200, got {} {}",
@@ -604,6 +644,9 @@ async fn an_antenna_holds_one_reservation_at_a_time() {
         &engine,
         &format!("{STATION}/Antenna 1/UNPLANNED/{}/{}", BASE, BASE + 900),
     );
+    // Four antennas at the subject station: what it HAS is what bounds how many
+    // overlapping passes it can hold, and the table reserves four at once.
+    stock_inventory(&engine, &inventory_setting(4));
     let profile_arn = create_mission_profile(&router, "placement", 1, None, None).await;
 
     // Rows differ along how each window relates to the ones reserved before it: the first
@@ -634,6 +677,36 @@ async fn an_antenna_holds_one_reservation_at_a_time() {
             antenna_name(antenna)
         );
     }
+
+    // A window every antenna of the station is already held for has no antenna time left
+    // to reserve, so the reservation is refused and nothing is written: the first antenna
+    // is under maintenance and the other three hold the rows above.
+    let window = (BASE + 450, BASE + 550);
+    let before = reservations(&router, STATION, window, &[]).await;
+    let refused = reserve_reply(&router, &profile_arn, STATION, window).await;
+    assert_eq!(
+        refused.status, 431,
+        "case every-antenna-held: expected the modelled InvalidParameterException status \
+         431, got {} {}",
+        refused.status, refused.body
+    );
+    assert_eq!(
+        refused.error_code(),
+        "InvalidParameterException",
+        "case every-antenna-held: wrong error shape, got {}",
+        refused.body
+    );
+    assert!(
+        refused.body.get("contactId").is_none(),
+        "case every-antenna-held: a refused reservation mints no contactId, got {}",
+        refused.body
+    );
+    let after = reservations(&router, STATION, window, &[]).await;
+    assert_eq!(
+        after, before,
+        "case every-antenna-held: a refused reservation holds no antenna time, got \
+         {after:#?}"
+    );
 
     // Nothing at the ground station shares an antenna with an overlapping reservation.
     let whole_day = reservations(&router, STATION, (BASE - 86_400, BASE + 86_400), &[]).await;
@@ -1008,6 +1081,11 @@ async fn the_listing_changes_nothing_a_later_caller_sees() {
     );
 }
 
+/// One row of the placement table below: the case, the ground station the pass is reserved
+/// at, its window, and the antenna the rule puts it on — `None` where the rule refuses the
+/// reservation because every antenna of that station is already held for the window.
+type PlacementRow = (&'static str, &'static str, (i64, i64), Option<&'static str>);
+
 #[tokio::test]
 async fn a_pass_is_placed_on_an_antenna_its_ground_station_has() {
     let (router, engine) = harness_with_engine();
@@ -1024,44 +1102,66 @@ async fn a_pass_is_placed_on_an_antenna_its_ground_station_has() {
     // Rows differ along how each window relates to the ones reserved before it, and along
     // whether their ground station has a recorded inventory at all: the first pass and one
     // overlapping it take the station's own antennas in name order, a third overlapping
-    // both falls through to the emulator's own numbering (every recorded antenna is held),
-    // one disjoint from everything takes the station's first antenna again, and one at a
-    // station this account was told nothing about is numbered from the start.
-    let rows: [(&str, &str, (i64, i64), &str); 5] = [
+    // both is REFUSED (the station has two antennas and both are held, so the window holds
+    // no antenna time left to reserve), one disjoint from everything takes the station's
+    // first antenna again, and one at a station this account was told nothing about takes
+    // the single antenna the emulator numbers for it. `None` is the refused row.
+    let rows: [PlacementRow; 5] = [
         (
             "first-pass-takes-the-first-antenna",
             STATION,
             (BASE, BASE + 600),
-            "Dish A",
+            Some("Dish A"),
         ),
         (
             "overlapping-pass-takes-the-next",
             STATION,
             (BASE + 300, BASE + 900),
-            "Dish B",
+            Some("Dish B"),
         ),
         (
             "every-recorded-antenna-held",
             STATION,
             (BASE + 400, BASE + 500),
-            "Antenna 1",
+            None,
         ),
         (
             "disjoint-pass-reuses-the-first-antenna",
             STATION,
             (BASE + 1200, BASE + 1800),
-            "Dish A",
+            Some("Dish A"),
         ),
         (
             "a-station-with-no-recorded-inventory",
             OTHER_STATION,
             (BASE, BASE + 600),
-            "Antenna 1",
+            Some("Antenna 1"),
         ),
     ];
 
     for (case, ground_station, window, antenna) in rows {
-        let contact_id = reserve_pass_at(&router, &profile_arn, ground_station, case, window).await;
+        let reply = reserve_reply(&router, &profile_arn, ground_station, window).await;
+        let Some(antenna) = antenna else {
+            assert_eq!(
+                reply.status, 431,
+                "case {case}: a window every antenna of the station is held for must be \
+                 refused, got {} {}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.error_code(),
+                "InvalidParameterException",
+                "case {case}: wrong error shape, got {}",
+                reply.body
+            );
+            continue;
+        };
+        assert_eq!(
+            reply.status, 200,
+            "case {case}: ReserveContact expected 200, got {} {}",
+            reply.status, reply.body
+        );
+        let contact_id = reply.string("contactId");
         let reported = reservations(&router, ground_station, window, &[CONTACT]).await;
         let placed = reported
             .iter()

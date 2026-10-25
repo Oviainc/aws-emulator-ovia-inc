@@ -434,13 +434,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
             ));
         }
-        // The item the update leaves is held to the documented key-value limits for
-        // every index key it would be projected into, exactly as the same item written
-        // by a `PutItem` is: an update must not leave an item an index cannot represent.
+        // The item the update leaves is held to the declared type and the documented
+        // key-value limits for every index key it would be projected into, exactly as
+        // the same item written by a `PutItem` is: an update must not leave an item an
+        // index cannot represent.
         store
             .active_table(&region, &name, now)
             .map_err(lift)?
-            .check_index_key_limits(&item)
+            .check_index_keys(&item)
             .map_err(lift)?;
 
         store

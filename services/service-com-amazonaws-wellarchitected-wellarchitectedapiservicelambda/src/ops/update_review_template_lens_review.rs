@@ -216,39 +216,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A `PillarNotes` key is a `PillarId`, and the pillars of a lens are what its
         // lens content names: a key naming a pillar the lens does NOT define belongs to
-        // no pillar of this lens review and is refused rather than stored. Only a lens
-        // this emulator holds content for has a pillar set to judge a key against
-        // (`crate::state::lens_pillars`); for a lens it holds none for there is nothing
-        // to judge, so the notes are stored as given and reported back by
-        // `ReviewTemplateRecord::lens_review_pillars` rather than refused for a pillar
-        // the real lens may well define.
-        let defined: std::collections::BTreeSet<&str> =
-            crate::state::lens_pillars(&input.lens_alias)
+        // no pillar of this lens review and is refused rather than stored — through the
+        // one place this service judges a pillar identifier against the lens under
+        // review, shared with `UpdateLensReview`.
+        if let Some(exception) = crate::state::undefined_pillar_refusal(
+            crate::state::PILLAR_NOTES_MEMBER,
+            &input.lens_alias,
+            input
+                .pillar_notes
                 .iter()
-                .map(|(pillar_id, _, _)| *pillar_id)
-                .collect();
-        if let (false, Some(pillar_notes)) = (defined.is_empty(), input.pillar_notes.as_ref()) {
-            let mut undefined: Vec<&str> = pillar_notes
-                .keys()
-                .map(String::as_str)
-                .filter(|pillar_id| !defined.contains(pillar_id))
-                .collect();
-            if !undefined.is_empty() {
-                // Sorted so the refusal does not depend on the request map's iteration
-                // order.
-                undefined.sort_unstable();
-                return Err(UpdateReviewTemplateLensReviewErrorModeled::ValidationException(
-                    crate::state::member_constraint_exception(
-                        PILLAR_NOTES_MEMBER,
-                        &format!(
-                            "every key must name a pillar of lens {}, which {} does not",
-                            input.lens_alias,
-                            undefined.join(", ")
-                        ),
-                    ),
-                )
-                .into());
-            }
+                .flat_map(|notes| notes.keys().map(String::as_str)),
+        ) {
+            return Err(
+                UpdateReviewTemplateLensReviewErrorModeled::ValidationException(exception).into(),
+            );
         }
 
         // Both note members are optional, so a request that supplies NEITHER asks for no
@@ -276,5 +257,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The member an undefined-pillar finding names (`UpdateReviewTemplateLensReviewInput$PillarNotes`).
-const PILLAR_NOTES_MEMBER: &str = "PillarNotes";

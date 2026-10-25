@@ -692,6 +692,22 @@
 //! `TransitGatewayOptions$AssociationDefaultRouteTableId` and
 //! `$PropagationDefaultRouteTableId` report name that record.
 //!
+//! ## Virtual private gateways
+//!
+//! [`ComAmazonawsEc2Amazonec2State::vpn_gateways`] holds the account's virtual private
+//! gateways as [`VpnGatewayRecord`]s, keyed by `VpnGatewayId` in a [`BTreeMap`]: the
+//! modelled [`VpnGateway`] shape every operation that reports one answers with — so a
+//! member a writer sets round-trips through `DescribeVpnGateways` without a field-by-field
+//! copy — plus the one thing that shape carries no member for, the [`PendingStateMove`] the
+//! clock owes the gateway.
+//!
+//! `CreateVpnGateway` answers a gateway in the non-terminal `pending` state, so the clock
+//! owes it `available` one [`TRANSITION_DELAY`] later, and `DeleteVpnGateway` leaves it in
+//! the non-terminal `deleting` state with `deleted` owed the same way — `VpnState`'s four
+//! members are `pending`, `available`, `deleting` and `deleted`, so a deleted gateway is
+//! still a gateway the API reports rather than a record that vanishes.
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies both moves.
+//!
 //! ## Transit gateway policy tables and their associations
 //!
 //! [`ComAmazonawsEc2Amazonec2State::transit_gateway_policy_tables`] holds the account's
@@ -983,7 +999,7 @@ use crate::ops::types::{
     SecondaryNetworkIpv4CidrBlockAssociation, SecondarySubnet,
     SecondarySubnetIpv4CidrBlockAssociation, SecurityGroup, ServiceConfiguration,
     SnapshotTaskDetail, SpotPlacementScore, StateReason,
-    Subnet, SubnetAssociation, Subscription, Tag,
+    Subnet, SubnetAssociation, SubnetCidrReservation, Subscription, Tag,
     TagSpecification,
     TransitGateway, TransitGatewayClientVpnAttachment,
     TransitGatewayMulticastDomainAssociation, TransitGatewayOptions,
@@ -996,7 +1012,7 @@ use crate::ops::types::{
     TransitGatewayVpcAttachment,
     UserIdGroupPair, Vpc, VpcBlockPublicAccessExclusion, VpcCidrBlockAssociation,
     VpcCidrBlockState, VpcEndpoint,
-    VpcEndpointConnection,
+    VpcEndpointConnection, VpnGateway,
 };
 use crate::scaffolded::Scaffolded;
 
@@ -2058,6 +2074,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Amazon EVS provisions into this account as part of an environment it is still
     /// building.
     pub subnet_available_at: BTreeMap<String, Instant>,
+    /// Every subnet CIDR reservation the account holds, by `SubnetCidrReservationId`, as
+    /// the modelled [`SubnetCidrReservation`] shape itself — so a member a writer sets
+    /// round-trips through `GetSubnetCidrReservations` without a field-by-field copy.
+    /// Ordered by id, which is the order that get reports and pages over.
+    ///
+    /// A reservation names the subnet it reserves part of ([`SubnetCidrReservation::subnet_id`]),
+    /// which is how `GetSubnetCidrReservations` narrows this one store to the subnet a
+    /// request asks about, rather than a second map per subnet that could drift from it.
+    pub subnet_cidr_reservations: BTreeMap<String, SubnetCidrReservation>,
     /// Every carrier gateway the account holds, by `CarrierGatewayId`, as the modelled
     /// `CarrierGateway` shape itself — see the module docs. Ordered by id, which is the
     /// order `DescribeCarrierGateways` reports and pages over.
@@ -2303,6 +2328,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// a pair either propagates or does not; ordered by route table and then by attachment,
     /// which is the order `GetTransitGatewayRouteTablePropagations` reports and pages over.
     pub transit_gateway_propagations: BTreeMap<(String, String), TransitGatewayPropagationRecord>,
+    /// Every virtual private gateway the account holds, by `VpnGatewayId`, as
+    /// [`VpnGatewayRecord`]s — the modelled [`VpnGateway`] shape plus the state move the
+    /// clock owes it (see the module docs). Ordered by id, which is the order
+    /// `DescribeVpnGateways` reports in.
+    pub vpn_gateways: BTreeMap<String, VpnGatewayRecord>,
     /// Which prefix list is referenced as a route of which transit gateway route table, by
     /// (`TransitGatewayRouteTableId`, `PrefixListId`) — see
     /// [`TransitGatewayPrefixListReferenceRecord`] and the module docs. One entry per pair,
@@ -2626,6 +2656,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             default_vpc_ids: BTreeMap::new(),
             subnets: BTreeMap::new(),
             subnet_available_at: BTreeMap::new(),
+            // A fresh account has reserved no part of any subnet's CIDR range.
+            subnet_cidr_reservations: BTreeMap::new(),
             carrier_gateways: BTreeMap::new(),
             carrier_gateway_available_at: BTreeMap::new(),
             carrier_gateway_client_tokens: HashMap::new(),
@@ -2686,6 +2718,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             transit_gateway_available_at: BTreeMap::new(),
             transit_gateway_route_tables: BTreeMap::new(),
             transit_gateway_propagations: BTreeMap::new(),
+            vpn_gateways: BTreeMap::new(),
             transit_gateway_prefix_list_references: BTreeMap::new(),
             dedicated_hosts: BTreeMap::new(),
             dedicated_host_client_tokens: HashMap::new(),
@@ -3037,6 +3070,54 @@ impl ComAmazonawsEc2Amazonec2State {
         self.add_stored_bytes(tag_list_bytes(subnet.tags.as_deref().unwrap_or_default()));
         self.subnets.insert(subnet_id.clone(), subnet);
         subnet_id
+    }
+
+    /// Whether another subnet CIDR reservation fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of [`Self::has_subnet_capacity`]:
+    /// a create asks first so it can refuse instead of overshooting.
+    pub fn has_subnet_cidr_reservation_capacity(&self) -> bool {
+        self.subnet_cidr_reservations.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Insert a subnet CIDR reservation, and answer the `SubnetCidrReservationId` it was
+    /// given.
+    ///
+    /// Everything the service itself owns is derived here rather than taken from the
+    /// caller — the reservation id and the owning account — so two writers cannot report
+    /// the same reservation differently, exactly as [`Self::insert_subnet`] does for a
+    /// subnet. The caller-chosen bytes of the reservation are charged against the store's
+    /// byte budget here, so a writer cannot store them uncharged.
+    ///
+    /// `None` means the store is at [`MAX_STORED_RECORDS_PER_STORE`] and NOTHING was
+    /// stored: the ceiling is enforced here, the way [`Self::insert_coip_pool`] enforces
+    /// its own, so a writer that forgets to ask cannot grow the store without bound.
+    pub fn insert_subnet_cidr_reservation(
+        &mut self,
+        spec: SubnetCidrReservationSpec,
+    ) -> Option<String> {
+        if !self.has_subnet_cidr_reservation_capacity() {
+            return None;
+        }
+        let reservation_id = self.next_id(SUBNET_CIDR_RESERVATION_ID_PREFIX);
+        self.add_stored_bytes(subnet_cidr_reservation_payload_bytes(
+            &spec.cidr,
+            spec.description.as_deref(),
+            &spec.tags,
+        ));
+        let reservation = SubnetCidrReservation {
+            subnet_cidr_reservation_id: Some(reservation_id.clone()),
+            subnet_id: Some(spec.subnet_id),
+            cidr: Some(spec.cidr),
+            reservation_type: Some(spec.reservation_type),
+            // "The ID of the account that owns the subnet CIDR reservation"
+            // (`SubnetCidrReservation$OwnerId`): this emulator serves one account.
+            owner_id: Some(::engine::emulator_account_id().to_string()),
+            description: spec.description,
+            tags: Some(spec.tags),
+        };
+        self.subnet_cidr_reservations
+            .insert(reservation_id.clone(), reservation);
+        Some(reservation_id)
     }
 
     /// Insert a customer-owned IP (CoIP) address pool, and answer the `PoolId` it was
@@ -4230,6 +4311,56 @@ pub struct SubnetSpec {
     pub tags: Vec<Tag>,
 }
 
+/// The prefix of a `SubnetCidrReservationId`, as EC2 spells one (`scr-…`), and the segment
+/// [`ComAmazonawsEc2Amazonec2State::insert_subnet_cidr_reservation`] mints the id from.
+pub const SUBNET_CIDR_RESERVATION_ID_PREFIX: &str = "scr";
+
+/// The `ResourceType` a `CreateSubnetCidrReservation` tag specification may name: the
+/// reservation it creates (`ResourceType` enum member `subnet-cidr-reservation`, in
+/// [`crate::ops::types::RESOURCE_TYPE_VALUES`]).
+pub const RESOURCE_TYPE_SUBNET_CIDR_RESERVATION: &str = "subnet-cidr-reservation";
+
+/// One subnet CIDR reservation as a writer asks for it: the members a creator chooses.
+/// Everything the service derives — the reservation id and the owning account — is minted
+/// by [`ComAmazonawsEc2Amazonec2State::insert_subnet_cidr_reservation`].
+#[derive(Debug, Clone)]
+pub struct SubnetCidrReservationSpec {
+    /// The subnet whose CIDR range this reservation is part of.
+    pub subnet_id: String,
+    /// The reserved range, in the canonical form the create read it in.
+    pub cidr: String,
+    /// One value of the `SubnetCidrReservationType` enum
+    /// ([`crate::ops::types::SUBNET_CIDR_RESERVATION_TYPE_VALUES`]).
+    pub reservation_type: String,
+    /// The description the request assigned, for a reservation that carries one.
+    pub description: Option<String>,
+    /// The tags the reservation carries.
+    pub tags: Vec<Tag>,
+}
+
+/// The caller-chosen bytes one stored subnet CIDR reservation holds, plus the fixed
+/// overhead the record itself costs.
+///
+/// Only the members whose length the REQUEST chose are counted on top of
+/// [`STORED_RECORD_OVERHEAD_BYTES`]: the reservation id and the owner are minted by
+/// [`ComAmazonawsEc2Amazonec2State::insert_subnet_cidr_reservation`]. The ONE definition of
+/// that charge, the way [`coip_pool_payload_bytes`] is for a CoIP pool, so a create charges
+/// exactly what a delete would give back.
+///
+/// It takes the caller-chosen members themselves rather than a stored record, so the create
+/// can ask about a reservation it has not stored yet — the budget has to be asked BEFORE the
+/// write — and a later delete can ask about the record it is removing.
+pub fn subnet_cidr_reservation_payload_bytes(
+    cidr: &str,
+    description: Option<&str>,
+    tags: &[Tag],
+) -> usize {
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(cidr.len())
+        .saturating_add(description.map_or(0, str::len))
+        .saturating_add(tag_list_bytes(tags))
+}
+
 /// The caller-chosen bytes one stored customer-owned IP address pool holds, plus the fixed
 /// overhead the record itself costs.
 ///
@@ -4885,6 +5016,21 @@ impl ComAmazonawsEc2Amazonec2State {
             }
         }
         for record in self.transit_gateway_route_table_announcements.values_mut() {
+            if let Some(state) = record
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.due_by(now))
+                .map(str::to_string)
+            {
+                record.view.state = Some(state);
+                record.pending = None;
+            }
+        }
+        // A virtual private gateway `CreateVpnGateway` left `pending` or `DeleteVpnGateway`
+        // left `deleting`: each reaches the terminal `VpnState` the write recorded for it at
+        // the instant it was owed, whether or not anybody called again — the same contract
+        // as the records above.
+        for record in self.vpn_gateways.values_mut() {
             if let Some(state) = record
                 .pending
                 .as_ref()
@@ -12913,7 +13059,12 @@ pub fn canonical_secondary_network_ipv4_cidr(value: &str) -> Result<String, Cidr
 /// `value` as an IPv4 CIDR block with its host bits cleared, with NO rule on the prefix
 /// length: the one reader [`canonical_vpc_ipv4_cidr`], [`canonical_subnet_ipv4_cidr`] and
 /// [`canonical_secondary_network_ipv4_cidr`] put their own published block size on top of.
-fn canonical_ipv4_cidr(value: &str) -> Result<String, CidrProblem> {
+///
+/// Public, like its IPv6 twin [`canonical_ipv6_cidr`], for the ranges the model and the
+/// docs publish no size for at all — a subnet CIDR reservation's range, whose only stated
+/// rule is the subnet range it has to sit inside — where a bound invented here would refuse
+/// blocks AWS accepts.
+pub fn canonical_ipv4_cidr(value: &str) -> Result<String, CidrProblem> {
     let (address, prefix_length) = value.split_once('/').ok_or(CidrProblem::Malformed)?;
     let base = u32::from(
         address
@@ -17018,6 +17169,36 @@ pub const AMAZON_SIDE_ASN_16_BIT: ::std::ops::RangeInclusive<i64> = 64_512..=65_
 /// (`TransitGatewayRequestOptions$AmazonSideAsn`).
 pub const AMAZON_SIDE_ASN_32_BIT: ::std::ops::RangeInclusive<i64> = 4_200_000_000..=4_294_967_294;
 
+/// The Amazon-side ASN a create asks for, or [`DEFAULT_AMAZON_SIDE_ASN`] when it asks for
+/// none — refusing anything outside the two published private ranges rather than defaulting
+/// it, so a typo never reads as "the default".
+///
+/// The ONE place that rule lives: both operations that let a caller choose an Amazon-side
+/// ASN publish the same two ranges and the same default — "If you're using a 16-bit ASN, it
+/// must be in the 64512 to 65534 range. If you're using a 32-bit ASN, it must be in the
+/// 4200000000 to 4294967294 range. Default: 64512" (`CreateVpnGatewayRequest$AmazonSideAsn`,
+/// and `TransitGatewayRequestOptions$AmazonSideAsn` in the same words) — so neither can
+/// accept an ASN the other refuses.
+pub fn private_amazon_side_asn<E>(requested: Option<i64>) -> Result<i64, Scaffolded<E>> {
+    match requested {
+        None => Ok(DEFAULT_AMAZON_SIDE_ASN),
+        Some(asn)
+            if AMAZON_SIDE_ASN_16_BIT.contains(&asn) || AMAZON_SIDE_ASN_32_BIT.contains(&asn) =>
+        {
+            Ok(asn)
+        }
+        Some(asn) => Err(invalid_parameter_value(format!(
+            "Value ({asn}) for parameter amazonSideAsn is invalid. \
+             The range is {min_16} to {max_16} for 16-bit ASNs and \
+             {min_32} to {max_32} for 32-bit ASNs.",
+            min_16 = AMAZON_SIDE_ASN_16_BIT.start(),
+            max_16 = AMAZON_SIDE_ASN_16_BIT.end(),
+            min_32 = AMAZON_SIDE_ASN_32_BIT.start(),
+            max_32 = AMAZON_SIDE_ASN_32_BIT.end(),
+        ))),
+    }
+}
+
 /// The longest IPv4 prefix a transit gateway CIDR block may have: "Must be a size /24 CIDR
 /// block or larger for IPv4" (`TransitGatewayRequestOptions$TransitGatewayCidrBlocks`) —
 /// larger block, so a prefix no longer than this.
@@ -17132,25 +17313,7 @@ pub fn canonical_transit_gateway_cidr(value: &str) -> Result<String, CidrProblem
 pub fn transit_gateway_options<E>(
     requested: Option<&TransitGatewayRequestOptions>,
 ) -> Result<TransitGatewayOptions, Scaffolded<E>> {
-    let asn = match requested.and_then(|options| options.amazon_side_asn) {
-        None => DEFAULT_AMAZON_SIDE_ASN,
-        Some(asn)
-            if AMAZON_SIDE_ASN_16_BIT.contains(&asn) || AMAZON_SIDE_ASN_32_BIT.contains(&asn) =>
-        {
-            asn
-        }
-        Some(asn) => {
-            return Err(invalid_parameter_value(format!(
-                "Value ({asn}) for parameter amazonSideAsn is invalid. \
-                 The range is {min_16} to {max_16} for 16-bit ASNs and \
-                 {min_32} to {max_32} for 32-bit ASNs.",
-                min_16 = AMAZON_SIDE_ASN_16_BIT.start(),
-                max_16 = AMAZON_SIDE_ASN_16_BIT.end(),
-                min_32 = AMAZON_SIDE_ASN_32_BIT.start(),
-                max_32 = AMAZON_SIDE_ASN_32_BIT.end(),
-            )))
-        }
-    };
+    let asn = private_amazon_side_asn(requested.and_then(|options| options.amazon_side_asn))?;
     let mut cidr_blocks: Vec<String> = Vec::new();
     for requested_block in requested
         .and_then(|options| options.transit_gateway_cidr_blocks.as_deref())
@@ -25987,6 +26150,212 @@ impl ComAmazonawsEc2Amazonec2State {
         delta_id: &str,
     ) -> Option<&IpamRoutingPolicyRegistrationDeltaRecord> {
         self.ipam_routing_policy_registration_deltas.get(delta_id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Virtual private gateways
+// ---------------------------------------------------------------------------
+//
+// See the module docs for why a gateway is stored as the modelled shape beside the move the
+// clock owes it. The words below are members of the model's own enums, named here so the
+// operations that create, report and delete a gateway cannot spell one value two ways.
+
+/// The id prefix EC2 gives a virtual private gateway (`vgw-0123456789abcdef0`), which
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] mints the long form of.
+pub const VPN_GATEWAY_ID_PREFIX: &str = "vgw";
+
+/// `VpnState`'s `pending` member: a gateway a create has just minted, which is not usable
+/// yet. The generated catalog of the four states is
+/// [`crate::ops::types::VPN_STATE_VALUES`].
+pub const VPN_GATEWAY_STATE_PENDING: &str = "pending";
+
+/// `VpnState`'s `available` member: a gateway that has finished coming up.
+pub const VPN_GATEWAY_STATE_AVAILABLE: &str = "available";
+
+/// `VpnState`'s `deleting` member: a gateway a delete has started on, which is not gone yet.
+pub const VPN_GATEWAY_STATE_DELETING: &str = "deleting";
+
+/// `VpnState`'s `deleted` member: a gateway whose deletion has finished. The enum carries
+/// this state, so a deleted gateway is still a gateway `DescribeVpnGateways` reports rather
+/// than a record that vanished.
+pub const VPN_GATEWAY_STATE_DELETED: &str = "deleted";
+
+/// `GatewayType`'s only member: "Currently the only supported type is `ipsec.1`"
+/// (`DescribeVpnGatewaysRequest$Filters`). The generated catalog is
+/// [`crate::ops::types::GATEWAY_TYPE_VALUES`].
+pub const GATEWAY_TYPE_IPSEC_1: &str = "ipsec.1";
+
+/// The `ResourceType` a `CreateVpnGateway` tag specification may name: the virtual private
+/// gateway it creates ("The tags to apply to the virtual private gateway",
+/// `CreateVpnGatewayRequest$TagSpecifications`).
+pub const RESOURCE_TYPE_VPN_GATEWAY: &str = "vpn-gateway";
+
+/// EC2's error code for a request naming a virtual private gateway id this account holds no
+/// gateway for.
+pub const INVALID_VPN_GATEWAY_ID_NOT_FOUND: &str = "InvalidVpnGatewayID.NotFound";
+
+/// EC2's error code for a request naming something that is not a virtual private gateway id
+/// at all, so there is nothing to look up.
+pub const INVALID_VPN_GATEWAY_ID_MALFORMED: &str = "InvalidVpnGatewayID.Malformed";
+
+/// EC2's error code for a create that would take the account past its virtual private
+/// gateway quota.
+pub const VPN_GATEWAY_LIMIT_EXCEEDED: &str = "VpnGatewayLimitExceeded";
+
+/// The largest number of virtual private gateways this in-memory store holds.
+///
+/// A capacity bound in the same style as [`MAX_TRANSIT_GATEWAYS`], not an AWS quota: each
+/// gateway is a record in this process's memory, so the number a caller can create has to be
+/// finite. [`ComAmazonawsEc2Amazonec2State::has_vpn_gateway_capacity`] is the predicate a
+/// writer asks before inserting; a create past it refuses with
+/// [`vpn_gateway_limit_exceeded`].
+pub const MAX_VPN_GATEWAYS: usize = 1_000;
+
+/// One stored virtual private gateway: what every operation that reports one answers with,
+/// plus the move the clock owes it.
+#[derive(Debug, Clone)]
+pub struct VpnGatewayRecord {
+    /// The gateway as `CreateVpnGateway` and `DescribeVpnGateways` report it.
+    pub view: VpnGateway,
+    /// The state this gateway is due to move to, while it is in a non-terminal one:
+    /// `available` after a create, `deleted` after a delete. `None` once nothing is owed.
+    pub pending: Option<PendingStateMove>,
+}
+
+/// Everything [`ComAmazonawsEc2Amazonec2State::insert_vpn_gateway`] needs that it does not
+/// derive itself: what the REQUEST said.
+#[derive(Debug, Clone)]
+pub struct VpnGatewaySpec {
+    /// "The type of VPN connection this virtual private gateway supports"
+    /// (`CreateVpnGatewayRequest$Type`) — the modelled `GatewayType`, which the boundary
+    /// validator has already held to [`GATEWAY_TYPE_IPSEC_1`].
+    pub gateway_type: String,
+    /// "The Availability Zone for the virtual private gateway"
+    /// (`CreateVpnGatewayRequest$AvailabilityZone`), absent when the request named none —
+    /// "This field may be empty or not returned" (`VpnGateway$AvailabilityZone`).
+    pub availability_zone: Option<String>,
+    /// The resolved Amazon-side ASN ([`private_amazon_side_asn`]).
+    pub amazon_side_asn: i64,
+    /// The tags of a `vpn-gateway` tag specification.
+    pub tags: Vec<Tag>,
+}
+
+/// The caller-chosen bytes one stored virtual private gateway holds: its tags and the
+/// Availability Zone name the request named. Everything else on the record — the id, the
+/// state, the type, the ASN — is derived by this module or bounded by the model, so it is
+/// fixed-size.
+///
+/// The ONE definition of that charge: `CreateVpnGateway` asks it before the write and
+/// [`ComAmazonawsEc2Amazonec2State::insert_vpn_gateway`] charges exactly it.
+pub fn vpn_gateway_payload_bytes(spec: &VpnGatewaySpec) -> usize {
+    tag_list_bytes(&spec.tags)
+        .saturating_add(spec.availability_zone.as_deref().map_or(0, str::len))
+}
+
+/// Refuse a request that named a virtual private gateway id this account holds no gateway
+/// for: HTTP 400 [`INVALID_VPN_GATEWAY_ID_NOT_FOUND`], worded by the one place this module
+/// words a missing resource id ([`id_not_found`]).
+pub fn invalid_vpn_gateway_id_not_found<E>(vpn_gateway_id: &str) -> Scaffolded<E> {
+    id_not_found(
+        INVALID_VPN_GATEWAY_ID_NOT_FOUND,
+        "vpnGateway ID",
+        vpn_gateway_id,
+    )
+}
+
+/// Refuse a create that would take the store past [`MAX_VPN_GATEWAYS`]: HTTP 400
+/// [`VPN_GATEWAY_LIMIT_EXCEEDED`].
+pub fn vpn_gateway_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        VPN_GATEWAY_LIMIT_EXCEEDED,
+        400,
+        format!(
+            "The maximum number of virtual private gateways has been reached \
+             ({MAX_VPN_GATEWAYS})"
+        ),
+    )
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another virtual private gateway fits inside the store's ceiling
+    /// ([`MAX_VPN_GATEWAYS`]).
+    ///
+    /// The same contract as [`Self::has_transit_gateway_capacity`]: a create asks first and
+    /// refuses with [`vpn_gateway_limit_exceeded`] when it answers `false`.
+    pub fn has_vpn_gateway_capacity(&self) -> bool {
+        self.vpn_gateways.len() < MAX_VPN_GATEWAYS
+    }
+
+    /// Insert a virtual private gateway in `pending`, and answer the `VpnGatewayId` it was
+    /// given.
+    ///
+    /// Everything the service itself owns is derived here rather than taken from the caller
+    /// — the id and the state — so two writers cannot report the same gateway differently.
+    /// Like [`Self::insert_transit_gateway`], the caller-chosen bytes of the record are
+    /// charged against the store's byte budget here, so a writer cannot store them
+    /// uncharged, and the clock-owed `available` move is recorded rather than slept for.
+    pub fn insert_vpn_gateway(&mut self, spec: VpnGatewaySpec) -> String {
+        let vpn_gateway_id = self.next_id(VPN_GATEWAY_ID_PREFIX);
+        self.add_stored_bytes(vpn_gateway_payload_bytes(&spec));
+        let view = VpnGateway {
+            vpn_gateway_id: Some(vpn_gateway_id.clone()),
+            state: Some(VPN_GATEWAY_STATE_PENDING.to_string()),
+            r#type: Some(spec.gateway_type),
+            availability_zone: spec.availability_zone,
+            amazon_side_asn: Some(spec.amazon_side_asn),
+            // "Any VPCs attached to the virtual private gateway"
+            // (`VpnGateway$VpcAttachments`): a gateway is created detached — "You must
+            // first attach the virtual private gateway to the VPC" is `AttachVpnGateway`'s
+            // job — so it carries no attachment yet.
+            vpc_attachments: Some(Vec::new()),
+            tags: Some(spec.tags),
+        };
+        self.vpn_gateways.insert(
+            vpn_gateway_id.clone(),
+            VpnGatewayRecord {
+                view,
+                // What the clock now owes this gateway: `available`, one TRANSITION_DELAY
+                // from now — the same span, off the same monotonic clock, as a VPC's
+                // pending move.
+                pending: Some(PendingStateMove::starting_now(VPN_GATEWAY_STATE_AVAILABLE)),
+            },
+        );
+        vpn_gateway_id
+    }
+
+    /// The virtual private gateway `vpn_gateway_id` names, refusing an id that is not shaped
+    /// like one with [`INVALID_VPN_GATEWAY_ID_MALFORMED`] and one the account holds no
+    /// gateway for with [`INVALID_VPN_GATEWAY_ID_NOT_FOUND`] — in that order, so "not a
+    /// virtual private gateway id" is never reported as "no such gateway".
+    pub fn require_vpn_gateway<E>(
+        &self,
+        vpn_gateway_id: &str,
+    ) -> Result<&VpnGatewayRecord, Scaffolded<E>> {
+        require_well_formed_id(
+            VPN_GATEWAY_ID_PREFIX,
+            vpn_gateway_id,
+            INVALID_VPN_GATEWAY_ID_MALFORMED,
+        )?;
+        self.vpn_gateways
+            .get(vpn_gateway_id)
+            .ok_or_else(|| invalid_vpn_gateway_id_not_found(vpn_gateway_id))
+    }
+
+    /// [`Self::require_vpn_gateway`], for a writer: the same two refusals in the same order,
+    /// handing back the record to change.
+    pub fn require_vpn_gateway_mut<E>(
+        &mut self,
+        vpn_gateway_id: &str,
+    ) -> Result<&mut VpnGatewayRecord, Scaffolded<E>> {
+        require_well_formed_id(
+            VPN_GATEWAY_ID_PREFIX,
+            vpn_gateway_id,
+            INVALID_VPN_GATEWAY_ID_MALFORMED,
+        )?;
+        self.vpn_gateways
+            .get_mut(vpn_gateway_id)
+            .ok_or_else(|| invalid_vpn_gateway_id_not_found(vpn_gateway_id))
     }
 }
 

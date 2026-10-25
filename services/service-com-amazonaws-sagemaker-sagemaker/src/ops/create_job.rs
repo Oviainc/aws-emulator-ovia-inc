@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a model-customization job: the record `DescribeJob` replays, and the
+//! registration the AgenticRFT job runtime data plane resolves a job ARN against — that
+//! service binds no call that creates a job, so a job exists for it only because this
+//! operation recorded one in the shared directory ([`crate::state::job_directory`]).
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +166,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // Rules the model states that the boundary validator cannot express — neither the
+        // configuration document's syntax nor the uniqueness of a tag key is a member
+        // constraint — so they are refused here, as 400 `ValidationException` and never
+        // as 501.
+        validate_request(&input)?;
+
+        let region = crate::state::request_region(ctx);
+        // `JobArn`'s pattern puts the category between the resource type and the name
+        // (`…:job/<JobCategory>/<JobName>`), so the ARN carries both parts of the
+        // identity every job operation takes.
+        let arn = crate::state::resource_arn(
+            &region,
+            crate::state::JOB_ARN_KIND,
+            &format!("{}/{}", input.job_category, input.job_name),
+        );
+
+        let mut store = state.lock();
+        // `JobName`'s doc: "The name must be unique within your account and Amazon Web
+        // Services Region" — so a second create under a name already held is the modelled
+        // `ResourceInUse` rather than a second job, whatever category it names, and the
+        // stored job is left untouched rather than overwritten.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateJob"))
+        // Identity is resolved BEFORE the store bound: a create that collides with a job
+        // already held asks for no new capacity, so the name is what refuses it however
+        // full the store is.
+        if store.jobs.contains_key(&input.job_name) {
+            return Err(CreateJobErrorModeled::ResourceInUse(ResourceInUse {
+                // The crate's one wording for this refusal: SageMaker answers the same
+                // sentence whatever resource kind and name the caller asked for.
+                message: Some(crate::state::RESOURCE_IN_USE_MESSAGE.to_string()),
+            })
+            .into());
+        }
+        // The store is bounded, so a caller varying `JobName` cannot grow it without end.
+        // `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.jobs_below_quota() {
+            return Err(CreateJobErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for jobs is {}, with current \
+                         utilization of {} and a request delta of 1.",
+                        crate::state::JOB_QUOTA,
+                        store.jobs.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        // The job runtime data plane resolves the `JobArn` a sampling call carries
+        // against the jobs this service holds, so the job goes into the SHARED directory
+        // as well as this service's own store — from the moment this call accepts it,
+        // which is when the job exists.
+        let registration = ::service_common::agentic_rft_jobs::JobRecord {
+            name: input.job_name.clone(),
+            category: input.job_category.clone(),
+            arn: arn.clone(),
+        };
+        store.jobs.insert(
+            input.job_name.clone(),
+            crate::state::Job {
+                name: input.job_name,
+                arn: arn.clone(),
+                category: input.job_category,
+                role_arn: input.role_arn,
+                config_schema_version: input.job_config_schema_version,
+                config_document: input.job_config_document,
+                tags: input.tags.unwrap_or_default(),
+                status: crate::state::JOB_STATUS_IN_PROGRESS.to_string(),
+                secondary_status: crate::state::JOB_SECONDARY_STATUS_STARTING.to_string(),
+                creation_time: now,
+                last_modified_time: now,
+            },
+        );
+        drop(store);
+        // LOCK ORDER (`crate::state::job_directory`): this service's own store first, the
+        // shared directory second. An engine that holds no directory leaves it unwritten
+        // — the record is an aid to the data plane, never part of this operation's own
+        // answer.
+        if let Some(directory) = crate::state::job_directory(&*self.engine) {
+            directory.lock().register(registration);
+        }
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateJobOutput { job_arn: arn })
     }
+}
+
+/// Refuse a request this operation understood and will not accept.
+///
+/// Each rule is one the model states and the boundary validator cannot express: the
+/// member constraints (lengths, patterns, list sizes and the `JobCategory` enum) are
+/// already enforced before `handle` runs, but the configuration document's SYNTAX is not
+/// a member constraint, and neither is the uniqueness of a tag key.
+///
+/// All of them refuse with 400 `ValidationException` — the code the real service answers
+/// for a request it understood and will not accept. This operation's three modelled errors
+/// each say something else (a name in use, a quota, a resource that does not resolve), so
+/// none fits.
+fn validate_request(input: &CreateJobInput) -> Result<(), CreateJobError> {
+    // `JobConfigDocument`: "The JSON configuration document for the job. The document
+    // must conform to the schema specified by JobConfigSchemaVersion." A document that is
+    // not JSON at all conforms to no schema, and that much is decidable from the request
+    // itself; which members a given schema version requires is
+    // `DescribeJobSchemaVersion`'s to state, and that operation is still a stub, so
+    // nothing beyond the syntax is claimed here.
+    if ::serde_json::from_str::<::serde_json::Value>(&input.job_config_document).is_err() {
+        return Err(crate::scaffolded::Scaffolded::validation(
+            "JobConfigDocument must be a JSON document.",
+        ));
+    }
+
+    // `Tags`' doc ends "Tag keys must be unique per resource", a rule the model cannot
+    // express (it carries only the list's `len 0..50`).
+    if let Some(duplicate) = input.tags.as_deref().and_then(duplicate_tag_key) {
+        return Err(crate::scaffolded::Scaffolded::validation(format!(
+            "Tag keys must be unique per resource: Tags takes the key {duplicate} twice"
+        )));
+    }
+
+    Ok(())
+}
+
+/// The `Tags` key a request takes twice, if any.
+fn duplicate_tag_key(tags: &[Tag]) -> Option<&str> {
+    let mut seen = ::std::collections::BTreeSet::new();
+    tags.iter()
+        .map(|tag| tag.key.as_str())
+        .find(|key| !seen.insert(*key))
 }

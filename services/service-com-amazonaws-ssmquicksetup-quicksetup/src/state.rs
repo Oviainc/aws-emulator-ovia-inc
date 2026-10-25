@@ -139,21 +139,82 @@ pub struct QuickSetupTypeEntry {
     /// A `QuickSetupTypeOutput$Type`: the type a `ConfigurationDefinitionInput`
     /// names. Satisfies that member's modelled `^[a-zA-Z0-9_\-.:/]{3,200}$` pattern.
     pub type_: &'static str,
-    /// A `QuickSetupTypeOutput$LatestVersion`: the newest configuration version
-    /// this service offers for `type_`, in the form `TypeVersion` takes.
-    pub latest_version: &'static str,
+    /// Every configuration version this service publishes for `type_`, oldest first:
+    /// the version history of the service-owned template that type deploys.
+    ///
+    /// Each entry takes the form the modelled `TypeVersion` pattern
+    /// `^\d{1,3}(\.\d{1,3})?$|^LATEST$` gives (`smithy_query(query="operation",
+    /// operation="UpdateConfigurationDefinition")`) — a major and an optional minor
+    /// of up to three digits each. Each type's template is versioned independently,
+    /// so one type's history advances without the others', which is why the version
+    /// lives per entry rather than once for the whole catalog. Never empty; the
+    /// newest entry is what [`Self::latest_version`] reports.
+    pub versions: &'static [&'static str],
 }
 
-/// The configuration version this emulator's catalog publishes for every type it
-/// offers.
+/// The configuration version a published version history starts at: the first
+/// version of a service-owned template, and what an entry publishing nothing at all
+/// would report.
+pub const FIRST_TYPE_VERSION: &str = "1.0";
+
+/// The alias a request uses to name whichever version a type publishes as its newest,
+/// instead of naming that version itself.
 ///
-/// AWS advances a type's `LatestVersion` as it ships new configuration versions of
-/// that type; the model publishes no version catalog, so this emulator offers
-/// exactly one version of each type — the first — and says so here rather than
-/// inventing a different number per type. It satisfies the modelled
-/// `ConfigurationDefinition$TypeVersion` `@length(1, 128)`, which is the only
-/// constraint the model puts on a type version.
-pub const CATALOG_LATEST_VERSION: &str = "1.0";
+/// Modelled: `UpdateConfigurationDefinitionInput$TypeVersion`'s pattern
+/// `^\d{1,3}(\.\d{1,3})?$|^LATEST$` admits exactly this one non-numeric value, and it
+/// means something only against the published catalog.
+pub const TYPE_VERSION_LATEST: &str = "LATEST";
+
+/// The `(major, minor)` a configuration version numbers — so two versions can be
+/// ordered and the newest of a history found — or `None` when the text is not a
+/// version in the form the modelled `TypeVersion` pattern gives.
+///
+/// An omitted minor numbers `0`, so `1` and `1.0` are two spellings of ONE version:
+/// that pattern admits both.
+pub fn type_version_order(value: &str) -> Option<(u32, u32)> {
+    fn component(text: &str) -> Option<u32> {
+        if text.is_empty() || text.len() > 3 || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        text.parse().ok()
+    }
+    let (major, minor) = value.split_once('.').unwrap_or((value, "0"));
+    Some((component(major)?, component(minor)?))
+}
+
+impl QuickSetupTypeEntry {
+    /// The newest configuration version this type publishes: its
+    /// `QuickSetupTypeOutput$LatestVersion`.
+    ///
+    /// Computed from the published history rather than written down beside it, so a
+    /// type's versions live in one place and the latest the catalog reports cannot
+    /// drift from the versions it accepts.
+    pub fn latest_version(&self) -> &'static str {
+        self.versions
+            .iter()
+            .copied()
+            .max_by_key(|version| type_version_order(version).unwrap_or((0, 0)))
+            .unwrap_or(FIRST_TYPE_VERSION)
+    }
+
+    /// The version of this type a request naming `requested` means, in the spelling
+    /// the catalog publishes it under, or `None` when this type publishes no such
+    /// version.
+    ///
+    /// Versions are matched by what they NUMBER rather than by their text, so a
+    /// request naming `2` means the version published as `2.0`; the modelled
+    /// [`TYPE_VERSION_LATEST`] alias means the newest.
+    pub fn published_version(&self, requested: &str) -> Option<&'static str> {
+        if requested == TYPE_VERSION_LATEST {
+            return Some(self.latest_version());
+        }
+        let wanted = type_version_order(requested)?;
+        self.versions
+            .iter()
+            .copied()
+            .find(|version| type_version_order(version) == Some(wanted))
+    }
+}
 
 /// The Quick Setup configuration types this service publishes, in a fixed order so
 /// two reads of the catalog report the same list.
@@ -173,32 +234,46 @@ pub const CATALOG_LATEST_VERSION: &str = "1.0";
 /// string rather than an enum only because the set is versioned out of band, so the
 /// membership check lives in [`quick_setup_type_rejection`] instead of at the
 /// modelled boundary.
+///
+/// It is the authority for VERSIONS too, not only for types: each entry carries the
+/// version history of that type's template ([`QuickSetupTypeEntry::versions`]), the
+/// newest of which it publishes as that type's `LatestVersion` and against which
+/// [`resolve_type_version`] resolves every member that names a configuration version.
 pub const QUICK_SETUP_TYPE_CATALOG: &[QuickSetupTypeEntry] = &[
     // Conformance Packs
-    QuickSetupTypeEntry { type_: "AWSQuickSetupType-CFGCPacks", latest_version: CATALOG_LATEST_VERSION },
+    QuickSetupTypeEntry { type_: "AWSQuickSetupType-CFGCPacks", versions: &["1.0", "1.1"] },
     // Config Recording
-    QuickSetupTypeEntry { type_: "AWSQuickSetupType-CFGRecording", latest_version: CATALOG_LATEST_VERSION },
+    QuickSetupTypeEntry { type_: "AWSQuickSetupType-CFGRecording", versions: &["1.0", "1.1", "1.2"] },
     // Default Host Management Configuration
-    QuickSetupTypeEntry { type_: "AWSQuickSetupType-DHMC", latest_version: CATALOG_LATEST_VERSION },
+    QuickSetupTypeEntry { type_: "AWSQuickSetupType-DHMC", versions: &["1.0", "1.1"] },
     // DevOps Guru
-    QuickSetupTypeEntry { type_: "AWSQuickSetupType-DevOpsGuru", latest_version: CATALOG_LATEST_VERSION },
+    QuickSetupTypeEntry { type_: "AWSQuickSetupType-DevOpsGuru", versions: &["1.0"] },
     // Distributor
-    QuickSetupTypeEntry { type_: "AWSQuickSetupType-Distributor", latest_version: CATALOG_LATEST_VERSION },
+    QuickSetupTypeEntry { type_: "AWSQuickSetupType-Distributor", versions: &["1.0", "1.1"] },
     // Patch Policy
-    QuickSetupTypeEntry { type_: "AWSQuickSetupType-PatchPolicy", latest_version: CATALOG_LATEST_VERSION },
+    QuickSetupTypeEntry { type_: "AWSQuickSetupType-PatchPolicy", versions: &["1.0", "1.1", "2.0"] },
     // Resource Explorer
-    QuickSetupTypeEntry { type_: "AWSQuickSetupType-ResourceExplorer", latest_version: CATALOG_LATEST_VERSION },
+    QuickSetupTypeEntry { type_: "AWSQuickSetupType-ResourceExplorer", versions: &["1.0", "1.1"] },
     // Quick Setup default configuration
-    QuickSetupTypeEntry { type_: "AWSQuickSetupType-SSM", latest_version: CATALOG_LATEST_VERSION },
+    QuickSetupTypeEntry { type_: "AWSQuickSetupType-SSM", versions: &["1.0"] },
     // Change Manager
-    QuickSetupTypeEntry { type_: "AWSQuickSetupType-SSMChangeMgr", latest_version: CATALOG_LATEST_VERSION },
+    QuickSetupTypeEntry { type_: "AWSQuickSetupType-SSMChangeMgr", versions: &["1.0", "1.1"] },
     // Host Management
-    QuickSetupTypeEntry { type_: "AWSQuickSetupType-SSMHostMgmt", latest_version: CATALOG_LATEST_VERSION },
+    QuickSetupTypeEntry { type_: "AWSQuickSetupType-SSMHostMgmt", versions: &["1.0", "1.1", "2.0"] },
     // OpsCenter
-    QuickSetupTypeEntry { type_: "AWSQuickSetupType-SSMOpsCenter", latest_version: CATALOG_LATEST_VERSION },
+    QuickSetupTypeEntry { type_: "AWSQuickSetupType-SSMOpsCenter", versions: &["1.0", "1.1"] },
     // Resource Scheduler
-    QuickSetupTypeEntry { type_: "AWSQuickSetupType-Scheduler", latest_version: CATALOG_LATEST_VERSION },
+    QuickSetupTypeEntry { type_: "AWSQuickSetupType-Scheduler", versions: &["1.0", "2.0"] },
 ];
+
+/// The catalog entry for a configuration type, or `None` when this service does not
+/// offer it. Membership is exact — a type name differing only in case is not a
+/// published type. The one place the catalog is looked up.
+pub fn quick_setup_type_entry(type_: &str) -> Option<&'static QuickSetupTypeEntry> {
+    QUICK_SETUP_TYPE_CATALOG
+        .iter()
+        .find(|entry| entry.type_ == type_)
+}
 
 /// Why the value of a configuration-type member is unacceptable, or `None` when this
 /// service offers that Quick Setup configuration type.
@@ -208,17 +283,13 @@ pub const QUICK_SETUP_TYPE_CATALOG: &[QuickSetupTypeEntry] = &[
 /// publishes ([`QUICK_SETUP_TYPE_CATALOG`], what `ListQuickSetupTypes` answers): a
 /// pattern-valid string the catalog does not carry names no template, so it is
 /// refused at validation rather than minting a manager that could never deploy.
-/// Membership is exact — a type name differing only in case is not a published type.
 ///
 /// The one place the rule lives, so every member that names a configuration type
 /// refuses the same values. The message names the member, the requirement and the
 /// value, the way this service's other refusals do; the echoed value is bounded for
 /// the reason [`MAX_ECHOED_VALUE`] gives.
 pub fn quick_setup_type_rejection(member: &str, value: &str) -> Option<String> {
-    if QUICK_SETUP_TYPE_CATALOG
-        .iter()
-        .any(|entry| entry.type_ == value)
-    {
+    if quick_setup_type_entry(value).is_some() {
         return None;
     }
     Some(format!(
@@ -226,6 +297,56 @@ pub fn quick_setup_type_rejection(member: &str, value: &str) -> Option<String> {
          (one of the types ListQuickSetupTypes publishes), got '{}'",
         echoed_value(value)
     ))
+}
+
+/// The published configuration version a definition of `type_` is deployed at when it
+/// names `requested`, or why that version cannot be served.
+///
+/// A configuration version names one shipped revision of the service-owned template
+/// `type_` deploys, so the published catalog is its authority exactly as it is for the
+/// type itself:
+///
+/// * a request naming a version the type publishes is served that version, in the
+///   spelling the catalog publishes it under;
+/// * a request naming the modelled [`TYPE_VERSION_LATEST`] alias, and one naming no
+///   version at all, are both served the type's newest published version — so what is
+///   stored and reported always names the version that was deployed, which is what
+///   lets a caller learn it;
+/// * anything else names no revision of that template and is refused, naming the
+///   versions the type does publish.
+///
+/// The one place the rule lives, so every member that names a configuration version
+/// resolves and refuses alike: `ConfigurationDefinitionInput$TypeVersion`, whose only
+/// modelled constraint is a `@length(1, 128)`, and
+/// `UpdateConfigurationDefinitionInput$TypeVersion`, whose modelled pattern gives the
+/// form but not the published set.
+pub fn resolve_type_version(
+    member: &str,
+    type_: &str,
+    requested: Option<&str>,
+) -> Result<String, String> {
+    let Some(entry) = quick_setup_type_entry(type_) else {
+        return Err(format!(
+            "{member} cannot be resolved because '{}' is not a Quick Setup configuration \
+             type this service offers",
+            echoed_value(type_)
+        ));
+    };
+    let Some(requested) = requested else {
+        return Ok(entry.latest_version().to_string());
+    };
+    entry
+        .published_version(requested)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            format!(
+                "{member} must name a configuration version this service publishes for \
+                 {} (one of [{}]) or the {TYPE_VERSION_LATEST} alias, got '{}'",
+                entry.type_,
+                entry.versions.join(", "),
+                echoed_value(requested)
+            )
+        })
 }
 
 /// The `Parameters` key naming the Regions a configuration definition is deployed to.
@@ -464,6 +585,11 @@ pub struct ConfigurationDefinitionRecord {
     /// `UpdateConfigurationDefinition` binds on its `{Id}` label.
     pub id: String,
     pub type_: String,
+    /// The published configuration version this definition is deployed at, resolved
+    /// against the catalog by [`resolve_type_version`]: a stored definition always
+    /// carries one — the version a request named, or the type's newest when it named
+    /// none — so a caller can read which version was deployed. The member it is
+    /// reported through is modelled optional, so the record keeps it optional too.
     pub type_version: Option<String>,
     pub parameters: BTreeMap<String, String>,
     pub local_deployment_execution_role_name: Option<String>,

@@ -29,7 +29,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 use service_com_amazonaws_groundstation_groundstation::state::{
-    parse_reserved_minutes, service_state, ReservedMinutesPlan,
+    parse_reserved_minutes, service_state, shift_seconds, ReservedMinutesPlan,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -81,11 +81,12 @@ pub(crate) fn minutes(reply: &Reply, member: &str, case: &str) -> i64 {
     })
 }
 
-/// `ReserveContact` for a window, answering the `contactId`.
-pub(crate) async fn reserve_pass(
+/// `ReserveContact` for a window at `ground_station`, answering the `contactId`.
+pub(crate) async fn reserve_pass_at_station(
     router: &MultiServiceRouter,
     profile_arn: &str,
     case: &str,
+    ground_station: &str,
     start: i64,
     seconds: i64,
 ) -> String {
@@ -95,7 +96,7 @@ pub(crate) async fn reserve_pass(
         "/contact",
         Some(json!({
             "missionProfileArn": profile_arn,
-            "groundStation": "Ohio-1",
+            "groundStation": ground_station,
             "startTime": start,
             "endTime": start + seconds,
         })),
@@ -109,9 +110,23 @@ pub(crate) async fn reserve_pass(
     reply.string("contactId")
 }
 
+/// `ReserveContact` for a window, answering the `contactId`.
+pub(crate) async fn reserve_pass(
+    router: &MultiServiceRouter,
+    profile_arn: &str,
+    case: &str,
+    start: i64,
+    seconds: i64,
+) -> String {
+    reserve_pass_at_station(router, profile_arn, case, "Ohio-1", start, seconds).await
+}
+
 /// One pass to reserve, and the minutes of antenna time it holds.
 struct Pass {
     case: &'static str,
+    /// The ground station the pass is held at. An antenna serves one pass at a time, so a
+    /// row whose window overlaps another row's is held at a station of its own.
+    station: &'static str,
     start: i64,
     seconds: i64,
     minutes: i64,
@@ -133,48 +148,58 @@ async fn usage_counts_each_months_passes_in_whole_minutes() {
     let passes = [
         Pass {
             case: "whole-minutes-at-the-first-instant-of-the-month",
+            station: "Ohio-1",
             start: epoch(2030, 7, 1, 0, 0),
             seconds: 600,
             minutes: 10,
         },
         Pass {
             case: "part-minute-rounds-up",
+            station: "Ohio-1",
             start: epoch(2030, 7, 2, 12, 0),
             seconds: 601,
             minutes: 11,
         },
         Pass {
             case: "one-second-pass-counts-one-minute",
+            station: "Ohio-1",
             start: epoch(2030, 7, 3, 8, 0),
             seconds: 1,
             minutes: 1,
         },
         Pass {
             case: "three-hour-pass",
+            station: "Ohio-1",
             start: epoch(2030, 7, 4, 10, 0),
             seconds: 3 * 3600,
             minutes: 180,
         },
         Pass {
             case: "starts-in-the-months-last-minute-and-runs-past-its-end",
+            station: "Ohio-1",
             start: epoch(2030, 7, 31, 23, 59),
             seconds: 2 * 3600,
             minutes: 120,
         },
         Pass {
+            // Inside the pass above, so it is held at another ground station: the two
+            // windows overlap, and one antenna cannot hold both.
             case: "starts-at-the-first-instant-of-the-next-month",
+            station: "Oregon-1",
             start: epoch(2030, 8, 1, 0, 0),
             seconds: 1800,
             minutes: 30,
         },
         Pass {
             case: "the-month-before",
+            station: "Ohio-1",
             start: epoch(2030, 6, 15, 5, 30),
             seconds: 3600,
             minutes: 60,
         },
         Pass {
             case: "a-leap-years-29th-of-february",
+            station: "Ohio-1",
             start: epoch(2028, 2, 29, 23, 0),
             seconds: 3660,
             minutes: 61,
@@ -182,7 +207,15 @@ async fn usage_counts_each_months_passes_in_whole_minutes() {
     ];
 
     for pass in &passes {
-        reserve_pass(&router, &profile_arn, pass.case, pass.start, pass.seconds).await;
+        reserve_pass_at_station(
+            &router,
+            &profile_arn,
+            pass.case,
+            pass.station,
+            pass.start,
+            pass.seconds,
+        )
+        .await;
     }
 
     // Every month the table touches, plus two it does not: a month between the leap
@@ -365,9 +398,24 @@ async fn upcoming_minutes_are_the_minutes_whose_pass_has_not_started() {
     ];
 
     for (case, start, seconds, expected_upcoming) in rows {
-        let (router, _engine) = harness_with_engine();
+        let (router, engine) = harness_with_engine();
         let profile_arn = create_mission_profile(&router, "clock split", 60, None, None).await;
-        reserve_pass(&router, &profile_arn, case, start, seconds).await;
+        // A pass whose window has already elapsed cannot be RESERVED — antenna time that
+        // is over is not reservable — so each row reserves a window still to come and then
+        // moves the stored contact's window to where the row wants it, which is what a
+        // contact whose pass has run looks like in the store.
+        let booked = now + 30 * 86_400;
+        let contact_id = reserve_pass(&router, &profile_arn, case, booked, seconds).await;
+        {
+            let state = service_state(&*engine).expect("this service's state store");
+            let mut guard = state.lock();
+            let contact = guard
+                .contacts
+                .get_mut(&contact_id)
+                .expect("the reserved contact");
+            contact.start_time = shift_seconds(&contact.start_time, start - booked);
+            contact.end_time = shift_seconds(&contact.end_time, start - booked);
+        }
 
         let reply = minute_usage(&router, month_of(start)).await;
         assert_eq!(

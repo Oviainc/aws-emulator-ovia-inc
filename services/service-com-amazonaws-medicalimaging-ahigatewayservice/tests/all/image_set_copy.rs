@@ -7,8 +7,14 @@
 //! latest version the caller named, and whose state is `ACTIVE`; it lands as a new
 //! VERSION of the destination — version 1 of an image set the call mints when the
 //! request names no destination, and one past the named version of the destination it
-//! does name — carrying the request's `force` as that version's `Overrides.forced` and
-//! the request's `promoteToPrimary` as the destination's `isPrimary`. Both image sets
+//! does name — carrying the request's `force` as that version's `Overrides.forced`.
+//! Membership of the primary DICOM hierarchy (`isPrimary`) is carried by the copy, never
+//! set as a flag on a record the caller named: a `promoteToPrimary` request MINTS a new
+//! primary image set and answers with ITS id as the destination (so a request that also
+//! names `destinationImageSet` is refused), a copy of a whole image set mints a
+//! destination in the hierarchy its source is in, a copy of a SUBSET of the source's SOP
+//! instances mints one outside the primary hierarchy, and an image set the copy versions
+//! keeps the hierarchy it already belonged to. Both image sets
 //! answer `LOCKED` while the copy is in flight (the source
 //! `COPYING_WITH_READ_ONLY_ACCESS`, the destination `COPYING`) and the CLOCK, not a
 //! later reader, returns them to `ACTIVE` — the destination `COPIED`, the source the
@@ -61,11 +67,23 @@ const SEEDED_WORKFLOW_STATUS: ImageSetWorkflowStatus = ImageSetWorkflowStatus::I
 const SEEDED_LATER_WORKFLOW_STATUS: ImageSetWorkflowStatus = ImageSetWorkflowStatus::Updated;
 
 /// Seed one `ACTIVE` image set with `versions` versions into a data store the emulator
-/// already holds, and answer its identifier.
+/// already holds, and answer its identifier. The image set is seeded OUTSIDE the primary
+/// DICOM hierarchy; [`seed_image_set_in_hierarchy`] chooses.
 ///
 /// Built with the crate's own `ImageSet::new` / `push_version`, so a seeded image set is
 /// shaped exactly like one a handler mints.
 pub(crate) fn seed_image_set(emulator: &Emulator, datastore_id: &str, versions: u32) -> String {
+    seed_image_set_in_hierarchy(emulator, datastore_id, versions, false)
+}
+
+/// [`seed_image_set`], with the seeded image set's membership of the primary DICOM
+/// hierarchy (`isPrimary`) chosen by the caller — what a copy of it carries.
+pub(crate) fn seed_image_set_in_hierarchy(
+    emulator: &Emulator,
+    datastore_id: &str,
+    versions: u32,
+    is_primary: bool,
+) -> String {
     assert!(
         versions >= 1,
         "an image set always holds at least one version, asked for {versions}"
@@ -82,8 +100,7 @@ pub(crate) fn seed_image_set(emulator: &Emulator, datastore_id: &str, versions: 
         image_set_arn(&datastore.datastore_arn, &image_set_id),
         ImageSetState::Active,
         SEEDED_WORKFLOW_STATUS,
-        // Secondary going in, so `promoteToPrimary` has something to change.
-        false,
+        is_primary,
         false,
         SystemTime::now(),
     );
@@ -160,76 +177,104 @@ struct CopyCase {
     /// How many versions the SOURCE image set is seeded with — also the version the
     /// request must name as the source's latest.
     source_versions: u32,
+    /// Whether the SOURCE is in the primary DICOM hierarchy going in.
+    source_is_primary: bool,
     /// How many versions the DESTINATION image set is seeded with, or `None` for a
     /// request that names no destination at all, which mints one.
     destination_versions: Option<u32>,
+    /// Whether a SEEDED destination is in the primary DICOM hierarchy going in; ignored
+    /// for a request that mints its destination.
+    destination_is_primary: bool,
     force: Option<bool>,
     promote_to_primary: Option<bool>,
     /// `DICOMCopies.copiableAttributes` — a JSON document naming the subset to copy.
     copiable_attributes: Option<&'static str>,
     /// The version the destination must report once the copy has landed.
     expected_destination_version: u32,
+    /// The hierarchy the destination must report once the copy has landed.
+    expected_destination_primary: bool,
 }
 
 /// The rows span: minting a destination versus versioning one; a source and a
-/// destination at one, two and three versions; each optional flag present-true,
-/// present-false and absent; and `copiableAttributes` present as an object, as an array
-/// and absent.
+/// destination at one, two and three versions; a source and a destination inside and
+/// outside the primary DICOM hierarchy; each optional flag present-true, present-false
+/// and absent; and `copiableAttributes` present as an object, as an array and absent.
 fn copy_cases() -> Vec<CopyCase> {
     vec![
         CopyCase {
-            case: "no destination image set and no optional flags: a new image set at version 1",
+            case: "no destination and no flags, from a primary source: a primary image set at version 1",
             source_versions: 1,
+            source_is_primary: true,
             destination_versions: None,
+            destination_is_primary: false,
             force: None,
             promote_to_primary: None,
             copiable_attributes: None,
             expected_destination_version: 1,
+            // A whole copy carries its source's hierarchy.
+            expected_destination_primary: true,
         },
         CopyCase {
-            case: "no destination image set, forced and promoted, with a copiable subset",
+            case: "no destination, forced, a copiable subset of a primary source: minted outside the primary hierarchy",
             source_versions: 1,
+            source_is_primary: true,
             destination_versions: None,
+            destination_is_primary: false,
             force: Some(true),
-            promote_to_primary: Some(true),
+            promote_to_primary: None,
             copiable_attributes: Some(r#"{"SchemaVersion":"1.1","Study":{"Series":{}}}"#),
             expected_destination_version: 1,
+            expected_destination_primary: false,
         },
         CopyCase {
-            case: "no destination image set, both flags present and false",
+            case: "no destination, both flags present and false, from a non-primary source",
             source_versions: 3,
+            source_is_primary: false,
             destination_versions: None,
+            destination_is_primary: false,
             force: Some(false),
             promote_to_primary: Some(false),
             copiable_attributes: None,
             expected_destination_version: 1,
+            expected_destination_primary: false,
         },
         CopyCase {
-            case: "into a destination at version 1: the copy becomes version 2",
+            case: "no destination, promoted, a subset of a non-primary source: a newly minted primary image set",
             source_versions: 1,
+            source_is_primary: false,
+            destination_versions: None,
+            destination_is_primary: false,
+            force: Some(true),
+            promote_to_primary: Some(true),
+            copiable_attributes: Some(r#"{"Study":{"DICOM":{}}}"#),
+            expected_destination_version: 1,
+            expected_destination_primary: true,
+        },
+        CopyCase {
+            case: "into a non-primary destination at version 1: the copy becomes version 2 and the hierarchy is kept",
+            source_versions: 1,
+            source_is_primary: true,
             destination_versions: Some(1),
+            destination_is_primary: false,
             force: None,
             promote_to_primary: None,
             copiable_attributes: None,
             expected_destination_version: 2,
+            // An image set the copy VERSIONS keeps the hierarchy it was already in, even
+            // where the source is in the other one.
+            expected_destination_primary: false,
         },
         CopyCase {
-            case: "into a destination at version 3, forced, from a source at version 2",
+            case: "into a primary destination at version 3, forced, from a non-primary source at version 2",
             source_versions: 2,
+            source_is_primary: false,
             destination_versions: Some(3),
+            destination_is_primary: true,
             force: Some(true),
             promote_to_primary: Some(false),
             copiable_attributes: Some(r#"[{"SOPInstanceUID":"1.2.840.10008.1.2.1"}]"#),
             expected_destination_version: 4,
-        },
-        CopyCase {
-            case: "into a destination at version 2, forced and promoted",
-            source_versions: 1,
-            destination_versions: Some(2),
-            force: Some(true),
-            promote_to_primary: Some(true),
-            copiable_attributes: Some(r#"{"Study":{"DICOM":{}}}"#),
-            expected_destination_version: 3,
+            expected_destination_primary: true,
         },
     ]
 }
@@ -238,15 +283,25 @@ fn copy_cases() -> Vec<CopyCase> {
 /// overrides the request asked for, and the clock — not the read — releases both.
 #[tokio::test]
 async fn a_copy_lands_a_new_version_and_the_clock_releases_both_image_sets() {
-    for case in copy_cases() {
+    for (row, case) in copy_cases().into_iter().enumerate() {
         let emulator = Emulator::new();
         let datastore_id = emulator
-            .active_datastore("copy.store", &format!("copy-{}", case.expected_destination_version))
+            .active_datastore("copy.store", &format!("copy-{row}"))
             .await;
-        let source_id = seed_image_set(&emulator, &datastore_id, case.source_versions);
-        let destination_seed = case
-            .destination_versions
-            .map(|versions| seed_image_set(&emulator, &datastore_id, versions));
+        let source_id = seed_image_set_in_hierarchy(
+            &emulator,
+            &datastore_id,
+            case.source_versions,
+            case.source_is_primary,
+        );
+        let destination_seed = case.destination_versions.map(|versions| {
+            seed_image_set_in_hierarchy(
+                &emulator,
+                &datastore_id,
+                versions,
+                case.destination_is_primary,
+            )
+        });
 
         let mut query: Vec<(&str, bool)> = Vec::new();
         if let Some(force) = case.force {
@@ -416,8 +471,18 @@ async fn a_copy_lands_a_new_version_and_the_clock_releases_both_image_sets() {
         );
         assert_eq!(
             destination.field(&["isPrimary"]),
-            &json!(case.promote_to_primary == Some(true)),
-            "case {:?}: isPrimary must follow promoteToPrimary, got {destination:?}",
+            &json!(case.expected_destination_primary),
+            "case {:?}: expected isPrimary {}, got {destination:?}",
+            case.case,
+            case.expected_destination_primary
+        );
+        // Whatever the destination landed in, the SOURCE's own hierarchy is untouched: a
+        // copy reads its source, it does not move it.
+        let source_read = get_image_set(&emulator, &datastore_id, &source_id, None).await;
+        assert_eq!(
+            source_read.field(&["isPrimary"]),
+            &json!(case.source_is_primary),
+            "case {:?}: a copy must leave the source's hierarchy alone, got {source_read:?}",
             case.case
         );
         assert_eq!(

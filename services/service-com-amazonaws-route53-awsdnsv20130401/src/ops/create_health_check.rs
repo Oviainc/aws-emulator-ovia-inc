@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateHealthCheck
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateHealthCheck`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateHealthCheck::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -110,6 +101,98 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    health_check_config_with_defaults, resource_location, StoredHealthCheck,
+    ENDPOINT_HEALTH_CHECK_TYPES, FIRST_HEALTH_CHECK_VERSION, HEALTH_CHECK_TYPE_CALCULATED,
+    HEALTH_CHECK_TYPE_CLOUDWATCH_METRIC, HEALTH_CHECK_TYPE_RECOVERY_CONTROL, MAX_HEALTH_CHECKS,
+    STRING_MATCH_HEALTH_CHECK_TYPES,
+};
+use std::collections::BTreeMap;
+
+/// The refusal text this operation answers a `CallerReference` that already
+/// names a health check configured differently with (`HealthCheckAlreadyExists`,
+/// HTTP 409).
+///
+/// A CONSTANT, naming neither the caller reference nor the health check it
+/// already names: the shape's own documentation states the rule without either
+/// ("The same value for CallerReference as an existing health check, and one or
+/// more values that differ from the existing health check that has the same
+/// caller reference"), and the health check's id is server-generated, so a
+/// refusal quoting it would differ on every run. The health check that reference
+/// names is in state, where `GetHealthCheck` reads it.
+const HEALTH_CHECK_ALREADY_EXISTS_MESSAGE: &str =
+    "A health check has already been created with the specified caller reference and a \
+     different configuration.";
+
+/// Why `config` could not be used, or `None` when it holds together.
+///
+/// `HealthCheckConfig`'s members are conditional on its `Type`: the model
+/// constrains each member on its own, so the rules that relate them — an
+/// endpoint type needs an endpoint to check, a string-match type needs the
+/// string to search for, an alarm-backed type needs the alarm, a
+/// routing-control type needs the routing control, and the two types that check
+/// no endpoint take no port — are the service's to enforce, under the
+/// `InvalidInput` its model declares.
+fn config_problem(config: &HealthCheckConfig) -> Option<String> {
+    let given = |member: &Option<String>| {
+        member
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+    };
+    let kind = config.r#type.as_str();
+    if ENDPOINT_HEALTH_CHECK_TYPES.contains(&kind) {
+        // `IPAddress`: "If you don't specify a value for IPAddress, Route 53
+        // sends a DNS request to resolve the domain name that you specify in
+        // FullyQualifiedDomainName" — so one of the two has to be there for
+        // there to be an endpoint at all.
+        if !given(&config.ip_address) && !given(&config.fully_qualified_domain_name) {
+            return Some(format!(
+                "a {kind} health check must specify HealthCheckConfig.IPAddress or \
+                 HealthCheckConfig.FullyQualifiedDomainName"
+            ));
+        }
+        // `SearchString`: "If the value of Type is HTTP_STR_MATCH or
+        // HTTPS_STR_MATCH, the string that you want Amazon Route 53 to search
+        // for in the response body".
+        if STRING_MATCH_HEALTH_CHECK_TYPES.contains(&kind) && !given(&config.search_string) {
+            return Some(format!(
+                "a {kind} health check must specify HealthCheckConfig.SearchString"
+            ));
+        }
+        return None;
+    }
+    // "Don't specify a value for Port when you specify a value for Type of
+    // CLOUDWATCH_METRIC or CALCULATED."
+    if matches!(
+        kind,
+        HEALTH_CHECK_TYPE_CLOUDWATCH_METRIC | HEALTH_CHECK_TYPE_CALCULATED
+    ) && config.port.is_some()
+    {
+        return Some(format!(
+            "HealthCheckConfig.Port cannot be specified for a {kind} health check"
+        ));
+    }
+    match kind {
+        // `AlarmIdentifier` "identifies the CloudWatch alarm that you want
+        // Amazon Route 53 health checkers to use to determine whether the
+        // specified health check is healthy", which is the whole of a
+        // CLOUDWATCH_METRIC check's input.
+        HEALTH_CHECK_TYPE_CLOUDWATCH_METRIC if config.alarm_identifier.is_none() => Some(format!(
+            "a {kind} health check must specify HealthCheckConfig.AlarmIdentifier"
+        )),
+        // "The Amazon Resource Name (ARN) for the Route 53 Application Recovery
+        // Controller routing control", which is what a RECOVERY_CONTROL check
+        // follows.
+        HEALTH_CHECK_TYPE_RECOVERY_CONTROL if !given(&config.routing_control_arn) => {
+            Some(format!(
+                "a {kind} health check must specify HealthCheckConfig.RoutingControlArn"
+            ))
+        }
+        _ => None,
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -180,18 +263,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateHealthCheck` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateHealthCheckErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateHealthCheck"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            CreateHealthCheckErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        if let Some(problem) = config_problem(&input.health_check_config) {
+            return Err(CreateHealthCheckErrorModeled::InvalidInput(InvalidInput {
+                message: Some(format!("Invalid request: {problem}")),
+            })
+            .into());
+        }
+
+        // What the service would report for this request: the members it fills
+        // in are applied BEFORE the configuration is stored or compared, so the
+        // store holds what a read reports and a repeated request is compared
+        // against the same thing.
+        let config = health_check_config_with_defaults(&input.health_check_config);
+
+        let mut store = state.lock();
+
+        // A CALCULATED health check is "healthy" as a function of its children,
+        // so a child it names has to be a health check the account holds.
+        if config.r#type == HEALTH_CHECK_TYPE_CALCULATED {
+            let children = config.child_health_checks.clone().unwrap_or_default();
+            if let Some(missing) = children
+                .iter()
+                .find(|child| !store.health_checks.contains_key(child.as_str()))
+            {
+                return Err(CreateHealthCheckErrorModeled::InvalidInput(InvalidInput {
+                    message: Some(format!(
+                        "Invalid request: HealthCheckConfig.ChildHealthChecks names no health \
+                         check of this account: {missing}"
+                    )),
+                })
+                .into());
+            }
+        }
+
+        // `CallerReference` is the idempotency token. "If you send a
+        // CreateHealthCheck request with the same CallerReference and settings
+        // as a previous request, and if the health check doesn't exist, Amazon
+        // Route 53 creates the health check. If the health check does exist,
+        // Route 53 returns the health check configuration in the response" —
+        // and "with different settings, Route 53 returns a
+        // HealthCheckAlreadyExists error".
+        let already_named = store
+            .health_check_by_caller_reference
+            .get(&input.caller_reference)
+            .and_then(|id| store.health_checks.get(id))
+            .cloned();
+        if let Some(existing) = already_named {
+            if existing.config != config {
+                return Err(CreateHealthCheckErrorModeled::HealthCheckAlreadyExists(
+                    HealthCheckAlreadyExists {
+                        message: Some(HEALTH_CHECK_ALREADY_EXISTS_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+            // The same request again: the health check it asked for is already
+            // there, so it is reported rather than duplicated — nothing is
+            // created and no version moves.
+            return Ok(CreateHealthCheckOutput {
+                health_check: existing.to_health_check(),
+                location: resource_location(ctx, &format!("healthcheck/{}", existing.id)),
+            });
+        }
+
+        // The account's own quota: a caller chooses `CallerReference` freely, so
+        // without this the store would grow for every distinct one it sends.
+        if store.health_checks.len() >= MAX_HEALTH_CHECKS {
+            return Err(CreateHealthCheckErrorModeled::TooManyHealthChecks(
+                TooManyHealthChecks {
+                    message: Some(format!(
+                        "the current account has reached the limit of {MAX_HEALTH_CHECKS} health \
+                         checks"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_health_check_id();
+        let health_check = StoredHealthCheck {
+            id: id.clone(),
+            caller_reference: input.caller_reference.clone(),
+            config,
+            version: FIRST_HEALTH_CHECK_VERSION,
+            // CreateHealthCheck takes no tags; a health check is tagged
+            // afterwards, through ChangeTagsForResource.
+            tags: BTreeMap::new(),
+        };
+        store
+            .health_check_by_caller_reference
+            .insert(input.caller_reference, id.clone());
+        // Insert and read back in ONE step: what the caller is told is read out
+        // of the store it was just written to, so a later GetHealthCheck tells
+        // it the same thing.
+        let stored = store
+            .health_checks
+            .entry(id.clone())
+            .or_insert(health_check)
+            .to_health_check();
+        Ok(CreateHealthCheckOutput {
+            health_check: stored,
+            location: resource_location(ctx, &format!("healthcheck/{id}")),
+        })
     }
 }

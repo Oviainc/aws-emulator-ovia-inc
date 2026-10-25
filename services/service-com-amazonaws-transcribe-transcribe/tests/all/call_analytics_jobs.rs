@@ -24,6 +24,11 @@
 //!   narrowed by `Status` and by a case-insensitive `JobNameContains`, in pages of
 //!   `MaxResults` (default 5) walked by a `NextToken` this service handed out.
 //!
+//! What a FINISHED job reports about the call that the request could not state — the
+//! identified language, the media format, the sample rate and the location of each
+//! transcript its redaction settings asked for — is the sibling suite
+//! `crate::call_analytics_job_results`, which reuses this one's harness and helpers.
+//!
 //! Each test asserts that over a table spanning the request class (media member and
 //! URI scheme, every documented output-location form, language options, vocabulary and
 //! filter settings, content redaction, summarization, channel definitions, tag count),
@@ -145,14 +150,33 @@ pub(crate) fn job_name(request: &Value) -> String {
         .to_string()
 }
 
-/// The language a stored job must report: the one `Settings.LanguageOptions` names
-/// when it names exactly one, and nothing otherwise — this emulator analyses no audio,
-/// so it identifies no language rather than guessing one.
-fn expected_language(request: &Value) -> Value {
+/// The language a FINISHED job must report: the first code
+/// `Settings.LanguageOptions` lists, since identification may only answer with one of
+/// the codes the request allowed, and the service's default for a request that
+/// narrowed the choice to nothing.
+///
+/// The sibling suite `crate::call_analytics_job_results` asserts that rule over a
+/// table of its own; here it is what the lifecycle and listing assertions expect.
+pub(crate) fn expected_language(request: &Value) -> Value {
     match request["Settings"]["LanguageOptions"].as_array() {
-        Some(options) if options.len() == 1 => options[0].clone(),
-        _ => Value::Null,
+        Some(options) if !options.is_empty() => options[0].clone(),
+        _ => json!(service_com_amazonaws_transcribe_transcribe::state::DEFAULT_IDENTIFIED_LANGUAGE),
     }
+}
+
+/// Whether a request asked for a REDACTED transcript: through `ContentRedaction`, or
+/// through the `Media.RedactedMediaFileUri` that "produces a redacted audio file in
+/// addition to a redacted transcript".
+pub(crate) fn expects_redacted_transcript(request: &Value) -> bool {
+    request["Settings"]["ContentRedaction"].is_object()
+        || request["Media"]["RedactedMediaFileUri"].is_string()
+}
+
+/// Whether it asked for the UNREDACTED transcript too: everything except
+/// `RedactionOutput: redacted`, for which "Amazon Transcribe creates only a redacted
+/// transcript".
+pub(crate) fn expects_unredacted_transcript(request: &Value) -> bool {
+    request["Settings"]["ContentRedaction"]["RedactionOutput"] != json!("redacted")
 }
 
 /// `GetCallAnalyticsJob` for `name`.
@@ -266,26 +290,24 @@ async fn a_started_call_analytics_job_reads_back_exactly_as_it_was_started() {
             "case {case:?}: an accepted job has no FailureReason, got {:?}",
             job["FailureReason"]
         );
-        // `MediaFormat` and `MediaSampleRateHertz` are not members of the start
-        // request: the real service DETECTS them from the media file, which this
-        // emulator never reads, so neither is reported. Nor is a confidence score for
-        // a language identification that was not performed.
-        assert!(
-            job["MediaFormat"].is_null()
-                && job["MediaSampleRateHertz"].is_null()
-                && job["IdentifiedLanguageScore"].is_null(),
-            "case {case:?}: nothing read the media, so MediaFormat, MediaSampleRateHertz \
-             and IdentifiedLanguageScore must be absent, got {:?}, {:?} and {:?}",
-            job["MediaFormat"],
-            job["MediaSampleRateHertz"],
-            job["IdentifiedLanguageScore"]
-        );
-        assert_eq!(
-            job["LanguageCode"],
-            expected_language(&request),
-            "case {case:?}: unexpected LanguageCode, got {:?}",
-            job["LanguageCode"]
-        );
+        // The language, the media format and the sample rate are not members of the
+        // start request: the service determines each of them while it processes the
+        // call, so a job that has not finished processing reports none of them (what
+        // a finished one reports is the sibling suite
+        // `crate::call_analytics_job_results`).
+        for member in [
+            "LanguageCode",
+            "IdentifiedLanguageScore",
+            "MediaFormat",
+            "MediaSampleRateHertz",
+        ] {
+            assert!(
+                job[member].is_null(),
+                "case {case:?}: a job still processing has determined no {member}, \
+                 got {:?}",
+                job[member]
+            );
+        }
 
         let name = job_name(&request);
         let fetched = get(&transcribe, &name).await;
@@ -351,18 +373,18 @@ async fn a_call_analytics_job_completes_once_its_processing_span_has_elapsed() {
             "case {case:?}: a completed job reports a CompletionTime, got {:?}",
             job["CompletionTime"]
         );
-        assert!(
+        assert_eq!(
             job["Transcript"]["TranscriptFileUri"].is_string(),
-            "case {case:?}: a completed job reports where its transcript would be, \
-             got {:?}",
+            expects_unredacted_transcript(&request),
+            "case {case:?}: an unredacted transcript location is reported exactly where \
+             the request asked for an unredacted transcript, got {:?}",
             job["Transcript"]
         );
-        // Nothing redacts a transcript nothing produced, so no redacted location is
-        // reported even for the row that asked for content redaction.
-        assert!(
-            job["Transcript"]["RedactedTranscriptFileUri"].is_null(),
-            "case {case:?}: nothing redacted a transcript, so no redacted location is \
-             reported, got {:?}",
+        assert_eq!(
+            job["Transcript"]["RedactedTranscriptFileUri"].is_string(),
+            expects_redacted_transcript(&request),
+            "case {case:?}: a redacted transcript location is reported exactly where the \
+             request asked for redaction, got {:?}",
             job["Transcript"]
         );
 

@@ -79,6 +79,8 @@ mod origin_request_policy_list;
 mod public_key_lifecycle;
 #[path = "all/response_headers_policy_lifecycle.rs"]
 mod response_headers_policy_lifecycle;
+#[path = "all/staging_config_promotion.rs"]
+mod staging_config_promotion;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/streaming_distribution_list.rs"]

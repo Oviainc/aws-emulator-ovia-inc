@@ -329,7 +329,7 @@ impl RequestError {
 //     around it;
 //   * the sentence around it always interpolates a value — `Value '<v>'` when
 //     the violation carries one and `Value null` when it does not — while the
-//     clause AWS states for a size or magnitude bound on this service echoes
+//     clause AWS states for a size or shape bound on this service echoes
 //     NO value, which is a third form that renderer cannot produce;
 //   * the bounds this service checks itself (the `TableName` form, the item and
 //     nesting ceilings) are not model traits at all, so they have no
@@ -391,17 +391,6 @@ pub fn min_length_requirement(min: usize) -> String {
 /// The requirement phrase for a `@length` maximum.
 pub fn max_length_requirement(max: usize) -> String {
     format!("Member must have length less than or equal to {max}")
-}
-
-/// The requirement phrase for a `@range` minimum. The bound is interpolated as
-/// the text it displays with, so an integral bound reads `1` and not `1.0`.
-pub fn min_value_requirement(min: &str) -> String {
-    format!("Member must have value greater than or equal to {min}")
-}
-
-/// The requirement phrase for a `@range` maximum.
-pub fn max_value_requirement(max: &str) -> String {
-    format!("Member must have value less than or equal to {max}")
 }
 
 /// The requirement phrase for `@uniqueItems`.
@@ -489,6 +478,61 @@ fn empty_key_attribute(attribute: &str, kind: &str) -> RequestError {
     RequestError::Validation(format!(
         "One or more parameter values are not valid. The AttributeValue for a key attribute \
          cannot contain an empty {kind} value. Key: {attribute}"
+    ))
+}
+
+/// The word a refusal names the KIND of an empty key value by, for the value
+/// types that can be empty at all (`S` and `B`); `None` for every other value,
+/// which cannot be empty in the sense the key rule speaks about.
+///
+/// The one place the two words are chosen: [`empty_key_attribute`] and
+/// [`empty_index_key_attribute`] state the same word for a table key and for a
+/// secondary-index key.
+fn empty_key_value_kind(value: &AttributeValue) -> Option<&'static str> {
+    match value {
+        AttributeValue::S(text) if text.is_empty() => Some("string"),
+        AttributeValue::B(bytes) if bytes.is_empty() => Some("binary"),
+        _ => None,
+    }
+}
+
+/// The refusal for an item whose SECONDARY-INDEX key attribute is empty.
+///
+/// "Attribute values of type String and Binary must have a length greater than
+/// zero if the attribute is used as a key attribute for a table or index" (the
+/// `PutItem$Item` doc), so an empty value is refused for an index key exactly as
+/// it is for the table's own key — but the sentence names the INDEX whose key
+/// schema the attribute belongs to and the attribute's role in it, because that
+/// is what tells the caller which projection it broke.
+fn empty_index_key_attribute(attribute: &str, kind: &str, index_name: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "One or more parameter values are not valid. A value specified for a secondary index \
+         key is not supported. The AttributeValue for a key attribute cannot contain an empty \
+         {kind} value. IndexName: {index_name}, IndexKey: {attribute}"
+    ))
+}
+
+/// The refusal for an item whose SECONDARY-INDEX key attribute carries a type
+/// other than the one the table declared for it.
+///
+/// "If you specify any attributes that are part of an index key, then the data
+/// types for those attributes must match those of the schema in the table's
+/// attribute definition" (the `PutItem$Item` doc), so the write is refused
+/// rather than landing an item the index could not hold. Like
+/// [`empty_key_attribute`] this is a parameter-value sentence of its own rather
+/// than a constraint-envelope clause, and it states only facts of the REQUEST
+/// and of the table it was addressed to: the index key attribute, the type the
+/// table declares for it, the type the item supplied, and the index whose key
+/// schema the attribute belongs to.
+fn index_key_type_mismatch(
+    attribute: &str,
+    expected: &str,
+    actual: &str,
+    index_name: &str,
+) -> RequestError {
+    RequestError::Validation(format!(
+        "One or more parameter values were invalid: Type mismatch for Index Key {attribute} \
+         Expected: {expected} Actual: {actual} IndexName: {index_name}"
     ))
 }
 
@@ -1704,17 +1748,17 @@ impl Table {
                 "No AttributeDefinition was provided for key attribute {attribute}"
             ))
         })?;
+        // "The AttributeValue for a key attribute cannot contain an empty string
+        // value" / an empty binary value: a key attribute's value must be non-empty,
+        // however the table declared its type, and the refusal names the key it was
+        // supplied for. A value of ANOTHER type than the one declared is the type
+        // mismatch below, whether or not it is also empty.
+        if declared == attribute_value_type(value) {
+            if let Some(kind) = empty_key_value_kind(value) {
+                return Err(empty_key_attribute(attribute, kind));
+            }
+        }
         let encoded = match (declared, value) {
-            // "The AttributeValue for a key attribute cannot contain an empty
-            // string value" / an empty binary value: a key attribute's value
-            // must be non-empty, however the table declared its type, and the
-            // refusal names the key it was supplied for.
-            ("S", AttributeValue::S(text)) if text.is_empty() => {
-                return Err(empty_key_attribute(attribute, "string"))
-            }
-            ("B", AttributeValue::B(bytes)) if bytes.is_empty() => {
-                return Err(empty_key_attribute(attribute, "binary"))
-            }
             ("S", AttributeValue::S(text)) => AttributeValueKey::S(text.clone()),
             ("B", AttributeValue::B(bytes)) => AttributeValueKey::B(bytes.clone()),
             ("N", AttributeValue::N(text)) => AttributeValueKey::N(
@@ -1848,31 +1892,104 @@ impl Table {
         })
     }
 
-    /// Hold every INDEX key attribute the item carries to the same key-value limits.
+    /// Hold every SECONDARY-INDEX key attribute the item carries to the type the
+    /// table declared for it, to the non-emptiness a key value must have, and to the
+    /// same key-value limits — the three rules below, in that order.
     ///
-    /// The documented limits are stated for a key attribute "for a table or index", and
-    /// an item that carries an index's key attributes is projected into that index, so
-    /// an oversize index key is refused on the same write the table's own key is
-    /// checked on. An item that does not carry the attribute is simply not projected
-    /// and is not checked for it.
-    pub fn check_index_key_limits(&self, item: &Item) -> Result<(), RequestError> {
-        let schemas = self
-            .global_secondary_indexes
-            .iter()
-            .map(|index| &index.key_schema)
-            .chain(
-                self.local_secondary_indexes
-                    .iter()
-                    .map(|index| &index.key_schema),
-            );
-        for schema in schemas {
-            for element in schema {
-                if let Some(value) = item.get(&element.attribute_name) {
-                    self.check_key_limits(&element.attribute_name, value)?;
+    /// Every write path that stores an item goes through here. The transactional
+    /// write, whose answer depends on WHICH of the rules was broken, calls
+    /// [`Self::check_index_key_types`] and [`Self::check_index_key_values`]
+    /// separately instead.
+    pub fn check_index_keys(&self, item: &Item) -> Result<(), RequestError> {
+        self.check_index_key_types(item)?;
+        self.check_index_key_values(item)
+    }
+
+    /// The TYPE rule for the item's secondary-index key attributes: "If you specify
+    /// any attributes that are part of an index key, then the data types for those
+    /// attributes must match those of the schema in the table's attribute definition"
+    /// (the `PutItem$Item` doc), so a value whose `AttributeValue` member is not the
+    /// `AttributeType` this table's `AttributeDefinitions` declare for that attribute
+    /// is refused ([`index_key_type_mismatch`]) and the item is never written.
+    ///
+    /// This is decided against the TABLE's schema rather than against the request
+    /// alone, which is why the transactional write reports it as the refusal of the
+    /// element that carries the item.
+    pub fn check_index_key_types(&self, item: &Item) -> Result<(), RequestError> {
+        for (index_name, attribute, value) in self.index_key_values(item) {
+            let actual = attribute_value_type(value);
+            if let Some(declared) = self.declared_type(attribute) {
+                if declared != actual {
+                    return Err(index_key_type_mismatch(
+                        attribute, declared, actual, index_name,
+                    ));
                 }
             }
         }
         Ok(())
+    }
+
+    /// The VALUE rules for the item's secondary-index key attributes:
+    ///
+    /// * the EMPTINESS: "Attribute values of type String and Binary must have a
+    ///   length greater than zero if the attribute is used as a key attribute for a
+    ///   table or index" (the `PutItem$Item` doc), so an empty `S`/`B` index key is
+    ///   refused ([`empty_index_key_attribute`]);
+    /// * the SIZE: the documented key-value limits are stated for a key attribute
+    ///   "for a table or index", and an item that carries an index's key attributes
+    ///   is projected into that index, so an oversize index key is refused on the
+    ///   same write the table's own key is checked on.
+    ///
+    /// Both speak about the value the request carried rather than about the table's
+    /// schema, so the transactional write answers them as the request-level refusals
+    /// they are.
+    pub fn check_index_key_values(&self, item: &Item) -> Result<(), RequestError> {
+        for (index_name, attribute, value) in self.index_key_values(item) {
+            if let Some(kind) = empty_key_value_kind(value) {
+                return Err(empty_index_key_attribute(attribute, kind, index_name));
+            }
+            self.check_key_limits(attribute, value)?;
+        }
+        Ok(())
+    }
+
+    /// Every secondary-index key attribute `item` carries, as `(index name,
+    /// attribute, value)`, over the global indexes first and then the local ones.
+    ///
+    /// An attribute the item does not carry is simply not projected into that index
+    /// and yields nothing. An attribute that is part of the TABLE's own key schema is
+    /// left out too: it is refused as the table key it is by [`Self::key_of_item`] —
+    /// the attribute plays both roles whenever a local secondary index is defined,
+    /// and the refusal AWS states names the role the table gave it.
+    fn index_key_values<'a>(
+        &'a self,
+        item: &'a Item,
+    ) -> impl Iterator<Item = (&'a str, &'a str, &'a AttributeValue)> + 'a {
+        self.global_secondary_indexes
+            .iter()
+            .map(|index| (index.name.as_str(), &index.key_schema))
+            .chain(
+                self.local_secondary_indexes
+                    .iter()
+                    .map(|index| (index.name.as_str(), &index.key_schema)),
+            )
+            .flat_map(move |(index_name, schema)| {
+                schema.iter().filter_map(move |element| {
+                    let attribute = element.attribute_name.as_str();
+                    if self.is_table_key(attribute) {
+                        return None;
+                    }
+                    item.get(attribute)
+                        .map(|value| (index_name, attribute, value))
+                })
+            })
+    }
+
+    /// Whether `attribute` is one of this table's OWN key attributes.
+    fn is_table_key(&self, attribute: &str) -> bool {
+        self.key_schema
+            .iter()
+            .any(|element| element.attribute_name == attribute)
     }
 
     /// The key attributes of a stored item, as the `Key`-shaped map
