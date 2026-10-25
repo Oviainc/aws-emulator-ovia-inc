@@ -232,7 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(ListSAMLProviderTagsErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(format!(
-                        "SAML Provider with arn {} does not exist.",
+                        "Manifest not found for arn {}",
                         input.saml_provider_arn
                     )),
                 },

@@ -34,4 +34,9 @@ operation only READS it — an account no put has configured is reported from th
 documented defaults without being materialised, so a describe cannot change what
 a later caller sees — and `lastUpdateDate` is reported only once a put has
 recorded one. `tests/all/storage_configuration.rs` covers both operations end to
-end.
+end, and `tests/all/describe_storage_configuration_reads.rs` pins the read side
+on its own: over a table of settings (none configured, each tier, both forms a
+retention period takes) every describe reports the setting in force with the
+documented defaults filled in, repeated reads answer identically, and the status
+moves only on the clock — a read neither settles a configuration early nor bumps
+its update date.

@@ -49,6 +49,8 @@ mod managed_rule_groups;
 mod parameter_validation;
 #[path = "all/permission_policy.rs"]
 mod permission_policy;
+#[path = "all/rate_based_statement_managed_keys.rs"]
+mod rate_based_statement_managed_keys;
 #[path = "all/regex_pattern_set_lifecycle.rs"]
 mod regex_pattern_set_lifecycle;
 #[path = "all/regex_pattern_set_listing.rs"]

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRateBasedStatementManagedKeys
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRateBasedStatementManagedKeys`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRateBasedStatementManagedKeys::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -115,6 +106,23 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The `AggregateKeyType` settings a managed-keys report is available for.
+///
+/// The operation itself fixes the pair: "This is only available for rate-based rules
+/// that aggregate solely on the IP address or on the forwarded IP address", and the
+/// refusal outside them names the same two — "This call is only available for
+/// rate-based rules with an `AggregateKeyType` setting of `IP` or `FORWARDED_IP`"
+/// (`smithy_query(query="shape",shape="WAFUnsupportedAggregateKeyTypeException")`).
+/// The two other settings `RateBasedStatementAggregateKeyType` declares
+/// (`CUSTOM_KEYS`, `CONSTANT`) aggregate on something else, so they are refused.
+const SOLE_IP_AGGREGATE_KEY_TYPES: &[&str] = &["IP", "FORWARDED_IP"];
+
+/// `IPAddressVersion` for the IPv4 half of the report
+/// (`smithy_query(query="shape",shape="IPAddressVersion")` → `IPV4`, `IPV6`).
+const IP_ADDRESS_VERSION_V4: &str = "IPV4";
+/// See [`IP_ADDRESS_VERSION_V4`].
+const IP_ADDRESS_VERSION_V6: &str = "IPV6";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -149,6 +157,26 @@ impl From<GetRateBasedStatementManagedKeysErrorModeled> for GetRateBasedStatemen
     fn from(modeled: GetRateBasedStatementManagedKeysErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// The rate-based statement of the rule named `rule_name` in `rules`, or `None`
+/// when that rule list holds no rate-based rule of that name.
+///
+/// Only a rule's OWN top-level statement is considered: "You cannot nest a
+/// `RateBasedStatement` inside another statement, for example inside a
+/// `NotStatement` or `OrStatement`. You can define a `RateBasedStatement` inside a
+/// web ACL and inside a rule group"
+/// (`smithy_query(query="doc",shape="RateBasedStatement")`), so a rate-based rule is
+/// addressed by the name of the rule whose statement it is — in a web ACL's rules or
+/// in the rules of a rule group the web ACL references.
+fn rate_based_rule<'rules>(
+    rules: &'rules [Rule],
+    rule_name: &str,
+) -> Option<&'rules RateBasedStatement> {
+    rules
+        .iter()
+        .find(|rule| rule.name == rule_name)
+        .and_then(|rule| rule.statement.rate_based_statement.as_deref())
 }
 
 /// The `GetRateBasedStatementManagedKeys` operation.
@@ -187,18 +215,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRateBasedStatementManagedKeys` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRateBasedStatementManagedKeysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A report: it reads the stored web ACL (and, when the rate-based rule lives
+        // inside a referenced rule group, that rule group) and writes nothing a later
+        // caller could see. `ctx` carries only request metadata, which this operation
+        // does not need.
+        let _ = ctx;
+
+        // `Scope` "specifies whether this is for a global resource type" and is the
+        // namespace the web ACL is resolved in, so it is judged first. `Scope` is a
+        // modelled enum, so the request boundary already refuses a value the model
+        // does not declare (a 400 `ValidationException`); this guard sits behind that
+        // one — like the guard in every sibling handler of this crate — so nothing
+        // that reaches the store is resolved in a namespace that does not exist.
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(
+                GetRateBasedStatementManagedKeysErrorModeled::WAFInvalidParameterException(
+                    crate::state::invalid_parameter_exception(
+                        crate::state::FIELD_SCOPE_VALUE,
+                        &input.scope,
+                        "the scope names the namespace the web ACL is resolved in, \
+                         and is one of CLOUDFRONT or REGIONAL",
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetRateBasedStatementManagedKeysErrorModeled::WAFInternalErrorException(
+                    WAFInternalErrorException {
+                        message: Some("the wafv2 store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let state = state.lock();
+
+        // "WAF monitors web requests and manages keys independently for each unique
+        // combination of web ACL, optional rule group, and rate-based rule", so the
+        // report is about ONE rate-based rule instance and every part of that triple
+        // has to resolve in the requested scope. A `Name`/`Scope`/`Id` triple that
+        // describes no stored web ACL names no web ACL at all.
+        let Some(entry) = state.web_acl(&input.scope, &input.web_acl_name, &input.web_acl_id) else {
+            return Err(
+                GetRateBasedStatementManagedKeysErrorModeled::WAFNonexistentItemException(
+                    crate::state::nonexistent_item_exception(),
+                )
+                .into(),
+            );
+        };
+        let web_acl_rules = entry.web_acl.rules.as_deref().unwrap_or_default();
+
+        // `RuleGroupRuleName` is "the name of the rule group reference statement in
+        // your web ACL … required only when you have the rate-based rule nested
+        // inside a rule group": with it, the rate-based rule is one of the REFERENCED
+        // rule group's rules, reached through the rule-group reference the named web
+        // ACL rule carries; without it, the rate-based rule is a rule of the web ACL
+        // itself.
+        let rules: &[Rule] = match input.rule_group_rule_name.as_deref() {
+            Some(rule_group_rule_name) => {
+                let referenced = web_acl_rules
+                    .iter()
+                    .find(|rule| rule.name == rule_group_rule_name)
+                    .and_then(|rule| rule.statement.rule_group_reference_statement.as_ref())
+                    .and_then(|reference| state.rule_group_by_arn(&reference.arn));
+                let Some(rule_group) = referenced else {
+                    return Err(
+                        GetRateBasedStatementManagedKeysErrorModeled::WAFNonexistentItemException(
+                            crate::state::nonexistent_item_exception(),
+                        )
+                        .into(),
+                    );
+                };
+                rule_group.rule_group.rules.as_deref().unwrap_or_default()
+            }
+            None => web_acl_rules,
+        };
+
+        // `RuleName` is "the name of the rate-based rule to get the keys for": a name
+        // that names no rate-based rule of that rule list — no rule at all, or a rule
+        // whose statement is of another kind — names no rate-based rule instance, and
+        // so no managed keys exist to report.
+        let Some(rate_based) = rate_based_rule(rules, &input.rule_name) else {
+            return Err(
+                GetRateBasedStatementManagedKeysErrorModeled::WAFNonexistentItemException(
+                    crate::state::nonexistent_item_exception(),
+                )
+                .into(),
+            );
+        };
+
+        // The keys WAF manages are IP addresses only when the rule aggregates solely
+        // on one: "This is only available for rate-based rules that aggregate solely
+        // on the IP address or on the forwarded IP address." Any other aggregation
+        // has keys that are not addresses, which is the modelled refusal.
+        if !SOLE_IP_AGGREGATE_KEY_TYPES.contains(&rate_based.aggregate_key_type.as_str()) {
+            return Err(
+                GetRateBasedStatementManagedKeysErrorModeled::WAFUnsupportedAggregateKeyTypeException(
+                    crate::state::unsupported_aggregate_key_type_exception(),
+                )
+                .into(),
+            );
+        }
+
+        // The managed keys are "the IP addresses that are currently blocked by a
+        // rate-based rule instance": the addresses whose request rate, as WAF counted
+        // it over this instance's evaluation window, went over the rule's limit. This
+        // emulator serves WAF's CONTROL plane — no web request is ever routed through
+        // a web ACL here — so no address has a rate at all and neither family's list
+        // holds one, which is also what WAF answers for a rate-based rule that is
+        // currently rate limiting nothing. Synthesising addresses nothing ever sent a
+        // request from would be fabrication, not emulation.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRateBasedStatementManagedKeys"))
+        // Both halves are reported, each tagged with the family it is "the keys that
+        // are of": one answer per `IPAddressVersion` the model declares, so a caller
+        // reading either member finds the list and its version rather than a missing
+        // member it has to interpret.
+        Ok(GetRateBasedStatementManagedKeysOutput {
+            managed_keys_ipv4: Some(RateBasedStatementManagedKeysIPSet {
+                ip_address_version: Some(IP_ADDRESS_VERSION_V4.to_string()),
+                addresses: Some(Vec::new()),
+            }),
+            managed_keys_ipv6: Some(RateBasedStatementManagedKeysIPSet {
+                ip_address_version: Some(IP_ADDRESS_VERSION_V6.to_string()),
+                addresses: Some(Vec::new()),
+            }),
+        })
     }
 }

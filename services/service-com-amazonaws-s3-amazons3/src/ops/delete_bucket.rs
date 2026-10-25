@@ -222,6 +222,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // A bucket AWS publishes ([`crate::state::aws_published`]) is not this account's
+        // either: nobody created it, no caller owns it, and its life is not the caller's
+        // to end — which is what `AccessDenied` (403) says, with the text S3 publishes for
+        // that code. This service goes on SERVING its objects, which is what holding it is
+        // for; it just does not belong to the caller asking for it to be deleted.
+        if bucket.is_aws_published() {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                403,
+                crate::scaffolded::documented_error_message("AccessDenied")
+                    .unwrap_or("Access Denied"),
+            ));
+        }
+
         // "All objects (INCLUDING ALL OBJECT VERSIONS and delete markers) in the bucket
         // must be deleted before the bucket itself can be deleted": emptiness is over the
         // bucket's whole version history, not over its current view. A versioned delete

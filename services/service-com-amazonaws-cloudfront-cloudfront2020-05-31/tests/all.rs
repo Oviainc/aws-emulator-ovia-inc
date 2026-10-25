@@ -77,6 +77,8 @@ mod key_value_store_list;
 mod key_value_store_update;
 #[path = "all/managed_cache_policy_catalog.rs"]
 mod managed_cache_policy_catalog;
+#[path = "all/managed_cache_policy_delete_gate.rs"]
+mod managed_cache_policy_delete_gate;
 #[path = "all/managed_certificate_details.rs"]
 mod managed_certificate_details;
 #[path = "all/managed_certificate_domain_ownership.rs"]

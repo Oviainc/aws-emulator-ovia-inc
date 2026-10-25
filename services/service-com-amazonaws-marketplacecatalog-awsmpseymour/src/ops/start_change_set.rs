@@ -413,6 +413,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into());
                 }
+                // The delivery options a change submits are each assigned an id
+                // and assessed against the product's framework, so the number of
+                // them a change may carry is bounded for the same reason the
+                // depth is: what one request leaves in the store is bounded by a
+                // constant and not by the width of the document it sent.
+                if let Some(count) = crate::state::delivery_option_count(value) {
+                    if count > crate::state::MAX_DELIVERY_OPTIONS_PER_CHANGE {
+                        return Err(StartChangeSetErrorModeled::ValidationException(
+                            crate::state::too_many_delivery_options(count),
+                        )
+                        .into());
+                    }
+                }
                 // Nothing here judges the MEMBERS of the details: they belong
                 // to the change type, which the model declares no shape for, so
                 // a value the catalog cannot read is found by APPLYING the

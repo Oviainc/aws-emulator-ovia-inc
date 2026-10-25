@@ -23,7 +23,11 @@
 //! * a member outside its modelled bounds is refused with a client error and
 //!   stores nothing, while the same member AT its bound is accepted;
 //! * the store is bounded: with the dashboard map at its ceiling a create is the
-//!   modelled quota refusal, and it is accepted again as soon as there is room.
+//!   modelled quota refusal, and it is accepted again as soon as there is room;
+//! * `clientToken` makes the create idempotent: a retry carrying the token of a
+//!   create this store already served answers from the dashboard THAT create
+//!   minted and writes nothing, while a create carrying no token, or a token no
+//!   create has spent, mints a dashboard of its own.
 //!
 //! The HTTP harness (`call`, `router`, `error_code`, `is_modelled_id`) is the one
 //! the asset suite already has; this suite reuses it rather than growing a second.
@@ -58,6 +62,31 @@ const DESCRIPTION_MAX: usize = 2048;
 /// `dashboardDefinition` targets `DashboardDefinition`, len 0..204800, and its
 /// `^.+$` pattern is what makes the empty literal a refusal despite the 0 floor.
 const DEFINITION_MAX: usize = 204_800;
+
+/// The floor of `clientToken`'s modelled length. Source:
+/// `smithy_query(query="operation", operation="CreateDashboard")` — `clientToken`
+/// targets `ClientToken`, len 36..64, pattern `^\S{36,64}$`.
+const CLIENT_TOKEN_MIN: usize = 36;
+
+/// A `clientToken` built from `seed`: a non-space string padded out to
+/// [`CLIENT_TOKEN_MIN`], so a row states a token without restating the bound.
+fn client_token(seed: usize) -> String {
+    let token = format!("retry-token-{seed}-");
+    format!(
+        "{token}{}",
+        "0".repeat(CLIENT_TOKEN_MIN.saturating_sub(token.chars().count()))
+    )
+}
+
+/// How many dashboards the shared store holds — what proves a replay wrote
+/// nothing.
+fn stored_dashboards(engine: &std::sync::Arc<engine::InMemoryEngine>) -> usize {
+    service_state(&**engine)
+        .expect("the IoT SiteWise store")
+        .lock()
+        .dashboards
+        .len()
+}
 
 /// A modelled `ID` built from `seed`: a lowercase hyphenated UUID that is not the
 /// all-zero one the pattern refuses. Used for the ids expected to resolve to
@@ -622,10 +651,13 @@ async fn a_member_past_its_modelled_bound_is_refused_and_stores_nothing() {
     let (stored_id, _) = seed(&router, base).await;
     let (_, stored) = describe_dashboard(&router, &stored_id).await;
 
-    for (member, at_bound, past_bound) in bound_cases() {
+    for (at, (member, at_bound, past_bound)) in bound_cases().into_iter().enumerate() {
         // AT the bound the member is accepted, on the create and on the update.
+        // Under a token of its own, so the row is a create rather than a retry of
+        // the seeded one, whose token `base` already spent.
         let mut accepted = create_body(base);
         accepted[member] = Value::String(at_bound.clone());
+        accepted["clientToken"] = Value::String(client_token(0xb0 + at));
         let (status, created) = create_dashboard(&router, accepted).await;
         assert_eq!(
             status, 201,
@@ -687,6 +719,7 @@ fn seeded_record(at: usize) -> DashboardRecord {
         definition: r#"{"widgets":[]}"#.to_string(),
         creation_date: now,
         last_update_date: now,
+        client_token: None,
         tags: HashMap::new(),
     }
 }
@@ -759,4 +792,167 @@ async fn a_create_past_the_dashboard_ceiling_is_the_modelled_quota_refusal() {
         status, 200,
         "the dashboard created with room again expected 200, got {status} {described}"
     );
+}
+
+#[tokio::test]
+async fn a_retry_under_a_spent_client_token_replays_the_create_and_writes_nothing() {
+    let (router, engine) = router_with_engine();
+    let projects = seed_projects(&router, 3).await;
+
+    // Every row of the table, each under a token of its own: what the retry is
+    // recognised by does not depend on what else the create carried.
+    for (at, case) in dashboard_cases(&projects).iter().enumerate() {
+        let mut body = create_body(case);
+        body["clientToken"] = Value::String(client_token(at));
+
+        let (status, created) = create_dashboard(&router, body.clone()).await;
+        assert_eq!(
+            status, 201,
+            "case {:?}: CreateDashboard expected 201, got {status} {created}",
+            case.label
+        );
+        let id = created["dashboardId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let held = stored_dashboards(&engine);
+        let (status, described) = describe_dashboard(&router, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: DescribeDashboard expected 200, got {status} {described}",
+            case.label
+        );
+
+        // The SAME request again, under the SAME token: the answer the first
+        // call gave, and nothing new in the store.
+        let (status, replayed) = create_dashboard(&router, body.clone()).await;
+        assert_eq!(
+            status, 201,
+            "case {:?}: a retry expected 201, got {status} {replayed}",
+            case.label
+        );
+        assert_eq!(
+            replayed, created,
+            "case {:?}: a retry under a spent clientToken must replay the first answer, got \
+             {replayed}",
+            case.label
+        );
+        assert_eq!(
+            stored_dashboards(&engine),
+            held,
+            "case {:?}: a replayed create must mint no second dashboard, the store holds {}",
+            case.label,
+            stored_dashboards(&engine)
+        );
+
+        // A retry whose other members differ is still that token's create: it
+        // answers the dashboard the token minted and writes nothing, so the
+        // stored dashboard keeps what the first call gave it.
+        let mut differing = body.clone();
+        differing["dashboardName"] = Value::String(format!("rewritten-{at}"));
+        differing["dashboardDefinition"] = Value::String(definition_of(128));
+        let (status, replayed) = create_dashboard(&router, differing).await;
+        assert_eq!(
+            status, 201,
+            "case {:?}: a differing retry expected 201, got {status} {replayed}",
+            case.label
+        );
+        assert_eq!(
+            replayed, created,
+            "case {:?}: a differing retry under a spent clientToken must still answer the \
+             dashboard that token minted, got {replayed}",
+            case.label
+        );
+        assert_eq!(
+            stored_dashboards(&engine),
+            held,
+            "case {:?}: a replayed create must write nothing, the store holds {}",
+            case.label,
+            stored_dashboards(&engine)
+        );
+        let (status, again) = describe_dashboard(&router, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: DescribeDashboard expected 200, got {status} {again}",
+            case.label
+        );
+        assert_eq!(
+            again, described,
+            "case {:?}: a replayed create must leave the stored dashboard alone",
+            case.label
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_create_with_no_token_or_an_unspent_one_mints_a_dashboard_of_its_own() {
+    let (router, engine) = router_with_engine();
+    let projects = seed_projects(&router, 3).await;
+
+    for (at, case) in dashboard_cases(&projects).iter().enumerate() {
+        let mut minted = BTreeSet::new();
+        let held = stored_dashboards(&engine);
+
+        // No token at all: nothing recognises the call as a retry, so the same
+        // request twice over is two dashboards.
+        let mut untokened = create_body(case);
+        untokened
+            .as_object_mut()
+            .expect("the create body is a JSON object")
+            .remove("clientToken");
+        // Two tokens no create has spent: likewise two dashboards, so it is the
+        // token's having been SPENT that replays, not its being carried.
+        let mut first_token = create_body(case);
+        first_token["clientToken"] = Value::String(client_token(0x100 + at));
+        let mut second_token = create_body(case);
+        second_token["clientToken"] = Value::String(client_token(0x200 + at));
+
+        for (label, body) in [
+            ("no token, first call", untokened.clone()),
+            ("no token, second call", untokened),
+            ("an unspent token", first_token),
+            ("another unspent token", second_token),
+        ] {
+            let (status, created) = create_dashboard(&router, body).await;
+            assert_eq!(
+                status, 201,
+                "case {:?} / {label}: CreateDashboard expected 201, got {status} {created}",
+                case.label
+            );
+            let id = created["dashboardId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                is_modelled_id(&id),
+                "case {:?} / {label}: expected a modelled id, got {created}",
+                case.label
+            );
+            let (status, described) = describe_dashboard(&router, &id).await;
+            assert_eq!(
+                status, 200,
+                "case {:?} / {label}: DescribeDashboard expected 200, got {status} {described}",
+                case.label
+            );
+            assert!(
+                minted.insert(id.clone()),
+                "case {:?} / {label}: {id} was already minted for another create",
+                case.label
+            );
+        }
+
+        assert_eq!(
+            minted.len(),
+            4,
+            "case {:?}: expected four distinct dashboards, got {minted:?}",
+            case.label
+        );
+        assert_eq!(
+            stored_dashboards(&engine),
+            held + 4,
+            "case {:?}: each of the four creates must store a dashboard, the store holds {}",
+            case.label,
+            stored_dashboards(&engine)
+        );
+    }
 }

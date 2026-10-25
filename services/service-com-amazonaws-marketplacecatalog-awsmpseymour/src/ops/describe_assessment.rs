@@ -4,11 +4,10 @@
 //! Reports one assessment of this catalog, with a page of its control results.
 //!
 //! An assessment is the RESULT of evaluating an entity or a change set against a
-//! framework. No operation of this service performs such an evaluation and this
-//! emulator runs none, so nothing creates an assessment record and every
-//! well-formed identifier names no assessment — the modelled
-//! `ResourceNotFoundException`; see `crate::state::AssessmentRecord`. The answer is
-//! still computed from the store, so it reports whatever the store holds.
+//! framework, which is what a succeeded `Intent=APPLY` change set submits a product's
+//! delivery options to — see `crate::state::AssessmentRecord`. An identifier naming
+//! no such record is the modelled `ResourceNotFoundException`. The answer is computed
+//! from the store, so it reports whatever the store holds.
 //!
 //! ## Shape of an operation
 //!
@@ -255,7 +254,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size =
             usize::try_from(input.max_results).expect("a page size in 1..=100 fits in usize");
 
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // An assessment exists once the change set that submitted the delivery
+        // option it assessed has succeeded, which is a change the clock owes
+        // rather than one a reader makes.
+        store.settle(now);
+
         let Some(record) = store.assessments.get(assessment_id) else {
             return Err(DescribeAssessmentErrorModeled::ResourceNotFoundException(
                 crate::state::assessment_not_found(assessment_id),

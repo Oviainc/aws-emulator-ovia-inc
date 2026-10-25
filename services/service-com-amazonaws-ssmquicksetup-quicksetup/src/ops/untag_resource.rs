@@ -213,6 +213,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // So a manager whose teardown has come due is gone before this request looks
+        // for it, rather than being untagged on its way out of the store.
+        store.settle(now);
 
         // The configuration manager is this service's only ARN-addressable resource, so
         // an ARN naming no stored manager names no taggable resource at all.
@@ -227,6 +230,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A manager whose teardown the service has accepted is on its way out, so it
+        // takes no further mutation — tags included — while that teardown is in flight.
+        if manager.is_deleting() {
+            return Err(UntagResourceErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::TEARDOWN_IN_FLIGHT_MESSAGE.to_string()),
+            })
+            .into());
+        }
 
         // Removing a key the resource does not carry is a no-op success: that is what
         // makes this `@idempotent` operation answer the same way however often the same

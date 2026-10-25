@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSAMLProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSAMLProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSAMLProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the SAML 2.0 identity provider the account holds under the ARN the request
+//! names, so no later read reports it and its name is free to be created again. Roles
+//! whose trust policies name the provider's ARN as a principal are deliberately left
+//! alone — "deleting the provider resource from IAM does not update any roles that
+//! reference the SAML provider resource's ARN as a principal in their trust policies".
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +161,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSAMLProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSAMLProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; what this reads from it is the signing key
+        // the request presented, which is the acting principal the audit record below
+        // names.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteSAMLProviderErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `arnType` asks only for a 20..2048 character string, so the value still has to
+        // BE an ARN — one "begins with arn:" (Amazon Resource Names, Amazon Web Services
+        // General Reference) — and anything else is an "invalid … value … supplied for an
+        // input parameter". A well-formed ARN naming no held provider is the DIFFERENT
+        // answer the entity-absent error carries, the same split `GetSAMLProvider` and
+        // `ListSAMLProviderTags` make on this member.
+        if !input.saml_provider_arn.starts_with("arn:") {
+            return Err(DeleteSAMLProviderErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Invalid SAMLProviderArn {}: the value is not an ARN",
+                        input.saml_provider_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The provider is keyed by the ARN `CreateSAMLProvider` derived from its name, so
+        // removing that entry is what deletes the provider: its metadata document, its
+        // instants, its encryption setting, its private key metadata and its tags are all
+        // members of that one record, so none of them outlives it — a later create for the
+        // same name must not look like it inherited the deleted provider's state.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSAMLProvider"))
+        // Nothing else the account holds is touched: a role trusting this provider keeps
+        // its trust policy, because "deleting the provider resource from IAM does not
+        // update any roles that reference the SAML provider resource's ARN as a principal
+        // in their trust policies".
+        let mut store = state.lock();
+        if store
+            .saml_providers
+            .remove(&input.saml_provider_arn)
+            .is_none()
+        {
+            // What IAM holds for a SAML provider is the metadata manifest the create
+            // uploaded, so an ARN it holds none for is reported as that manifest not being
+            // found for the ARN — the wording every operation naming a provider by ARN
+            // uses for the absence.
+            return Err(DeleteSAMLProviderErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "Manifest not found for arn {}",
+                        input.saml_provider_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Audit record for a destructive call: the acting principal and the federation
+        // trust anchor that went away. The provider's metadata document is not logged —
+        // the record says WHAT was deleted, not what it contained.
+        ::tracing::info!(
+            audit = true,
+            operation = "DeleteSAMLProvider",
+            outcome = "deleted",
+            caller_akid = %caller_akid,
+            saml_provider_arn = %input.saml_provider_arn,
+            "SAML provider deleted"
+        );
+
+        // The output shape is `Unit`: the operation reports nothing, and the provider's
+        // absence is read back through `GetSAMLProvider` and `ListSAMLProviders`.
+        Ok(DeleteSAMLProviderOutput)
     }
 }

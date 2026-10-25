@@ -501,8 +501,12 @@ fn clock_secs(at: ::std::time::SystemTime) -> i64 {
     i64::try_from(clock_nanos(at).div_euclid(1_000_000_000)).unwrap_or(i64::MAX)
 }
 
-/// The first whole second at or after a modelled `TimestampType`, so a start inside a
-/// second does not pull in a data point that sits before it.
+/// The first whole second at or after a modelled `TimestampType`.
+///
+/// Both endpoints of the window are measured with it, so an endpoint inside a second
+/// decides each whole-second data point by where that point really sits relative to it: a
+/// start inside a second does not pull in the data point before it, and an end inside a
+/// second does not drop the data point before it.
 fn ceil_secs(at: ::aws_smithy_types::DateTime) -> i64 {
     if at.subsec_nanos() > 0 {
         at.secs().saturating_add(1)
@@ -528,9 +532,10 @@ fn forecast_instants(
     let earliest = now_secs.saturating_sub(MAX_FORECAST_HISTORY_DAYS * SECONDS_PER_DAY);
     let latest = now_secs.saturating_add(FORECAST_HORIZON_DAYS * SECONDS_PER_DAY);
     let first = ceil_secs(start_time).max(earliest);
-    // A point at exactly `EndTime` is outside the window; one at the last whole second
-    // before an `EndTime` inside a second is inside it.
-    let end = end_time.secs();
+    // Measured with [`ceil_secs`], `at < end` is the exclusive end at full precision: a
+    // point exactly at a whole-second `EndTime` stays outside the window, and the whole
+    // second before an `EndTime` inside a second — strictly earlier than it — stays in.
+    let end = ceil_secs(end_time);
 
     let mut at = first.div_euclid(FORECAST_INTERVAL_SECONDS) * FORECAST_INTERVAL_SECONDS;
     if at < first {

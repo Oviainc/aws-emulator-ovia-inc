@@ -78,8 +78,9 @@ fn expected_stream_arn(region: &str, cluster: &str, stream: &str) -> String {
     )
 }
 
-/// A `targetDefinition` naming a Kinesis destination.
-fn kinesis_target(region: &str, stream_name: &str, role: &str) -> Value {
+/// A `targetDefinition` naming a Kinesis destination. Shared with the suites that
+/// need a well-formed target rather than a target to scrutinise.
+pub fn kinesis_target(region: &str, stream_name: &str, role: &str) -> Value {
     json!({"kinesis": {"streamArn": kinesis_arn(region, stream_name), "roleArn": role_arn(role)}})
 }
 

@@ -107,6 +107,9 @@ mod lens_review_rollup;
 #[path = "all/lens_share_deletion.rs"]
 mod lens_share_deletion;
 
+#[path = "all/lens_share_invitation_answers.rs"]
+mod lens_share_invitation_answers;
+
 #[path = "all/lens_shares.rs"]
 mod lens_shares;
 
