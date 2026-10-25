@@ -368,6 +368,16 @@ impl Scan {
         }
     }
 
+    /// The run an account-wide scan LISTING reports this scan from, or `None` when the
+    /// scan is not one a listing returns at all: `ListScans` "Does not return `EXPRESS`
+    /// scans", so a scan whose current run is an Express run is reported by no listing
+    /// (it stays reachable by name through `GetScan`). A scan with no run has nothing to
+    /// report either.
+    pub fn listed_run(&self) -> Option<&ScanRun> {
+        self.latest_run()
+            .filter(|run| run.scan_type != SCAN_TYPE_EXPRESS)
+    }
+
     /// `numberOfRevisions`: "The number of times a scan has been re-run on a revised
     /// resource" (`GetScanResponse$numberOfRevisions`), so the run that created the scan
     /// is not counted and a scan with one run reports `0`.

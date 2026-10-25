@@ -52,7 +52,7 @@ use super::license_server_endpoints::{
 /// inside that window. The same wait the provisioning suite uses.
 const PAST_THE_OWED_TRANSITION: Duration = Duration::from_millis(900);
 
-async fn delete_endpoint(h: &Harness, arn: &str) -> Reply {
+pub(crate) async fn delete_endpoint(h: &Harness, arn: &str) -> Reply {
     // `DeleteLicenseServerEndpoint` is bound to POST
     // /license-server/DeleteLicenseServerEndpoint (smithy_query: http.uri).
     call(

@@ -17,6 +17,7 @@
 pub mod cancel_tag_sync_task_types;
 pub mod create_group_types;
 pub mod delete_group_types;
+pub mod get_account_settings_types;
 pub mod get_group_configuration_types;
 pub mod get_group_query_types;
 pub mod get_group_types;
@@ -44,6 +45,8 @@ pub use cancel_tag_sync_task_types::*;
 pub use create_group_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use delete_group_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use get_account_settings_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_group_configuration_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

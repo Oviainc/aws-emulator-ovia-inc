@@ -50,7 +50,7 @@ use service_com_amazonaws_licensemanagerusersubscriptions_licensemanagerusersubs
 
 use super::identity_provider_subscriptions::{
     arn_prefix, as_str, call, encoded_label, harness, list_providers, provider_union, register,
-    send, Harness, Reply, ACCOUNT, PRODUCTS, REGION, SIGNING_NAME,
+    send, start_subscription, Harness, Reply, ACCOUNT, PRODUCTS, REGION, SIGNING_NAME,
 };
 
 /// The sentence `DisassociateUser` answers a request that addresses no association
@@ -1596,6 +1596,73 @@ async fn a_request_cannot_buy_unbounded_work_or_state() {
         }),
     )
     .await;
+    assert_eq!(
+        reply.status, 400,
+        "at the limit: expected HTTP 400, got {} with body {:?}",
+        reply.status, reply.body
+    );
+    assert_eq!(
+        reply.error_type.as_deref(),
+        Some("ServiceQuotaExceededException"),
+        "at the limit: expected the modelled quota error, got {:?} with body {:?}",
+        reply.error_type,
+        reply.body
+    );
+}
+
+/// RULE: the state ONE request can buy is bounded for a product subscription too — the
+/// kind holds at most `MAX_RESOURCES_PER_KIND` records, beyond which
+/// `StartProductSubscription` answers the modelled `ServiceQuotaExceededException` instead
+/// of the store, and the work a later list spends walking it, growing without limit.
+#[tokio::test]
+async fn a_subscription_past_the_store_bound_is_refused() {
+    let h = harness();
+    register(
+        &h,
+        &registration(
+            "d-0123456789",
+            PRODUCTS[0],
+            &["subnet-0123456789abcdef0"],
+            None,
+        ),
+    )
+    .await
+    .ok("a registration to subscribe through");
+
+    let subscription = |username: &str| {
+        json!({
+            "Username": username,
+            "IdentityProvider": provider_union("d-0123456789"),
+            "Product": PRODUCTS[0],
+        })
+    };
+    start_subscription(&h, &subscription("quota.user"))
+        .await
+        .ok("one subscription to clone");
+
+    {
+        let store = h
+            .engine
+            .state::<ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState>();
+        let mut guard = store.lock();
+        let template = guard
+            .product_users
+            .values()
+            .next()
+            .cloned()
+            .expect("the subscription is in the store");
+        while guard.product_users.len() < MAX_RESOURCES_PER_KIND {
+            // Written through the one product-user writer, so every index the store keeps
+            // of a subscription agrees with the records this filler adds.
+            let filler_number = guard.product_users.len();
+            let mut filler = template.clone();
+            filler.arn = format!("{}filler{filler_number}", arn_prefix("user"));
+            filler.username = format!("filler.user{filler_number}");
+            guard.insert_product_user(filler);
+        }
+    }
+
+    let reply = start_subscription(&h, &subscription("one.too.many")).await;
     assert_eq!(
         reply.status, 400,
         "at the limit: expected HTTP 400, got {} with body {:?}",

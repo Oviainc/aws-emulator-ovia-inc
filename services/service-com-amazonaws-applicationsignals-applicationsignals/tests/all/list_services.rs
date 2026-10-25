@@ -134,16 +134,18 @@ struct Stored {
 /// The SLOs every discovery test stores.
 ///
 /// The rows differ along what the rule generalises over: the NUMBER of attributes in an
-/// identity (one, two, three and the modelled maximum of four — `ServiceSummary`'s
-/// `KeyAttributes` is `length 1..4`), the KIND of entity (`Service`, `RemoteService`,
-/// `Resource` and `AWS::Service`, `Type` values the member's own doc names), the COUNT of
-/// SLOs per identity (two SLOs on `checkout` are one service), whether the SLO names an
-/// operation, and whether the identity is a SUBSET of another observed one.
+/// identity (two in a stored SLO's own record, three and the modelled maximum of four —
+/// `ServiceSummary`'s `KeyAttributes` is `length 1..4`), the KIND of entity (`Service`,
+/// `RemoteService`, `Resource` and `AWS::Service`, `Type` values the member's own doc names),
+/// the COUNT of SLOs per identity (two SLOs on `checkout` are one service), whether the SLO
+/// names an operation, and whether the identity is a SUBSET of another observed one.
 ///
-/// Every identity names its `Type`, because that is the entry an entity lookup is read by
-/// (`crate::state::entity_identity_refusal`), so each one here is an identity the
-/// `GetService` round trip below can ask for — a one-attribute identity is therefore the
-/// type on its own.
+/// Every identity a summary is reported under names its `Type` and the attributes that `Type`
+/// makes applicable — `Name` and `Environment` for a service, `ResourceType` and `Identifier`
+/// for a resource — because that is what an entity lookup is read by
+/// (`crate::state::entity_identity_refusal`), so each one is an identity the `GetService`
+/// round trip below can ask for. The one SUBSET identity is folded into the fuller identity
+/// it names, so it is reported under that one rather than on its own.
 fn stored_slos() -> Vec<Stored> {
     vec![
         Stored {
@@ -192,9 +194,13 @@ fn stored_slos() -> Vec<Stored> {
             dependency: None,
         },
         Stored {
-            case: "a one-attribute identity: the entity type alone",
-            name: "billing-latency",
-            key_attributes: json!({ "Type": "AWS::Service" }),
+            case: "an AWS service entity, named and placed",
+            name: "billing-queue-latency",
+            key_attributes: json!({
+                "Type": "AWS::Service",
+                "Name": "sqs",
+                "Environment": "prod"
+            }),
             operation_name: None,
             dependency: None,
         },
@@ -214,7 +220,7 @@ fn discovered_identities() -> Vec<Value> {
             "Identifier": "orders-table",
             "Environment": "prod"
         }),
-        json!({ "Type": "AWS::Service" }),
+        json!({ "Type": "AWS::Service", "Name": "sqs", "Environment": "prod" }),
     ]
 }
 
