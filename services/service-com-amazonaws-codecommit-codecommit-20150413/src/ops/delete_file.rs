@@ -336,10 +336,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return if repository.commits.contains_key(&input.parent_commit_id) {
                 Err(DeleteFileErrorModeled::ParentCommitIdOutdatedException(
                     ParentCommitIdOutdatedException {
-                        message: Some(format!(
-                            "the parent commit id {} is not the tip of the branch {}",
-                            input.parent_commit_id, input.branch_name
-                        )),
+                        message: Some(crate::state::PARENT_COMMIT_ID_OUTDATED_MESSAGE.to_string()),
                     },
                 )
                 .into())

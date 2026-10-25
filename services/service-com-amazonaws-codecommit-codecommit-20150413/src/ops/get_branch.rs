@@ -195,11 +195,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
-        let branch = repository.branches.get(&branch_name).ok_or_else(|| {
+        // Whether an error body carries a message is part of the response shape:
+        // this operation's branch-not-found body carries NO message text, so the
+        // member is absent rather than filled with the code's constant
+        // (`crate::state::BRANCH_DOES_NOT_EXIST_MESSAGE`, which the write paths
+        // that raise this code do send).
+        let branch = repository.branches.get(&branch_name).ok_or(
             GetBranchErrorModeled::BranchDoesNotExistException(BranchDoesNotExistException {
-                message: Some(crate::state::BRANCH_DOES_NOT_EXIST_MESSAGE.to_string()),
-            })
-        })?;
+                message: None,
+            }),
+        )?;
 
         Ok(GetBranchOutput {
             branch: Some(BranchInfo {

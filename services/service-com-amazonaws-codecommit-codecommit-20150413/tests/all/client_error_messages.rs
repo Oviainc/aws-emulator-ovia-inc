@@ -300,7 +300,11 @@ async fn repository_name_exists_message_names_the_requested_repository() {
 }
 
 /// Cause 3 — `BranchDoesNotExistException` reads the same constant whatever branch
-/// and repository the request named, and whichever operation raises it.
+/// and repository the request named, on the WRITE operations that raise it. The
+/// branch READ (`GetBranch`) answers the code with no message text at all, which
+/// `crate::branch_read_refusal` pins; that is a property of the operation's
+/// response shape rather than a second wording of the code, so this suite's table
+/// covers the operations that do carry the constant.
 #[tokio::test]
 async fn branch_does_not_exist_message_is_a_constant() {
     let router = emulator();
@@ -337,10 +341,6 @@ async fn branch_does_not_exist_message_is_a_constant() {
         let branches = branch_names();
         let ghost = branches[index % branches.len()].clone();
         let requests: Vec<(&str, Value)> = vec![
-            (
-                "GetBranch",
-                json!({"repositoryName": repository, "branchName": ghost}),
-            ),
             (
                 "PutFile",
                 json!({
