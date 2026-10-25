@@ -26,6 +26,11 @@ hex = { workspace = true }
 # The 32 hex digits of a minted `AddressId` / `JobId`, which the modelled patterns spell
 # `[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`.
 sha2 = { workspace = true }
+# Calendar arithmetic for a long-term pricing contract's end date: the start plus the
+# whole months its `LongTermPricingType` names, with month lengths and leap days handled
+# by the crate rather than by a calendar of this service's own. 0.4.31 is where
+# `DateTime::from_timestamp` landed, which is the entry point used here.
+chrono = { version = "0.4.31", default-features = false, features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
