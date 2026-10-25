@@ -979,6 +979,17 @@ impl IngestConfigurationRecord {
         }
     }
 
+    /// Leave this configuration associated with NO stage, reporting
+    /// [`NO_ASSOCIATED_STAGE_ARN`] for `stageArn`.
+    ///
+    /// The ONE writer of the "no stage" reading, so every operation that ends an
+    /// association (a publisher's disconnect, the deletion of the stage itself) leaves
+    /// the same value on the record — and `stageArn` never reports a stage this store
+    /// no longer holds.
+    pub fn clear_stage_association(&mut self) {
+        self.stage_arn = NO_ASSOCIATED_STAGE_ARN.to_string();
+    }
+
     /// Whether `participant_id` is one of the participants THIS configuration's ingest
     /// credentials were minted for: its own, or one of its redundant ones.
     ///
@@ -2665,6 +2676,32 @@ pub fn ingest_configuration_publishers(
         }
     }
     publishers
+}
+
+/// Leave every ingest configuration associated with `stage_arn` associated with no
+/// stage.
+///
+/// A non-empty `IngestConfiguration$stageArn` is a REFERENCE to a stage of this service
+/// ([`resolved_stage_association`] refuses one this store holds no stage for), so a
+/// stage that goes away takes the references to it with it: once the stage is gone, no
+/// configuration reports its ARN. The configurations themselves stay — they keep their
+/// ingest keys and can be associated with another stage — so only the association is
+/// dropped, through the one writer of the "no stage" reading
+/// ([`IngestConfigurationRecord::clear_stage_association`]).
+pub fn disassociate_stage_from_ingest_configurations(
+    state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    stage_arn: &str,
+) {
+    // A configuration associated with no stage is already where this leaves it, so the
+    // "no stage" value is never treated as a stage to disassociate from.
+    if stage_arn == NO_ASSOCIATED_STAGE_ARN {
+        return;
+    }
+    for configuration in state.ingest_configurations.values_mut() {
+        if configuration.stage_arn == stage_arn {
+            configuration.clear_stage_association();
+        }
+    }
 }
 
 /// The region a minted ARN names: the one the request was signed for, so a caller
