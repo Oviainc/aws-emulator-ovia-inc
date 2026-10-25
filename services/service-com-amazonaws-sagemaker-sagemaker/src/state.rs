@@ -595,6 +595,9 @@ pub const AUTO_MODEL_REGISTRATION_DISABLED: &str = "AutoModelRegistrationDisable
 pub const STATUS_CREATING: &str = "Creating";
 /// See [`STATUS_CREATING`].
 pub const STATUS_IN_SERVICE: &str = "InService";
+/// `ClusterStatus`'s member a cluster carries between the call that asked for its
+/// deletion and the instant the deletion completes. See [`Cluster::begin_deletion`].
+pub const STATUS_DELETING: &str = "Deleting";
 
 /// How long after the call that starts it the clock owes a transient -> ready
 /// transition for the resources in this slice: a scheduler resource's `Creating` ->
@@ -4931,6 +4934,20 @@ impl PartnerApp {
 /// provisioning takes many minutes; the span is the emulator's own choice.
 pub const CLUSTER_IN_SERVICE_AFTER: Duration = Duration::from_millis(300);
 
+/// How long after `DeleteCluster` the clock owes the `Deleting` -> gone transition of a
+/// HyperPod cluster. The same compressed, never-zero span as
+/// [`CLUSTER_IN_SERVICE_AFTER`]: a caller that describes the cluster straight after
+/// asking for its deletion still observes `Deleting`, one that waits observes the
+/// cluster gone. Real HyperPod teardown takes many minutes; the span is the emulator's
+/// own choice.
+pub const CLUSTER_RELEASED_AFTER: Duration = CLUSTER_IN_SERVICE_AFTER;
+
+/// `ClusterStatus`'s terminal failure member. Nothing in this emulator fails a cluster,
+/// so no record carries it — it is named because a delete is admitted for a cluster in
+/// it as well as for one `InService` ([`Cluster::accepts_deletion`]), and a handler must
+/// not compare a bare string literal.
+pub const CLUSTER_STATUS_FAILED: &str = "Failed";
+
 /// See [`MODEL_QUOTA`]; bounds the cluster store, and is released by `DeleteCluster`.
 pub const CLUSTER_QUOTA: usize = 1_000;
 
@@ -4979,6 +4996,11 @@ pub struct Cluster {
     pub tags: Vec<Tag>,
     pub creation_time: SystemTime,
     pub in_service_at: SystemTime,
+    /// The instant the clock owes this cluster's deletion, set by
+    /// [`Cluster::begin_deletion`]; `None` while no `DeleteCluster` has asked for one.
+    /// Past it the cluster is gone for every caller ([`Cluster::is_released`]), whether
+    /// or not a sweep has released the record yet.
+    pub removal_due_at: Option<SystemTime>,
     /// The cluster's nodes, keyed by `NodeLogicalId` — the instances its groups were
     /// created asking for plus the ones `BatchAddClusterNodes` added, which
     /// `ListClusterNodes` reports, `DescribeClusterNode` replays and
@@ -4992,6 +5014,43 @@ pub struct Cluster {
 }
 
 impl Cluster {
+    /// Whether a delete may begin on this cluster: its status is a settled one.
+    ///
+    /// A cluster the service is already moving — provisioning it, updating it, rolling
+    /// an update back, or tearing it down — cannot take a second change at the same
+    /// time, which is the conflict `DeleteCluster` models `ConflictException` for. The
+    /// settled statuses are `InService` and [`CLUSTER_STATUS_FAILED`].
+    pub fn accepts_deletion(&self) -> bool {
+        self.status == STATUS_IN_SERVICE || self.status == CLUSTER_STATUS_FAILED
+    }
+
+    /// Start the deletion `DeleteCluster` asked for: the cluster reports `Deleting`, and
+    /// the clock owes its release [`CLUSTER_RELEASED_AFTER`] later.
+    ///
+    /// The record is NOT dropped here: SageMaker answers a cluster in `ClusterStatus`'s
+    /// `Deleting` until the teardown finishes, so the transient status is observable and
+    /// the removal is the clock's — stored as an instant and never slept on.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        self.status = STATUS_DELETING.to_string();
+        self.removal_due_at = Some(now + CLUSTER_RELEASED_AFTER);
+    }
+
+    /// Whether a `DeleteCluster` has asked for this cluster's deletion, i.e. it is
+    /// `Deleting` and on its way out.
+    pub fn is_deleting(&self) -> bool {
+        self.removal_due_at.is_some()
+    }
+
+    /// Whether the deletion the clock owed has completed, i.e. the cluster is gone.
+    ///
+    /// A lookup answers `None` for such a cluster and a listing leaves it out, so no
+    /// caller sees a cluster whose teardown was already due — the record itself is
+    /// dropped by [`ComAmazonawsSagemakerSagemakerState::release_deleted_clusters`],
+    /// which frees the name and the quota slot it held.
+    pub fn is_released(&self, now: SystemTime) -> bool {
+        self.removal_due_at.is_some_and(|due| now >= due)
+    }
+
     /// Materialise the `Creating` -> `InService` transition the clock already owes.
     ///
     /// The one write a reporting operation may make: the transition was due at
@@ -5147,6 +5206,26 @@ impl ComAmazonawsSagemakerSagemakerState {
         self.clusters.len() < CLUSTER_QUOTA
     }
 
+    /// Drop every cluster whose deletion the clock already completed, answering their
+    /// ARNs in store order.
+    ///
+    /// Materialises only what was already due: the release was owed at the stored instant
+    /// whether or not anybody called, and a lookup already answers `None` for such a
+    /// cluster ([`Cluster::is_released`]), so this changes nothing a later caller sees —
+    /// it frees the name and the quota slot the gone cluster still held.
+    pub fn release_deleted_clusters(&mut self, now: SystemTime) -> Vec<String> {
+        let released: Vec<(String, String)> = self
+            .clusters
+            .values()
+            .filter(|cluster| cluster.is_released(now))
+            .map(|cluster| (cluster.name.clone(), cluster.arn.clone()))
+            .collect();
+        for (name, _) in &released {
+            self.clusters.remove(name);
+        }
+        released.into_iter().map(|(_, arn)| arn).collect()
+    }
+
     /// The cluster whose `ClusterArn` is `arn`, if this account holds one.
     ///
     /// [`Self::clusters`] is keyed by `ClusterName` — the identifier `CreateCluster`
@@ -5156,7 +5235,10 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// resolves it against the same records `CreateCluster` writes and `ListClusters`
     /// reports, rather than against a second copy of the cluster.
     pub fn cluster_by_arn(&self, arn: &str) -> Option<&Cluster> {
-        self.clusters.values().find(|cluster| cluster.arn == arn)
+        self.clusters
+            .values()
+            .find(|cluster| cluster.arn == arn)
+            .filter(|cluster| !cluster.is_released(SystemTime::now()))
     }
 }
 
@@ -6036,29 +6118,44 @@ impl ComAmazonawsSagemakerSagemakerState {
 impl ComAmazonawsSagemakerSagemakerState {
     /// The cluster a `ClusterNameOrArn` member names: by ARN when the value is one, by
     /// name otherwise — the two forms the model accepts for the one resource.
+    /// A cluster whose deletion the clock already completed answers `None` here, as it
+    /// does from every other cluster lookup ([`Cluster::is_released`]).
     pub fn cluster_by_name_or_arn(&self, value: &str) -> Option<&Cluster> {
+        let now = SystemTime::now();
         if value.starts_with(ARN_PREFIX) {
-            return self.clusters.values().find(|cluster| cluster.arn == value);
+            return self
+                .clusters
+                .values()
+                .find(|cluster| cluster.arn == value)
+                .filter(|cluster| !cluster.is_released(now));
         }
-        self.clusters.get(value)
+        self.clusters
+            .get(value)
+            .filter(|cluster| !cluster.is_released(now))
     }
 
     /// [`Self::cluster_by_name_or_arn`], for a caller that writes.
     pub fn cluster_by_name_or_arn_mut(&mut self, value: &str) -> Option<&mut Cluster> {
+        let now = SystemTime::now();
         if value.starts_with(ARN_PREFIX) {
             return self
                 .clusters
                 .values_mut()
-                .find(|cluster| cluster.arn == value);
+                .find(|cluster| cluster.arn == value)
+                .filter(|cluster| !cluster.is_released(now));
         }
-        self.clusters.get_mut(value)
+        self.clusters
+            .get_mut(value)
+            .filter(|cluster| !cluster.is_released(now))
     }
 
     /// [`Self::cluster_by_arn`], for a caller that writes.
     pub fn cluster_by_arn_mut(&mut self, value: &str) -> Option<&mut Cluster> {
+        let now = SystemTime::now();
         self.clusters
             .values_mut()
             .find(|cluster| cluster.arn == value)
+            .filter(|cluster| !cluster.is_released(now))
     }
 
     /// The partner app whose ARN is `value`.

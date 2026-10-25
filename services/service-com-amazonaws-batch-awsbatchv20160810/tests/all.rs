@@ -33,6 +33,8 @@ mod job_lifecycle;
 mod job_queue_updates;
 #[path = "all/job_state_change_events.rs"]
 mod job_state_change_events;
+#[path = "all/quota_share_listing.rs"]
+mod quota_share_listing;
 #[path = "all/refusal_contract.rs"]
 mod refusal_contract;
 #[path = "all/resource_tags.rs"]

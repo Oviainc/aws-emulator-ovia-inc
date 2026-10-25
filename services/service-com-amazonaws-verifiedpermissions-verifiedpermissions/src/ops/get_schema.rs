@@ -32,6 +32,11 @@
 //!   The ID of the policy store that contains the schema.
 //! * `schema` (SchemaJson, len 1..) **required** — The body of the schema, written in Cedar
 //!   schema JSON.
+//! * `definition` (SchemaDefinition) — the same schema document in the union form
+//!   `PutSchema` takes it in (`cedarJson`). NOT declared by the checked-in
+//!   `GetSchemaOutput`: the recorded response carries it beside `schema`, and the
+//!   recording is what the wire is, so it is reported from the same stored
+//!   document rather than left off for a client whose SDK reads the union arm.
 //!
 //! ## Errors
 //!
@@ -146,6 +151,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Modelled optional here (unlike on `PutSchema`), but a schema
             // document always knows its namespaces, so they are always reported.
             namespaces: Some(schema.namespaces.clone()),
+            // The same one document, in the union form the writer takes it in.
+            definition: SchemaDefinition::cedarJson(schema.cedar_json.clone()),
         })
     }
 }

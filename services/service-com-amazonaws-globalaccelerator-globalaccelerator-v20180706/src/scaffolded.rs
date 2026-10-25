@@ -177,13 +177,46 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The wire-name suffix every modelled error that reports a resource the service does
+/// not hold shares: `AcceleratorNotFoundException`, `ListenerNotFoundException`,
+/// `EndpointGroupNotFoundException`, `EndpointNotFoundException`,
+/// `AttachmentNotFoundException` and `ByoipCidrNotFoundException`
+/// (`smithy_query(query="shape", shape="AcceleratorNotFoundException,...")`: each
+/// `errorKind` client, each `@httpError 404`).
+const NOT_FOUND_EXCEPTION_SUFFIX: &str = "NotFoundException";
+
+/// The status THIS service serializes the modelled error `shape_name` at, given the
+/// `modelled` status its own `@httpError` declares.
+///
+/// Global Accelerator's frontend answers a request that references a resource it does
+/// not hold with HTTP **400**, not the 404 those shapes' `@httpError` declares:
+/// recorded wire behaviour, seen on four operations across three fixtures
+/// (`DescribeAccelerator`, `DescribeListener`, `DescribeEndpointGroup`,
+/// `CreateListener`) with the body's `__type` and `Message` exactly as modelled — so
+/// the error identity is the model's and only the status is the frontend's. A 404 on a
+/// JSON-protocol endpoint reads to generic HTTP middleware as a missing route rather
+/// than a missing resource, which is what makes the difference observable to a client.
+///
+/// It is a per-SERVICE rule, applied here — the one place every operation's error is
+/// serialized through — rather than in each handler, so an operation that raises one of
+/// these errors later cannot answer a different status for the same condition. Every
+/// other modelled error keeps the status its own `@httpError` declares.
+fn frontend_status(shape_name: &str, modelled: u16) -> u16 {
+    if shape_name.ends_with(NOT_FOUND_EXCEPTION_SUFFIX) {
+        400
+    } else {
+        modelled
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
 pub enum Scaffolded<E> {
     /// The operation is generated but has no implementation. Renders as HTTP 501.
     NotImplemented(NotImplemented),
-    /// A modeled error the operation declares. Renders with the model's own status.
+    /// A modeled error the operation declares. Renders with the status this service's
+    /// frontend serializes that error at — see [`frontend_status`].
     Modeled(E),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
@@ -282,10 +315,14 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     ///
     /// Keep it 501 and not a 5xx server fault: SDK retry classifiers treat those as
     /// retryable, so a client would retry an operation that can never succeed.
+    ///
+    /// A modeled error takes the status THIS SERVICE's frontend serializes it at
+    /// ([`frontend_status`]), which is the model's `@httpError` for every error except
+    /// the not-found family.
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
-            Self::Modeled(e) => e.http_status(),
+            Self::Modeled(e) => frontend_status(e.shape_name(), e.http_status()),
             Self::ValidationException(_) => 400,
         }
     }

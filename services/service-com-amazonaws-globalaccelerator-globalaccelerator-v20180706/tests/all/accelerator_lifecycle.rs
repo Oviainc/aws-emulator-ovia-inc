@@ -356,7 +356,7 @@ async fn an_accelerator_and_its_listener_round_trip_through_the_store() {
     .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (404, "AcceleratorNotFoundException"),
+        (400, "AcceleratorNotFoundException"),
         "case describe after delete: got {status} {body}"
     );
     let listed = ok(&router, "ListAccelerators", json!({})).await;
@@ -368,7 +368,8 @@ async fn an_accelerator_and_its_listener_round_trip_through_the_store() {
 }
 
 /// RULE: a resource ARN the store does not hold is the operation's own
-/// not-found error, with the status the model declares — never a success.
+/// not-found error, at the status this service answers a missing resource with —
+/// never a success.
 #[tokio::test]
 async fn an_unknown_arn_is_the_modelled_not_found_error() {
     let router = emulator();
@@ -381,25 +382,25 @@ async fn an_unknown_arn_is_the_modelled_not_found_error() {
             "DescribeAccelerator",
             json!({ "AcceleratorArn": missing_accelerator }),
             "AcceleratorNotFoundException",
-            404,
+            400,
         ),
         (
             "DeleteAccelerator",
             json!({ "AcceleratorArn": missing_accelerator }),
             "AcceleratorNotFoundException",
-            404,
+            400,
         ),
         (
             "UpdateAccelerator",
             json!({ "AcceleratorArn": missing_accelerator, "Enabled": false }),
             "AcceleratorNotFoundException",
-            404,
+            400,
         ),
         (
             "ListListeners",
             json!({ "AcceleratorArn": missing_accelerator }),
             "AcceleratorNotFoundException",
-            404,
+            400,
         ),
         (
             "CreateListener",
@@ -410,19 +411,19 @@ async fn an_unknown_arn_is_the_modelled_not_found_error() {
                 "IdempotencyToken": "tok-missing",
             }),
             "AcceleratorNotFoundException",
-            404,
+            400,
         ),
         (
             "DescribeListener",
             json!({ "ListenerArn": missing_listener }),
             "ListenerNotFoundException",
-            404,
+            400,
         ),
         (
             "DeleteListener",
             json!({ "ListenerArn": missing_listener }),
             "ListenerNotFoundException",
-            404,
+            400,
         ),
     ];
 

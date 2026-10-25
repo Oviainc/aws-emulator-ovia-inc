@@ -349,6 +349,82 @@ pub(crate) fn xml_blocks(xml: &str, tag: &str) -> Vec<String> {
     found
 }
 
+/// Wait past the instant a drift detection's own result becomes due.
+///
+/// The drift clock's counterpart to [`wait_for_the_transition`], shared by every suite that
+/// runs a detection so the two cannot disagree about how long one takes to conclude.
+pub(crate) async fn wait_for_the_detection() {
+    tokio::time::sleep(state::DRIFT_DETECTION_DELAY + Duration::from_millis(250)).await;
+}
+
+/// Deploy a template, wait past the instant its create settles, and assert it completed.
+///
+/// The IAM resources a template may declare are acknowledged, so a row that declares one is
+/// accepted whichever of the two capabilities it requires.
+pub(crate) async fn deploy(router: &MultiServiceRouter, name: &str, template: &str) {
+    let (status, body) = create_stack(router, name, template, &acknowledging_iam(&[])).await;
+    assert_eq!(
+        status, 200,
+        "case {name:?}: CreateStack answered {status} with {body}"
+    );
+    wait_for_the_transition().await;
+    let (status, body) = describe_stack(router, name).await;
+    assert_eq!(
+        status, 200,
+        "case {name:?}: DescribeStacks answered {status} with {body}"
+    );
+    assert_eq!(
+        xml_text(&body, "StackStatus").as_deref(),
+        Some("CREATE_COMPLETE"),
+        "case {name:?}: expected the create to complete, got {body}"
+    );
+}
+
+/// The top-level `<member>` elements of the first `tag` list in `xml`, each as the XML it
+/// holds, in wire order.
+///
+/// The leaf form of this scan is [`xml_blocks`]; this one is for a LIST, whose entries the
+/// query serializer renders as `<member>` and whose first entry carries the envelope's
+/// `xmlns`, so the element is matched by name. A member may itself carry a nested list of
+/// `<member>`s (a `StackResourceDrift`'s `PropertyDifferences`), so the scan tracks DEPTH:
+/// an inner member does not close the outer one, and what comes back is the outer entries.
+pub(crate) fn list_members(xml: &str, tag: &str) -> Vec<String> {
+    let mut members = Vec::new();
+    let Some(block) = xml_blocks(xml, tag).into_iter().next() else {
+        return members;
+    };
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut index = 0usize;
+    while index < block.len() {
+        let rest = &block[index..];
+        if rest.starts_with("<member") {
+            let Some(tag_end) = rest.find('>') else { break };
+            index += tag_end + 1;
+            if depth == 0 {
+                start = index;
+            }
+            depth += 1;
+            continue;
+        }
+        if rest.starts_with("</member>") {
+            if depth == 0 {
+                // A close with nothing open: the scan has run past the list it was handed,
+                // so it stops with what it read rather than underflowing the depth.
+                break;
+            }
+            depth -= 1;
+            if depth == 0 {
+                members.push(block[start..index].to_string());
+            }
+            index += "</member>".len();
+            continue;
+        }
+        index += rest.chars().next().map_or(1, char::len_utf8);
+    }
+    members
+}
+
 pub(crate) async fn create_stack(
     router: &MultiServiceRouter,
     name: &str,

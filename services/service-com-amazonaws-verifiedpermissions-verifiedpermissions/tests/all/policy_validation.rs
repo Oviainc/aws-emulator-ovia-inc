@@ -504,8 +504,9 @@ async fn a_schema_refusal_reports_every_reason_at_the_validated_member() {
             1,
         ),
         (
-            // A policy TEMPLATE carries its Cedar text at the top level, so the
-            // validated member is `/statement`.
+            // A policy TEMPLATE's statement is an element of the template the
+            // call describes, so the validated member is
+            // `/template/statement`.
             "CreatePolicyTemplate naming an action the schema does not declare",
             "CreatePolicyTemplate",
             json!({
@@ -514,7 +515,7 @@ async fn a_schema_refusal_reports_every_reason_at_the_validated_member() {
                               action == PhotoApp::Action::\"deletePhoto\", \
                               resource == PhotoApp::Photo::\"vacation.jpg\");",
             }),
-            "/statement",
+            "/template/statement",
             1,
         ),
     ];

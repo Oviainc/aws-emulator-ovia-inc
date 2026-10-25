@@ -15,12 +15,16 @@
 mod account_allocated_concurrency;
 #[path = "all/account_settings.rs"]
 mod account_settings;
+#[path = "all/alias_deletion.rs"]
+mod alias_deletion;
 #[path = "all/alias_listing.rs"]
 mod alias_listing;
 #[path = "all/alias_name_constraint.rs"]
 mod alias_name_constraint;
 #[path = "all/alias_not_found_sentence.rs"]
 mod alias_not_found_sentence;
+#[path = "all/alias_update.rs"]
+mod alias_update;
 #[path = "all/async_invocation.rs"]
 mod async_invocation;
 #[path = "all/capacity_provider_bounds.rs"]
@@ -39,6 +43,8 @@ mod code_signing_config_update;
 mod code_signing_configs;
 #[path = "all/event_source_mapping_deletion.rs"]
 mod event_source_mapping_deletion;
+#[path = "all/event_source_mapping_update.rs"]
+mod event_source_mapping_update;
 #[path = "all/event_source_mappings.rs"]
 mod event_source_mappings;
 #[path = "all/function_aliases.rs"]
@@ -61,6 +67,8 @@ mod function_scaling_config;
 mod function_url_config;
 #[path = "all/function_url_deletion.rs"]
 mod function_url_deletion;
+#[path = "all/function_url_update.rs"]
+mod function_url_update;
 #[path = "all/function_version_listing.rs"]
 mod function_version_listing;
 #[path = "all/layer_listing.rs"]
@@ -91,6 +99,8 @@ mod resource_policy;
 mod resource_policy_document;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/response_stream_invocation.rs"]
+mod response_stream_invocation;
 #[path = "all/runtime_management_config.rs"]
 mod runtime_management_config;
 #[path = "all/signing_name_routing.rs"]

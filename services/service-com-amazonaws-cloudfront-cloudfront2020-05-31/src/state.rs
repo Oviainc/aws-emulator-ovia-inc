@@ -4630,6 +4630,29 @@ pub fn is_public_key_id(value: &str) -> bool {
     is_prefixed_token(value, PUBLIC_KEY_ID_PREFIX)
 }
 
+/// The longest name a key value store carries, and the length its own name constraint
+/// bounds every store name by.
+///
+/// `KeyValueStoreName` is `length 1..64, pattern ^[a-zA-Z0-9-_]{1,64}$` (from
+/// `smithy_query` on `CreateKeyValueStoreRequest$Name`), so this is the model's bound
+/// rather than a number this emulator chose.
+pub const MAX_KEY_VALUE_STORE_NAME: usize = 64;
+
+/// Whether `value` is a name a key value store of this account can be held under: the
+/// `KeyValueStoreName` constraint, `length 1..`[`MAX_KEY_VALUE_STORE_NAME`] over the
+/// characters its pattern admits (ASCII letters, digits, `-` and `_`).
+///
+/// `ListKeyValueStores`'s `Marker` is the name the previous page ended at, and the model
+/// constrains that parameter no further than `string`, so this is what tells a resume
+/// point this service handed out from a value a client made up.
+pub fn is_key_value_store_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_KEY_VALUE_STORE_NAME
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// Whether `value` is `prefix` followed by [`ID_BODY_LEN`] characters of the id
 /// alphabet.
 fn is_prefixed_token(value: &str, prefix: char) -> bool {
@@ -6090,6 +6113,25 @@ pub fn key_value_store_already_exists(name: &str) -> EntityAlreadyExists {
         )),
     }
 }
+
+/// The modelled `InvalidArgument` (HTTP 400) for a `ListKeyValueStores` `Marker` that is
+/// no resume point this service handed out.
+///
+/// ONE CONSTANT for the condition, for the same reason [`invalid_public_key_marker`] is
+/// one: what the refusal states is the CONSTRAINT on the parameter — a marker is a key
+/// value store name — which is a property of the parameter rather than of the value
+/// submitted, so nothing from the request belongs in the text.
+pub fn invalid_key_value_store_marker() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(INVALID_KEY_VALUE_STORE_MARKER_MESSAGE.to_string()),
+    }
+}
+
+/// The message `ListKeyValueStores` refuses an unusable `Marker` with: the constraint on
+/// the parameter, worded as [`INVALID_PUBLIC_KEY_MARKER_MESSAGE`] words the same
+/// constraint on the other listing's marker.
+pub const INVALID_KEY_VALUE_STORE_MARKER_MESSAGE: &str =
+    "Marker must be a valid CF key value store Name";
 
 /// The modelled `EntityNotFound` (HTTP 404) for a distribution id no stored distribution
 /// carries, for the operations whose model names `EntityNotFound` rather than

@@ -711,9 +711,10 @@ pub fn validate_port_range(range: &PortRange) -> Result<(i32, i32), String> {
         ));
     }
     if from > to {
-        return Err(format!(
-            "PortRange {from}-{to} is invalid: FromPort must not be greater than ToPort"
-        ));
+        // The sentence the service states this violation with: the requirement on the
+        // two members, with no part taken from the request (recorded wire behaviour on
+        // `CreateListener`).
+        return Err("FromPort should be less than or equal to ToPort".to_string());
     }
     Ok((from, to))
 }
@@ -902,6 +903,18 @@ pub fn accelerator_not_found_message(accelerator_arn: &str) -> String {
     format!("Accelerator {accelerator_arn} not found.")
 }
 
+/// The message a create states when the accelerator it was asked to attach the new
+/// resource to does not exist.
+///
+/// The service words the parent lookup of a create as a sentence with no variable part:
+/// recorded wire behaviour on `CreateListener`. The operation that is ASKED about one
+/// accelerator (a describe, a delete, an update, a list of its children) states
+/// [`accelerator_not_found_message`] instead, which names the ARN the request carried,
+/// so each path keeps the wording it is observed with.
+pub fn create_parent_accelerator_not_found_message() -> String {
+    "Could not find accelerator.".to_string()
+}
+
 /// The message for a refusal that names a listener the store does not hold. The same
 /// rule as [`accelerator_not_found_message`], one level down.
 pub fn listener_not_found_message(listener_arn: &str) -> String {
@@ -909,9 +922,12 @@ pub fn listener_not_found_message(listener_arn: &str) -> String {
 }
 
 /// The message for a refusal that names an endpoint group the store does not hold. The
-/// same rule as [`accelerator_not_found_message`], one level further down.
+/// same rule as [`accelerator_not_found_message`], one level further down, in the
+/// wording the service states this error class with: the resource kind as the model
+/// spells the shape, the ARN the request carried, and "does not exist" (recorded wire
+/// behaviour on `DescribeEndpointGroup`).
 pub fn endpoint_group_not_found_message(endpoint_group_arn: &str) -> String {
-    format!("Endpoint group {endpoint_group_arn} not found.")
+    format!("EndpointGroup {endpoint_group_arn} does not exist.")
 }
 
 /// The message for deleting an accelerator that is still enabled.

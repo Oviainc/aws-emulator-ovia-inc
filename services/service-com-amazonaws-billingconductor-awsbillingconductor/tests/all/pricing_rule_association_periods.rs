@@ -23,6 +23,9 @@
 //! The wire cannot make an association in a PAST period — an associating call happens
 //! now — so a row makes its association through the real wire and then backdates the
 //! stored start period, which is the one thing the test cannot ask the service for.
+//! Backdating an association backdates the RULE it names too: an association cannot be
+//! in force in a period before the rule exists, and a rule is reported only for the
+//! periods from its creation onward.
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -55,6 +58,24 @@ fn period_from_months(total: i64) -> String {
         total.div_euclid(12),
         total.rem_euclid(12) + 1
     )
+}
+
+/// The instant a billing period BEGINS, in millis since the epoch: midnight UTC on the
+/// first day of that month.
+///
+/// The conversion is `aws_smithy_types::DateTime` — the same formatter the service
+/// derives a billing period from an instant with — rather than hand-written calendar
+/// arithmetic, applied to the canonical spelling of the month so either spelling of one
+/// period answers the same instant.
+pub(crate) fn period_start_millis(period: &str) -> i64 {
+    let canonical = period_from_months(period_months(period));
+    ::aws_smithy_types::DateTime::from_str(
+        &format!("{canonical}-01T00:00:00Z"),
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .unwrap_or_else(|error| panic!("a test billing period starts at an instant: {error}"))
+    .to_millis()
+    .unwrap_or_else(|error| panic!("a test billing period start fits in millis: {error}"))
 }
 
 /// The period `months` after `period` (negative for before), crossing year
@@ -97,6 +118,12 @@ impl Emulator {
     /// the parsed response body.
     pub(crate) async fn post(&self, path: &str, body: &Value) -> (u16, Value) {
         self.send("POST", path, body).await
+    }
+
+    /// PUT a JSON body to one of this service's routes — the method the writes'
+    /// modelled HTTP bindings name (`UpdatePricingRule`, `AssociatePricingRules`).
+    pub(crate) async fn put(&self, path: &str, body: &Value) -> (u16, Value) {
+        self.send("PUT", path, body).await
     }
 
     /// Send a JSON body to one of this service's routes with the method its modelled
@@ -184,17 +211,59 @@ impl Emulator {
     }
 
     /// Backdate every association the plan holds to `period`, as if the associating
-    /// call had been made in that billing period.
+    /// call had been made in that billing period — and with it the rules those
+    /// associations name, since a rule has to exist in the period its association is in
+    /// force in.
     fn backdate(&self, plan: &str, period: &str) {
+        let rules: Vec<String> = {
+            let state = self.engine.state::<BillingConductorState>();
+            let mut state = state.lock();
+            let record = state
+                .pricing_plans
+                .get_mut(plan)
+                .expect("setup backdate: the plan was created above");
+            for association in &mut record.pricing_rule_associations {
+                association.inclusive_start_billing_period = period.to_string();
+            }
+            record
+                .pricing_rule_associations
+                .iter()
+                .map(|association| association.arn.clone())
+                .collect()
+        };
+        for rule in rules {
+            self.create_rule_in(&rule, period);
+        }
+    }
+
+    /// Backdate `rule_arn`'s creation to `period`, as if the creating call had been made
+    /// in that billing period: the way a world where a rule already existed in a closed
+    /// period is set up, which no request can ask for (a create happens now).
+    pub(crate) fn create_rule_in(&self, rule_arn: &str, period: &str) {
+        let at = period_start_millis(period);
         let state = self.engine.state::<BillingConductorState>();
         let mut state = state.lock();
         let record = state
-            .pricing_plans
-            .get_mut(plan)
-            .expect("setup backdate: the plan was created above");
-        for association in &mut record.pricing_rule_associations {
-            association.inclusive_start_billing_period = period.to_string();
-        }
+            .pricing_rules
+            .get_mut(rule_arn)
+            .expect("setup create_rule_in: the rule was created above");
+        record.creation_time_millis = at;
+        record.last_modified_time_millis = at;
+    }
+
+    /// Backdate the rule's CURRENT generation to `period`, as if the write that left the
+    /// rule as it stands had been made in that billing period: how a world whose
+    /// generations started in DIFFERENT periods is set up, which no request can ask for
+    /// (a write happens now).
+    pub(crate) fn restate_generation_in(&self, rule_arn: &str, period: &str) {
+        let at = period_start_millis(period);
+        let state = self.engine.state::<BillingConductorState>();
+        let mut state = state.lock();
+        let record = state
+            .pricing_rules
+            .get_mut(rule_arn)
+            .expect("setup restate_generation_in: the rule was created above");
+        record.last_modified_time_millis = at;
     }
 
     /// Backdate the plan's association with ONE rule to `period`, as if that
@@ -203,18 +272,22 @@ impl Emulator {
     /// (`tests/all/pricing_rule_association_billing_periods.rs`), which no request can
     /// ask for.
     pub(crate) fn start_association_in(&self, plan: &str, rule_arn: &str, period: &str) {
-        let state = self.engine.state::<BillingConductorState>();
-        let mut state = state.lock();
-        let record = state
-            .pricing_plans
-            .get_mut(plan)
-            .expect("setup start_association_in: the plan was created above");
-        let association = record
-            .pricing_rule_associations
-            .iter_mut()
-            .find(|association| association.arn == rule_arn)
-            .expect("setup start_association_in: the association was made above");
-        association.inclusive_start_billing_period = period.to_string();
+        {
+            let state = self.engine.state::<BillingConductorState>();
+            let mut state = state.lock();
+            let record = state
+                .pricing_plans
+                .get_mut(plan)
+                .expect("setup start_association_in: the plan was created above");
+            let association = record
+                .pricing_rule_associations
+                .iter_mut()
+                .find(|association| association.arn == rule_arn)
+                .expect("setup start_association_in: the association was made above");
+            association.inclusive_start_billing_period = period.to_string();
+        }
+        // The rule has to exist in the period its association is in force in.
+        self.create_rule_in(rule_arn, period);
     }
 
     /// The rule ARNs `ListPricingRulesAssociatedToPricingPlan` reports for `plan` in
@@ -286,6 +359,15 @@ impl Emulator {
             status, 200,
             "case {case}: ListPricingRules expected 200, got {status} with {answer:?}"
         );
+        // A rule is reported only for the billing periods from its creation onward, so a
+        // period in which the rule did not exist yet reports neither the rule nor any
+        // association of it: no plan associates it then.
+        if answer["PricingRules"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+        {
+            return 0;
+        }
         answer["PricingRules"][0]["AssociatedPricingPlanCount"]
             .as_i64()
             .unwrap_or_else(|| {

@@ -178,34 +178,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `MaxResults` declares no default, so an absent one means "as many as a page can
-        // hold": the modelled maximum of `ListServiceLevelObjectivesMaxResults`. A value
-        // outside the modelled `range 1..50` is refused rather than coerced, so a caller
-        // never reads an empty page as "nothing is stored". The refusal is worded by the
-        // service's one constraint-violation builder — member path and requirement, with no
-        // echo of the rejected value — so a constraint this handler enforces reads exactly
-        // like the same constraint enforced at the boundary.
+        // hold": the modelled maximum of `ListServiceLevelObjectivesMaxResults`. A supplied
+        // value is read straight off the input, because its modelled `range 1..50` is
+        // enforced and worded once for every operation of this service — by the centralized
+        // walk, before any handler runs — exactly as every sibling list here relies on.
         let page_size = match input.max_results {
             None => crate::state::MAX_SLO_PAGE as usize,
-            Some(max_results) if max_results < 1 => {
-                return Err(crate::scaffolded::Scaffolded::validation(
-                    crate::state::validation_envelope(&[crate::state::constraint_clause(
-                        "maxResults",
-                        "Member must have value greater than or equal to 1",
-                    )]),
-                ))
-            }
-            Some(max_results) if max_results > crate::state::MAX_SLO_PAGE => {
-                return Err(crate::scaffolded::Scaffolded::validation(
-                    crate::state::validation_envelope(&[crate::state::constraint_clause(
-                        "maxResults",
-                        &format!(
-                            "Member must have value less than or equal to {}",
-                            crate::state::MAX_SLO_PAGE
-                        ),
-                    )]),
-                ))
-            }
-            Some(max_results) => max_results as usize,
+            Some(max_results) => max_results.max(0) as usize,
         };
 
         let cursor = match input.next_token.as_deref() {

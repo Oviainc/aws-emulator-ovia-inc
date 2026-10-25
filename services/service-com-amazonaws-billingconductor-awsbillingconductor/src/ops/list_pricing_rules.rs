@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPricingRules
-//! Reports the pricing rules this service holds, one page at a time — the read that
-//! `CreatePricingRule` and `DeletePricingRule` are observable through.
+//! Reports the pricing rules this service holds for ONE billing period, one page at a
+//! time — the read that `CreatePricingRule`, `UpdatePricingRule` and
+//! `DeletePricingRule` are observable through.
 //!
 //! ## Shape of an operation
 //!
@@ -112,25 +113,31 @@ impl From<ListPricingRulesErrorModeled> for ListPricingRulesError {
     }
 }
 
-/// The modelled view of a stored rule. `AssociatedPricingPlanCount` is derived from
-/// the pricing plans that name the rule, never stored beside it.
+/// The modelled view of a stored rule AS IT STOOD in the billing period the read is
+/// scoped to: `version` is the generation of the rule in force in that period
+/// ([`crate::state::PricingRuleRecord::effective_in`]), and the members no write can
+/// change (`Arn`, `Scope`, `Service`, `BillingEntity`, `UsageType`, `Operation`,
+/// `CreationTime` — none of them carried by `UpdatePricingRuleInput`) come from the
+/// record itself. `AssociatedPricingPlanCount` is derived from the pricing plans that
+/// name the rule in that same period, never stored beside it.
 fn element(
     rule: &crate::state::PricingRuleRecord,
+    version: &crate::state::PricingRuleVersion,
     associated_pricing_plan_count: i64,
 ) -> PricingRuleListElement {
     PricingRuleListElement {
-        name: Some(rule.name.clone()),
+        name: Some(version.name.clone()),
         arn: Some(rule.arn.clone()),
-        description: rule.description.clone(),
+        description: version.description.clone(),
         scope: Some(rule.scope.clone()),
-        r#type: Some(rule.rule_type.clone()),
-        modifier_percentage: rule.modifier_percentage,
+        r#type: Some(version.rule_type.clone()),
+        modifier_percentage: version.modifier_percentage,
         service: rule.service.clone(),
         associated_pricing_plan_count,
         creation_time: rule.creation_time_millis,
-        last_modified_time: rule.last_modified_time_millis,
+        last_modified_time: version.last_modified_time_millis,
         billing_entity: rule.billing_entity.clone(),
-        tiering: rule.tiering.as_ref().map(|tiering| Tiering {
+        tiering: version.tiering.as_ref().map(|tiering| Tiering {
             free_tier: tiering
                 .free_tier_activated
                 .map(|activated| FreeTierConfig { activated }),
@@ -202,10 +209,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .collect()
             });
 
-        // `AssociatedPricingPlanCount` counts the plans that associate the rule, and
-        // an association is in force only from the billing period it was made in
-        // onward, so the count is taken for the period the read is scoped to. A
-        // request that names no period asks about the current one.
+        // `BillingPeriod` selects the month the listing is READ FOR — "the billing
+        // period for which the described pricing rules are applicable" — and a request
+        // that names no period asks about the current one. So a rule is reported only
+        // for the periods it existed in, with the values that held in the period asked
+        // about: the generation in force then
+        // ([`crate::state::PricingRuleRecord::effective_in`]) and the plan associations
+        // in force then.
         let billing_period = input
             .billing_period
             .clone()
@@ -213,24 +223,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `pricing_rules` is ordered by ARN, and an ARN carries the monotonic id this
         // service mints, so the sequence is creation order and a `NextToken` names the
-        // same cut point on the next call.
-        let selected: Vec<(String, PricingRuleListElement)> = state
+        // same cut point on the next call. The page is cut FIRST, so the generation each
+        // reported rule stood at is projected for at most one page of rules — bounded by
+        // the request's `MaxResults`, or by `DEFAULT_PAGE_SIZE` when it names none.
+        let selected: Vec<(String, &crate::state::PricingRuleRecord)> = state
             .pricing_rules
             .iter()
-            .filter(|(arn, _)| wanted.as_ref().is_none_or(|wanted| wanted.contains(arn)))
-            .map(|(arn, rule)| {
-                (
-                    arn.clone(),
-                    element(
-                        rule,
-                        state.associated_pricing_plan_count(arn, &billing_period),
-                    ),
-                )
+            .filter(|(arn, rule)| {
+                wanted.as_ref().is_none_or(|wanted| wanted.contains(*arn))
+                    && rule.exists_in(&billing_period)
             })
+            .map(|(arn, rule)| (arn.clone(), rule))
             .collect();
 
-        let (pricing_rules, next_token) =
+        let (page, next_token) =
             crate::state::paginate(selected, input.next_token.as_deref(), input.max_results);
+        let pricing_rules: Vec<PricingRuleListElement> = page
+            .iter()
+            .filter_map(|rule| {
+                let version = rule.effective_in(&billing_period)?;
+                Some(element(
+                    rule,
+                    &version,
+                    state.associated_pricing_plan_count(&rule.arn, &billing_period),
+                ))
+            })
+            .collect();
 
         Ok(ListPricingRulesOutput {
             // "The billing period for which the described pricing rules are

@@ -695,6 +695,17 @@ pub struct DeployedResource {
     /// `StackResourceDriftInformation$LastCheckTimestamp`: "when CloudFormation last
     /// checked if the resource had drifted from its expected configuration".
     pub drift_checked_at: Option<SystemTime>,
+    /// The COMPARISON the last drift detection carried out over this resource: the expected
+    /// and actual configurations it read and the differences it found
+    /// ([`drift::ResourceDriftDetail`]), which is what `DescribeStackResourceDrifts` reports
+    /// per resource.
+    ///
+    /// `None` for a resource no check was carried out for — one nothing has checked yet,
+    /// and one whose type drift detection is not supported for here, which is exactly the
+    /// set `DescribeStackResourceDrifts` leaves out ("resources that haven't yet been
+    /// checked for drift aren't included"; "resources that don't currently support drift
+    /// detection aren't checked, and so not included").
+    pub drift_detail: Option<drift::ResourceDriftDetail>,
 }
 
 impl DeployedResource {
@@ -708,6 +719,7 @@ impl DeployedResource {
             status_reason: None,
             drift_status: resource_drift_status::NOT_CHECKED.to_string(),
             drift_checked_at: None,
+            drift_detail: None,
         }
     }
 }
@@ -2412,6 +2424,7 @@ impl ComAmazonawsCloudformationCloudformationState {
             {
                 deployed.drift_status = result.status.clone();
                 deployed.drift_checked_at = Some(checked_at);
+                deployed.drift_detail = result.detail.clone();
             }
         }
     }
@@ -3240,6 +3253,8 @@ pub enum PageOf {
     StackEvents,
     /// `ListStackResources`'s `StackResourceSummaries`.
     StackResourceSummaries,
+    /// `DescribeStackResourceDrifts`'s `StackResourceDrifts`.
+    StackResourceDrifts,
     /// `DescribeChangeSet`'s `Changes`.
     Changes,
     /// `ListChangeSets`'s `Summaries`.
@@ -3264,6 +3279,7 @@ impl PageOf {
             Self::StackSummaries => "summaries",
             Self::StackEvents => "events",
             Self::StackResourceSummaries => "resources",
+            Self::StackResourceDrifts => "resource-drifts",
             Self::Changes => "changes",
             Self::ChangeSetSummaries => "change-set-summaries",
             Self::HookResults => "hookresults",
@@ -3597,6 +3613,60 @@ pub fn resource_drift_information_summary(
     Some(crate::ops::types::StackResourceDriftInformationSummary {
         stack_resource_drift_status: deployed.drift_status.clone(),
         last_check_timestamp: deployed.drift_checked_at.map(timestamp),
+    })
+}
+
+/// One resource's drift result as the modelled `StackResourceDrift` — the shape
+/// `DescribeStackResourceDrifts` and `DetectStackResourceDrift` both report a checked
+/// resource through.
+///
+/// `None` for a resource no drift check has been carried out over: "resources that haven't
+/// yet been checked for drift aren't included", and neither are the ones "that don't
+/// currently support drift detection", which are exactly the resources
+/// [`DeployedResource::drift_detail`] is absent for.
+///
+/// `Timestamp` is "time at which CloudFormation performed drift detection on the stack
+/// resource" — the instant of the check this record came from. The two property structures
+/// and the differences are the comparison that check carried out, so what is reported is
+/// what was compared rather than a comparison recomputed on a read; `PropertyDifferences`
+/// is present only where there are differences, which is "only for resources whose
+/// StackResourceDriftStatus is MODIFIED".
+///
+/// `PhysicalResourceIdContext` and `ModuleInfo` are absent: context pairs identify a
+/// resource "in cases where a resource's logical and physical IDs aren't enough", which the
+/// one physical id per logical resource this emulator records always is, and module
+/// information belongs to a resource "created from a module included in the stack
+/// template", which nothing here deploys.
+pub fn stack_resource_drift_view(
+    stack_id: &str,
+    deployed: &DeployedResource,
+) -> Option<crate::ops::types::StackResourceDrift> {
+    let detail = deployed.drift_detail.as_ref()?;
+    let checked_at = deployed.drift_checked_at?;
+    Some(crate::ops::types::StackResourceDrift {
+        stack_id: stack_id.to_string(),
+        logical_resource_id: deployed.resource.logical_id.clone(),
+        physical_resource_id: physical_resource_id(&deployed.resource),
+        physical_resource_id_context: None,
+        resource_type: deployed.resource.resource_type.clone(),
+        expected_properties: detail.expected_properties.clone(),
+        actual_properties: detail.actual_properties.clone(),
+        property_differences: non_empty(
+            detail
+                .differences
+                .iter()
+                .map(|difference| crate::ops::types::PropertyDifference {
+                    property_path: difference.property_path.clone(),
+                    expected_value: difference.expected_value.clone(),
+                    actual_value: difference.actual_value.clone(),
+                    difference_type: difference.difference_type.clone(),
+                })
+                .collect(),
+        ),
+        stack_resource_drift_status: deployed.drift_status.clone(),
+        timestamp: timestamp(checked_at),
+        module_info: None,
+        drift_status_reason: detail.reason.clone(),
     })
 }
 

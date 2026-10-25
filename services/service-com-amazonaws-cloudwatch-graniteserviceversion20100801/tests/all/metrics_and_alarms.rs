@@ -13,7 +13,14 @@ use serde_json::{json, Value};
 
 /// A fixed epoch second used as the base of every published time stamp, so the aggregation
 /// windows a test asserts on never depend on the wall clock.
-const T0: f64 = 1_700_000_000.0;
+///
+/// Aligned on a whole HOUR, which is the coarsest boundary a read rounds a requested start
+/// time down to ("Start time greater than 63 days ago - Round down to the nearest 1-hour clock
+/// interval.", `GetMetricStatisticsInput$StartTime`): a request starting here therefore starts
+/// exactly where it says, so the rows below assert the bucketing on its own. The rounding
+/// itself is asserted by
+/// [`a_start_time_off_the_boundary_is_rounded_down_before_the_windows_are_laid`].
+const T0: f64 = 1_699_999_200.0;
 
 /// A numeric member, treating an absent member and an explicit null alike.
 fn number(value: &Value, member: &str) -> Option<f64> {
@@ -439,6 +446,101 @@ async fn datapoints_bucket_into_period_windows_anchored_at_the_start_time() {
         assert_eq!(
             got, expected,
             "case {case:?}: expected windows {expected:?}, got {got:?} from {stats}"
+        );
+    }
+}
+
+/// A requested start time is rounded DOWN before the period windows are laid over the range,
+/// so the datapoints a read returns are stamped on the boundaries CloudWatch lays and
+/// aggregate the observations inside those windows.
+///
+/// "CloudWatch rounds the specified time stamp as follows: Start time less than 15 days ago -
+/// Round down to the nearest whole minute. […] Start time between 15 and 63 days ago - Round
+/// down to the nearest 5-minute clock interval. […] Start time greater than 63 days ago -
+/// Round down to the nearest 1-hour clock interval. […] If you set Period to 5, 10, 20, or 30,
+/// the start time of your request is rounded down to the nearest time that corresponds to even
+/// 5-, 10-, 20-, or 30-second divisions of a minute." (`GetMetricStatisticsInput$StartTime`)
+///
+/// The rows span the three age bands and the sub-minute periods that round by themselves, each
+/// with a start time deliberately off its own boundary.
+#[tokio::test]
+async fn a_start_time_off_the_boundary_is_rounded_down_before_the_windows_are_laid() {
+    let router = build_router();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is after the epoch")
+        .as_secs_f64()
+        .floor();
+    // A whole hour in the recent past, so a start time near it is "less than 15 days ago", and
+    // one 30 days before it is in the five-minute band.
+    let recent = (now / 3600.0).floor() * 3600.0 - 3600.0;
+    const DAY: f64 = 24.0 * 60.0 * 60.0;
+
+    // (case, the whole-boundary base, how far past it the request starts, the period, the
+    // interval the start time rounds to)
+    let cases: Vec<(&str, f64, f64, i64, f64)> = vec![
+        ("less than 15 days ago rounds to the minute", recent, 150.0, 300, 60.0),
+        ("the same band at a one-minute period", recent, 95.0, 60, 60.0),
+        (
+            "between 15 and 63 days ago rounds to five minutes",
+            recent - 30.0 * DAY,
+            150.0,
+            300,
+            300.0,
+        ),
+        (
+            "more than 63 days ago rounds to the hour",
+            recent - 100.0 * DAY,
+            1_250.0,
+            3_600,
+            3_600.0,
+        ),
+        // A sub-minute period rounds to its own division of the minute, whatever the age.
+        ("a thirty-second period rounds to thirty seconds", recent, 47.0, 30, 30.0),
+        ("a twenty-second period rounds to twenty seconds", recent, 47.0, 20, 20.0),
+    ];
+
+    for (case, base, offset, period, interval) in cases {
+        let metric = format!("Rounded{period}x{offset}");
+        let at = base + offset;
+        let expected_start = ((at / interval).floor() * interval).max(0.0);
+        ok(
+            &router,
+            "PutMetricData",
+            &json!({
+                "Namespace": "MyApp",
+                "MetricData": [{
+                    "MetricName": metric,
+                    "Dimensions": [{"Name": "Service", "Value": "api"}],
+                    "Value": 4.0,
+                    "Timestamp": at,
+                }],
+            }),
+        )
+        .await;
+        let stats = ok(
+            &router,
+            "GetMetricStatistics",
+            &json!({
+                "Namespace": "MyApp",
+                "MetricName": metric,
+                "Dimensions": [{"Name": "Service", "Value": "api"}],
+                "StartTime": at,
+                "EndTime": at + f64::from(period as i32),
+                "Period": period,
+                "Statistics": ["Sum"],
+            }),
+        )
+        .await;
+        let stamps: Vec<f64> = datapoints(&stats)
+            .iter()
+            .filter_map(|point| number(point, "Timestamp"))
+            .collect();
+        assert_eq!(
+            stamps,
+            vec![expected_start],
+            "case {case:?}: expected the window stamped at the rounded start {expected_start}, \
+             got {stamps:?} from {stats}"
         );
     }
 }

@@ -25,6 +25,8 @@ mod hypervisor_configuration_test;
 mod hypervisor_host_is_not_a_key;
 #[path = "all/hypervisor_import_concurrency.rs"]
 mod hypervisor_import_concurrency;
+#[path = "all/hypervisor_import_is_not_deduplicated.rs"]
+mod hypervisor_import_is_not_deduplicated;
 #[path = "all/hypervisor_listing.rs"]
 mod hypervisor_listing;
 #[path = "all/hypervisor_property_mappings.rs"]

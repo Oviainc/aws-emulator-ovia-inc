@@ -13,9 +13,10 @@
 //! changes to the schema validate only policies and templates submitted after the schema
 //! change. Existing policies and templates are not re-evaluated against the changed schema.
 //!
-//! The schema text is persisted in [`crate::state`] exactly as it arrived and its
-//! `namespaces` are read off the schema the Cedar parser produced, so `GetSchema`
-//! reports what was stored rather than anything re-derived from the request.
+//! The schema document is persisted in [`crate::state`] in the form a read
+//! reports it ([`crate::state::canonical_schema_json`]) and its `namespaces` are
+//! read off the schema the Cedar parser produced, so `GetSchema` reports what was
+//! stored rather than anything re-derived from the request.
 //!
 //! ## Input
 //!
@@ -201,7 +202,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .map_or(now, |existing| existing.created_date);
         store.schema = Some(crate::state::StoredSchema {
-            cedar_json: definition.clone(),
+            // The document, not the caller's spelling of it: what a read reports
+            // is the submitted JSON with its insignificant whitespace gone and
+            // nothing else about it changed.
+            cedar_json: crate::state::canonical_schema_json(definition),
             namespaces: parsed.namespaces,
             created_date,
             last_updated_date: now,

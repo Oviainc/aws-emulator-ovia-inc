@@ -19,6 +19,8 @@ mod error_response_bodies;
 mod list_rules_page_order;
 #[path = "all/lockable_rule_invariant.rs"]
 mod lockable_rule_invariant;
+#[path = "all/not_found_error_body_members.rs"]
+mod not_found_error_body_members;
 #[path = "all/resource_tag_pair_quota.rs"]
 mod resource_tag_pair_quota;
 #[path = "all/resource_tags.rs"]

@@ -19,7 +19,10 @@
 //! The source of every row is
 //! `smithy_query(query="doc",shape="com.amazonaws.taxsettings#PutTaxRegistration")`,
 //! whose country-by-country list is also what `crate::state::COUNTRY_RULES`
-//! carries; `every_documented_country_rule_is_exercised` pins that this table
+//! carries, plus the per-country requirements the model states on the entry's
+//! own members — `Address$stateOrRegion` and
+//! `CanadaAdditionalInfo$isResellerAccount`, each quoted above its rows;
+//! `every_documented_country_rule_is_exercised` pins that this table
 //! covers that rule set row for row.
 //!
 //! The harness (`emulator`, `call`) lives in `tax_registration_lifecycle.rs`;
@@ -850,6 +853,152 @@ fn cases() -> Vec<Case> {
                 "registrationType": "VAT",
                 "legalName": "Magaliti LLC",
                 "legalAddress": { "postalCode": "0105", "countryCode": "GE" },
+            }),
+            expect: Expect::Stored,
+        },
+        // `Address$stateOrRegion`: "This field is only required for Canada,
+        // India, United Arab Emirates, Romania, and Brazil (CPF). It is
+        // optional for all other countries."
+        // (`smithy_query(query="doc",shape="com.amazonaws.taxsettings#Address",member="stateOrRegion")`)
+        Case {
+            name: "Canada with no stateOrRegion",
+            entry: json!({
+                "registrationId": "123456789RT0001",
+                "registrationType": "GST",
+                "legalName": "Example Canada Inc",
+                "legalAddress": {
+                    "addressLine1": "1 Robson Street",
+                    "city": "Vancouver",
+                    "postalCode": "V6B 1A1",
+                    "countryCode": "CA",
+                },
+            }),
+            expect: missing("STATE_OR_REGION"),
+        },
+        Case {
+            name: "Canada with a stateOrRegion",
+            entry: json!({
+                "registrationId": "123456789RT0001",
+                "registrationType": "GST",
+                "legalName": "Example Canada Inc",
+                "legalAddress": {
+                    "addressLine1": "1 Robson Street",
+                    "city": "Vancouver",
+                    "stateOrRegion": "British Columbia",
+                    "postalCode": "V6B 1A1",
+                    "countryCode": "CA",
+                },
+            }),
+            expect: Expect::Stored,
+        },
+        Case {
+            name: "India with no stateOrRegion",
+            entry: json!({
+                "registrationId": "29ABCDE1234F1Z5",
+                "registrationType": "GST",
+                "legalName": "Acme India Private Limited",
+                "legalAddress": {
+                    "addressLine1": "1 Residency Road",
+                    "city": "Bengaluru",
+                    "postalCode": "560025",
+                    "countryCode": "IN",
+                },
+            }),
+            expect: missing("STATE_OR_REGION"),
+        },
+        Case {
+            name: "India with a stateOrRegion",
+            entry: json!({
+                "registrationId": "29ABCDE1234F1Z5",
+                "registrationType": "GST",
+                "legalName": "Acme India Private Limited",
+                "legalAddress": {
+                    "addressLine1": "1 Residency Road",
+                    "city": "Bengaluru",
+                    "stateOrRegion": "Karnataka",
+                    "postalCode": "560025",
+                    "countryCode": "IN",
+                },
+            }),
+            expect: Expect::Stored,
+        },
+        Case {
+            name: "the United Arab Emirates with no stateOrRegion",
+            entry: json!({
+                "registrationId": "100123456700003",
+                "registrationType": "VAT",
+                "legalName": "Example Trading LLC",
+                "legalAddress": { "postalCode": "00000", "countryCode": "AE" },
+            }),
+            expect: missing("STATE_OR_REGION"),
+        },
+        Case {
+            name: "Romania with no stateOrRegion",
+            entry: json!({
+                "registrationId": "RO1234567890",
+                "registrationType": "VAT",
+                "legalName": "Exemplu SRL",
+                "legalAddress": { "postalCode": "010101", "countryCode": "RO" },
+            }),
+            expect: missing("STATE_OR_REGION"),
+        },
+        Case {
+            name: "Brazil CPF with no stateOrRegion",
+            entry: json!({
+                "registrationId": "123.456.789-09",
+                "registrationType": "CPF",
+                "legalName": "Maria Exemplo",
+                "legalAddress": { "postalCode": "22041-001", "countryCode": "BR" },
+            }),
+            expect: missing("STATE_OR_REGION"),
+        },
+        Case {
+            name: "Brazil CNPJ with no stateOrRegion, which only CPF requires",
+            entry: json!({
+                "registrationId": "12.345.678/0001-95",
+                "registrationType": "CNPJ",
+                "legalName": "Exemplo Industria Ltda",
+                "legalAddress": { "postalCode": "01001-000", "countryCode": "BR" },
+            }),
+            expect: Expect::Stored,
+        },
+        // `CanadaAdditionalInfo$isResellerAccount`: "The value for this
+        // parameter must be true if the provincialSalesTaxId value is provided
+        // for a TRN in British Columbia, Saskatchewan, or Manitoba provinces."
+        Case {
+            name: "Canada claiming a provincial sales tax ID with no isResellerAccount",
+            entry: json!({
+                "registrationId": "123456789RT0001",
+                "registrationType": "GST",
+                "legalName": "Example Canada Inc",
+                "legalAddress": {
+                    "stateOrRegion": "British Columbia",
+                    "postalCode": "V6B 1A1",
+                    "countryCode": "CA",
+                },
+                "additionalTaxInformation": {
+                    "canadaAdditionalInfo": { "provincialSalesTaxId": "PST-1234567" },
+                },
+            }),
+            expect: rejected_value("IS_RESELLER_ACCOUNT"),
+        },
+        Case {
+            name: "Canada claiming a provincial sales tax ID as a reseller",
+            entry: json!({
+                "registrationId": "123456789RT0001",
+                "registrationType": "GST",
+                "legalName": "Example Canada Inc",
+                "legalAddress": {
+                    "stateOrRegion": "British Columbia",
+                    "postalCode": "V6B 1A1",
+                    "countryCode": "CA",
+                },
+                "additionalTaxInformation": {
+                    "canadaAdditionalInfo": {
+                        "provincialSalesTaxId": "PST-1234567",
+                        "isResellerAccount": true,
+                    },
+                },
             }),
             expect: Expect::Stored,
         },

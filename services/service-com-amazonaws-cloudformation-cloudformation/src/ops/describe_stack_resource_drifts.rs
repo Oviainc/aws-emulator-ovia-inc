@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeStackResourceDrifts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeStackResourceDrifts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeStackResourceDrifts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the resources of the named stack a drift detection has CHECKED,
+//! one `StackResourceDrift` per checked resource: the expected configuration the template
+//! declared, the actual one the owning service reported, and the property-level differences
+//! between the two, as the check that ran recorded them (`crate::state::drift`). A resource
+//! nothing has checked yet, and one whose type drift detection is not supported for here,
+//! are left out. `StackResourceDriftStatusFilters` narrows the result to the drift statuses
+//! the request names, and one response carries one bounded page. A `StackName` no stack of
+//! the request's Region carries is refused with `ValidationError`.
 //!
 //! ## Shape of an operation
 //!
@@ -95,6 +94,25 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{DeployedResource, StoredStack};
+
+/// The stack's checked resources in the order this read reports them: by LOGICAL ID, the
+/// order every other read of a stack's resources answers in
+/// (`ops::list_stack_resources`'s `ordered_resources`) and for the same reason — the stored
+/// order is a template reader's parse order, which is not one a client can depend on, while
+/// this one is the same on every build and makes the page boundaries stable.
+fn checked_resources(stack: &StoredStack) -> Vec<&DeployedResource> {
+    let mut ordered: Vec<&DeployedResource> = stack
+        .resources
+        .iter()
+        // "Resources that haven't yet been checked for drift aren't included. Resources
+        // that don't currently support drift detection aren't checked, and so not
+        // included" — both are resources no comparison was carried out over.
+        .filter(|deployed| deployed.drift_detail.is_some())
+        .collect();
+    ordered.sort_by(|left, right| left.resource.logical_id.cmp(&right.resource.logical_id));
+    ordered
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -163,18 +181,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeStackResourceDrifts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeStackResourceDriftsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeStackResourceDrifts"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no stack store to read, so this
+            // answers 501 rather than an empty, truthful-looking list.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DescribeStackResourceDrifts",
+            ));
+        };
+
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a status transition the
+        // clock had already made due, which was owed whether or not anyone called — and it
+        // is that transition which installs the resources a deployment produced.
+        store.settle(::std::time::SystemTime::now());
+
+        // A `StackName` that resolves to no stack of this Region is a `ValidationError`, as
+        // it is on every other read of a stack.
+        let region = crate::state::request_region(ctx.parts());
+        let stack = store.resolve(&region, &input.stack_name).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation_error(crate::state::stack_does_not_exist(
+                &input.stack_name,
+            ))
+        })?;
+
+        // "The resource drift status values to use as filters for the resource drift
+        // results returned": a request that names no status is not filtered, however it
+        // spells naming none.
+        let filters = input
+            .stack_resource_drift_status_filters
+            .as_deref()
+            .filter(|statuses| !statuses.is_empty());
+        let drifts: Vec<StackResourceDrift> = checked_resources(stack)
+            .into_iter()
+            .filter(|deployed| {
+                filters.is_none_or(|filters| filters.contains(&deployed.drift_status))
+            })
+            .filter_map(|deployed| {
+                crate::state::stack_resource_drift_view(&stack.stack_id, deployed)
+            })
+            .collect();
+
+        // `@paginated(inputToken: NextToken, outputToken: NextToken, pageSize: MaxResults)`:
+        // "the maximum number of results to be returned with a single call. If the number
+        // of available results exceeds this maximum, the response includes a NextToken
+        // value" that resumes just past the page.
+        let max_results = input.max_results.and_then(|max| usize::try_from(max).ok());
+        let (stack_resource_drifts, next_token) = crate::state::paginate_at_most(
+            crate::state::PageOf::StackResourceDrifts,
+            drifts,
+            input.next_token.as_deref(),
+            max_results,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        Ok(DescribeStackResourceDriftsOutput {
+            stack_resource_drifts,
+            next_token,
+        })
     }
 }

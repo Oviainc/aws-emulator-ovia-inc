@@ -991,8 +991,19 @@ pub const EVENT_DATA_STORE_NOT_FOUND_STATUS: u16 = 400;
 
 /// The refusal text for `EventDataStoreNotFoundException`.
 ///
-/// It names no value from the request because the service's own text does not: the
-/// store the caller asked for is exactly what could not be found.
+/// The model annotates CloudTrail's not-found errors — `ChannelNotFoundException`,
+/// `EventDataStoreNotFoundException`, `QueryIdNotFoundException` — `@httpError(404)`,
+/// but CloudTrail answers 400 for them on the wire: the recorded responses for
+/// `GetChannel`, `GetEventDataStore` and `DescribeQuery` are all `HTTP 400` with the
+/// model's own `__type`. The error CODE stays the model's; only the status is stated
+/// here, and an operation applies it through
+/// [`crate::scaffolded::Scaffolded::modeled_with_status`]. It lives here so the four
+/// operations that refuse a not-found cannot drift apart on the status.
+pub const NOT_FOUND_STATUS: u16 = 400;
+
+/// The refusal text for `EventDataStoreNotFoundException` when the request named no
+/// event data store — the store the caller asked for is exactly what could not be
+/// found, which is how the service words it.
 pub const EVENT_DATA_STORE_NOT_FOUND_MESSAGE: &str = "The event data store was not found.";
 
 /// The refusal text for `EventDataStoreNotFoundException` on a call that names ONE
@@ -3362,9 +3373,10 @@ impl TaggableArn {
             Self::Trail { .. } => unknown_trail_message(subject),
             Self::Dashboard { .. } => DASHBOARD_NOT_FOUND_MESSAGE.to_string(),
             Self::EventDataStore { .. } => event_data_store_not_found_message(subject),
-            // A channel has no shared helper yet: `RemoveTags` is the first operation
-            // to answer `ChannelNotFoundException`, and the recorded text is this one.
-            Self::Channel { .. } => format!("The {} {subject} was not found.", self.noun()),
+            // A channel's not-found wording is the one every channel operation
+            // answers with: one helper, so the tagging and the channel paths cannot
+            // drift.
+            Self::Channel { .. } => channels::channel_not_found_message(subject),
         }
     }
 }
@@ -3487,7 +3499,7 @@ pub fn parse_taggable_arn(value: &str) -> Result<TaggableArn, TaggableArnRejecti
     }
 
     let reject = || {
-        if value.contains(CHANNEL_RESOURCE_PREFIX) {
+        if value.contains(channels::CHANNEL_RESOURCE_PREFIX) {
             TaggableArnRejection::ChannelArn(value.to_string())
         } else if value.contains(EVENT_DATA_STORE_RESOURCE_PREFIX) {
             TaggableArnRejection::EventDataStoreArn(value.to_string())

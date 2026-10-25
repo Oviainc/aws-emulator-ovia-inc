@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDataTransformationProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDataTransformationProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDataTransformationProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Drops the data transformation profile record `CreateDataTransformationProfile`
+//! minted in [`crate::state`] — with its DRAFT and every version published from
+//! it, as the model documents — and reports which profile went and when.
+//!
+//! A profile is one record holding every version of itself, so the delete is the
+//! single removal of that record: no version of a deleted profile is readable
+//! afterwards, nor are the tags that were held on it, and the content bytes and
+//! the profile slot it occupied are given back. The output carries no status
+//! member, so the profile is gone the instant this call answers and owes the clock
+//! no transition. A profile no record holds — including one an earlier call
+//! already deleted — is a `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +153,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDataTransformationProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDataTransformationProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDataTransformationProfile"))
+        // A profile is the same record for every caller, so `ctx` carries nothing this
+        // write needs.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server(
+                "the HealthLake data transformation profile registry is unavailable",
+            ));
+        };
+
+        let mut store = state.lock();
+        // "Deletes a data transformation profile and all its versions, including the
+        // DRAFT and all published versions": every version lives on the one record,
+        // so removing it drops them together — and the content bytes and the profile
+        // slot it held are given back by the record being dropped.
+        let Some(profile) = store.profiles.remove(&input.profile_id) else {
+            return Err(not_found(crate::state::PROFILE_NOT_FOUND_MESSAGE));
+        };
+
+        // The deletion happened at this instant — the output carries no status, so
+        // nothing about this profile is pending afterwards and a second delete of the
+        // same profile finds no record at all.
+        Ok(DeleteDataTransformationProfileOutput {
+            profile_id: profile.id,
+            profile_name: Some(profile.name),
+            deletion_time: ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()),
+        })
     }
+}
+
+/// This operation's 404, worded without quoting the requested identifier — the
+/// wording this service's not-found text uses.
+fn not_found(message: &str) -> DeleteDataTransformationProfileError {
+    DeleteDataTransformationProfileErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(message.to_string()),
+        },
+    )
+    .into()
+}
+
+/// This operation's 500, for a store the handler could not reach at all.
+fn internal_server(message: &str) -> DeleteDataTransformationProfileError {
+    DeleteDataTransformationProfileErrorModeled::InternalServerException(InternalServerException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

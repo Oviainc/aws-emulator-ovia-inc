@@ -524,6 +524,11 @@ fn property_records(
                 crate::state::PropertyRecord {
                     definition: property.definition,
                     value: property.value,
+                    // A create carries no time-series value: those arrive
+                    // through the time-series data plane
+                    // (`BatchPutPropertyValues`), which writes them into the
+                    // property record this one stores.
+                    time_series: ::std::collections::BTreeMap::new(),
                 },
             )
         })
