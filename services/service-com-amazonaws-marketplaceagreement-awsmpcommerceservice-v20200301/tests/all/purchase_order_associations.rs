@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::agreement_lifecycle::{
-    accept, call, create, emulator, expected_charge_ids, new_request, term,
+    accept, agreement_type_filter, call, create, emulator, expected_charge_ids, new_request, term,
 };
 
 /// Term ids naming kinds that are charged, so a quote over `n` of them mints `n`
@@ -97,7 +97,10 @@ async fn agreements_for(router: &MultiServiceRouter, proposal: &str) -> usize {
     let found = call(
         router,
         "SearchAgreements",
-        json!({"filters": [{"name": "OfferId", "values": [proposal]}]}),
+        json!({"filters": [
+            agreement_type_filter(),
+            {"name": "OfferId", "values": [proposal]},
+        ]}),
     )
     .await;
     assert_eq!(

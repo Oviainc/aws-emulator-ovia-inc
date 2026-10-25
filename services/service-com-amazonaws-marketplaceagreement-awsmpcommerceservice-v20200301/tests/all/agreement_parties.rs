@@ -18,8 +18,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::agreement_lifecycle::{
-    accept, agreement_over, call, cancel, create, emulator, term, upfront_term,
-    variable_payment_term, Answer,
+    accept, agreement_over, agreement_type_filter, call, cancel, create, emulator, term,
+    upfront_term, variable_payment_term, Answer,
 };
 
 /// The account id every generated emulator presents, spelled out here rather
@@ -205,7 +205,7 @@ async fn both_parties_of_every_stored_agreement_are_reported() {
         let router = emulator();
         let agreements = stored(&router, &case).await;
 
-        let searched = search(&router, json!({})).await;
+        let searched = search(&router, json!({"filters": [agreement_type_filter()]})).await;
         let summaries = summaries(&searched);
 
         for agreement_id in &agreements {
@@ -271,7 +271,10 @@ async fn both_parties_of_every_stored_agreement_are_reported() {
         for party_type in PARTY_TYPES {
             let scoped = search(
                 &router,
-                json!({"filters": [{"name": "PartyType", "values": [party_type]}]}),
+                json!({"filters": [
+                    agreement_type_filter(),
+                    {"name": "PartyType", "values": [party_type]},
+                ]}),
             )
             .await;
             assert_eq!(
@@ -311,7 +314,10 @@ async fn a_party_scoped_search_reports_the_whole_population() {
         for party_type in PARTY_TYPES {
             let scoped = search(
                 &router,
-                json!({"filters": [{"name": "PartyType", "values": [party_type]}]}),
+                json!({"filters": [
+                    agreement_type_filter(),
+                    {"name": "PartyType", "values": [party_type]},
+                ]}),
             )
             .await;
             assert_eq!(
