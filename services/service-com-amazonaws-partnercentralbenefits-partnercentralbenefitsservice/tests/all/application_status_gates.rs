@@ -32,7 +32,10 @@ use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::
 use crate::benefit_application_lifecycle::{error_code, text, Harness, CATALOG};
 
 /// Create one draft application in `catalog` and return its id.
-async fn seed(harness: &Harness, case: &str, catalog: &str, token: &str) -> String {
+///
+/// Shared with `tests/all/amend_terminal_refusal.rs`, which states the same gate over a
+/// wider row set, so both suites drive the same seeding path.
+pub(crate) async fn seed(harness: &Harness, case: &str, catalog: &str, token: &str) -> String {
     let benefit_id = text(case, &harness.active_benefit_of(catalog).await, "Id");
     let created = harness
         .create(
@@ -59,8 +62,9 @@ async fn seed(harness: &Harness, case: &str, catalog: &str, token: &str) -> Stri
 /// no modelled operation reaches them, so those rows are placed in the store
 /// ([`Harness::place_status`]) after a real submission.
 ///
-/// Reused by `tests/all/disassociate_benefit_application_resource.rs`, which states its
-/// own gate over the same six statuses.
+/// Reused by `tests/all/disassociate_benefit_application_resource.rs` and
+/// `tests/all/amend_terminal_refusal.rs`, which state their own gates over the same six
+/// statuses.
 pub(crate) async fn reach(
     harness: &Harness,
     case: &str,

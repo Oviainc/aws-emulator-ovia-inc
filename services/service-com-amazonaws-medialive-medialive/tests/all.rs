@@ -179,6 +179,9 @@ mod rejection_messages;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 
+#[path = "all/schedule_channel_references.rs"]
+mod schedule_channel_references;
+
 #[path = "all/sdi_source_lifecycle.rs"]
 mod sdi_source_lifecycle;
 

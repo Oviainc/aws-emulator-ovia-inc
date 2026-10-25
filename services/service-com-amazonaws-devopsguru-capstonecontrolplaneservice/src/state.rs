@@ -41,8 +41,9 @@ use crate::ops::types::{
     ProactiveAnomaly, ProactiveInsight, ProactiveInsightSummary,
     ProactiveOrganizationInsightSummary, ReactiveAnomaly, ReactiveInsight, ReactiveInsightSummary,
     ReactiveOrganizationInsightSummary, ResourceCollection, ServiceCollection, ServiceHealth,
-    ServiceInsightHealth, TagCollection, TagHealth, ValidationException, ValidationExceptionField,
-    INSIGHT_TYPE_VALUES,
+    ServiceInsightHealth, StartTimeRange, TagCollection, TagHealth, ValidationException,
+    ValidationExceptionField, INSIGHT_SEVERITY_VALUES, INSIGHT_STATUS_VALUES, INSIGHT_TYPE_VALUES,
+    SERVICE_NAME_VALUES,
 };
 
 /// Per-service state for com-amazonaws-devopsguru-capstonecontrolplaneservice. A handler reaches it through [`service_state`].
@@ -1013,7 +1014,7 @@ impl MillisRange {
 
     /// The interval as a page-scope fragment, so a cursor into one window does not
     /// resolve against another.
-    fn page_scope(&self) -> String {
+    pub fn page_scope(&self) -> String {
         let bound = |at: Option<i64>| at.map_or_else(|| "-".to_string(), |at| at.to_string());
         format!("{}/{}", bound(self.from), bound(self.to))
     }
@@ -1146,6 +1147,187 @@ impl InsightStatusSelector {
     }
 }
 
+/// What a `Search*Insights` request selects out of the stored insights.
+///
+/// `SearchInsights` documents "You can specify which insights are returned by their
+/// start time, one or more statuses, one or more severities, and type",
+/// and `SearchInsightsFilters` adds "Each filter type contains one or more values to
+/// search for. If you specify multiple filter types, the filter types are joined with an
+/// AND, and the request returns only results that match all of the specified filters".
+/// So an insight is selected exactly while EVERY filter the request carries admits it,
+/// and a filter is satisfied by ANY ONE of the values it names; a filter that names no
+/// value restricts nothing, which is what an absent filter means (every filter member is
+/// optional, and `InsightSeverities`/`InsightStatuses` are modelled len 0..3 and 0..2, so
+/// an empty list is a well-formed request).
+///
+/// Shared, like [`InsightStatusSelector`], because the account-scoped `SearchInsights`
+/// and the organization-wide `SearchOrganizationInsights` carry the same four filter
+/// members over the same store, so the two searches of one store cannot disagree about
+/// which insights a filter set selects.
+#[derive(Debug, Clone)]
+pub struct InsightSearchSelector<'a> {
+    /// The required `Type`, one of `INSIGHT_TYPE_VALUES`.
+    insight_type: &'static str,
+    /// The required `StartTimeRange`: "A time range used to specify when the behavior of
+    /// an insight or anomaly started", so it is matched against the insight's
+    /// `InsightTimeRange.StartTime`.
+    started: MillisRange,
+    /// `Filters.Severities`, or `None` when the request names none.
+    severities: Option<&'a Vec<String>>,
+    /// `Filters.Statuses`, or `None` when the request names none.
+    statuses: Option<&'a Vec<String>>,
+    /// The resources `Filters.ResourceCollection` names, normalised to the same set form
+    /// an insight's own collection is stored in, or `None` when it names no resource.
+    about: Option<ResourceCoverage>,
+    /// `Filters.ServiceCollection.ServiceNames`, or `None` when the request names none.
+    service_names: Option<&'a Vec<String>>,
+}
+
+impl<'a> InsightSearchSelector<'a> {
+    /// The selection a search request's `Type`, `StartTimeRange` and filter members name,
+    /// or the [`FilterRejection`] that refuses it.
+    ///
+    /// The filter members are taken one by one rather than as a filter STRUCTURE, because
+    /// the two searches model the same four members on two different shapes
+    /// (`SearchInsightsFilters` and `SearchOrganizationInsightsFilters`).
+    pub fn of(
+        insight_type: &str,
+        start_time_range: &StartTimeRange,
+        severities: Option<&'a Vec<String>>,
+        statuses: Option<&'a Vec<String>>,
+        resource_collection: Option<&'a ResourceCollection>,
+        service_collection: Option<&'a ServiceCollection>,
+    ) -> Result<Self, FilterRejection> {
+        let severities = named(severities);
+        let statuses = named(statuses);
+        let service_names =
+            named(service_collection.and_then(|collection| collection.service_names.as_ref()));
+        enum_values(severities, INSIGHT_SEVERITY_VALUES, "Filters.Severities")?;
+        enum_values(statuses, INSIGHT_STATUS_VALUES, "Filters.Statuses")?;
+        enum_values(
+            service_names,
+            SERVICE_NAME_VALUES,
+            "Filters.ServiceCollection.ServiceNames",
+        )?;
+        Ok(Self {
+            insight_type: insight_type_of(insight_type, "Type")?,
+            started: millis_range(
+                start_time_range.from_time.as_ref(),
+                start_time_range.to_time.as_ref(),
+                "StartTimeRange",
+            )?,
+            severities,
+            statuses,
+            about: resource_collection
+                .map(ResourceCoverage::of_wire)
+                .filter(|about| !about.names_no_resource()),
+            service_names,
+        })
+    }
+
+    /// Whether this selection holds `insight`: its type and start instant are what the
+    /// request requires, and every filter it carries admits the insight.
+    pub fn matches(&self, insight: &InsightRecord) -> bool {
+        self.severities
+            .is_none_or(|wanted| wanted.contains(&insight.severity))
+            && self
+                .statuses
+                .is_none_or(|wanted| wanted.contains(&insight.status))
+            && self.service_names.is_none_or(|wanted| {
+                wanted
+                    .iter()
+                    .any(|service_name| insight.service_names.contains(service_name))
+            })
+            // A `ResourceCollection` filter names a SET OF RESOURCES, so it admits an
+            // insight that is about any one of them; an insight about no resource at all
+            // is in no such set.
+            && self.about.as_ref().is_none_or(|wanted| {
+                insight
+                    .resource_collection
+                    .as_ref()
+                    .is_some_and(|about| wanted.intersects(about))
+            })
+            && insight.insight_type == self.insight_type
+            && self.started.holds(insight.start_time_millis)
+    }
+
+    /// The scope a page token over this selection is bound to, so a cursor issued for one
+    /// filter set does not seek into another's selection. A caller prefixes its
+    /// operation, as [`InsightStatusSelector::page_scope`]'s callers do.
+    ///
+    /// Each list filter is rendered as the SET of values it names, so reordering or
+    /// repeating a value — which selects exactly the same insights — keeps a cursor
+    /// resolvable, while naming a different set does not.
+    pub fn page_scope(&self) -> String {
+        let values = |named: Option<&Vec<String>>| {
+            let named: BTreeSet<&str> = named
+                .into_iter()
+                .flatten()
+                .map(String::as_str)
+                .collect();
+            scope_values(named)
+        };
+        format!(
+            "{}/started/{}/severities/{}/statuses/{}/services/{}/resources/{}",
+            self.insight_type,
+            self.started.page_scope(),
+            values(self.severities),
+            values(self.statuses),
+            values(self.service_names),
+            self.about
+                .as_ref()
+                .map_or_else(|| "-".to_string(), ResourceCoverage::page_fragment),
+        )
+    }
+}
+
+/// Accepts a list filter member whose every value is one `allowed` holds, or the
+/// rejection naming `member`.
+///
+/// The model declares each of these members as a list of ENUM, so the boundary validator
+/// refuses anything else before a handler runs; this keeps such a value a 400 rather than
+/// a silently empty answer if it ever reaches here — the rule
+/// [`insight_type_of`] applies to a single enum member.
+fn enum_values(
+    values: Option<&Vec<String>>,
+    allowed: &[&str],
+    member: &str,
+) -> Result<(), FilterRejection> {
+    let Some(values) = values else {
+        return Ok(());
+    };
+    let Some(outside) = values
+        .iter()
+        .find(|value| !allowed.contains(&value.as_str()))
+    else {
+        return Ok(());
+    };
+    let allowed = allowed.join(" | ");
+    Err(FilterRejection {
+        message: format!("{member} must each be one of {allowed}, got '{outside}'"),
+        reason: "FIELD_VALIDATION_FAILED",
+        field: member.to_string(),
+        field_message: format!("each value must be one of {allowed}"),
+    })
+}
+
+/// A set of values as an unambiguous page-scope fragment.
+///
+/// Each value is rendered with its byte length, so no separator a modelled value may
+/// itself contain — an `AppBoundaryKey` and a `TagValue` both admit `/`, `:` and `=` —
+/// can make two different filter sets render the same fragment and let one's cursor seek
+/// into the other's selection.
+fn scope_values<S: AsRef<str>>(values: impl IntoIterator<Item = S>) -> String {
+    let rendered: Vec<String> = values
+        .into_iter()
+        .map(|value| {
+            let value = value.as_ref();
+            format!("{}:{value}", value.len())
+        })
+        .collect();
+    rendered.join(",")
+}
+
 /// `value` as one of `InsightType`'s values, or the rejection naming `member`.
 ///
 /// The model declares the member as an enum, so the boundary validator refuses anything
@@ -1173,7 +1355,7 @@ fn insight_type_of(value: &str, member: &str) -> Result<&'static str, FilterReje
 /// A range whose `FromTime` is after its `ToTime` is NOT refused: it holds no instant,
 /// so it selects nothing, which is what an empty interval means. The model states no
 /// ordering rule for either range, so refusing it would be this emulator's invention.
-fn millis_range(
+pub fn millis_range(
     from: Option<&::aws_smithy_types::DateTime>,
     to: Option<&::aws_smithy_types::DateTime>,
     member: &str,
@@ -1327,8 +1509,8 @@ impl<'a> OrganizationAccountScope<'a> {
         organizational_unit_ids: &'a Option<Vec<String>>,
     ) -> Self {
         Self {
-            account_ids: named(account_ids),
-            organizational_unit_ids: named(organizational_unit_ids),
+            account_ids: named(account_ids.as_ref()),
+            organizational_unit_ids: named(organizational_unit_ids.as_ref()),
         }
     }
 
@@ -1379,13 +1561,14 @@ impl<'a> OrganizationAccountScope<'a> {
     }
 }
 
-/// The ids a filter member names, or `None` when it names none: an absent list and an
+/// The values a filter member names, or `None` when it names none: an absent list and an
 /// empty one both restrict nothing.
-fn named(list: &Option<Vec<String>>) -> Option<&Vec<String>> {
-    match list {
-        Some(ids) if !ids.is_empty() => Some(ids),
-        _ => None,
-    }
+///
+/// Takes the borrowed form, so a member held directly on a request
+/// (`&request.account_ids`, through `.as_ref()`) and one reached through an optional
+/// filter structure both resolve the same way: the rule lives here once.
+fn named(list: Option<&Vec<String>>) -> Option<&Vec<String>> {
+    list.filter(|values| !values.is_empty())
 }
 
 /// The set of resources DevOps Guru analyses for this account and region.
@@ -1418,6 +1601,73 @@ pub struct ResourceCoverage {
 pub const APP_BOUNDARY_KEYS_PER_ACCOUNT: usize = 1;
 
 impl ResourceCoverage {
+    /// The resources a wire `ResourceCollection` names, as the SET form this store keeps
+    /// coverage in.
+    ///
+    /// The inverse of [`Self::wire_collection`], so a collection a client submits as a
+    /// FILTER is compared against the collection an insight is about in one normal form:
+    /// a stack name named twice, or a tag key named by two `TagCollection` entries, names
+    /// the same resources as naming each once.
+    pub fn of_wire(collection: &ResourceCollection) -> Self {
+        let mut coverage = Self::default();
+        if let Some(cloud_formation) = collection.cloud_formation.as_ref() {
+            coverage
+                .cloudformation_stack_names
+                .extend(cloud_formation.stack_names.iter().flatten().cloned());
+        }
+        for tag_collection in collection.tags.iter().flatten() {
+            coverage
+                .tag_collections
+                .entry(tag_collection.app_boundary_key.clone())
+                .or_default()
+                .extend(tag_collection.tag_values.iter().cloned());
+        }
+        coverage
+    }
+
+    /// Whether this collection names no resource at all — either because it carries
+    /// neither half, or because the halves it carries are empty: a `TagCollection` naming
+    /// a key with no value names no (key, value) pair, and so no resource.
+    pub fn names_no_resource(&self) -> bool {
+        self.monitored_resource_count() == 0
+    }
+
+    /// Whether this collection and `other` name a resource in common — a covered stack
+    /// name, or an (app-boundary key, tag value) pair, that both hold.
+    ///
+    /// The two halves are OR-ed because a collection is the SET of the resources it
+    /// names: "the two types of Amazon Web Services resource collections supported are
+    /// Amazon Web Services CloudFormation stacks and Amazon Web Services resources that
+    /// contain the same Amazon Web Services tag", so naming both names their union.
+    pub fn intersects(&self, other: &Self) -> bool {
+        self.cloudformation_stack_names
+            .iter()
+            .any(|stack_name| other.cloudformation_stack_names.contains(stack_name))
+            || self.tag_collections.iter().any(|(key, values)| {
+                other
+                    .tag_collections
+                    .get(key)
+                    .is_some_and(|held| values.iter().any(|value| held.contains(value)))
+            })
+    }
+
+    /// This collection as a page-token scope fragment, so a cursor issued for a search
+    /// over one collection does not seek into another's selection. Both halves are sets,
+    /// so the rendering is stable, and each value is length-prefixed by [`scope_values`]
+    /// because a key or a value may itself contain the separators.
+    pub fn page_fragment(&self) -> String {
+        let pairs = self.tag_collections.iter().flat_map(|(key, values)| {
+            values
+                .iter()
+                .map(move |value| scope_values([key.as_str(), value.as_str()]))
+        });
+        format!(
+            "stacks/{}/tags/{}",
+            scope_values(&self.cloudformation_stack_names),
+            scope_values(pairs),
+        )
+    }
+
     /// This coverage as the modelled `ResourceCollection`.
     ///
     /// The one rendering of a stored coverage, used both for the account's own

@@ -750,6 +750,54 @@ fn routing_bytes(routing: &[RoutingConfigurationListItem]) -> usize {
         .sum()
 }
 
+/// What a state machine ARN REFERS to: the state machine it resolves to, and the
+/// version or alias its qualifier named.
+///
+/// A state machine ARN may be qualified with "either a version or an alias", and
+/// both qualified forms are references to the state machine rather than resources
+/// of their own: `StartExecution`'s `stateMachineArn` "accepts one of the following
+/// inputs: an unqualified state machine ARN [...] a state machine version ARN [...]
+/// a state machine alias ARN", and `ListExecutions` "can also return a list of
+/// executions associated with a specific alias or version, by specifying an alias
+/// ARN or a version ARN". So the qualifier is resolved to the state machine that
+/// owns it, and the version or alias it named is what the call is SCOPED to.
+#[derive(Debug, Clone)]
+pub struct StateMachineReference {
+    /// The unqualified ARN of the state machine this reference resolves to.
+    pub state_machine_arn: String,
+    /// The version ARN, when the qualifier named a published version.
+    pub version_arn: Option<String>,
+    /// The alias ARN, when the qualifier named an alias.
+    pub alias_arn: Option<String>,
+}
+
+/// What a start operation needs to run ONE execution: the state machine the
+/// request's ARN resolved to, the definition that execution interprets, and the
+/// version and alias the execution is associated with.
+///
+/// A version is "a numbered snapshot of a state machine", so an execution started
+/// through a version ARN — or through an alias that routed to a version — runs the
+/// definition and role that version holds, not whatever the state machine has been
+/// updated to since.
+#[derive(Debug, Clone)]
+pub struct RunTarget {
+    /// The unqualified ARN of the state machine being run.
+    pub state_machine_arn: String,
+    /// That state machine's name, which its execution ARNs carry.
+    pub name: String,
+    /// `STANDARD` or `EXPRESS`.
+    pub sm_type: String,
+    /// The definition this run interprets.
+    pub definition: String,
+    pub role_arn: String,
+    /// The version this run is attributed to, if any — see
+    /// [`Execution::state_machine_version_arn`].
+    pub version_arn: Option<String>,
+    /// The alias this run was started through, if any — see
+    /// [`Execution::state_machine_alias_arn`].
+    pub alias_arn: Option<String>,
+}
+
 /// One stored activity: every member `DescribeActivity` reports, plus the tag set
 /// the tagging calls read and write.
 ///
@@ -1028,6 +1076,18 @@ pub struct Execution {
     pub error: Option<String>,
     pub cause: Option<String>,
     pub trace_header: Option<String>,
+    /// The state machine VERSION this execution runs, when the ARN it was started
+    /// with named a version or an alias that routed to one; `None` for an execution
+    /// started with an unqualified ARN, which "Step Functions doesn't associate [...]
+    /// with a version".
+    pub state_machine_version_arn: Option<String>,
+    /// The state machine ALIAS this execution was started through, when the ARN it
+    /// was started with named one: "Step Functions associates executions that you
+    /// start with an alias ARN with that alias and the state machine version used
+    /// for that execution". `None` for an execution started with a version ARN,
+    /// which it "doesn't associate [...] with any aliases that point to that
+    /// version", and for one started with an unqualified ARN.
+    pub state_machine_alias_arn: Option<String>,
     pub redrive_count: i32,
     /// The instant the last successful `RedriveExecution` redrove this execution;
     /// `None` until one has, which is what `redriveDate`'s own documentation says it
@@ -1075,6 +1135,11 @@ impl Execution {
             + self.error.as_ref().map_or(0, String::len)
             + self.cause.as_ref().map_or(0, String::len)
             + self.trace_header.as_ref().map_or(0, String::len)
+            + self
+                .state_machine_version_arn
+                .as_ref()
+                .map_or(0, String::len)
+            + self.state_machine_alias_arn.as_ref().map_or(0, String::len)
             + redrive_tokens_bytes(&self.redrive_tokens)
             + history_bytes(&self.history)
             + self.pending.as_ref().map_or(0, PendingOutcome::measure)
@@ -1543,6 +1608,22 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         uuid_v4(high, low)
     }
 
+    /// One draw in `0..bound`, from the same generator every id this store mints is
+    /// drawn from; `0` for an empty span.
+    ///
+    /// What a weighted routing configuration is sampled with
+    /// ([`Self::routed_version`]): the counter is what makes two draws in the same
+    /// nanosecond differ, so consecutive starts through one alias do not all route
+    /// to the same version.
+    fn draw_below(&mut self, bound: u64) -> u64 {
+        if bound == 0 {
+            return 0;
+        }
+        self.name_counter = self.name_counter.wrapping_add(1);
+        let mut seed = now_nanos() ^ self.name_counter.rotate_left(29);
+        splitmix64(&mut seed) % bound
+    }
+
     /// A fresh revision id for a state machine `UpdateStateMachine` just changed.
     ///
     /// `revisionId` is "the revision identifier for the updated state machine", and
@@ -1897,6 +1978,24 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             .collect()
     }
 
+    /// The aliases of one state machine, NEWEST FIRST.
+    ///
+    /// From `ListStateMachineAliases`' own documentation: "Results are sorted by
+    /// time, with the most recently created aliases listed first." Two aliases
+    /// created inside one clock tick carry the same creation time, so the ARN — which
+    /// no two aliases of one state machine share — breaks that tie and the order is
+    /// total, exactly as [`Self::versions_newest_first`] makes it total.
+    pub fn aliases_newest_first(&self, state_machine_arn: &str) -> Vec<&StateMachineAlias> {
+        let mut aliases = self.aliases_of(state_machine_arn);
+        aliases.sort_by(|left, right| {
+            right
+                .creation_date
+                .cmp(&left.creation_date)
+                .then_with(|| left.arn.cmp(&right.arn))
+        });
+        aliases
+    }
+
     /// Why the store cannot take one more alias of `bytes` for `state_machine_arn`,
     /// or `None` when it can — the modelled `ServiceQuotaExceededException`.
     pub fn alias_rejection(&self, state_machine_arn: &str, bytes: usize) -> Option<String> {
@@ -2007,6 +2106,130 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             return Err(RoutingRejection::Deleting(owner));
         }
         Ok(owner)
+    }
+
+    /// What the state machine ARN `arn` refers to, or `None` when the store holds no
+    /// record it names.
+    ///
+    /// The ONE place a qualified state machine ARN is resolved, so every operation
+    /// that takes one reads it identically: a qualifier of nothing but digits is a
+    /// VERSION ([`qualifier_version`]) and any other qualifier is an ALIAS name, each
+    /// stored under the qualified ARN itself, and both resolve to the state machine
+    /// that owns them. A reference the store holds nothing for is a resource that is
+    /// absent, which is what the caller's own not-found error reports; the ARN itself
+    /// is judged earlier, by [`read_state_machine_arn`].
+    pub fn read_state_machine_reference(
+        &self,
+        arn: &str,
+        parsed: &StateMachineArn,
+    ) -> Option<StateMachineReference> {
+        // A map-run LABELED ARN names a Distributed Map state inside a state
+        // machine, so its trailing field is not a qualifier and nothing here
+        // answers for it.
+        let qualifier = parsed
+            .qualifier
+            .as_deref()
+            .filter(|_| parsed.label().is_none());
+        let Some(qualifier) = qualifier else {
+            let machine = self.state_machines.get(arn)?;
+            return Some(StateMachineReference {
+                state_machine_arn: machine.arn.clone(),
+                version_arn: None,
+                alias_arn: None,
+            });
+        };
+        if qualifier_version(qualifier).is_some() {
+            let version = self.state_machine_versions.get(arn)?;
+            return Some(StateMachineReference {
+                state_machine_arn: version.state_machine_arn.clone(),
+                version_arn: Some(version.arn.clone()),
+                alias_arn: None,
+            });
+        }
+        let alias = self.state_machine_aliases.get(arn)?;
+        Some(StateMachineReference {
+            state_machine_arn: alias.state_machine_arn.clone(),
+            version_arn: None,
+            alias_arn: Some(alias.arn.clone()),
+        })
+    }
+
+    /// The version one alias routes an execution to, drawn in proportion to the
+    /// weights of its routing configuration, or `None` when the store holds no
+    /// such alias.
+    ///
+    /// "You can also map an alias to split StartExecution requests between two
+    /// versions of a state machine. [...] Step Functions randomly chooses which
+    /// version runs a given execution based on the percentage you specify" — so the
+    /// draw is made once per start, and an entry's share of the total weight is its
+    /// chance of being drawn. An entry at weight 0 is therefore never drawn.
+    pub fn routed_version(&mut self, alias_arn: &str) -> Option<String> {
+        let routing: Vec<(String, u64)> = self
+            .state_machine_aliases
+            .get(alias_arn)?
+            .routing_configuration
+            .iter()
+            .map(|item| {
+                (
+                    item.state_machine_version_arn.clone(),
+                    u64::try_from(item.weight).unwrap_or(0),
+                )
+            })
+            .collect();
+        let total: u64 = routing.iter().map(|(_, weight)| weight).sum();
+        // "The sum of the weights in the routing configuration must be equal to
+        // 100", so the span below is positive; a configuration that somehow adds up
+        // to nothing still routes, to the first version it names.
+        let draw = self.draw_below(total);
+        let mut reached = 0_u64;
+        routing
+            .iter()
+            .find_map(|(version_arn, weight)| {
+                reached = reached.saturating_add(*weight);
+                (draw < reached).then(|| version_arn.clone())
+            })
+            .or_else(|| routing.first().map(|(version_arn, _)| version_arn.clone()))
+    }
+
+    /// The run the state machine ARN `arn` names, or `None` when the store holds no
+    /// record it refers to.
+    ///
+    /// This is what both start operations resolve their `stateMachineArn` through: an
+    /// unqualified ARN runs the state machine's CURRENT configuration, a version ARN
+    /// runs that version's snapshot, and an alias ARN runs the version its routing
+    /// configuration draws ([`Self::routed_version`]) — and the version and alias the
+    /// ARN named are carried onto the execution, which is what every execution report
+    /// attributes it by.
+    pub fn read_run_target(&mut self, arn: &str, parsed: &StateMachineArn) -> Option<RunTarget> {
+        let reference = self.read_state_machine_reference(arn, parsed)?;
+        let alias_arn = reference.alias_arn.clone();
+        let version_arn = match alias_arn.as_deref() {
+            Some(alias_arn) => self.routed_version(alias_arn),
+            None => reference.version_arn.clone(),
+        };
+        if alias_arn.is_some() || version_arn.is_some() {
+            // A version is immutable, so what it holds IS what this run executes.
+            let version = self.state_machine_versions.get(version_arn.as_deref()?)?;
+            return Some(RunTarget {
+                state_machine_arn: version.state_machine_arn.clone(),
+                name: version.name.clone(),
+                sm_type: version.sm_type.clone(),
+                definition: version.definition.clone(),
+                role_arn: version.role_arn.clone(),
+                version_arn: Some(version.arn.clone()),
+                alias_arn,
+            });
+        }
+        let machine = self.state_machines.get(&reference.state_machine_arn)?;
+        Some(RunTarget {
+            state_machine_arn: machine.arn.clone(),
+            name: machine.name.clone(),
+            sm_type: machine.sm_type.clone(),
+            definition: machine.definition.clone(),
+            role_arn: machine.role_arn.clone(),
+            version_arn: None,
+            alias_arn: None,
+        })
     }
 
     /// Apply `update` to the state machine `arn` names: every member the update
@@ -2597,6 +2820,17 @@ pub fn read_activity_arn(arn: &str, endpoint_region: &str) -> Result<String, Str
 pub fn resource_not_found_message(resource_arn: &str) -> String {
     format!("could not find the resource {resource_arn}")
 }
+
+/// What the modelled `ResourceNotFound` says when a routing configuration names a
+/// state machine version that was never published.
+///
+/// The alias operations do not resolve a routing configuration entry by a generic
+/// resource lookup: the rule being enforced is the one the routing configuration
+/// itself carries — every entry must reference a version that already exists — so
+/// the refusal states THAT rule, in a sentence of its own that no value of the
+/// request appears in. RECORDED text.
+pub const ROUTING_CONFIGURATION_VERSION_NOT_FOUND: &str =
+    "Routing configuration must contain state machine version ARNs that already exist.";
 
 /// What the modelled `ActivityWorkerLimitExceeded` says: the activity whose pollers
 /// are all open, and the number of them.

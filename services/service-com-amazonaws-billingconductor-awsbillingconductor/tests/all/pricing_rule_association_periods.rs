@@ -33,7 +33,12 @@ use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
 /// A `BillingPeriod` as a count of months, so two periods compare and shift.
-fn period_months(value: &str) -> i64 {
+///
+/// Shared with the suites that read this world from another angle
+/// (`tests/all/pricing_rule_association_billing_periods.rs`,
+/// `tests/all/pricing_rule_association_period_subsets.rs`), so one ordering rule serves
+/// every period-scoped assertion in this crate.
+pub(crate) fn period_months(value: &str) -> i64 {
     let (year, month) = value
         .split_once('-')
         .expect("a test billing period is spelled YYYY-MM");
@@ -60,7 +65,10 @@ fn shift_period(period: &str, months: i64) -> String {
 
 /// A live emulator holding only this service, with the engine kept so a row can
 /// backdate an association the wire could only make now.
-struct Emulator {
+///
+/// This is the harness the other association-period suites in this crate drive too, so
+/// the dispatch and signing boilerplate exists once.
+pub(crate) struct Emulator {
     engine: Arc<engine::InMemoryEngine>,
     router: MultiServiceRouter,
 }
@@ -70,7 +78,7 @@ impl Emulator {
     /// organization's PAYER account — the world in which this payer-account-only
     /// control plane is reachable at all (see `tests/all/payer_account_gate.rs` for
     /// the denial every other caller gets).
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         engine
             .state::<BillingConductorState>()
@@ -83,7 +91,7 @@ impl Emulator {
 
     /// POST a JSON body to one of this service's routes and return the status plus
     /// the parsed response body.
-    async fn post(&self, path: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn post(&self, path: &str, body: &Value) -> (u16, Value) {
         self.send("POST", path, body).await
     }
 
@@ -119,7 +127,7 @@ impl Emulator {
     }
 
     /// Create a `GLOBAL`/`MARKUP` pricing rule and answer the ARN the service minted.
-    async fn create_rule(&self, name: &str) -> String {
+    pub(crate) async fn create_rule(&self, name: &str) -> String {
         let (status, body) = self
             .post(
                 "/create-pricing-rule",
@@ -139,7 +147,7 @@ impl Emulator {
 
     /// Create a pricing plan associating `rules`, and answer the ARN the service
     /// minted.
-    async fn create_plan(&self, name: &str, rules: &[String]) -> String {
+    pub(crate) async fn create_plan(&self, name: &str, rules: &[String]) -> String {
         let (status, body) = self
             .post(
                 "/create-pricing-plan",
@@ -157,7 +165,7 @@ impl Emulator {
     }
 
     /// `AssociatePricingRules`: add `rules` to the plan's associations.
-    async fn associate(&self, plan: &str, rules: &[String]) {
+    pub(crate) async fn associate(&self, plan: &str, rules: &[String]) {
         let (status, body) = self
             .send(
                 "PUT",
@@ -183,6 +191,26 @@ impl Emulator {
         for association in &mut record.pricing_rule_associations {
             association.inclusive_start_billing_period = period.to_string();
         }
+    }
+
+    /// Backdate the plan's association with ONE rule to `period`, as if that
+    /// associating call had been made in that billing period: the way a world where a
+    /// plan's associations started in DIFFERENT periods is set up
+    /// (`tests/all/pricing_rule_association_billing_periods.rs`), which no request can
+    /// ask for.
+    pub(crate) fn start_association_in(&self, plan: &str, rule_arn: &str, period: &str) {
+        let state = self.engine.state::<BillingConductorState>();
+        let mut state = state.lock();
+        let record = state
+            .pricing_plans
+            .get_mut(plan)
+            .expect("setup start_association_in: the plan was created above");
+        let association = record
+            .pricing_rule_associations
+            .iter_mut()
+            .find(|association| association.arn == rule_arn)
+            .expect("setup start_association_in: the association was made above");
+        association.inclusive_start_billing_period = period.to_string();
     }
 
     /// The rule ARNs `ListPricingRulesAssociatedToPricingPlan` reports for `plan` in
@@ -222,7 +250,7 @@ impl Emulator {
     }
 
     /// The `Size` `ListPricingPlans` reports for `plan` in `period`.
-    async fn plan_size(&self, case: &str, plan: &str, period: Option<&str>) -> i64 {
+    pub(crate) async fn plan_size(&self, case: &str, plan: &str, period: Option<&str>) -> i64 {
         let mut body = json!({"Filters": {"Arns": [plan]}});
         if let Some(period) = period {
             body["BillingPeriod"] = json!(period);
@@ -239,7 +267,12 @@ impl Emulator {
 
     /// The `AssociatedPricingPlanCount` `ListPricingRules` reports for `rule` in
     /// `period`.
-    async fn rule_plan_count(&self, case: &str, rule: &str, period: Option<&str>) -> i64 {
+    pub(crate) async fn rule_plan_count(
+        &self,
+        case: &str,
+        rule: &str,
+        period: Option<&str>,
+    ) -> i64 {
         let mut body = json!({"Filters": {"Arns": [rule]}});
         if let Some(period) = period {
             body["BillingPeriod"] = json!(period);
@@ -260,7 +293,7 @@ impl Emulator {
 /// The ARN list a response reports under `member`, as owned strings (an absent
 /// member is an empty set, which is how both listings report "none": the member is
 /// modelled `@length(min: 1)`).
-fn arns(body: &Value, member: &str) -> Vec<String> {
+pub(crate) fn arns(body: &Value, member: &str) -> Vec<String> {
     body.get(member)
         .and_then(Value::as_array)
         .map(|arns| {

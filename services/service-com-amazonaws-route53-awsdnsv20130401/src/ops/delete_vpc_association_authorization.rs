@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteVPCAssociationAuthorization
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteVPCAssociationAuthorization`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteVPCAssociationAuthorization::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +74,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    no_such_hosted_zone, normalize_zone_id, vpc_id_is_well_formed, vpc_region_is_modelled,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -153,20 +148,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteVPCAssociationAuthorization` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteVPCAssociationAuthorizationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteVPCAssociationAuthorization"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            DeleteVPCAssociationAuthorizationErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        // A request names the authorization to remove the same way the request
+        // that created it named it: ONE VPC, by its id together with the region
+        // it was created in. Neither `VPC` member is modelled as required (the
+        // container is shared with the operations that merely report one), so
+        // the handler is what refuses a request naming no VPC — the same two
+        // refusals `CreateVPCAssociationAuthorization` answers. The region
+        // branch is reached only for an ABSENT member: a value outside the
+        // modelled `VPCRegion` enum is refused by the request boundary, which
+        // enforces every modelled constraint before this handler runs.
+        let vpc_id = input.vpc.vpc_id.as_deref().unwrap_or_default().trim();
+        let vpc_region = input.vpc.vpc_region.as_deref().unwrap_or_default().trim();
+        if !vpc_id_is_well_formed(vpc_id) {
+            return Err(DeleteVPCAssociationAuthorizationErrorModeled::InvalidVPCId(
+                InvalidVPCId {
+                    message: Some(format!(
+                        "Invalid VPC ID: {vpc_id:?} is not a valid Amazon VPC ID"
+                    )),
+                },
+            )
+            .into());
+        }
+        if !vpc_region_is_modelled(vpc_region) {
+            return Err(DeleteVPCAssociationAuthorizationErrorModeled::InvalidInput(
+                InvalidInput {
+                    message: Some(format!(
+                        "Invalid request: VPC.VPCRegion {vpc_region:?} is not a region an Amazon \
+                         VPC can be created in"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The caller may pass the bare id or the `/hostedzone/`-prefixed `Id` a
+        // HostedZone handed it back; both name the same zone.
+        let zone_id = normalize_zone_id(&input.hosted_zone_id).to_string();
+        let mut store = state.lock();
+        let zone = store.zones.get_mut(&zone_id).ok_or_else(|| {
+            DeleteVPCAssociationAuthorizationErrorModeled::NoSuchHostedZone(no_such_hosted_zone(
+                &input.hosted_zone_id,
+            ))
+        })?;
+
+        // The authorization list is a SET keyed by VPC id, so a zone holds at
+        // most one authorization per VPC and there is exactly one entry to
+        // remove. A request naming a VPC the zone does not authorize — one never
+        // authorized, or one whose authorization an earlier request already
+        // removed — asks to remove an authorization that is not there, which is
+        // the modelled `VPCAssociationAuthorizationNotFound`.
+        let position = zone.vpc_authorization_position(vpc_id).ok_or_else(|| {
+            DeleteVPCAssociationAuthorizationErrorModeled::VPCAssociationAuthorizationNotFound(
+                VPCAssociationAuthorizationNotFound {
+                    message: Some(format!(
+                        "The VPC {vpc_id} is not authorized to be associated with the hosted \
+                         zone {}",
+                        input.hosted_zone_id
+                    )),
+                },
+            )
+        })?;
+        // Withdrawing a PERMISSION touches the authorization list only: "If the
+        // VPC is already associated with the hosted zone,
+        // DeleteVPCAssociationAuthorization won't disassociate the VPC from the
+        // hosted zone."
+        zone.vpc_authorizations.remove(position);
+
+        Ok(DeleteVPCAssociationAuthorizationOutput {})
     }
 }
+

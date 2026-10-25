@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(image) = store.images.get(&input.image_name) else {
             let arn = crate::state::resource_arn(&region, "image", &input.image_name);
             return Err(CreateImageVersionErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!("Could not find image \"{arn}\".")),
+                message: Some(crate::state::image_does_not_exist(&arn)),
             })
             .into());
         };

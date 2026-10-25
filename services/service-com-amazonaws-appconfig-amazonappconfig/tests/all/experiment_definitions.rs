@@ -40,7 +40,7 @@ use crate::resource_tags::pct;
 
 /// One treatment as `TreatmentInput` models it: a weight, an optional description and a
 /// required flag value.
-fn treatment(weight: f64, description: Option<&str>, flag_value: Value) -> Value {
+pub(crate) fn treatment(weight: f64, description: Option<&str>, flag_value: Value) -> Value {
     let mut input = json!({ "Weight": weight, "FlagValue": flag_value });
     if let Some(description) = description {
         input["Description"] = Value::from(description);
@@ -49,7 +49,7 @@ fn treatment(weight: f64, description: Option<&str>, flag_value: Value) -> Value
 }
 
 /// A flag value with no attributes.
-fn flag(enabled: bool) -> Value {
+pub(crate) fn flag(enabled: bool) -> Value {
     json!({ "Enabled": enabled })
 }
 
@@ -71,13 +71,13 @@ fn flag_with_every_attribute_variant(enabled: bool) -> Value {
 
 /// The scaffolding one definition needs: an application, an environment and a
 /// configuration profile under it.
-struct Scope {
-    application: String,
-    environment: String,
-    profile: String,
+pub(crate) struct Scope {
+    pub(crate) application: String,
+    pub(crate) environment: String,
+    pub(crate) profile: String,
 }
 
-async fn scope(router: &MultiServiceRouter, label: &str) -> Scope {
+pub(crate) async fn scope(router: &MultiServiceRouter, label: &str) -> Scope {
     let application = create_application(router, &format!("app-{label}")).await;
     let environment = create_environment(router, &application, &format!("env-{label}")).await;
     let profile = create_profile(router, &application, &format!("profile-{label}")).await;
@@ -89,7 +89,7 @@ async fn scope(router: &MultiServiceRouter, label: &str) -> Scope {
 }
 
 /// `POST` an experiment definition under `application`.
-async fn create_definition(
+pub(crate) async fn create_definition(
     router: &MultiServiceRouter,
     application: &str,
     body: &Value,
@@ -107,7 +107,7 @@ async fn create_definition(
 }
 
 /// `GET` an experiment definition.
-async fn get_definition(
+pub(crate) async fn get_definition(
     router: &MultiServiceRouter,
     application: &str,
     definition: &str,
@@ -140,7 +140,7 @@ fn body(scope: &Scope, name: &str, treatments: Vec<Value>, control: Value) -> Va
 
 /// A number member of a JSON object, for the float members strict JSON equality would
 /// judge by their written form rather than their value.
-fn number(value: &Value, member: &str) -> Option<f64> {
+pub(crate) fn number(value: &Value, member: &str) -> Option<f64> {
     value.get(member).and_then(Value::as_f64)
 }
 
@@ -423,7 +423,7 @@ async fn an_experiment_definition_round_trips_across_the_modelled_input_range() 
 }
 
 /// Every member of a treatment except the key the service minted is the caller's.
-fn assert_treatment_body(case: &str, label: &str, requested: &Value, answered: &Value) {
+pub(crate) fn assert_treatment_body(case: &str, label: &str, requested: &Value, answered: &Value) {
     assert_eq!(
         number(answered, "Weight"),
         number(requested, "Weight"),

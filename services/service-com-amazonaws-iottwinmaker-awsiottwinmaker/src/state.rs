@@ -269,6 +269,10 @@ pub const SYNC_SOURCE_SITEWISE: &str = "SITEWISE";
 pub const SYNC_JOB_STATE_CREATING: &str = "CREATING";
 /// See [`SYNC_JOB_STATE_CREATING`].
 pub const SYNC_JOB_STATE_ERROR: &str = "ERROR";
+/// See [`SYNC_JOB_STATE_CREATING`]. The state `DeleteSyncJob` answers with for
+/// the removal it performs: the job is gone from the workspace that held it, and
+/// the call reports the removal rather than a job's standing state.
+pub const SYNC_JOB_STATE_DELETING: &str = "DELETING";
 
 /// How long a sync job stays in [`SYNC_JOB_STATE_CREATING`] before the clock
 /// makes its outcome due.

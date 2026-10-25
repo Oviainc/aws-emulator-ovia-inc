@@ -61,6 +61,60 @@ pub struct IdentityPool {
     pub identity_pool_tags: Option<BTreeMap<String, String>>,
 }
 
+impl IdentityPool {
+    /// Whether this pool accepts a `Logins` entry made in the name of `provider_name`.
+    ///
+    /// `GetCredentialsForIdentity` is documented "Any provided logins will be validated
+    /// against supported login providers" (this service's model). What this emulator can
+    /// validate is the trust the POOL's own configuration states, and a login whose
+    /// issuer the provider name itself names is exactly that case: an Amazon Cognito
+    /// user pool, named `cognito-idp.<region>.amazonaws.com/<UserPoolId>` (`GetId.Logins`),
+    /// is a login provider of this pool only when one of its `CognitoIdentityProviders`
+    /// entries names that user pool — so a token minted by any OTHER user pool
+    /// authenticates nobody here, however validly it was signed where it was issued.
+    ///
+    /// A login of any other kind is decided by the provider that issued its token
+    /// (Facebook, Google, an OIDC or SAML issuer), which this emulator does not reach,
+    /// so the pool's stored configuration alone does not refuse it.
+    pub fn accepts_login_provider(&self, provider_name: &str) -> bool {
+        !names_cognito_user_pool(provider_name)
+            || self
+                .cognito_identity_providers
+                .iter()
+                .flatten()
+                .filter_map(|provider| provider.provider_name.as_deref())
+                .any(|name| name == provider_name)
+    }
+}
+
+/// Whether `provider_name` names an Amazon Cognito user pool: the
+/// `cognito-idp.<region>.amazonaws.com/<UserPoolId>` form `GetId.Logins` publishes for
+/// one ("Amazon Cognito user pool: `cognito-idp.<region>.amazonaws.com/<YOUR_USER_POOL_ID>`",
+/// this service's model). The name itself carries the issuer, which is what makes the
+/// pool's stored configuration able to decide whether the login is one it accepts.
+pub fn names_cognito_user_pool(provider_name: &str) -> bool {
+    provider_name
+        .strip_prefix(COGNITO_USER_POOL_PROVIDER_PREFIX)
+        .is_some_and(|rest| rest.contains('/'))
+}
+
+/// The prefix of every Amazon Cognito user-pool provider name: the user-pools service's
+/// own endpoint prefix, which every such provider name starts with.
+const COGNITO_USER_POOL_PROVIDER_PREFIX: &str = "cognito-idp.";
+
+/// The message a `NotAuthorizedException` carries for a `Logins` entry whose provider is
+/// not one the identity pool accepts.
+///
+/// One fixed sentence, naming neither the provider the request presented nor the
+/// providers the pool is configured with: the caller of this refusal is an
+/// UNAUTHENTICATED one — the credential-exchange operations are the calls a client makes
+/// before it holds any credential — so a message built from the pool's configuration
+/// would report that configuration to anyone who asked with a token the pool rejects.
+/// It states that the token's provider is not supported here, which is what a client has
+/// to act on.
+pub const UNSUPPORTED_LOGIN_PROVIDER_MESSAGE: &str =
+    "Token is not from a supported provider of this identity pool.";
+
 /// The most tags one identity pool can carry, from the model's own doc for `TagResource`:
 /// "An identity pool can have as many as 50 tags"
 /// (`smithy_query(query="doc",shape="TagResource")`). An AWS-published ceiling on the

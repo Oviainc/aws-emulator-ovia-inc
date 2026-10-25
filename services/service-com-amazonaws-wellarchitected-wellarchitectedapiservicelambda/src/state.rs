@@ -977,10 +977,40 @@ pub const MAX_LENSES_PER_REVIEW_TEMPLATE: usize = 10;
 /// (`smithy_query(query="shape", shape="LensAliases")`). Being an emulator quota rather
 /// than a modelled constraint, `CreateWorkload` answers a longer list with the modelled
 /// `ServiceQuotaExceededException` — as `CreateReviewTemplate` does for a template's — and
-/// it is what bounds the lens list a STORED workload carries, the lens resolution that
+/// it is what bounds the lens list ONE create attaches, the lens resolution that
 /// create runs ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::unapplicable_lenses_refusal`])
-/// and the per-lens work of every read that reports its lens reviews.
+/// and the per-lens work of every read that reports its lens reviews. What bounds the
+/// list a STORED workload carries once further lenses are associated with it is the
+/// service's own documented ceiling, [`MAX_LENSES_ASSOCIATED_PER_WORKLOAD`].
 pub const MAX_LENSES_PER_WORKLOAD: usize = 10;
+
+/// The most lenses one workload is reviewed against, however many requests attached them:
+/// "A maximum of 20 lenses can be associated with a workload"
+/// (`smithy_query(query="operation", operation="AssociateLenses")`).
+///
+/// A ceiling the service publishes rather than one this emulator chose, and the one bound
+/// on a STORED workload's lens list: the per-request quotas above bound only what a single
+/// create or association names. `AssociateLenses` models no `ServiceQuotaExceededException`,
+/// so a request that would leave a workload reviewed against more lenses than this is
+/// answered with the modelled `ValidationException`
+/// ([`too_many_lenses_associated_exception`]). It is also what keeps the per-lens work of
+/// every read that reports a workload's lens reviews bounded.
+pub const MAX_LENSES_ASSOCIATED_PER_WORKLOAD: usize = 20;
+
+/// The most lens aliases one `AssociateLenses` / `DisassociateLenses` request may name —
+/// an emulator quota, like [`MAX_PROFILE_ARNS_PER_REQUEST`], because the member those two
+/// operations carry the aliases in publishes only `@length(min: 1)`
+/// (`smithy_query(query="shape", shape="LensAliases")`), so nothing in the model bounds
+/// the list a caller sends. The number is the one that member's own doc states: "Up to 10
+/// lenses can be specified".
+///
+/// It is what makes the per-request work of an association constant rather than
+/// caller-chosen: the length is checked before any per-entry work and before the shared
+/// store lock is taken, so an oversized list costs one comparison. Being a request-shape
+/// rule rather than a resource quota — and neither operation models
+/// `ServiceQuotaExceededException` — it is answered with the modelled `ValidationException`
+/// naming [`LENS_ALIASES_MEMBER`] ([`too_many_lens_aliases_exception`]).
+pub const MAX_LENS_ALIASES_PER_REQUEST: usize = 10;
 
 /// The most profiles one workload is reviewed against — a MODELLED bound, unlike the lens
 /// quota above: `WorkloadProfiles`, the list every read of a workload reports its
@@ -3031,6 +3061,12 @@ pub enum LensesRefusal {
 /// `CreateReviewTemplateInput$Lenses`).
 pub const LENSES_MEMBER: &str = "Lenses";
 
+/// The member a lens-list refusal of an ASSOCIATION names
+/// (`AssociateLensesInput$LensAliases` / `DisassociateLensesInput$LensAliases`). A refusal
+/// names the member the request carried the lenses in, so the two lens-list members are
+/// named apart.
+pub const LENS_ALIASES_MEMBER: &str = "LensAliases";
+
 /// The ARN of the AWS-OFFICIAL lens a `LensAlias` names, in the Region the request was
 /// signed for.
 ///
@@ -4513,6 +4549,7 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     pub fn unapplicable_lenses_refusal(
         &self,
         lenses: &[String],
+        member: &str,
         now: SystemTime,
     ) -> Option<LensesRefusal> {
         for lens in lenses {
@@ -4526,7 +4563,7 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
                 }
                 LensResolution::DraftCustom => {
                     return Some(LensesRefusal::Unapplicable(member_constraint_exception(
-                        LENSES_MEMBER,
+                        member,
                         &format!(
                             "member must name a lens with a published version; lens {lens} \
                              has none until one is published with CreateLensVersion"
@@ -5551,6 +5588,37 @@ pub fn too_many_profiles_exception() -> crate::ops::types::ValidationException {
         format!(
             "A workload is associated with at most {MAX_PROFILES_PER_WORKLOAD} profile, so a \
              request must not name more distinct profiles than that."
+        ),
+    )])
+}
+
+/// The refusal for a request whose `LensAliases` is longer than
+/// [`MAX_LENS_ALIASES_PER_REQUEST`]: the member publishes no modelled maximum, so this is
+/// the quota that keeps the per-request work of an association constant. `named` is the
+/// length as sent, so the caller is told how far past the quota it is.
+pub fn too_many_lens_aliases_exception(named: usize) -> crate::ops::types::ValidationException {
+    field_validation_exception(&[(
+        LENS_ALIASES_MEMBER.to_string(),
+        format!(
+            "{LENS_ALIASES_MEMBER} must name at most {MAX_LENS_ALIASES_PER_REQUEST} lenses; \
+             {named} were named."
+        ),
+    )])
+}
+
+/// The refusal for a request that would leave one workload reviewed against more than
+/// [`MAX_LENSES_ASSOCIATED_PER_WORKLOAD`] lenses: the service publishes that maximum, so
+/// the request asks for a workload the service does not serve. `attached` is what the
+/// workload already holds, so the caller is told how much room is left.
+pub fn too_many_lenses_associated_exception(
+    workload_id: &str,
+    attached: usize,
+) -> crate::ops::types::ValidationException {
+    field_validation_exception(&[(
+        LENS_ALIASES_MEMBER.to_string(),
+        format!(
+            "A workload is associated with at most {MAX_LENSES_ASSOCIATED_PER_WORKLOAD} lenses, \
+             and the workload with ID {workload_id} is already associated with {attached}."
         ),
     )])
 }

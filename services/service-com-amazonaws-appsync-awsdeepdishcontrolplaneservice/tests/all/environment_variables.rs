@@ -19,9 +19,11 @@
 //!    stored list exactly as it was. The rows sit one past each published length bound
 //!    and one per character class the alphabet excludes;
 //! 3. the list belongs to the API it was written on: each of several APIs in one store
-//!    reports its own list, an API never written to reports an empty one, and an
-//!    `apiId` that names no API is refused the way every `apiId`-resolving operation
-//!    refuses it (404, or 400 for an id longer than an AppSync API id).
+//!    reports its own list, an API never written to reports an empty one, a call that
+//!    touches another part of the API (or a new API created under a deleted one's name)
+//!    does not change what a read reports, and an `apiId` that names no API is refused
+//!    the way every `apiId`-resolving operation refuses it (404, or 400 for an id
+//!    longer than an AppSync API id).
 //!
 //! Every assertion goes through the router the production emulator mounts, so these
 //! exercise routing, restJson1 (de)serialization, the boundary validator, the handlers
@@ -540,6 +542,100 @@ async fn each_api_reports_its_own_list() {
              rejected id, got {answer:?}"
         );
     }
+}
+
+/// Rule 3, continued: a read reports the list its own API holds, so a call that
+/// touches some OTHER part of that API leaves the reported list exactly as the last
+/// write left it, and a new API never inherits a deleted one's list.
+///
+/// The rows differ along the KIND of interleaved call: a read of the API itself, a read
+/// of the whole API collection, a create of a resource under the API (an API key, a
+/// data source) and a read of one of those.
+#[tokio::test]
+async fn a_call_on_another_part_of_the_api_leaves_the_reported_list_alone() {
+    let router = router();
+    let name = "Api_env_unrelated";
+    let api_id = api(&router, name).await;
+
+    let stored = json!({ "ENV": "prod", "Region_1": "eu-west-1" });
+    let seeded = put(&router, &api_id, &stored).await;
+    assert_eq!(
+        seeded.status, 200,
+        "case seed the stored list: expected 200, got {seeded:?}"
+    );
+
+    // `expires` is omitted from the key create, so it takes `CreateApiKey`'s
+    // documented default of 7 days; `NONE` is the one `DataSourceType` configured
+    // through no configuration member.
+    let rows: Vec<(&str, &str, String, Option<Value>)> = vec![
+        (
+            "read the API itself",
+            "GET",
+            format!("/v1/apis/{api_id}"),
+            None,
+        ),
+        ("read the API collection", "GET", "/v1/apis".to_string(), None),
+        (
+            "create an API key under it",
+            "POST",
+            format!("/v1/apis/{api_id}/apikeys"),
+            Some(json!({ "description": "a key" })),
+        ),
+        (
+            "read its API keys",
+            "GET",
+            format!("/v1/apis/{api_id}/apikeys"),
+            None,
+        ),
+        (
+            "create a data source under it",
+            "POST",
+            format!("/v1/apis/{api_id}/datasources"),
+            Some(json!({ "name": "ds_none", "type": "NONE" })),
+        ),
+        (
+            "read that data source",
+            "GET",
+            format!("/v1/apis/{api_id}/datasources/ds_none"),
+            None,
+        ),
+    ];
+
+    for (label, method, path, body) in rows {
+        let (status, answered) =
+            crate::graphql_api_lifecycle::call(&router, method, &path, body).await;
+        assert_eq!(
+            status, 200,
+            "case {label}: expected the interleaved call to succeed, got {status} {answered:?}"
+        );
+        let read = get(&router, &api_id).await;
+        assert_eq!(
+            read.body["environmentVariables"], stored,
+            "case {label}: expected the stored list to be untouched, got {read:?}"
+        );
+    }
+
+    // The list belongs to the API, not to its name: a fresh API created under the same
+    // name as a deleted one holds the empty list.
+    let dropped =
+        crate::graphql_api_lifecycle::call(&router, "DELETE", &format!("/v1/apis/{api_id}"), None)
+            .await;
+    assert_eq!(
+        dropped.0, 200,
+        "case delete the API: expected 200, got {dropped:?}"
+    );
+    let reborn = api(&router, name).await;
+    let read = get(&router, &reborn).await;
+    assert_eq!(
+        read.status, 200,
+        "case an API recreated under a deleted API's name: expected 200, got {read:?}"
+    );
+    assert_eq!(
+        read.body["environmentVariables"],
+        json!({}),
+        "case an API recreated under a deleted API's name: expected the empty list, \
+         got {read:?}"
+    );
 }
 
 /// The modelled entry count is enforced too: one pair past the maximum is refused by

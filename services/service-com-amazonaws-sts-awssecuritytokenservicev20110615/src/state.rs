@@ -785,11 +785,138 @@ pub fn duplicate_tag_key(tags: Option<&[Tag]>) -> Option<&str> {
     })
 }
 
-/// Whether a session policy is a JSON policy document. An IAM policy document is a
-/// JSON object; anything else — invalid JSON, or valid JSON that is not an object —
-/// is what `MalformedPolicyDocumentException` reports.
-pub fn is_policy_document(policy: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(policy).is_ok_and(|value| value.is_object())
+/// Why a session policy is not a JSON policy document, as the message
+/// `MalformedPolicyDocumentException` carries — `None` when it is one.
+///
+/// An IAM policy document is a JSON object, and the refusal's message "describes the
+/// specific error" (`MalformedPolicyDocumentException`, this service's model), so it
+/// is built from the submitted document rather than restating the member's type: a
+/// document that does not parse is reported with the first offending character and
+/// its character code, what the parser expected in its place, and the line and column
+/// the failure sits at; a document that parses but is not an object is reported with
+/// the JSON type it carries instead.
+pub fn policy_document_error(policy: &str) -> Option<String> {
+    match serde_json::from_str::<serde_json::Value>(policy) {
+        Ok(value) if value.is_object() => None,
+        Ok(value) => Some(format!(
+            "The policy document must be a JSON object, not {}",
+            json_type_name(&value)
+        )),
+        Err(parse) => Some(policy_parse_message(policy, &parse)),
+    }
+}
+
+/// The JSON type a value carries, named the way the refusal names it.
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a JSON boolean",
+        serde_json::Value::Number(_) => "a JSON number",
+        serde_json::Value::String(_) => "a JSON string",
+        serde_json::Value::Array(_) => "a JSON array",
+        serde_json::Value::Object(_) => "a JSON object",
+    }
+}
+
+/// The parse failure of a policy document, as the refusal reports it: the offending
+/// character and its code (or end-of-input), what was expected there, and the
+/// position of the failure in the submitted document.
+fn policy_parse_message(document: &str, parse: &serde_json::Error) -> String {
+    let (line, column) = (parse.line(), parse.column());
+    // The parser renders "<cause> at line <l> column <c>"; the position is reported
+    // in the location below, so only the cause is wanted here.
+    let rendered = parse.to_string();
+    let cause = rendered
+        .split(" at line ")
+        .next()
+        .unwrap_or(&rendered)
+        .trim();
+    // A document that ends mid-value has no offending character to name: the
+    // position is the end of what was submitted.
+    let offender = if cause.starts_with("EOF while parsing") {
+        None
+    } else {
+        character_at(document, line, column)
+    };
+    let expected = expected_where_parsing_stopped(cause, offender);
+    let diagnosis = match offender {
+        Some(offender) => format!(
+            "Unexpected character ('{}' (code {})): {expected}",
+            render_character(offender),
+            u32::from(offender)
+        ),
+        None => format!("Unexpected end-of-input: {expected}"),
+    };
+    // The location names the line and column but NOT the document: the service does
+    // not echo a submitted policy back in its refusal.
+    format!(
+        "Unexpected IOException: {diagnosis}\n at [Source: REDACTED \
+         (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); \
+         line: {line}, column: {column}]"
+    )
+}
+
+/// What the parser expected where it stopped, from its own diagnosis of the failure.
+/// A cause with no phrasing of its own is reported as the parser states it, so a
+/// failure this list does not name still describes itself.
+fn expected_where_parsing_stopped(cause: &str, offender: Option<char>) -> &str {
+    // A comma is trailing because what follows it closes the collection, so what was
+    // expected depends on which collection that is: an object wants its next field
+    // name, an array its next value.
+    let cause = match (cause, offender) {
+        ("trailing comma", Some(']')) => "expected value",
+        ("trailing comma", _) => "key must be a string",
+        (cause, _) => cause,
+    };
+    match cause {
+        "key must be a string" => "was expecting double-quote to start field name",
+        "expected value" => {
+            "was expecting a valid value (JSON String, Number, Array, Object or token \
+             'null', 'true' or 'false')"
+        }
+        "expected ident" => "was expecting a valid token ('null', 'true' or 'false')",
+        "expected `:`" => "was expecting a colon to separate field name and value",
+        "expected `,` or `}`" => "was expecting comma to separate Object entries",
+        "expected `,` or `]`" => "was expecting comma to separate Array entries",
+        "trailing characters" => "was expecting end of the document",
+        "EOF while parsing an object" => "expected close marker for Object",
+        "EOF while parsing a list" => "expected close marker for Array",
+        "EOF while parsing a string" => "expected close marker for String",
+        "EOF while parsing a value" => "expected a value",
+        other => other,
+    }
+}
+
+/// The character the failure sits on: the `column`th byte of the `line`th line of
+/// the submitted document, where both are counted from one, and `None` when the
+/// position is past its end. The parser counts a column in bytes, so a position
+/// inside a multi-byte character names that character.
+fn character_at(document: &str, line: usize, column: usize) -> Option<char> {
+    if line == 0 || column == 0 {
+        return None;
+    }
+    let mut start = 0;
+    for _ in 1..line {
+        start += document[start..].find('\n')? + 1;
+    }
+    let mut index = start + column - 1;
+    if index >= document.len() {
+        return None;
+    }
+    while index > start && !document.is_char_boundary(index) {
+        index -= 1;
+    }
+    document[index..].chars().next()
+}
+
+/// A character as the diagnosis prints it: itself when it is printable, an escape
+/// when it is a control character that would otherwise be invisible in the message.
+fn render_character(character: char) -> String {
+    if character.is_control() {
+        character.escape_default().to_string()
+    } else {
+        character.to_string()
+    }
 }
 
 /// Mint a session credential and record the session it belongs to.

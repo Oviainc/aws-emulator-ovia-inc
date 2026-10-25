@@ -287,15 +287,15 @@ fn cases() -> Vec<Case> {
             terminal_message: COMPLETED,
         },
         Case {
-            label: "a query, FULL_SUPPORT, three tags",
+            label: "a query, AI_ONLY, three tags",
             body: text_body(
                 "Subprocessors",
                 "Which subprocessors handle customer content?",
-                Some("FULL_SUPPORT"),
+                Some("AI_ONLY"),
                 &[("team", "legal"), ("env", "prod"), ("owner", "a.b@c")],
             ),
             input_source: "TEXT",
-            support_mode: "FULL_SUPPORT",
+            support_mode: "AI_ONLY",
             tags: &[("team", "legal"), ("env", "prod"), ("owner", "a.b@c")],
             terminal_status: "COMPLETED",
             terminal_message: COMPLETED,
@@ -684,7 +684,7 @@ async fn a_client_token_reused_on_different_content_is_refused() {
     for (label, mutate) in [
         ("the title", 0usize),
         ("the query", 1),
-        ("the supportMode", 2),
+        ("the content form and its supportMode", 2),
         ("a tag value", 3),
         ("an added tag", 4),
         ("the content form", 5),
@@ -693,7 +693,13 @@ async fn a_client_token_reused_on_different_content_is_refused() {
         match mutate {
             0 => body["name"] = json!("Renamed"),
             1 => body["inquiryContent"] = json!({ "query": "Is customer data encrypted in transit?" }),
-            2 => body["supportMode"] = json!("FULL_SUPPORT"),
+            2 => {
+                // `supportMode` can only differ on content the other mode is available
+                // for: `FULL_SUPPORT` is "only supported for file upload mode", so the
+                // row that changes the mode changes the content's form with it.
+                body["inquiryContent"] = json!({ "fileContent": { "content": FILE_CONTENT } });
+                body["supportMode"] = json!("FULL_SUPPORT");
+            }
             3 => body["tags"] = json!({ "team": "legal" }),
             4 => body["tags"] = json!({ "team": "compliance", "env": "prod" }),
             _ => {

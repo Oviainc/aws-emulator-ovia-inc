@@ -29,6 +29,8 @@ mod core_network_policy_version_restore;
 mod core_network_policy_versions;
 #[path = "all/core_network_prefix_list_association.rs"]
 mod core_network_prefix_list_association;
+#[path = "all/customer_gateway_association_lifecycle.rs"]
+mod customer_gateway_association_lifecycle;
 #[path = "all/delete_attachment.rs"]
 mod delete_attachment;
 #[path = "all/delete_dependency_refusal.rs"]

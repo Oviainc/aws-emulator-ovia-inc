@@ -194,14 +194,15 @@ fn minted_id_pointer(operation: &str) -> &'static str {
 }
 
 /// How many assessments this account holds, as the service reports them: an account with
-/// none has no latest assessment id at all (404), so this counts 0 or "at least one".
+/// none has no latest assessment id at all, which `GetLatestAssessmentId` refuses with
+/// its declared `ValidationException` (400), so this counts 0 or "at least one".
 async fn has_an_assessment(router: &MultiServiceRouter) -> bool {
     let answer = call(router, "GET", "/get-latest-assessment-id", None).await;
     match answer.status {
         200 => true,
-        404 => false,
+        400 => false,
         other => panic!(
-            "GetLatestAssessmentId answered neither 200 nor 404 but {other} with {:?}",
+            "GetLatestAssessmentId answered neither 200 nor 400 but {other} with {:?}",
             answer.body
         ),
     }

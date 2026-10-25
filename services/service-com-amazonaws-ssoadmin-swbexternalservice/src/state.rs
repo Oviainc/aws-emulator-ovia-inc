@@ -270,12 +270,32 @@ pub fn application_assignment_not_found_message(
     )
 }
 
+/// The refusal a delete of an account assignment that is not granted earns, as the
+/// message of the modelled `ResourceNotFoundException`.
+///
+/// Built from the request: an assignment's identity is the whole (account, permission
+/// set, principal type, principal id) tuple, so the refusal names every part of it
+/// rather than one resource of the call.
+pub fn account_assignment_not_found_message(
+    account_id: &str,
+    permission_set_arn: &str,
+    principal_type: &str,
+    principal_id: &str,
+) -> String {
+    format!(
+        "Could not find an assignment of permission set {permission_set_arn} to \
+         {principal_type} {principal_id} on account {account_id}."
+    )
+}
+
 /// The refusal a `RequestId` this instance holds no assignment-operation status record
 /// for earns, as the message of the modelled `ResourceNotFoundException`.
 ///
 /// Built from the request, like [`trusted_token_issuer_not_found_message`]: it names the
 /// request id that resolved to nothing, which is what tells "no operation was ever
-/// tracked under this id" from "some other resource of this call is missing".
+/// tracked under this id" from "some other resource of this call is missing". One helper
+/// for both halves of that history: a creation status and a deletion status are looked up
+/// the same way, by the id the operation answered with.
 pub fn assignment_operation_not_found_message(request_id: &str) -> String {
     format!("Could not find the status of an assignment operation with request id {request_id}.")
 }
@@ -433,6 +453,12 @@ pub const MAX_PAGE_SIZE: i32 = 100;
 /// it is refused with the modelled `ServiceQuotaExceededException`, which AWS documents
 /// as "the principal has crossed the permitted number of resources that can be
 /// created", so the refusal is one a real client already handles.
+///
+/// One store does not refuse at this ceiling:
+/// [`ComAmazonawsSsoadminSwbexternalserviceState::assignment_deletions`] holds the
+/// history of deletions that have ALREADY been applied, so it evicts its oldest records
+/// instead (see
+/// [`ComAmazonawsSsoadminSwbexternalserviceState::record_assignment_deletion`]).
 pub const MAX_RECORDS_PER_STORE: usize = 1_000;
 
 /// The message a store at [`MAX_RECORDS_PER_STORE`] refuses a new record with; `store`
@@ -1707,6 +1733,21 @@ pub struct ComAmazonawsSsoadminSwbexternalserviceState {
     /// adding another, and a delete that removes an assignment removes its status
     /// record with it. Holds at most [`MAX_RECORDS_PER_STORE`] records.
     pub assignment_operations: BTreeMap<String, AssignmentOperationRecord>,
+    /// Assignment DELETION statuses, newest last — the history
+    /// `DescribeAccountAssignmentDeletionStatus` reads by `RequestId`, in the same record
+    /// type a creation status uses ([`AssignmentOperationRecord`], which carries the
+    /// instance it ran under), so the two views cannot disagree about the members of
+    /// `AccountAssignmentOperationStatus`.
+    ///
+    /// Separate from [`Self::assignment_operations`] because the two are read by
+    /// different operations: a `RequestId` a deletion carries is not a creation status and
+    /// must not answer a describe of one. A deletion status is also history rather than a
+    /// resource — by the time it is stored the assignment it reports on is gone, so it
+    /// cannot be held beside that assignment. A `Vec` in insertion order, so the history
+    /// is chronological; it holds at most [`MAX_RECORDS_PER_STORE`] records and the oldest
+    /// is evicted beyond that (see [`Self::record_assignment_deletion`]) rather than a
+    /// delete being refused for history nobody can grow.
+    pub assignment_deletions: Vec<AssignmentOperationRecord>,
     /// Whether the account's IAM Identity Center ENABLEMENT has been decided already.
     ///
     /// The emulator's account gets its instance from the first request that needs one: a
@@ -1830,6 +1871,8 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
             .retain(|_, record| record.instance_arn != instance_arn);
         self.assignment_operations
             .retain(|_, record| record.instance_arn != instance_arn);
+        self.assignment_deletions
+            .retain(|record| record.instance_arn != instance_arn);
         let orphaned_applications: Vec<String> = self
             .applications
             .values()
@@ -1975,6 +2018,49 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
                 && row.principal_type == principal_type
                 && row.principal_id == principal_id
         })
+    }
+
+    /// Store the status of one assignment deletion, evicting the OLDEST records while
+    /// the history is over [`MAX_RECORDS_PER_STORE`].
+    ///
+    /// A deletion is applied before this is called, so the history cannot refuse it: the
+    /// emulator's memory ceiling is kept by dropping the oldest statuses instead, which
+    /// is why this store is the one caller-driven store that evicts rather than refusing
+    /// (a creation status belongs to a live assignment, so it is bounded by the
+    /// assignments themselves).
+    pub fn record_assignment_deletion(&mut self, record: AssignmentOperationRecord) {
+        self.assignment_deletions.push(record);
+        let excess = self
+            .assignment_deletions
+            .len()
+            .saturating_sub(MAX_RECORDS_PER_STORE);
+        self.assignment_deletions.drain(..excess);
+    }
+
+    /// The stored status of the assignment deletion `request_id` names WITHIN
+    /// `instance_arn`.
+    ///
+    /// Scoped to the instance exactly as [`Self::assignment_operation`] is: a `RequestId`
+    /// of another instance's deletion is as absent here as one that never ran.
+    pub fn assignment_deletion(
+        &self,
+        instance_arn: &str,
+        request_id: &str,
+    ) -> Option<&AssignmentOperationRecord> {
+        self.assignment_deletions
+            .iter()
+            .find(|record| record.instance_arn == instance_arn && record.request_id == request_id)
+    }
+
+    /// Whether any stored assignment operation — a creation status or a deletion status —
+    /// already carries `request_id`, so a freshly minted one is never reused for a second
+    /// operation.
+    pub fn assignment_request_id_taken(&self, request_id: &str) -> bool {
+        self.assignment_operations.contains_key(request_id)
+            || self
+                .assignment_deletions
+                .iter()
+                .any(|record| record.request_id == request_id)
     }
 
     /// The index of the assignment with this identity tuple, if it exists.

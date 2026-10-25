@@ -293,8 +293,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // or after that instant reports it. Nothing sleeps.
             pending: Some(crate::state::PendingTransition {
                 due_at: now + crate::state::TRANSITION_SPAN,
-                status: crate::state::APPLICATION_STATUS_ACTIVATED.to_string(),
-                discovery_status: crate::state::DISCOVERY_STATUS_SUCCESS.to_string(),
+                change: crate::state::PendingChange::Status {
+                    status: crate::state::APPLICATION_STATUS_ACTIVATED.to_string(),
+                    discovery_status: crate::state::DISCOVERY_STATUS_SUCCESS.to_string(),
+                },
             }),
         };
 

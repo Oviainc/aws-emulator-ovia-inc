@@ -31,20 +31,20 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::thread::sleep;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_iottwinmaker_awsiottwinmaker::ops::list_sync_jobs::DEFAULT_PAGE_SIZE;
 use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
-    ResourceRef, SyncJob, SYNC_JOB_ERROR_CODE, SYNC_JOB_ERROR_MESSAGE, SYNC_JOB_SETTLE_SPAN,
-    SYNC_JOB_STATE_CREATING, SYNC_JOB_STATE_ERROR, SYNC_SOURCE_SITEWISE, MAX_PAGE_SIZE,
+    SYNC_JOB_ERROR_CODE, SYNC_JOB_ERROR_MESSAGE, SYNC_JOB_SETTLE_SPAN, SYNC_JOB_STATE_CREATING,
+    SYNC_JOB_STATE_ERROR, SYNC_SOURCE_SITEWISE, MAX_PAGE_SIZE,
 };
 
-use crate::harness::{sync_job_arn, workspace_arn, Emulator, Resp};
+use crate::harness::{seed_sync_job, sync_job_arn, workspace_arn, Emulator, Resp};
 
 /// The role every seeded job carries; the listing does not report it, but a
 /// stored job always has one.
-const SEEDED_ROLE: &str = "arn:aws:iam::000000000000:role/TwinMakerSyncRole";
+const SEEDED_ROLE: &str = crate::harness::SYNC_ROLE;
 
 /// Block until the outcome an accepted job owes has fallen due, so a case that
 /// compares a listing with a single read is comparing a job the clock can no
@@ -64,40 +64,6 @@ async fn emulator_with_workspaces(workspace_ids: &[&str]) -> Emulator {
         );
     }
     emulator
-}
-
-/// Store one sync job for `sync_source` in `workspace_id`, written into the very
-/// store the handlers read, exactly as `CreateSyncJob` writes one: the job
-/// record under its source, and its ARN in the service's index.
-///
-/// Used for the sources the create path refuses (it supports one), so a suite
-/// can build the multi-job workspace the pagination rules are about.
-fn seed_sync_job(emulator: &Emulator, workspace_id: &str, sync_source: &str) {
-    let arn = sync_job_arn(workspace_id, sync_source);
-    let state = emulator.state();
-    let mut state = state.lock();
-    let workspace = state
-        .workspaces
-        .get_mut(workspace_id)
-        .unwrap_or_else(|| panic!("the workspace {workspace_id:?} must exist before it is seeded"));
-    workspace.sync_jobs.insert(
-        sync_source.to_string(),
-        SyncJob::accepted(
-            sync_source.to_string(),
-            arn.clone(),
-            workspace_id.to_string(),
-            SEEDED_ROLE.to_string(),
-            BTreeMap::new(),
-            SystemTime::now(),
-        ),
-    );
-    state.arn_index.insert(
-        arn,
-        ResourceRef::SyncJob {
-            workspace_id: workspace_id.to_string(),
-            sync_source: sync_source.to_string(),
-        },
-    );
 }
 
 /// The `syncJobSummaries` of a response: a present array, never an absent

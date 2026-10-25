@@ -22,16 +22,15 @@
 //! which identifier form names the group, and whether a group matches); the account-wide
 //! policy an issue happens to cite is one row.
 //!
-//! A log-group level policy is put in the store through [`IndexPolicyRecord`] — the record
-//! `PutIndexPolicy` will write — because that operation is still a scaffold stub
-//! (`issues/things-that-do-not-work/20261023T113357Z-logs-putindexpolicy-stub.md`), so no
-//! wire call can store one yet. Everything these cases assert is read back over the wire.
+//! A log-group level policy is stored the way a client stores one, through
+//! `PutIndexPolicy`; what that operation itself is held to is
+//! `tests/all/index_policy_puts.rs`. Everything these cases assert is read back over the
+//! wire.
 
 use serde_json::{json, Value};
 
 use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
     log_group_arn, ComAmazonawsCloudwatchlogsLogs20140328State, DataSourceRecord,
-    IndexPolicyRecord,
 };
 
 use crate::account_policies::{field_index_document, put_body};
@@ -119,20 +118,13 @@ async fn put_account_policy(logs: &Logs, case: &str, criteria: Option<&str>) -> 
     document
 }
 
-/// Store a log-group level index policy on a stored group, stamped at `last_update_time_ms`.
-fn seed_group_policy(logs: &Logs, group: &str, document: &str, last_update_time_ms: i64) {
-    let state = logs
-        .engine()
-        .state::<ComAmazonawsCloudwatchlogsLogs20140328State>();
-    let mut store = state.lock();
-    let record = store
-        .log_groups
-        .get_mut(group)
-        .unwrap_or_else(|| panic!("case {group}: the log group must be stored"));
-    record.index_policy = Some(IndexPolicyRecord {
-        policy_document: document.to_string(),
-        last_update_time_ms,
-    });
+/// Store a log-group level index policy on a group the way a client does.
+async fn put_group_policy(logs: &Logs, group: &str, document: &str) {
+    logs.ok(
+        "PutIndexPolicy",
+        &json!({"logGroupIdentifier": group, "policyDocument": document}),
+    )
+    .await;
 }
 
 /// Store the data sources `sources` names — `(name, type)` pairs — on a stored group. No
@@ -347,8 +339,8 @@ async fn a_log_group_level_policy_is_reported_ahead_of_an_account_wide_one() {
     let account_document = put_account_policy(&logs, "applies-to-all", None).await;
 
     let own_document = field_index_document(&["requestId", "sessionId"]);
-    let stamped = now_ms() - 60 * 60 * 1_000;
-    seed_group_policy(&logs, HOLDER, &own_document, stamped);
+    let own_put_at = now_ms();
+    put_group_policy(&logs, HOLDER, &own_document).await;
 
     // The two identifier forms the modelled `LogGroupIdentifier` pattern
     // (`^[\w#+=/:,.@-]*$`) admits: the group's name, and the ARN form WITHOUT the trailing
@@ -377,10 +369,10 @@ async fn a_log_group_level_policy_is_reported_ahead_of_an_account_wide_one() {
             arn,
             "case {case}: expected the log group's ARN, got {policy}"
         );
-        assert_eq!(
-            last_update_time(&policy),
-            stamped,
-            "case {case}: expected the stored update time {stamped}, got {policy}"
+        let stamped = last_update_time(&policy);
+        assert!(
+            (own_put_at..=now_ms()).contains(&stamped),
+            "case {case}: expected an update time in [{own_put_at}, now], got {stamped}"
         );
     }
 

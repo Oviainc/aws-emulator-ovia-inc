@@ -224,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             named => {
                 let mut pipelines: Vec<i32> = Vec::with_capacity(named.len());
                 for id in named {
-                    let pipeline = pipeline_index(id)
+                    let pipeline = crate::state::pipeline_index(id)
                         .filter(|pipeline| channel.has_pipeline(*pipeline))
                         .ok_or_else(|| bad_pipeline(channel, id))?;
                     // Naming one pipeline twice restarts it once.
@@ -251,23 +251,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // reports no deadline for one.
             maintenance_status: None,
         ))
-    }
-}
-
-/// The pipeline a `ChannelPipelineIdToRestart` value names, as
-/// `PipelineDetail$PipelineId` numbers it.
-///
-/// The enum's only values are `PIPELINE_0` and `PIPELINE_1`
-/// (`smithy_query(query="shape", shape="ChannelPipelineIdToRestart")`, and the
-/// `PipelineIds` member's own doc: "Format PIPELINE_0 or PIPELINE_1"), so they
-/// are matched exactly rather than by parsing the suffix: a spelling the enum
-/// does not declare names no pipeline. `None` for anything else, which the caller
-/// refuses.
-fn pipeline_index(id: &str) -> Option<i32> {
-    match id {
-        "PIPELINE_0" => Some(0),
-        "PIPELINE_1" => Some(1),
-        _ => None,
     }
 }
 
