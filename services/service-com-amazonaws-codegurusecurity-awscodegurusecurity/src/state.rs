@@ -30,13 +30,15 @@
 //!   [`tag_quota_refusal`]), so repeatedly tagging one scan cannot grow its tag store
 //!   without end.
 //! * `idempotency` gains one entry only where a run was created, so it is bounded by the
-//!   same (scans x runs) product.
+//!   same (scans x runs) product, and an entry is dropped once its
+//!   [`CLIENT_TOKEN_WINDOW_MILLIS`] has passed ([`Store::expire_due_client_tokens`]).
 //! * `findings` is written only by a scan run's analysis, so no request path grows it;
 //!   the readers' page sizes are clamped to the modelled `maxResults` maxima.
 //!
 //! Per-request CPU is bounded too: the clock-owed work the readers do is driven by the
-//! `pending_runs` / `artifact_expiry` due-queues, so each call touches only the entries
-//! that actually came due rather than walking everything earlier requests stored.
+//! `pending_runs` / `artifact_expiry` / `idempotency_expiry` due-queues, so each call
+//! touches only the entries that actually came due rather than walking everything earlier
+//! requests stored.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -252,6 +254,17 @@ pub fn tag_quota_refusal(
 /// idempotency ledger and the work the due-queues can hold.
 pub const RUNS_PER_SCAN_QUOTA: usize = 100;
 
+/// How long a `CreateScan` client token stands for the request it was first seen on.
+///
+/// CHOSEN, not documented: AWS publishes no window for `CreateScanRequest$clientToken`,
+/// only that the value exists "to prevent the accidental creation of duplicate scans if
+/// there are failures and retries" — a retry horizon, not a permanent reservation. A
+/// bounded window is what makes the token behave as a retry marker rather than as a
+/// lifetime lock: once it has passed, the token names no request and the next call
+/// carrying it is a fresh one, which is also what keeps the ledger from holding a record
+/// for the lifetime of the process.
+pub const CLIENT_TOKEN_WINDOW_MILLIS: i64 = 24 * 60 * 60 * 1_000;
+
 /// `quotaCode` of a `ThrottlingException` refusing a `CreateUploadUrl` over
 /// [`UPLOAD_ARTIFACT_QUOTA`].
 pub const QUOTA_CODE_UPLOAD_ARTIFACTS: &str = "code-artifacts-per-account";
@@ -451,6 +464,50 @@ pub struct ScanRun {
     pub settle_due_millis: i64,
 }
 
+/// What a `CreateScan` request asked for, as the service resolved it: every modelled
+/// input of the operation, with the documented defaults already applied.
+///
+/// This is what one client token stands for. Two requests carrying the same token are the
+/// SAME request exactly when these compare equal, so a member named explicitly with the
+/// value the service would have defaulted to is the same request as one that left it out,
+/// and an absent tag map is the same request as an empty one — both ask for the same work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanRequestParameters {
+    /// `scanName`, the name the revisions of one resource are tracked under.
+    pub scan_name: String,
+    /// `resourceId.codeArtifactId`, the code artifact the run is to be started on.
+    pub code_artifact_id: String,
+    /// `scanType`, resolved ([`SCAN_TYPE_STANDARD`] when the request named none).
+    pub scan_type: String,
+    /// `analysisType`, resolved ([`ANALYSIS_TYPE_SECURITY`] when the request named none).
+    pub analysis_type: String,
+    /// `tags`, as the request carried them; empty when it carried no map at all.
+    pub tags: BTreeMap<String, String>,
+}
+
+/// One `clientToken` record: the request the token was first seen on and the run that
+/// request started, honoured until [`expires_at_millis`](Self::expires_at_millis).
+///
+/// `clientToken` is `@idempotencyToken`, and a retry is the SAME request sent again: the
+/// record therefore keeps the whole request ([`ScanRequestParameters`]), so a replay can
+/// be told apart from a different request sent under one token, rather than only the id of
+/// what the first call produced.
+#[derive(Debug, Clone)]
+pub struct IdempotentCreateScan {
+    /// The token itself. Also this record's key in [`Store::idempotency`].
+    pub client_token: String,
+    /// The request the token was first seen on.
+    pub request: ScanRequestParameters,
+    /// The `runId` that request started, which a replay of it answers with.
+    pub run_id: String,
+    /// Epoch milliseconds at which the token was first seen.
+    pub recorded_at_millis: i64,
+    /// Epoch milliseconds at which the token stops standing for that request; see
+    /// [`CLIENT_TOKEN_WINDOW_MILLIS`]. Stored, never slept on: a later call materialises
+    /// the expiry the clock already owes ([`Store::expire_due_client_tokens`]).
+    pub expires_at_millis: i64,
+}
+
 /// The account's CodeGuru Security configuration record — the resource
 /// `GetAccountConfiguration` reports and `UpdateAccountConfiguration` updates.
 ///
@@ -558,11 +615,17 @@ pub struct ComAmazonawsCodegurusecurityAwscodegurusecurityState {
     /// A run fills it with what its analysis produced; see [`SCAN_NOT_ANALYSED_MESSAGE`]
     /// for why a run this emulator records produces none.
     pub findings: BTreeMap<(String, String), Finding>,
-    /// `(clientToken, scanName)` -> `runId`, so a retried `CreateScan` answers with the
-    /// run the first call created instead of starting another revision. Keyed on the
-    /// scan name as well as the token, so a token reused for a different scan can never
-    /// answer for the other scan's run.
-    pub idempotency: HashMap<(String, String), String>,
+    /// `clientToken` -> what the request carrying it asked for and the run it started, so
+    /// a retried `CreateScan` answers with that run instead of starting another revision
+    /// and a DIFFERENT request sent under the same token is told apart from a retry.
+    /// Keyed on the token alone, because one token stands for one request: the request's
+    /// own members — its `scanName` included — are compared from the record rather than
+    /// folded into the key. Bounded by [`CLIENT_TOKEN_WINDOW_MILLIS`].
+    pub idempotency: HashMap<String, IdempotentCreateScan>,
+    /// `(expires_at_millis, clientToken)` of every token still inside its window: the
+    /// due-queue [`Self::expire_due_client_tokens`] walks, so forgetting the tokens whose
+    /// window has closed costs only what actually closed.
+    pub idempotency_expiry: BTreeSet<(i64, String)>,
     /// How many bytes of uploaded content the resources of `upload_artifacts` retain in
     /// total, kept in step with every write and release so the figure is available
     /// without walking the store. Bounded by [`UPLOAD_ARTIFACT_QUOTA`] times
@@ -645,6 +708,37 @@ impl ComAmazonawsCodegurusecurityAwscodegurusecurityState {
                 self.release_upload_bytes(&released);
             }
         }
+    }
+
+    /// Forget every client token whose window the clock has already closed at
+    /// `now_millis`, so the next `CreateScan` carrying it is a fresh request rather than a
+    /// replay of one made arbitrarily long ago. Driven off the `idempotency_expiry`
+    /// due-queue, so the work is proportional to what came due.
+    pub fn expire_due_client_tokens(&mut self, now_millis: i64) {
+        let horizon = (now_millis.saturating_add(1), String::new());
+        let due: Vec<(i64, String)> = self.idempotency_expiry.range(..horizon).cloned().collect();
+        for key in due {
+            self.idempotency_expiry.remove(&key);
+            if self
+                .idempotency
+                .get(&key.1)
+                .is_some_and(|record| record.expires_at_millis <= now_millis)
+            {
+                self.idempotency.remove(&key.1);
+            }
+        }
+    }
+
+    /// Record what one client token stands for, registering the close of its window on the
+    /// due-queue. A token already recorded keeps one record only: its previous due-queue
+    /// entry goes with it, so the queue and the ledger stay in step.
+    pub fn remember_client_token(&mut self, record: IdempotentCreateScan) {
+        let key = (record.expires_at_millis, record.client_token.clone());
+        if let Some(previous) = self.idempotency.insert(record.client_token.clone(), record) {
+            self.idempotency_expiry
+                .remove(&(previous.expires_at_millis, previous.client_token));
+        }
+        self.idempotency_expiry.insert(key);
     }
 
     /// Take the bytes a released artifact retained out of the retained total.

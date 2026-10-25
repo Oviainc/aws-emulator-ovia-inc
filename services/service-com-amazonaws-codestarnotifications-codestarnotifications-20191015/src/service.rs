@@ -45,6 +45,8 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+pub(crate) mod validation;
+
 /// The `com-amazonaws-codestarnotifications-codestarnotifications-20191015` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -97,16 +99,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it. The wording is NOT written here: it is `validation::refused`, the
+        // ONE formatter for every constrained member of every operation, which states
+        // the member path and the constraint the framework reported, withholds the value
+        // of a member the model marks `@sensitive`, and advertises a `@pattern`
+        // expression the way this service publishes it. Both the code and the message
+        // come from there, since a client branches on the code and a message without its
+        // matching code is worse than leaving both alone; a refusal class that module
+        // has no wording for keeps the framework's own sentence.
+        validation::refused(refusal)
     }
 
     fn override_routing_error(

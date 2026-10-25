@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTasks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTasks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTasks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation enumerates the tasks `CreateTask` recorded for the
+//! workspace a request names, in a stable order, paged by `maxResults`/`nextToken`,
+//! each summary read straight off the stored task; this is the ONLY file to touch
+//! for it.
 //!
 //! ## Shape of an operation
 //!
@@ -154,20 +149,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTasks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTasksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTasks"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            internal_failure("the IoT SiteWise store is unavailable".to_string())
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // A read: every member reported below is read off the stored task, or derived
+        // from the instant the transition its last write owes falls due, so a listing
+        // moves no task on and two readers of one task cannot disagree.
+        let store = state.lock();
+
+        // The listing is scoped to ONE workspace, so that workspace has to exist: a
+        // name this service does not hold is the modelled refusal rather than an empty
+        // page, which would report absence as success. Resolved BEFORE the paging
+        // arguments are read, as every workspace-scoped read in this crate resolves
+        // the resource its path names first, so a request that is wrong in both ways
+        // reports the resource that is absent.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            )));
+        }
+
+        // Every task of the named workspace and no other's: a task name is unique only
+        // within its workspace, so the workspace half of the key is what selects here.
+        let mut tasks: Vec<&crate::state::TaskRecord> = store
+            .tasks
+            .values()
+            .filter(|record| record.workspace_name == input.workspace_name)
+            .collect();
+        // A stable total order is what makes `nextToken` resumable: oldest first, ties
+        // broken by name so two tasks created in the same instant still order
+        // deterministically.
+        tasks.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+
+        // `nextToken` is this enumeration's resume point: the name of the first task of
+        // the next page, hex-encoded so the token stays opaque to the caller. A token
+        // whose resume point is not in this enumeration is refused rather than answered
+        // with an empty page.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                tasks
+                    .iter()
+                    .position(|record| record.name == resume)
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        // `maxResults` carries the modelled range 1..250 and the default of 50 the
+        // model itself states, both applied BEFORE this handler runs, so the value here
+        // is already in range; `max(1)` only keeps the slice arithmetic below total.
+        let max_results = input.max_results.max(1) as usize;
+        let end = start.saturating_add(max_results).min(tasks.len());
+
+        // "The token to be used for the next set of paginated results": issued only
+        // when a task follows this page.
+        let next_token = tasks
+            .get(end)
+            .map(|record| ::hex::encode(record.name.as_bytes()));
+        let task_summaries = tasks[start..end]
+            .iter()
+            .map(|record| summary(record, now))
+            .collect();
+
+        Ok(ListTasksOutput {
+            task_summaries,
+            next_token,
+        })
     }
+}
+
+/// One stored task as the summary this operation reports, read straight off the
+/// record `CreateTask` persisted and `UpdateTask` appended to — so a listed task and
+/// a described one never disagree.
+fn summary(record: &crate::state::TaskRecord, now: ::std::time::SystemTime) -> TaskSummary {
+    TaskSummary {
+        task_name: record.name.clone(),
+        // The description of the version a read naming none answers from: the newest.
+        description: record.current.description.clone(),
+        task_arn: record.arn.clone(),
+        version: record.version_label(),
+        status: record.status(now),
+        created_at: crate::state::to_date_time(record.created_at),
+        // "The time the task was last updated": the instant the write that produced
+        // the current version landed.
+        updated_at: crate::state::to_date_time(record.updated_at()),
+    }
+}
+
+/// Decode a `nextToken` back into the task name it resumes from.
+fn decode_token(token: &str) -> Result<String, ListTasksError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
+fn invalid_token() -> ListTasksError {
+    ListTasksErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: "The nextToken is not a token this operation issued.".to_string(),
+    })
+    .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> ListTasksError {
+    ListTasksErrorModeled::ResourceNotFoundException(ResourceNotFoundException { message }).into()
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal_failure(message: String) -> ListTasksError {
+    ListTasksErrorModeled::InternalFailureException(InternalFailureException { message }).into()
 }
