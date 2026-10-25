@@ -63,8 +63,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     Connection, ConnectionAuthResponseParameters, DeadLetterConfig, DescribeApiDestinationOutput,
-    DescribeArchiveOutput, DescribeConnectionOutput, LogConfig, PartnerEventSourceAccount,
-    Rule as RuleSummary, Tag, Target, INCLUDE_DETAIL_VALUES, LEVEL_VALUES, RULE_STATE_VALUES,
+    DescribeArchiveOutput, DescribeConnectionOutput, DescribeReplayOutput, LogConfig,
+    PartnerEventSourceAccount, ReplayDestination, Rule as RuleSummary, Tag, Target,
+    INCLUDE_DETAIL_VALUES, LEVEL_VALUES, RULE_STATE_VALUES,
 };
 
 /// The event bus a request lands on when it names none.
@@ -1123,6 +1124,134 @@ impl ArchiveRecord {
     }
 }
 
+/// The `ReplayState` a started replay is answered in.
+///
+/// "Starts the specified replay" (`StartReplay`) is the beginning of a job that
+/// runs on its own afterwards, so the create answers a non-terminal state and
+/// `DescribeReplay` is what reports its progress ("You can use DescribeReplay to
+/// determine the progress of a replay").
+pub const REPLAY_STATE_STARTING: &str = "STARTING";
+
+/// The `ReplayState` of a replay that has finished re-publishing its window.
+pub const REPLAY_STATE_COMPLETED: &str = "COMPLETED";
+
+/// How long after `StartReplay` the replay's `COMPLETED` state becomes due.
+///
+/// A replay is asynchronous in AWS — the call answers a non-terminal state and
+/// the caller polls `DescribeReplay` — so a replay answered `STARTING` reaches
+/// `COMPLETED` a moment later rather than instantly, and a caller reading
+/// straight after the call still observes the transient state. AWS publishes no
+/// duration for it (it depends on the window replayed); this is the emulator's
+/// own span, chosen inside the 250–750 ms window the project fixes for a
+/// clock-owed transition, and it is stored as a DUE INSTANT rather than waited
+/// for.
+pub const REPLAY_TRANSITION: Duration = Duration::from_millis(400);
+
+/// Largest number of replays this store holds.
+///
+/// This emulator's OWN bound, like [`MAX_ARCHIVES`]: a `StartReplay` past it
+/// answers the modelled `LimitExceededException` instead of growing memory
+/// without limit. It is far above any realistic fixture's needs.
+pub const MAX_REPLAYS: usize = 100;
+
+/// A replay as this emulator persists it.
+///
+/// "A replay processes events to replay based on the time in the event"
+/// (`StartReplay`): the record holds the archive the events come from, the
+/// window of event time that selects them, the destination they are re-published
+/// onto, and the progress `DescribeReplay` reports — the state, when the replay
+/// started and ended, and the event time of the last event it replayed.
+#[derive(Debug, Clone)]
+pub struct ReplayRecord {
+    pub name: String,
+    /// Minted ONCE, when the replay is started, and never recomputed.
+    pub arn: String,
+    /// The `ArchiveArn` the request named, reported back as given.
+    pub event_source_arn: String,
+    pub description: Option<String>,
+    /// The `ReplayDestination` the request named: the bus the events are
+    /// re-published onto and, when it carries them, the rules they are confined
+    /// to.
+    pub destination: ReplayDestination,
+    /// The window of EVENT time the replay selects from the archive.
+    pub event_start_time: SystemTime,
+    pub event_end_time: SystemTime,
+    /// One of `ReplayState`'s values.
+    pub state: String,
+    pub state_reason: Option<String>,
+    pub replay_start_time: SystemTime,
+    /// When the clock owes this replay its `COMPLETED` state, or `None` once it
+    /// has settled.
+    pub completed_due: Option<SystemTime>,
+    pub replay_end_time: Option<SystemTime>,
+    /// "The value returned for EventLastReplayedTime indicates the time within
+    /// the specified time range associated with the last event replayed"
+    /// (`StartReplay`), so it is the EVENT time of that event and not a clock
+    /// reading. `None` for a replay whose window selected no event.
+    pub event_last_replayed_time: Option<SystemTime>,
+}
+
+impl ReplayRecord {
+    /// A replay just started from `event_source_arn`: in [`REPLAY_STATE_STARTING`]
+    /// and having replayed nothing yet, with its [`REPLAY_STATE_COMPLETED`] state
+    /// due [`REPLAY_TRANSITION`] later. `Description` is written onto the record
+    /// by its creator.
+    pub fn new(
+        name: &str,
+        arn: String,
+        event_source_arn: String,
+        destination: ReplayDestination,
+        event_start_time: SystemTime,
+        event_end_time: SystemTime,
+        started: SystemTime,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            arn,
+            event_source_arn,
+            description: None,
+            destination,
+            event_start_time,
+            event_end_time,
+            state: REPLAY_STATE_STARTING.to_string(),
+            state_reason: None,
+            replay_start_time: started,
+            completed_due: Some(started + REPLAY_TRANSITION),
+            replay_end_time: None,
+            event_last_replayed_time: None,
+        }
+    }
+
+    /// Whether `time` — one archived event's own event time — lies in the window
+    /// this replay selects.
+    ///
+    /// "Only events that occurred between the EventStartTime and EventEndTime are
+    /// replayed" (`StartReplay$EventEndTime`), so the window is closed at both
+    /// ends: an event at either bound occurred between them.
+    pub fn replays(&self, time: SystemTime) -> bool {
+        time >= self.event_start_time && time <= self.event_end_time
+    }
+
+    /// Every member `DescribeReplay` reports, read back from the stored record,
+    /// so a read and what the replay did cannot disagree.
+    pub fn to_describe_output(&self) -> DescribeReplayOutput {
+        DescribeReplayOutput {
+            replay_name: Some(self.name.clone()),
+            replay_arn: Some(self.arn.clone()),
+            description: self.description.clone(),
+            state: Some(self.state.clone()),
+            state_reason: self.state_reason.clone(),
+            event_source_arn: Some(self.event_source_arn.clone()),
+            destination: Some(self.destination.clone()),
+            event_start_time: Some(to_wire_timestamp(self.event_start_time)),
+            event_end_time: Some(to_wire_timestamp(self.event_end_time)),
+            event_last_replayed_time: self.event_last_replayed_time.map(to_wire_timestamp),
+            replay_start_time: Some(to_wire_timestamp(self.replay_start_time)),
+            replay_end_time: self.replay_end_time.map(to_wire_timestamp),
+        }
+    }
+}
+
 /// The `ApiDestinationState` of a destination whose connection can authorize an
 /// invocation.
 pub const API_DESTINATION_STATE_ACTIVE: &str = "ACTIVE";
@@ -1191,6 +1320,26 @@ pub struct ApiDestinationRecord {
 /// resource is the archive's own name under this service's `archive/` type.
 pub fn archive_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("archive/{name}"))
+}
+
+/// The name of the archive an `ArchiveArn` names, or `None` when the text is not
+/// an archive ARN at all.
+///
+/// The counterpart of [`archive_arn`], and the ONE place an `ArchiveArn` is read
+/// back: the name is the whole remainder after the `archive/` segment, so an ARN
+/// this service minted resolves to the archive it was minted for.
+pub fn archive_name_in_arn(arn: &str) -> Option<&str> {
+    let (prefix, name) = arn.split_once(":archive/")?;
+    (prefix.starts_with("arn:") && !name.is_empty()).then_some(name)
+}
+
+/// `arn:aws:events:<region>:<account>:replay/<name>`.
+///
+/// `ReplayArn`'s modelled pattern is
+/// `^arn:aws([a-z]|\-)*:events:([a-z]|\d|\-)*:([0-9]{12})?:.+\/[\.\-_A-Za-z0-9]+$`,
+/// so the resource is the replay's own name under this service's `replay/` type.
+pub fn replay_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("replay/{name}"))
 }
 
 /// `arn:aws:events:<region>:<account>:api-destination/<name>/<id>`.
@@ -1412,6 +1561,10 @@ pub struct ComAmazonawsEventbridgeAwseventsState {
     /// Every archive, by name — the resource `CreateArchive` writes,
     /// `DescribeArchive` reports and `PutEvents` captures matching events into.
     pub archives: BTreeMap<String, ArchiveRecord>,
+    /// Every replay, by name — the job `StartReplay` writes and
+    /// `DescribeReplay` reports. Ordered by name, so enumeration is
+    /// deterministic.
+    pub replays: BTreeMap<String, ReplayRecord>,
     /// Every API destination, by name — the resource `CreateApiDestination`
     /// writes and `DescribeApiDestination` reports.
     pub api_destinations: BTreeMap<String, ApiDestinationRecord>,
@@ -1465,6 +1618,7 @@ impl Default for ComAmazonawsEventbridgeAwseventsState {
             buses,
             connections: BTreeMap::new(),
             archives: BTreeMap::new(),
+            replays: BTreeMap::new(),
             api_destinations: BTreeMap::new(),
             partner_sources: BTreeMap::new(),
             partner_namespaces: BTreeSet::new(),
@@ -1675,6 +1829,40 @@ impl ComAmazonawsEventbridgeAwseventsState {
             }
             changed |= archive.expire_captured(now) > 0;
             settled += usize::from(changed);
+        }
+        settled
+    }
+
+    /// The replay `name` names, for a REPORTING operation.
+    pub fn replay(&self, name: &str) -> Option<&ReplayRecord> {
+        self.replays.get(name)
+    }
+
+    /// The replay `name` names, mutably. Creates nothing: a replay comes into
+    /// existence through `StartReplay`.
+    pub fn replay_mut(&mut self, name: &str) -> Option<&mut ReplayRecord> {
+        self.replays.get_mut(name)
+    }
+
+    /// Materialise every replay change the clock has ALREADY made due at `now`,
+    /// and answer how many replays one was applied to.
+    ///
+    /// One change is owed by the clock alone: the non-terminal ->
+    /// [`REPLAY_STATE_COMPLETED`] transition [`REPLAY_TRANSITION`] after the
+    /// replay started. It was owed at the same instant even if nobody had
+    /// called, which is why a reporting operation may finish it.
+    pub fn settle_replays(&mut self, now: SystemTime) -> usize {
+        let mut settled = 0usize;
+        for replay in self.replays.values_mut() {
+            let Some(due) = replay.completed_due.filter(|due| *due <= now) else {
+                continue;
+            };
+            // The state moves to the instant the transition fell DUE, not to the
+            // instant it was noticed, so two reads agree.
+            replay.completed_due = None;
+            replay.state = REPLAY_STATE_COMPLETED.to_string();
+            replay.replay_end_time = Some(due);
+            settled += 1;
         }
         settled
     }
@@ -2439,6 +2627,50 @@ pub fn archive_rule_pattern(event_pattern: Option<&str>) -> String {
 /// ([`archive_rule_pattern`]).
 pub const REPLAY_NAME_FIELD: &str = "replay-name";
 
+/// How many levels the event envelope wraps a `Detail` document in: `detail` is
+/// one member of the envelope object, so an envelope nests exactly one level
+/// deeper than the document it carries ([`event_envelope`]).
+const ENVELOPE_LEVELS: usize = 1;
+
+/// The envelope a replay re-publishes for one archived event: the event exactly
+/// as the archive holds it, carrying the [`REPLAY_NAME_FIELD`] of the replay that
+/// re-published it.
+///
+/// "Each redelivered event carries the name of the replay that redelivered it" is
+/// what the archive's own rule reads to keep a replayed event out of the archive
+/// ([`archive_rule_pattern`]), so the field is added HERE — the one place a
+/// replayed envelope is built — rather than by each caller. Nothing else of the
+/// event changes: its `id`, its `time` and its `detail` are the archived ones,
+/// because a replay re-publishes the event it archived rather than a new event
+/// built from it.
+///
+/// `None` when the archived text is not a JSON object, which is text no rule
+/// could be matched against; the caller replays nothing for it rather than
+/// inventing an envelope. Reading the text DESCENDS into it, so the published
+/// [`MAX_DETAIL_DEPTH`] is charged here for the reason [`parse_detail`] gives,
+/// allowing for the levels the envelope itself adds.
+pub fn replayed_envelope(archived: &str, replay_name: &str) -> Option<::serde_json::Value> {
+    if json_nesting_depth(archived) > MAX_DETAIL_DEPTH + ENVELOPE_LEVELS {
+        return None;
+    }
+    let mut reader = ::serde_json::Deserializer::from_str(archived);
+    // Past the charge above, the parser's own default would refuse an envelope
+    // this service archived, so the published bound replaces it.
+    reader.disable_recursion_limit();
+    let mut documents = reader.into_iter::<::serde_json::Value>();
+    let Some(Ok(mut envelope)) = documents.next() else {
+        return None;
+    };
+    if documents.next().is_some() {
+        return None;
+    }
+    envelope.as_object_mut()?.insert(
+        REPLAY_NAME_FIELD.to_string(),
+        ::serde_json::Value::String(replay_name.to_string()),
+    );
+    Some(envelope)
+}
+
 /// The rule that serves `archive`, as this service provisions it on the archive's
 /// source bus.
 ///
@@ -2539,6 +2771,20 @@ pub fn connection_name_in_arn(arn: &str) -> Option<&str> {
 /// [`no_such_rule`] gives.
 pub fn no_such_event_bus(bus_name: &str) -> String {
     format!("Event bus {bus_name} does not exist.")
+}
+
+/// What any reader reports for a name — or an `ArchiveArn` — that names no
+/// archive: the missing ARCHIVE, built from the request. Written once, for the
+/// reason [`no_such_rule`] gives: `DescribeArchive` and a replay resolving its
+/// event source refuse a missing archive in the same words.
+pub fn no_such_archive(archive_name: &str) -> String {
+    format!("Archive {archive_name} does not exist.")
+}
+
+/// What any reader reports for a name that names no replay: the missing REPLAY,
+/// built from the request. Written once, for the reason [`no_such_rule`] gives.
+pub fn no_such_replay(replay_name: &str) -> String {
+    format!("Replay {replay_name} does not exist.")
 }
 
 /// What a tagging path reports for a well-formed ARN naming a resource this
