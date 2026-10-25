@@ -115,9 +115,23 @@ pub struct ClusterParameterSpec {
 }
 
 impl ClusterParameterSpec {
+    /// The `<low>-<high>` halves of a range [`Self::allowed_values`], or `None` when the
+    /// entry is not a range at all (a single admitted value).
+    ///
+    /// A low bound may itself be NEGATIVE — PostgreSQL publishes `-1-2147483647` for a
+    /// parameter whose `-1` disables it — so the separator is the first `-` AFTER the first
+    /// character; splitting at the first `-` anywhere would read that low bound as empty and
+    /// refuse the published value.
+    pub fn range(&self) -> Option<(&'static str, &'static str)> {
+        let values = self.allowed_values;
+        let offset = values.get(1..)?.find('-')? + 1;
+        Some((&values[..offset], &values[offset + 1..]))
+    }
+
     /// Whether this parameter admits `value`, reading [`Self::allowed_values`] the way
     /// [`Self::data_type`] says: a comma-separated enumeration is matched exactly, and a
-    /// `<low>-<high>` range is parsed as the numeric type and bounds-checked inclusively.
+    /// `<low>-<high>` range ([`Self::range`]) is parsed as the numeric type and
+    /// bounds-checked inclusively.
     pub fn admits(&self, value: &str) -> bool {
         if self.allowed_values.contains(',') {
             return self
@@ -126,7 +140,7 @@ impl ClusterParameterSpec {
                 .map(str::trim)
                 .any(|allowed| allowed == value);
         }
-        match self.allowed_values.split_once('-') {
+        match self.range() {
             Some((low, high)) if self.data_type == "integer" => {
                 match (
                     value.parse::<i64>(),
@@ -276,9 +290,24 @@ pub fn published_parameters(family: &str) -> Option<&'static [ClusterParameterSp
 /// matched exactly: `Filter$Name`'s "filter names are case sensitive" is the API's habit
 /// throughout, and the engine's parameter names are lowercase.
 pub fn published_parameter(family: &str, name: &str) -> Option<&'static ClusterParameterSpec> {
-    published_parameters(family)?
-        .iter()
-        .find(|spec| spec.name == name)
+    spec_in_catalog(published_parameters(family), name)
+}
+
+/// The spec `catalog` publishes for the parameter named `name`, if any; see
+/// [`published_parameter`] for how a name is matched.
+///
+/// The catalog is taken as an argument rather than looked up from a family, because a
+/// parameter group is scoped to a family AND to a level: the cluster-level parameters of a
+/// family are one published catalog ([`published_parameters`]) and its instance-level ones
+/// are another, which the service that publishes them passes in here. The rules over a
+/// catalog — what it admits, which apply method a change gets, whether that change is
+/// pending — are the same rules at either level, so they live once and read the catalog they
+/// are given.
+pub fn spec_in_catalog(
+    catalog: Option<&'static [ClusterParameterSpec]>,
+    name: &str,
+) -> Option<&'static ClusterParameterSpec> {
+    catalog?.iter().find(|spec| spec.name == name)
 }
 
 /// Whether a change to `name` with apply method `apply_method` is still waiting on a reboot
@@ -290,8 +319,15 @@ pub fn published_parameter(family: &str, name: &str) -> Option<&'static ClusterP
 /// apply [`APPLY_METHOD_PENDING_REBOOT`], and any change to a parameter whose published
 /// apply type is [`APPLY_TYPE_STATIC`], is pending.
 pub fn change_is_pending(family: &str, name: &str, apply_method: &str) -> bool {
+    change_is_pending_for(published_parameter(family, name), apply_method)
+}
+
+/// [`change_is_pending`] for a parameter whose published spec the caller already has (or
+/// `None` where its catalog publishes none); see [`spec_in_catalog`] for why the spec rather
+/// than the family is the argument.
+pub fn change_is_pending_for(spec: Option<&ClusterParameterSpec>, apply_method: &str) -> bool {
     apply_method == APPLY_METHOD_PENDING_REBOOT
-        || published_parameter(family, name).is_some_and(|spec| spec.apply_type == APPLY_TYPE_STATIC)
+        || spec.is_some_and(|spec| spec.apply_type == APPLY_TYPE_STATIC)
 }
 
 /// The method a change gets when the caller asks for none: the one the parameter's own apply
@@ -304,7 +340,14 @@ pub fn change_is_pending(family: &str, name: &str, apply_method: &str) -> bool {
 /// a parameter whose family publishes no apply type, where assuming the change needs no reboot
 /// would be a guess — waits for the reboot.
 pub fn default_apply_method(family: &str, name: &str) -> &'static str {
-    match published_parameter(family, name) {
+    default_apply_method_for(published_parameter(family, name))
+}
+
+/// [`default_apply_method`] for a parameter whose published spec the caller already has (or
+/// `None` where its catalog publishes none); see [`spec_in_catalog`] for why the spec rather
+/// than the family is the argument.
+pub fn default_apply_method_for(spec: Option<&ClusterParameterSpec>) -> &'static str {
+    match spec {
         Some(spec) if spec.apply_type == APPLY_TYPE_DYNAMIC => APPLY_METHOD_IMMEDIATE,
         _ => APPLY_METHOD_PENDING_REBOOT,
     }
@@ -318,16 +361,54 @@ pub fn default_apply_method(family: &str, name: &str) -> &'static str {
 /// from the text alone. A family this emulator publishes no catalog for admits any
 /// parameter and any value; see [`published_parameters`].
 pub fn validate_parameter_setting(family: &str, name: &str, value: &str) -> Result<(), String> {
-    let Some(published) = published_parameters(family) else {
+    validate_setting_in_catalog(published_parameters(family), family, name, value)
+}
+
+/// [`validate_parameter_setting`] against an explicit catalog that is the family's WHOLE
+/// published list, so a name it does not publish is a parameter that does not exist; see
+/// [`spec_in_catalog`] for why the catalog rather than the family is the argument, and
+/// [`validate_known_setting`] for the rule where a catalog is only a sample of the list.
+/// `family` is carried only to name it in the refusal.
+pub fn validate_setting_in_catalog(
+    catalog: Option<&'static [ClusterParameterSpec]>,
+    family: &str,
+    name: &str,
+    value: &str,
+) -> Result<(), String> {
+    let Some(published) = catalog else {
         return Ok(());
     };
-    let Some(spec) = published.iter().find(|spec| spec.name == name) else {
+    if spec_in_catalog(catalog, name).is_none() {
         let names: Vec<&str> = published.iter().map(|spec| spec.name).collect();
         return Err(format!(
-            "Invalid parameter name '{name}': the {family} cluster parameter group family \
+            "Invalid parameter name '{name}': the {family} parameter group family \
              publishes no parameter with that name; its parameters are {}",
             names.join(", ")
         ));
+    }
+    validate_known_setting(catalog, name, value)
+}
+
+/// Refuse a setting of a parameter `catalog` DOES publish: one the engine does not let a
+/// caller modify, or a value outside the ones that parameter admits.
+///
+/// A name the catalog does not publish is admitted, which is the rule wherever a catalog is
+/// a SAMPLE of what the family publishes rather than the whole of it — an engine publishes
+/// hundreds of parameters per family and that list moves with every engine release, so
+/// refusing a name this emulator does not carry would invent a constraint and reject a
+/// parameter the engine has. Where the catalog IS the whole list, the name itself is
+/// checked too: that is [`validate_setting_in_catalog`].
+///
+/// `Err` carries the message to answer with, built from the request — the parameter the
+/// caller named and the values that parameter admits — so the caller can fix the request
+/// from the text alone.
+pub fn validate_known_setting(
+    catalog: Option<&'static [ClusterParameterSpec]>,
+    name: &str,
+    value: &str,
+) -> Result<(), String> {
+    let Some(spec) = spec_in_catalog(catalog, name) else {
+        return Ok(());
     };
     if !spec.is_modifiable {
         return Err(format!(
@@ -409,6 +490,66 @@ mod tests {
     //! step past each bound.
 
     use super::*;
+
+    /// A published `AllowedValues` splits into the halves of the range it names, at the
+    /// first `-` AFTER the first character — so a negative low bound is read as a bound and
+    /// not as an empty one — and an entry naming no range splits into none.
+    ///
+    /// The table is over LITERAL `AllowedValues` strings, the forms the catalogs publish:
+    /// an enumeration, a positive range, a range whose low bound is negative, one whose both
+    /// bounds are, and a single admitted value.
+    #[test]
+    fn an_allowed_values_range_splits_at_its_own_separator() {
+        // (case, AllowedValues, the halves, a value inside, a value outside)
+        type Row = (
+            &'static str,
+            &'static str,
+            Option<(&'static str, &'static str)>,
+            &'static str,
+            &'static str,
+        );
+        let rows: [Row; 5] = [
+            ("a positive range", "1-100", Some(("1", "100")), "100", "101"),
+            (
+                "a negative low bound",
+                "-1-2147483647",
+                Some(("-1", "2147483647")),
+                "-1",
+                "-2",
+            ),
+            ("two negative bounds", "-15--2", Some(("-15", "-2")), "-15", "-16"),
+            ("a single admitted value", "8192", None, "8192", "8193"),
+            ("an enumeration", "0,1", None, "1", "2"),
+        ];
+
+        for (case, allowed_values, halves, inside, outside) in rows {
+            let spec = ClusterParameterSpec {
+                name: "a_parameter_under_test",
+                apply_type: APPLY_TYPE_DYNAMIC,
+                data_type: "integer",
+                allowed_values,
+                default_value: inside,
+                is_modifiable: true,
+                minimum_engine_version: "",
+                description: "a parameter under test",
+            };
+            // An enumeration names no range, and `admits` reads it before the split.
+            let expected = halves.filter(|_| !allowed_values.contains(','));
+            assert_eq!(
+                spec.range(),
+                expected,
+                "case {case:?}: expected the halves {expected:?} of {allowed_values:?}"
+            );
+            assert!(
+                spec.admits(inside),
+                "case {case:?}: {inside:?} is published for it, so it must be admitted"
+            );
+            assert!(
+                !spec.admits(outside),
+                "case {case:?}: {outside:?} is not published for it, so it must be refused"
+            );
+        }
+    }
 
     /// Every published parameter admits exactly what its own `AllowedValues` names.
     #[test]

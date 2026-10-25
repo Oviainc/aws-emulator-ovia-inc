@@ -381,9 +381,11 @@ async fn describe_reports_what_create_acme_domain_validation_stored() {
                 tag_pairs(&requested),
                 "case {case:?}: expected the stored Tags to be reported, got {listed}"
             ),
-            None => assert!(
-                listed["Tags"].is_null(),
-                "case {case:?}: a create that named no Tags must report none, got {listed}"
+            None => assert_eq!(
+                listed["Tags"],
+                json!([]),
+                "case {case:?}: a create that named no Tags must report the empty list, \
+                 got {listed}"
             ),
         }
     }

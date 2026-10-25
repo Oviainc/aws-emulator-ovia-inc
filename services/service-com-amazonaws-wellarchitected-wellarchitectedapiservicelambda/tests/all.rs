@@ -182,6 +182,9 @@ mod workload_harness;
 #[path = "all/workload_lens_association.rs"]
 mod workload_lens_association;
 
+#[path = "all/workload_lens_disassociation.rs"]
+mod workload_lens_disassociation;
+
 #[path = "all/workload_lifecycle.rs"]
 mod workload_lifecycle;
 

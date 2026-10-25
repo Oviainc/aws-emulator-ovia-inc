@@ -11,14 +11,16 @@
 //!    the AWS envelope (`N validation error(s) detected: `). The subject names the
 //!    input POSITION that failed and the value submitted there
 //!    (`Value '<value>' at '<member path>'`), EXCEPT at a position whose value ACM
-//!    withholds — a resource identifier (`…Arn`), a request token (`…Token`), and a
+//!    withholds — a resource identifier (`…Arn`), a request token (`…Token`), a
 //!    value the validating walk holds no submitted text for (a collection's element
-//!    count, a value past its echo cap) — which read
-//!    `Value of the input at '<member path>'`; an ABSENT member, having no submitted
-//!    value at all, reads `Value null at '<path>'`. A `@pattern` requirement reports
-//!    the expression without the model's `^` / `$` anchoring, and a failure of a
-//!    collection's ELEMENT is reported against the collection member with the
-//!    element's requirement nested.
+//!    count, a value past its echo cap), and a clause collapsed onto a COLLECTION
+//!    member, whose submitted scalar is an element rather than the position named —
+//!    which read `Value of the input at '<member path>'`; an ABSENT member, having no
+//!    submitted value at all, reads `Value null at '<path>'`. A `@pattern` requirement
+//!    reports the expression without the model's `^` / `$` anchoring, and a failure of
+//!    a collection's ELEMENT is reported against the collection member with the WHOLE
+//!    set of constraints the element shape declares nested — so an element that fails
+//!    two of them is still one clause and one error.
 //!    The table spans the constraint kinds (`@required`, `@length` on a string and
 //!    on a list, `@range`, `@pattern`, `@enum`), the member depth (a top-level
 //!    member, a collection element, and a member of a collection element), both
@@ -80,6 +82,9 @@ const IDEMPOTENCY_TOKEN_PATTERN: &str = r"^\w+$";
 /// The `@pattern` of `com.amazonaws.acm#TagKey`
 /// (`smithy_query(query="shape", shape="com.amazonaws.acm#TagKey")`).
 const TAG_KEY_PATTERN: &str = r"^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$";
+
+/// The `@length` maximum of `com.amazonaws.acm#TagKey` (`length 1..128`).
+const TAG_KEY_MAX_LENGTH: usize = 128;
 
 /// The sentence `ListCertificates` answers the paired `SortBy` / `SortOrder` rule
 /// with ("If you specify SortBy, you must also specify SortOrder" /
@@ -152,12 +157,48 @@ fn pattern_requirement(modelled: &str) -> String {
     )
 }
 
-/// The requirement a collection ELEMENT's failure states: the element's own
-/// requirement, nested, because the clause is reported against the collection
-/// member rather than the index inside it.
-fn nested(element_requirement: &str) -> String {
-    format!("Member must satisfy constraint: [{element_requirement}]")
+/// The requirement a collection ELEMENT's failure states: the WHOLE set of
+/// constraints the element shape declares, nested, because the clause is reported
+/// against the collection member rather than the index inside it — one clause stating
+/// everything an element has to satisfy, not only the constraint this value tripped
+/// over.
+fn nested(element_constraints: &[String]) -> String {
+    format!(
+        "Member must satisfy constraint: [{}]",
+        element_constraints.join(", ")
+    )
 }
+
+/// The constraint set of `com.amazonaws.acm#TagKey`, the element shape of every
+/// `TagKeyList` member, in the order ACM lists one: the length maximum, the length
+/// minimum, the pattern, and that an element must not be null
+/// (`smithy_query(query="shape", shape="com.amazonaws.acm#TagKeyList")` reports its
+/// member as `length 1..128`, `pattern ^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`).
+fn tag_key_constraints() -> Vec<String> {
+    vec![
+        "Member must have length less than or equal to 128".to_string(),
+        "Member must have length greater than or equal to 1".to_string(),
+        pattern_requirement(TAG_KEY_PATTERN),
+        ELEMENT_NOT_NULL.to_string(),
+    ]
+}
+
+/// The constraint set of `com.amazonaws.acm#CertificateStatus`, the element shape of
+/// `ListCertificatesRequest$CertificateStatuses`: its value set, and that an element
+/// must not be null.
+fn certificate_status_constraints() -> Vec<String> {
+    vec![
+        format!(
+            "Member must satisfy enum value set: [{}]",
+            CERTIFICATE_STATUSES.join(", ")
+        ),
+        ELEMENT_NOT_NULL.to_string(),
+    ]
+}
+
+/// The clause that closes every element constraint set: an element of a list is never
+/// null, which every element shape requires and no trait records.
+const ELEMENT_NOT_NULL: &str = "Member must not be null";
 
 /// `modelled` without a leading `^` and a trailing `$`.
 fn unanchored(modelled: &str) -> &str {
@@ -340,37 +381,46 @@ fn cases() -> Vec<Case<'static>> {
             what: "a list ELEMENT outside its enum value set",
             operation: "ListCertificates",
             body: json!({ "CertificateStatuses": ["NOT_A_STATUS"] }),
-            subject: Subject::Echoed("NOT_A_STATUS"),
-            clauses: vec![(
-                "certificateStatuses",
-                nested(&format!(
-                    "Member must satisfy enum value set: [{}]",
-                    CERTIFICATE_STATUSES.join(", ")
-                )),
-            )],
-            withheld: vec![],
+            subject: Subject::Withheld,
+            clauses: vec![("certificateStatuses", nested(&certificate_status_constraints()))],
+            withheld: vec!["NOT_A_STATUS"],
         },
         Case {
             what: "a list ELEMENT below the element's @length minimum",
             operation: "UntagResource",
             body: json!({ "ResourceArn": arn, "TagKeys": [""] }),
-            subject: Subject::Echoed(""),
-            clauses: vec![(
-                "tagKeys",
-                nested("Member must have length greater than or equal to 1"),
-            )],
+            subject: Subject::Withheld,
+            clauses: vec![("tagKeys", nested(&tag_key_constraints()))],
             withheld: vec![],
         },
         Case {
             what: "a list ELEMENT outside the element's @pattern",
             operation: "UntagResource",
             body: json!({ "ResourceArn": arn, "TagKeys": ["{not-a-legal-key}"] }),
-            subject: Subject::Echoed("{not-a-legal-key}"),
-            clauses: vec![(
-                "tagKeys",
-                nested(&pattern_requirement(TAG_KEY_PATTERN)),
-            )],
+            subject: Subject::Withheld,
+            clauses: vec![("tagKeys", nested(&tag_key_constraints()))],
+            withheld: vec!["{not-a-legal-key}"],
+        },
+        Case {
+            what: "a list ELEMENT failing TWO of the element's constraints at once",
+            operation: "UntagResource",
+            body: json!({
+                "ResourceArn": arn,
+                "TagKeys": [format!("{}#", "k".repeat(TAG_KEY_MAX_LENGTH))],
+            }),
+            // One clause, and one error: the set the clause states already names every
+            // constraint the element failed.
+            subject: Subject::Withheld,
+            clauses: vec![("tagKeys", nested(&tag_key_constraints()))],
             withheld: vec![],
+        },
+        Case {
+            what: "two list ELEMENTS of one member, each failing a different constraint",
+            operation: "UntagResource",
+            body: json!({ "ResourceArn": arn, "TagKeys": ["", "{not-a-legal-key}"] }),
+            subject: Subject::Withheld,
+            clauses: vec![("tagKeys", nested(&tag_key_constraints()))],
+            withheld: vec!["{not-a-legal-key}"],
         },
         // The same rule at the OTHER seam: a value sitting directly on a UNION
         // member, which the framework's validating walk does not descend into, so
@@ -440,15 +490,17 @@ async fn a_whole_envelope_is_pinned_as_a_literal() {
             "1 validation error detected: Value null at 'resourceArn' failed to satisfy \
              constraint: Member must not be null",
         ),
-        // A collection ELEMENT's failure, reported against the collection member
-        // with the element's requirement nested, and the element's own value stated.
+        // A collection ELEMENT's failure, reported against the collection member with
+        // the element shape's whole constraint set nested — and with the value
+        // withheld, because the position the clause names is the collection and the
+        // submitted scalar is one element inside it.
         (
             "ListCertificates",
             json!({ "CertificateStatuses": ["NOT_A_STATUS"] }),
-            "1 validation error detected: Value 'NOT_A_STATUS' at 'certificateStatuses' failed to \
+            "1 validation error detected: Value of the input at 'certificateStatuses' failed to \
              satisfy constraint: Member must satisfy constraint: [Member must satisfy enum value \
              set: [PENDING_VALIDATION, ISSUED, INACTIVE, EXPIRED, VALIDATION_TIMED_OUT, REVOKED, \
-             FAILED]]",
+             FAILED], Member must not be null]",
         ),
     ];
 

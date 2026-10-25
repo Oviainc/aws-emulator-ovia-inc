@@ -3,12 +3,13 @@
 //! The validation state machine of a requested ACM certificate, end to end over the
 //! wire (`POST /`, `X-Amz-Target: CertificateManager.<Op>`, awsJson1_1).
 //!
-//! RULE under test: `PENDING_VALIDATION` is a TRANSIENT status. A certificate
-//! `RequestCertificate` creates is owed a terminal status by the clock — `ISSUED`
-//! when the request needs no proof of domain ownership, else `FAILED` with the
-//! `FailureReason` for a request whose verification the service cannot obtain — and
-//! every reader reports that outcome once it has fallen due, so a client polling for a
-//! terminal status terminates.
+//! RULE under test: `PENDING_VALIDATION` is the status a request WAITS in, and what it
+//! waits for is fixed by the request. The clock owes a terminal status — `ISSUED` when
+//! the request needs no proof of domain ownership, `FAILED` with its `FailureReason`
+//! when it names a domain whose control can never be proven, and
+//! `VALIDATION_TIMED_OUT` at the end of the documented 72-hour validation window
+//! otherwise — and every reader reports that outcome once it has fallen due, so a
+//! client polling for a terminal status terminates.
 //!
 //! The table spans what the rule generalises over: both outcomes, every modelled
 //! `ValidationMethod` and the absence of one, and one name as against several. Each
@@ -26,7 +27,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_acm_certificatemanager::state::{
-    ComAmazonawsAcmCertificatemanagerState, VALIDATION_SETTLE_DELAY,
+    ComAmazonawsAcmCertificatemanagerState, VALIDATION_SETTLE_DELAY, VALIDATION_WINDOW,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -46,10 +47,10 @@ const CERTIFICATE_VALIDITY_SECONDS: f64 = 395.0 * 24.0 * 60.0 * 60.0;
 const ADDITIONAL_VERIFICATION_REQUIRED: &str = "ADDITIONAL_VERIFICATION_REQUIRED";
 
 /// One row of the state-machine table: what it is, the `RequestCertificate` body,
-/// the terminal `CertificateStatus` the clock owes the certificate it creates, and
-/// the `ValidationMethod` its domains are validated by (the request's, else the
-/// `EMAIL` ACM falls back to).
-type OutcomeCase<'a> = (&'a str, Value, &'a str, &'a str);
+/// the terminal `CertificateStatus` the clock owes the certificate it creates, the
+/// `ValidationMethod` its domains are validated by (the request's, else the `EMAIL` ACM
+/// falls back to), and the span that terminal status falls due within.
+type OutcomeCase<'a> = (&'a str, Value, &'a str, &'a str, Duration);
 
 /// How long until the stored validation outcome of `arn` falls due, or `None` when
 /// the record owes none (it has already reached a terminal status).
@@ -115,8 +116,7 @@ fn assert_terminal(case: &str, detail: &Value, expected: &str, method: &str) {
         "case {case}: expected the clock-owed terminal status {expected}, got {detail}"
     );
 
-    match expected {
-        "ISSUED" => {
+    match expected {        "ISSUED" => {
             // "This value exists only when the certificate status is FAILED"
             // (`CertificateDetail$FailureReason` doc).
             assert!(
@@ -160,12 +160,23 @@ fn assert_terminal(case: &str, detail: &Value, expected: &str, method: &str) {
                 "case {case}: expected the extended key usages of an issued certificate, got {detail}"
             );
         }
-        "FAILED" => {
-            assert_eq!(
-                detail["FailureReason"].as_str(),
-                Some(ADDITIONAL_VERIFICATION_REQUIRED),
-                "case {case}: expected the FailureReason of an unverifiable request, got {detail}"
-            );
+        "FAILED" | "VALIDATION_TIMED_OUT" => {
+            // "This value exists only when the certificate status is FAILED"
+            // (`CertificateDetail$FailureReason` doc), so the reason is reported beside
+            // the up-front failure and nowhere else — a request that waited the
+            // validation window out carries none.
+            if expected == "FAILED" {
+                assert_eq!(
+                    detail["FailureReason"].as_str(),
+                    Some(ADDITIONAL_VERIFICATION_REQUIRED),
+                    "case {case}: expected the FailureReason of an unverifiable request, got {detail}"
+                );
+            } else {
+                assert!(
+                    detail["FailureReason"].is_null(),
+                    "case {case}: a timed-out request carries no FailureReason, got {detail}"
+                );
+            }
             for validation in validations(case, detail) {
                 assert_eq!(
                     validation["ValidationStatus"].as_str(),
@@ -173,16 +184,14 @@ fn assert_terminal(case: &str, detail: &Value, expected: &str, method: &str) {
                     "case {case}: a domain left unproven is FAILED, got {validation}"
                 );
                 // "A list of email addresses that ACM used to send domain validation
-                // emails" (`DomainValidation$ValidationEmails` doc): an email-validated
-                // domain whose validation never ran used no mailbox, so the list is
-                // reported empty; for DNS or HTTP validation ACM sends no mail and the
-                // member does not apply.
+                // emails" (`DomainValidation$ValidationEmails` doc): for DNS or HTTP
+                // validation ACM sends no mail and the member does not apply.
                 let emails = &validation["ValidationEmails"];
                 if method == "EMAIL" {
-                    assert_eq!(
-                        emails.as_array().map(Vec::len),
-                        Some(0),
-                        "case {case}: a failed email validation used no mailbox, got {validation}"
+                    assert!(
+                        emails.is_array(),
+                        "case {case}: an email-validated domain reports its mailboxes, \
+                         got {validation}"
                     );
                 } else {
                     assert!(
@@ -235,25 +244,30 @@ async fn arns_in_statuses(router: &MultiServiceRouter, statuses: &[&str]) -> Vec
         .collect()
 }
 
-/// RULE: a requested certificate is `PENDING_VALIDATION` only transiently — the clock
-/// owes it a terminal status, `ISSUED` where no proof of domain ownership is required
-/// and `FAILED` with `ADDITIONAL_VERIFICATION_REQUIRED` where that proof cannot be
-/// obtained — and every reader reports the outcome once it is due.
+/// RULE: a requested certificate is `PENDING_VALIDATION` until the clock owes it a
+/// terminal status — `ISSUED` where no proof of domain ownership is required, `FAILED`
+/// with `ADDITIONAL_VERIFICATION_REQUIRED` where the name is one whose control can
+/// never be proven, and `VALIDATION_TIMED_OUT` at the end of the documented 72-hour
+/// validation window for a name whose owner could have published the evidence — and
+/// every reader reports the outcome once it is due.
 #[tokio::test]
 async fn a_requested_certificate_reaches_a_terminal_status() {
     // Rows differ along what the rule generalises over: the validation method asked
-    // for (every modelled value, and none), the number of names covered, and whether
-    // the request names a private certificate authority — the one case that needs no
-    // domain validation at all, and so the one that resolves to ISSUED.
+    // for (every modelled value, and none), the number of names covered, whether the
+    // request names a private certificate authority — the one case that needs no domain
+    // validation at all, and so the one that resolves to ISSUED — and whether the names
+    // it covers are reserved ones no requester can be delegated (which ACM refuses up
+    // front) or ordinary ones (which it waits the validation window out for).
     let cases: &[OutcomeCase<'_>] = &[
         (
-            "DNS validation, one name",
+            "DNS validation, one reserved name",
             json!({ "DomainName": "dns.example.com", "ValidationMethod": "DNS" }),
             "FAILED",
             "DNS",
+            VALIDATION_SETTLE_DELAY,
         ),
         (
-            "EMAIL validation, two names",
+            "EMAIL validation, two reserved names",
             json!({
                 "DomainName": "email.example.com",
                 "SubjectAlternativeNames": ["mail.email.example.com"],
@@ -261,31 +275,60 @@ async fn a_requested_certificate_reaches_a_terminal_status() {
             }),
             "FAILED",
             "EMAIL",
+            VALIDATION_SETTLE_DELAY,
         ),
         (
-            "HTTP validation, wildcard name",
+            "HTTP validation, reserved wildcard name",
             json!({ "DomainName": "*.http.example.org", "ValidationMethod": "HTTP" }),
             "FAILED",
             "HTTP",
+            VALIDATION_SETTLE_DELAY,
         ),
         (
-            "no validation method named",
+            "no validation method named, reserved name",
             json!({ "DomainName": "defaulted.example.net" }),
             "FAILED",
             "EMAIL",
+            VALIDATION_SETTLE_DELAY,
         ),
         (
-            "EMAIL validation with a validation domain and three names",
+            "DNS validation, one ordinary name",
+            json!({ "DomainName": "dns.probe-domain.com", "ValidationMethod": "DNS" }),
+            "VALIDATION_TIMED_OUT",
+            "DNS",
+            VALIDATION_WINDOW,
+        ),
+        (
+            "EMAIL validation with a validation domain and three ordinary names",
             json!({
-                "DomainName": "a.deep.example.io",
-                "SubjectAlternativeNames": ["b.deep.example.io", "c.deep.example.io"],
+                "DomainName": "a.deep.probe-domain.io",
+                "SubjectAlternativeNames": ["b.deep.probe-domain.io", "c.deep.probe-domain.io"],
                 "ValidationMethod": "EMAIL",
                 "DomainValidationOptions": [
-                    { "DomainName": "a.deep.example.io", "ValidationDomain": "example.io" }
+                    { "DomainName": "a.deep.probe-domain.io", "ValidationDomain": "probe-domain.io" }
                 ],
             }),
-            "FAILED",
+            "VALIDATION_TIMED_OUT",
             "EMAIL",
+            VALIDATION_WINDOW,
+        ),
+        (
+            "HTTP validation, an ordinary wildcard name",
+            json!({ "DomainName": "*.http.probe-domain.net", "ValidationMethod": "HTTP" }),
+            "VALIDATION_TIMED_OUT",
+            "HTTP",
+            VALIDATION_WINDOW,
+        ),
+        (
+            "one reserved name beside an ordinary one",
+            json!({
+                "DomainName": "mixed.probe-domain.com",
+                "SubjectAlternativeNames": ["mixed.example.com"],
+                "ValidationMethod": "DNS",
+            }),
+            "FAILED",
+            "DNS",
+            VALIDATION_SETTLE_DELAY,
         ),
         (
             "private certificate authority, DNS validation asked for",
@@ -296,6 +339,7 @@ async fn a_requested_certificate_reaches_a_terminal_status() {
             }),
             "ISSUED",
             "DNS",
+            VALIDATION_SETTLE_DELAY,
         ),
         (
             "private certificate authority, two names and no method",
@@ -306,15 +350,16 @@ async fn a_requested_certificate_reaches_a_terminal_status() {
             }),
             "ISSUED",
             "EMAIL",
+            VALIDATION_SETTLE_DELAY,
         ),
     ];
 
-    for (case, body, expected, method) in cases {
+    for (case, body, expected, method, due_within) in cases {
         // A fresh store per row, so one row's certificate cannot explain another's.
         let (router, engine) = router_with_engine();
         let arn = request_certificate(&router, body).await;
 
-        // The transient status is real: the span is never zero, so a caller reading
+        // The pending status is real: the span is never zero, so a caller reading
         // straight after the request still sees PENDING_VALIDATION and its evidence.
         let pending = describe(&router, &arn).await;
         assert_eq!(
@@ -336,8 +381,8 @@ async fn a_requested_certificate_reaches_a_terminal_status() {
         let due_in = pending_due_in(&engine, &arn)
             .unwrap_or_else(|| panic!("case {case}: the request owed no validation outcome"));
         assert!(
-            due_in > Duration::ZERO && due_in <= VALIDATION_SETTLE_DELAY,
-            "case {case}: expected an outcome due within {VALIDATION_SETTLE_DELAY:?} and not instantly, got {due_in:?}"
+            due_in > Duration::ZERO && due_in <= *due_within,
+            "case {case}: expected an outcome due within {due_within:?} and not instantly, got {due_in:?}"
         );
 
         // Once the stored instant has passed, the outcome is owed whether or not

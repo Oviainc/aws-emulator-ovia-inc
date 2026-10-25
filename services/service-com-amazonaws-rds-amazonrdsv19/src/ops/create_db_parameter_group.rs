@@ -227,6 +227,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description,
             region: region.clone(),
             tags: input.tags.unwrap_or_default(),
+            // A created group carries none of its own: the engine's defaults belong to the
+            // family, which publishes them, so `ModifyDBParameterGroup` is what puts a
+            // parameter in here.
+            parameters: Default::default(),
         };
         store.db_parameter_groups.insert(key.clone(), record);
 

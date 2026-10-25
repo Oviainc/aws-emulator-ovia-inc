@@ -32,10 +32,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
-use service_com_amazonaws_memorydb_amazonmemorydb::state::{MAX_MAX_RESULTS, MIN_MAX_RESULTS};
+use service_com_amazonaws_memorydb_amazonmemorydb::state::PARAMETER_PAGE_SIZE_WINDOW;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cluster_lifecycle::{call, error_code, ok, router};
+
+/// The page sizes this listing serves: `DescribeParameters` reads the parameter-group
+/// surface, so its window is that surface's own.
+const WINDOW_MIN: i32 = PARAMETER_PAGE_SIZE_WINDOW.min;
+const WINDOW_MAX: i32 = PARAMETER_PAGE_SIZE_WINDOW.max;
 
 /// What a family's listing must and must not carry, by the engine line the family
 /// belongs to.
@@ -778,9 +783,9 @@ async fn the_parameter_listing_pages_in_name_order() {
     // the low rows really walk several pages.
     let total = expected.len();
     let at_set_size = i32::try_from(total)
-        .unwrap_or(MAX_MAX_RESULTS)
-        .clamp(MIN_MAX_RESULTS, MAX_MAX_RESULTS);
-    for page_size in [MIN_MAX_RESULTS, MIN_MAX_RESULTS + 1, at_set_size] {
+        .unwrap_or(WINDOW_MAX)
+        .clamp(WINDOW_MIN, WINDOW_MAX);
+    for page_size in [WINDOW_MIN, WINDOW_MIN + 1, at_set_size] {
         let case = format!("MaxResults={page_size}");
         let mut seen: Vec<String> = Vec::new();
         let mut token: Option<String> = None;
@@ -816,7 +821,7 @@ async fn the_parameter_listing_pages_in_name_order() {
     }
 
     // A page size outside the service's window names no page.
-    for max_results in [0, -9, MIN_MAX_RESULTS - 1, MAX_MAX_RESULTS + 1] {
+    for max_results in [0, -9, WINDOW_MIN - 1, WINDOW_MAX + 1] {
         let (status, refused) = call(
             &router,
             "DescribeParameters",

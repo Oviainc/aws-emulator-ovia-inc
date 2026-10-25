@@ -269,20 +269,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One listener per port on a load balancer: moving this one onto a port another
         // of its load balancer's listeners holds is the modelled duplicate.
         if updated.port != stored.port {
-            if let Some(clash) = guard
-                .listeners
-                .values()
-                .find(|other| {
-                    other.arn != updated.arn
-                        && other.load_balancer_arn == updated.load_balancer_arn
-                        && other.port == updated.port
-                })
-                .map(|other| other.arn.clone())
-            {
+            let clash = guard.listeners.values().any(|other| {
+                other.arn != updated.arn
+                    && other.load_balancer_arn == updated.load_balancer_arn
+                    && other.port == updated.port
+            });
+            if clash {
+                // The refusal says WHAT conflicts — the port, on this listener's own
+                // load balancer — and not which other listener holds it: the identifier
+                // of the resource that happens to hold a reference is not part of the
+                // message, exactly as `CreateListener` words the same refusal.
                 return Err(ModifyListenerErrorModeled::DuplicateListenerException(
                     DuplicateListenerException {
                         message: Some(format!(
-                            "A listener already exists on port {} of load balancer '{}': '{clash}'",
+                            "A listener already exists on port {} of load balancer '{}'",
                             updated.port.unwrap_or_default(),
                             updated.load_balancer_arn
                         )),

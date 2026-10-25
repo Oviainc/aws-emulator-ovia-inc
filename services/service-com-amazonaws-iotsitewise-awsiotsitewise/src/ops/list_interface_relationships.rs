@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInterfaceRelationships
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInterfaceRelationships`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInterfaceRelationships::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation reports, from the shared engine store
+//! (`crate::state`), the asset models the named interface asset model is applied
+//! to; this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -155,20 +149,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInterfaceRelationships` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInterfaceRelationshipsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInterfaceRelationships"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListInterfaceRelationshipsError::Modeled(
+                ListInterfaceRelationshipsErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+
+        // A pure read: nothing below writes, so two callers listing in either order
+        // see the same relationships.
+        let store = state.lock();
+        // The member is a `CustomID` label: a raw UUID or the `externalId:` form.
+        let interface_asset_model_id = store
+            .resolve_asset_model_id(&input.interface_asset_model_id)
+            .ok_or_else(|| model_not_found(&input.interface_asset_model_id))?;
+
+        // The relationships this interface stands on the INTERFACE side of: one per
+        // asset model it was applied to, which is what the summary's `id` names
+        // ("The ID of the asset model that has the interface applied to it"). A
+        // model nothing applied this interface to contributes nothing, so a model
+        // that is not an interface, or one no application names, answers the empty
+        // list rather than an invented refusal.
+        let mut applied_to: Vec<&crate::state::AssetModelRecord> = store
+            .interface_relationships
+            .values()
+            .filter(|record| record.interface_asset_model_id == interface_asset_model_id)
+            // The applied-to model itself is what the summary reports, so an entry
+            // naming a model the store no longer holds reports nothing.
+            .filter_map(|record| store.asset_models.get(&record.asset_model_id))
+            .collect();
+        // A stable order is what makes `nextToken` resumable: oldest model first,
+        // ties broken by id so two models created in the same instant still order
+        // deterministically — the order `ListAssets` enumerates in.
+        applied_to.sort_by(|left, right| {
+            left.creation_date
+                .cmp(&right.creation_date)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        // `nextToken` is this enumeration's resume point: the `assetModelId` of the
+        // first summary of the next page, hex-encoded so the token matches the
+        // modelled `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this
+        // enumeration is refused rather than answered with an empty page, which
+        // would report absence as success.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                applied_to
+                    .iter()
+                    .position(|record| record.id == resume)
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        // `maxResults` carries the modelled range 1..250, which the runtime validates
+        // BEFORE this handler runs, so a value that arrives here is already in range
+        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic below
+        // total. The default is the one this operation documents.
+        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
+        let end = start.saturating_add(max_results).min(applied_to.len());
+
+        let next_token = applied_to
+            .get(end)
+            .map(|record| ::hex::encode(record.id.as_bytes()));
+        let interface_relationship_summaries = applied_to[start..end]
+            .iter()
+            .map(|record| InterfaceRelationshipSummary {
+                id: record.id.clone(),
+            })
+            .collect();
+
+        Ok(ListInterfaceRelationshipsOutput {
+            interface_relationship_summaries,
+            next_token,
+        })
     }
+}
+
+/// The page size this operation documents for a caller that gives no `maxResults`
+/// ("The maximum number of results to return for each paginated request. Default:
+/// 50").
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// Decode a `nextToken` back into the `assetModelId` it resumes from.
+fn decode_token(token: &str) -> Result<String, ListInterfaceRelationshipsError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
+fn invalid_token() -> ListInterfaceRelationshipsError {
+    ListInterfaceRelationshipsError::Modeled(
+        ListInterfaceRelationshipsErrorModeled::InvalidRequestException(InvalidRequestException {
+            message: "The nextToken is not a token this operation issued.".to_string(),
+        }),
+    )
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the asset-model label that resolved
+/// to nothing.
+fn model_not_found(label: &str) -> ListInterfaceRelationshipsError {
+    ListInterfaceRelationshipsError::Modeled(
+        ListInterfaceRelationshipsErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException {
+                message: crate::state::not_found_message(
+                    crate::state::RESOURCE_ASSET_MODEL,
+                    label,
+                ),
+            },
+        ),
+    )
 }

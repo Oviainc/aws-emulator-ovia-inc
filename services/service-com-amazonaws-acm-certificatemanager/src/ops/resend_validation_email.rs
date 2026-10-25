@@ -266,9 +266,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ResendValidationEmailErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "The domain {} is not a domain name in the certificate {}.",
-                            input.domain, input.certificate_arn
+                        message: Some(crate::state::certificate_domain_not_found_message(
+                            &input.certificate_arn,
+                            &input.domain,
                         )),
                     },
                 )

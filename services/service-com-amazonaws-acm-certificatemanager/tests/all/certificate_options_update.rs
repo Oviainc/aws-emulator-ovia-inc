@@ -615,15 +615,16 @@ async fn export_cannot_be_updated_after_creation() {
 }
 
 /// RULE: only a certificate ACM has ISSUED can be reconfigured — a request still being
-/// validated has produced no certificate yet and a failed one never will, so either is
-/// refused with HTTP 400 `ValidationException` and nothing is written.
+/// validated has produced no certificate yet, one whose validation timed out or failed
+/// never will, so either is refused with HTTP 400 `InvalidStateException` (the
+/// processing state a client waits out, not a malformed request) and nothing is written.
 #[tokio::test]
 async fn options_cannot_be_updated_unless_the_certificate_is_issued() {
     // Rows: the request, whether its validation outcome is held off (leaving the
     // certificate in the transient PENDING_VALIDATION status) or materialised (leaving
-    // a public request FAILED), the status the row asserts, and the options it asks
-    // for — the first row is the recorded case, a validation-method change while the
-    // certificate is pending.
+    // a public request in the terminal status its own names decide), the status the row
+    // asserts, and the options it asks for — the first row is the recorded case, a
+    // validation-method change while the certificate is pending.
     let cases: &[(&str, Value, bool, &str, Value)] = &[
         (
             "a public certificate still being validated",
@@ -644,15 +645,15 @@ async fn options_cannot_be_updated_unless_the_certificate_is_issued() {
             json!({ "ValidationMethod": "EMAIL" }),
         ),
         (
-            "a public certificate whose validation failed",
-            json!({ "DomainName": "failed.example.net", "ValidationMethod": "DNS" }),
+            "a public certificate whose validation timed out",
+            json!({ "DomainName": "timedout.probe-domain.com", "ValidationMethod": "DNS" }),
             false,
-            "FAILED",
+            "VALIDATION_TIMED_OUT",
             json!({ "ValidationMethod": "HTTP" }),
         ),
         (
             "a failed certificate, asked for the export option it already has",
-            json!({ "DomainName": "failed.example.io", "ValidationMethod": "EMAIL" }),
+            json!({ "DomainName": "failed.example.org", "ValidationMethod": "EMAIL" }),
             false,
             "FAILED",
             json!({ "Export": "DISABLED" }),
@@ -685,8 +686,8 @@ async fn options_cannot_be_updated_unless_the_certificate_is_issued() {
         let (status, response) = update_options(&router, &arn, options).await;
         assert_eq!(
             (status, error_code(&response).as_str()),
-            (400, "ValidationException"),
-            "case {case}: expected 400 ValidationException for a {expected_status} \
+            (400, "InvalidStateException"),
+            "case {case}: expected 400 InvalidStateException for a {expected_status} \
              certificate, got {status} {response}"
         );
         let message = error_message(&response);
@@ -757,8 +758,8 @@ async fn options_cannot_be_updated_once_the_certificate_is_revoked() {
         update_options(&router, &arn, &json!({ "ValidationMethod": "HTTP" })).await;
     assert_eq!(
         (status, error_code(&response).as_str()),
-        (400, "ValidationException"),
-        "case once revoked: expected 400 ValidationException, got {status} {response}"
+        (400, "InvalidStateException"),
+        "case once revoked: expected 400 InvalidStateException, got {status} {response}"
     );
     let message = error_message(&response);
     assert_eq!(

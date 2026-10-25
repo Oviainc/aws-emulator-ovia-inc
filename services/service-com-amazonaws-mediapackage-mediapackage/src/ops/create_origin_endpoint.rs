@@ -207,9 +207,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the store copies these collections and strings verbatim, so one request must
         // not decide how much memory its record occupies. Each refusal is this service's
         // own envelope, keyed by the member it is about.
-        for (member, value) in [("id", &input.id), ("channelId", &input.channel_id)] {
-            crate::state::bound_chars(member, value, crate::state::MAX_STRING_CHARS)?;
-        }
+        // The id this endpoint is stored under is the `{Id}` label of its own reads and
+        // the last segment of its ARN, so it is judged by the identifier rule all three
+        // creates share — the `channelId` it REFERENCES is only resolved against the
+        // store below, so it is bounded by size alone.
+        crate::state::check_created_id(&input.id)?;
+        crate::state::bound_chars(
+            "channelId",
+            &input.channel_id,
+            crate::state::MAX_STRING_CHARS,
+        )?;
         crate::state::bound_tags(&input.tags)?;
         // The members a create shares with an update are bounded by the one function both
         // handlers call, so neither can store more than the other would have refused.

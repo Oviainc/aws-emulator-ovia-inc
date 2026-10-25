@@ -14,8 +14,8 @@
 //!   log, and the listing reports that record: the call's own `ControlOperationType`, the
 //!   `operationIdentifier` the call returned, the control, the target and the enabled
 //!   control it acted on, `IN_PROGRESS` with no `endTime` until the clock makes it due and
-//!   `SUCCEEDED` with a stable `endTime` after — for any control, target, parameter list
-//!   and tag map;
+//!   `SUCCEEDED` with a stable `endTime` after — for any catalogued control,
+//!   organizational-unit target, declared parameter list and tag map;
 //! * the listing is the stored log narrowed by EVERY member of `filter`, and a value no
 //!   record carries selects nothing;
 //! * the listing is paginated by `maxResults`/`nextToken`, so a walk returns each record
@@ -37,7 +37,7 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::enabled_control_lifecycle::{account, control, enable, entries, ou};
+use crate::enabled_control_lifecycle::{control, enable, entries, ou};
 use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, Answer};
 
 /// POST `/list-control-operations` with `body`, asserting the call succeeded.
@@ -88,10 +88,9 @@ struct Row {
 }
 
 /// The enablement table: the rows differ along what the rule generalises over — the
-/// control, the target (both types `targetIdentifier`'s docs name), the parameter list
-/// (absent, empty, one, several kinds of `Document`) and the tag map (absent, empty,
-/// several). Every row names a different control/target pair, because a control is enabled
-/// at most once per target.
+/// control, the target, the parameter list (absent, empty, one, every key the control
+/// declares) and the tag map (absent, empty, several). Every row names a different
+/// control/target pair, because a control is enabled at most once per target.
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -102,29 +101,27 @@ fn rows() -> Vec<Row> {
             tags: serde_json::Value::Null,
         },
         Row {
-            case: "an empty parameter list and an empty tag map, on an account target",
+            case: "an empty parameter list and an empty tag map, on another OU",
             control_identifier: control("AWS-GR_RESTRICT_ROOT_USER"),
-            target_identifier: account("123456789012"),
+            target_identifier: ou("bb04"),
             parameters: serde_json::json!([]),
             tags: serde_json::json!({}),
         },
         Row {
-            case: "one string parameter and one tag",
-            control_identifier: control("AWS-GR_MFA_ENABLED_FOR_IAM_CONSOLE_ACCESS"),
+            case: "one declared parameter and one tag",
+            control_identifier: control("AWS-GR_REGION_DENY"),
             target_identifier: ou("bb02"),
             parameters: serde_json::json!([{ "key": "AllowedRegions", "value": "us-west-2" }]),
             tags: serde_json::json!({ "owner": "platform" }),
         },
         Row {
-            case: "parameters covering every document kind, on another OU",
-            control_identifier: control("AWS-GR_AUDIT_BUCKET_POLICY_CHANGES_PROHIBITED"),
+            case: "every declared parameter, covering several document kinds, on another OU",
+            control_identifier: control("AWS-GR_REGION_DENY"),
             target_identifier: ou("bb03"),
             parameters: serde_json::json!([
-                { "key": "text", "value": "a string" },
-                { "key": "count", "value": 7 },
-                { "key": "on", "value": true },
-                { "key": "regions", "value": ["us-west-2", "eu-west-1"] },
-                { "key": "nested", "value": { "inner": { "deeper": [1, 2] } } }
+                { "key": "AllowedRegions", "value": ["us-west-2", "eu-west-1"] },
+                { "key": "ExemptedPrincipalArns", "value": "arn:aws:iam::000000000000:role/r" },
+                { "key": "ExemptedActions", "value": { "inner": { "deeper": [1, 2] } } }
             ]),
             tags: serde_json::json!({ "env": "test", "cost-centre": "4711" }),
         },
@@ -329,7 +326,7 @@ async fn the_listing_is_the_log_narrowed_by_every_filter_member() {
         (
             "controlIdentifiers on a control no record carries",
             serde_json::json!({
-                "filter": { "controlIdentifiers": [control("AWS-GR_NOTHING_ENABLED_THIS")] }
+                "filter": { "controlIdentifiers": [control("AWS-GR_RDS_STORAGE_ENCRYPTED")] }
             }),
             none.clone(),
         ),
@@ -466,14 +463,15 @@ async fn the_listing_is_the_log_narrowed_by_every_filter_member() {
 async fn a_paginated_walk_returns_each_record_exactly_once() {
     let router = emulator();
 
-    // Six records, so a page size of 2 and 3 divide the set and 4 does not.
+    // Six records, so a page size of 2 and 3 divide the set and 4 does not. One catalogued
+    // control on six organizational units: a control is enabled at most once per target.
     let mut started: Vec<String> = Vec::new();
     for index in 0..6usize {
         let (_, operation) = enable(
             &router,
             serde_json::json!({
-                "controlIdentifier": control(&format!("AWS-GR_PAGED_{index}")),
-                "targetIdentifier": ou("cc01"),
+                "controlIdentifier": control("AWS-GR_ENCRYPTED_VOLUMES"),
+                "targetIdentifier": ou(&format!("cc{index:02}")),
             }),
         )
         .await;

@@ -21,7 +21,7 @@
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::enabled_control_lifecycle::{
-    account, control, details, enable, enabled_control_prefix, entries, ou,
+    control, details, enable, enabled_control_prefix, entries, ou,
 };
 use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span};
 
@@ -44,9 +44,10 @@ async fn enable_spec(router: &MultiServiceRouter, spec: &Enablement<'_>) -> Stri
 }
 
 /// The enablements every case in this suite populates the store with: they differ in the
-/// control, in the target's type (an OU and an account are the two target types
-/// `TargetIdentifier`'s docs name), and in the parameter list's entry count and
-/// `Document` kinds — the dimensions `GetEnabledControl`'s report is read off.
+/// control, in the target organizational unit, and in the parameter list's entry count and
+/// `Document` kinds — the dimensions `GetEnabledControl`'s report is read off. A
+/// configuration names only keys its control declares, so the rows that carry one name the
+/// control this emulator's catalog publishes with parameters.
 fn populated_store() -> Vec<Enablement<'static>> {
     vec![
         (
@@ -56,34 +57,35 @@ fn populated_store() -> Vec<Enablement<'static>> {
             serde_json::Value::Null,
         ),
         (
-            "an empty parameter list, OU target",
+            "an empty parameter list, another OU",
             control("AWS-GR_RESTRICT_ROOT_USER"),
             ou("2222"),
             serde_json::json!([]),
         ),
         (
-            "one string parameter, account target",
-            control("AWS-GR_MFA_ENABLED_FOR_IAM_CONSOLE_ACCESS"),
-            account("123456789012"),
+            "one declared parameter",
+            control("AWS-GR_REGION_DENY"),
+            ou("4444"),
             serde_json::json!([{ "key": "AllowedRegions", "value": "us-west-2" }]),
         ),
         (
-            "three parameters of three Document kinds, account target",
-            control("AWS-GR_AUDIT_BUCKET_POLICY_CHANGES_PROHIBITED"),
-            account("210987654321"),
+            "three declared parameters of three Document kinds",
+            control("AWS-GR_REGION_DENY"),
+            ou("5555"),
             serde_json::json!([
-                { "key": "count", "value": 7 },
-                { "key": "enabled", "value": false },
-                { "key": "nested", "value": { "inner": ["a", "b"] } }
+                { "key": "AllowedRegions", "value": ["us-west-2", "eu-west-1"] },
+                { "key": "ExemptedActions", "value": false },
+                { "key": "ExemptedPrincipalArns", "value": { "inner": ["a", "b"] } }
             ]),
         ),
         (
             // The same control as the first row, on another target: the record is keyed
-            // by the enablement, not by the control, so both must stay resolvable.
+            // by the enablement, not by the control, so both must stay resolvable. That
+            // control declares no parameters, so neither row configures one.
             "a control already enabled on another target",
             control("AWS-GR_ENCRYPTED_VOLUMES"),
             ou("3333"),
-            serde_json::json!([{ "key": "ExemptedPrincipalArns", "value": [] }]),
+            serde_json::Value::Null,
         ),
     ]
 }

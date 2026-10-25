@@ -92,8 +92,8 @@ async fn tagged_certificate(
 }
 
 /// The certificate's stored tags as sorted `(key, value)` pairs, read back through
-/// `ListTagsForCertificate`. An untagged certificate reports no `Tags` member, which
-/// is the empty vector here.
+/// `ListTagsForCertificate`. An untagged certificate reports the empty `Tags` list,
+/// which is the empty vector here.
 async fn stored_tags(
     router: &smithy_server_runtime::MultiServiceRouter,
     arn: &str,
@@ -383,9 +383,8 @@ async fn a_removed_tag_can_be_added_again() {
         );
     }
 
-    // The map is empty now, so `ListTagsForCertificate` reports no `Tags` member at
-    // all: `TagList` has a minimum length of one, so an empty list is not a legal
-    // value.
+    // The map is empty now, and `ListTagsForCertificate` reports that as the EMPTY
+    // `Tags` list — the recorded shape a client reading `response["Tags"]` relies on.
     let (status, response) = call(
         &router,
         "ListTagsForCertificate",
@@ -393,9 +392,9 @@ async fn a_removed_tag_can_be_added_again() {
     )
     .await;
     assert_eq!(
-        (status, response["Tags"].is_null()),
-        (200, true),
-        "expected no Tags member once every tag was removed, got {status} {response}"
+        (status, &response["Tags"]),
+        (200, &json!([])),
+        "expected the empty Tags list once every tag was removed, got {status} {response}"
     );
 }
 
