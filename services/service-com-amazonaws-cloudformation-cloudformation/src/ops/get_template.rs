@@ -158,11 +158,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there is no template store to read.
             return Err(crate::scaffolded::Scaffolded::not_implemented("GetTemplate"));
         };
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // Reporting operation: the only write is materialising a status transition the
         // clock had already made due.
@@ -179,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
             let change_set = store
-                .resolve_change_set(change_set_name, input.stack_name.as_deref())
+                .resolve_change_set(&region, change_set_name, input.stack_name.as_deref())
                 .ok_or_else(|| {
                     GetTemplateError::from(GetTemplateErrorModeled::ChangeSetNotFoundException(
                         ChangeSetNotFoundException {
@@ -217,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You can get the template for running or deleted stacks" — a deleted stack is
         // addressable by its stack id, which is what `resolve` honours. "If the template
         // doesn't exist, a ValidationError is returned."
-        let stack = store.resolve(name_or_id).ok_or_else(|| {
+        let stack = store.resolve(&region, name_or_id).ok_or_else(|| {
             crate::scaffolded::Scaffolded::validation_error(crate::state::stack_does_not_exist(
                 name_or_id,
             ))

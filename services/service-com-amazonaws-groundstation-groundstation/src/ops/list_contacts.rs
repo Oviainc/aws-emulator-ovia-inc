@@ -258,8 +258,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let window_end = input.end_time.as_secs_f64();
 
         let mut guard = state.lock();
-        // Apply every SCHEDULING -> SCHEDULED move already due, so the status filter
-        // sees the status in force now.
+        // Apply every status move the clock already owes a contact — the scheduler's
+        // SCHEDULING -> SCHEDULED move and the steps of the pass lifecycle a contact's
+        // own window owes it — so the status filter sees the status in force now.
         guard.settle_due_contacts();
 
         // Ordered by contact id: a page boundary is only stable over a stable order.
@@ -310,8 +311,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 post_pass_end_time: Some(contact.post_pass_end_time),
                 ground_station: Some(contact.ground_station.clone()),
                 contact_status: Some(contact.contact_status.clone()),
-                // Nothing in this emulator has failed a contact, tracked a pass or run
-                // a dataflow, so the members reporting those carry nothing.
+                // No contact has failed and no antenna has tracked a pass in this
+                // emulator, so the members reporting those carry nothing.
+                // `maximumElevation` and the visibility times are the pass GEOMETRY,
+                // which nothing this service holds determines (see DescribeContact).
                 error_message: None,
                 maximum_elevation: None,
                 region: Some(contact.region.clone()),

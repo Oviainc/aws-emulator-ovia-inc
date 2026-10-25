@@ -19,7 +19,11 @@
 //! * a **billing adjustment request** — what
 //!   `BatchCreateBillingAdjustmentRequest` submits against one invoice of an
 //!   agreement, and what `GetBillingAdjustmentRequest` and
-//!   `ListBillingAdjustmentRequests` report on.
+//!   `ListBillingAdjustmentRequests` report on;
+//! * an **invoice** — what the acceptance of an agreement issues for each
+//!   charge it bills ([`Invoice`]), what `ListAgreementInvoiceLineItems`
+//!   reports grouped by invoice, and what an adjustment entry is resolved
+//!   against.
 //!
 //! Every projection the model asks for (`DescribeAgreementOutput`,
 //! `AgreementViewSummary`, `ChargeSummary`, `AcceptedTerm`,
@@ -64,13 +68,16 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     AcceptedTerm, Acceptor, AgreementCancellationRequestSummary, AgreementEntitlement,
-    AgreementViewSummary, BatchCreateBillingAdjustmentRequestEntry, BillingAdjustmentSummary,
+    AgreementInvoiceLineItemGroupSummary, AgreementViewSummary,
+    BatchCreateBillingAdjustmentRequestEntry, BillingAdjustmentSummary,
     ByolPricingTerm, Charge, ChargeSummary, ConfigurableUpfrontPricingTerm,
     ConfigurableUpfrontPricingTermConfiguration, ConflictException, DescribeAgreementOutput,
     EndTimeBehavior, Entitlement, EstimatedCharges, ExpectedCharge, Filter,
     FixedUpfrontPricingTerm, FreeTrialPricingTerm, GetAgreementPaymentRequestOutput,
-    GetBillingAdjustmentRequestOutput, InternalServerException, ItemizedCharge, LegalTerm,
-    NetPaymentTerm, PaymentRequestSummary, PaymentScheduleTerm, ProposalSummary, Proposer,
+    GetBillingAdjustmentRequestOutput, InternalServerException, InvoiceBillingPeriod,
+    ItemizedCharge, LegalTerm,
+    NetPaymentTerm, PaymentRequestSummary, PaymentScheduleTerm, PricingCurrencyAmount,
+    ProposalSummary, Proposer,
     CreateAgreementRequestInput, PurchaseOrder, RecurringPaymentTerm, RenewalTerm, RequestedTerm,
     RequestedTermConfiguration, Resource, ResourceNotFoundException,
     SendAgreementCancellationRequestInput, SendAgreementPaymentRequestInput, SupportTerm,
@@ -285,6 +292,19 @@ pub const CURRENCY_CODE: &str = "USD";
 /// How many minor units one unit of [`CURRENCY_CODE`] divides into, which is
 /// the precision every amount this service reports carries.
 const MINOR_UNITS: u128 = 100;
+
+/// How many fraction digits a currency amount of this service is reported to —
+/// the digits of its [`MINOR_UNITS`].
+const MINOR_DIGITS: usize = 2;
+
+/// How many fraction digits an amount of this API may carry at most:
+/// `PositiveAmountUpto8Decimals` is named for its eight
+/// (`^[0-9]*(\.[0-9]{0,8})?$`).
+const AMOUNT_FRACTION_DIGITS: u32 = 8;
+
+/// How many of the smallest unit [`amount_units`] counts make one unit of
+/// [`CURRENCY_CODE`]: ten to the power of [`AMOUNT_FRACTION_DIGITS`].
+const AMOUNT_UNITS_PER_CURRENCY_UNIT: u128 = 100_000_000;
 
 /// One published per-unit rate of the rate card this emulator carries: what one
 /// unit of a product dimension costs, per contract length.
@@ -549,10 +569,10 @@ pub const BILLING_ADJUSTMENT_PENDING: &str = "PENDING";
 pub const BILLING_ADJUSTMENT_COMPLETED: &str = "COMPLETED";
 /// See [`BILLING_ADJUSTMENT_PENDING`]. No stored request reaches this status:
 /// `BatchCreateBillingAdjustmentRequest` documents an `errors` list "for entries
-/// that failed validation", so an entry this emulator cannot accept is reported
-/// on that per-entry channel at submit time and no record is created for it. The
-/// checks AWS can only make later (against the invoice being adjusted) need the
-/// invoice, which this service neither models nor stores.
+/// that failed validation", so an entry this emulator cannot accept — including
+/// one whose invoice details do not hold up against the invoice being adjusted
+/// ([`Invoice`]) — is reported on that per-entry channel at submit time and no
+/// record is created for it.
 pub const BILLING_ADJUSTMENT_VALIDATION_FAILED: &str = "VALIDATION_FAILED";
 
 /// How long a submitted billing adjustment request stays `PENDING` before the
@@ -593,6 +613,64 @@ pub const BILLING_ADJUSTMENT_ERROR_CONFLICT: &str = "CONFLICT_EXCEPTION";
 pub const BILLING_ADJUSTMENT_AGREEMENT_NOT_FOUND_MESSAGE: &str =
     "Provided agreement does not exist.";
 
+/// The message `BatchCreateBillingAdjustmentError$message` carries for an entry
+/// whose `originalInvoiceId` names no invoice of the agreement it adjusts.
+///
+/// The sibling of [`BILLING_ADJUSTMENT_AGREEMENT_NOT_FOUND_MESSAGE`], for the
+/// other resource an entry names: `originalInvoiceId` is "the identifier of the
+/// original invoice to adjust", so an id that is not one of that agreement's
+/// invoices ([`Invoice`]) names no invoice this account was ever issued.
+pub const BILLING_ADJUSTMENT_INVOICE_NOT_FOUND_MESSAGE: &str =
+    "Provided invoice does not exist.";
+
+/// The `ValidationExceptionReason` for an entry whose `currencyCode` is not the
+/// currency the invoice it adjusts is denominated in
+/// (`smithy_query(query="shape", shape="ValidationExceptionReason")` lists
+/// `INVALID_CURRENCY_CODE`).
+pub const REASON_INVALID_CURRENCY_CODE: &str = "INVALID_CURRENCY_CODE";
+
+/// The `ValidationExceptionReason` for an entry asking to adjust more of an
+/// invoice than that invoice has left to adjust (the modelled
+/// `EXCEEDED_MAXIMUM_ADJUSTMENT_AMOUNT`).
+pub const REASON_EXCEEDED_MAXIMUM_ADJUSTMENT_AMOUNT: &str =
+    "EXCEEDED_MAXIMUM_ADJUSTMENT_AMOUNT";
+
+/// The `ValidationExceptionReason` for an entry whose `adjustmentAmount` is not
+/// an amount at all (the modelled `INVALID_ADJUSTMENT_AMOUNT`).
+pub const REASON_INVALID_ADJUSTMENT_AMOUNT: &str = "INVALID_ADJUSTMENT_AMOUNT";
+
+/// How many characters of `adjustmentAmount` this service accepts.
+///
+/// `PositiveAmountUpto8Decimals` carries a pattern but no `@length`, so the only
+/// bound on how long a submitted amount may be is this service's own, and one is
+/// needed: the amount is parsed as a number and compared, which is work the
+/// caller would otherwise choose the size of. The bound leaves room for the
+/// eight fraction digits the shape is named for, the decimal point, and more
+/// integer digits than any amount this service can bill — so no amount of a
+/// real invoice is near it — and makes parsing one constant work.
+pub const BILLING_ADJUSTMENT_AMOUNT_MAX_LEN: usize = 32;
+
+/// Whether `amount` is an amount this service accepts on a batch entry: short
+/// enough to be an amount at all ([`BILLING_ADJUSTMENT_AMOUNT_MAX_LEN`]) and
+/// positive ([`is_positive_amount`]).
+///
+/// The length is checked FIRST, so nothing reads or parses a string past the
+/// bound.
+pub fn is_acceptable_adjustment_amount(amount: &str) -> bool {
+    amount.len() <= BILLING_ADJUSTMENT_AMOUNT_MAX_LEN && is_positive_amount(amount)
+}
+
+/// How a per-entry refusal of `BatchCreateBillingAdjustmentRequest` states the
+/// rule the entry broke: the modelled `ValidationExceptionReason` a client
+/// branches on, then what about the entry broke it.
+///
+/// `BatchCreateBillingAdjustmentError` carries only a `code`, a `message` and
+/// the entry's `clientToken` — no `reason` member — so the reason is named in
+/// the message, which is the only place left for it.
+pub fn billing_adjustment_entry_message(reason: &str, detail: impl AsRef<str>) -> String {
+    format!("{reason}: {}", detail.as_ref())
+}
+
 /// Whether `amount` is the positive amount `PositiveAmountUpto8Decimals` is
 /// named for.
 ///
@@ -602,6 +680,219 @@ pub const BILLING_ADJUSTMENT_AGREEMENT_NOT_FOUND_MESSAGE: &str =
 /// has to carry a non-zero digit.
 pub fn is_positive_amount(amount: &str) -> bool {
     amount.chars().any(|digit| digit.is_ascii_digit() && digit != '0')
+}
+
+/// `value` as a count of the smallest unit an amount of this API can carry, or
+/// `None` when it is not an amount this service can hold at all.
+///
+/// Amounts cross this API as decimal STRINGS of at most eight fraction digits
+/// (`PositiveAmountUpto8Decimals`'s `^[0-9]*(\.[0-9]{0,8})?$`, which the
+/// boundary already enforced) whose length a handler bounds before reading one
+/// ([`BILLING_ADJUSTMENT_AMOUNT_MAX_LEN`]). The SCALE is therefore fixed by the
+/// model: such a value is an exact whole number of 10^-8 currency units, so
+/// comparing and subtracting two of them is integer arithmetic and no money is
+/// lost to a binary float. `None` for a value outside that shape, and for one
+/// too large to count in those units — astronomically past any amount this
+/// service bills, and refused rather than wrapped.
+pub fn amount_units(value: &str) -> Option<u128> {
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if fraction.len() > AMOUNT_FRACTION_DIGITS as usize {
+        return None;
+    }
+    let digits = |part: &str| -> Option<u128> {
+        if part.is_empty() {
+            return Some(0);
+        }
+        part.bytes()
+            .try_fold(0u128, |total, digit| {
+                let digit = u128::from(digit.checked_sub(b'0').filter(|d| *d < 10)?);
+                total.checked_mul(10)?.checked_add(digit)
+            })
+    };
+    let scaled_fraction = digits(fraction)?.checked_mul(
+        10u128.pow(AMOUNT_FRACTION_DIGITS - u32::try_from(fraction.len()).ok()?),
+    )?;
+    digits(whole)?
+        .checked_mul(AMOUNT_UNITS_PER_CURRENCY_UNIT)?
+        .checked_add(scaled_fraction)
+}
+
+/// `units` of the smallest unit [`amount_units`] counts, spelled the way every
+/// money member of this service spells an amount: the units, a decimal point,
+/// and the fraction digits — at least the two a currency amount is reported to
+/// ([`amount`]) and no trailing zero past them, so an amount nothing has
+/// adjusted reads exactly as the quote that priced it spelled it.
+pub fn amount_of_units(units: u128) -> String {
+    let mut fraction = format!(
+        "{:0width$}",
+        units % AMOUNT_UNITS_PER_CURRENCY_UNIT,
+        width = AMOUNT_FRACTION_DIGITS as usize
+    );
+    while fraction.len() > MINOR_DIGITS && fraction.ends_with('0') {
+        fraction.pop();
+    }
+    format!("{whole}.{fraction}", whole = units / AMOUNT_UNITS_PER_CURRENCY_UNIT)
+}
+
+// ---------------------------------------------------------------------------
+// Invoices
+// ---------------------------------------------------------------------------
+
+/// `InvoiceType`'s values (`INVOICE_TYPE_VALUES` in `types`): "Valid values are
+/// `INVOICE` and `CREDIT_MEMO`."
+///
+/// Every invoice this service issues is an `INVOICE` — it bills a charge of an
+/// agreement. A `CREDIT_MEMO` is the document a credit is issued as, which AWS
+/// raises in the billing system that applies an approved adjustment; no
+/// operation of this service creates or reports one, so this store holds none.
+pub const INVOICE_TYPE_INVOICE: &str = "INVOICE";
+
+/// `InvoiceBillingPeriod`'s modelled bounds: "The billing period month. Valid
+/// range: 1-12" and `@range(min: 2023, max: 2050)` on its `year`
+/// (`smithy_query(query="shape", shape="InvoiceBillingPeriod")`). A period
+/// outside them is not a value the member admits, so it is left unreported
+/// rather than reported out of range.
+const BILLING_PERIOD_MONTHS: ::std::ops::RangeInclusive<i32> = 1..=12;
+/// See [`BILLING_PERIOD_MONTHS`].
+const BILLING_PERIOD_YEARS: ::std::ops::RangeInclusive<i32> = 2023..=2050;
+
+/// One invoice of an agreement, as this emulator persists it.
+///
+/// An invoice BILLS one charge of an agreement, and the charges this service can
+/// invoice are the ones whose invoice date it knows: `ExpectedCharge$time` is
+/// "the date and time when the charge is due to be invoiced… available only when
+/// the charge date is known", and the charges with a known date are the ones
+/// [`charge_timing`] times [`TIMING_ON_ACCEPTANCE`] — "charged immediately when
+/// the agreement request is accepted" — so accepting the quote is what issues
+/// them. A charge timed on a billing period or on the proposal's payment
+/// schedule is due on a date this service does not model, and a charge the
+/// published rates do not price carries no amount to bill, so neither is
+/// invoiced at all.
+///
+/// `BatchCreateBillingAdjustmentRequest` adjusts one of these, and
+/// `ListAgreementInvoiceLineItems` reports them grouped by invoice.
+#[derive(Debug, Clone)]
+pub struct Invoice {
+    /// `ResourceId`'s `^[A-Za-z0-9_/-]+$`, minted by
+    /// [`ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State::mint_invoice_id`].
+    pub id: String,
+    /// The agreement whose charge this invoice bills; the agreement itself stays
+    /// the single copy of its own type, catalog and parties.
+    pub agreement_id: String,
+    /// The charge this invoice bills — the line item of its group. Held for
+    /// provenance (which charge of the quote this invoice came from); no member
+    /// of `AgreementInvoiceLineItemGroupSummary` reports a charge, so nothing
+    /// projects it.
+    pub charge_id: String,
+    /// What the invoice bills, read from the quote that priced that charge (see
+    /// the module docs) rather than priced a second time.
+    pub amount: String,
+    /// The part of [`Self::amount`] still open to adjustment, which is what
+    /// `PricingCurrencyAmount$maxAdjustmentAmount` reports.
+    ///
+    /// Held ON the invoice and decremented once, by the submit that stores an
+    /// adjustment request against it
+    /// ([`ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State::hold_against_invoice`]),
+    /// so reporting it and holding an entry to it are constant work rather than
+    /// a walk over every stored adjustment request. Spelled the way every money
+    /// member of this service spells an amount, and never negative: an entry
+    /// asking for more than is open is refused before it is stored.
+    pub open_amount: String,
+    /// "The three-letter currency code for all charges": the currency the quote
+    /// priced the agreement in, which is also the currency an adjustment of this
+    /// invoice has to be in.
+    pub currency_code: String,
+    /// One of `InvoiceType`'s values — [`INVOICE_TYPE_INVOICE`] for every
+    /// invoice this service issues.
+    pub invoice_type: String,
+    /// When the invoice was issued: the instant the charge it bills was
+    /// incurred.
+    pub issued_at: SystemTime,
+}
+
+impl Invoice {
+    /// The most of this invoice an adjustment may still ask to credit, as a
+    /// count of the smallest unit an amount can carry ([`amount_units`]) — the
+    /// same amount [`Self::open_amount`] spells and
+    /// `PricingCurrencyAmount$maxAdjustmentAmount` reports.
+    pub fn open_units(&self) -> u128 {
+        amount_units(&self.open_amount).unwrap_or_default()
+    }
+
+    /// The billing period this invoice belongs to: the calendar month its issue
+    /// date falls in, as `InvoiceBillingPeriod` spells one.
+    ///
+    /// The month and year are read off the issue instant rendered the way the
+    /// protocol renders a `Timestamp` (`YYYY-MM-DD…`), so the period is the one
+    /// a client reading `issuedTime` would compute. Absent when the period falls
+    /// outside the member's own bounds ([`BILLING_PERIOD_MONTHS`]).
+    pub fn billing_period(&self) -> Option<InvoiceBillingPeriod> {
+        let issued = ::aws_smithy_types::DateTime::from(self.issued_at)
+            .fmt(::aws_smithy_types::date_time::Format::DateTime)
+            .ok()?;
+        let (year, rest) = issued.split_once('-')?;
+        let month = rest.split('-').next()?;
+        let period = InvoiceBillingPeriod {
+            month: month.parse().ok()?,
+            year: year.parse().ok()?,
+        };
+        (BILLING_PERIOD_MONTHS.contains(&period.month)
+            && BILLING_PERIOD_YEARS.contains(&period.year))
+        .then_some(period)
+    }
+
+    /// The `ListAgreementInvoiceLineItems` projection of this invoice: the group
+    /// its line items are grouped into.
+    ///
+    /// `invoicingEntity` — "the entity that issues the invoice" — stays absent
+    /// for the reason the module docs give for `ChargeSummary$invoicingEntity`:
+    /// AWS invoices through the entity the acceptor's address belongs to, which
+    /// this service does not model.
+    pub fn to_group_summary(&self) -> AgreementInvoiceLineItemGroupSummary {
+        AgreementInvoiceLineItemGroupSummary {
+            agreement_id: Some(self.agreement_id.clone()),
+            invoice_id: Some(self.id.clone()),
+            pricing_currency_amount: Some(PricingCurrencyAmount {
+                amount: Some(self.amount.clone()),
+                max_adjustment_amount: Some(self.open_amount.clone()),
+                currency_code: Some(self.currency_code.clone()),
+            }),
+            invoice_billing_period: self.billing_period(),
+            issued_time: Some(::aws_smithy_types::DateTime::from(self.issued_at)),
+            invoice_type: Some(self.invoice_type.clone()),
+            invoicing_entity: None,
+        }
+    }
+}
+
+/// The scope a `ListAgreementInvoiceLineItems` page token belongs to: the whole
+/// query, so a token cannot resume a different listing.
+///
+/// Every part is length-prefixed by [`query_scope`], so no value a caller
+/// supplies can imitate the delimiters and make two different listings hash
+/// alike.
+pub fn invoice_line_item_scope(
+    agreement_id: &str,
+    group_by: &str,
+    invoice_id: Option<&str>,
+    invoice_type: Option<&str>,
+    billing_period: Option<&InvoiceBillingPeriod>,
+    issued_after: Option<f64>,
+    issued_before: Option<f64>,
+) -> String {
+    let instant = |bound: Option<f64>| bound.map(|secs| format!("{secs:?}")).unwrap_or_default();
+    let period = billing_period
+        .map(|period| format!("{}/{}", period.month, period.year))
+        .unwrap_or_default();
+    query_scope(&[
+        agreement_id,
+        group_by,
+        invoice_id.unwrap_or_default(),
+        invoice_type.unwrap_or_default(),
+        &period,
+        &instant(issued_after),
+        &instant(issued_before),
+    ])
 }
 
 /// `Timing`'s values (`TIMING_VALUES` in `types`), with the meaning
@@ -2764,6 +3055,11 @@ pub struct ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
     /// order to page over: ids are minted from a zero-padded counter, so they
     /// sort in creation order.
     pub billing_adjustment_requests: BTreeMap<String, BillingAdjustmentRequest>,
+    /// Every invoice this service has issued, keyed by its `inv-…` id. A
+    /// `BTreeMap` is what gives `ListAgreementInvoiceLineItems` a stable total
+    /// order to page over: ids are minted from a zero-padded counter, so they
+    /// sort in the order the invoices were issued.
+    pub invoices: BTreeMap<String, Invoice>,
     /// An `@idempotencyToken` `clientToken` to the resource it created, so a
     /// replayed create answers with the first resource instead of minting a
     /// second one. `CreateAgreementRequest` keys it by the token itself;
@@ -2834,6 +3130,116 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
             if !self.billing_adjustment_requests.contains_key(&id) {
                 return id;
             }
+        }
+    }
+
+    /// Mint an unused invoice id matching `ResourceId`'s `^[A-Za-z0-9_/-]+$`,
+    /// which is how `AgreementInvoiceLineItemGroupSummary$invoiceId` is
+    /// modelled.
+    pub fn mint_invoice_id(&mut self) -> String {
+        loop {
+            let id = format!("inv-{:016x}", self.next_sequence());
+            if !self.invoices.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// Issue the invoices accepting `agreement_id` bills, answering their ids in
+    /// the order they were issued.
+    ///
+    /// One invoice per charge of the agreement's own quote that is charged on
+    /// acceptance and carries an amount — see [`Invoice`] for why those are the
+    /// charges this service can invoice. The amount and currency are READ from
+    /// that quote, which priced the charge once, so an invoice never states a
+    /// second amount for a charge the agreement already reports.
+    pub fn issue_acceptance_invoices(
+        &mut self,
+        agreement_id: &str,
+        now: SystemTime,
+    ) -> Vec<String> {
+        let Some(summary) = self
+            .agreements
+            .get(agreement_id)
+            .and_then(|agreement| self.agreement_requests.get(&agreement.agreement_request_id))
+            .map(|request| request.charge_summary.clone())
+        else {
+            return Vec::new();
+        };
+        let Some(currency_code) = summary.currency_code else {
+            return Vec::new();
+        };
+        // One pair per charge this acceptance bills: the charge, and the amount
+        // the quote priced it at.
+        let billed: Vec<(String, String)> = summary
+            .expected_charges
+            .iter()
+            .flatten()
+            .filter(|charge| charge.timing.as_deref() == Some(TIMING_ON_ACCEPTANCE))
+            .filter_map(|charge| {
+                let id = charge.id.clone()?;
+                let amount = charge
+                    .amount
+                    .clone()
+                    .filter(|amount| is_positive_amount(amount))?;
+                Some((id, amount))
+            })
+            .collect();
+
+        let mut issued = Vec::with_capacity(billed.len());
+        for (charge_id, amount) in billed {
+            let id = self.mint_invoice_id();
+            self.invoices.insert(
+                id.clone(),
+                Invoice {
+                    id: id.clone(),
+                    agreement_id: agreement_id.to_string(),
+                    charge_id,
+                    // Nothing has been adjusted yet, so the whole of what the
+                    // invoice bills is open to adjustment.
+                    open_amount: amount.clone(),
+                    amount,
+                    currency_code: currency_code.clone(),
+                    invoice_type: INVOICE_TYPE_INVOICE.to_string(),
+                    issued_at: now,
+                },
+            );
+            issued.push(id);
+        }
+        issued
+    }
+
+    /// The invoice of `agreement_id` that `invoice_id` names, or `None` when
+    /// that id names no invoice of THAT agreement.
+    ///
+    /// An invoice belongs to one agreement, so an id naming an invoice of
+    /// another agreement resolves to nothing here: an adjustment is made to an
+    /// invoice OF the agreement its entry names.
+    pub fn invoice_of(&self, agreement_id: &str, invoice_id: &str) -> Option<&Invoice> {
+        self.invoices
+            .get(invoice_id)
+            .filter(|invoice| invoice.agreement_id == agreement_id)
+    }
+
+    /// The invoices of one agreement, in the order they were issued.
+    pub fn invoices_of(&self, agreement_id: &str) -> Vec<&Invoice> {
+        self.invoices
+            .values()
+            .filter(|invoice| invoice.agreement_id == agreement_id)
+            .collect()
+    }
+
+    /// Hold `units` of the invoice `invoice_id` names against that invoice:
+    /// what one stored adjustment request asks to credit is no longer open to a
+    /// later one.
+    ///
+    /// Called once, by the submit that stores the request, so the invoice and
+    /// the requests against it never disagree. An amount larger than what is
+    /// open is refused before it is stored, so this never drives the open amount
+    /// below zero; if it somehow were, nothing is left open.
+    pub fn hold_against_invoice(&mut self, invoice_id: &str, units: u128) {
+        if let Some(invoice) = self.invoices.get_mut(invoice_id) {
+            invoice.open_amount = amount_of_units(invoice.open_units().saturating_sub(units));
         }
     }
 

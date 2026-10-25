@@ -27,12 +27,14 @@
 //! current task size and the form it is registered in, how many tasks the service keeps
 //! running, the look-back period in force, and which analysis input is missing.
 
+use std::sync::Arc;
+
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    call, call_cloudwatch, call_ecs, call_in_region, emulator_with_analysed_services, error_code,
-    opt_in, REGION,
+    call, call_ecs, call_in_region, emulator_with_analysed_services,
+    emulator_with_analysed_services_and_engine, error_code, opt_in, seed_cloudwatch_series, REGION,
 };
 
 /// The account id every ARN the emulator mints carries.
@@ -86,7 +88,7 @@ struct AnalysisCase {
 
 #[tokio::test]
 async fn a_recommendation_is_computed_from_the_service_and_its_observed_utilization() {
-    let router = emulator_with_analysed_services();
+    let (router, engine) = emulator_with_analysed_services_and_engine();
     opt_in(&router).await;
     let cluster = "analysis";
     create_cluster(&router, cluster, "setup").await;
@@ -255,25 +257,21 @@ async fn a_recommendation_is_computed_from_the_service_and_its_observed_utilizat
         )
         .await;
         publish(
-            &router,
+            &engine,
             cluster,
             test.service,
             CPU_METRIC,
             &test.cpu_values,
             published_at,
-            case,
-        )
-        .await;
+        );
         publish(
-            &router,
+            &engine,
             cluster,
             test.service,
             MEMORY_METRIC,
             &test.memory_values,
             published_at,
-            case,
-        )
-        .await;
+        );
 
         let found = only_recommendation(&router, &arn, case).await;
 
@@ -524,7 +522,7 @@ async fn a_recommendation_is_computed_from_the_service_and_its_observed_utilizat
 /// ones, because no Savings Plans commitment is recorded against a service's Fargate spend.
 #[tokio::test]
 async fn after_discount_savings_are_reported_only_when_the_preference_activates_them() {
-    let router = emulator_with_analysed_services();
+    let (router, engine) = emulator_with_analysed_services_and_engine();
     opt_in(&router).await;
     let cluster = "discounts";
     create_cluster(&router, cluster, "setup").await;
@@ -537,16 +535,7 @@ async fn after_discount_savings_are_reported_only_when_the_preference_activates_
         register_task_definition(&router, &family, "2048", "4096", service).await;
         create_service(&router, cluster, service, &family, "FARGATE", 2, service).await;
         for metric in [CPU_METRIC, MEMORY_METRIC] {
-            publish(
-                &router,
-                cluster,
-                service,
-                metric,
-                &[10.0, 20.0],
-                published_at,
-                service,
-            )
-            .await;
+            publish(&engine, cluster, service, metric, &[10.0, 20.0], published_at);
         }
     }
 
@@ -646,7 +635,7 @@ struct ErrorCase {
 
 #[tokio::test]
 async fn a_service_with_no_analysis_input_is_reported_as_an_error() {
-    let router = emulator_with_analysed_services();
+    let (router, engine) = emulator_with_analysed_services_and_engine();
     opt_in(&router).await;
     let cluster = "errors";
     create_cluster(&router, cluster, "setup").await;
@@ -706,15 +695,13 @@ async fn a_service_with_no_analysis_input_is_reported_as_an_error() {
         }
         for metric in test.publish {
             publish(
-                &router,
+                &engine,
                 cluster,
                 test.service,
                 metric,
                 &[50.0, 60.0],
                 now_secs() - test.age_secs,
-                case,
-            )
-            .await;
+            );
         }
 
         let arn = service_arn(cluster, test.service);
@@ -903,7 +890,7 @@ async fn a_malformed_request_is_refused_and_an_unenrolled_account_has_no_analysi
 
 #[tokio::test]
 async fn recommendations_are_paged_in_arn_order_and_filtered_by_finding() {
-    let router = emulator_with_analysed_services();
+    let (router, engine) = emulator_with_analysed_services_and_engine();
     opt_in(&router).await;
     let cluster = "paging";
     create_cluster(&router, cluster, "setup").await;
@@ -920,25 +907,21 @@ async fn recommendations_are_paged_in_arn_order_and_filtered_by_finding() {
         register_task_definition(&router, &family, "1024", "2048", service).await;
         create_service(&router, cluster, service, &family, "FARGATE", 1, service).await;
         publish(
-            &router,
+            &engine,
             cluster,
             service,
             CPU_METRIC,
             &cpu_values,
             published_at,
-            service,
-        )
-        .await;
+        );
         publish(
-            &router,
+            &engine,
             cluster,
             service,
             MEMORY_METRIC,
             &[20.0, 30.0],
             published_at,
-            service,
-        )
-        .await;
+        );
     }
 
     // Every page size walks the same sequence, in ARN order, and the last page carries no
@@ -1024,7 +1007,7 @@ async fn recommendations_are_paged_in_arn_order_and_filtered_by_finding() {
 /// account can address — the rule holds for each of them, not just one.
 #[tokio::test]
 async fn only_the_services_of_the_requested_region_are_analysed() {
-    let router = emulator_with_analysed_services();
+    let (router, engine) = emulator_with_analysed_services_and_engine();
     opt_in(&router).await;
     let cluster = "regional";
     create_cluster(&router, cluster, "setup").await;
@@ -1033,16 +1016,7 @@ async fn only_the_services_of_the_requested_region_are_analysed() {
     let arn = create_service(&router, cluster, "checkout", family, "FARGATE", 1, "setup").await;
     let published_at = now_secs() - 3_600;
     for metric in [CPU_METRIC, MEMORY_METRIC] {
-        publish(
-            &router,
-            cluster,
-            "checkout",
-            metric,
-            &[40.0, 50.0],
-            published_at,
-            "setup",
-        )
-        .await;
+        publish(&engine, cluster, "checkout", metric, &[40.0, 50.0], published_at);
     }
 
     // At the endpoint the service's ARN names, the sweep reports exactly it.
@@ -1231,41 +1205,28 @@ async fn create_service(
         .to_string()
 }
 
-/// Publish `values` of one `AWS/ECS` series of one service, at `at`.
-async fn publish(
-    router: &MultiServiceRouter,
+/// Record `values` of one `AWS/ECS` series of one service, at `at`.
+///
+/// `AWS/ECS` is a namespace AWS reserves for the service that owns the metric, and no client
+/// may publish into it (`PutMetricData` refuses a `Namespace` beginning with `AWS/`), so the
+/// utilization these rows analyse is seeded into the metric store the way ECS writes it.
+fn publish(
+    engine: &Arc<engine::InMemoryEngine>,
     cluster: &str,
     service: &str,
     metric_name: &str,
     values: &[f64],
     at: i64,
-    case: &str,
 ) {
-    let dimensions = json!([
-        { "Name": "ClusterName", "Value": cluster },
-        { "Name": "ServiceName", "Value": service },
-    ]);
-    let data: Vec<Value> = values
-        .iter()
-        .map(|value| {
-            json!({
-                "MetricName": metric_name,
-                "Dimensions": dimensions,
-                "Value": value,
-                "Unit": "Percent",
-                "Timestamp": at,
-            })
-        })
-        .collect();
-    let (status, body) = call_cloudwatch(
-        router,
-        "PutMetricData",
-        json!({ "Namespace": "AWS/ECS", "MetricData": data }),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: expected PutMetricData to answer 200, got {status}: {body}"
+    #[allow(clippy::cast_precision_loss)]
+    seed_cloudwatch_series(
+        engine,
+        "AWS/ECS",
+        metric_name,
+        &[("ClusterName", cluster), ("ServiceName", service)],
+        Some("Percent"),
+        at as f64,
+        values,
     );
 }
 

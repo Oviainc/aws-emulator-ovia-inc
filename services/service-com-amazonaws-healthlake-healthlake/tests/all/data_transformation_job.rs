@@ -13,10 +13,12 @@
 //! never with an empty or synthesised job.
 //!
 //! `StartDataTransformationJob` — the operation that MINTS a job record — is
-//! still a scaffold stub with its own issue, so the rows below are seeded into
-//! the SAME store this handler reads, through the shared engine the harness
-//! exposes (exactly how `tests/all/fhir_export_job_listing.rs` seeds export
-//! jobs). Every `DescribeDataTransformationJob` call itself goes over the real
+//! covered end-to-end by `tests/all/start_data_transformation_job.rs`; the rows
+//! below are seeded directly into the SAME store this handler reads, through
+//! the shared engine the harness exposes (exactly how
+//! `tests/all/fhir_export_job_listing.rs` seeds export jobs), so one record can
+//! differ from the next along any member a start does not choose. Every
+//! `DescribeDataTransformationJob` call itself goes over the real
 //! awsJson1_0 wire through `MultiServiceRouter::dispatch` — the entry point
 //! `core/router` serves — so routing, deserialization, the modelled constraints
 //! and the error envelope are all exercised, not bypassed.
@@ -202,7 +204,9 @@ impl Seed {
             id: self.id.to_string(),
             name: self.name.map(str::to_string),
             status: self.status,
-            pending: self.pending.map(|next| (armed_at + JOB_TRANSITION, next)),
+            pending: self
+                .pending
+                .map(|next| (armed_at + JOB_TRANSITION, next, None)),
             submitted_at: ::aws_smithy_types::DateTime::from_secs(
                 BASE_SECS + self.submitted_after_base,
             ),
@@ -232,6 +236,10 @@ impl Seed {
                 total_files_failed: counts[2],
                 total_resources_generated: counts[3],
             }),
+            // Seeded rather than started, so no `ClientToken` named this job
+            // and no request fingerprinted to it.
+            client_token: None,
+            request_fingerprint: String::new(),
         }
     }
 
