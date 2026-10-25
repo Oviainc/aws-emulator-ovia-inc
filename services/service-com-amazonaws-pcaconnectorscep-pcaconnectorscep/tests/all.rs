@@ -21,6 +21,8 @@ mod connector_delete_not_found;
 mod connector_deletion;
 #[path = "all/connector_lifecycle.rs"]
 mod connector_lifecycle;
+#[path = "all/connector_oidc_parameters.rs"]
+mod connector_oidc_parameters;
 #[path = "all/connector_vpc_endpoint.rs"]
 mod connector_vpc_endpoint;
 #[path = "all/resource_tags.rs"]

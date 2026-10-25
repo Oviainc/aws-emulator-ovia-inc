@@ -70,6 +70,9 @@ mod state_roundtrip;
 #[path = "all/stream_enabled_table_round_trip.rs"]
 mod stream_enabled_table_round_trip;
 
+#[path = "all/stream_identity_is_minted_once.rs"]
+mod stream_identity_is_minted_once;
+
 #[path = "all/stream_specification_with_other_members.rs"]
 mod stream_specification_with_other_members;
 

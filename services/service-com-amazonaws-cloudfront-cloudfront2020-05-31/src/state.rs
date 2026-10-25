@@ -63,7 +63,8 @@ use crate::ops::types::{
     ContinuousDeploymentSingleHeaderConfig, ContinuousDeploymentSingleWeightConfig,
     CustomErrorResponse, CustomErrorResponses, CustomOriginConfig,
     Customizations, DefaultCacheBehavior, Distribution, DistributionConfig, DistributionSummary,
-    DistributionTenant, DomainResult, EntityAlreadyExists, EntityNotFound, ForwardedValues,
+    DistributionTenant, DomainResult, EntityAlreadyExists, EntityNotFound,
+    FieldLevelEncryptionProfile, FieldLevelEncryptionProfileConfig, ForwardedValues,
     FunctionAssociations, GeoRestriction, Invalidation, InvalidationBatch, InvalidationSummary,
     InvalidTagging, KGKeyPairIds, KeyPairIds, KeyValueStore, LambdaFunctionAssociations,
     LoggingConfig, ManagedCertificateDetails, ManagedCertificateRequest, MonitoringSubscription,
@@ -590,6 +591,24 @@ pub const PUBLIC_KEY_ID_PREFIX: char = 'K';
 /// own ceiling is an account quota that can be raised and the model states no number, so
 /// this bound is the emulator's rather than a claim about the service.
 pub const MAX_PUBLIC_KEYS: usize = 1_000;
+
+/// The prefix a field-level encryption profile id carries.
+///
+/// CloudFront answers a `CreateFieldLevelEncryptionProfile` with an id like
+/// `P280MFCLSYOCVU` — a `P` followed by [`ID_BODY_LEN`] characters of the id alphabet — so
+/// the prefix is what separates the profile namespace from the `E`-prefixed one every other
+/// CloudFront entity id is drawn from and from the `K`-prefixed public key one.
+pub const FIELD_LEVEL_ENCRYPTION_PROFILE_ID_PREFIX: char = 'P';
+
+/// The most field-level encryption profiles this emulator holds.
+///
+/// CHOSEN by this emulator, for the same reason as [`MAX_PUBLIC_KEYS`]: a profile record is
+/// what a later read answers from, so it cannot be evicted, and the create path is refused
+/// at this entry count with the modelled `TooManyFieldLevelEncryptionProfiles` ("The maximum
+/// number of profiles for field-level encryption have been created.") instead of growing
+/// further. CloudFront's own ceiling is an account quota that can be raised and the model
+/// states no number, so this bound is the emulator's rather than a claim about the service.
+pub const MAX_FIELD_LEVEL_ENCRYPTION_PROFILES: usize = 1_000;
 
 /// The `PriceClass` reported for a distribution whose stored configuration names none:
 /// the class that covers every CloudFront edge location, which is what
@@ -3026,6 +3045,48 @@ impl StoredPublicKey {
     }
 }
 
+/// One CloudFront field-level encryption profile, as this emulator persists it.
+///
+/// The record is the single source of truth for the profile's id, the configuration it was
+/// created with, the instant it was last written and its version token, so the create and
+/// every later read — `GetFieldLevelEncryptionProfile` and
+/// `GetFieldLevelEncryptionProfileConfig` — answer from it rather than from the request
+/// being served.
+///
+/// Nothing in here is owed by the CLOCK: the model's `FieldLevelEncryptionProfile` is `Id`,
+/// `LastModifiedTime` and `FieldLevelEncryptionProfileConfig` only — a profile carries no
+/// status and no propagation deadline, so one this service accepts is usable at once.
+#[derive(Debug, Clone)]
+pub struct StoredFieldLevelEncryptionProfile {
+    /// `FieldLevelEncryptionProfile$Id` — "The ID for a field-level encryption profile
+    /// configuration": the token minted at creation, which is also the key this record is
+    /// held under and the path segment its `Location` names.
+    pub id: String,
+    /// `FieldLevelEncryptionProfile$LastModifiedTime` — "The last time the field-level
+    /// encryption profile was updated", which for a profile nothing has updated yet is the
+    /// instant the create stored it.
+    pub last_modified_time: SystemTime,
+    /// The configuration as submitted — stored whole, so a read reports what was stored
+    /// rather than re-deriving anything from a request, down to the members the create
+    /// left out.
+    pub config: FieldLevelEncryptionProfileConfig,
+    /// The version token the last mutation handed back, and the single source of truth for
+    /// every `If-Match` check against this profile.
+    pub etag: String,
+}
+
+impl StoredFieldLevelEncryptionProfile {
+    /// The `FieldLevelEncryptionProfile` projection every profile operation returns, read
+    /// from the one stored record.
+    pub fn to_profile(&self) -> FieldLevelEncryptionProfile {
+        FieldLevelEncryptionProfile {
+            id: self.id.clone(),
+            last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_time),
+            field_level_encryption_profile_config: self.config.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-cloudfront-cloudfront2020-05-31. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudfrontCloudfront20200531State {
@@ -3103,6 +3164,11 @@ pub struct ComAmazonawsCloudfrontCloudfront20200531State {
     /// `distributions`: one stable total order for `ListPublicKeys`'s `Marker` to index
     /// into.
     pub public_keys: BTreeMap<String, StoredPublicKey>,
+    /// Every field-level encryption profile this emulator holds, keyed by its minted id —
+    /// the identifier every field-level encryption profile operation addresses one by. A
+    /// `BTreeMap` for the same reason as `distributions`: one stable total order for
+    /// `ListFieldLevelEncryptionProfiles`'s `Marker` to index into.
+    pub field_level_encryption_profiles: BTreeMap<String, StoredFieldLevelEncryptionProfile>,
     /// Every streaming (RTMP) distribution this emulator holds, keyed by its id — the
     /// identifier every streaming distribution operation addresses one by. A `BTreeMap`
     /// for the same reason as `distributions`: one stable total order for
@@ -3612,6 +3678,35 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             .find(|key| key.config.caller_reference == caller_reference)
     }
 
+    /// The field-level encryption profile `id` names, or `None` when the store holds none.
+    pub fn field_level_encryption_profile(
+        &self,
+        id: &str,
+    ) -> Option<&StoredFieldLevelEncryptionProfile> {
+        self.field_level_encryption_profiles.get(id)
+    }
+
+    /// The field-level encryption profile created under `caller_reference`, or `None` when
+    /// no profile was.
+    ///
+    /// `FieldLevelEncryptionProfileConfig$CallerReference` is "A unique number that ensures
+    /// that the request can't be replayed", so at most one profile answers and this is what
+    /// tells a replayed create from a second profile under a reference already taken.
+    ///
+    /// A scan over the profiles rather than a second index beside them, for the same reason
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::public_key_by_caller_reference`]
+    /// scans: the stored records are the single source of truth for which references are
+    /// taken, so a scan cannot drift out of step with them, and the collection is bounded
+    /// by [`MAX_FIELD_LEVEL_ENCRYPTION_PROFILES`].
+    pub fn field_level_encryption_profile_by_caller_reference(
+        &self,
+        caller_reference: &str,
+    ) -> Option<&StoredFieldLevelEncryptionProfile> {
+        self.field_level_encryption_profiles
+            .values()
+            .find(|profile| profile.config.caller_reference == caller_reference)
+    }
+
     /// The cache policy whose STORED configuration carries `name`, or `None`.
     ///
     /// `CachePolicyConfig$Name` is "A unique name to identify the cache policy", and the
@@ -4014,6 +4109,26 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         loop {
             let candidate = format!("{PUBLIC_KEY_ID_PREFIX}{}", self.mint(ID_BODY_LEN));
             if !self.public_keys.contains_key(&candidate) {
+                break candidate;
+            }
+        }
+    }
+
+    /// Allocate a field-level encryption profile id no stored profile holds.
+    ///
+    /// `FieldLevelEncryptionProfile$Id` is "The ID for a field-level encryption profile
+    /// configuration", and CloudFront mints one in the shape its own answers show
+    /// (`P280MFCLSYOCVU`): a [`FIELD_LEVEL_ENCRYPTION_PROFILE_ID_PREFIX`] followed by
+    /// [`ID_BODY_LEN`] uppercase alphanumerics, the id alphabet every other entity id here
+    /// is drawn from — so no two profiles are minted the same id and the namespace is
+    /// distinguishable from a distribution's `E`-prefixed one.
+    pub fn allocate_field_level_encryption_profile_id(&mut self) -> String {
+        loop {
+            let candidate = format!(
+                "{FIELD_LEVEL_ENCRYPTION_PROFILE_ID_PREFIX}{}",
+                self.mint(ID_BODY_LEN)
+            );
+            if !self.field_level_encryption_profiles.contains_key(&candidate) {
                 break candidate;
             }
         }
@@ -5045,6 +5160,12 @@ pub fn public_key_path(id: &str) -> String {
     format!("/2020-05-31/public-key/{id}")
 }
 
+/// The path of a field-level encryption profile resource under this service's API version.
+/// The resource is addressed by ID, as `GetFieldLevelEncryptionProfile`'s `{Id}` label is.
+pub fn field_level_encryption_profile_path(id: &str) -> String {
+    format!("/2020-05-31/field-level-encryption-profile/{id}")
+}
+
 /// The fully qualified URI a `Location` header reports for `path`.
 ///
 /// CloudFront's control API is GLOBAL and served on one endpoint
@@ -5386,6 +5507,21 @@ pub fn same_origin_access_identity_config(
 /// and comparing the DESERIALIZED configurations is what makes it insensitive to the
 /// request document's whitespace and member order.
 pub fn same_public_key_config(left: &PublicKeyConfig, right: &PublicKeyConfig) -> bool {
+    format!("{left:?}") == format!("{right:?}")
+}
+
+/// Whether two field-level encryption profile configurations ask for the same thing, which
+/// is what decides whether a repeated `CallerReference` is the same create again or a second
+/// profile under a reference that is already taken.
+///
+/// The same comparison [`same_public_key_config`] makes, for the same reasons: every member
+/// a caller can submit takes part — down to the members a request left out — and comparing
+/// the DESERIALIZED configurations is what makes it insensitive to the request document's
+/// whitespace and member order.
+pub fn same_field_level_encryption_profile_config(
+    left: &FieldLevelEncryptionProfileConfig,
+    right: &FieldLevelEncryptionProfileConfig,
+) -> bool {
     format!("{left:?}") == format!("{right:?}")
 }
 
@@ -6219,6 +6355,38 @@ pub fn cache_policy_quantity_mismatch(config: &CachePolicyConfig) -> Option<Stri
             "QueryStringsConfig.QueryStrings",
             query_strings.quantity,
             items_len(&query_strings.items),
+        ));
+    }
+
+    counts
+        .iter()
+        .find_map(|(label, quantity, len)| quantity_disagreement(label, *quantity, *len))
+}
+
+/// The modelled `InconsistentQuantities` message for the first list wrapper in a
+/// field-level encryption profile configuration whose `Quantity` disagrees with the length
+/// of its `Items`, or `None` when every wrapper agrees.
+///
+/// The SAME rule [`config_quantity_mismatch`], [`cache_policy_quantity_mismatch`] and the
+/// other wrapper walks apply: every CloudFront list travels in a wrapper stating its own
+/// length beside the list itself, and the service refuses a request where the two disagree.
+/// A `FieldLevelEncryptionProfileConfig` reaches its required `EncryptionEntities` wrapper
+/// and the `FieldPatterns` wrapper each entity in it carries, so the walk covers the nested
+/// ones too rather than only the outermost.
+pub fn field_level_encryption_profile_quantity_mismatch(
+    config: &FieldLevelEncryptionProfileConfig,
+) -> Option<String> {
+    let entities = &config.encryption_entities;
+    let mut counts: Vec<(String, i32, usize)> = vec![(
+        "EncryptionEntities".to_string(),
+        entities.quantity,
+        items_len(&entities.items),
+    )];
+    for entity in entities.items.as_deref().unwrap_or_default() {
+        counts.push((
+            format!("EncryptionEntities.Items[{}].FieldPatterns", entity.public_key_id),
+            entity.field_patterns.quantity,
+            items_len(&entity.field_patterns.items),
         ));
     }
 
@@ -7231,6 +7399,63 @@ pub fn no_such_public_key() -> crate::ops::types::NoSuchPublicKey {
 
 /// `NoSuchPublicKey`'s message, as the model documents the shape.
 pub const NO_SUCH_PUBLIC_KEY_MESSAGE: &str = "The specified public key doesn't exist.";
+
+/// The longest comment a field-level encryption profile carries.
+///
+/// `FieldLevelEncryptionProfileConfig$Comment`: "An optional comment for the field-level
+/// encryption profile. The comment cannot be longer than 128 characters." The SAME bound,
+/// stated in the same words, as [`MAX_ORIGIN_ACCESS_IDENTITY_COMMENT`] — so it is that
+/// constant rather than a second literal, and a comment past it is refused with the one
+/// [`comment_too_long`] sentence.
+pub const MAX_FIELD_LEVEL_ENCRYPTION_PROFILE_COMMENT: usize = MAX_ORIGIN_ACCESS_IDENTITY_COMMENT;
+
+/// The modelled `NoSuchFieldLevelEncryptionProfile` (HTTP 404) for a profile id the store
+/// does not hold.
+///
+/// The sentence is the one the model states on the shape itself — "The specified profile for
+/// field-level encryption doesn't exist." — a property of the store rather than of the
+/// request, so nothing from the request belongs in the text.
+pub fn no_such_field_level_encryption_profile() -> crate::ops::types::NoSuchFieldLevelEncryptionProfile
+{
+    crate::ops::types::NoSuchFieldLevelEncryptionProfile {
+        message: Some(NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE.to_string()),
+    }
+}
+
+/// `NoSuchFieldLevelEncryptionProfile`'s message, as the model documents the shape.
+pub const NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE: &str =
+    "The specified profile for field-level encryption doesn't exist.";
+
+/// The sentence `FieldLevelEncryptionProfileAlreadyExists` carries — "The specified profile
+/// for field-level encryption already exists." — up to the profile the caller reference is
+/// already associated with, which it names at the end: the one piece of store-derived detail
+/// in it, and the one a caller cannot work out for itself. The same shape
+/// [`public_key_already_exists_message`] takes, for the same rule applied to the other
+/// resource.
+pub fn field_level_encryption_profile_already_exists_message(existing_id: &str) -> String {
+    format!(
+        "The specified profile for field-level encryption already exists: {existing_id}"
+    )
+}
+
+/// The modelled `TooManyFieldLevelEncryptionProfiles` (HTTP 400) for a create that would
+/// take the store past [`MAX_FIELD_LEVEL_ENCRYPTION_PROFILES`].
+///
+/// The sentence is the one the model states on the shape itself — "The maximum number of
+/// profiles for field-level encryption have been created." — a property of the account's
+/// stored profiles rather than of the request, so nothing from the request belongs in the
+/// text; it lives here beside every other modelled error text of this service rather than in
+/// the handler.
+pub fn too_many_field_level_encryption_profiles(
+) -> crate::ops::types::TooManyFieldLevelEncryptionProfiles {
+    crate::ops::types::TooManyFieldLevelEncryptionProfiles {
+        message: Some(TOO_MANY_FIELD_LEVEL_ENCRYPTION_PROFILES_MESSAGE.to_string()),
+    }
+}
+
+/// `TooManyFieldLevelEncryptionProfiles`'s message, as the model documents the shape.
+pub const TOO_MANY_FIELD_LEVEL_ENCRYPTION_PROFILES_MESSAGE: &str =
+    "The maximum number of profiles for field-level encryption have been created.";
 
 /// The modelled `InvalidArgument` (HTTP 400) for a `ListPublicKeys` `Marker` that is no
 /// resume point this service handed out.

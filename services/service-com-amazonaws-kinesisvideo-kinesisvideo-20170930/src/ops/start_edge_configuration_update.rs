@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartEdgeConfigurationUpdate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartEdgeConfigurationUpdate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartEdgeConfigurationUpdate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or rewrites the edge configuration of the stored stream a
+//! `StreamName`/`StreamARN` pair names, leaving it `SYNCING` until the clock owes it the
+//! terminal sync status.
 //!
 //! ## Shape of an operation
 //!
@@ -181,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for StartEdgeConfigurationUpdate<Eng>
 {
     type Input = StartEdgeConfigurationUpdateInput;
-    type Output = StartEdgeConfigurationUpdateOutput;
+    type Output = Report<StartEdgeConfigurationUpdateOutput>;
     type Error = StartEdgeConfigurationUpdateError;
 
     const NAME: &'static str = "StartEdgeConfigurationUpdate";
@@ -194,18 +188,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartEdgeConfigurationUpdate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartEdgeConfigurationUpdateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartEdgeConfigurationUpdate"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                StartEdgeConfigurationUpdateErrorModeled::ClientLimitExceededException(
+                    ClientLimitExceededException {
+                        message: Some(
+                            "The stream store is unavailable. Try again later.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now_millis = crate::state::now_millis();
+        let syncs_at = ::std::time::Instant::now() + crate::state::EDGE_SYNC_SPAN;
+
+        let mut store = state.lock();
+        store.settle_clock();
+
+        let stream = store
+            .resolve_mut(input.stream_name.as_deref(), input.stream_arn.as_deref())
+            .map_err(lookup_error)?;
+
+        // "You will have to wait for the sync status to reach a terminal state such as:
+        // IN_SYNC, or SYNC_FAILED, before using this API again. If you invoke this API
+        // during the syncing process, a ResourceInUseException will be thrown."
+        if stream
+            .edge
+            .as_ref()
+            .is_some_and(|edge| edge.sync_status == crate::state::SYNC_STATUS_SYNCING)
+        {
+            return Err(
+                StartEdgeConfigurationUpdateErrorModeled::ResourceInUseException(
+                    ResourceInUseException {
+                        message: Some(format!(
+                            "The edge configuration of stream {} is {}; \
+                             wait for it to reach a terminal sync status.",
+                            stream.stream_name,
+                            crate::state::SYNC_STATUS_SYNCING
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The timestamp at which a stream's edge configuration was FIRST created"
+        // (`CreationTime`), so a later update of the same configuration keeps it and
+        // moves only `LastUpdatedTime`.
+        let creation_time_millis = stream
+            .edge
+            .as_ref()
+            .map_or(now_millis, |edge| edge.creation_time_millis);
+
+        // The sync is asynchronous: the configuration is stored `SYNCING` and the move
+        // to the terminal status is owed by the clock, so a caller reading it straight
+        // back still observes `SYNCING`.
+        let edge = crate::state::EdgeConfiguration {
+            config: input.edge_config,
+            creation_time_millis,
+            last_updated_time_millis: now_millis,
+            sync_status: crate::state::SYNC_STATUS_SYNCING.to_string(),
+            synced_at: Some(syncs_at),
+        };
+        stream.edge = Some(edge.clone());
+
+        Ok(Report::of(StartEdgeConfigurationUpdateOutput {
+            stream_name: Some(stream.stream_name.clone()),
+            stream_arn: Some(stream.stream_arn.clone()),
+            creation_time: Some(::aws_smithy_types::DateTime::from_millis(
+                edge.creation_time_millis,
+            )),
+            last_updated_time: Some(::aws_smithy_types::DateTime::from_millis(
+                edge.last_updated_time_millis,
+            )),
+            sync_status: Some(edge.sync_status),
+            // `FailedStatusDetails` describes a sync that FAILED; this one has just
+            // started, so there is nothing to describe and the member reaches the wire
+            // as JSON `null` (see [`Report`]).
+            failed_status_details: None,
+            edge_config: Some(edge.config),
+        }))
     }
+}
+
+/// State the failure to resolve a `StreamName`/`StreamARN` pair as this service's
+/// own modeled error: absent or contradictory identifiers are a bad argument (400),
+/// a well-formed identifier for no stored stream is a missing resource (404).
+fn lookup_error(error: crate::state::LookupError) -> StartEdgeConfigurationUpdateError {
+    match error {
+        crate::state::LookupError::NoIdentifier => {
+            StartEdgeConfigurationUpdateErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(crate::state::STREAM_IDENTIFIER_REQUIRED_MESSAGE.to_string()),
+                },
+            )
+        }
+        crate::state::LookupError::Mismatch => {
+            StartEdgeConfigurationUpdateErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(crate::state::STREAM_IDENTIFIER_MISMATCH_MESSAGE.to_string()),
+                },
+            )
+        }
+        crate::state::LookupError::NotFound => {
+            StartEdgeConfigurationUpdateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::STREAM_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+        }
+    }
+    .into()
 }

@@ -33,3 +33,23 @@ pub struct ListSignalingChannelsOutput {
     pub next_token: Option<String>,
 }
 
+/// How a [`ListSignalingChannelsOutput`] reaches the wire: as a [`Report`], so EVERY
+/// modelled output member is present and one the listing has no value for is JSON `null`
+/// rather than an absent key — the same rule the stream listing and the tag listings of
+/// this service follow for their own `NextToken`.
+impl ReportedOutput for ListSignalingChannelsOutput {
+    fn output_schema() -> &'static ::aws_smithy_schema::Schema {
+        &Self::SCHEMA
+    }
+
+    fn has_no_value(&self, member: &::aws_smithy_schema::Schema) -> bool {
+        match member.member_name() {
+            Some("ChannelInfoList") => self.channel_info_list.is_none(),
+            Some("NextToken") => self.next_token.is_none(),
+            // A member added to the model is written by the record itself; it is
+            // reported as absent only once this match names it.
+            _ => false,
+        }
+    }
+}
+

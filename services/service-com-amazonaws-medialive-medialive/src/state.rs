@@ -396,6 +396,18 @@ pub use offerings::{
     OFFERING_TYPE,
 };
 
+/// The RESERVATION slice: the reserved resources the account has bought against
+/// the [`offerings`] catalog, in one module of its own for the same reason as the
+/// slices above. Its store is the [`ComAmazonawsMedialiveMedialiveState::reservations`]
+/// member below, and every member a reservation reports about what it reserves is
+/// read from the catalog entry the purchase named.
+pub mod reservations;
+
+pub use reservations::{
+    reservation_start, reservation_state, reservation_time, NewReservation, ReservationRecord,
+    ReservationRefusal, ReservationStartRefusal, DEFAULT_AUTOMATIC_RENEWAL, MAX_RESERVATIONS,
+};
+
 /// The `ChannelState` enum values this slice uses, spelled exactly as the model
 /// declares them (`smithy_query(query="shape", shape="ChannelState")`:
 /// CREATING | CREATE_FAILED | IDLE | STARTING | RUNNING | RECOVERING | STOPPING |
@@ -2067,6 +2079,16 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// against one cluster's endpoint. PRIVATE for the same reason as
     /// [`Self::channel_tokens`].
     node_tokens: IdempotencyTokens,
+    /// Every reservation the account has purchased, keyed by its minted `Id`, in
+    /// id order for the same reason as [`Self::channels`]: a reader walks it in
+    /// id order on every call.
+    pub reservations: BTreeMap<String, ReservationRecord>,
+    /// Mint counter behind the reservation slice's `mint_reservation_id`.
+    /// PRIVATE: only that slice mints a reservation id.
+    next_reservation_id: u64,
+    /// `PurchaseOffering`'s `RequestId` (`@idempotencyToken`) -> the reservation
+    /// it purchased. PRIVATE for the same reason as [`Self::channel_tokens`].
+    reservation_tokens: IdempotencyTokens,
 }
 
 impl ComAmazonawsMedialiveMedialiveState {
@@ -3705,6 +3727,9 @@ impl ComAmazonawsMedialiveMedialiveState {
         {
             return Some(TaggedResource::ChannelPlacementGroup(record.id.clone()));
         }
+        if let Some(record) = self.reservations.values().find(|record| record.arn == arn) {
+            return Some(TaggedResource::Reservation(record.id.clone()));
+        }
         None
     }
 
@@ -3746,6 +3771,9 @@ impl ComAmazonawsMedialiveMedialiveState {
                 .channel_placement_groups
                 .get(&id)
                 .map(|record| &record.tags),
+            TaggedResource::Reservation(id) => {
+                self.reservations.get(&id).map(|record| &record.tags)
+            }
         }
     }
 
@@ -3840,6 +3868,13 @@ impl ComAmazonawsMedialiveMedialiveState {
                 .channel_placement_groups
                 .get_mut(&id)
                 .filter(|record| !record.is_delete_accepted())
+                .map(|record| &mut record.tags),
+            // No delete filter: nothing in this service deletes a reservation
+            // yet (`DeleteReservation` is a scaffold with an issue of its own),
+            // so there is no dead id to filter out here.
+            TaggedResource::Reservation(id) => self
+                .reservations
+                .get_mut(&id)
                 .map(|record| &mut record.tags),
         }
     }
@@ -3972,6 +4007,7 @@ enum TaggedResource {
     EventBridgeRuleTemplate(String),
     Cluster(String),
     ChannelPlacementGroup(String),
+    Reservation(String),
 }
 
 /// What a monitor deployment of a signal map DOES, which is what decides the

@@ -41,3 +41,5 @@ mod send_message_batch;
 mod state_roundtrip;
 #[path = "all/support.rs"]
 mod support;
+#[path = "all/time_driven_queue_semantics.rs"]
+mod time_driven_queue_semantics;

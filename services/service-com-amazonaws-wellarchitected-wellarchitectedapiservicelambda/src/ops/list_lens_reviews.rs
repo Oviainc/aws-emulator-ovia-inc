@@ -243,21 +243,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The `LensReviewSummary` of ONE lens review of `workload`: the lens as the workload
-/// records it, the lens's own metadata, and the risk roll-up over the questions THAT lens
-/// asks.
+/// records it, what the catalog says about the version that review is against, and the
+/// risk roll-up over the questions THAT lens asks.
 ///
 /// Every member is derived from the stored workload and the lens catalog on each read, so
 /// a summary moves when an answer does and cannot disagree with what `GetLensReview`
-/// reports about the same review — the metadata and the roll-up come from the same two
-/// places (`crate::state::lens_metadata` and `WorkloadRecord::lens_risk_counts`) that read
-/// builds its answer from.
+/// reports about the same review — the lens's identity and currency and the roll-up come
+/// from the same two places (`crate::state::reviewed_lens_at` and
+/// `WorkloadRecord::lens_risk_counts`) that read builds its answer from.
 fn lens_review_summary(
     store: &crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState,
     workload: &crate::state::WorkloadRecord,
     lens: &str,
     region: &str,
 ) -> LensReviewSummary {
-    let metadata = crate::state::lens_metadata(lens);
+    let reviewed = store.reviewed_lens_at(lens, workload.lens_review_version(lens), region);
     LensReviewSummary {
         // "Each lens is identified by its `LensSummary$LensAlias`" (`WorkloadLenses` doc):
         // the name the workload records the lens under — for a custom lens its ARN, which
@@ -265,13 +265,13 @@ fn lens_review_summary(
         // the REQUEST named the lens by (`GetLensReview`); a listing has no such spelling,
         // so it reports the one the attach recorded, which resolves to the same lens.
         lens_alias: Some(lens.to_string()),
-        lens_arn: Some(store.lens_arn_of(lens, region)),
-        // A lens's name, version and status are lens CONTENT, reported for the lens whose
-        // definition this emulator ships and omitted rather than guessed at for one it
-        // holds no content for.
-        lens_version: metadata.map(|content| content.version.to_string()),
-        lens_name: metadata.map(|content| content.name.to_string()),
-        lens_status: metadata.map(|content| content.status.to_string()),
+        lens_arn: Some(reviewed.lens_arn),
+        // A lens's name, version and currency are lens CONTENT, reported for the version
+        // the review is against and omitted rather than guessed at for a lens this
+        // emulator holds no content for.
+        lens_version: reviewed.lens_version,
+        lens_name: reviewed.lens_name,
+        lens_status: reviewed.lens_status,
         // "The date and time when the lens review was last updated": a review's content —
         // the answers recorded against it — is part of the workload record, so the instant
         // the workload last changed is the instant its reviews last changed. A milestone

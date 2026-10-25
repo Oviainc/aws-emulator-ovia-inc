@@ -2548,30 +2548,44 @@ pub fn resolve_targets(targets: &HashMap<String, ExperimentTarget>) -> Vec<Resol
 /// specified percentage of targets"). A count or a percentage asking for more than the
 /// target identified keeps what it identified.
 ///
-/// Two choices this emulator makes, where FIS documents no rule: a percentage that does
+/// One choice this emulator makes, where FIS documents no rule: a percentage that does
 /// not reach a whole resource is taken DOWN (`PERCENT(25)` of two resources keeps none,
-/// of four keeps one), and a value in none of the three documented forms is read as the
-/// documented default, `ALL`, rather than scoping anything away. FIS picks the kept
-/// resources "at random"; this emulator keeps the first ones in the order the target
-/// named them, which satisfies the documented count and makes a resolution reproducible.
+/// of four keeps one). FIS picks the kept resources "at random"; this emulator keeps the
+/// first ones in the order the target named them, which satisfies the documented count and
+/// makes a resolution reproducible.
+///
+/// A target that names NO `selectionMode`, and one whose mode is in none of the three
+/// documented forms, keep every identified resource — the documented default. A stored
+/// target is never in that second case: [`targets_refusal`] refuses a mode outside the
+/// documented forms before a template carrying it is persisted, and it decides that by
+/// asking [`selection_mode_count`], so the rule and the resolution read one definition of
+/// the three forms.
 pub fn selection_count(selection_mode: Option<&str>, identified: usize) -> usize {
-    let Some(mode) = selection_mode.map(str::trim) else {
-        return identified;
-    };
+    selection_mode
+        .and_then(|mode| selection_mode_count(mode, identified))
+        .unwrap_or(identified)
+}
+
+/// How many of the `identified` resources the `selectionMode` `mode` keeps, or `None` when
+/// `mode` is in NONE of the three forms FIS documents for it.
+///
+/// The one definition of those forms: `ALL`, `COUNT(n)` and `PERCENT(n)`, matched
+/// case-sensitively because the documented forms are upper-case. Both the rule that admits
+/// a target ([`targets_refusal`]) and the resolution that scopes one
+/// ([`selection_count`]) read it, so a mode a created template carries is one the
+/// resolution understands.
+pub fn selection_mode_count(mode: &str, identified: usize) -> Option<usize> {
+    let mode = mode.trim();
     if mode == SELECTION_MODE_ALL {
-        return identified;
+        return Some(identified);
     }
     if let Some(count) = selection_argument(mode, SELECTION_MODE_COUNT_PREFIX) {
-        return identified.min(count);
+        return Some(identified.min(count));
     }
     if let Some(percent) = selection_argument(mode, SELECTION_MODE_PERCENT_PREFIX) {
-        return identified.saturating_mul(percent.min(100)) / 100;
+        return Some(identified.saturating_mul(percent.min(100)) / 100);
     }
-    // `ALL`, and anything the create accepted that is in none of the documented forms:
-    // the default scopes nothing away. No panic and no refusal here — `selectionMode` is
-    // modelled as a plain string, so a value outside the documented forms reaches the
-    // store, and reporting every identified resource for it is the documented default.
-    identified
+    None
 }
 
 /// The `n` of a `selectionMode` of the form `<prefix>n)`, or `None` when `mode` is not of
@@ -3234,24 +3248,94 @@ pub fn wait_duration(value: &str) -> Result<Duration, WaitDurationProblem> {
     Ok(span)
 }
 
+/// `None` when every target of the template a request builds satisfies what FIS documents
+/// for a target; otherwise the `ValidationException` that refuses the request.
+///
+/// Taken over the STORED targets rather than over one request's input shape, so a created
+/// and an updated template are judged by the same rule. A template declaring NO target is
+/// admissible — `targets` is not `@required` on the create, and an action that needs none
+/// (the built-in wait) runs without one.
+///
+/// Two rules the model cannot express, both stated by `CreateExperimentTemplateTargetInput`
+/// itself ("You must specify at least one Amazon Resource Name (ARN) or at least one
+/// resource tag. You cannot specify both ARNs and tags"), which is why `resourceArns` and
+/// `resourceTags` are modelled as two independent optional members:
+///
+/// * a target identifies its resources by EXACTLY ONE of them, so one that names both and
+///   one that names neither are each refused rather than stored;
+/// * `selectionMode` is one of the three documented forms ([`selection_mode_count`]), so a
+///   value outside them is refused instead of being resolved as the documented default.
+///
+/// An EMPTY `resourceArns` list, and an empty `resourceTags` map, name no resource and no
+/// tag: both are "not specified" here, which is what the documented sentence requires of
+/// them ("at least one").
+pub fn targets_refusal(
+    targets: &HashMap<String, ExperimentTemplateTarget>,
+) -> Option<ValidationException> {
+    // The map's iteration order is not stable, so the refusal is taken over the target
+    // names in order: one request always earns the same message.
+    let mut entries: Vec<(&String, &ExperimentTemplateTarget)> = targets.iter().collect();
+    entries.sort_by_key(|(name, _)| *name);
+    for (name, target) in entries {
+        let names_arns = target.resource_arns.as_ref().is_some_and(|arns| !arns.is_empty());
+        let names_tags = target
+            .resource_tags
+            .as_ref()
+            .is_some_and(|tags| !tags.is_empty());
+        if names_arns && names_tags {
+            return Some(invalid_input(format!(
+                "targets.{name} must not specify both resourceArns and resourceTags."
+            )));
+        }
+        if !names_arns && !names_tags {
+            return Some(invalid_input(format!(
+                "targets.{name} must specify at least one resourceArns entry or at least one \
+                 resourceTags entry."
+            )));
+        }
+        // `selectionMode` is required on the create's and the update's target input alike,
+        // so a stored target always carries one; an absent one is refused by this rule
+        // rather than silently resolved as the documented default.
+        let selection_mode = target.selection_mode.as_deref().unwrap_or_default();
+        if selection_mode_count(selection_mode, 0).is_none() {
+            return Some(invalid_input(format!(
+                "targets.{name}.selectionMode must be {SELECTION_MODE_ALL}, \
+                 {SELECTION_MODE_COUNT_PREFIX}n) or {SELECTION_MODE_PERCENT_PREFIX}n), \
+                 got {selection_mode:?}"
+            )));
+        }
+    }
+    None
+}
+
 /// `None` when every action of the template a request builds satisfies what FIS documents
 /// for it; otherwise the `ValidationException` that refuses the request.
 ///
 /// Taken over the STORED actions rather than over one request's input shape, so a created
-/// and an updated template are judged by the same rule.
+/// and an updated template are judged by the same rule. `targets` is the SAME template's
+/// target map, because two of the rules below are about how an action and a target of one
+/// template refer to each other.
 ///
 /// The first rule is the template's own: it DECLARES at least one action. `actions` is
 /// `@required` on the create and the maps carry no `@length`, so the "at least one" floor
 /// is server-side — an experiment with no action has nothing to carry out.
 ///
-/// The next rule this enforces is the built-in `aws:fis:wait` action's: it takes a required
-/// `duration` parameter, an ISO 8601 duration within the documented 1 to 720 minutes. An
-/// action id FIS defines elsewhere carries its own parameter catalog, which this service
-/// does not hold, so its parameters are stored as sent. The other rule here is on the
-/// graph: `startAfter` is "the name of the action that must be completed before the
-/// current action starts", so it names an action the same template declares.
+/// The rules on one action, none of them expressible as a modelled constraint:
+///
+/// * `startAfter` is "the name of the action that must be completed before the current
+///   action starts", so it names an action the same template declares;
+/// * `actionId` is "the ID of the action", one of the actions FIS PUBLISHES
+///   ([`ACTION_CATALOG`], which `GetAction` reports from), so an id the catalog holds no
+///   action for is refused rather than stored and later started;
+/// * the parameters that action's catalogued contract marks required are supplied — for the
+///   built-in wait that is its `duration`, whose documented 1 to 720 minute range is
+///   checked with it, and for every other published action the parameters that action's
+///   own entry records as required;
+/// * each entry of `targets` names, under a target key that action SUPPORTS, a target the
+///   same template declares, of the resource type the action's entry records for that key.
 pub fn actions_refusal(
     actions: &HashMap<String, ExperimentTemplateAction>,
+    targets: &HashMap<String, ExperimentTemplateTarget>,
 ) -> Option<ValidationException> {
     if actions.is_empty() {
         return Some(invalid_input("actions must declare at least one action."));
@@ -3273,33 +3357,117 @@ pub fn actions_refusal(
                 "actions.{name}.startAfter must name actions the template declares."
             )));
         }
-        if action.action_id.as_deref() != Some(WAIT_ACTION_ID) {
-            continue;
-        }
-        let duration = action
-            .parameters
-            .as_ref()
-            .and_then(|parameters| parameters.get(DURATION_PARAMETER));
-        let Some(duration) = duration else {
+        // An `actionId` is required on the create and inherited by an update that omits it
+        // ([`ExperimentTemplateRecord::updated_actions`]), so a stored action carries one;
+        // a record without one names no published action and is refused by this rule.
+        let action_id = action.action_id.as_deref().unwrap_or_default();
+        let Some(entry) = action_catalog_entry(action_id) else {
             return Some(invalid_input(format!(
-                "actions.{name}.parameters must carry '{DURATION_PARAMETER}' \
-                 for action {WAIT_ACTION_ID}."
+                "actions.{name}.actionId must be an action FIS publishes, got {action_id:?}"
             )));
         };
-        match wait_duration(duration) {
-            Ok(_) => {}
-            Err(WaitDurationProblem::OutOfRange) => {
-                return Some(invalid_input(format!(
-                    "'{DURATION_PARAMETER}' must be within a range of \
-                     {WAIT_DURATION_MIN_MINUTES} to {WAIT_DURATION_MAX_MINUTES} minutes."
-                )))
-            }
-            Err(WaitDurationProblem::NotADuration) => {
-                return Some(invalid_input(format!(
-                    "actions.{name}.parameters.'{DURATION_PARAMETER}' must be a \
-                     duration in ISO 8601 format."
-                )))
-            }
+        if let Some(refusal) = action_parameters_refusal(name, action, entry) {
+            return Some(refusal);
+        }
+        if let Some(refusal) = action_targets_refusal(name, action, entry, targets) {
+            return Some(refusal);
+        }
+    }
+    None
+}
+
+/// `None` when `action` supplies every parameter its catalogued contract `entry` marks
+/// required, and the built-in wait's `duration` names a span within the documented range;
+/// otherwise the `ValidationException` that refuses the template.
+///
+/// `ActionParameter$required` is reported by `GetAction` for every published action, so
+/// which parameters an action needs is part of the contract this service already serves —
+/// the same table decides it here, rather than only the wait action being checked. The
+/// parameters are judged in the order the catalogued entry records them (sorted by name),
+/// so an action missing several of them always earns the same message.
+fn action_parameters_refusal(
+    name: &str,
+    action: &ExperimentTemplateAction,
+    entry: &ActionCatalogEntry,
+) -> Option<ValidationException> {
+    let action_id = entry.id;
+    for parameter in entry.parameters.iter().filter(|parameter| parameter.required) {
+        if action
+            .parameters
+            .as_ref()
+            .is_none_or(|parameters| !parameters.contains_key(parameter.name))
+        {
+            return Some(invalid_input(format!(
+                "actions.{name}.parameters must carry '{}' for action {action_id}.",
+                parameter.name
+            )));
+        }
+    }
+    // The wait is the one action FIS documents a RANGE for its `duration`: "duration — the
+    // duration of the wait", 1 to 720 minutes. Another action's `duration` names the span
+    // of that action, for which no bound is published, so its value is stored as sent.
+    if action_id != WAIT_ACTION_ID {
+        return None;
+    }
+    let duration = action
+        .parameters
+        .as_ref()
+        .and_then(|parameters| parameters.get(DURATION_PARAMETER))?;
+    match wait_duration(duration) {
+        Ok(_) => None,
+        Err(WaitDurationProblem::OutOfRange) => Some(invalid_input(format!(
+            "'{DURATION_PARAMETER}' must be within a range of \
+             {WAIT_DURATION_MIN_MINUTES} to {WAIT_DURATION_MAX_MINUTES} minutes."
+        ))),
+        Err(WaitDurationProblem::NotADuration) => Some(invalid_input(format!(
+            "actions.{name}.parameters.'{DURATION_PARAMETER}' must be a \
+             duration in ISO 8601 format."
+        ))),
+    }
+}
+
+/// `None` when every entry of `action`'s `targets` map refers to a target of the same
+/// template that its catalogued contract `entry` admits; otherwise the
+/// `ValidationException` that refuses the template.
+///
+/// An action's `targets` map says WHICH of the template's targets the action acts on, under
+/// the key the action names that target by — `ActionTarget`, which `GetAction` reports for
+/// every published action, records those keys and the `resourceType` each one takes. So
+/// three things have to hold of one entry, and none of them is expressible in the model
+/// (the map is a free `string -> string` one, and a target lives on another member of the
+/// template): the key is a target the action supports, the value names a target the SAME
+/// template declares, and that target's `resourceType` is the one the action takes under
+/// that key. The entries are judged in key order, so an action outside more than one of
+/// them always earns the same message.
+fn action_targets_refusal(
+    name: &str,
+    action: &ExperimentTemplateAction,
+    entry: &ActionCatalogEntry,
+    targets: &HashMap<String, ExperimentTemplateTarget>,
+) -> Option<ValidationException> {
+    let action_id = entry.id;
+    let declared = action.targets.as_ref()?;
+    let mut keys: Vec<(&String, &String)> = declared.iter().collect();
+    keys.sort_by_key(|(key, _)| *key);
+    for (key, target_name) in keys {
+        let Some(supported) = entry.targets.iter().find(|target| target.name == *key) else {
+            return Some(invalid_input(format!(
+                "actions.{name}.targets.{key} is not a target of action {action_id}."
+            )));
+        };
+        let Some(target) = targets.get(target_name) else {
+            return Some(invalid_input(format!(
+                "actions.{name}.targets.{key} must name a target the template declares, \
+                 got {target_name:?}"
+            )));
+        };
+        let resource_type = target.resource_type.as_deref().unwrap_or_default();
+        if resource_type != supported.resource_type {
+            return Some(invalid_input(format!(
+                "actions.{name}.targets.{key} must name a target of resourceType {}, \
+                 got {resource_type:?}",
+                supported.resource_type
+            )));
         }
     }
     None
@@ -3354,9 +3522,10 @@ pub enum TemplateRefusal {
 pub fn template_refusal(template: &ExperimentTemplateRecord) -> Option<TemplateRefusal> {
     // What the model cannot express is that `roleArn` names an IAM ROLE, what FIS documents
     // for a stop condition's `source`/`value` pair, which values the two `experimentOptions`
-    // enums admit, and the parameters FIS's built-in actions take. The modelled constraints
-    // — the required members, the lengths and patterns, the 50-entry tag map — were already
-    // refused at the boundary.
+    // enums admit, how a target identifies its resources and scopes them, and the actions
+    // FIS publishes with the parameters and the targets each one takes. The modelled
+    // constraints — the required members, the lengths and patterns, the 50-entry tag map —
+    // were already refused at the boundary.
     if let Some(refusal) = role_arn_refusal("roleArn", Some(template.role_arn.as_str())) {
         return Some(TemplateRefusal::Invalid(refusal));
     }
@@ -3371,15 +3540,23 @@ pub fn template_refusal(template: &ExperimentTemplateRecord) -> Option<TemplateR
     if let Some(refusal) = log_configuration_refusal(template.log_configuration.as_ref()) {
         return Some(TemplateRefusal::Invalid(refusal));
     }
+    // The targets are judged BEFORE the actions, because an action refers to them: a
+    // template whose target is not one FIS admits is refused on that target rather than on
+    // the action that happens to name it.
+    if let Some(refusal) = targets_refusal(&template.targets) {
+        return Some(TemplateRefusal::Invalid(refusal));
+    }
     // The action count is capped because it is a published quota, and because it is what
     // bounds the work the action graph of this template costs every later
     // `StartExperiment` — a quota, so FIS answers it with its own error class.
     if let Some(refusal) = actions_quota_refusal(&template.actions) {
         return Some(TemplateRefusal::QuotaExceeded(refusal));
     }
-    // A wait beyond the documented bound is refused HERE rather than persisted: a template
-    // a call accepts is one the service would run.
-    if let Some(refusal) = actions_refusal(&template.actions) {
+    // An action FIS publishes no action for, one missing a parameter its published contract
+    // requires, one naming a target the template does not declare and a wait beyond the
+    // documented bound are each refused HERE rather than persisted: a template a call
+    // accepts is one the service would run.
+    if let Some(refusal) = actions_refusal(&template.actions, &template.targets) {
         return Some(TemplateRefusal::Invalid(refusal));
     }
     None

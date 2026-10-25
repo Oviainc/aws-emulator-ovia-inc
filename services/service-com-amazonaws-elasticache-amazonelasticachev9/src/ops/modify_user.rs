@@ -211,20 +211,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // syntax: one that names something that is not a rule is refused rather
         // than stored as a permission set no engine could apply. The same test
         // `CreateUser` applies (`crate::state::access_string_rejection`), so the
-        // two cannot drift about which rule lists the service accepts.
-        for (member, value) in [
-            ("AccessString", input.access_string.as_deref()),
-            ("AppendAccessString", input.append_access_string.as_deref()),
-        ] {
-            if let Some(value) = value {
-                if let Some(message) = crate::state::access_string_rejection(member, value) {
-                    return Err(ModifyUserErrorModeled::InvalidParameterValueException(
-                        InvalidParameterValueException {
-                            message: Some(message),
-                        },
-                    )
-                    .into());
-                }
+        // two cannot drift about which rule lists the service accepts — nor
+        // about the words the refusal carries, which name neither the offending
+        // rule nor the member it arrived on.
+        for value in [
+            input.access_string.as_deref(),
+            input.append_access_string.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(message) = crate::state::access_string_rejection(value) {
+                return Err(ModifyUserErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into());
             }
         }
 
@@ -365,12 +368,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // from call to call, so the bound is checked on the RESULT rather
             // than on the rules the request added; it is the same bound a whole
             // access string is accepted under (`crate::state::access_string_rejection`).
-            if let Some(message) =
-                crate::state::access_string_rejection("AppendAccessString", &next)
-            {
+            if let Some(message) = crate::state::access_string_rejection(&next) {
                 return Err(ModifyUserErrorModeled::InvalidParameterValueException(
                     InvalidParameterValueException {
-                        message: Some(message),
+                        message: Some(message.to_string()),
                     },
                 )
                 .into());

@@ -360,7 +360,7 @@ mod stream_surface {
                     ),
                     (
                         "a scaffolded operation's 501",
-                        "/describeImageGenerationConfiguration",
+                        "/deleteEdgeConfiguration",
                         r#"{"StreamName":"envelope-probe"}"#,
                         true,
                     ),

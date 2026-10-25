@@ -54,6 +54,8 @@ mod environment_lifecycle;
 mod error_wire_status;
 #[path = "all/hcx_eip_associations.rs"]
 mod hcx_eip_associations;
+#[path = "all/host_deletion.rs"]
+mod host_deletion;
 #[path = "all/host_ec2_instances.rs"]
 mod host_ec2_instances;
 #[path = "all/host_placement_references.rs"]

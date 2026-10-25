@@ -185,10 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.resolve_strategy(&input.deployment_strategy_id).is_some() {
             return Err(DeleteDeploymentStrategyErrorModeled::BadRequestException(
                 BadRequestException {
-                    message: Some(format!(
-                        "Deployment strategy {} is an AppConfig predefined deployment \
-                         strategy and cannot be deleted.",
-                        input.deployment_strategy_id
+                    message: Some(crate::state::predefined_deployment_strategy_immutable(
+                        crate::state::StrategyMutation::Delete,
+                        &input.deployment_strategy_id,
                     )),
                     reason: None,
                     details: None,

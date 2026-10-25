@@ -411,12 +411,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ec2,
             pending,
         );
-        // The name is unique across environments, checked above, so the slot is vacant.
-        let host = environment
-            .hosts
-            .entry(input.host.host_name.clone())
-            .or_insert(host)
-            .to_wire();
+        // The name is free across the hosts that still occupy an environment, checked
+        // above, so the only record that can hold this key is a host
+        // `DeleteEnvironmentHost` has finished with — kept for reporting only — and the
+        // new host replaces it: a host added under a freed DNS hostname is a new host.
+        let host_wire = host.to_wire();
+        environment.hosts.insert(input.host.host_name.clone(), host);
+        let host = host_wire;
         // Adding a host changes the environment, so the record is re-stamped and the
         // summary this operation answers with reports that.
         environment.modified_at_ms = created_at_ms;
