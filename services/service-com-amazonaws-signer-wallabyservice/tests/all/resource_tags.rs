@@ -31,7 +31,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_signer_wallabyservice::state::{
-    ERROR_CODE_BAD_REQUEST, ERROR_CODE_PROFILE_NOT_FOUND, MAX_TAGS_PER_PROFILE,
+    ERROR_CODE_BAD_REQUEST, ERROR_CODE_PROFILE_NOT_FOUND, ERROR_CODE_VALIDATION,
+    MAX_TAGS_PER_PROFILE, RESERVED_TAG_KEY_PREFIX,
 };
 use service_com_amazonaws_signer_wallabyservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -876,4 +877,284 @@ async fn a_write_outside_the_modelled_tag_bounds_is_refused_and_stores_nothing()
         !stored.contains_key("one-too-many"),
         "expected the refused key to be absent, got {stored:?}"
     );
+}
+
+/// One request naming tag keys. The rows differ along what the rule generalises
+/// over: how many keys the request carries, where the reserved one sits among
+/// them, and how deep the reserved key's own namespace goes.
+struct ReservedKeyCase {
+    case: &'static str,
+    /// The keys the request names; at least one of them is reserved.
+    keys: &'static [&'static str],
+    /// The key the refusal is expected to name — the first reserved one.
+    reserved: &'static str,
+}
+
+/// The reserved keys below are spellings of the ONE prefix `TagKey`'s
+/// `@pattern` excludes with its negative lookahead,
+/// `^(?!aws:)[a-zA-Z+-=._:/]+$` (`smithy_query(query="shape",
+/// shape="TagKeyList")`), which is `RESERVED_TAG_KEY_PREFIX`; the rest of each
+/// key uses only characters that pattern's alphabet admits.
+fn reserved_key_cases() -> Vec<ReservedKeyCase> {
+    vec![
+        ReservedKeyCase {
+            case: "the bare reserved prefix, alone",
+            keys: &["aws:"],
+            reserved: "aws:",
+        },
+        ReservedKeyCase {
+            case: "a deep reserved key, alone",
+            keys: &["aws:cloudformation:stack-name"],
+            reserved: "aws:cloudformation:stack-name",
+        },
+        ReservedKeyCase {
+            case: "a legal key first, the reserved one second",
+            keys: &["env", "aws:createdBy"],
+            reserved: "aws:createdBy",
+        },
+        ReservedKeyCase {
+            case: "the reserved key first, legal keys after it",
+            keys: &["aws:createdBy", "env", "team"],
+            reserved: "aws:createdBy",
+        },
+        ReservedKeyCase {
+            case: "two reserved keys among legal ones",
+            keys: &["env", "aws:createdBy", "team", "aws:cloudformation:logical-id"],
+            reserved: "aws:createdBy",
+        },
+    ]
+}
+
+/// Keys that only LOOK reserved: the namespace is the exact prefix `aws:` at the
+/// START of the key, and the pattern that excludes it is case-sensitive, so each
+/// of these is a key `TagKey` admits.
+const KEYS_OUTSIDE_THE_RESERVED_NAMESPACE: &[&str] =
+    &["AWS:createdBy", "awsome", "env:aws:region", "paws:claw"];
+
+/// A tag key inside AWS's reserved namespace is not a key `TagKey` admits, so
+/// every operation that takes tag keys refuses the whole request 400 and changes
+/// nothing — `UntagResource` removes none of the keys it names (not even the
+/// legal ones beside the reserved key), `TagResource` writes none of them, and
+/// `PutSigningProfile` stores no profile.
+#[tokio::test]
+async fn a_reserved_tag_key_is_refused_by_every_operation_that_takes_tag_keys() {
+    let router = emulator();
+    let seeded = tags(&[("env", "prod"), ("team", "iot")]);
+
+    for (index, row) in reserved_key_cases().into_iter().enumerate() {
+        let case = row.case;
+        let profile = format!("Reserved_Keys_{index}");
+        let arn = seed_profile(&router, &profile).await;
+        assert_eq!(
+            tag_resource(&router, &arn, &seeded).await.status,
+            200,
+            "case {case:?}: seeding the profile's tags must succeed"
+        );
+
+        // The removal half: refused, and every seeded key is still there.
+        let removal = untag_resource(&router, &arn, row.keys).await;
+        assert_eq!(
+            removal.status, 400,
+            "case {case:?}: expected UntagResource to refuse {:?} with 400, got {} {:?}",
+            row.keys, removal.status, removal.body
+        );
+        assert_eq!(
+            removal.code(),
+            Some(ERROR_CODE_BAD_REQUEST),
+            "case {case:?}: expected the modelled code, got {:?}",
+            removal.body
+        );
+        assert_eq!(
+            removal.error_type.as_deref(),
+            Some("BadRequestException"),
+            "case {case:?}: expected the modelled error shape, got {:?}",
+            removal.error_type
+        );
+        assert!(
+            removal.message().unwrap_or_default().contains(row.reserved),
+            "case {case:?}: expected the refusal to name the reserved key {:?}, got {:?}",
+            row.reserved,
+            removal.message()
+        );
+        assert_eq!(
+            list_tags(&router, &arn).await.tags().as_ref(),
+            Some(&seeded),
+            "case {case:?}: a refused removal must remove nothing, got {:?}",
+            list_tags(&router, &arn).await.tags()
+        );
+
+        // The write half, over the same keys: refused, and nothing added.
+        let written: BTreeMap<String, String> = row
+            .keys
+            .iter()
+            .map(|key| ((*key).to_string(), "written".to_string()))
+            .collect();
+        let write = tag_resource(&router, &arn, &written).await;
+        assert_eq!(
+            write.status, 400,
+            "case {case:?}: expected TagResource to refuse {:?} with 400, got {} {:?}",
+            row.keys, write.status, write.body
+        );
+        assert_eq!(
+            list_tags(&router, &arn).await.tags().as_ref(),
+            Some(&seeded),
+            "case {case:?}: a refused write must store nothing, got {:?}",
+            list_tags(&router, &arn).await.tags()
+        );
+
+        // The create half: the same keys on `PutSigningProfile`, whose modelled
+        // 400 is `ValidationException` — and no profile is stored for it.
+        let created = format!("Reserved_Create_{index}");
+        let create = put_profile(
+            &router,
+            &created,
+            json!({
+                "platformId": "AWSLambda-SHA384-ECDSA",
+                "signingMaterial": { "certificateArn": CERTIFICATE_ARN },
+                "tags": Value::Object(
+                    written
+                        .iter()
+                        .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+                        .collect::<Map<String, Value>>(),
+                ),
+            }),
+        )
+        .await;
+        assert_eq!(
+            create.status, 400,
+            "case {case:?}: expected PutSigningProfile to refuse {:?} with 400, got {} {:?}",
+            row.keys, create.status, create.body
+        );
+        assert_eq!(
+            create.code(),
+            Some(ERROR_CODE_VALIDATION),
+            "case {case:?}: expected the modelled code, got {:?}",
+            create.body
+        );
+        let read_back = get_profile(&router, &created).await;
+        assert_eq!(
+            read_back.status, 404,
+            "case {case:?}: a refused create must store no profile, got {} {:?}",
+            read_back.status, read_back.body
+        );
+    }
+}
+
+/// The refusal is the reserved NAMESPACE, not a resemblance to it: a key the
+/// prefix rule does not catch round-trips through the create, the write and the
+/// removal. The namespace is also judged before the `resourceArn` is resolved,
+/// so both halves of the tagging pair answer the same refusal for a reserved key
+/// on an ARN that reaches no profile.
+#[tokio::test]
+async fn a_key_outside_the_reserved_namespace_round_trips_through_every_tag_operation() {
+    let router = emulator();
+
+    for key in KEYS_OUTSIDE_THE_RESERVED_NAMESPACE {
+        assert!(
+            !key.starts_with(RESERVED_TAG_KEY_PREFIX),
+            "case {key:?}: this row must be a key outside the reserved namespace"
+        );
+    }
+
+    // Created WITH the keys: a create carrying them stores them.
+    let created = tags(
+        &KEYS_OUTSIDE_THE_RESERVED_NAMESPACE
+            .iter()
+            .map(|key| (*key, "created"))
+            .collect::<Vec<_>>(),
+    );
+    let create = put_profile(
+        &router,
+        "Lookalike_Keys",
+        json!({
+            "platformId": "AWSLambda-SHA384-ECDSA",
+            "signingMaterial": { "certificateArn": CERTIFICATE_ARN },
+            "tags": Value::Object(
+                created
+                    .iter()
+                    .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+                    .collect::<Map<String, Value>>(),
+            ),
+        }),
+    )
+    .await;
+    assert_eq!(
+        create.status, 200,
+        "expected keys outside the reserved namespace to be admitted by the create, got {} {:?}",
+        create.status, create.body
+    );
+    let arn = format!(
+        "arn:aws:signer:{REGION}:{ACCOUNT_ID}:/signing-profiles/{}",
+        "Lookalike_Keys"
+    );
+    assert_eq!(
+        list_tags(&router, &arn).await.tags().as_ref(),
+        Some(&created),
+        "expected the created tags to be reported, got {:?}",
+        list_tags(&router, &arn).await.tags()
+    );
+
+    // Written and removed one at a time: each key is admitted by both halves.
+    for key in KEYS_OUTSIDE_THE_RESERVED_NAMESPACE {
+        let write = tag_resource(&router, &arn, &tags(&[(key, "written")])).await;
+        assert_eq!(
+            write.status, 200,
+            "case {key:?}: expected TagResource 200, got {} {:?}",
+            write.status, write.body
+        );
+        assert_eq!(
+            list_tags(&router, &arn)
+                .await
+                .tags()
+                .and_then(|map| map.get(*key).cloned()),
+            Some("written".to_string()),
+            "case {key:?}: expected the written value to be reported"
+        );
+        let removal = untag_resource(&router, &arn, &[key]).await;
+        assert_eq!(
+            removal.status, 200,
+            "case {key:?}: expected UntagResource 200, got {} {:?}",
+            removal.status, removal.body
+        );
+        assert!(
+            list_tags(&router, &arn)
+                .await
+                .tags()
+                .is_some_and(|map| !map.contains_key(*key)),
+            "case {key:?}: expected the removed key to be gone"
+        );
+    }
+
+    // A reserved key on an ARN that reaches no profile: the request's own keys
+    // are judged first, so the pair answers the bad request rather than the
+    // missing resource.
+    let missing = format!("arn:aws:signer:{REGION}:{ACCOUNT_ID}:/signing-profiles/No_Such_Profile");
+    for (operation, answer) in [
+        (
+            "UntagResource",
+            untag_resource(&router, &missing, &["aws:createdBy"]).await,
+        ),
+        (
+            "TagResource",
+            tag_resource(&router, &missing, &tags(&[("aws:createdBy", "someone")])).await,
+        ),
+    ] {
+        assert_eq!(
+            answer.status, 400,
+            "case {operation:?}: expected the reserved key to be refused 400 ahead of the ARN \
+             lookup, got {} {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.code(),
+            Some(ERROR_CODE_BAD_REQUEST),
+            "case {operation:?}: expected the modelled code, got {:?}",
+            answer.body
+        );
+        assert_ne!(
+            answer.code(),
+            Some(ERROR_CODE_PROFILE_NOT_FOUND),
+            "case {operation:?}: the reserved key is refused before the profile lookup"
+        );
+    }
 }
