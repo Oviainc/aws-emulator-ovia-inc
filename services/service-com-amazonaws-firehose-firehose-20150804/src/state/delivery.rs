@@ -1220,6 +1220,9 @@ fn write_objects<Eng: Send + Sync + 'static>(engine: &Eng, objects: Vec<Delivere
             // And no restore: a delivered object is stored in a non-archive storage class,
             // so there is nothing to restore; S3's own `RestoreObject` is what asks for one.
             restore: None,
+            // And no annotation: one is attached to a stored object afterwards, by S3's own
+            // `PutObjectAnnotation`.
+            annotations: BTreeMap::new(),
         };
         match store.put_object(&object.bucket, &object.key, stored) {
             Some(
