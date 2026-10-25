@@ -150,24 +150,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = (ctx, &self.engine);
         let entries = catalog_entries();
 
-        let (tables, next_token) = crate::state::page(
+        let (tables, next_token) = crate::state::page_or_token_refusal(
             crate::state::PageTokenKind::Tables,
             &entries,
             input.max_results,
             input.next_token.as_deref(),
-        )
-        .ok_or_else(|| {
-            ListTablesErrorModeled::ValidationException(ValidationException {
-                message: "NextToken is not a pagination token issued by this service."
-                    .to_string(),
-                reason: Some(crate::state::VALIDATION_REASON_FIELD_FAILED.to_string()),
-                fields: Some(vec![ValidationExceptionField {
-                    name: "NextToken".to_string(),
-                    message: "The token must be one returned by a previous ListTables call."
-                        .to_string(),
-                }]),
-            })
-        })?;
+            "The token must be one returned by a previous ListTables call.",
+            ListTablesErrorModeled::ValidationException,
+        )?;
 
         Ok(ListTablesOutput {
             tables: Some(tables),
@@ -177,7 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The catalog as `(table name, Table)` pairs in name order: what
-/// [`crate::state::page`] pages over for this listing.
+/// [`crate::state::page_or_token_refusal`] pages over for this listing.
 ///
 /// Built from the one catalog in [`crate::state::TABLE_CATALOG`], which `GetTable`
 /// describes an entry of, so a table this listing advertises is a table that reader
