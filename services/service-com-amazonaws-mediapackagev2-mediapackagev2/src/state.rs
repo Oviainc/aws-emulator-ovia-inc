@@ -575,6 +575,21 @@ impl ComAmazonawsMediapackagev2Mediapackagev2State {
                     .get(endpoint)?
                     .tags,
             ),
+            TaggedResource::HarvestJob {
+                channel,
+                endpoint,
+                job,
+                ..
+            } => Some(
+                &group
+                    .channels
+                    .get(channel)?
+                    .origin_endpoints
+                    .get(endpoint)?
+                    .harvest_jobs
+                    .get(job)?
+                    .tags,
+            ),
         }
     }
 
@@ -632,6 +647,24 @@ impl ComAmazonawsMediapackagev2Mediapackagev2State {
                 };
                 mutate(&mut endpoint.tags);
                 endpoint.commit(at);
+                true
+            }
+            TaggedResource::HarvestJob {
+                channel,
+                endpoint,
+                job,
+                ..
+            } => {
+                let Some(job) = group
+                    .channels
+                    .get_mut(channel)
+                    .and_then(|channel| channel.origin_endpoints.get_mut(endpoint))
+                    .and_then(|endpoint| endpoint.harvest_jobs.get_mut(job))
+                else {
+                    return false;
+                };
+                mutate(&mut job.tags);
+                job.commit(at);
                 true
             }
         }
@@ -1274,8 +1307,10 @@ pub fn harvest_job_arn(
 
 /// Which resource a `TagArn` names.
 ///
-/// The three taggable levels of the hierarchy, in the resource-path form the `*_arn`
-/// builders above produce.
+/// Every level of the hierarchy this service mints an ARN for and stores a tag map on,
+/// in the resource-path form the `*_arn` builders above produce. A level the service
+/// tags is a level the tagging operations reach: the deepest of them, the harvest job,
+/// carries `Tags` on its create and on its read just as its ancestors do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaggedResource {
     ChannelGroup {
@@ -1290,6 +1325,12 @@ pub enum TaggedResource {
         channel: String,
         endpoint: String,
     },
+    HarvestJob {
+        group: String,
+        channel: String,
+        endpoint: String,
+        job: String,
+    },
 }
 
 impl TaggedResource {
@@ -1299,7 +1340,8 @@ impl TaggedResource {
         match self {
             Self::ChannelGroup { group }
             | Self::Channel { group, .. }
-            | Self::OriginEndpoint { group, .. } => group,
+            | Self::OriginEndpoint { group, .. }
+            | Self::HarvestJob { group, .. } => group,
         }
     }
 }
@@ -1321,9 +1363,12 @@ pub struct TagTarget {
 ///
 /// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>` — six
 /// colon-separated fields, the first literally `arn` — and this service's resource path
-/// is `channelGroup/<g>[/channel/<c>[/originEndpoint/<e>]]`. Anything else cannot name a
-/// MediaPackage resource, which is a different failure from naming one that is absent:
-/// the caller has to fix the ARN rather than create the resource.
+/// is `channelGroup/<g>[/channel/<c>[/originEndpoint/<e>[/harvestJob/<j>]]]`, one
+/// `<type>/<name>` pair per level of the containment hierarchy. Every path the `*_arn`
+/// builders above can produce parses back, so no ARN this service HANDED a caller is
+/// refused as malformed. Anything else cannot name a MediaPackage resource, which is a
+/// different failure from naming one that is absent: the caller has to fix the ARN
+/// rather than create the resource.
 pub fn parse_tag_arn(arn: &str) -> Option<TagTarget> {
     let mut fields = arn.splitn(6, ':');
     let (Some("arn"), Some(partition), Some(service), Some(region), Some(_account), Some(resource)) = (
@@ -1358,6 +1403,21 @@ pub fn parse_tag_arn(arn: &str) -> Option<TagTarget> {
                 endpoint: (*endpoint).to_string(),
             }
         }
+        [
+            "channelGroup",
+            group,
+            "channel",
+            channel,
+            "originEndpoint",
+            endpoint,
+            "harvestJob",
+            job,
+        ] => TaggedResource::HarvestJob {
+            group: (*group).to_string(),
+            channel: (*channel).to_string(),
+            endpoint: (*endpoint).to_string(),
+            job: (*job).to_string(),
+        },
         _ => return None,
     };
     Some(TagTarget {

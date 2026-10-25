@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! IMPLEMENTED. Reports the tags of the channel group, channel or origin endpoint the
-//! `ResourceArn` names. The ARN is PARSED before the store is read: a string that is not
+//! IMPLEMENTED. Reports the tags of the resource the `ResourceArn` names — any level of
+//! the hierarchy this service tags, channel group through harvest job.
+//! The ARN is PARSED before the store is read: a string that is not
 //! a syntactically valid ARN for one of this service's resources is refused
 //! `BadRequestException` (400), and a well-formed ARN naming a resource this emulator
 //! does not hold is refused `NotFoundException` (404). Purely reporting: it writes

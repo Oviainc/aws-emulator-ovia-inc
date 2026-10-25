@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! IMPLEMENTED. Removes the named tags from the channel group, channel or origin
-//! endpoint the `ResourceArn` names, under the SAME ARN rule `TagResource` applies: a
+//! IMPLEMENTED. Removes the named tags from the resource the `ResourceArn` names — any
+//! level of the hierarchy this service tags, channel group through harvest job — under
+//! the SAME ARN rule `TagResource` applies: a
 //! malformed ARN is `BadRequestException` (400) before any lookup, an absent resource is
 //! `NotFoundException` (404).
 //!
