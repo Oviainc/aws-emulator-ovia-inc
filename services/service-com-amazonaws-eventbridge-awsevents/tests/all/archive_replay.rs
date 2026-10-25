@@ -24,9 +24,9 @@
 //!   later with `ReplayEndTime` and with `EventLastReplayedTime` at the event time
 //!   of the last event replayed;
 //! * a request no replay can be started for is refused with the modelled error for
-//!   its cause — a missing archive or bus, a name already held — and with a
-//!   `ValidationException` for a destination, filter or window the model cannot
-//!   express.
+//!   its cause — a missing destination bus, a name already held — and with a
+//!   `ValidationException` for an event source, destination, filter or window the
+//!   model cannot express.
 //!
 //! Each table spans the class rather than one recorded case: the rows differ along
 //! where the window falls (including ON each bound and one second past it), how
@@ -802,13 +802,15 @@ async fn start_replay_refuses_a_request_no_replay_can_be_started_for() {
     // (case, the member that is wrong, the error code it is refused with)
     let rows: [(&str, Value, &str); 7] = [
         (
+            // An `EventSourceArn` that resolves to no archive is refused as the
+            // PARAMETER it is, not as a resource that went missing.
             "an EventSourceArn naming no archive",
             json!({
                 "ReplayName": "missing-archive",
                 "EventSourceArn": format!("arn:aws:events:{REGION}:{account}:archive/nope"),
                 "Destination": { "Arn": scenario.bus_arn },
             }),
-            "ResourceNotFoundException",
+            "ValidationException",
         ),
         (
             "an EventSourceArn that names no archive resource at all",
@@ -817,7 +819,7 @@ async fn start_replay_refuses_a_request_no_replay_can_be_started_for() {
                 "EventSourceArn": scenario.bus_arn,
                 "Destination": { "Arn": scenario.bus_arn },
             }),
-            "ResourceNotFoundException",
+            "ValidationException",
         ),
         (
             "a ReplayName already held",

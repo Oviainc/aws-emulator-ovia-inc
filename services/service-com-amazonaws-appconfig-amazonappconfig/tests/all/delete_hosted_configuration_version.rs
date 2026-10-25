@@ -45,8 +45,9 @@ fn hosted_uri(application: &str, profile: &str) -> String {
 
 /// Bytes of hosted configuration content this service is holding, across every profile.
 /// No operation reports it, so the budget a delete frees is read off the state the
-/// handlers share.
-fn held_bytes(engine: &Arc<engine::InMemoryEngine>) -> usize {
+/// handlers share. `pub(crate)` because every delete that drops hosted content asserts
+/// against the same accounting.
+pub(crate) fn held_bytes(engine: &Arc<engine::InMemoryEngine>) -> usize {
     state::service_state(&**engine)
         .expect("the test engine must carry this service's state")
         .lock()

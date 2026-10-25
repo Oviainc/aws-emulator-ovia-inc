@@ -27,6 +27,8 @@ mod delete_table_in_flight;
 mod delete_type;
 #[path = "all/get_keyspace.rs"]
 mod get_keyspace;
+#[path = "all/get_table_auto_scaling_settings_unconfigured.rs"]
+mod get_table_auto_scaling_settings_unconfigured;
 #[path = "all/keyspace_table_lifecycle.rs"]
 mod keyspace_table_lifecycle;
 #[path = "all/list_keyspaces.rs"]

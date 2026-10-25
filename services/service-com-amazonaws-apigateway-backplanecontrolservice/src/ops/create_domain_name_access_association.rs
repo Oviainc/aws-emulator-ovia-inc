@@ -258,9 +258,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 CreateDomainNameAccessAssociationErrorModeled::LimitExceededException(
                     LimitExceededException {
                         retry_after_seconds: None,
-                        message: Some(format!(
-                            "Maximum number of domain name access associations exceeded: \
-                             {MAX_DOMAIN_NAME_ACCESS_ASSOCIATIONS}"
+                        message: Some(crate::state::quota_reached(
+                            "Domain Name Access Associations",
+                            "account",
                         )),
                     },
                 )

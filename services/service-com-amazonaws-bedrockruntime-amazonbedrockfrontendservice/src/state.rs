@@ -1476,7 +1476,7 @@ pub fn validate_conversation(messages: Option<&Vec<Message>>) -> Result<&Vec<Mes
 #[derive(Debug, Clone)]
 pub struct ConverseTurn {
     /// The assistant's text. No model runs here, so it is
-    /// [`emulated_completion_text`] — never the request's own text echoed back.
+    /// [`emulated_completion`] — never the request's own text echoed back.
     pub text: String,
     pub input_tokens: u32,
     pub output_tokens: u32,
@@ -1516,7 +1516,9 @@ impl ConverseTurn {
 /// the only difference between them is how the turn is framed on the wire.
 ///
 /// `requested_max_tokens` is `inferenceConfig.maxTokens`; the model's own ceiling
-/// caps it, and hitting the cap is what truncates the turn.
+/// caps it, and the completion is composed to FIT that budget
+/// ([`emulated_completion`]) — only a budget it cannot fit in at all cuts the
+/// turn short.
 pub fn converse_turn(
     model: &ModelEntry,
     system: Option<&Vec<SystemContentBlock>>,
@@ -1530,23 +1532,18 @@ pub fn converse_turn(
         .unwrap_or(model.max_output_tokens)
         .min(model.max_output_tokens);
     let turns = messages.map(Vec::len).unwrap_or_default();
-    let full_text = emulated_completion_text(
+    let completion = emulated_completion(
         &model.model_id,
         u32::try_from(turns).unwrap_or(u32::MAX),
         input_tokens,
+        max_output_tokens,
     );
-    let truncated = count_text_tokens(&full_text) > max_output_tokens;
-    let text = if truncated {
-        truncate_to_tokens(&full_text, max_output_tokens)
-    } else {
-        full_text
-    };
-    let output_tokens = count_text_tokens(&text);
+    let output_tokens = count_text_tokens(&completion.text);
     ConverseTurn {
-        text,
+        text: completion.text,
         input_tokens,
         output_tokens,
-        truncated,
+        truncated: completion.truncated,
     }
 }
 
@@ -1776,8 +1773,9 @@ pub struct InvokeTurn {
 pub fn invoke_turn(model: &ModelEntry, family: ModelFamily, body: &[u8]) -> InvokeTurn {
     let parsed_body = serde_json::from_slice::<serde_json::Value>(body).ok();
     // The generation cap the body carries for this family, bounded by the model's
-    // own ceiling; reaching it is what makes the family's response report its
-    // length stop reason instead of a completed one.
+    // own ceiling. It is a ceiling, so the completion is composed to fit it and
+    // the family's length stop reason is reported only for a completion that
+    // really reached it.
     let max_output_tokens = parsed_body
         .as_ref()
         .and_then(|value| body_max_tokens(family, value))
@@ -1785,13 +1783,9 @@ pub fn invoke_turn(model: &ModelEntry, family: ModelFamily, body: &[u8]) -> Invo
         .min(model.max_output_tokens);
 
     let input_tokens = body_input_tokens(body);
-    let full_text = emulated_completion_text(&model.model_id, 1, input_tokens);
-    let truncated = count_text_tokens(&full_text) > max_output_tokens;
-    let text = if truncated {
-        truncate_to_tokens(&full_text, max_output_tokens)
-    } else {
-        full_text
-    };
+    let completion = emulated_completion(&model.model_id, 1, input_tokens, max_output_tokens);
+    let text = completion.text;
+    let truncated = completion.truncated;
     let output_tokens = count_text_tokens(&text);
 
     // A completion id is a per-run, server-generated value; deriving it from the
@@ -1896,18 +1890,89 @@ pub fn document_to_json(document: &::aws_smithy_types::Document) -> serde_json::
 // Completions
 // ---------------------------------------------------------------------------
 
-/// The text a synchronous inference call answers with.
+/// The whole milliseconds a served invocation took, as every modelled latency
+/// member reports it.
 ///
-/// No language model runs in this emulator, so this says so, and carries only
-/// facts about the request that was actually served: how many messages it held
-/// and how many tokens of input they were. It is never the request's own text
-/// echoed back as if generated.
+/// A latency member is the latency MEASURED for the invocation that was served,
+/// and serving one takes a nonzero amount of time, so the measurement rounds UP
+/// to the next whole millisecond rather than being reported as no time at all:
+/// one millisecond is the granularity these members are reported in, and it is
+/// the smallest value a served invocation can honestly report.
+pub fn latency_ms(elapsed: std::time::Duration) -> i64 {
+    let millis = elapsed.as_micros().div_ceil(1_000).max(1);
+    i64::try_from(millis).unwrap_or(i64::MAX)
+}
+
+/// The shortest completion this emulator answers an inference call with.
+///
+/// A generation cap is a CEILING on the response, not a target, so a completion
+/// is composed to FIT the budget the caller allowed: this sentence is the part
+/// that is always said, and [`emulated_completion`] appends the further clauses
+/// that still fit. A budget below this sentence is the only way generation is
+/// cut off mid-completion, which is what a length stop reason reports.
+pub const EMULATED_COMPLETION_FLOOR: &str = "No language model runs in this emulator.";
+
+/// One synthesized completion: the text served, and whether the generation cap
+/// cut it off before it was finished.
+#[derive(Debug, Clone)]
+pub struct EmulatedCompletion {
+    /// The assistant text. Never the request's own text echoed back as if
+    /// generated.
+    pub text: String,
+    /// `true` only when the cap was reached before the completion was finished,
+    /// i.e. the budget was too small even for [`EMULATED_COMPLETION_FLOOR`].
+    pub truncated: bool,
+}
+
+/// The completion a synchronous inference call answers with, composed to fit
+/// `max_output_tokens`.
+///
+/// No language model runs in this emulator, so the text says so, and carries
+/// only facts about the request that was actually served: how many messages it
+/// held and how many tokens of input they were. It is never the request's own
+/// text echoed back as if generated.
+///
+/// The caller's cap is the maximum number of tokens to ALLOW in the generated
+/// response, so a completion that has nothing left to say inside that ceiling
+/// has finished (`truncated` is `false`) however much room is left over: the
+/// clauses are appended in order only while the next one still fits. Only a
+/// budget smaller than [`EMULATED_COMPLETION_FLOOR`] genuinely reaches the
+/// ceiling, and that completion is reported as cut off.
+pub fn emulated_completion(
+    model_id: &str,
+    messages: u32,
+    input_tokens: u32,
+    max_output_tokens: u32,
+) -> EmulatedCompletion {
+    if count_text_tokens(EMULATED_COMPLETION_FLOOR) > max_output_tokens {
+        return EmulatedCompletion {
+            text: truncate_to_tokens(EMULATED_COMPLETION_FLOOR, max_output_tokens),
+            truncated: true,
+        };
+    }
+    let mut text = EMULATED_COMPLETION_FLOOR.to_string();
+    for clause in [
+        format!(" {model_id} generated no text for this request."),
+        format!(
+            " The request carried {messages} message(s) and {input_tokens} input token(s)."
+        ),
+    ] {
+        let extended = format!("{text}{clause}");
+        if count_text_tokens(&extended) > max_output_tokens {
+            break;
+        }
+        text = extended;
+    }
+    EmulatedCompletion {
+        text,
+        truncated: false,
+    }
+}
+
+/// The whole completion [`emulated_completion`] composes when no generation cap
+/// constrains it.
 pub fn emulated_completion_text(model_id: &str, messages: u32, input_tokens: u32) -> String {
-    format!(
-        "No language model runs in this Amazon Bedrock Runtime emulator, so {model_id} generated \
-         no text for this request. The request carried {messages} message(s) and {input_tokens} \
-         input token(s)."
-    )
+    emulated_completion(model_id, messages, input_tokens, u32::MAX).text
 }
 
 /// The refusal message for an `InvokeModel` body that is not even a JSON object:

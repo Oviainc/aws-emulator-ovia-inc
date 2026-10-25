@@ -1017,8 +1017,9 @@ async fn a_setting_that_breaks_a_documented_rule_is_the_modelled_error() {
     }
 
     // A table with no auto scaling settings at all — the table's own or a Region's — still
-    // has none to report after every refusal above.
-    assert_failure(
+    // has none to report after every refusal above, and is still reported as the live
+    // table it is.
+    let no_settings = assert_ok(
         "a table with no auto scaling settings",
         emulator
             .call(
@@ -1026,7 +1027,10 @@ async fn a_setting_that_breaks_a_documented_rule_is_the_modelled_error() {
                 json!({"keyspaceName": multi, "tableName": on_demand_table}),
             )
             .await,
-        404,
-        "ResourceNotFoundException",
+    );
+    assert!(
+        no_settings.pointer("/autoScalingSpecification").is_none(),
+        "case \"a table with no auto scaling settings\": expected no \
+         autoScalingSpecification, got {no_settings}"
     );
 }

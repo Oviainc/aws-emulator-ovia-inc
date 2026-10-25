@@ -519,8 +519,8 @@ async fn a_patch_this_operation_cannot_apply_is_refused_and_changes_nothing() {
         assert_read_back(&gateway, &api, &resource, "GET", "200", case, &baseline).await;
     }
 
-    // The refusal for a path the resource has no updateable member for names the path,
-    // the op and the paths it does have — the service's shared `patchOperations` wording.
+    // The refusal for a path the resource has no updateable member for is the service's
+    // shared `patchOperations` wording: the fixed sentence and the path the request sent.
     let answer =
         update_method_response(&gateway, &api, &resource, "GET", "200", vec![replace("/statusCode", "201")])
             .await;
@@ -528,18 +528,10 @@ async fn a_patch_this_operation_cannot_apply_is_refused_and_changes_nothing() {
         .as_str()
         .unwrap_or_else(|| panic!("case the unsupported path: expected a message, got {:?}", answer.body))
         .to_owned();
-    let prefix =
-        "Invalid patch path  '/statusCode' specified for op 'replace'. Must be one of: [";
-    assert!(
-        message.starts_with(prefix),
-        "case the unsupported path: expected the refusal to start {prefix:?}, got {message:?}"
+    assert_eq!(
+        message, "Invalid patch path /statusCode",
+        "case the unsupported path: expected the fixed sentence and the path, got {message:?}"
     );
-    for member in ["/responseModels/", "/responseParameters/"] {
-        assert!(
-            message.contains(member),
-            "case the unsupported path: the supported set must name {member}, got {message:?}"
-        );
-    }
 
     // An `op` outside the modelled `Op` enum is a CONSTRAINT failure, not a patch this
     // resource cannot apply, so the boundary validator refuses it before the handler runs

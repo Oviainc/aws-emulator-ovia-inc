@@ -33,7 +33,8 @@
 //! Beside the servers, the account's **application components**
 //! ([`ApplicationComponentRecord`]) — the processes and databases the assessment found
 //! running on those servers — which `GetApplicationComponentDetails` reports one at a
-//! time: every member of the `ApplicationComponentDetail` it answers comes from that
+//! time and `ListApplicationComponents` a filtered page at a time: every member of the
+//! `ApplicationComponentDetail` it answers comes from that
 //! record, and the association counts it reports are counted off the record's own lists.
 //! `UpdateApplicationComponentConfig` writes that same record — the component's app type,
 //! inclusion status, database credentials, source code configuration and the strategy
@@ -358,6 +359,15 @@ pub const ANALYZABLE_SERVER_PAGE_MARKER: &str = "migrationhubstrategy:analyzable
 /// another list's records.
 pub const COLLECTOR_PAGE_MARKER: &str = "migrationhubstrategy:collectors:";
 
+/// The marker a `ListApplicationComponents` cursor carries.
+///
+/// That list pages over the account's application components rather than over any list of
+/// servers, so it gets its own marker: a token one of this service's other lists issued is
+/// foreign here (and one of these is foreign there) and refused instead of resolving
+/// against another list's records.
+pub const APPLICATION_COMPONENT_PAGE_MARKER: &str =
+    "migrationhubstrategy:application-components:";
+
 /// Encode the key a page stopped at as an opaque `nextToken` carrying `marker`.
 ///
 /// Hex round-trips exactly and is non-empty for a non-empty key, so the token satisfies
@@ -374,6 +384,167 @@ pub fn encode_page_token(marker: &str, key: &str) -> String {
 pub fn decode_page_token(marker: &str, token: &str) -> Option<String> {
     let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
     decoded.strip_prefix(marker).map(str::to_string)
+}
+
+/// What a `nextToken` of a FILTERED list of this service carries, beside the marker: the
+/// list the page was taken from, and the record the next page starts at.
+///
+/// A token names a position in ONE list, so it carries a fingerprint of the SELECTION the
+/// list was taken under ([`selection_fingerprint`]) — the criteria and value, the order and
+/// the groups. Handed back with a different selection it is refused, rather than resuming
+/// at whatever position that record happens to have in some other list. The page SIZE is
+/// deliberately not part of it: `maxResults` is documented per call ("if a previous call to
+/// this action returned 100 items, but you set maxResults to 10"), so changing it between
+/// pages is the caller's business.
+///
+/// One cursor for every selected list of this service — the lists differ in what they hold
+/// and not in how a page of them resumes — so the token shape cannot drift between them;
+/// the marker is what tells the lists apart.
+#[derive(Debug, Clone)]
+pub struct ListCursor {
+    /// The fingerprint of the selection the list was taken under.
+    pub selection: String,
+    /// The key of the first record the previous page did not report.
+    pub resume_at: String,
+}
+
+impl ListCursor {
+    /// This cursor as the opaque `nextToken` the caller hands back, through the service's
+    /// one page-token codec under `marker`.
+    pub fn to_token(&self, marker: &str) -> String {
+        encode_page_token(marker, &format!("{}:{}", self.selection, self.resume_at))
+    }
+
+    /// The cursor a token carries, or `None` for anything the list owning `marker` did not
+    /// mint.
+    pub fn from_token(marker: &str, token: &str) -> Option<Self> {
+        let payload = decode_page_token(marker, token)?;
+        let (selection, resume_at) = payload.split_once(':')?;
+        Some(Self {
+            selection: selection.to_string(),
+            resume_at: resume_at.to_string(),
+        })
+    }
+}
+
+/// A fingerprint of the selection a list was taken under: which records it holds and in
+/// which order, independent of how they are paged.
+///
+/// A digest rather than the members themselves, so a token stays well inside `NextToken`'s
+/// `@length(0, 2048)` however many groups the filter names — and so it carries nothing a
+/// caller could read its own filter back out of.
+pub fn selection_fingerprint(
+    filter: Option<(&str, &str)>,
+    descending: bool,
+    groups: &[Group],
+) -> String {
+    use ::sha2::{Digest, Sha256};
+
+    // The group filter is a SET: the same groups in another order select the same records,
+    // so the fingerprint must not depend on the order they were sent in.
+    let mut named: Vec<String> = groups
+        .iter()
+        .map(|group| {
+            format!(
+                "{:?}={:?}",
+                group.name.as_deref().unwrap_or_default(),
+                group.value.as_deref().unwrap_or_default()
+            )
+        })
+        .collect();
+    named.sort();
+    let (criteria, value) = filter.unwrap_or((CRITERIA_NOT_DEFINED, ""));
+    let order = if descending {
+        SORT_DESCENDING
+    } else {
+        SORT_ASCENDING
+    };
+    let digest = <Sha256 as Digest>::digest(
+        format!("{criteria:?}/{value:?}/{order}/{}", named.join(",")).as_bytes(),
+    );
+    // Half the digest: the fingerprint only has to tell two selections of one account's
+    // portfolio apart, and a shorter token is a shorter `nextToken`.
+    ::hex::encode(&digest[..16])
+}
+
+/// The page a list request asks for: how many records it takes, and the key it resumes
+/// from.
+#[derive(Debug, Clone)]
+pub struct ListPage {
+    /// How many records this page holds at most.
+    pub size: usize,
+    /// The key the page starts at, or `None` for a request that starts a list.
+    pub resume_at: Option<String>,
+}
+
+/// Hold `maxResults` to the documented maximum and `nextToken` to a token the list owning
+/// `marker` issued for THIS selection.
+///
+/// Every `maxResults` of this service is documented "The maximum number of items to include
+/// in the response. The maximum value is 100" ([`MAX_LIST_PAGE_SIZE`]) and its target shape
+/// carries no `@range`, so a request past that bound (or one asking for a page of nothing)
+/// is refused here rather than silently clamped: a caller that asked for more than the
+/// service gives has to learn it cannot have it. An absent `maxResults` takes the documented
+/// maximum.
+///
+/// The refusals are this service's two `ValidationException` sentences — an unusable value
+/// ([`invalid_request_body`]) and an unresolvable one ([`page_token_not_accepted`]) — which
+/// each operation lifts into its own error channel.
+pub fn list_page(
+    max_results: Option<i32>,
+    next_token: Option<String>,
+    marker: &str,
+    selection: &str,
+) -> Result<ListPage, ValidationException> {
+    let size = match max_results {
+        None => MAX_LIST_PAGE_SIZE,
+        Some(requested) if (1..=MAX_LIST_PAGE_SIZE).contains(&requested) => requested,
+        Some(_) => return Err(invalid_request_body()),
+    };
+    let resume_at = match next_token {
+        None => None,
+        Some(token) => {
+            let cursor =
+                ListCursor::from_token(marker, &token).ok_or_else(page_token_not_accepted)?;
+            if cursor.selection != selection {
+                return Err(page_token_not_accepted());
+            }
+            Some(cursor.resume_at)
+        }
+    };
+    Ok(ListPage {
+        size: usize::try_from(size).unwrap_or(0),
+        resume_at,
+    })
+}
+
+/// The (criteria, value) pair a list request filters on, or `None` when it filters nothing.
+///
+/// A criteria other than [`CRITERIA_NOT_DEFINED`] names the member to compare, so it needs
+/// a `filterValue` to compare against and is refused without one; `NOT_DEFINED` (and an
+/// absent criteria) names no member, so it filters nothing and needs no value. Membership
+/// in `declared` — the criteria enumeration's own generated value list — is checked here
+/// because the boundary validator does not enforce it: a value the enumeration does not
+/// declare is refused rather than quietly matching no record.
+///
+/// One rule for every criteria-filtered list of this service: each criteria enumeration
+/// declares the same `NOT_DEFINED` member and each `filterValue` is documented the same way
+/// ("Specify the value based on the … criteria type"), so the lists differ only in which
+/// catalog they pass in and which member each value names.
+pub fn filter_pair<'a>(
+    criteria: Option<&'a str>,
+    filter_value: Option<&'a str>,
+    declared: &[&str],
+) -> Result<Option<(&'a str, &'a str)>, ValidationException> {
+    let criteria = criteria.unwrap_or(CRITERIA_NOT_DEFINED);
+    if !declared.contains(&criteria) {
+        return Err(invalid_request_body());
+    }
+    if criteria == CRITERIA_NOT_DEFINED {
+        return Ok(None);
+    }
+    let value = filter_value.ok_or_else(invalid_request_body)?;
+    Ok(Some((criteria, value)))
 }
 
 /// One assessment of an on-premises environment, as this emulator persists it.
@@ -558,12 +729,19 @@ impl RecommendationReport {
     }
 }
 
-/// The `ServerCriteria` value that names no member to filter on, so a request carrying it
-/// (or no `serverCriteria` at all) filters nothing.
+/// The criteria value that names no member to filter on, so a list request carrying it (or
+/// no criteria at all) filters nothing.
 ///
-/// From `ServerCriteria`'s value list (`SERVER_CRITERIA_VALUES`): every other value names
-/// a member of the server record, and `NOT_DEFINED` is the one that does not.
-pub const SERVER_CRITERIA_NOT_DEFINED: &str = "NOT_DEFINED";
+/// Each criteria enumeration of this service declares it — `ServerCriteria`
+/// (`SERVER_CRITERIA_VALUES`) and `ApplicationComponentCriteria`
+/// (`APPLICATION_COMPONENT_CRITERIA_VALUES`) — and in both every OTHER value names a member
+/// of the record the list reports, so the one that names none is stated once here.
+pub const CRITERIA_NOT_DEFINED: &str = "NOT_DEFINED";
+
+/// The `ServerCriteria` value that names no member to filter on, so a request carrying it
+/// (or no `serverCriteria` at all) filters nothing — the service-wide
+/// [`CRITERIA_NOT_DEFINED`] under the name the server inventory reads it by.
+pub const SERVER_CRITERIA_NOT_DEFINED: &str = CRITERIA_NOT_DEFINED;
 
 /// `SortOrder`'s ascending value, which is the order a list is reported in when the
 /// request names no `sort`.
@@ -928,23 +1106,30 @@ impl ServerRecord {
         })
     }
 
-    /// True when this server came in with one of `groups`.
-    ///
-    /// A `Group` is a (`name`, `value`) pair — "The object containing information about
-    /// distinct imports or groups" — so a server is in a filter's group only when both
-    /// halves agree, and several groups in a filter widen the selection rather than
-    /// narrowing it: `groupIdFilter` names the groups whose servers to report.
-    ///
-    /// An EMPTY slice answers `false`, which is why a caller that named no group at all
-    /// must not reach here: naming no group scopes nothing, so the handler applies this
-    /// only to a non-empty filter.
+    /// True when this server came in with one of `groups` — the service's one
+    /// [`in_any_group`], over the groups this record holds.
     pub fn in_any_group(&self, groups: &[Group]) -> bool {
-        groups.iter().any(|wanted| {
-            self.group_id
-                .iter()
-                .any(|held| held.name == wanted.name && held.value == wanted.value)
-        })
+        in_any_group(&self.group_id, groups)
     }
+}
+
+/// True when a resource that came in with `held` belongs to one of the groups `wanted`
+/// names.
+///
+/// A `Group` is a (`name`, `value`) pair — "The object containing information about
+/// distinct imports or groups" — so a resource is in a filter's group only when both halves
+/// agree, and several groups in a filter widen the selection rather than narrowing it: a
+/// `groupIdFilter` names the groups whose resources to report.
+///
+/// An EMPTY `wanted` answers `false`, which is why a caller that named no group at all must
+/// not reach here: naming no group scopes nothing, so a handler applies this only to a
+/// non-empty filter. One rule for every list of this service that takes a `groupIdFilter`,
+/// so a server and an application component are scoped by a filter the same way.
+fn in_any_group(held: &[Group], wanted: &[Group]) -> bool {
+    wanted.iter().any(|wanted| {
+        held.iter()
+            .any(|held| held.name == wanted.name && held.value == wanted.value)
+    })
 }
 
 /// One application component of this account's portfolio, as this emulator persists it.
@@ -1037,6 +1222,15 @@ pub struct ApplicationComponentRecord {
     /// `ApplicationComponentStrategy$isPreferred` is the member the model gives the
     /// distinction to.
     pub preferred_strategy: Option<StrategyOption>,
+    /// The import groups this component came in with —
+    /// `StartImportFileTaskRequest$groupId` of the import that brought it in, whose
+    /// documentation is "This ID can be as filter in ListApplicationComponents and
+    /// ListServers".
+    ///
+    /// Not a member of `ApplicationComponentDetail`: like the server inventory's own groups
+    /// ([`ServerRecord::group_id`]) it is what a list's `groupIdFilter` scopes the answer
+    /// by. Empty for a component that came in with no group.
+    pub group_id: Vec<Group>,
 }
 
 impl ApplicationComponentRecord {
@@ -1119,6 +1313,43 @@ impl ApplicationComponentRecord {
             is_preferred: Some(listing.is_preferred),
         })
         .collect()
+    }
+
+    /// True when this component satisfies `criteria` = `value`.
+    ///
+    /// Each `ApplicationComponentCriteria` value names ONE member of the component record
+    /// and the value is compared to it for equality — `filterValue` is documented "Specify
+    /// the value based on the application component criteria type. For example, if
+    /// `applicationComponentCriteria` is set to `SERVER_ID` and `filterValue` is set to
+    /// `server1`, then `ListApplicationComponents` returns all the application components
+    /// running on `server1`". `SERVER_ID` is the one criteria whose member is a LIST (a
+    /// component runs on one or more servers), so a value equal to any of the servers the
+    /// component runs on selects it.
+    ///
+    /// [`CRITERIA_NOT_DEFINED`] names no member, so it selects every component. A value
+    /// `ApplicationComponentCriteria` does not declare selects none; a caller never sees
+    /// that, because the handler refuses an undeclared criteria before it gets here.
+    pub fn matches_criteria(&self, criteria: &str, value: &str) -> bool {
+        match criteria {
+            CRITERIA_NOT_DEFINED => true,
+            "APP_NAME" => self.name.as_deref() == Some(value),
+            "APP_TYPE" => self.app_type.as_deref() == Some(value),
+            "SERVER_ID" => self
+                .associated_server_ids
+                .iter()
+                .any(|server| server == value),
+            "STRATEGY" => self.strategy.as_deref() == Some(value),
+            "DESTINATION" => self.target_destination.as_deref() == Some(value),
+            "ANALYSIS_STATUS" => self.analysis_status.as_deref() == Some(value),
+            "ERROR_CATEGORY" => self.app_unit_error_category.as_deref() == Some(value),
+            _ => false,
+        }
+    }
+
+    /// True when this component came in with one of `groups` — the service's one
+    /// [`in_any_group`], over the groups this record holds.
+    pub fn in_any_group(&self, groups: &[Group]) -> bool {
+        in_any_group(&self.group_id, groups)
     }
 }
 

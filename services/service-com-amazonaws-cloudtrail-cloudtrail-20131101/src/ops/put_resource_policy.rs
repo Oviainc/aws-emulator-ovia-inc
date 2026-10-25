@@ -181,11 +181,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // A resource ARN carries its own Region, so this operation reads no Region
         // off the request.
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
@@ -214,10 +213,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // occurs, wait a few minutes, and then try the operation again."
         if !resource.ready {
             return Err(PutResourcePolicyErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Resource {} is not ready for this operation; wait a few minutes and \
-                     then try the operation again",
-                    resource.arn
+                message: Some(crate::state::policy_resource_not_ready_message(
+                    &resource.arn,
                 )),
             })
             .into());

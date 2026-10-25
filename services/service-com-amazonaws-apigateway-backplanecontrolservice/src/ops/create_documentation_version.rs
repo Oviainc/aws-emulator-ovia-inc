@@ -93,9 +93,10 @@ pub fn documentation_version_body(
 /// The `ConflictException` message for a version identifier this API already has a
 /// snapshot under.
 ///
-/// Built from the request: it names the identifier the caller has to change.
+/// A fixed sentence naming the version that already exists — the one thing the caller has
+/// to change — and nothing else.
 pub fn version_clash_message(version: &str) -> String {
-    format!("Documentation version already exists: {version}")
+    format!("Documentation version {version} already exists.")
 }
 
 /// Refuse a request whose caller-sized members would grow the store past a bound, or
@@ -256,10 +257,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     CreateDocumentationVersionErrorModeled::LimitExceededException(
                         LimitExceededException {
                             retry_after_seconds: None,
-                            message: Some(format!(
-                                "Maximum number of documentation versions exceeded for this \
-                                 API: {}",
-                                crate::state::MAX_DOCUMENTATION_VERSIONS_PER_API
+                            message: Some(crate::state::quota_reached(
+                                "Documentation Versions",
+                                "API",
                             )),
                         },
                     )

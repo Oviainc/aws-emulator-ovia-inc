@@ -254,20 +254,10 @@ fn name_of(row: &Row, index: usize) -> String {
     format!("{}-db-{index:02}", row.prefix)
 }
 
-/// The page sizes a listing of `total` records must report: full pages until the
-/// remainder, and always at least one page — an empty account still answers once.
+/// The page sizes a listing of `total` records must report, through the shared
+/// paging contract this test target keeps in one place.
 fn expected_page_sizes(total: usize) -> Vec<usize> {
-    if total == 0 {
-        return vec![0];
-    }
-    let mut sizes = Vec::new();
-    let mut left = total;
-    while left > 0 {
-        let page = left.min(PAGE_SIZE);
-        sizes.push(page);
-        left -= page;
-    }
-    sizes
+    crate::paging::expected_page_sizes(total, PAGE_SIZE)
 }
 
 /// Create this row's databases, IN REVERSE NAME ORDER, each on its own blueprint

@@ -20,6 +20,9 @@ mod application_component_config;
 #[path = "all/application_component_details.rs"]
 mod application_component_details;
 
+#[path = "all/application_component_listing.rs"]
+mod application_component_listing;
+
 #[path = "all/application_component_strategies.rs"]
 mod application_component_strategies;
 

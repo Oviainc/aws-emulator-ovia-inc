@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: takes an application, and everything stored under it, out of this
+//! service's state, so every later reader and writer of that id misses on it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Taking the children with it is deliberate, and is what "Deletes an application." is
+//! read as here: AppConfig states a prerequisite where it has one — `DeleteExtension`
+//! documents "You must delete all associations to an extension before you delete the
+//! extension", and a configuration profile's own delete is refused while it still holds
+//! hosted versions — and the application's delete states none, so no refusal is invented
+//! for it. The children are held inside the application record, so they cannot outlive
+//! it.
 //!
 //! ## Shape of an operation
 //!
@@ -158,20 +159,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteApplicationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // The delete IS the removal of the stored record. An application is the root of
+        // this service's tree — its environments (with the deployments started into
+        // them), its configuration profiles (with the configuration versions hosted in
+        // them) and its experiment definitions (with their runs) are held INSIDE the
+        // application record — so taking that record out takes them with it: once this
+        // answers 204, `GetApplication`, `UpdateApplication`, `ListApplications`, the
+        // tagging operations and every operation addressed through this application id
+        // all miss on it, because each of them reads the map this took it out of.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteApplication"))
+        // `ApplicationId` is an id rather than an "ID or name" identifier, so it is
+        // looked up as the stored key, exactly as `GetApplication` and
+        // `UpdateApplication` look it up.
+        let Some(removed) = store.applications.remove(&input.application_id) else {
+            // An attribution record for the refusal: which resource was addressed and
+            // what this call answered, so a destructive call that changed nothing leaves
+            // a trace beside the ones that did.
+            tracing::debug!(
+                operation = "DeleteApplication",
+                outcome = "ResourceNotFoundException",
+                application_id = input.application_id.as_str(),
+                "refused an application delete"
+            );
+            return Err(DeleteApplicationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::application_not_found(&input.application_id)),
+                    resource_name: Some(input.application_id),
+                },
+            )
+            .into());
+        };
+
+        // The configuration content those profiles were holding is no longer stored, so
+        // the account-wide budget `CreateHostedConfigurationVersion` reserved for it is
+        // given back — the same accounting `DeleteHostedConfigurationVersion` does when a
+        // single version goes, so this service is never left charged for bytes it dropped.
+        let released: usize = removed
+            .profiles
+            .values()
+            .map(crate::state::ConfigurationProfile::hosted_bytes)
+            .sum();
+        store.release_hosted_configuration_bytes(released);
+
+        // An attribution record for the removal, so the one call that takes a whole
+        // subtree out of this service's state is observable with what went with it.
+        tracing::debug!(
+            operation = "DeleteApplication",
+            outcome = "deleted",
+            application_id = removed.id.as_str(),
+            environments = removed.environments.len(),
+            configuration_profiles = removed.profiles.len(),
+            experiment_definitions = removed.experiment_definitions.len(),
+            released_hosted_bytes = released,
+            "deleted an application"
+        );
+
+        Ok(DeleteApplicationOutput)
     }
 }

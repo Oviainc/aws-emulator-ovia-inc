@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! REMOVES the tags the request's `TagKeys` names from the identity pool its `ResourceArn`
+//! names, on that pool's own record (`IdentityPool::identity_pool_tags`), so
+//! `ListTagsForResource` and `DescribeIdentityPool` report the remaining set afterwards.
+//!
+//! Removal is KEYED, as AWS's resource untagging is: only the keys the request names are
+//! removed, and every other key the pool holds is left exactly as it was. A key the pool
+//! does not hold is removed by having nothing to remove — the call still succeeds, so
+//! making it twice leaves the same set — and a refused call removes nothing, so a pool's
+//! tag set only ever changes through a call that succeeded.
+//!
+//! Two rules refuse a call before it removes anything: a `TagKeys` entry outside the
+//! bounds the model's own `IdentityPoolTagsListType` states (400 `ValidationException`,
+//! the protocol-level constraint refusal) and a key in the `aws:` namespace AWS reserves
+//! for its own tags, which a caller can neither assign nor delete — a bad input parameter,
+//! which is the modelled 400 `InvalidParameterException`, the only client-input error this
+//! operation models for a tag key this service will not act on.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +153,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // A write to one named resource: `ctx` carries only request metadata, and the pool
+        // this call untags is named by the request's own `ResourceArn`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the identity-pool store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `ARNString` constrains only the length (20..2048), so the ARN's own form is this
+        // service's rule — the same rule `TagResource` and `ListTagsForResource` read a
+        // `ResourceArn` by: a `ResourceArn` that is not an identity-pool ARN of this
+        // service names no resource at all, which is a bad input parameter rather than a
+        // missing resource.
+        let Some(identity_pool_id) = crate::state::identity_pool_id_from_arn(&input.resource_arn)
+        else {
+            return Err(invalid_parameter(format!(
+                "ResourceArn '{}' is not the ARN of an Amazon Cognito identity pool.",
+                input.resource_arn
+            )));
+        };
+
+        // Every key is checked before the pool is looked up, and everything is checked
+        // before anything is removed: a refused call leaves the pool's tag set exactly as
+        // it was.
+        let (detected, violations) = constraint_violations(&input.tag_keys);
+        if detected > 0 {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::validation_errors_detected(detected, &violations),
+            ));
+        }
+
+        // The reservation of the `aws:` namespace is on MODIFYING a tag that lies in it,
+        // which removing one is: AWS's tagging rules reserve the prefix so that a user can
+        // neither create, edit NOR delete a tag whose key carries it (see
+        // [`crate::state::RESERVED_TAG_KEY_PREFIX`], the rule `TagResource` refuses
+        // assigning such a key on this same resource by).
+        for tag_key in &input.tag_keys {
+            if crate::state::is_reserved_tag_key(tag_key) {
+                return Err(invalid_parameter(format!(
+                    "TagKeys key '{tag_key}' is not valid: the '{}' prefix is reserved for \
+                     Amazon Web Services use.",
+                    crate::state::RESERVED_TAG_KEY_PREFIX
+                )));
+            }
+        }
+
+        // The keys to remove, as a SET: `TagKeys` is a list, so it may name a key twice,
+        // and the set is built before the store's guard is taken so the work done while
+        // holding it is bounded by the pool's own tag set rather than by how many keys the
+        // request names.
+        let removed: ::std::collections::HashSet<&str> =
+            input.tag_keys.iter().map(String::as_str).collect();
+
+        let mut store = state.lock();
+        let Some(record) = store.identity_pools.get_mut(identity_pool_id) else {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("IdentityPool '{identity_pool_id}' not found.")),
+                },
+            )
+            .into());
+        };
+
+        // Only the named keys go, and only from a set the pool actually has: a pool that
+        // was never given the member keeps carrying no tag set at all rather than gaining
+        // an empty one, which is the distinction `DescribeIdentityPool` reports. A key the
+        // set does not hold removes nothing and is not an error, so the same call made
+        // twice leaves the same set.
+        if let Some(assigned) = record.identity_pool_tags.as_mut() {
+            assigned.retain(|tag_key, _| !removed.contains(tag_key.as_str()));
+        }
+        Ok(UntagResourceOutput {})
     }
+}
+
+/// The most modelled-constraint violation CLAUSES one refusal names. `TagKeys` is a LIST,
+/// and a clause is phrased from the entry that caused it, so without a ceiling the length of
+/// one refusal would grow with the number of entries a caller sends; the first few are what
+/// a caller acts on. The COUNT the refusal states is the number of violations the request
+/// has, never this ceiling.
+const MAX_REPORTED_VIOLATIONS: usize = 10;
+
+/// How many modelled-constraint violations the request's `TagKeys` has, and the first
+/// [`MAX_REPORTED_VIOLATIONS`] of them phrased the way a constraint refusal names the member
+/// and the constraint it failed, in the order the list carries them.
+///
+/// The bound sits on the list's MEMBER shape ([`crate::state::TAG_KEY_LENGTH`], the one
+/// `TagKeysType` bound every operation of this service reading a tag key shares), so a
+/// violation is in one entry of the list rather than in the member as a whole. A constraint
+/// the model states is a protocol-level refusal — HTTP 400 `ValidationException` — so the
+/// request is refused the same way wherever it is walked, and an entry sitting ON a bound is
+/// never refused for its length.
+fn constraint_violations(tag_keys: &[String]) -> (usize, Vec<String>) {
+    let mut detected = 0usize;
+    let mut violations = Vec::new();
+    for tag_key in tag_keys
+        .iter()
+        .filter(|tag_key| !crate::state::length_is_within(tag_key, &crate::state::TAG_KEY_LENGTH))
+    {
+        detected += 1;
+        if violations.len() < MAX_REPORTED_VIOLATIONS {
+            violations.push(format!(
+                "Value '{tag_key}' at 'tagKeys' failed to satisfy constraint: Member must \
+                 satisfy constraint: [Member must have length less than or equal to {}, Member \
+                 must have length greater than or equal to {}]",
+                crate::state::TAG_KEY_LENGTH.end(),
+                crate::state::TAG_KEY_LENGTH.start()
+            ));
+        }
+    }
+    (detected, violations)
+}
+
+/// The modelled refusal for a bad input parameter (HTTP 400), carrying what was wrong with
+/// the request.
+fn invalid_parameter(message: String) -> UntagResourceError {
+    UntagResourceErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+    })
+    .into()
 }

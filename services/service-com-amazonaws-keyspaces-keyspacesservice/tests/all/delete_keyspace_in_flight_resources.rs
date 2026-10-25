@@ -505,7 +505,8 @@ async fn a_refused_delete_keyspace_retires_no_auto_scaling_settings() {
     );
 
     // Settled, the delete is accepted — and the capacities the targets scaled go with the
-    // table, so the settings are gone.
+    // table, so the settings are gone, while the table itself is still reported on its way
+    // out.
     tokio::time::sleep(settle_wait()).await;
     assert_ok(
         case,
@@ -513,12 +514,14 @@ async fn a_refused_delete_keyspace_retires_no_auto_scaling_settings() {
             .call("DeleteKeyspace", json!({"keyspaceName": keyspace}))
             .await,
     );
-    assert_failure(
+    let retired = assert_ok(
         case,
         emulator
             .call("GetTableAutoScalingSettings", scaling_request)
             .await,
-        404,
-        "ResourceNotFoundException",
+    );
+    assert!(
+        retired.pointer("/autoScalingSpecification").is_none(),
+        "case {case:?}: expected the retired settings to be gone, got {retired}"
     );
 }
