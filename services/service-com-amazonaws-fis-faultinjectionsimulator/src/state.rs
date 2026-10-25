@@ -1236,6 +1236,19 @@ impl ExperimentTemplateRecord {
     /// and the other refusals the create applies) and discards this record if any of them
     /// refuses it.
     ///
+    /// A nested configuration structure the request carries with NONE of its members set
+    /// names no configuration at all, so it REMOVES the configuration the template
+    /// carried rather than replacing it: the template is afterwards reported WITHOUT that
+    /// member, and a template that carried none is left carrying none. That is the
+    /// meaning wherever the service admits no such empty configuration and models no
+    /// operation that deletes one — `logConfiguration`, whose every member this request's
+    /// shape makes optional (the create declares `logSchemaVersion` required) and which
+    /// has to name a destination to be admissible at all
+    /// ([`log_configuration_refusal`]), so an empty one can only be the removal.
+    /// `experimentReportConfiguration` is NOT such a member: the create's shape declares
+    /// no required member either, so an empty report configuration is one a create could
+    /// have stored and the update replaces the stored one with it.
+    ///
     /// `id`, `arn`, `creationTime`, the template's `tags` (which `TagResource` owns) and
     /// its target account configurations (which their own operations own) are never
     /// touched by an update. `lastUpdateTime` moves to `now`: this call is the update FIS
@@ -1264,7 +1277,11 @@ impl ExperimentTemplateRecord {
             self.actions = self.updated_actions(actions)?;
         }
         if let Some(configuration) = input.log_configuration.as_ref() {
-            self.log_configuration = Some(self.updated_log_configuration(configuration)?);
+            self.log_configuration = if update_log_configuration_is_empty(configuration) {
+                None
+            } else {
+                Some(self.updated_log_configuration(configuration)?)
+            };
         }
         if let Some(options) = input.experiment_options.as_ref() {
             if let Some(mode) = options.empty_target_resolution_mode.clone() {
@@ -1321,6 +1338,10 @@ impl ExperimentTemplateRecord {
     /// The log configuration an update's `logConfiguration` leaves the template carrying:
     /// the one the request names, with the stored `logSchemaVersion` kept when the request
     /// omits it (see [`ExperimentTemplateRecord::apply_update`]).
+    ///
+    /// Only ever called for a request that NAMES a configuration: one naming none removes
+    /// the stored configuration instead ([`update_log_configuration_is_empty`]), so no
+    /// schema version is inherited for it and nothing is refused on its behalf.
     fn updated_log_configuration(
         &self,
         input: &UpdateExperimentTemplateLogConfigurationInput,
@@ -3636,6 +3657,23 @@ fn update_stop_condition(
         source: Some(input.source.clone()),
         value: input.value.clone(),
     }
+}
+
+/// Whether an update's `logConfiguration` names NO log configuration — every member
+/// unset.
+///
+/// Such a request cannot be replacing the stored configuration with the one it names,
+/// because it names none: a log configuration says where an experiment's logs are
+/// delivered ([`log_configuration_refusal`]) and carries the schema version the create
+/// declares required. FIS models no operation that deletes a log configuration, so this
+/// is how logging is switched off — the member is REMOVED from the template
+/// ([`ExperimentTemplateRecord::apply_update`]).
+fn update_log_configuration_is_empty(
+    input: &UpdateExperimentTemplateLogConfigurationInput,
+) -> bool {
+    input.cloud_watch_logs_configuration.is_none()
+        && input.s3_configuration.is_none()
+        && input.log_schema_version.is_none()
 }
 
 /// The report configuration an `UpdateExperimentTemplate` request names, as the template
