@@ -1488,6 +1488,13 @@ pub struct User {
     /// a listing of several is stable. `DeviceKeyType` carries no
     /// case-insensitivity trait, so a key is matched exactly as it was stored.
     pub devices: BTreeMap<String, Device>,
+    /// The attribute verification codes outstanding for this user, keyed by the
+    /// attribute name each was issued for and ordered so a read is stable.
+    ///
+    /// A fresh code for an attribute REPLACES the one issued before it, so one
+    /// user holds at most one per attribute and this map is bounded by the
+    /// attributes a message is sent for at all ([`delivery_medium`]).
+    pub pending_attribute_verifications: BTreeMap<String, AttributeVerification>,
 }
 
 impl User {
@@ -1611,6 +1618,26 @@ impl User {
             .map(|(key, _)| key.clone())
             .collect()
     }
+}
+
+/// One verification code issued for one attribute of a user: what the
+/// operation that sent the code recorded, and the delivery it reported.
+#[derive(Debug, Clone)]
+pub struct AttributeVerification {
+    /// The code itself ([`new_verification_code`]). The real service delivers
+    /// it out of band — by mail or text message — so no response carries it.
+    /// Stored because it is what a verification of this attribute would check;
+    /// no operation implemented here reads it yet.
+    pub code: String,
+    /// The stored attribute value the code was issued for: the address or
+    /// number the message was addressed to, which is what
+    /// `CodeDeliveryDetailsType.Destination` reports.
+    pub destination: String,
+    /// The `DeliveryMediumType` that destination is reached over
+    /// ([`verification_delivery_medium`]).
+    pub delivery_medium: String,
+    /// When this code was issued.
+    pub issued_at: SystemTime,
 }
 
 /// One device of a user: the device a sign-in minted a `DeviceKey` for, as the
@@ -2018,6 +2045,27 @@ const STANDARD_SCHEMA: [(&str, &str, bool, bool); 20] = [
 /// Whether `name` is one of the standard attributes every pool carries.
 pub fn is_standard_attribute(name: &str) -> bool {
     STANDARD_SCHEMA.iter().any(|(standard, ..)| *standard == name)
+}
+
+/// How many digits a minted verification code carries: Amazon Cognito's
+/// verification messages carry a six-digit code.
+const VERIFICATION_CODE_LENGTH: usize = 6;
+
+/// A fresh verification code: [`VERIFICATION_CODE_LENGTH`] decimal digits,
+/// which satisfies `ConfirmationCodeType`'s modelled length 1..2048 and
+/// pattern `^[\S]+$` — the shape the member that carries it back accepts.
+///
+/// The randomness is the same v4-UUID source every other minted value in this
+/// file draws on ([`new_uuid`]), so nothing here is a hand-rolled generator: a
+/// v4 UUID renders as 32 hex characters, each reduced to one decimal digit, so
+/// one draw always yields the whole code and this makes no loop.
+pub fn new_verification_code() -> String {
+    new_uuid()
+        .chars()
+        .filter_map(|character| character.to_digit(16))
+        .filter_map(|value| char::from_digit(value % 10, 10))
+        .take(VERIFICATION_CODE_LENGTH)
+        .collect()
 }
 
 /// The attribute that records whether `attribute`'s stored value was confirmed,

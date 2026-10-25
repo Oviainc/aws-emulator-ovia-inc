@@ -367,6 +367,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A registered user has no remembered device: a device is known only once a
             // sign-in has minted a key for one.
             devices: ::std::collections::BTreeMap::new(),
+            // Nothing has asked for an attribute verification code yet.
+            pending_attribute_verifications: ::std::collections::BTreeMap::new(),
         };
         let pool = guard
             .pool_mut(&user_pool_id)

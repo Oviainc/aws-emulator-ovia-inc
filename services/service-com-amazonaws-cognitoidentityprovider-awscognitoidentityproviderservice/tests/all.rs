@@ -61,5 +61,7 @@ mod update_user_attributes;
 mod update_user_pool;
 #[path = "all/update_user_pool_client.rs"]
 mod update_user_pool_client;
+#[path = "all/user_attribute_verification_code.rs"]
+mod user_attribute_verification_code;
 #[path = "all/user_pool_domain.rs"]
 mod user_pool_domain;
