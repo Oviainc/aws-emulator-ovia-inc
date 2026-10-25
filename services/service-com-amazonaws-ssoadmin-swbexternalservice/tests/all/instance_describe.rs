@@ -209,8 +209,8 @@ async fn describe_instance_reports_the_stored_instance_and_denies_every_other_ar
             case.label,
             body["PermissionSetsEnabled"]
         );
-        // An ACTIVE instance has no additional status context, and nothing configures a
-        // customer-managed key, so neither optional member is invented.
+        // An ACTIVE instance has no additional status context, so that member is not
+        // invented.
         assert_eq!(
             body["StatusReason"],
             Value::Null,
@@ -218,13 +218,36 @@ async fn describe_instance_reports_the_stored_instance_and_denies_every_other_ar
             case.label,
             body["StatusReason"]
         );
+        // Every instance IS encrypted, so its configuration is always reported: nothing
+        // has opted this one into a key of its own, so it is the Amazon Web Services
+        // owned default, in effect, with no ARN naming it.
+        let details = body["EncryptionConfigurationDetails"].clone();
         assert_eq!(
-            body["EncryptionConfigurationDetails"],
+            details["KeyType"].as_str(),
+            Some("AWS_OWNED_KMS_KEY"),
+            "case {:?}: an instance nobody has reconfigured is encrypted under the AWS \
+             owned key, got {details:?}",
+            case.label
+        );
+        assert_eq!(
+            details["EncryptionStatus"].as_str(),
+            Some("ENABLED"),
+            "case {:?}: that default is already in effect, so encryption is enabled, \
+             got {details:?}",
+            case.label
+        );
+        assert_eq!(
+            details["KmsKeyArn"],
             Value::Null,
-            "case {:?}: no encryption configuration is held, so none may be reported, \
-             got {:?}",
-            case.label,
-            body["EncryptionConfigurationDetails"]
+            "case {:?}: no ARN names an AWS owned key, got {details:?}",
+            case.label
+        );
+        assert_eq!(
+            details["EncryptionStatusReason"],
+            Value::Null,
+            "case {:?}: nothing failed, so no EncryptionStatusReason may be reported, \
+             got {details:?}",
+            case.label
         );
 
         // The primary Region is one of the enabled Regions, and it is the one flagged
