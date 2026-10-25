@@ -211,24 +211,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "Either availabilityZone or availabilityZoneId must be specified",
                 ));
             }
-            (Some(zone_name), None) => zones
-                .iter()
-                .find(|zone| zone.zone_name == zone_name)
-                .ok_or_else(|| {
-                    Scaffolded::invalid_parameter_value(format!(
-                        "Invalid value '{zone_name}' for availabilityZone. \
-                         Region '{region}' has no such Availability Zone"
-                    ))
-                })?,
-            (None, Some(zone_id)) => zones
-                .iter()
-                .find(|zone| zone.zone_id == zone_id)
-                .ok_or_else(|| {
-                    Scaffolded::invalid_parameter_value(format!(
-                        "Invalid value '{zone_id}' for availabilityZoneId. \
-                         Region '{region}' has no such Availability Zone"
-                    ))
-                })?,
+            (Some(zone_name), None) => crate::state::availability_zone_of_region(
+                &zones,
+                &region,
+                "availabilityZone",
+                zone_name,
+                |zone| zone.zone_name.as_str(),
+            )?,
+            (None, Some(zone_id)) => crate::state::availability_zone_of_region(
+                &zones,
+                &region,
+                "availabilityZoneId",
+                zone_id,
+                |zone| zone.zone_id.as_str(),
+            )?,
         };
 
         // "You cannot specify InstanceFamily and InstanceType in the same request"

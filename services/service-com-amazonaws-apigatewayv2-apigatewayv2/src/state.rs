@@ -102,6 +102,17 @@ pub const MAX_INTEGRATIONS_PER_API: usize = 300;
 /// error the operation refuses with.
 pub const MAX_ROUTE_RESPONSES_PER_ROUTE: usize = 300;
 
+/// The most integration responses one integration may hold, after which
+/// CreateIntegrationResponse is refused.
+///
+/// AWS publishes no separate integration-responses-per-integration quota, so this is a
+/// CHOSEN bound, set to the per-parent quota this service already enforces for an api's
+/// integrations ([`MAX_INTEGRATIONS_PER_API`]): what it buys is that no loop of
+/// CreateIntegrationResponse calls can grow this store without end, and that the
+/// per-integration duplicate-key scan stays bounded. `TooManyRequestsException` ("A
+/// limit has been exceeded") is the modelled error the operation refuses with.
+pub const MAX_INTEGRATION_RESPONSES_PER_INTEGRATION: usize = 300;
+
 /// The most models one api may hold, after which CreateModel is refused.
 ///
 /// An EMULATOR growth bound, not a figure AWS publishes: API Gateway publishes per-api
@@ -817,9 +828,24 @@ pub struct Integration {
     /// "If you created an API using quick create, the resulting integration is managed
     /// by API Gateway" (`Integration$ApiGatewayManaged`).
     pub api_gateway_managed: bool,
+    /// This integration's integration responses, keyed by `IntegrationResponseId`.
+    /// Owned by the integration, so deleting the integration (or its api) cascades to
+    /// them in one `remove`.
+    pub integration_responses: BTreeMap<String, IntegrationResponse>,
+    /// Drives [`Integration::mint_integration_response_id`]. Per-integration, because
+    /// an `IntegrationResponseId` only has to be unique within the integration that
+    /// owns the response.
+    pub integration_response_id_seed: u64,
 }
 
 impl Integration {
+    /// Mint a fresh `IntegrationResponseId` for this integration: ten lowercase
+    /// alphanumerics, never one this integration already minted.
+    pub fn mint_integration_response_id(&mut self) -> String {
+        self.integration_response_id_seed = self.integration_response_id_seed.wrapping_add(1);
+        mint_id(self.integration_response_id_seed)
+    }
+
     /// Project the record onto the modelled `Integration` shape.
     pub fn to_wire(&self) -> wire::Integration {
         wire::Integration {
@@ -831,9 +857,12 @@ impl Integration {
             description: self.description.clone(),
             integration_id: Some(self.integration_id.clone()),
             integration_method: self.integration_method.clone(),
-            // The integration response selection expression is a WebSocket-only value
-            // the service computes from the integration's own responses; nothing here
-            // has any, so there is none to report.
+            // "The integration response selection expression for the integration.
+            // Supported only for WebSocket APIs"
+            // (`Integration$IntegrationResponseSelectionExpression`): no request member
+            // sets it, and an integration response of this service is selected by the
+            // `IntegrationResponseKey` it was stored under, so the record holds no such
+            // expression to report.
             integration_response_selection_expression: None,
             integration_subtype: self.integration_subtype.clone(),
             integration_type: Some(self.integration_type.clone()),
@@ -869,6 +898,49 @@ impl Integration {
             template_selection_expression: self.template_selection_expression.clone(),
             timeout_in_millis: Some(self.timeout_in_millis),
             tls_config: self.tls_config.clone(),
+        }
+    }
+}
+
+/// A persisted `IntegrationResponse` resource, owned by its parent [`Integration`].
+///
+/// An integration response is WebSocket-only: its
+/// `IntegrationResponse$ContentHandlingStrategy` is "Supported only for WebSocket
+/// APIs", and the selection keys it is matched against are the WebSocket API's
+/// integration response selection expressions.
+#[derive(Debug, Clone, Default)]
+pub struct IntegrationResponse {
+    pub integration_response_id: String,
+    /// Required on the modelled `IntegrationResponse` shape, so the record always
+    /// carries one. Unique within the owning integration.
+    pub integration_response_key: String,
+    /// One of `CONTENT_HANDLING_STRATEGY_VALUES` when the request named one.
+    pub content_handling_strategy: Option<String>,
+    pub response_parameters: BTreeMap<String, String>,
+    pub response_templates: BTreeMap<String, String>,
+    pub template_selection_expression: Option<String>,
+}
+
+impl IntegrationResponse {
+    /// Project the record onto the modelled `IntegrationResponse` shape.
+    pub fn to_wire(&self) -> wire::IntegrationResponse {
+        wire::IntegrationResponse {
+            content_handling_strategy: self.content_handling_strategy.clone(),
+            integration_response_id: Some(self.integration_response_id.clone()),
+            integration_response_key: self.integration_response_key.clone(),
+            response_parameters: Some(
+                self.response_parameters
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
+            response_templates: Some(
+                self.response_templates
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
+            template_selection_expression: self.template_selection_expression.clone(),
         }
     }
 }

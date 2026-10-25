@@ -708,9 +708,9 @@ pub(super) async fn call_query(
     let mut body = format!("Action={action}&Version={version}");
     for (name, value) in parameters {
         body.push('&');
-        body.push_str(&::percent_encoding::utf8_percent_encode(name, FORM_VALUE).to_string());
+        body.push_str(&percent_encoded(name));
         body.push('=');
-        body.push_str(&::percent_encoding::utf8_percent_encode(value, FORM_VALUE).to_string());
+        body.push_str(&percent_encoded(value));
     }
     let headers = vec![("content-type", FORM_URLENCODED.to_string())];
     let (status, payload) =
@@ -732,6 +732,22 @@ pub(super) async fn call_query(
             .unwrap_or_else(|| format!("{UNNAMED_CODE_PREFIX}{status}")),
         message: xml_element(&document, "Message").unwrap_or_default(),
     })
+}
+
+/// One value as a single form component, URI path segment or query value: everything
+/// outside RFC 3986's unreserved set escaped ([`FORM_VALUE`]), which is what an AWS SDK
+/// sends for an awsQuery parameter or a non-greedy `@httpLabel` and what the SigV4
+/// canonical request assumes.
+///
+/// The ONE spelling of that encoding here, so a parameter of an awsQuery call
+/// ([`call_query`]) and a name written into a REST URI are escaped identically.
+///
+/// A value that comes from the TEMPLATE — the name a declaration asks for — therefore
+/// reaches the called operation as one value rather than as extra URI structure, so a name
+/// outside the called model's own pattern is refused by that operation's validation instead
+/// of addressing a different one.
+pub(super) fn percent_encoded(value: &str) -> String {
+    ::percent_encoding::utf8_percent_encode(value, FORM_VALUE).to_string()
 }
 
 /// Call one REST-JSON operation of another emulated service in-process and read its answer

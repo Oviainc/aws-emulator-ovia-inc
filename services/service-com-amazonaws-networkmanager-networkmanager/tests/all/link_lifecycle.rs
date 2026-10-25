@@ -12,7 +12,7 @@
 use serde_json::{json, Value};
 
 use crate::global_network_lifecycle::{
-    error_code, expected_arn, ids_of, is_minted_id, Emulator, PAST_SETTLE,
+    error_code, expected_scoped_arn, ids_of, is_minted_id, Emulator, PAST_SETTLE,
 };
 
 /// One row of the create/round-trip table: the members the request carries, with
@@ -206,8 +206,8 @@ async fn create_link_stores_every_member_and_get_links_answers_from_the_stored_r
         );
         assert_eq!(
             link["LinkArn"],
-            json!(expected_arn("link", &link_id)),
-            "case {name}: the ARN must name the minted id, got {link}"
+            json!(expected_scoped_arn("link", &network, &link_id)),
+            "case {name}: the ARN must name the global network and the minted id, got {link}"
         );
         assert_eq!(
             link["GlobalNetworkId"],

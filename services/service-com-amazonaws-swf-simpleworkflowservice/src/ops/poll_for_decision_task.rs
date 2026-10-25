@@ -409,8 +409,8 @@ fn answer_poll(
             // that bound is terminated by the service rather than grown: it is closed
             // here instead of being handed out, and this poll goes on waiting.
             if !execution.has_history_room_for(1) {
-                execution.terminate_for_event_limit(now);
-                domain.release_open_run(&waiting.workflow_id, &waiting.run_id);
+                let key = (waiting.workflow_id.clone(), waiting.run_id.clone());
+                domain.close_run(&key, crate::state::RunClose::event_limit_exceeded(), now);
                 return Ok(None);
             }
             // Handing the task over IS the `DecisionTaskStarted` event: it names the

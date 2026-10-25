@@ -366,13 +366,17 @@ async fn listing_the_types_of_an_absent_keyspace_is_a_modelled_not_found() {
     create_type(&emulator, ks, "present").await;
 
     // Rows: a keyspace nothing ever created, and one that WAS created and then deleted —
-    // so the refusal tracks state rather than a fixed list of names.
+    // so the refusal tracks state rather than a fixed list of names. The keyspace is
+    // deletable once the type it holds has settled, and the deletion itself settles into
+    // absence, so both waits are the clock's.
+    tokio::time::sleep(settle_wait()).await;
     assert_ok(
         "delete the keyspace",
         emulator
             .call("DeleteKeyspace", json!({"keyspaceName": ks}))
             .await,
     );
+    tokio::time::sleep(settle_wait()).await;
     for case in ["never_created_ks", ks] {
         let (status, body) = emulator
             .call("ListTypes", json!({"keyspaceName": case}))

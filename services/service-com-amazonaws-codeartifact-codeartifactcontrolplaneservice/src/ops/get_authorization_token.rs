@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAuthorizationToken
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAuthorizationToken`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAuthorizationToken::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints the bearer credential every package-manager client and every repository read or
+//! write presents, for one domain this service holds.
+//!
+//! The call MUTATES: generating a token is what it does, so a fresh, unique secret is
+//! minted per call by the emulator's credential store — the one component that generates
+//! secrets — and nothing else in the store is touched. The token is NOT a credential of
+//! this emulator (it authenticates a package-manager client against a repository, not a
+//! SigV4 request), so the minted record is removed again: nothing accumulates per call and
+//! the emulator never goes on accepting an issued token as a signing key.
+//!
+//! Issuing it resolves the domain first, so a token is never handed out for a domain
+//! nothing holds — the token is domain-scoped, and a scope that does not exist cannot be
+//! granted.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +176,201 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAuthorizationToken` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAuthorizationTokenErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAuthorizationToken"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(server_error());
+        };
+
+        // `durationSeconds` is modelled `@range(0..43200)`, so the boundary validator has
+        // already refused anything outside those bounds; the GAP inside them (1..899) is
+        // this handler's to refuse, because the accepted set is not an interval.
+        let Some(period) = authorization_period(input.duration_seconds) else {
+            return Err(GetAuthorizationTokenErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "durationSeconds value {} is not valid; valid values are {} and any \
+                         number between {} and {}.",
+                        input.duration_seconds.unwrap_or_default(),
+                        CALLER_CREDENTIAL_DURATION_SECONDS,
+                        MIN_REQUESTED_DURATION_SECONDS,
+                        MAX_REQUESTED_DURATION_SECONDS
+                    ),
+                    reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The token is scoped to ONE domain, so the scope is resolved before anything is
+        // minted. The guard is dropped here: nothing about the record is carried out of
+        // it, and the credential store is a different store.
+        let domain_held = state
+            .lock()
+            .domain(&input.domain, input.domain_owner.as_deref())
+            .is_some();
+        if !domain_held {
+            return Err(GetAuthorizationTokenErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::domain_not_found_message(
+                        &input.domain,
+                        input.domain_owner.as_deref(),
+                    ),
+                    resource_id: Some(input.domain.clone()),
+                    resource_type: Some("domain".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let Some(token) = mint_authorization_token(ctx.credential_store()) else {
+            // The credential store minted no secret, and this operation will not invent
+            // one: a token nothing generated is not a credential.
+            return Err(server_error());
+        };
+        let expiration = ::std::time::SystemTime::now() + period;
+
+        // Issuing a bearer credential is the security-relevant event of this operation, so
+        // it is attributable in the emulator's log: which operation, which caller, the
+        // scope it was issued for, when what was issued expires, and the outcome. The
+        // token itself is never logged — only the caller gets it.
+        ::tracing::info!(
+            operation = Self::NAME,
+            presented_access_key_id = %::engine::extract_akid(&ctx.parts().headers),
+            domain = %input.domain,
+            domain_owner = %crate::state::addressed_domain_owner(input.domain_owner.as_deref()),
+            expires_at_unix_seconds = expiration
+                .duration_since(::std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            outcome = "issued",
+            "issued a CodeArtifact authorization token"
+        );
+
+        Ok(GetAuthorizationTokenOutput {
+            authorization_token: Some(token),
+            expiration: Some(::aws_smithy_types::DateTime::from(expiration)),
+        })
+    }
+}
+
+/// The shortest authorization period a caller may ASK for, from this operation's own
+/// `durationSeconds` documentation: "Valid values are 0 and any number between 900 (15
+/// minutes) and 43200 (12 hours)".
+pub const MIN_REQUESTED_DURATION_SECONDS: i64 = 900;
+
+/// The longest authorization period a caller may ask for — the same sentence, and the
+/// modelled `@range` ceiling of `AuthorizationTokenDurationSeconds`.
+pub const MAX_REQUESTED_DURATION_SECONDS: i64 = 43_200;
+
+/// The `durationSeconds` value that ties the token to the caller's own credentials
+/// instead of naming a period: "A value of 0 will set the expiration of the authorization
+/// token to the same expiration of the user's role's temporary credentials"
+/// (`durationSeconds`' own documentation).
+pub const CALLER_CREDENTIAL_DURATION_SECONDS: i64 = 0;
+
+/// How long a token stays valid when the caller names no `durationSeconds`.
+///
+/// The operation's own documentation states the period — "CodeArtifact authorization
+/// tokens are valid for a period of 12 hours", with `durationSeconds` able to set "a
+/// custom authorization period, up to a maximum of 12 hours" — so this is a duration the
+/// service documents, not a chosen one.
+pub const DEFAULT_AUTHORIZATION_PERIOD: ::std::time::Duration =
+    ::std::time::Duration::from_secs(12 * 60 * 60);
+
+/// How long a token requested with `durationSeconds=0` stays valid: the remaining life of
+/// the caller's temporary credentials.
+///
+/// This emulator verifies signatures but models no session behind them, so there is no
+/// per-caller credential expiry to read. The period used is the documented DEFAULT
+/// lifetime of AWS temporary credentials — `AssumeRole`'s `DurationSeconds` is documented
+/// "By default, the value is set to 3600 seconds" — which is the expiry a caller holding
+/// default temporary credentials would in fact get. It is therefore a documented duration
+/// standing in for one this emulator cannot observe, not a chosen one.
+pub const CALLER_CREDENTIAL_PERIOD: ::std::time::Duration =
+    ::std::time::Duration::from_secs(3_600);
+
+/// The period a token requested with `duration_seconds` stays valid, or `None` when that
+/// value is not one CodeArtifact accepts.
+///
+/// The accepted set is `0` plus the closed interval
+/// [`MIN_REQUESTED_DURATION_SECONDS`]..=[`MAX_REQUESTED_DURATION_SECONDS`], so a value
+/// between the two — inside the modelled `@range` but outside the documented set — is a
+/// bad request rather than a shorter token.
+fn authorization_period(duration_seconds: Option<i64>) -> Option<::std::time::Duration> {
+    match duration_seconds {
+        None => Some(DEFAULT_AUTHORIZATION_PERIOD),
+        Some(CALLER_CREDENTIAL_DURATION_SECONDS) => Some(CALLER_CREDENTIAL_PERIOD),
+        Some(seconds)
+            if (MIN_REQUESTED_DURATION_SECONDS..=MAX_REQUESTED_DURATION_SECONDS)
+                .contains(&seconds) =>
+        {
+            u64::try_from(seconds)
+                .ok()
+                .map(::std::time::Duration::from_secs)
+        }
+        Some(_) => None,
+    }
+}
+
+/// A fresh authorization token.
+///
+/// It is minted by the emulator's credential store, the one component that generates
+/// secrets, and then removed from that store again: the token authenticates a
+/// package-manager client against a CodeArtifact repository, NOT a SigV4 request to this
+/// emulator, so the emulator must not go on accepting it as one, and nothing accumulates
+/// per call.
+///
+/// `None` when the store minted no session-token secret, or when the minted credential
+/// could not be removed from the store again — a token the emulator would still accept as
+/// SigV4 is not the credential this operation promises, so it is refused rather than
+/// handed out, and the failed removal is logged.
+fn mint_authorization_token(store: &::emulator_server::CredentialStore) -> Option<String> {
+    let minted = store.create(&::emulator_server::aws_credentials::AWS_SESSION);
+    let token = minted
+        .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
+        .map(str::to_string);
+    // The token is not a credential of this emulator; see above.
+    if let Err(error) = store.delete(&minted.id) {
+        ::tracing::warn!(
+            operation = "GetAuthorizationToken",
+            access_key_id = %minted.id,
+            error = ?error,
+            "a credential minted for an authorization token could not be deleted"
+        );
+        return None;
+    }
+    token
+}
+
+/// The modelled server fault for a token this emulator could not produce.
+fn server_error() -> GetAuthorizationTokenError {
+    GetAuthorizationTokenErrorModeled::InternalServerException(InternalServerException {
+        message: "the CodeArtifact emulator could not issue an authorization token".to_string(),
+    })
+    .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The accepted set of `durationSeconds`, and the period each value maps to.
+    #[test]
+    fn the_accepted_duration_set_is_zero_plus_the_published_interval() {
+        let cases: [(&str, Option<i64>, Option<u64>); 7] = [
+            ("no durationSeconds", None, Some(12 * 60 * 60)),
+            ("the caller-credential value", Some(0), Some(3_600)),
+            ("the published minimum", Some(900), Some(900)),
+            ("inside the interval", Some(7_200), Some(7_200)),
+            ("the published maximum", Some(43_200), Some(43_200)),
+            ("one below the minimum", Some(899), None),
+            ("just above the caller-credential value", Some(1), None),
+        ];
+        for (case, requested, expected) in cases {
+            let actual = authorization_period(requested).map(|period| period.as_secs());
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?} seconds, got {actual:?}"
+            );
+        }
     }
 }

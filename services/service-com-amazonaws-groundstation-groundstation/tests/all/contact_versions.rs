@@ -67,11 +67,24 @@ async fn reserve_contact(
     mission_profile_arn: &str,
     satellite_arn: Option<&str>,
 ) -> String {
+    reserve_contact_in_slot(router, mission_profile_arn, satellite_arn, 0).await
+}
+
+/// `ReserveContact` for the pass a day per `slot` after [`CONTACT_START`], so each
+/// reservation of a table holds a window of its own: an antenna serves one pass at a time,
+/// so a second reservation of the SAME window at one ground station is refused.
+async fn reserve_contact_in_slot(
+    router: &MultiServiceRouter,
+    mission_profile_arn: &str,
+    satellite_arn: Option<&str>,
+    slot: i64,
+) -> String {
+    let shift = slot * 86_400;
     let mut body = json!({
         "missionProfileArn": mission_profile_arn,
         "groundStation": "Ohio-1",
-        "startTime": CONTACT_START,
-        "endTime": CONTACT_END,
+        "startTime": CONTACT_START + shift,
+        "endTime": CONTACT_END + shift,
     });
     if let Some(arn) = satellite_arn {
         body["satelliteArn"] = json!(arn);
@@ -481,9 +494,18 @@ async fn a_replayed_client_token_appends_no_second_version() {
     // token, an everyday retry token, one made of printable punctuation and one of the
     // full 64 characters.
     let longest = "t".repeat(64);
-    for token in ["a", "retry-token-2026", "!#$%&'()*+,-./:;<=>?@[]^_`{|}~", &longest] {
+    for (slot, token) in ["a", "retry-token-2026", "!#$%&'()*+,-./:;<=>?@[]^_`{|}~", &longest]
+        .into_iter()
+        .enumerate()
+    {
         let case = format!("clientToken of {} characters", token.len());
-        let contact_id = reserve_contact(&router, &profile_arn, Some(&reserved_satellite)).await;
+        let contact_id = reserve_contact_in_slot(
+            &router,
+            &profile_arn,
+            Some(&reserved_satellite),
+            i64::try_from(slot).expect("a row index fits in i64"),
+        )
+        .await;
         let body = json!({"satelliteArn": updated_satellite, "clientToken": token});
 
         let first = update_contact(&router, &contact_id, body.clone()).await;

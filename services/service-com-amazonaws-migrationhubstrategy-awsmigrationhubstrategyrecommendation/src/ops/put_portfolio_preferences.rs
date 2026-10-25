@@ -14,10 +14,10 @@
 //! 400 `ValidationException`, rather than stored and reported back as a preference the
 //! service does not have.
 //!
-//! The preferences are the account-wide inputs the service's recommendations are computed
-//! from, so a save is refused with the modelled 409 `ConflictException` for as long as any
-//! task of the account has not reached a terminal status
-//! ([`crate::state::ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState::ongoing_task`]),
+//! The preferences are the inputs the service's recommendations are computed from for one
+//! Region's portfolio, so a save is refused with the modelled 409 `ConflictException` for
+//! as long as any task of that same Region has not reached a terminal status
+//! ([`crate::state::RegionState::ongoing_task`]),
 //! and the stored record is left exactly as it was. The gate is decided from the STORE,
 //! never from what the request carries.
 //!
@@ -256,7 +256,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(PutPortfolioPreferencesErrorModeled::InternalServerException(
                 InternalServerException {
@@ -282,25 +281,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
+        // Everything below is this request's own Region: the task the save waits on is a
+        // task of that Region, and the record is saved in that Region's portfolio.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
         // These preferences are the inputs the service's recommendations are computed
         // from, so they cannot be replaced underneath work that consumes them: while any
-        // task of this account is still running the save is refused with the modelled
-        // conflict and the stored record is left exactly as it was, and the caller waits
-        // for the task to finish. The condition comes from the store — is a task still
-        // owed its terminal status? — so it does not depend on what this request carries.
-        if let Some(ongoing) = store.ongoing_task(now) {
+        // task of this Region's portfolio is still running the save is refused with the
+        // modelled conflict and the stored record is left exactly as it was, and the
+        // caller waits for the task to finish. The condition comes from the store — is a
+        // task still owed its terminal status? — so it does not depend on what this
+        // request carries. A Region nothing was ever stored in runs no task.
+        let ongoing = store
+            .region_mut(&region)
+            .and_then(|portfolio| portfolio.ongoing_task(now));
+        if let Some(ongoing) = ongoing {
             return Err(PutPortfolioPreferencesErrorModeled::ConflictException(
                 ongoing_task_conflict(&ongoing),
             )
             .into());
         }
 
+        // The store keeps a portfolio for a bounded number of Regions: the Region comes
+        // from the caller's own credential scope, so this is what stops made-up Regions
+        // growing the store without bound. The operation models no quota error, so the
+        // refusal is its `ThrottlingException` (HTTP 429).
+        if store.region_capacity_reached(&region) {
+            return Err(PutPortfolioPreferencesErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(format!(
+                        "this emulator holds portfolio preferences in at most {} Regions",
+                        crate::state::MAX_REGIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
         // The save: the record becomes exactly what this request carries, so a member it
-        // leaves out is not set afterwards. `GetPortfolioPreferences` reads this same
-        // record — there is one copy of it in the store.
-        store.portfolio_preferences = Some(PortfolioPreferences {
+        // leaves out is not set afterwards. It is saved in the Region this request was
+        // signed for — one preferences record per Region — and `GetPortfolioPreferences`
+        // signed for that same Region reads this same record.
+        store.region_entry(&region).portfolio_preferences = Some(PortfolioPreferences {
             prioritize_business_goals: input.prioritize_business_goals,
             application_preferences: input.application_preferences,
             database_preferences: input.database_preferences,

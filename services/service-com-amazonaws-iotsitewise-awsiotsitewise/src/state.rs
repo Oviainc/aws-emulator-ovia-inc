@@ -51,7 +51,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AggregatedValue, Aggregates, Alarms, AssetHierarchy, AssetModelCompositeModel,
+    AggregatedValue, Aggregates, Alarms, AssetCompositeModelPathSegment,
+    AssetCompositeModelSummary, AssetHierarchy, AssetModelCompositeModel,
     AssetModelCompositeModelPathSegment, AssetModelCompositeModelSummary, AssetModelHierarchy,
     AssetModelProperty, AssetModelPropertyDefinition, AssetModelStatus, AssetProperty,
     AssetPropertyValue, AssetStatus, AssetSummary, ComputeNode, ComputeNodeExecutionDetails,
@@ -873,6 +874,40 @@ impl AssetModelRecord {
             r#type: composite.r#type.clone(),
             description: composite.description.clone(),
             path: Some(self.composite_model_path(id)),
+        })
+    }
+
+    /// The [`Self::composite_model_path`] of composite model `id`, as the
+    /// ASSET-side path segment shape reports it.
+    ///
+    /// An asset composite model is an instance of a composite model of this
+    /// model, so the chain of composite models it sits in is the same chain —
+    /// only the shape the two views carry it in differs.
+    pub fn asset_composite_model_path(&self, id: &str) -> Vec<AssetCompositeModelPathSegment> {
+        self.composite_model_path(id)
+            .into_iter()
+            .map(|segment| AssetCompositeModelPathSegment {
+                id: segment.id,
+                name: segment.name,
+            })
+            .collect()
+    }
+
+    /// Composite model `id` as the ASSET-side summary an asset instantiated from
+    /// this model reports it as, derived from [`Self::composite_model_summary`]
+    /// so the model view and the asset view of one stored composite model cannot
+    /// disagree. The asset-side summary states its description and path
+    /// unconditionally, and carries the path in the asset-side segment shape,
+    /// which is the only difference.
+    pub fn asset_composite_model_summary(&self, id: &str) -> Option<AssetCompositeModelSummary> {
+        let summary = self.composite_model_summary(id)?;
+        Some(AssetCompositeModelSummary {
+            id: summary.id,
+            external_id: summary.external_id,
+            name: summary.name,
+            r#type: summary.r#type,
+            description: summary.description.unwrap_or_default(),
+            path: self.asset_composite_model_path(id),
         })
     }
 }
@@ -3053,6 +3088,34 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             .any(|model| model.composite_model(id).is_some())
     }
 
+    /// The property definitions composite model `composite_id` of `model`
+    /// contributes: its OWN definitions, or, for a component-model-based
+    /// composite model, the properties of the `COMPONENT_MODEL` it reuses.
+    ///
+    /// A component-model-based composite model stores no properties of its own —
+    /// the component model it names provides them, and they are read from that
+    /// model's stored record rather than copied at create time, so a later change
+    /// to the component model shows through. One definition of "the properties of
+    /// a composite model", so every view of one (the model's own, and an asset's
+    /// instance of it) answers from the same place.
+    pub fn composite_model_properties(
+        &self,
+        model: &AssetModelRecord,
+        composite_id: &str,
+    ) -> Vec<AssetModelProperty> {
+        match model.composed_asset_model_id(composite_id) {
+            Some(composed) => self
+                .asset_models
+                .get(composed)
+                .map(|component| component.properties.clone())
+                .unwrap_or_default(),
+            None => model
+                .composite_model(composite_id)
+                .and_then(|composite| composite.properties.clone())
+                .unwrap_or_default(),
+        }
+    }
+
     /// Append `value` to the `(asset_id, property_id)` series, keeping it sorted
     /// ascending by timestamp.
     ///
@@ -3610,26 +3673,21 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             let mut properties: Vec<AssetProperty> = Vec::with_capacity(definitions.len());
             let mut seeded: Vec<(String, AssetPropertyValue)> = Vec::new();
             for definition in &definitions {
-                let Some(id) = definition.id.clone().filter(|id| !id.is_empty()) else {
+                let Some(mut property) = asset_property_from_model(definition) else {
                     continue;
                 };
-                let held = carried.iter().find(|property| property.id == id);
+                let held = carried.iter().find(|held| held.id == property.id);
                 if held.is_none() {
                     if let Some(sample) = initial_property_sample(definition, now) {
-                        seeded.push((id.clone(), sample));
+                        seeded.push((property.id.clone(), sample));
                     }
                 }
-                properties.push(AssetProperty {
-                    id,
-                    external_id: definition.external_id.clone(),
-                    name: definition.name.clone(),
-                    alias: held.and_then(|property| property.alias.clone()),
-                    notification: held.and_then(|property| property.notification.clone()),
-                    data_type: definition.data_type.clone(),
-                    data_type_spec: definition.data_type_spec.clone(),
-                    unit: definition.unit.clone(),
-                    path: None,
-                });
+                // An alias and a notification are not inherited from a
+                // definition, so a property the asset already carried keeps the
+                // ones set on it by `UpdateAssetProperty`.
+                property.alias = held.and_then(|held| held.alias.clone());
+                property.notification = held.and_then(|held| held.notification.clone());
+                properties.push(property);
             }
             let hierarchies: Vec<AssetHierarchy> = hierarchy_definitions
                 .iter()
@@ -3918,6 +3976,13 @@ pub const RESOURCE_QUERY: &str = "Query";
 /// operations that address one cannot each invent a kind of their own.
 pub const RESOURCE_ASSET_MODEL_COMPOSITE_MODEL: &str = "Asset Model Composite Model";
 
+/// The resource kind those errors name for a composite model of an ASSET — the
+/// instance of an asset model's composite model that lives on one asset.
+///
+/// Named as what it is for the same reason as the kind above: a composite model
+/// is not a top-level resource.
+pub const RESOURCE_ASSET_COMPOSITE_MODEL: &str = "Asset Composite Model";
+
 /// The resource kind those errors name for a gateway.
 ///
 /// AWS's own wording was observed for the asset and asset-model paths; for this
@@ -4018,6 +4083,33 @@ pub fn property_definitions_to_properties(
         });
     }
     Ok(properties)
+}
+
+/// One model property materialised as the asset property an asset created from
+/// that model carries: the asset property INHERITS the definition's id, external
+/// id, name, data type and unit, so a value written against the asset resolves
+/// to the definition it came from. An alias and a notification are not inherited
+/// — they are set per asset property, by `UpdateAssetProperty`.
+///
+/// `None` when the stored model property carries no usable id, which would
+/// materialise an asset property no request could address.
+///
+/// Shared by every operation that reports an asset's properties, so the asset
+/// properties a create materialises and the ones a read derives from the same
+/// definitions cannot disagree.
+pub fn asset_property_from_model(property: &AssetModelProperty) -> Option<AssetProperty> {
+    let id = property.id.clone().filter(|id| !id.is_empty())?;
+    Some(AssetProperty {
+        id,
+        external_id: property.external_id.clone(),
+        name: property.name.clone(),
+        alias: None,
+        notification: None,
+        data_type: property.data_type.clone(),
+        data_type_spec: property.data_type_spec.clone(),
+        unit: property.unit.clone(),
+        path: None,
+    })
 }
 
 /// Which of the four property types a `PropertyType` sets, named as the shape's
