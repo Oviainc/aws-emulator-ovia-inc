@@ -37,6 +37,10 @@
 //! ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::update_hypervisor`]),
 //! applying only the members the request carried, so every later read reports the record
 //! the last write left and no second copy of a hypervisor exists to drift from it.
+//! The ARN minted for a record is its ONLY identity: `Host`, `Name` and the rest are
+//! metadata the record carries, so any number of records may hold the same host (one
+//! appliance re-registered, or configured several times over) and no import or update is
+//! refused because another record already carries the value it asks for.
 //!
 //! The third resource this store owns is the **virtual machine**
 //! ([`StoredVirtualMachine`]), keyed by its own ARN. A virtual machine is not minted by
@@ -341,21 +345,6 @@ pub const METADATA_SYNC_RUNNING_MESSAGE: &str = "The metadata sync is running.";
 
 /// See [`METADATA_SYNC_CREATED_MESSAGE`].
 pub const METADATA_SYNC_SUCCEEDED_MESSAGE: &str = "The metadata sync succeeded.";
-
-/// `ConflictException$ErrorCode` for an import naming a host this service has already
-/// imported a hypervisor for, and the sentence that states it.
-///
-/// A hypervisor IS its host: the record stands for the machine reachable at that address,
-/// so importing the same host twice cannot mint a second one — `ConflictException` is the
-/// modelled "the operation cannot proceed because it is not supported"
-/// (`smithy_query(query="shape",shape="ConflictException")`), whose `ErrorCode` member is
-/// REQUIRED and documented as "a description of why the operation is not supported". AWS
-/// publishes no vocabulary for that member, so this value names the condition.
-pub const HYPERVISOR_ALREADY_EXISTS: &str = "HypervisorAlreadyExists";
-
-/// See [`HYPERVISOR_ALREADY_EXISTS`].
-pub const HYPERVISOR_ALREADY_EXISTS_MESSAGE: &str =
-    "A hypervisor has already been imported for this host.";
 
 /// The largest number of gateways this emulator keeps.
 ///
@@ -1143,14 +1132,17 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         page_of(&self.hypervisors, after, limit)
     }
 
-    /// The hypervisor stored for `host`, if any.
+    /// Every hypervisor this store holds whose `Host` is `host`, in ARN order.
     ///
-    /// A hypervisor record stands for the machine reachable at its host, so the host is
-    /// what an import resolves against before minting a second record for it.
-    pub fn hypervisor_by_host(&self, host: &str) -> Option<&StoredHypervisor> {
+    /// A hypervisor is keyed by the ARN minted for it and by nothing else: `Host` is
+    /// metadata the record carries, not an identity, so any number of records may hold one
+    /// host and this hands back all of them. A lookup, never a constraint — no writer of
+    /// this store consults it to decide whether a record may exist.
+    pub fn hypervisors_for_host(&self, host: &str) -> Vec<&StoredHypervisor> {
         self.hypervisors
             .values()
-            .find(|hypervisor| hypervisor.host == host)
+            .filter(|hypervisor| hypervisor.host == host)
+            .collect()
     }
 
     /// Apply `update` to the hypervisor stored under `arn`, and hand back the record as it
@@ -1163,38 +1155,17 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// Nothing else on the record moves — an update is not an import and not a sync, so it
     /// neither re-dates the record nor touches its state, tags, mappings or sync progress.
     ///
-    /// Refused, with NOTHING written, when `arn` names no hypervisor this store holds
-    /// ([`HypervisorUpdateRefusal::NoSuchHypervisor`]) or when the new host is the host of
-    /// a DIFFERENT stored hypervisor ([`HypervisorUpdateRefusal::HostAlreadyImported`]): a
-    /// record stands for the machine reachable at its host, so the one-host-one-record
-    /// invariant [`Self::hypervisor_by_host`] rests on holds for every writer, not just
-    /// for an import. Setting a hypervisor's host to the host it already has is the same
-    /// record again and succeeds.
+    /// `None` — nothing written — when `arn` names no hypervisor this store holds (never
+    /// imported, or already deleted). That is the ONLY condition an update is refused on:
+    /// a record is identified by its ARN alone, so the VALUES the update carries decide
+    /// nothing about whether it may be written, and a host another record already holds is
+    /// written like any other.
     pub fn update_hypervisor(
         &mut self,
         arn: &str,
         update: HypervisorUpdate,
-    ) -> Result<StoredHypervisor, HypervisorUpdateRefusal> {
-        let Some(stored) = self.hypervisors.get(arn) else {
-            return Err(HypervisorUpdateRefusal::NoSuchHypervisor);
-        };
-        // The key the store holds, so the refusal below compares records and not the
-        // string the request spelled.
-        let stored_arn = stored.arn.clone();
-        if let Some(host) = &update.host {
-            if let Some(other) = self.hypervisor_by_host(host) {
-                if other.arn != stored_arn {
-                    return Err(HypervisorUpdateRefusal::HostAlreadyImported(
-                        other.arn.clone(),
-                    ));
-                }
-            }
-        }
-        // Present: the same `&mut self` borrow resolved it above, so nothing could have
-        // removed it in between.
-        let Some(record) = self.hypervisors.get_mut(arn) else {
-            return Err(HypervisorUpdateRefusal::NoSuchHypervisor);
-        };
+    ) -> Option<StoredHypervisor> {
+        let record = self.hypervisors.get_mut(arn)?;
         if let Some(name) = update.name {
             record.name = name;
         }
@@ -1208,7 +1179,7 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         }
         // The record the store now holds, read back off the same borrow that wrote it:
         // nothing between the write and here could have removed it.
-        Ok(record.clone())
+        Some(record.clone())
     }
 
     /// Whether property mappings are SET for `arn`.
@@ -1297,8 +1268,7 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// A machine is identified on its hypervisor by its [`StoredVirtualMachine::path`] —
     /// where it sits in that hypervisor's inventory — so reporting the same path again
     /// UPDATES the record under the ARN the machine already has (keeping its
-    /// `discovered_time`) rather than minting a second machine for it, exactly as
-    /// [`Self::hypervisor_by_host`] keeps one hypervisor per host.
+    /// `discovered_time`) rather than minting a second machine for it.
     ///
     /// `None` — nothing written — when this store holds no hypervisor under
     /// `hypervisor_arn` (a machine cannot be on a hypervisor the service does not have),
@@ -1645,22 +1615,6 @@ pub enum AssociationRefusal {
     NoSuchServer,
     /// The gateway is already associated with a DIFFERENT server, whose ARN this carries.
     AlreadyAssociated(String),
-}
-
-/// Why a hypervisor could not be updated.
-///
-/// Returned by
-/// [`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::update_hypervisor`], which
-/// writes nothing on either arm. As with [`AssociationRefusal`], the store names the
-/// CONDITION and the handler maps it to the modelled error its own operation declares.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HypervisorUpdateRefusal {
-    /// The `HypervisorArn` names no hypervisor this store holds — never imported, or
-    /// already deleted.
-    NoSuchHypervisor,
-    /// The requested host is already the host of a DIFFERENT stored hypervisor, whose ARN
-    /// this carries.
-    HostAlreadyImported(String),
 }
 
 /// How this service refuses a well-formed resource ARN that names no resource it holds.

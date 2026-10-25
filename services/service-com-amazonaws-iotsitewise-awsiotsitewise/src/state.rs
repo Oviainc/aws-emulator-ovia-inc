@@ -3201,6 +3201,27 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         }
     }
 
+    /// The `PropertyDataType` of the stream `key` names: the declared type of the
+    /// asset property that owns it, or the type the disassociated record kept.
+    /// `None` when the store holds no such stream.
+    ///
+    /// The counterpart of [`Self::series`] for a reader that needs the stream's
+    /// TYPE rather than its samples: one data stream reports one data type whether
+    /// an asset property is associated with it or not, so every reader takes it
+    /// from here instead of reaching only into [`Self::assets`].
+    pub fn series_data_type(&self, key: &SeriesKey) -> Option<&str> {
+        match key {
+            SeriesKey::Property(asset_id, property_id) => self
+                .assets
+                .get(asset_id)
+                .and_then(|asset| asset.property(property_id))
+                .map(|property| property.data_type.as_str()),
+            SeriesKey::Disassociated(alias) => self
+                .disassociated_stream_type(alias)
+                .map(|(data_type, _)| data_type),
+        }
+    }
+
     /// The highest-timestamp value stored for `(asset_id, property_id)`, if any.
     ///
     /// The property's OWN series, borrowing the two ids the way

@@ -1231,6 +1231,15 @@ pub const STATUS_AVAILABLE: &str = "available";
 /// already provisioned: the cluster is only intermittently available for queries
 /// until the change is applied (see [`availability_status`]).
 pub const STATUS_MODIFYING: &str = "modifying";
+/// `ClusterStatus` while the cluster is restarting, which is the momentary
+/// outage a `RebootCluster` call starts. Like [`STATUS_MODIFYING`] it is work
+/// the service is doing to an already provisioned cluster, so it ends at the
+/// cluster's own due instant (see
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::settle`]).
+///
+/// Source: `smithy_query(query="doc", shape="Cluster", member="ClusterStatus")`,
+/// which publishes `rebooting` among the cluster states.
+pub const STATUS_REBOOTING: &str = "rebooting";
 /// `ClusterStatus` a `DeleteCluster` response reports.
 pub const STATUS_DELETING: &str = "deleting";
 
@@ -1917,14 +1926,18 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         // next week whether or not anybody called.
         let wall = ::aws_smithy_types::DateTime::from(SystemTime::now());
         for stored in &mut self.clusters {
-            // A cluster the service is still working on — bringing it up, or
-            // applying a change to it — is available again once that work's span
-            // has passed, whether or not anybody called.
+            // A cluster the service is still working on — bringing it up,
+            // applying a change to it, or restarting it — is available again
+            // once that work's span has passed, whether or not anybody called.
             let in_progress = stored
                 .cluster
                 .cluster_status
                 .as_deref()
-                .is_some_and(|status| status == STATUS_CREATING || status == STATUS_MODIFYING);
+                .is_some_and(|status| {
+                    status == STATUS_CREATING
+                        || status == STATUS_MODIFYING
+                        || status == STATUS_REBOOTING
+                });
             if in_progress && now >= stored.available_at {
                 stored.cluster.cluster_status = Some(STATUS_AVAILABLE.to_string());
                 stored.cluster.cluster_availability_status =
@@ -2575,6 +2588,42 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
                         }),
                     }
                 }
+            }
+        }
+    }
+
+    /// Record, on the cluster at `position`, that every parameter change which
+    /// was waiting for a restart of that cluster has now been applied.
+    ///
+    /// The counterpart of [`Self::mark_parameter_group_pending_reboot`], and the
+    /// one rule for it: a value at
+    /// [`PARAMETER_APPLY_STATUS_PENDING_REBOOT`] "will be applied after the
+    /// cluster reboots" (`smithy_query(query="doc",
+    /// shape="ClusterParameterStatus", member="ParameterApplyStatus")`), so once
+    /// the cluster restarts it carries that value and reports
+    /// [`PARAMETER_APPLY_STATUS_IN_SYNC`]. A status reporting anything else —
+    /// already in sync, or an apply ERROR the restart does not clear — is left
+    /// exactly as it stands.
+    pub fn apply_pending_parameter_changes(&mut self, position: usize) {
+        let Some(stored) = self.clusters.get_mut(position) else {
+            return;
+        };
+        let Some(memberships) = stored.cluster.cluster_parameter_groups.as_mut() else {
+            return;
+        };
+        let applied = |status: &mut Option<String>| {
+            if status.as_deref() == Some(PARAMETER_APPLY_STATUS_PENDING_REBOOT) {
+                *status = Some(PARAMETER_APPLY_STATUS_IN_SYNC.to_string());
+            }
+        };
+        for membership in memberships.iter_mut() {
+            applied(&mut membership.parameter_apply_status);
+            for status in membership
+                .cluster_parameter_status_list
+                .iter_mut()
+                .flatten()
+            {
+                applied(&mut status.parameter_apply_status);
             }
         }
     }

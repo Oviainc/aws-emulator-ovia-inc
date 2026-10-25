@@ -22,9 +22,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_ssmquicksetup_quicksetup::state::{
-    CATALOG_LATEST_VERSION, QUICK_SETUP_TYPE_CATALOG,
-};
+use service_com_amazonaws_ssmquicksetup_quicksetup::state::QUICK_SETUP_TYPE_CATALOG;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// One emulator with an empty store, mounted exactly as the router mounts it.
@@ -224,7 +222,7 @@ async fn the_quick_setup_type_catalog_is_reported_in_full_whatever_the_request_a
 
     let expected: Vec<(String, String)> = QUICK_SETUP_TYPE_CATALOG
         .iter()
-        .map(|entry| (entry.type_.to_string(), entry.latest_version.to_string()))
+        .map(|entry| (entry.type_.to_string(), entry.latest_version().to_string()))
         .collect();
     assert!(
         !expected.is_empty(),
@@ -311,7 +309,7 @@ async fn a_published_catalog_entry_is_accepted_as_a_configuration_definition_typ
             "Name": "change-manager",
             "ConfigurationDefinitions": [{
                 "Type": entry.type_,
-                "TypeVersion": entry.latest_version,
+                "TypeVersion": entry.latest_version(),
                 "Parameters": { "DelegatedAccountId": "000000000000" },
             }],
         })),
@@ -319,13 +317,9 @@ async fn a_published_catalog_entry_is_accepted_as_a_configuration_definition_typ
     .await;
     assert_eq!(
         status, 200,
-        "case {}: a create naming a published type must succeed, got {status} / {answer:?}",
+        "case {}: a create naming a published type and its published LatestVersion must \
+         succeed, got {status} / {answer:?}",
         entry.type_
-    );
-    assert_eq!(
-        entry.latest_version, CATALOG_LATEST_VERSION,
-        "case {}: every published entry carries the catalog's version, got {:?}",
-        entry.type_, entry.latest_version
     );
 }
 

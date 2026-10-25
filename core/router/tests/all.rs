@@ -19,6 +19,8 @@
 // else appends to.
 #[path = "all/kinesisvideo_signing_name_routing.rs"]
 mod kinesisvideo_signing_name_routing;
+#[path = "all/pi_resource_metadata_reflects_rds_configuration.rs"]
+mod pi_resource_metadata_reflects_rds_configuration;
 #[path = "all/amplifybackend_app_registration.rs"]
 mod amplifybackend_app_registration;
 #[path = "all/apigateway_signing_name_routing.rs"]

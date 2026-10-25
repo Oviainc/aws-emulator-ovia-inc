@@ -193,7 +193,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 PutBearerTokenAuthenticationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some("The specified log group does not exist".to_string()),
+                        // The one sentence form this service refuses a missing resource
+                        // with, built by `crate::state::resource_not_found_message` so this
+                        // operation words it exactly as every other one does.
+                        message: Some(crate::state::resource_not_found_message("log group")),
                     },
                 )
                 .into(),

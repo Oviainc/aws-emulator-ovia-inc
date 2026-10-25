@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSubnetCidrReservation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSubnetCidrReservation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reserves part of a stored subnet's CIDR range — the request's `Cidr`, read
+//! in its own address family and canonicalised, checked to sit inside that subnet's range
+//! and not to overlap a reservation the subnet already has — stored as the modelled
+//! [`SubnetCidrReservation`] shape (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::subnet_cidr_reservations`]) and answered
+//! as the record it was stored as.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSubnetCidrReservation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +144,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSubnetCidrReservation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSubnetCidrReservationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSubnetCidrReservation"))
+        use crate::state::{self, AddressFamily};
+
+        // `ctx` carries request metadata only, and nothing this operation stores depends on
+        // it: a reservation carries no ARN and no Region of its own, only the subnet whose
+        // range it reserves part of. The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The IPv4 or IPV6 CIDR range to reserve" (`$Cidr`), read in the address family of
+        // the value itself and stored with its host bits cleared — so one range named two
+        // ways is ONE range, and the containment and overlap questions below are asked of a
+        // block rather than of a string. NO size rule: neither the model nor the docs
+        // publish a prefix length for a reservation (the one stated rule is the subnet range
+        // it has to sit inside, checked below), so a bound invented here would refuse ranges
+        // AWS accepts. Neither canonicaliser carries a prefix-length rule, so the only way
+        // either can fail is a value that is not a CIDR range of its family at all.
+        let family = AddressFamily::of_cidr(&input.cidr);
+        let canonical = match family {
+            AddressFamily::Ipv4 => state::canonical_ipv4_cidr(&input.cidr),
+            AddressFamily::Ipv6 => state::canonical_ipv6_cidr(&input.cidr),
+        };
+        let cidr = canonical.map_err(|_| {
+            state::invalid_parameter_value(format!(
+                "Value ({requested}) for parameter cidr is invalid. \
+                 This is not a valid CIDR block.",
+                requested = input.cidr,
+            ))
+        })?;
+
+        // "The tags to assign to the subnet CIDR reservation" — the shared reader refuses a
+        // specification naming any other resource type and holds the payload to the
+        // documented bounds.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_SUBNET_CIDR_RESERVATION,
+            Self::NAME,
+        )?;
+        let payload_bytes =
+            state::subnet_cidr_reservation_payload_bytes(&cidr, input.description.as_deref(), &tags);
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // A reservation is part OF a subnet, so a subnet id this account holds no subnet for
+        // is a refusal rather than a reservation of nothing.
+        let Some(subnet) = store.subnets.get(&input.subnet_id) else {
+            return Err(state::invalid_subnet_id_not_found(&input.subnet_id));
+        };
+        // "The CIDR that has been reserved" (`SubnetCidrReservation$Cidr`) is a range of the
+        // subnet's own range, so every address of it has to be an address that subnet has —
+        // in the family the request named, a subnet's IPv4 block being no part of its IPv6
+        // blocks and the other way round. A subnet with no block of that family therefore
+        // contains no range of it at all.
+        let within_subnet = match family {
+            AddressFamily::Ipv4 => subnet
+                .cidr_block
+                .as_deref()
+                .is_some_and(|block| state::ipv4_cidr_block_contains(block, &cidr)),
+            AddressFamily::Ipv6 => subnet
+                .ipv6_cidr_block_association_set
+                .iter()
+                .flatten()
+                .filter_map(|association| association.ipv6_cidr_block.as_deref())
+                .any(|block| state::ipv6_cidr_block_contains(block, &cidr)),
+        };
+        if !within_subnet {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({cidr}) for parameter cidr is invalid. \
+                 The CIDR must be within the CIDR range of subnet '{subnet_id}'.",
+                subnet_id = input.subnet_id,
+            )));
+        }
+        // Two reservations of one subnet cannot both hold an address (Amazon VPC User Guide,
+        // "Subnet CIDR reservations": a range you reserve cannot overlap an existing
+        // reservation of that subnet), whatever each one's type. The conflict is per SUBNET,
+        // so the same range reserved in another subnet is not one, and ranges of different
+        // families never overlap ([`crate::state::cidr_blocks_overlap`]). EC2 documents no
+        // error code of its own for this conflict, so it is refused as the parameter value it
+        // is, naming the reservation in the way.
+        if let Some(conflicting) = store
+            .subnet_cidr_reservations
+            .values()
+            .filter(|held| held.subnet_id.as_deref() == Some(input.subnet_id.as_str()))
+            .find(|held| {
+                held.cidr
+                    .as_deref()
+                    .is_some_and(|held_cidr| state::cidr_blocks_overlap(held_cidr, &cidr))
+            })
+            .and_then(|held| held.subnet_cidr_reservation_id.clone())
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({cidr}) for parameter cidr is invalid. \
+                 The CIDR overlaps the existing subnet CIDR reservation '{conflicting}'."
+            )));
+        }
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of.
+        if !store.has_subnet_cidr_reservation_capacity() {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {max} subnet CIDR reservations, which is as many as it \
+                 stores",
+                max = state::MAX_STORED_RECORDS_PER_STORE,
+            )));
+        }
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let Some(reservation_id) =
+            store.insert_subnet_cidr_reservation(state::SubnetCidrReservationSpec {
+                subnet_id: input.subnet_id.clone(),
+                cidr,
+                // One member of the model's `SubnetCidrReservationType` enum: the boundary
+                // validator has already refused every other value.
+                reservation_type: input.reservation_type.clone(),
+                description: input.description.clone(),
+                tags,
+            })
+        else {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {max} subnet CIDR reservations, which is as many as it \
+                 stores",
+                max = state::MAX_STORED_RECORDS_PER_STORE,
+            )));
+        };
+
+        // The answer is the record as it was stored, so `CreateSubnetCidrReservation` and
+        // `GetSubnetCidrReservations` cannot drift apart.
+        let Some(reservation) = store.subnet_cidr_reservations.get(&reservation_id).cloned() else {
+            return Err(state::internal_error(format!(
+                "the subnet CIDR reservation '{reservation_id}' just created could not be \
+                 read back"
+            )));
+        };
+        Ok(CreateSubnetCidrReservationOutput {
+            subnet_cidr_reservation: Some(SubnetCidrReservation {
+                // "The tags assigned to the subnet CIDR reservation" (`$Tags`): reported
+                // only when the reservation carries any, so creating an untagged one does
+                // not answer with an empty set.
+                tags: reservation.tags.clone().filter(|tags| !tags.is_empty()),
+                ..reservation
+            }),
+        })
     }
 }

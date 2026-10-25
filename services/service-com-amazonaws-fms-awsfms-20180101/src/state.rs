@@ -229,10 +229,17 @@ pub const SCOPE_ID_TYPE_ACCOUNT: &str = "ACCOUNT";
 /// [`crate::ops::types::SECURITY_SERVICE_TYPE_VALUES`].
 pub const SECURITY_SERVICE_SHIELD_ADVANCED: &str = "SHIELD_ADVANCED";
 
-/// The default `CustomerPolicyStatus` of a policy an administrator created: the
-/// administrator can manage and delete it. One of
+/// The `CustomerPolicyStatus` of a policy that IS in the administrative scope
+/// governing it: "the administrator can manage and delete the policy"
+/// (`Policy$PolicyStatus`). One of
 /// [`crate::ops::types::CUSTOMER_POLICY_STATUS_VALUES`].
 pub const POLICY_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The `CustomerPolicyStatus` of a policy that is OUTSIDE the administrative
+/// scope governing it: "the administrator can view the policy, but they can't
+/// edit or delete the policy" (`Policy$PolicyStatus`). One of
+/// [`crate::ops::types::CUSTOMER_POLICY_STATUS_VALUES`].
+pub const POLICY_STATUS_OUT_OF_ADMIN_SCOPE: &str = "OUT_OF_ADMIN_SCOPE";
 
 /// The default `ResourceSetStatus` of a resource set an administrator created:
 /// it is in the administrator's Region scope, so the administrator can manage
@@ -291,10 +298,17 @@ pub const ASSOCIATION_SETTLE: Duration = Duration::from_millis(400);
 /// member of `Policy` or `PolicySummary` carries them, and they are what the
 /// later compliance-status slice (`ListComplianceStatus`, which reports a
 /// policy's last evaluation) reads.
+///
+/// `region` is the Region the policy was created in — the one its ARN names.
+/// It is held as a field rather than read back out of the ARN because it is
+/// state in its own right: a policy is a regional resource, and whether it is
+/// in an administrator's Region scope
+/// ([`ComAmazonawsFmsAwsfms20180101State::policy_status`]) is decided from it.
 #[derive(Debug, Clone)]
 pub struct PolicyRecord {
     pub policy_id: String,
     pub policy_arn: String,
+    pub region: String,
     pub update_token: String,
     pub policy: Policy,
     pub tags: Vec<Tag>,
@@ -305,18 +319,28 @@ pub struct PolicyRecord {
 impl PolicyRecord {
     /// The stored policy as `GetPolicy`/`PutPolicy` return it: the caller's own
     /// members, with the service-owned `PolicyId` and `PolicyUpdateToken`
-    /// filled in from the record so a read never reports a stale token.
-    pub fn policy(&self) -> Policy {
+    /// filled in from the record so a read never reports a stale token, and the
+    /// service-derived `PolicyStatus` the caller passes in.
+    ///
+    /// `policy_status` is a PARAMETER rather than a stored member because the
+    /// service derives it from the administrative scope governing the policy
+    /// ([`ComAmazonawsFmsAwsfms20180101State::policy_status`]), which lives
+    /// beside the policy rather than inside it: taking it here is what stops a
+    /// reader reporting a status that is not derived at all.
+    pub fn policy(&self, policy_status: &str) -> Policy {
         let mut policy = self.policy.clone();
         policy.policy_id = Some(self.policy_id.clone());
         policy.policy_update_token = Some(self.update_token.clone());
+        policy.policy_status = Some(policy_status.to_string());
         policy
     }
 
     /// The `PolicySummary` projection `ListPolicies` reports, every member read
     /// off the stored policy (`SecurityServiceType` is the stored
-    /// `SecurityServicePolicyData.Type`).
-    pub fn summary(&self) -> PolicySummary {
+    /// `SecurityServicePolicyData.Type`) and `PolicyStatus` the same derived
+    /// value [`Self::policy`] reports, so a summary cannot disagree with the
+    /// `Policy` a reader gets for the same id.
+    pub fn summary(&self, policy_status: &str) -> PolicySummary {
         PolicySummary {
             policy_arn: Some(self.policy_arn.clone()),
             policy_id: Some(self.policy_id.clone()),
@@ -325,7 +349,7 @@ impl PolicyRecord {
             security_service_type: Some(self.policy.security_service_policy_data.r#type.clone()),
             remediation_enabled: self.policy.remediation_enabled,
             delete_unused_fm_managed_resources: self.policy.delete_unused_fm_managed_resources,
-            policy_status: self.policy.policy_status.clone(),
+            policy_status: Some(policy_status.to_string()),
         }
     }
 }
@@ -1410,6 +1434,44 @@ impl ComAmazonawsFmsAwsfms20180101State {
             .collect()
     }
 
+    /// The `CustomerPolicyStatus` of one stored policy: SERVICE-DERIVED, from
+    /// the administrative scope that governs the policy rather than from
+    /// anything a caller sent.
+    ///
+    /// `Policy$PolicyStatus` "indicates whether the policy is in or out of an
+    /// admin's policy or Region scope": [`POLICY_STATUS_ACTIVE`] while that
+    /// scope covers both the policy's type and its Region — "the administrator
+    /// can manage and delete the policy" — and
+    /// [`POLICY_STATUS_OUT_OF_ADMIN_SCOPE`] otherwise, where "the administrator
+    /// can view the policy, but they can't edit or delete" it.
+    ///
+    /// The governing scope is the CALLING account's own `AdminScope` when
+    /// `PutAdminAccount` configured one for it ("the resources that the
+    /// specified Firewall Manager administrator can manage"). With none, the
+    /// caller administers the organization as its default administrator, which
+    /// "has full administrative scope that allows administration of all policy
+    /// types, accounts, organizational units, and Regions"
+    /// ([`default_admin_scope`]) — nothing can narrow it, so every policy is in
+    /// it. `PutAdminAccount` refuses to configure a scope for the default
+    /// administrator's account, so the two cases cannot overlap.
+    ///
+    /// Derived on every read, so narrowing an administrator's scope moves the
+    /// policies it no longer covers out of scope and widening it moves them
+    /// back, and no two readers of one policy can report different statuses.
+    pub fn policy_status(&self, record: &PolicyRecord) -> &'static str {
+        let Some(admin) = self.organization_admins.get(::engine::emulator_account_id()) else {
+            return POLICY_STATUS_ACTIVE;
+        };
+        let security_service_type = record.policy.security_service_policy_data.r#type.as_str();
+        if admin_scope_manages_policy_type(&admin.admin_scope, security_service_type)
+            && admin_scope_manages_region(&admin.admin_scope, &record.region)
+        {
+            POLICY_STATUS_ACTIVE
+        } else {
+            POLICY_STATUS_OUT_OF_ADMIN_SCOPE
+        }
+    }
+
     /// The `PolicyComplianceStatus` of ONE member account under ONE stored
     /// policy: the per-account summary `ListComplianceStatus` reports.
     ///
@@ -1824,6 +1886,55 @@ pub fn admin_scope_manages_account(scope: &AdminScope, account_id: &str) -> bool
 /// types can only be managed by the Firewall Manager default administrator".
 /// One of [`crate::ops::types::SECURITY_SERVICE_TYPE_VALUES`].
 pub const SECURITY_SERVICE_THIRD_PARTY_FIREWALL: &str = "THIRD_PARTY_FIREWALL";
+
+/// Whether an administrator holding `scope` may manage a policy whose
+/// `SecurityServicePolicyData.Type` is `security_service_type`.
+///
+/// `PolicyTypeScope`'s own documented reading, beside
+/// [`admin_scope_manages_account`] so no reader re-derives it:
+/// `AllPolicyTypesEnabled` "allows the specified Firewall Manager administrator
+/// to manage all Firewall Manager policy types, except for third-party policy
+/// types" ([`SECURITY_SERVICE_THIRD_PARTY_FIREWALL`], which "can only be
+/// managed by the Firewall Manager default administrator"); otherwise the
+/// listed `PolicyTypes` are "the list of policy types that the specified
+/// Firewall Manager administrator can manage". A scope that configures no
+/// `PolicyTypeScope` at all has been granted no policy type, so it manages
+/// none.
+pub fn admin_scope_manages_policy_type(scope: &AdminScope, security_service_type: &str) -> bool {
+    let Some(policy_type_scope) = scope.policy_type_scope.as_ref() else {
+        return false;
+    };
+    if policy_type_scope.all_policy_types_enabled {
+        return security_service_type != SECURITY_SERVICE_THIRD_PARTY_FIREWALL;
+    }
+    policy_type_scope
+        .policy_types
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|listed| listed == security_service_type)
+}
+
+/// Whether an administrator holding `scope` may act in `region`.
+///
+/// `RegionScope`'s own documented reading: `AllRegionsEnabled` "allows the
+/// specified Firewall Manager administrator to manage all Amazon Web Services
+/// Regions"; otherwise the listed `Regions` are "the Amazon Web Services
+/// Regions that the specified Firewall Manager administrator can perform
+/// actions in". A scope that configures no `RegionScope` at all has been
+/// granted no Region, so it covers none.
+pub fn admin_scope_manages_region(scope: &AdminScope, region: &str) -> bool {
+    let Some(region_scope) = scope.region_scope.as_ref() else {
+        return false;
+    };
+    region_scope.all_regions_enabled
+        || region_scope
+            .regions
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|listed| listed == region)
+}
 
 /// Why `scope` is not an administrative scope this service can grant, or `None`
 /// when it is — the service-level validation of an `AdminScope` a caller sends,

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFunction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFunction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFunction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: replaces the code and the configuration of the `DEVELOPMENT` stage of one
+//! stored function under the `If-Match` precondition — the function the URI label names is
+//! looked up in this service's state, the submitted version token is compared against the
+//! one that stage currently carries, the code and the configuration are refused at the
+//! same published quotas a create is refused at, and only then is the stage written,
+//! `LastModifiedTime` moved to now and a fresh version token minted. The answer is the
+//! stored record, so a later `DescribeFunction` and `GetFunction` report exactly what this
+//! call persisted. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +88,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::IfMatch;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -162,18 +165,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFunction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFunctionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFunction"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // "To update a function, you provide the function's name and version (ETag value)
+        // along with the updated function code": an update names NO stage, and the stage a
+        // function is edited in is the one it is created in — "In this stage, you can test
+        // the function with TestFunction, and update it with UpdateFunction" — so the
+        // version this call is checked against, and the record it writes, are the
+        // DEVELOPMENT stage's. A name no function holds is "the function does not exist",
+        // and is answered before the precondition, which can only be checked against a
+        // stored version.
+        let Some(current_etag) = store
+            .function(&input.name)
+            .map(|stored| stored.development.etag.clone())
+        else {
+            return Err(UpdateFunctionErrorModeled::NoSuchFunctionExists(
+                crate::state::no_such_function_exists(
+                    &input.name,
+                    crate::state::FUNCTION_STAGE_DEVELOPMENT,
+                ),
+            )
+            .into());
+        };
+
+        // The precondition is checked against the STORED version, so an update only lands
+        // on the function its caller actually read: a token that is not a version token at
+        // all is "missing or not valid", and a well-formed token that is not the current
+        // one is a failed precondition.
+        match crate::state::check_if_match(&current_etag, Some(input.if_match.as_str())) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => {
+                return Err(UpdateFunctionErrorModeled::InvalidIfMatchVersion(
+                    crate::state::invalid_if_match_version(),
+                )
+                .into());
+            }
+            IfMatch::Stale => {
+                return Err(UpdateFunctionErrorModeled::PreconditionFailed(
+                    crate::state::precondition_failed(),
+                )
+                .into());
+            }
+        }
+
+        // Every refusal below is decided BEFORE anything is written, so a refused update
+        // leaves the stored function exactly as it was: its code, its configuration and
+        // its version token all stand.
+
+        // "The function is too large": the same published function-size quota the create
+        // path applies — code is stored by whichever call carries it, so an update cannot
+        // store code past what CloudFront runs either.
+        if input.function_code.len() > crate::state::MAX_FUNCTION_CODE_BYTES {
+            return Err(UpdateFunctionErrorModeled::FunctionSizeLimitExceeded(
+                FunctionSizeLimitExceeded {
+                    message: Some(format!(
+                        "The function is too large: the code is {} bytes and at most {} bytes \
+                         are allowed per function",
+                        input.function_code.len(),
+                        crate::state::MAX_FUNCTION_CODE_BYTES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The same configuration check the create path applies: a whole `FunctionConfig`
+        // is stored by either call, so a configuration describing no function this service
+        // can hold is refused with the modelled `InvalidArgument` on both.
+        if let Some(reason) = store.function_config_unusable(&input.function_config) {
+            return Err(UpdateFunctionErrorModeled::InvalidArgument(InvalidArgument {
+                message: Some(format!("An argument is invalid: {reason}")),
+            })
+            .into());
+        }
+
+        let Some(stored) = store.apply_function_update(
+            &input.name,
+            input.function_config,
+            input.function_code,
+            now,
+        ) else {
+            return Err(UpdateFunctionErrorModeled::NoSuchFunctionExists(
+                crate::state::no_such_function_exists(
+                    &input.name,
+                    crate::state::FUNCTION_STAGE_DEVELOPMENT,
+                ),
+            )
+            .into());
+        };
+
+        Ok(UpdateFunctionOutput {
+            // "Contains configuration information and metadata about a CloudFront
+            // function" — the projection of the stage this call just wrote.
+            function_summary: Some(stored.development.to_summary(&stored.name, &stored.arn)),
+            // "The version identifier for the current version of the CloudFront function":
+            // a fresh token, so the version this caller just replaced no longer satisfies
+            // an `If-Match`.
+            e_tag: Some(stored.development.etag.clone()),
+        })
     }
 }
