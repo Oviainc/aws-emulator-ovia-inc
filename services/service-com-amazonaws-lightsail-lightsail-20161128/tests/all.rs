@@ -41,6 +41,8 @@ mod container_service_lifecycle;
 mod container_service_metric_data;
 #[path = "all/container_service_public_endpoint.rs"]
 mod container_service_public_endpoint;
+#[path = "all/cost_estimate.rs"]
+mod cost_estimate;
 #[path = "all/disk_attachment.rs"]
 mod disk_attachment;
 #[path = "all/disk_block_storage.rs"]
