@@ -23,6 +23,8 @@ mod cluster_device_capability;
 mod cluster_job_listing;
 #[path = "all/cluster_node_updates.rs"]
 mod cluster_node_updates;
+#[path = "all/cluster_provisioning.rs"]
+mod cluster_provisioning;
 #[path = "all/cluster_updates.rs"]
 mod cluster_updates;
 #[path = "all/export_job_parts.rs"]

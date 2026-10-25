@@ -300,6 +300,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The lens reviews this template carries: one per applied lens, each against the
+        // version of that lens's content as of the instant the lenses above resolved, so
+        // the review is pinned to the version it was applied at rather than following
+        // whatever `CreateLensVersion` publishes next.
+        let lens_reviews = store.applied_lens_reviews(&input.lenses, now);
         let template_arn = store.mint_review_template_arn(&region);
         let record = crate::state::ReviewTemplateRecord {
             template_arn: template_arn.clone(),
@@ -318,10 +323,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A new template's lens reviews carry no answers yet: every question of
             // every applied lens is `UNANSWERED` until one is recorded.
             answers: std::collections::BTreeMap::new(),
-            // …and nothing has been written to those lens reviews either, so each
-            // reports the template's own `UpdatedAt` until
-            // `UpdateReviewTemplateLensReview` writes notes to it.
-            lens_reviews: std::collections::BTreeMap::new(),
+            // …and nothing has been written to those lens reviews either: each carries
+            // only the version of its lens the template applies it at, and reports this
+            // create's instant as its own `UpdatedAt` until something is written to it.
+            lens_reviews,
         };
 
         store.review_templates.insert(template_arn.clone(), record);

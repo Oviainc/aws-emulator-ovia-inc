@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListParticipantEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListParticipantEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListParticipantEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation reports
+//!
+//! The occurrences of ONE participant during ONE stage session: exactly the events the
+//! store holds for the `(stageArn, sessionId)` pair the request names
+//! ([`crate::state::StageSessionRecord`]) whose own `participantId` is the one the
+//! request names, in the order they occurred. An `Event` is "an occurrence during a
+//! stage session", so the occurrences are recorded where they happen — a participant
+//! joining or leaving over the stage's DATA plane
+//! (`crate::state::join_stage_session` / `crate::state::leave_stage_session`), a
+//! publisher's media beginning and ending with it, and a replication starting
+//! (`StartParticipantReplication`) — and this operation answers from those records
+//! alone.
+//!
+//! Two things it does beyond reading them, each stated once in
+//! [`ListParticipantEvents::handle`]: it refuses a `nextToken` it did not issue, and it
+//! pages the matching records with the documented default of fifty per page. A
+//! `(stageArn, sessionId)` pair this store holds no session for, and a participant that
+//! did nothing in it, are not errors — the model declares no
+//! `ResourceNotFoundException` here — they simply select no event.
 //!
 //! ## Shape of an operation
 //!
@@ -93,10 +104,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivsrealtime-amazoninter
 // here — hence the `ListParticipantEventsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivsrealtime#ListParticipantEvents")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivsrealtime#ListParticipantEvents",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListParticipantEventsErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    // Widened in through `extra_errors`: the SERVICE models `InternalServerException`
+    // (HTTP 500) though `ListParticipantEvents` does not list it, and it is the only
+    // honest answer if the shared engine cannot hand back this service's store.
+    InternalServerException(InternalServerException),
     ValidationException(ValidationException),
 }
 
@@ -146,23 +164,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_PARTICIPANT_EVENTS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report the occurrences of the named participant during the named stage session.
+    ///
+    /// A pure read over the stored session; nothing is written, so polling it while a
+    /// participant joins, publishes and leaves cannot itself change what a later caller
+    /// sees.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListParticipantEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListParticipantEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListParticipantEvents"))
+        // Nothing here reads request metadata: the events this reports are named
+        // entirely by the `stageArn`, `sessionId` and `participantId` members, whose
+        // modelled lengths and patterns the framework's constraint walk refuses with a
+        // 400 `ValidationException` before `handle` runs.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::store_unavailable(
+                ListParticipantEventsErrorModeled::InternalServerException,
+            )
+        })?;
+
+        // A `nextToken` this operation did not issue names no position, so it is
+        // refused rather than read as "start from the beginning" — including a token
+        // from this service's other listings, which name a position among records these
+        // pages do not hold.
+        let resume_after = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(
+                crate::state::decode_participant_event_page_token(token).ok_or_else(|| {
+                    crate::state::validation_failed(
+                        ListParticipantEventsErrorModeled::ValidationException,
+                        // The one rule this service words a foreign page token with,
+                        // shared with its other listings.
+                        crate::state::foreign_page_token_message(Self::NAME),
+                    )
+                })?,
+            ),
+        };
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            // Documented on `ListParticipantEventsRequest$maxResults`: "Maximum number
+            // of results to return. Default: 50" — the same default the model documents
+            // for every listing of this service.
+            .unwrap_or(crate::state::DEFAULT_LIST_PAGE_SIZE)
+            // Unreachable defence, not an accepted-and-adjusted input: the modelled
+            // `MaxParticipantEventResults` range (1..100) refuses a non-positive
+            // `maxResults` with a 400 before this handler runs. It is here only so a
+            // page size of zero can never make pagination loop forever.
+            .max(1);
+
+        let store = state.lock();
+        // Occurrence order, so an event recorded mid-pagination cannot shift a later
+        // page onto an already-returned one. An event belongs to the participant that
+        // triggered it (`Event$participantId`), so an occurrence of another participant
+        // is not this one's even where it names it as the remote participant. A pair
+        // this store holds no session for selects nothing: see the module note.
+        let matching: Vec<&crate::state::EventRecord> = store
+            .stage_session(&input.stage_arn, &input.session_id)
+            .map(crate::state::StageSessionRecord::events_in_occurrence_order)
+            .unwrap_or_default()
+            .iter()
+            .filter(|record| record.participant_id == input.participant_id)
+            .filter(|record| resume_after.is_none_or(|after| record.sequence > after))
+            .collect();
+        let page: Vec<&crate::state::EventRecord> =
+            matching.iter().take(page_size).copied().collect();
+        let events: Vec<Event> = page.iter().map(|record| record.to_event()).collect();
+        // A token only when an event is left over, and it names the position this page
+        // ended at: the last page carries none.
+        let next_token = page
+            .last()
+            .filter(|_| matching.len() > page_size)
+            .map(|record| crate::state::encode_participant_event_page_token(record.sequence));
+
+        Ok(ListParticipantEventsOutput { events, next_token })
     }
 }

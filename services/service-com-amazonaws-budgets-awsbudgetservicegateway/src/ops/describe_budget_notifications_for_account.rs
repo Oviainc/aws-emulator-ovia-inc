@@ -184,7 +184,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let store = crate::state::store_at(&state, now);
         // Ordered by `BudgetName`: the pagination token indexes into this order, so it
         // must not depend on `HashMap` iteration order.
         let mut found: Vec<&crate::state::StoredBudget> = store

@@ -159,6 +159,11 @@ impl Answer {
     fn member(&self, name: &str) -> &str {
         self.body[name].as_str().unwrap_or_default()
     }
+
+    /// The wire error code (`__type`), or the empty string on a success.
+    fn error_code(&self) -> &str {
+        self.body["__type"].as_str().unwrap_or_default()
+    }
 }
 
 async fn call(router: &MultiServiceRouter, uri: &str, body: Value) -> Answer {
@@ -274,10 +279,12 @@ async fn the_created_date_keeps_its_wire_type_across_reads_and_renames() {
     });
 
     // Rows differ along how the read names the account and along what has been written to
-    // it since: the created date is set once, so every row reports the same string.
+    // it since: the created date is set once, so every row reports the same string. The
+    // caller's own record is reached by the standalone call only — naming its own id is
+    // the authorization refusal, asserted on its own below.
     for (case, request) in [
         ("a second read, AccountId absent", json!({})),
-        ("AccountId named explicitly", json!({"AccountId": own})),
+        ("a third read, AccountId absent", json!({})),
     ] {
         let answer = get_account_information(&router, request).await;
         assert_eq!(
@@ -286,6 +293,16 @@ async fn the_created_date_keeps_its_wire_type_across_reads_and_renames() {
             answer.body["AccountCreatedDate"]
         );
     }
+
+    let named = get_account_information(&router, json!({"AccountId": own})).await;
+    assert_eq!(
+        (named.status, named.error_code()),
+        (403, "AccessDeniedException"),
+        "case \"AccountId named explicitly\": naming the caller's own id must be refused, \
+         got {} with {:?}",
+        named.status,
+        named.body
+    );
 
     for (case, name) in admitted_names() {
         let put = put_account_name(&router, json!({"AccountName": name})).await;
@@ -313,8 +330,9 @@ async fn the_account_name_is_reported_before_any_rename() {
     let own = default_account_id().to_string();
 
     // Rows differ along how the record came to exist and how the read names it: the
-    // caller's own pre-existing account (named and unnamed in the request), and a member
-    // account this emulator learned about from a write that never set a name.
+    // caller's own pre-existing account (reached by the standalone call, which is the
+    // only way to reach it), and a member account this emulator learned about from a
+    // write that never set a name.
     let contact = json!({
         "AccountId": account_id(0),
         "AlternateContactType": "BILLING",
@@ -332,10 +350,6 @@ async fn the_account_name_is_reported_before_any_rename() {
 
     for (case, request) in [
         ("the caller's own account, AccountId absent", json!({})),
-        (
-            "the caller's own account, AccountId named",
-            json!({"AccountId": own}),
-        ),
         (
             "a member account known only from an alternate-contact write",
             json!({"AccountId": account_id(0)}),
@@ -361,6 +375,16 @@ async fn the_account_name_is_reported_before_any_rename() {
             answer.body["AccountState"]
         );
     }
+
+    let named = get_account_information(&router, json!({"AccountId": own})).await;
+    assert_eq!(
+        (named.status, named.error_code()),
+        (403, "AccessDeniedException"),
+        "case \"the caller's own account, AccountId named\": naming the caller's own id \
+         must be refused, got {} with {:?}",
+        named.status,
+        named.body
+    );
 }
 
 #[tokio::test]

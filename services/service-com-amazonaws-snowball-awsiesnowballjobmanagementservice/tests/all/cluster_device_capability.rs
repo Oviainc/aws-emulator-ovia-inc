@@ -68,7 +68,7 @@ const INITIAL_CLUSTER_SIZE_MAX: i64 = 16;
 /// `ListClusters` is still a scaffold in this crate, so the only way to see a cluster the
 /// caller was never given an id for is the service's own store — the store `CreateCluster`
 /// writes, reached the way the service reaches it.
-fn stored_cluster_ids(engine: &Arc<engine::InMemoryEngine>) -> BTreeSet<String> {
+pub(crate) fn stored_cluster_ids(engine: &Arc<engine::InMemoryEngine>) -> BTreeSet<String> {
     let state = service_state(&**engine).expect("the service's store is on this engine");
     let store = state.lock();
     store.clusters.keys().cloned().collect()

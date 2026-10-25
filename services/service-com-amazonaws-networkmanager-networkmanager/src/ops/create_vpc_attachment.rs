@@ -189,13 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .to_string();
         if !core_network.topology.has_edge_location(&edge_location) {
             return Err(CreateVpcAttachmentErrorModeled::ValidationException(
-                crate::state::field_rejection(
+                crate::state::no_such_edge(
                     crate::state::FIELD_VPC_ARN,
-                    crate::state::VALIDATION_REASON_OTHER,
-                    format!(
-                        "core network {} configures no edge location in {edge_location}",
-                        input.core_network_id
-                    ),
+                    &input.core_network_id,
+                    &edge_location,
                 ),
             )
             .into());
@@ -271,6 +268,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                     input.options.as_ref(),
                                 )
                         }
+                        // An attachment of another kind is not this request, whatever the
+                        // token says.
                         crate::state::AttachmentDetail::Connect { .. }
                         | crate::state::AttachmentDetail::SiteToSiteVpn
                         | crate::state::AttachmentDetail::DirectConnectGateway { .. }

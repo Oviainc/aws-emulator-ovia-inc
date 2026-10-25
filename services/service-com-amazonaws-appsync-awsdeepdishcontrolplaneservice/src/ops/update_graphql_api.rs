@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateGraphqlApi
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateGraphqlApi`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateGraphqlApi::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: replaces the stored configuration of an existing `GraphqlApi` with the
+//! one the request carries and answers from the updated record in [`crate::state`], so
+//! `GetGraphqlApi` / `ListGraphqlApis` project the same thing afterwards.
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +184,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateGraphqlApi` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateGraphqlApiErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateGraphqlApi"))
+        // Which API is updated, and to what, depends only on the request body and the
+        // `apiId` in its URI: the API already exists, so nothing here is derived from
+        // the request's metadata (its ARN and endpoints were minted by the create).
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateGraphqlApiErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // An `apiId` that is not an API id at all is a malformed request, not a
+        // missing resource (see `crate::state::is_api_id`).
+        if !crate::state::is_api_id(&input.api_id) {
+            return Err(UpdateGraphqlApiErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_api_id_message(&input.api_id)),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // The configuration the API is to be left with has to be well formed on the
+        // same grounds as the one it was created with — an authentication type that
+        // is set up through a member of its own needs that member, no authentication
+        // type may be named twice, an OIDC issuer has to be an absolute URL and
+        // `ownerContact` has to fit its documented length. Checked BEFORE anything is
+        // written, so a refused update leaves the stored API exactly as it was.
+        if let Some(message) = crate::state::graphql_api_config_refusal(
+            &input.authentication_type,
+            input.open_id_connect_config.as_ref(),
+            input.user_pool_config.is_some(),
+            input.lambda_authorizer_config.is_some(),
+            input
+                .additional_authentication_providers
+                .as_deref()
+                .unwrap_or_default(),
+            input.owner_contact.as_deref(),
+        ) {
+            return Err(UpdateGraphqlApiErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        let mut guard = state.lock();
+        let Some(record) = guard.graphql_apis.get_mut(&input.api_id) else {
+            return Err(UpdateGraphqlApiErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        // "Updates a GraphqlApi object": the request carries the API's whole
+        // configuration (`name` and `authenticationType` are required on it), so the
+        // submitted configuration REPLACES the stored one member for member — a
+        // member the request omits is left absent rather than carried over from the
+        // previous configuration, exactly as the same member omitted on the create
+        // would have been.
+        record.name = input.name;
+        record.authentication_type = input.authentication_type;
+        record.owner_contact = input.owner_contact;
+        record.xray_enabled = input.xray_enabled;
+        record.query_depth_limit = input.query_depth_limit;
+        record.resolver_count_limit = input.resolver_count_limit;
+        record.merged_api_execution_role_arn = input.merged_api_execution_role_arn;
+        record.log_config = input.log_config;
+        record.user_pool_config = input.user_pool_config;
+        record.open_id_connect_config = input.open_id_connect_config;
+        record.lambda_authorizer_config = input.lambda_authorizer_config;
+        record.additional_authentication_providers = input
+            .additional_authentication_providers
+            .unwrap_or_default();
+        record.enhanced_metrics_config = input.enhanced_metrics_config;
+        // The one member the request may omit and still SET: the model documents the
+        // value `introspectionConfig` takes when no value is provided.
+        record.introspection_config = input
+            .introspection_config
+            .unwrap_or_else(|| crate::state::DEFAULT_INTROSPECTION_CONFIG.to_string());
+
+        // Everything the update request carries no member for is the API's identity or
+        // was fixed when it was created, so it survives the update untouched: the
+        // `apiId`, the ARN, the endpoints (`dns` / `uris`), the owning account, the
+        // `apiType`, the `visibility` ("This value cannot be changed once the API has
+        // been created"), the tags, and the API keys, data sources and environmental
+        // variables held under the API.
+
+        // Answer from the STORED record, so this body is the one `GetGraphqlApi` and
+        // `ListGraphqlApis` answer with afterwards.
+        Ok(UpdateGraphqlApiOutput {
+            graphql_api: Some(record.to_graphql_api()),
+        })
     }
 }

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/audit_records.rs"]
 mod audit_records;
+#[path = "all/create_time_tag_merge.rs"]
+mod create_time_tag_merge;
 #[path = "all/dashboard_lifecycle.rs"]
 mod dashboard_lifecycle;
 #[path = "all/dashboard_name_uniqueness.rs"]

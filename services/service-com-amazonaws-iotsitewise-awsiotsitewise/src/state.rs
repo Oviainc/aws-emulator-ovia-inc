@@ -23,7 +23,11 @@
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::dataset_export_jobs`], keyed by
 //! the workspace and the minted job id, each record carrying the request that
 //! started it and the instant it started, from which a read DERIVES how far the
-//! job has got. An execution of an action lives in
+//! job has got. A workspace's asynchronous queries live in
+//! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::queries`], keyed the same way,
+//! each record carrying what running its statement produced and the instant it
+//! was submitted, from which a read DERIVES the status the clock has made due. An
+//! execution of an action lives in
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::executions`], keyed by its own
 //! id, which is what `ListExecutions` summarises for the target resource a
 //! request names. The service's own settings live here too:
@@ -55,8 +59,9 @@ use crate::ops::types::{
     ExecutionEnvironmentVariables, ExecutionStatus, ExecutionSummary, ExportErrorReportLocation,
     ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform, Identity, ImageLocation,
     LoggingOptions, Mount, MountOverrides, PipelineExecutionStatus, PortalStatus, PortalTypeEntry,
-    ProcessingInput, PropertyType, ResolveTo, Resource, ResourceStatus, TargetResource,
-    TaskConfiguration, TimeInNanos, TrimSettings, Variant, WorkspaceEncryptionConfiguration,
+    ProcessingInput, PropertyType, QueryStatistics, ResolveTo, Resource, ResourceStatus,
+    TargetResource, TaskConfiguration, TimeInNanos, TrimSettings, Variant,
+    WorkspaceEncryptionConfiguration,
     WorkspaceEncryptionConfigurationInfo, WorkspaceStatus, ENCRYPTION_TYPE_VALUES,
     VIDEO_DATA_TYPE_VALUES,
 };
@@ -2471,6 +2476,163 @@ pub fn check_compute_nodes(computations: &[ComputeNode]) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// The asynchronous queries of a workspace: what `StartQuery` starts and
+// `DescribeQuery` reports. A query's STATUS is derived from the instant it was
+// submitted, exactly as a dataset export job's is, so a read reports what the
+// clock has made due without writing anything.
+// ---------------------------------------------------------------------------
+
+/// The `QueryStatus` a query reports from the instant it is submitted: "The
+/// initial query status. The value is always SUBMITTED upon creation"
+/// (`crate::ops::types::QUERY_STATUS_VALUES`).
+pub const QUERY_SUBMITTED: &str = "SUBMITTED";
+
+/// The value a query reports once the clock has started it running.
+pub const QUERY_RUNNING: &str = "RUNNING";
+
+/// The value a query whose statement produced a result reports. Terminal.
+pub const QUERY_COMPLETED: &str = "COMPLETED";
+
+/// The value a query whose run did not finish reports, beside the message saying
+/// why. Terminal.
+pub const QUERY_FAILED: &str = "FAILED";
+
+/// How long each step of a query's lifecycle takes: a submitted query stays
+/// `SUBMITTED` for this long, then reports `RUNNING` for this long, then is in its
+/// terminal status.
+///
+/// CHOSEN, not documented: AWS publishes no duration for either step — a query
+/// takes as long as the data it reads. The span is deliberately NON-ZERO, so a
+/// caller that describes a query straight after starting it still observes the
+/// transient statuses the real service reports, and short enough that a caller can
+/// poll the query through to its terminal one.
+pub const QUERY_STEP: Duration = Duration::from_millis(250);
+
+/// How many queries one workspace holds.
+///
+/// CHOSEN: starting a query is the only thing that adds one and nothing evicts
+/// one, so without a bound a stream of queries would grow one emulator process
+/// without limit.
+pub const MAX_QUERIES_PER_WORKSPACE: usize = 100;
+
+/// How many queries the store holds in total, across every workspace. The
+/// per-workspace cap cannot bound the store on its own, for the reason
+/// [`MAX_DATASET_EXPORT_JOBS`] states.
+pub const MAX_QUERIES: usize = 1_000;
+
+/// One query of a workspace, as `StartQuery` started it.
+///
+/// The statement is RUN while `StartQuery` is serving the request, so what the run
+/// produced is known from the moment the query exists and nothing has to be
+/// computed again later. What is NOT stored is the query's status: that is DERIVED
+/// from [`Self::submitted_at`] ([`Self::status`]), because the lifecycle is owed by
+/// the clock rather than by any call, so two readers of one query can never
+/// disagree about where it has got to and a read can never move it on.
+#[derive(Debug, Clone)]
+pub struct QueryRecord {
+    /// The `queryId` this query was minted with ([`new_id`]).
+    pub query_id: String,
+    /// The workspace the query was started in. A read is scoped to a workspace,
+    /// so the pair is the query's identity — see [`query_key`].
+    pub workspace_name: String,
+    /// The `queryStatement` the request carried. Modelled `@sensitive`, so no
+    /// operation reports it back; it is kept because it is what the query IS, and
+    /// what a reader of the query's results re-reads the store with.
+    pub query_statement: String,
+    /// The `clientToken` the request carried, if any: what makes a retry of that
+    /// same request replay this query rather than start a second one.
+    pub client_token: Option<String>,
+    /// When the query was submitted, which is the `submittedAt` a read reports.
+    pub submitted_at: SystemTime,
+    /// What running the statement produced.
+    pub outcome: QueryOutcome,
+}
+
+/// What running one query's statement over the store produced.
+#[derive(Debug, Clone)]
+pub enum QueryOutcome {
+    /// The run answered rows: how many there were, how many bytes of stored cells
+    /// it read and how long it took. These are the `QueryStatistics` a read
+    /// reports, each measured by the run itself.
+    Completed {
+        /// "The total number of rows returned by the query."
+        row_count: i64,
+        /// "The total number of bytes scanned during query execution."
+        bytes_scanned: i64,
+        /// "The total query execution time, in milliseconds."
+        execution_time_in_millis: i64,
+    },
+    /// The run did not finish, and the message saying why — the `errorMessage` a
+    /// read reports beside the `FAILED` status.
+    Failed {
+        /// "A human-readable error description for a failed query."
+        error_message: String,
+    },
+}
+
+impl QueryRecord {
+    /// The query's `status` at `now`: `SUBMITTED` until the first [`QUERY_STEP`]
+    /// has elapsed, `RUNNING` until the second has, and then the terminal status
+    /// its run earned — `COMPLETED` for a run that answered rows, `FAILED` for one
+    /// that did not finish. A terminal status never moves again.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        match self.completed_at(now) {
+            Some(_) => match self.outcome {
+                QueryOutcome::Completed { .. } => QUERY_COMPLETED,
+                QueryOutcome::Failed { .. } => QUERY_FAILED,
+            },
+            None if now >= self.submitted_at + QUERY_STEP => QUERY_RUNNING,
+            None => QUERY_SUBMITTED,
+        }
+    }
+
+    /// "The date and time when the query reached a terminal state": the instant
+    /// the terminal status fell due, and `None` until it has.
+    pub fn completed_at(&self, now: SystemTime) -> Option<SystemTime> {
+        let completes_at = self.submitted_at + 2 * QUERY_STEP;
+        (now >= completes_at).then_some(completes_at)
+    }
+
+    /// The query's `statistics` at `now`: "statistics about a COMPLETED query
+    /// execution", so a query that has not reached its terminal status yet, and one
+    /// whose run failed, reports none.
+    pub fn statistics(&self, now: SystemTime) -> Option<QueryStatistics> {
+        match (&self.outcome, self.completed_at(now)) {
+            (
+                QueryOutcome::Completed {
+                    row_count,
+                    bytes_scanned,
+                    execution_time_in_millis,
+                },
+                Some(_),
+            ) => Some(QueryStatistics {
+                row_count: *row_count,
+                bytes_scanned: *bytes_scanned,
+                execution_time_in_millis: *execution_time_in_millis,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The query's `errorMessage` at `now`: the message its failed run carried,
+    /// and `None` until that failure is the status the query reports.
+    pub fn error_message(&self, now: SystemTime) -> Option<String> {
+        match (&self.outcome, self.completed_at(now)) {
+            (QueryOutcome::Failed { error_message }, Some(_)) => Some(error_message.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// The key [`ComAmazonawsIotsitewiseAwsiotsitewiseState::queries`] holds a query
+/// under: the workspace it was started in and its own id, because every operation
+/// on a query addresses it within a workspace, so a query of one workspace is not
+/// reachable through another.
+pub fn query_key(workspace_name: &str, query_id: &str) -> (String, String) {
+    (workspace_name.to_string(), query_id.to_string())
+}
+
 /// The `ListTimeSeriesType` value of a series associated with an asset property.
 pub const TIME_SERIES_TYPE_ASSOCIATED: &str = "ASSOCIATED";
 
@@ -2626,6 +2788,12 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// were created in and their own id — because every operation on a job
     /// addresses it within a workspace.
     pub dataset_export_jobs: HashMap<(String, String), DatasetExportJobRecord>,
+    /// The asynchronous queries of every workspace, by [`query_key`] — the
+    /// workspace they were started in and their own id — because every operation
+    /// on a query addresses it within a workspace. Written by `StartQuery` and
+    /// read by `DescribeQuery`; bounded by [`MAX_QUERIES`] and
+    /// [`MAX_QUERIES_PER_WORKSPACE`].
+    pub queries: HashMap<(String, String), QueryRecord>,
     /// Workspaces by `workspaceName`, which is what identifies one in an
     /// account and region.
     pub workspaces: HashMap<String, WorkspaceRecord>,
@@ -3739,6 +3907,9 @@ pub const RESOURCE_WORKSPACE: &str = "Workspace";
 
 /// The resource kind those errors name for a pipeline execution.
 pub const RESOURCE_PIPELINE_EXECUTION: &str = "Pipeline Execution";
+
+/// The resource kind those errors name for a query of a workspace.
+pub const RESOURCE_QUERY: &str = "Query";
 
 /// The resource kind those errors name for a composite model of an asset model.
 ///

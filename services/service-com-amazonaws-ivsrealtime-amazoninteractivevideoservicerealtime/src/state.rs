@@ -5,7 +5,8 @@
 //! The stage lifecycle (`CreateStage`, `GetStage`, `ListStages`, `UpdateStage`,
 //! `DeleteStage`), the token issuance that makes a stage usable
 //! (`CreateParticipantToken`), the stage sessions a stage's participants are
-//! grouped into (`ListParticipants`) and the compositions a stage is composed into
+//! grouped into (`ListParticipants`), the occurrences during one of those sessions
+//! (`ListParticipantEvents`) and the compositions a stage is composed into
 //! (`StartComposition`, `GetComposition`, `StopComposition`) all read and write the
 //! records below, so the records, the id minting they share and the modelled defaults
 //! they apply live here rather than in any one operation's file.
@@ -21,7 +22,7 @@ use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
     AutoParticipantRecordingConfiguration, Composition, ConflictException, Destination,
-    DestinationConfiguration, DestinationDetail, EncoderConfiguration, GridConfiguration,
+    DestinationConfiguration, DestinationDetail, EncoderConfiguration, Event, GridConfiguration,
     IngestConfiguration, InternalServerException, LayoutConfiguration,
     ParticipantRecordingHlsConfiguration, ParticipantReplica, ParticipantSummary,
     ParticipantThumbnailConfiguration, ParticipantToken, PipConfiguration,
@@ -308,8 +309,9 @@ pub const NO_ACTIVE_SESSION_ID: &str = "";
 ///
 /// The model documents it on `ListStagesRequest$maxResults` ("Maximum number of
 /// results to return. Default: 50.") and states the same default on
-/// `ListParticipantsRequest$maxResults`, `ListParticipantReplicasRequest$maxResults`
-/// and `ListStageSessionsRequest$maxResults`, so those listings page by it.
+/// `ListParticipantsRequest$maxResults`, `ListParticipantReplicasRequest$maxResults`,
+/// `ListParticipantEventsRequest$maxResults` and `ListStageSessionsRequest$maxResults`,
+/// so those listings page by it.
 pub const DEFAULT_LIST_PAGE_SIZE: usize = 50;
 
 /// Total size an `attributes` map may reach, on every shape of this service that
@@ -461,6 +463,12 @@ pub const MAX_STAGE_SESSIONS_PER_STAGE: usize = 1_000;
 /// Participants this emulator keeps per stage session, bounded the same way and for
 /// the same reason as [`MAX_STAGE_SESSIONS_PER_STAGE`].
 pub const MAX_PARTICIPANTS_PER_SESSION: usize = 1_000;
+
+/// Occurrences this emulator keeps per stage session, bounded the same way and for the
+/// same reason as [`MAX_STAGE_SESSIONS_PER_STAGE`]: an occurrence is not an API call
+/// either (see [`EventRecord`]), so reaching the bound is not a request to refuse — the
+/// occurrence is simply not recorded.
+pub const MAX_EVENTS_PER_SESSION: usize = 10_000;
 
 // ---------------------------------------------------------------------------
 // What an ingest configuration reports beyond what the creating request said
@@ -736,6 +744,10 @@ const STORAGE_CONFIGURATION_PAGE_TOKEN_PREFIX: &str = "ivs-realtime-storage-conf
 /// The same marker for a `ListStageSessions` page, kept distinct from the others so a
 /// token issued by one listing names no position in another and is refused there.
 const STAGE_SESSION_PAGE_TOKEN_PREFIX: &str = "ivs-realtime-stage-session-after:";
+
+/// The same marker for a `ListParticipantEvents` page, kept distinct from the others so
+/// a token issued by one listing names no position in another and is refused there.
+const PARTICIPANT_EVENT_PAGE_TOKEN_PREFIX: &str = "ivs-realtime-participant-event-after:";
 
 /// One stage, as `CreateStage` persisted it and `GetStage` / `ListStages` report it.
 #[derive(Debug, Clone)]
@@ -1368,6 +1380,170 @@ impl ParticipantRecord {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The occurrences of a stage session
+//
+// The model's `Event` doc fixes what one is: "An occurrence during a stage session." So
+// an event is recorded where the occurrence happens and nowhere else — a participant
+// joining or leaving the session ([`join_stage_session`] / [`leave_stage_session`]) and
+// a publisher's replication starting (`StartParticipantReplication`) — and
+// `ListParticipantEvents` reports exactly those records. The names of `EventName` that
+// nothing here records are the ones nothing here does: this emulator serves no WebRTC
+// subscribe, fails no ingest and exchanges no participant token, so a `SUBSCRIBE_*`, an
+// error event or a `TOKEN_EXCHANGED` would name something that never happened.
+// ---------------------------------------------------------------------------
+
+/// `EventName` of a participant joining the session — one of the twelve values the
+/// modelled `EventName` carries (`smithy_query(query="shape",shape="EventName")`), and
+/// the occurrence [`join_stage_session`] records.
+pub const EVENT_JOINED: &str = "JOINED";
+
+/// `EventName` of a participant leaving the session, the counterpart of
+/// [`EVENT_JOINED`] and what [`leave_stage_session`] records.
+pub const EVENT_LEFT: &str = "LEFT";
+
+/// `EventName` of a participant starting to publish to the session.
+///
+/// A join that publishes is a join AND a publish — `ParticipantSummary$published` is
+/// "whether the participant ever published" — so the publisher's first media is its own
+/// occurrence beside the join's.
+pub const EVENT_PUBLISH_STARTED: &str = "PUBLISH_STARTED";
+
+/// `EventName` of a publishing participant's media ending, the counterpart of
+/// [`EVENT_PUBLISH_STARTED`]: a publisher that leaves the session stops publishing to
+/// it, so the two names alternate for one participant
+/// ([`StageSessionRecord::is_publishing`]).
+pub const EVENT_PUBLISH_STOPPED: &str = "PUBLISH_STOPPED";
+
+/// `EventName` of a publishing participant beginning to be replicated into another
+/// stage, which is what `StartParticipantReplication` does. The two members the model
+/// marks "applicable only if the event name is `REPLICATION_STARTED` or
+/// `REPLICATION_STOPPED`" (`destinationStageArn`, `destinationSessionId`) are carried by
+/// exactly this event.
+pub const EVENT_REPLICATION_STARTED: &str = "REPLICATION_STARTED";
+
+/// One occurrence during one stage session, as the data-plane seam that observed it
+/// recorded it ([`record_participant_event`]) and `ListParticipantEvents` reports it.
+#[derive(Debug, Clone)]
+pub struct EventRecord {
+    /// One of the modelled `EventName` values — the `EVENT_*` constants above.
+    pub name: String,
+    /// The participant the occurrence happened to: "the participant who triggered the
+    /// event", as `Event$participantId` states, and the id
+    /// `ListParticipantEvents` selects an event by.
+    pub participant_id: String,
+    /// When it occurred.
+    pub event_time: SystemTime,
+    /// The other participant the occurrence involves — "for a subscribe event, this is
+    /// the publisher. For a publish or join event, this is null", as
+    /// `Event$remoteParticipantId` states.
+    pub remote_participant_id: Option<String>,
+    /// The modelled `EventErrorCode` of an error event; "if the event is not an error
+    /// event, this field is null", as `Event$errorCode` states.
+    pub error_code: Option<String>,
+    /// Where the participant is replicated, carried only by a replication event.
+    pub destination_stage_arn: Option<String>,
+    /// The session of that destination stage, carried only by a replication event.
+    pub destination_session_id: Option<String>,
+    /// Whether [`Self::participant_id`] is a replicated participant.
+    pub replica: bool,
+    /// Occurrence order within the session, and the stable key `ListParticipantEvents`
+    /// pages over — the same role [`ParticipantRecord::sequence`] plays for
+    /// `ListParticipants`.
+    pub sequence: u64,
+}
+
+impl EventRecord {
+    /// The modelled `Event` this record reports in a `ListParticipantEvents` page.
+    ///
+    /// `previousToken` and `newToken` describe a `TOKEN_EXCHANGED` event ("Source
+    /// participant token for `TOKEN_EXCHANGED` event" / "Participant token created
+    /// during `TOKEN_EXCHANGED` event"), which no occurrence of this emulator is, so
+    /// they stay absent rather than reporting a token exchange that did not happen.
+    pub fn to_event(&self) -> Event {
+        Event {
+            name: Some(self.name.clone()),
+            participant_id: Some(self.participant_id.clone()),
+            event_time: Some(::aws_smithy_types::DateTime::from(self.event_time)),
+            remote_participant_id: self.remote_participant_id.clone(),
+            error_code: self.error_code.clone(),
+            destination_stage_arn: self.destination_stage_arn.clone(),
+            destination_session_id: self.destination_session_id.clone(),
+            replica: self.replica,
+            previous_token: None,
+            new_token: None,
+        }
+    }
+}
+
+/// What a data-plane seam observed occurring: the modelled name of the occurrence, the
+/// participant it happened to, and only those members that name applies to.
+///
+/// Everything else an [`EventRecord`] holds — when it occurred and where it sits in the
+/// session's occurrence order — is [`record_participant_event`]'s own doing, so no two
+/// callers can record an occurrence differently.
+#[derive(Debug, Default, Clone)]
+pub struct ParticipantEvent {
+    pub name: String,
+    pub participant_id: String,
+    pub remote_participant_id: Option<String>,
+    pub error_code: Option<String>,
+    pub destination_stage_arn: Option<String>,
+    pub destination_session_id: Option<String>,
+    pub replica: bool,
+}
+
+impl ParticipantEvent {
+    /// The occurrence `name` happening to `participant_id`, with every member that does
+    /// not apply to that name left unset.
+    pub fn new(name: &str, participant_id: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            participant_id: participant_id.to_string(),
+            ..Default::default()
+        }
+    }
+}
+
+/// Record `event` as having just occurred in the session `session_id` of `stage_arn`.
+///
+/// The ONE place an event record is created, so every seam that observes an occurrence
+/// writes the same representation of it: the instant is the one it occurred at and the
+/// position is the session's next occurrence position, which is what keeps a page of
+/// events in occurrence order.
+///
+/// `false` — nothing recorded — when this store holds no such session, or when the
+/// session is at [`MAX_EVENTS_PER_SESSION`] events.
+pub fn record_participant_event(
+    state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    stage_arn: &str,
+    session_id: &str,
+    event: ParticipantEvent,
+) -> bool {
+    if state
+        .stage_session(stage_arn, session_id)
+        .is_none_or(|session| session.events.len() >= MAX_EVENTS_PER_SESSION)
+    {
+        return false;
+    }
+    let sequence = state.next_sequence();
+    let Some(session) = session_mut(state, stage_arn, session_id) else {
+        return false;
+    };
+    session.events.push(EventRecord {
+        name: event.name,
+        participant_id: event.participant_id,
+        event_time: SystemTime::now(),
+        remote_participant_id: event.remote_participant_id,
+        error_code: event.error_code,
+        destination_stage_arn: event.destination_stage_arn,
+        destination_session_id: event.destination_session_id,
+        replica: event.replica,
+        sequence,
+    });
+    true
+}
+
 /// One started replication of one publishing participant into one destination stage, as
 /// `StartParticipantReplication` persisted it and `ListParticipantReplicas` reports it.
 #[derive(Debug, Clone)]
@@ -1442,6 +1618,10 @@ pub struct StageSessionRecord {
     /// Every participant that joined this session, in join order, the ones that have
     /// left included.
     pub participants: Vec<ParticipantRecord>,
+    /// Every occurrence during this session, in occurrence order — what
+    /// `ListParticipantEvents` reports. Written only by
+    /// [`record_participant_event`].
+    pub events: Vec<EventRecord>,
     /// Start order, the key a page over the sessions of one stage resumes from.
     pub sequence: u64,
 }
@@ -1468,6 +1648,38 @@ impl StageSessionRecord {
         let mut participants: Vec<&ParticipantRecord> = self.participants.iter().collect();
         participants.sort_by_key(|record| record.sequence);
         participants
+    }
+
+    /// This session's occurrences in the order they happened — the order
+    /// `ListParticipantEvents` pages over, so an occurrence recorded mid-pagination
+    /// cannot shift a later page onto an already-returned one.
+    ///
+    /// The stored order IS that order: the one writer
+    /// ([`record_participant_event`]) only ever appends, under a strictly increasing
+    /// position, so no ordering copy is needed.
+    pub fn events_in_occurrence_order(&self) -> &[EventRecord] {
+        &self.events
+    }
+
+    /// Whether `participant_id` is publishing to this session right now.
+    ///
+    /// Read off the occurrences themselves: [`EVENT_PUBLISH_STARTED`] and
+    /// [`EVENT_PUBLISH_STOPPED`] are what begin and end one participant's media, so the
+    /// later of the two is its publishing state and the two alternate rather than
+    /// repeating. [`ParticipantRecord::published`] cannot answer this — it is "whether
+    /// the participant EVER published", which stays set once set.
+    pub fn is_publishing(&self, participant_id: &str) -> bool {
+        // Over `self.events` directly, and from the back: the one writer
+        // ([`record_participant_event`]) only ever appends, under an increasing
+        // position, so the last matching record is the latest one and no ordering copy
+        // is needed to find it.
+        self.events
+            .iter()
+            .rfind(|event| {
+                event.participant_id == participant_id
+                    && (event.name == EVENT_PUBLISH_STARTED || event.name == EVENT_PUBLISH_STOPPED)
+            })
+            .is_some_and(|event| event.name == EVENT_PUBLISH_STARTED)
     }
 }
 
@@ -1516,6 +1728,10 @@ pub struct JoinedParticipant {
 /// of this service begins, so a participant that joins and a replica that is
 /// replicated in are in the SAME session of the stage.
 ///
+/// The join is also an occurrence of the session ([`EVENT_JOINED`]), and a join that
+/// publishes is a publish occurrence beside it ([`EVENT_PUBLISH_STARTED`]), so
+/// `ListParticipantEvents` reports what this recorded and nothing else.
+///
 /// `None` — nothing recorded — when this store holds no such stage, when the stage is
 /// at [`MAX_STAGE_SESSIONS_PER_STAGE`] sessions, or when the session is at
 /// [`MAX_PARTICIPANTS_PER_SESSION`] participants.
@@ -1527,10 +1743,13 @@ pub fn join_stage_session(
     // The session the stage is in, or a fresh one: "a stage session begins when the
     // first participant joins a stage".
     let session_id = ensure_active_session(state, stage_arn)?;
+    // Read off before the join is applied, because applying it consumes `joined`.
+    let participant_id = joined.participant_id.clone();
+    let publishes = joined.published;
 
     // A participant the session already holds is REJOINING it, so it keeps its id, its
     // first join instant and its page position.
-    {
+    let rejoined = {
         let session = session_mut(state, stage_arn, &session_id)?;
         if let Some(rejoined) = session
             .participants
@@ -1539,23 +1758,65 @@ pub fn join_stage_session(
         {
             rejoined.state = PARTICIPANT_STATE_CONNECTED.to_string();
             rejoined.published = rejoined.published || joined.published;
-            if let Some(recording_state) = joined.recording_state {
+            if let Some(recording_state) = joined.recording_state.clone() {
                 rejoined.recording_state = recording_state;
             }
             rejoined.redundant_ingest = joined.redundant_ingest;
             if joined.ingest_configuration_arn.is_some() {
-                rejoined.ingest_configuration_arn = joined.ingest_configuration_arn;
+                rejoined.ingest_configuration_arn = joined.ingest_configuration_arn.clone();
             }
-            return Some(rejoined.clone());
+            Some(rejoined.clone())
+        } else {
+            // Bound the store this join grows: the records are reclaimed only with the
+            // stage.
+            if session.participants.len() >= MAX_PARTICIPANTS_PER_SESSION {
+                return None;
+            }
+            None
         }
+    };
 
-        // Bound the store this join grows: the records are reclaimed only with the
-        // stage.
-        if session.participants.len() >= MAX_PARTICIPANTS_PER_SESSION {
-            return None;
-        }
+    let record = match rejoined {
+        Some(record) => record,
+        None => new_participant_record(state, stage_arn, &session_id, joined)?,
+    };
+
+    // Both a first join and a rejoin are a participant joining the session, so each is
+    // recorded; a publish is recorded only where the media actually begins, which a
+    // rejoin of a participant already publishing is not.
+    record_participant_event(
+        state,
+        stage_arn,
+        &session_id,
+        ParticipantEvent::new(EVENT_JOINED, &participant_id),
+    );
+    if publishes
+        && !state
+            .stage_session(stage_arn, &session_id)
+            .is_some_and(|session| session.is_publishing(&participant_id))
+    {
+        record_participant_event(
+            state,
+            stage_arn,
+            &session_id,
+            ParticipantEvent::new(EVENT_PUBLISH_STARTED, &participant_id),
+        );
     }
+    Some(record)
+}
 
+/// Put the participant `joined` describes into the session `session_id` of `stage_arn`
+/// as one NEW to it, and return the record the session now holds.
+///
+/// Split out of [`join_stage_session`] so the join's two paths — a rejoin and a first
+/// join — meet again at one place that records the occurrence, rather than one of them
+/// returning early.
+fn new_participant_record(
+    state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    stage_arn: &str,
+    session_id: &str,
+    joined: JoinedParticipant,
+) -> Option<ParticipantRecord> {
     // Only a participant that is NEW to the session takes a page position, so the join
     // order of a session's participants stays contiguous.
     let sequence = state.next_sequence();
@@ -1577,7 +1838,7 @@ pub fn join_stage_session(
         ingest_configuration_arn: joined.ingest_configuration_arn,
         sequence,
     };
-    session_mut(state, stage_arn, &session_id)?
+    session_mut(state, stage_arn, session_id)?
         .participants
         .push(record.clone());
     Some(record)
@@ -1611,6 +1872,9 @@ fn session_mut<'a>(
 /// `endTime` is set and the stage reports no active session again, so the next join
 /// begins a new session.
 ///
+/// The departure is also an occurrence of the session ([`EVENT_LEFT`]), preceded by the
+/// end of its media ([`EVENT_PUBLISH_STOPPED`]) when the participant was publishing.
+///
 /// `false` — nothing recorded — when this store holds no such stage, session or
 /// participant, or when that participant has already left.
 pub fn leave_stage_session(
@@ -1643,6 +1907,26 @@ pub fn leave_stage_session(
         }
         emptied
     };
+    // A participant that is publishing when it goes stops publishing first: the two
+    // publish names alternate ([`StageSessionRecord::is_publishing`]), and the departure
+    // is the last occurrence either way.
+    if state
+        .stage_session(stage_arn, session_id)
+        .is_some_and(|session| session.is_publishing(participant_id))
+    {
+        record_participant_event(
+            state,
+            stage_arn,
+            session_id,
+            ParticipantEvent::new(EVENT_PUBLISH_STOPPED, participant_id),
+        );
+    }
+    record_participant_event(
+        state,
+        stage_arn,
+        session_id,
+        ParticipantEvent::new(EVENT_LEFT, participant_id),
+    );
     if session_ended {
         if let Some(stage) = state.stages.get_mut(stage_arn) {
             if stage.active_session_id.as_deref() == Some(session_id) {
@@ -1986,6 +2270,7 @@ pub fn ensure_active_session(
             start_time: SystemTime::now(),
             end_time: None,
             participants: Vec::new(),
+            events: Vec::new(),
             sequence,
         });
     // The stage now reports the session a caller passes to `ListParticipants`, which is
@@ -2326,6 +2611,20 @@ pub fn encode_participant_page_token(after_sequence: u64) -> String {
 /// another listing included.
 pub fn decode_participant_page_token(token: &str) -> Option<u64> {
     decode_after(PARTICIPANT_PAGE_TOKEN_PREFIX, token)
+}
+
+/// [`encode_page_token`] for a `ListParticipantEvents` page: the occurrence position of
+/// the last event it reported, which the next page resumes after, under that listing's
+/// own marker.
+pub fn encode_participant_event_page_token(after_sequence: u64) -> String {
+    encode_after(PARTICIPANT_EVENT_PAGE_TOKEN_PREFIX, after_sequence)
+}
+
+/// The occurrence position a `ListParticipantEvents` `nextToken` resumes after, or
+/// `None` when the token was not issued by [`encode_participant_event_page_token`] — a
+/// token from another listing included.
+pub fn decode_participant_event_page_token(token: &str) -> Option<u64> {
+    decode_after(PARTICIPANT_EVENT_PAGE_TOKEN_PREFIX, token)
 }
 
 /// [`encode_page_token`] for a `ListStageSessions` page: the start sequence the next

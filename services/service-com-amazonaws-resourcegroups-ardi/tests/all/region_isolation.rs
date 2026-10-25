@@ -24,7 +24,7 @@
 use serde_json::{json, Value};
 
 use super::group_tags::pct;
-use super::resource_group_lifecycle::{error_code, identifier_names, Emulator, ACCOUNT};
+use super::resource_group_lifecycle::{error_code, identifier_names, static_group, Emulator, ACCOUNT};
 
 /// The regions a caller's SigV4 credential scope can name, spanning the forms the
 /// modelled `GroupArn` region production `[a-z]{2}(-[a-z]+)+-\d{1}` admits: a
@@ -253,9 +253,15 @@ fn foreign_calls() -> Vec<ForeignCall> {
 async fn no_operation_resolves_a_group_of_another_region() {
     let home = "us-east-1";
     let name = "scoped";
+    // A second group of the home region, configured so it can hold a static
+    // membership (`GroupResources` serves only a configured group, and a group
+    // carries either a query or a configuration, never both), so the membership
+    // half of the rule is asserted on a group that actually holds one.
+    let static_name = "scoped-static";
     let emulator = Emulator::new();
     let member = format!("arn:aws:ec2:{home}:{ACCOUNT}:instance/i-000000000000000a");
     let arn = group_arn(home, name);
+    let static_arn = group_arn(home, static_name);
 
     emulator
         .ok_in(
@@ -272,19 +278,25 @@ async fn no_operation_resolves_a_group_of_another_region() {
             }),
         )
         .await;
+    emulator.ok_in(home, "/groups", &static_group(static_name)).await;
     emulator
         .ok_in(
             home,
             "/group-resources",
-            &json!({ "Group": name, "ResourceArns": [member.clone()] }),
+            &json!({ "Group": static_name, "ResourceArns": [member.clone()] }),
         )
         .await;
     let before = emulator.ok_in(home, "/get-group", &json!({ "Group": name })).await;
 
     for region in REGIONS.iter().filter(|region| **region != home) {
-        // The identifier forms a caller can address the group with: its bare name,
-        // and the group's own stored ARN, which names the home region.
-        for identifier in [json!(name), json!(arn)] {
+        // The identifier forms a caller can address either group with: its bare
+        // name, and the group's own stored ARN, which names the home region.
+        for identifier in [
+            json!(name),
+            json!(arn),
+            json!(static_name),
+            json!(static_arn),
+        ] {
             for call in foreign_calls() {
                 let body = (call.body)(&identifier);
                 let (status, answered) = emulator.call_in(region, call.path, &body).await;
@@ -324,7 +336,6 @@ async fn no_operation_resolves_a_group_of_another_region() {
             "case {region:?}: expected an empty listing, got {listed}",
         );
     }
-
     // Every refusal above left the group exactly as it was: the same projection,
     // the same query, the same tags and the same membership.
     let after = emulator.ok_in(home, "/get-group", &json!({ "Group": name })).await;
@@ -351,7 +362,7 @@ async fn no_operation_resolves_a_group_of_another_region() {
         tags.1,
     );
     let members = emulator
-        .ok_in(home, "/list-group-resources", &json!({ "Group": name }))
+        .ok_in(home, "/list-group-resources", &json!({ "Group": static_name }))
         .await;
     let listed_members: Vec<&str> = members["Resources"]
         .as_array()
