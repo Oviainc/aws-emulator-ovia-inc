@@ -14,6 +14,16 @@
 //! [`crate::state::NO_TEST_RUNNER_REASON`] as `errorReason`) rather than in a fabricated
 //! `PASS`/`FAIL` with test results nothing produced.
 //!
+//! ## `parallelRun` decides whether a concurrent run is refused
+//!
+//! `SuiteRunConfiguration$parallelRun` is the input the model documents as governing
+//! exactly this — "TRUE if multiple test suites run in parallel" — so a second run of one
+//! definition is accepted while an earlier one is still in progress only when this request
+//! and that earlier run BOTH ask for a parallel run; otherwise the earlier run holds the
+//! definition and the start is refused with the modelled `ConflictException`. Runs that do
+//! share a definition are capped by
+//! [`crate::state::MAX_PARALLEL_RUNS_PER_DEFINITION`].
+//!
 //! ## An unknown definition is a `ValidationException`, not a `ResourceNotFoundException`
 //!
 //! `smithy_query(query="operation",operation="StartSuiteRun")` declares exactly three
@@ -208,16 +218,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // One run at a time per definition: any run of it that is not finished — PENDING,
-        // RUNNING, or STOPPING until the stop completes — refuses the next start.
-        let in_progress = store
-            .runs_of_mut(&input.suite_definition_id, now)
-            .find(|run| run.is_in_progress())
-            .map(|run| run.id.clone());
-        if let Some(in_progress) = in_progress {
+        // Concurrency, as `suiteRunConfiguration.parallelRun` governs it: two runs of one
+        // definition execute at the same time only when BOTH asked to run in parallel, so
+        // a run that is not finished — PENDING, RUNNING, or STOPPING until the stop
+        // completes — refuses the next start unless this request and that run both carry
+        // the member. Runs that do share the definition are capped
+        // (`MAX_PARALLEL_RUNS_PER_DEFINITION`), so the parallel case cannot hold the store
+        // open without limit.
+        let wants_parallel =
+            crate::state::asks_for_parallel_run(&input.suite_run_configuration);
+        let mut blocking: Option<String> = None;
+        let mut in_progress_count = 0usize;
+        for run in store.runs_of_mut(&input.suite_definition_id, now) {
+            if !run.is_in_progress() {
+                continue;
+            }
+            in_progress_count += 1;
+            if blocking.is_none() && !(wants_parallel && run.allows_parallel_runs()) {
+                blocking = Some(run.id.clone());
+            }
+        }
+        if let Some(in_progress) = blocking {
             return Err(StartSuiteRunErrorModeled::ConflictException(ConflictException {
                 message: Some(format!(
                     "Suite run {in_progress} is still in progress for suite definition {}",
+                    input.suite_definition_id
+                )),
+            })
+            .into());
+        }
+        if in_progress_count >= crate::state::MAX_PARALLEL_RUNS_PER_DEFINITION {
+            return Err(StartSuiteRunErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Suite definition {} already has {in_progress_count} suite runs in \
+                     progress, which is the maximum number that can run in parallel",
                     input.suite_definition_id
                 )),
             })
