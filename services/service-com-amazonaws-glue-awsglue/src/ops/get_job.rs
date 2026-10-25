@@ -138,7 +138,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // An unreachable store is an internal mounting fault, reported through
             // this operation's own server error.
@@ -150,11 +149,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
         // `JobName` is `@required` with `length 1..255`, so an absent or over-long name
-        // is refused at the boundary: reaching here, the only question is whether a job
-        // of that name is stored.
-        let Some(entry) = store.jobs.get(&input.job_name) else {
+        // is refused at the boundary: reaching here, the only question is whether THIS
+        // Region holds a job of that name — a job of another Region does not exist here.
+        let Some(entry) = store.job(&region, &input.job_name) else {
             return Err(GetJobErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
                     message: Some(format!("Job {} not found", input.job_name)),

@@ -263,18 +263,15 @@ fn entry_for(
         // deprecated version reports no list rather than an empty one.
         version_stages: version.stages_out(),
         created_date: Some(crate::state::timestamp(version.created_date)),
-        // "The date that this version of the secret was last accessed." No
-        // operation in this emulator records an access, so nothing has ever set
-        // one — the same reason `DescribeSecret` reports no `LastAccessedDate`.
-        last_accessed_date: None,
-        // "The KMS keys used to encrypt the secret version." A version is
-        // encrypted under the key the secret carries, which is the one
-        // `CreateSecret` recorded, in the form the caller gave it; a secret left
-        // on the Amazon-managed key records none and reports none here.
-        kms_key_ids: secret
-            .kms_key_id
-            .clone()
-            .map(|kms_key_id| vec![kms_key_id]),
+        // "The date that this version of the secret was last accessed", which
+        // the retrieval of its value records and which is omitted until one
+        // has (see `state::Secret::record_access`).
+        last_accessed_date: version.last_accessed_date.map(crate::state::timestamp),
+        // "The KMS keys used to encrypt the secret version." Every version is
+        // encrypted under some key, so this is never absent: the key the secret
+        // names, or the account's default Secrets Manager key for a secret that
+        // names none (see `state::Secret::encryption_key_ids`).
+        kms_key_ids: Some(secret.encryption_key_ids()),
     }
 }
 

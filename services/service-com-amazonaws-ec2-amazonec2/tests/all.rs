@@ -259,6 +259,8 @@ mod transit_gateway_multicast_domains;
 mod regions;
 #[path = "all/resource_specific_error_codes.rs"]
 mod resource_specific_error_codes;
+#[path = "all/revoke_security_group_ingress.rs"]
+mod revoke_security_group_ingress;
 #[path = "all/route_server_peers.rs"]
 mod route_server_peers;
 #[path = "all/route_servers.rs"]
@@ -415,3 +417,8 @@ mod ipam_byoasns;
 // associating a route server with a VPC, and reading one route server's associations back.
 #[path = "all/route_server_associations.rs"]
 mod route_server_associations;
+// Declared LAST for the reason the header gives: the sorted region of this file is where
+// every new ec2 suite inserts its lines. What `DeleteTrafficMirrorSession` deletes out of
+// the Traffic Mirror session store, and what it refuses.
+#[path = "all/traffic_mirror_sessions.rs"]
+mod traffic_mirror_sessions;

@@ -123,6 +123,8 @@ mod organization_configuration;
 mod organization_managed_members;
 #[path = "all/organization_statistics.rs"]
 mod organization_statistics;
+#[path = "all/publishing_destination_delete.rs"]
+mod publishing_destination_delete;
 #[path = "all/publishing_destination_lifecycle.rs"]
 mod publishing_destination_lifecycle;
 #[path = "all/publishing_destination_listing.rs"]
@@ -131,6 +133,8 @@ mod publishing_destination_listing;
 mod publishing_destination_update;
 #[path = "all/request_region_partition_bounds.rs"]
 mod request_region_partition_bounds;
+#[path = "all/resource_tag_addition.rs"]
+mod resource_tag_addition;
 #[path = "all/resource_tag_removal.rs"]
 mod resource_tag_removal;
 #[path = "all/sample_finding_catalog.rs"]

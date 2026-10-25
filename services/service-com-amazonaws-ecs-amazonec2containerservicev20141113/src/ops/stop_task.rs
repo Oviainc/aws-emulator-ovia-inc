@@ -230,7 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             task.tags.clear();
             task.version += 1;
             for container in &mut task.containers {
-                container.last_status = crate::state::STATUS_DEACTIVATING.to_string();
+                container.advance_to(crate::state::STATUS_DEACTIVATING);
             }
         }
 

@@ -498,6 +498,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     secret_binary: input.secret_binary.clone(),
                     version_stages: vec![crate::state::STAGE_CURRENT.to_string()],
                     created_date: now,
+                    // Never retrieved yet: `LastAccessedDate` "is omitted if
+                    // the secret has never been retrieved".
+                    last_accessed_date: None,
                 },
                 now,
             );

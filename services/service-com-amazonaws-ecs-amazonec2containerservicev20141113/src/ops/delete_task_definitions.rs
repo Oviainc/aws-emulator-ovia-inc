@@ -163,14 +163,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You can specify up to 10 task definitions as a comma separated list" — the
         // documented size of ONE request, refused like every other batch bound this
-        // service states, naming the member and the count it was given.
+        // service states, naming the entries and the bound.
         if input.task_definitions.len() > crate::state::MAX_DELETE_TASK_DEFINITIONS {
             return Err(DeleteTaskDefinitionsErrorModeled::ClientException(
                 ClientException {
-                    message: Some(format!(
-                        "taskDefinitions must name at most {} task definitions; got {}",
+                    message: Some(crate::state::at_most_items_message(
+                        "task definitions",
                         crate::state::MAX_DELETE_TASK_DEFINITIONS,
-                        input.task_definitions.len()
                     )),
                 },
             )

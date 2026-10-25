@@ -878,3 +878,159 @@ async fn an_update_that_leaves_a_notification_in_alarm_publishes_its_alert() {
         }
     }
 }
+
+/// Rule, on the write that REPLACES a subscriber: `UpdateSubscriber` attaches
+/// `NewSubscriber` to the notification in `OldSubscriber`'s place, so a notification
+/// already in alarm owes its alert to the subscriber that call ATTACHES — one alert on
+/// the topic a replacement `SNS` subscriber names, and none when the notification is not
+/// in alarm, when the replacement is an address no service here hosts a transport for, or
+/// when it names the subscriber the notification already held (which attaches nothing).
+///
+/// The rows differ along the alarm state, along whether the replacement keeps or changes
+/// the subscription type, and along the Region of the topic it moves to.
+#[tokio::test]
+async fn updating_a_subscriber_of_a_notification_in_alarm_publishes_its_alert() {
+    for (case, state, held, new, expected) in [
+        (
+            "an email replaced by an SNS subscriber",
+            "ALARM",
+            email_subscriber(0),
+            sns_subscriber(&primary_topic()),
+            Some(primary_topic()),
+        ),
+        (
+            "an SNS subscriber moved to a topic in another Region",
+            "ALARM",
+            sns_subscriber(&primary_topic()),
+            sns_subscriber(&other_topic()),
+            Some(other_topic()),
+        ),
+        (
+            "an email replaced by an SNS subscriber, the notification not in alarm",
+            "OK",
+            email_subscriber(0),
+            sns_subscriber(&primary_topic()),
+            None,
+        ),
+        (
+            "an SNS subscriber replaced by an email address",
+            "ALARM",
+            sns_subscriber(&primary_topic()),
+            email_subscriber(1),
+            None,
+        ),
+        (
+            "a replacement naming the subscriber already held",
+            "ALARM",
+            sns_subscriber(&primary_topic()),
+            sns_subscriber(&primary_topic()),
+            None,
+        ),
+    ] {
+        let emulator = emulator();
+        given_topic(&emulator, REGION, "budget-alerts").await;
+        given_topic(&emulator, OTHER_REGION, "budget-alerts").await;
+        let name = "alert-subscriber-update";
+
+        let notification = json!({
+            "NotificationType": "ACTUAL",
+            "ComparisonOperator": "GREATER_THAN",
+            "Threshold": 80,
+            "NotificationState": state
+        });
+        let (status, body) = call(
+            &emulator.router,
+            "CreateBudget",
+            &json!({
+                "AccountId": account_id(),
+                "Budget": {
+                    "BudgetName": name,
+                    "TimeUnit": "MONTHLY",
+                    "BudgetType": "COST",
+                    "BudgetLimit": {"Amount": "100", "Unit": "USD"}
+                },
+                "NotificationsWithSubscribers": [{
+                    "Notification": notification,
+                    "Subscribers": [&held]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateBudget answered {status} {body}"
+        );
+        // Whatever the creating write already owed is set aside, so what is asserted
+        // below is what the UPDATE published.
+        let before = delivered(&emulator);
+
+        let (status, body) = call(
+            &emulator.router,
+            "UpdateSubscriber",
+            &json!({
+                "AccountId": account_id(),
+                "BudgetName": name,
+                "Notification": notification,
+                "OldSubscriber": &held,
+                "NewSubscriber": &new
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: UpdateSubscriber answered {status} {body}"
+        );
+
+        let found = delivered(&emulator);
+        // A MULTISET difference, not a containment filter: the row whose replacement
+        // names the subscriber already held would publish an alert IDENTICAL to the one
+        // the create owed, and a containment filter would hide that second copy — the
+        // very behaviour that row exists to refuse.
+        let mut remaining = before.clone();
+        let mut published: Vec<(String, Value)> = Vec::new();
+        for alert in found {
+            match remaining.iter().position(|held| *held == alert) {
+                Some(position) => {
+                    remaining.remove(position);
+                }
+                None => published.push(alert),
+            }
+        }
+        match expected {
+            Some(topic) => {
+                // One alert, on the topic the REPLACEMENT names, naming what the
+                // notification alerts on — its threshold type absent, so rendered as the
+                // percentage it means.
+                let want = alert(
+                    name,
+                    "COST",
+                    "MONTHLY",
+                    Some(("100", "USD")),
+                    "ACTUAL",
+                    "GREATER_THAN",
+                    80.0,
+                    THRESHOLD_TYPE_PERCENTAGE,
+                );
+                assert_eq!(
+                    published.len(),
+                    1,
+                    "case {case:?}: expected one alert from the update, got {published:?}"
+                );
+                assert_eq!(
+                    published[0].0, topic,
+                    "case {case:?}: expected the alert on {topic}, got it on {}",
+                    published[0].0
+                );
+                assert!(
+                    same(&published[0].1, &want),
+                    "case {case:?}: expected the alert {want}, got {}",
+                    published[0].1
+                );
+            }
+            None => assert!(
+                published.is_empty(),
+                "case {case:?}: expected the update to publish nothing, got {published:?}"
+            ),
+        }
+    }
+}

@@ -70,6 +70,18 @@
 //! builds that shape from the violations it already holds and serializes it
 //! through this service's own protocol, so a boundary refusal and a
 //! handler-raised `ValidationException` reach the wire as the same document.
+//!
+//! ## The second thing the wrapper reads off the request: a member sent as `null`
+//!
+//! A JSON body distinguishes a member it OMITS from one it carries with the value
+//! `null`, and this service's update operation gives the two different meanings
+//! (see [`BodyMembersSentAsNull`]). The typed input a handler is handed cannot:
+//! the codec reads an absent member and a `null` one into the same `Option::None`
+//! / empty collection, so the distinction is gone by the time `handle` runs. The
+//! wrapper, which is handed the request bytes, is where it is recovered: it names
+//! the body members THIS request carried as `null` and passes them to the handler
+//! as a request extension, which is the channel request metadata already reaches a
+//! handler through ([`smithy_server_runtime::OperationContext::parts`]).
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema::Schema;
@@ -246,7 +258,24 @@ where
             if let Some(refusal) = constraint_rejection::<O>(svc, req) {
                 return refusal;
             }
-            self.operation.run(svc, req, ctx).await
+            // Which body members this request carried as an explicit `null` —
+            // read off the bytes here, because the typed input the handler is
+            // handed no longer tells a `null` member from an omitted one.
+            let sent_as_null = members_sent_as_null::<O>(req);
+            if sent_as_null.is_empty() {
+                // Nothing to carry: the request runs under the context the
+                // router built, untouched.
+                return self.operation.run(svc, req, ctx).await;
+            }
+            // The context is rebuilt rather than mutated: a handler reads request
+            // metadata through a SHARED borrow of the router's parts, so this is
+            // the one way to add to them. Everything else — the headers, the URI,
+            // the extensions the router and the middleware set, the service
+            // identity and the callback into this emulator — is carried over
+            // unchanged, so the handler sees the same request it otherwise would.
+            let parts = parts_with_extension(ctx.parts(), BodyMembersSentAsNull(sent_as_null));
+            let carried = OperationContext::new(&parts, ctx.identity(), ctx.callback().clone());
+            self.operation.run(svc, req, &carried).await
         })
     }
 
@@ -255,6 +284,109 @@ where
     fn auth_schemes(&self) -> Option<&'static [&'static str]> {
         self.operation.auth_schemes()
     }
+}
+
+/// The request-body members of one request that carried an explicit JSON `null`,
+/// each by the name the model gives it, as a handler reads them
+/// ([`sent_as_null`]).
+///
+/// # The distinction this carries, and why it needs carrying
+///
+/// A JSON object can say three different things about a member: it can omit it,
+/// it can carry it with a value, or it can carry it with `null`. The update
+/// operation of this service gives all three a meaning — "Only the settings that
+/// you include in the request body are modified. Omitted settings remain
+/// unchanged. To reset a setting to its default behavior, set the value to null"
+/// (`smithy_query(query="doc", shape="UpdateAccountCustomizations")`) — so a
+/// handler that cannot tell the first form from the third cannot serve the
+/// documented reset at all.
+///
+/// The typed boundary cannot tell them apart: the codec reads a `null` member and
+/// an omitted one into the same value (`None` for a scalar, an empty collection
+/// for a list), by design — that is what makes a Smithy client's `null` mean
+/// "unset" on every protocol. So the set of `null`-valued members is read off the
+/// request bytes at this service's front door, which is handed them, and travels
+/// to the handler as a request extension.
+///
+/// Only TOP-LEVEL body members are named: it is the operation's own input members
+/// a request resets, and a `null` nested inside a member's value is that value's
+/// own business.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BodyMembersSentAsNull(Vec<String>);
+
+impl BodyMembersSentAsNull {
+    /// Whether `member` is one of the members this request sent as `null`.
+    fn names(&self, member: &str) -> bool {
+        self.0.iter().any(|named| named == member)
+    }
+}
+
+/// Whether THIS request carried the body member `member` with an explicit JSON
+/// `null` — the request form a handler serves differently from an omitted member.
+///
+/// `false` for a request that omitted it, for one that carried a value, and for
+/// every operation whose request never reached the front door that records this
+/// (nothing recorded means nothing was sent as `null`).
+pub fn sent_as_null(ctx: &OperationContext<'_>, member: &str) -> bool {
+    ctx.parts()
+        .extensions
+        .get::<BodyMembersSentAsNull>()
+        .is_some_and(|sent| sent.names(member))
+}
+
+/// Every top-level body member of `O`'s input that `req` carried as an explicit
+/// JSON `null`, by the member name the model declares.
+///
+/// The model decides what to look for and where: the members come from `O`'s own
+/// input schema, each is looked up under the name it travels on the wire (its
+/// `@jsonName` if it declares one, else its member name), and a member bound to
+/// the URI rather than the body is not looked for at all.
+///
+/// Empty for a request with no body, a body that is not a JSON object, and a body
+/// this operation's input declares no `null` member of — including a body the
+/// codec cannot read, which is refused by the walk that follows rather than
+/// re-judged here.
+fn members_sent_as_null<O: Operation>(req: &RtRequest) -> Vec<String> {
+    let Some(bytes) = req.body().bytes() else {
+        return Vec::new();
+    };
+    let Ok(serde_json::Value::Object(body)) = serde_json::from_slice::<serde_json::Value>(bytes)
+    else {
+        return Vec::new();
+    };
+    O::INPUT_SCHEMA
+        .members()
+        .iter()
+        .filter(|member| carried_in_the_body(member))
+        .filter_map(|member| {
+            let name = member.member_name()?;
+            let wire_name = member.json_name().map_or(name, |json| json.value());
+            body.get(wire_name)
+                .is_some_and(serde_json::Value::is_null)
+                .then(|| name.to_string())
+        })
+        .collect()
+}
+
+/// `parts` with `extension` added: the request metadata the router built, plus the
+/// one fact this service's front door read off the body.
+///
+/// Built from a fresh request rather than copied field by field into a literal —
+/// `http::request::Parts` has a private member, so a literal cannot name it — and
+/// every public field is carried over, so nothing the router or the middleware put
+/// on the request is dropped on the way to the handler.
+fn parts_with_extension<T>(parts: &http::request::Parts, extension: T) -> http::request::Parts
+where
+    T: Clone + Send + Sync + 'static,
+{
+    let (mut carried, ()) = http::Request::new(()).into_parts();
+    carried.method = parts.method.clone();
+    carried.uri = parts.uri.clone();
+    carried.version = parts.version;
+    carried.headers = parts.headers.clone();
+    carried.extensions = parts.extensions.clone();
+    carried.extensions.insert(extension);
+    carried
 }
 
 /// Every modelled constraint `req` breaks, for the operation `O`.
@@ -319,12 +451,24 @@ fn binds_to_body(input_schema: &Schema, violation_path: &str) -> bool {
         member
             .member_name()
             .is_some_and(|name| path::member(name) == member_name)
-            && member.http_label().is_none()
-            && member.http_query().is_none()
-            && member.http_query_params().is_none()
-            && member.http_header().is_none()
-            && member.http_prefix_headers().is_none()
+            && carried_in_the_body(member)
     })
+}
+
+/// Whether `member` travels in the request BODY, read off its own HTTP binding
+/// traits: a member with no `@httpLabel` / `@httpQuery` / `@httpQueryParams` /
+/// `@httpHeader` / `@httpPrefixHeaders` binding is a body member.
+///
+/// The one place that reading is written down, so the two things this service's
+/// front door does with it — placing a constraint violation ([`binds_to_body`])
+/// and looking for a member sent as `null` ([`members_sent_as_null`]) — cannot
+/// disagree about where a member travels.
+fn carried_in_the_body(member: &Schema) -> bool {
+    member.http_label().is_none()
+        && member.http_query().is_none()
+        && member.http_query_params().is_none()
+        && member.http_header().is_none()
+        && member.http_prefix_headers().is_none()
 }
 
 /// The front door's answer to a body it refused: HTTP 400 with the error code

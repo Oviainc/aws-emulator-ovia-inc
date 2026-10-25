@@ -7016,7 +7016,8 @@ pub const MAX_ACCESS_STRING_LEN: usize = 8192;
 /// ONE fixed sentence, whatever is wrong with the list and whichever member
 /// carried it: the service states that the access string as a whole is not one,
 /// and names neither the member nor the token that is not a rule, so nothing of
-/// the request is read back out of the refusal.
+/// the request is read back out of the refusal. It is borrowed rather than built,
+/// so a caller cannot compose anything into it.
 pub const ACCESS_STRING_INVALID: &str = "The access-string is invalid.";
 
 /// Why `access_string` is not an access string, or `None` when it is one.
@@ -7028,23 +7029,25 @@ pub const ACCESS_STRING_INVALID: &str = "The access-string is invalid.";
 /// never apply ([`ACCESS_STRING_INVALID`] is how that refusal reads). The caller
 /// maps the refusal onto its own modelled `InvalidParameterValueException`.
 ///
+/// Every way a rule list can fail this test is the SAME condition — the access
+/// string is not one this service accepts — so all of them are refused with the
+/// one sentence [`ACCESS_STRING_INVALID`] holds, which carries no part of the
+/// request: neither the rule that offended nor the member it arrived on is
+/// reported, and a caller therefore does not say which member it is checking.
+///
 /// A SELECTOR — the Redis OSS 7 / Valkey form `(+get ~key1)` — is one rule that
 /// carries a rule list of its own, so it is read as a parenthesised group whose
 /// inner rules are checked by the same per-rule test. A group that is never
 /// closed is refused.
-pub fn access_string_rejection(member: &str, access_string: &str) -> Option<String> {
+pub fn access_string_rejection(access_string: &str) -> Option<&'static str> {
     // Checked before the list is walked: the length is the one thing about a
     // rule list a caller can grow without end (see [`MAX_ACCESS_STRING_LEN`]),
     // and it bounds the work the walk below does.
     if access_string.chars().count() > MAX_ACCESS_STRING_LEN {
-        return Some(format!(
-            "Invalid value for {member}: an access string is at most \
-             {MAX_ACCESS_STRING_LEN} characters."
-        ));
+        return Some(ACCESS_STRING_INVALID);
     }
     // Every refusal below is the same one sentence, so the walk only has to
     // decide WHETHER the list is a rule list.
-    let refuse = || Some(ACCESS_STRING_INVALID.to_string());
     let mut rules = 0usize;
     // The selector being read, once its `(` has been seen and before its `)`.
     let mut selector: Option<String> = None;
@@ -7057,7 +7060,7 @@ pub fn access_string_rejection(member: &str, access_string: &str) -> Option<Stri
             }
             let group = selector.take().unwrap_or_default();
             if !is_selector(&group) {
-                return refuse();
+                return Some(ACCESS_STRING_INVALID);
             }
             rules += 1;
             continue;
@@ -7065,7 +7068,7 @@ pub fn access_string_rejection(member: &str, access_string: &str) -> Option<Stri
         if token.starts_with('(') {
             if token.ends_with(')') && token.len() > 1 {
                 if !is_selector(token) {
-                    return refuse();
+                    return Some(ACCESS_STRING_INVALID);
                 }
                 rules += 1;
             } else {
@@ -7074,15 +7077,15 @@ pub fn access_string_rejection(member: &str, access_string: &str) -> Option<Stri
             continue;
         }
         if !is_access_rule(token) {
-            return refuse();
+            return Some(ACCESS_STRING_INVALID);
         }
         rules += 1;
     }
-    if selector.is_some() {
-        return refuse();
-    }
-    if rules == 0 {
-        return refuse();
+    // A selector whose `)` never arrived, and a string that names no rule at
+    // all, are the same condition as a rule the engine does not know: neither is
+    // an access string the service can apply.
+    if selector.is_some() || rules == 0 {
+        return Some(ACCESS_STRING_INVALID);
     }
     None
 }

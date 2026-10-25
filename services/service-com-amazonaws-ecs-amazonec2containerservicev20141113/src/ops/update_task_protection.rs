@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTaskProtection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateTaskProtection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Marks a task as protected from termination by a scale-in event, or unsets that
+//! protection.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateTaskProtection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Protection is stored as the INSTANT it expires, so the lapse the doc describes
+//! ("expires after 2 hours at which point Amazon ECS clears the `protectionEnabled`
+//! property") is owed by the CLOCK and materialised by the state's clock pass — nothing
+//! sleeps, and a later read sees the protection gone without this call having to be made
+//! again. A repeat RESETS the period ("The `expiresInMinutes` property is always reset
+//! when you invoke this operation for a task that already has `protectionEnabled` set to
+//! true").
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +184,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateTaskProtection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateTaskProtectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateTaskProtection"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateTaskProtectionErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        // Bounded before any per-entry work and before the store is locked, at the size
+        // the member documents.
+        if input.tasks.len() > crate::state::MAX_UPDATE_TASK_PROTECTION_TASKS {
+            return Err(UpdateTaskProtectionErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::at_most_items_message(
+                        "tasks",
+                        crate::state::MAX_UPDATE_TASK_PROTECTION_TASKS,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "You can specify a value from 1 minute to up to 2,880 minutes (48 hours)" — a
+        // period outside that is refused, and nothing is protected.
+        let requested_minutes = input
+            .expires_in_minutes
+            .unwrap_or(crate::state::DEFAULT_TASK_PROTECTION_MINUTES);
+        if !(crate::state::MIN_TASK_PROTECTION_MINUTES
+            ..=crate::state::MAX_TASK_PROTECTION_MINUTES)
+            .contains(&requested_minutes)
+        {
+            return Err(UpdateTaskProtectionErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::task_protection_period_message()),
+                },
+            )
+            .into());
+        }
+
+        let cluster_name = crate::state::cluster_name_from_reference(Some(&input.cluster));
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        guard.advance_clock(now);
+
+        if !guard.has_active_cluster(&cluster_name) {
+            return Err(UpdateTaskProtectionErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // "Specify true to mark a task for protection and false to unset protection":
+        // protecting a task records when the protection expires, and unsetting it takes
+        // the expiry off — the one place `protectionEnabled` is read from.
+        let expires_at = input.protection_enabled.then(|| {
+            now + ::std::time::Duration::from_secs(
+                u64::try_from(requested_minutes).unwrap_or_default() * 60,
+            )
+        });
+
+        let mut protected_tasks = Vec::new();
+        let mut failures = Vec::new();
+        let mut seen = ::std::collections::HashSet::new();
+        for reference in &input.tasks {
+            let task_arn =
+                crate::state::task_arn_from_reference(&region, &cluster_name, reference);
+            // The same id repeated names one task, so it is answered once.
+            if !seen.insert(task_arn.clone()) {
+                continue;
+            }
+            let found = guard
+                .tasks
+                .get(&task_arn)
+                .filter(|task| task.cluster_name == cluster_name)
+                .map(|task| task.is_protectable());
+            match found {
+                // "Invoking this operation for a standalone task will result in an
+                // TASK_NOT_VALID failure."
+                Some(false) => failures.push(Failure {
+                    arn: Some(task_arn.clone()),
+                    reason: Some(crate::state::FAILURE_TASK_NOT_VALID.to_string()),
+                    detail: None,
+                }),
+                Some(true) => {
+                    let task = guard
+                        .tasks
+                        .get_mut(&task_arn)
+                        .expect("the task was just found in this cluster");
+                    if task.protection_expires_at != expires_at {
+                        task.protection_expires_at = expires_at;
+                        // `Task$version`: "Every time a task experiences a change ... the
+                        // version counter is incremented."
+                        task.version += 1;
+                    }
+                    protected_tasks.push(task.protection_view());
+                }
+                None => failures.push(crate::state::missing_failure(&task_arn)),
+            }
+        }
+
+        Ok(UpdateTaskProtectionOutput {
+            protected_tasks: Some(protected_tasks),
+            failures: Some(failures),
+        })
     }
 }

@@ -15,6 +15,13 @@
 //! `ValidationException` and nothing is minted (see
 //! [`crate::state::check_tag_keys_not_reserved`]).
 //!
+//! The `AccountGrouping` is refused unless the relationships it describes hold: the
+//! account designated the group's main account must be one of the group's own accounts
+//! (`PRIMARY_NOT_ASSOCIATED`), and a `ResponsibilityTransferArn` must name a billing
+//! transfer of this organization — the same predicate
+//! `GetBillingTransferPreference` resolves one with
+//! ([`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::transfer_belongs_to_this_organization`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -184,8 +191,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
-
         // Tag-on-create takes caller-supplied tag keys, so the reserved `aws:` namespace
         // is refused here exactly as `TagResource` refuses it: from the request alone,
         // before anything is minted, so a create naming such a key leaves no resource
@@ -278,6 +283,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "The account ID that serves as the MAIN account in a billing group": the
+        // primary account is an account OF the group, so a request designating one that
+        // the grouping does not list describes a group whose main account is in no
+        // billing group at all. `ValidationExceptionReason` enumerates
+        // `PRIMARY_NOT_ASSOCIATED` for exactly that relationship, and
+        // `PRIMARY_CANNOT_DISASSOCIATE` (which `DisassociateAccounts` enforces) keeps
+        // the same invariant afterwards: while a group holds a primary account, that
+        // account is one of its members. A request naming no primary account designates
+        // no main account at all, which the group's own derived status reports, so there
+        // is nothing to refuse there.
+        if let Some(primary) = input.primary_account_id.as_deref() {
+            if !linked_account_ids.iter().any(|member| member == primary) {
+                return Err(validation(
+                    "PRIMARY_NOT_ASSOCIATED",
+                    "PrimaryAccountId",
+                    format!(
+                        "account {primary} is not one of the accounts of the billing group and \
+                         cannot be its primary account"
+                    ),
+                ));
+            }
+        }
+
+        // The transfer relationship a group bills through has to be one this
+        // organization HAS: the ARN "identifies the transfer relationship owned by the
+        // Bill Transfer account (caller account)", and the same predicate
+        // `GetBillingTransferPreference` and `UpdateBillingTransferPreference` decide a
+        // transfer's existence with answers it here
+        // (`crate::state::transfer_belongs_to_this_organization`). This operation models
+        // no `ResourceNotFoundException`, so a transfer no reader of this store can
+        // resolve is a fault in the INPUT: the modelled 400 `ValidationException` with
+        // the reason the model enumerates for an ARN that names no such resource.
+        if let Some(transfer_arn) = input
+            .account_grouping
+            .responsibility_transfer_arn
+            .as_deref()
+        {
+            if !state.transfer_belongs_to_this_organization(transfer_arn) {
+                return Err(validation(
+                    "INVALID_ARN",
+                    "AccountGrouping.ResponsibilityTransferArn",
+                    format!("the billing transfer {transfer_arn} does not exist"),
+                ));
+            }
+        }
+
         // `AutoAssociate` elects the ONE group that "will automatically associate
         // newly added Amazon Web Services accounts that join your consolidated billing
         // family", so a create that would leave the family with more enabled groups
@@ -347,16 +398,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for account_id in linked_account_ids {
             state.associate_account(&account_id, &arn);
         }
-        // The primary account belongs to the consolidated billing family whether or
-        // not it is a member of this group. When it is not a member it is in no
-        // billing group, which is what `UNMONITORED` reports.
-        if let Some(primary) = input.primary_account_id {
-            if state.account_billing_group(&primary).is_none() {
-                state.note_unassociated_account(&primary);
-            }
-        }
         state.record_idempotent_arn(Self::NAME, input.client_token.as_deref(), &arn);
 
+        // The audit record for a state-changing call, as `UpdateBillingGroup` writes it
+        // for the same resource: who asked, what was minted and that it succeeded. Never
+        // a `@sensitive` member (the group's name and description) — only the access key
+        // id the caller presented and the ARN this call created.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::engine::extract_akid(&ctx.parts().headers),
+            billing_group_arn = %arn,
+            outcome = "created",
+            "billing group created"
+        );
         Ok(CreateBillingGroupOutput { arn: Some(arn) })
     }
 }

@@ -161,6 +161,12 @@ mod review_template_answer_updates;
 #[path = "all/review_template_answers.rs"]
 mod review_template_answers;
 
+// Declared in its sorted position, beside the review-template suite it extends, rather
+// than at the end of this list: the tail is where every new suite appends, and an
+// insertion there is what repeatedly refused to merge.
+#[path = "all/review_template_imported_lens_answers.rs"]
+mod review_template_imported_lens_answers;
+
 #[path = "all/review_template_deletion.rs"]
 mod review_template_deletion;
 
@@ -259,3 +265,8 @@ mod global_settings;
 // Declared last for the same reason as the declarations above.
 #[path = "all/agent_context_updates.rs"]
 mod agent_context_updates;
+
+// Declared last for the same reason as the declarations above: the sorted position for a
+// workload suite falls in a crowded run of this list.
+#[path = "all/workload_lens_review_upgrade.rs"]
+mod workload_lens_review_upgrade;

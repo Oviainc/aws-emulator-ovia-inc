@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutObjectLegalHold
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutObjectLegalHold`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutObjectLegalHold::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the legal hold configuration the request carries to the addressed object
+//! version — the one `versionId` names, or the key's current object — and answers 200. The
+//! status the `LegalHold` container names is what the version carries afterwards, which
+//! `GetObjectLegalHold` reports back.
+//!
+//! A legal hold is part of S3 Object Lock, so it is served only by a bucket that has an
+//! Object Lock configuration: a call addressed to a bucket without one is refused 400
+//! [`crate::state::INVALID_REQUEST_CODE`] with
+//! [`crate::state::OBJECT_LOCK_CONFIGURATION_MISSING_MESSAGE`], and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -110,14 +111,25 @@ use super::types::*;
 // `PutObjectLegalHoldError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `PutObjectLegalHoldError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#PutObjectLegalHold")]
+// The operation's MODELED errors, widened with `extra_errors` by the two 404 shapes this
+// SERVICE models for an address that does not exist.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="PutObjectLegalHold")` reports `errors: []`),
+// yet `Bucket` and `Key` are both @httpLabels, so a request can name a bucket or a key
+// that does not exist — AWS answers `NoSuchBucket` ("The specified bucket does not
+// exist") and `NoSuchKey` ("The specified key does not exist"), each modelled
+// `@httpError(404)`. Widening the set with those two shapes is what lets this handler
+// answer the same two 404s its reader `GetObjectLegalHold` answers for the same two
+// causes.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#PutObjectLegalHold",
+    extra_errors = ["NoSuchBucket", "NoSuchKey"]
+)]
 #[derive(Debug)]
 pub enum PutObjectLegalHoldErrorModeled {
+    NoSuchBucket(NoSuchBucket),
+    NoSuchKey(NoSuchKey),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -172,17 +184,154 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutObjectLegalHold` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutObjectLegalHoldErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutObjectLegalHold"))
+        // request metadata only, and this write needs nothing from it.
+        let _ = ctx;
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // bucket, the request fails with the HTTP status code 403 Forbidden (access
+        // denied)" — `PutObjectLegalHoldRequest$ExpectedBucketOwner`, judged the way every
+        // other handler here judges it: this emulator serves one account, so the owner of
+        // every bucket it holds is that account.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                ACCESS_DENIED_MESSAGE,
+            ));
+        }
+
+        // The hold this call asks for. `LegalHold` is "the container element for the legal
+        // hold configuration you want to apply to the specified object"
+        // (`PutObjectLegalHoldRequest$LegalHold`) and carries one member, the `Status`, so a
+        // request that names no status describes no configuration to apply — refused rather
+        // than read as one of the two states, which would apply a hold nobody asked for or
+        // take one off nobody asked to lift. No error code of this model says that, so it
+        // goes out through the framework's 400 refusal channel.
+        let Some(status) = input
+            .legal_hold
+            .as_ref()
+            .and_then(|hold| hold.status.as_deref())
+        else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "LegalHold names no Status: a legal hold configuration names the status to \
+                 apply, one of {:?}",
+                super::types::OBJECT_LOCK_LEGAL_HOLD_STATUS_VALUES
+            )));
+        };
+        // `Status` targets the `ObjectLockLegalHoldStatus` enum, whose values the boundary
+        // validator already refuses anything outside; checked again here because what is
+        // stored is the hold a later reader reports, so an unknown status must never reach
+        // the store.
+        if !super::types::OBJECT_LOCK_LEGAL_HOLD_STATUS_VALUES.contains(&status) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "LegalHold.Status {status:?} is not one of {:?}",
+                super::types::OBJECT_LOCK_LEGAL_HOLD_STATUS_VALUES
+            )));
+        }
+        let held = status == crate::state::LEGAL_HOLD_ON_STATUS;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Without the store the hold cannot be recorded at all, and no modelled error
+            // says that, so the scaffold's 501 carries what is true: this emulator cannot
+            // serve the request.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutObjectLegalHold",
+            ));
+        };
+
+        let mut store = state.lock();
+        let version_id = input.version_id.as_deref();
+
+        // The ADDRESS is resolved first, so a request naming a bucket, a key or a version
+        // this emulator does not hold answers that — the way the service orders the
+        // refusals — rather than reporting whatever is wrong with a hold no object version
+        // could have carried.
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(PutObjectLegalHoldErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        // A legal hold is one half of S3 Object Lock, which a bucket has only once an
+        // Object Lock configuration is on it: the configuration's rule "will be applied by
+        // default to every new object placed in the specified bucket"
+        // (`PutObjectLockConfiguration`'s own documentation), and a bucket carrying none
+        // locks nothing. Applying a hold there is a request S3 cannot carry out as given,
+        // which is what `InvalidRequest` reports.
+        if !bucket.object_lock_enabled() {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_REQUEST_CODE,
+                crate::state::INVALID_REQUEST_STATUS,
+                crate::state::OBJECT_LOCK_CONFIGURATION_MISSING_MESSAGE,
+            ));
+        }
+        // A delete marker is a version with no object behind it, so there is nothing to
+        // place a hold on: 405, the status S3 answers an object-level call on a marker
+        // with, as `HeadObject` already answers it for the same cause.
+        if version_id.is_some_and(|named| {
+            bucket
+                .stored_version(&input.key, named)
+                .is_some_and(|held| held.as_delete_marker().is_some())
+        }) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::METHOD_NOT_ALLOWED_CODE,
+                crate::state::METHOD_NOT_ALLOWED_STATUS,
+                crate::state::METHOD_NOT_ALLOWED_MESSAGE,
+            ));
+        }
+        if bucket.addressed_object(&input.key, version_id).is_none() {
+            return Err(no_such_object(version_id));
+        }
+
+        // A REPLACEMENT of the whole subresource: the status the version carries afterwards
+        // is exactly the one this `LegalHold` named. Nothing in force bars it — a hold
+        // "provides the same protection as a retention period, but it has no expiration
+        // date" and is lifted by the same call that places it, so neither an existing hold
+        // nor a retention makes this call a weakening one the way a shorter retention period
+        // would.
+        match store.replace_object_legal_hold(&input.bucket, &input.key, version_id, held) {
+            Some(crate::state::ObjectLegalHoldWrite::Applied) => {}
+            // Unreachable through this handler (the address was just resolved under the
+            // same lock), and answered rather than asserted so a future caller of this
+            // state seam cannot turn a vanished address into a panic.
+            None => {
+                return Err(PutObjectLegalHoldErrorModeled::NoSuchBucket(NoSuchBucket {}).into())
+            }
+            Some(crate::state::ObjectLegalHoldWrite::NoSuchObject) => {
+                return Err(no_such_object(version_id))
+            }
+        }
+
+        Ok(PutObjectLegalHoldOutput {
+            // "If present, indicates that the requester was successfully charged for the
+            // request" (`PutObjectLegalHoldOutput$RequestCharged`) — Requester Pays is not
+            // emulated, so nobody was charged and nothing is reported.
+            request_charged: None,
+        })
+    }
+}
+
+/// The wire error code a request this emulator will not serve for the caller is refused
+/// with, and its status and message: "403 Forbidden (access denied)", the way every other
+/// handler in this crate answers an expected-bucket-owner mismatch.
+const ACCESS_DENIED_CODE: &str = "AccessDenied";
+/// See [`ACCESS_DENIED_CODE`].
+const ACCESS_DENIED_STATUS: u16 = 403;
+/// See [`ACCESS_DENIED_CODE`] — the text Amazon S3 "Error responses" publishes for it.
+const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
+
+/// The 404 for an address whose bucket this emulator holds but whose object version it does
+/// not: the version the request NAMED is missing (`NoSuchVersion`), or the key has no
+/// current object (`NoSuchKey`) — which is also the case where the key's current version is
+/// a delete marker, "Amazon S3 behaves as if the object was deleted".
+fn no_such_object(version_id: Option<&str>) -> PutObjectLegalHoldError {
+    match version_id {
+        Some(_) => crate::scaffolded::Scaffolded::unmodeled(
+            crate::state::NO_SUCH_VERSION_CODE,
+            404,
+            crate::state::NO_SUCH_VERSION_MESSAGE,
+        ),
+        None => PutObjectLegalHoldErrorModeled::NoSuchKey(NoSuchKey {}).into(),
     }
 }

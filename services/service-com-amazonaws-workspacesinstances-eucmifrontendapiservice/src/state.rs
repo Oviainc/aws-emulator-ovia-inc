@@ -21,7 +21,8 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{
     BillingConfiguration, ConflictException, InstanceTypeInfo, ManagedInstanceRequest,
     ResourceNotFoundException, ServiceQuotaExceededException, SupportedInstanceConfiguration, Tag,
-    TagSpecification, ValidationException, ValidationExceptionField, BILLING_MODE_VALUES,
+    TagSpecification, ValidationException, ValidationExceptionField,
+    VolumeModificationRateExceededException, BILLING_MODE_VALUES,
     INSTANCE_CONFIGURATION_TENANCY_ENUM_VALUES, PLATFORM_TYPE_ENUM_VALUES,
 };
 
@@ -196,6 +197,34 @@ pub const DEALLOCATION_SPAN: Duration = Duration::from_millis(500);
 /// `DEALLOCATED` state is observable, and it is materialised lazily like the two
 /// transitions above ([`WorkspaceInstanceRecord::is_forgotten`]).
 pub const DEALLOCATED_RETENTION: Duration = Duration::from_millis(500);
+
+/// How long after `ModifyVolume` the modification that call starts becomes due, so
+/// the target configuration it asked for becomes the volume's configuration.
+///
+/// Modifying a volume is asynchronous work: the call is accepted and the volume keeps
+/// its current configuration while the modification runs ("To track the progress of a
+/// modification, use the Amazon EC2 DescribeVolumesModifications operation" —
+/// `ModifyVolume`). AWS documents no duration for it, so this is a CHOSEN span,
+/// non-zero for the same reason as [`ALLOCATION_SPAN`]: a caller that modifies the
+/// same volume again straight away still observes the modification in progress, and
+/// is refused for it. The due instant is stored on the modification
+/// ([`VolumeModification::completes_at`]) and materialised lazily by
+/// [`VolumeRecord::settle_modifications`]; nothing sleeps.
+pub const VOLUME_MODIFICATION_SPAN: Duration = Duration::from_millis(500);
+
+/// How many modifications of ONE volume this service accepts inside
+/// [`VOLUME_MODIFICATION_WINDOW`].
+///
+/// MODELLED, not chosen: the model's own doc for
+/// `VolumeModificationRateExceededException` states the bound and the window it is
+/// counted over — "has reached the limit of four modifications in a rolling 24-hour
+/// period" — and that error (HTTP 429) is how reaching it is reported
+/// ([`VOLUME_MODIFICATION_LIMIT_MESSAGE`], whose wording spells the same figure).
+pub const VOLUME_MODIFICATIONS_PER_WINDOW: usize = 4;
+
+/// The rolling window [`VOLUME_MODIFICATIONS_PER_WINDOW`] is counted over: the
+/// 24-hour period the same sentence names.
+pub const VOLUME_MODIFICATION_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The `BillingMode` an instance created without a `BillingConfiguration` runs on.
 ///
@@ -1565,6 +1594,124 @@ pub struct VolumeRecord {
     /// Where this volume is attached, or `None` for a volume no `AssociateVolume` has
     /// attached (or one a `DisassociateVolume` has detached again).
     pub attachment: Option<VolumeAttachment>,
+    /// The modifications `ModifyVolume` has accepted for this volume, in the order
+    /// they were accepted: the one still running (at most one, which is why a second
+    /// `ModifyVolume` is refused while it lasts) and the ones accepted inside
+    /// [`VOLUME_MODIFICATION_WINDOW`], which is what the rolling limit is counted
+    /// over. [`Self::settle_modifications`] applies each one the clock has made due
+    /// and drops the ones the window has left behind.
+    pub modifications: Vec<VolumeModification>,
+}
+
+/// One modification of one volume, as `ModifyVolume` accepted it.
+///
+/// The TARGET configuration, not the current one: a modification is asynchronous, so
+/// the volume keeps its configuration until [`Self::completes_at`] and the target is
+/// what the call reports and what the volume becomes once the clock makes it due. Each
+/// target member is the one the call named, or — for a member it left out — the one the
+/// volume keeps, which is why the record is the only place a response reads from.
+#[derive(Debug, Clone)]
+pub struct VolumeModification {
+    /// The target `SizeInGB`: `None` only for a volume that has no size of its own
+    /// either (one restored from a snapshot, whose size the snapshot carries) and
+    /// whose modification named none.
+    pub target_size_in_gb: Option<i32>,
+    /// The target `VolumeTypeEnum` value: the one the call named, or the type the
+    /// volume already is ([`VolumeRecord::effective_volume_type`]).
+    pub target_volume_type: String,
+    /// The target provisioned IOPS, or `None` for a target type that provisions none.
+    pub target_iops: Option<i32>,
+    /// The target `Throughput` in MiB/s, or `None` for a target type whose throughput
+    /// is not configurable.
+    pub target_throughput: Option<i32>,
+    /// The `ClientToken` the accepting call carried, if any: a retry carrying it again
+    /// replays THIS modification rather than starting another one.
+    pub client_token: Option<String>,
+    /// When the call that started the modification was accepted — what the rolling
+    /// [`VOLUME_MODIFICATIONS_PER_WINDOW`] limit counts.
+    pub started_at: Instant,
+    /// When the modification finishes and its target becomes the volume's
+    /// configuration: [`VOLUME_MODIFICATION_SPAN`] after [`Self::started_at`].
+    pub completes_at: Instant,
+}
+
+impl VolumeRecord {
+    /// The volume type this volume IS: the one its create named, or the backing
+    /// service's documented default ([`DEFAULT_VOLUME_TYPE`]) for a create that named
+    /// none — the same default the create's own configuration rules were read for.
+    pub fn effective_volume_type(&self) -> &str {
+        self.volume_type.as_deref().unwrap_or(DEFAULT_VOLUME_TYPE)
+    }
+
+    /// Whether a modification of this volume has been accepted and has not finished
+    /// yet: "You can modify a volume only after any previous modification for that
+    /// volume has finished" (`ModifyVolume`).
+    pub fn modification_in_progress(&self, now: Instant) -> bool {
+        self.modifications
+            .iter()
+            .any(|modification| modification.completes_at > now)
+    }
+
+    /// How many modifications of this volume were accepted inside the rolling
+    /// [`VOLUME_MODIFICATION_WINDOW`] ending at `now`.
+    pub fn modifications_in_window(&self, now: Instant) -> usize {
+        self.modifications
+            .iter()
+            .filter(|modification| {
+                now.saturating_duration_since(modification.started_at) < VOLUME_MODIFICATION_WINDOW
+            })
+            .count()
+    }
+
+    /// The modification the call carrying `token` started, while this volume still
+    /// holds it: what a retry of that call replays instead of starting another one.
+    pub fn modification_for_token(&self, token: &str) -> Option<&VolumeModification> {
+        self.modifications
+            .iter()
+            .rev()
+            .find(|modification| modification.client_token.as_deref() == Some(token))
+    }
+
+    /// Materialise what the clock owes this volume: the configuration of the newest
+    /// modification it has already completed becomes the volume's configuration, and
+    /// every finished modification the rolling window has left behind is dropped.
+    ///
+    /// Both were due at their stored instants whether or not anybody called, so this
+    /// is the lazy form of work the service had already done — the same shape as
+    /// [`WorkspaceInstanceRecord::settle`]. Applying only the NEWEST completed
+    /// modification is enough because they are accepted one at a time: an older one's
+    /// target was already superseded by the newer one the caller asked for.
+    ///
+    /// Returns the `ClientToken`s of the modifications it dropped, so the claims they
+    /// hold can be retired with them (a token that can no longer replay anything must
+    /// not keep a claim).
+    pub fn settle_modifications(&mut self, now: Instant) -> Vec<String> {
+        if let Some(applied) = self
+            .modifications
+            .iter()
+            .rev()
+            .find(|modification| modification.completes_at <= now)
+            .cloned()
+        {
+            self.size_in_gb = applied.target_size_in_gb;
+            self.volume_type = Some(applied.target_volume_type);
+            self.iops = applied.target_iops;
+            self.throughput = applied.target_throughput;
+        }
+        let mut retired = Vec::new();
+        self.modifications.retain(|modification| {
+            let inside_window = now.saturating_duration_since(modification.started_at)
+                < VOLUME_MODIFICATION_WINDOW;
+            let keep = modification.completes_at > now || inside_window;
+            if !keep {
+                if let Some(token) = modification.client_token.clone() {
+                    retired.push(token);
+                }
+            }
+            keep
+        });
+        retired
+    }
 }
 
 /// What one spent `@idempotencyToken` created, and WHICH request spent it.
@@ -1705,6 +1852,18 @@ pub struct ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState {
     /// create call that carried it, so a volume token can never replay an instance
     /// id (the two ids are not even the same shape).
     pub volume_client_tokens: BTreeMap<(String, String), IdempotencyClaim>,
+    /// (Region, `ClientToken`) -> the [`IdempotencyClaim`] `ModifyVolume` spent it on:
+    /// the volume that modification was accepted for, and the fingerprint of the
+    /// request that started it, so a retry replays that one modification
+    /// ([`VolumeRecord::modification_for_token`]) and a token reused for a different
+    /// modification — of the same volume or another one — is refused rather than
+    /// starting a second one.
+    ///
+    /// A namespace of its own beside [`Self::volume_client_tokens`], for the same
+    /// reason that map is separate from [`Self::client_tokens`]: a token is scoped to
+    /// the call that carried it, so a modify token can neither replay a create nor be
+    /// retired by one.
+    pub volume_modification_tokens: BTreeMap<(String, String), IdempotencyClaim>,
     /// Source of the unique `wsinst-…` / `i-…` identifiers.
     pub id_counter: u64,
 }
@@ -1799,6 +1958,19 @@ impl ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState {
                 volume.attachment = None;
             }
         }
+        // A volume modification the clock has completed is owed in the same sense: its
+        // target became the volume's configuration at its stored instant, whether or
+        // not anybody called afterwards. The tokens of the modifications the rolling
+        // window has left behind are retired with them.
+        let mut retired: Vec<(String, String)> = Vec::new();
+        for volume in self.volumes.values_mut() {
+            for token in volume.settle_modifications(now) {
+                retired.push((volume.region.clone(), token));
+            }
+        }
+        for key in retired {
+            self.volume_modification_tokens.remove(&key);
+        }
     }
 
     /// Stop reporting a torn-down record: the record goes, and so does the
@@ -1892,6 +2064,14 @@ impl ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState {
             self.volume_client_tokens
                 .remove(&(removed.region.clone(), token));
         }
+        // The tokens of this volume's modifications go the same way, and for the same
+        // reason: a modify token whose volume no longer exists can replay nothing, so
+        // leaving its claim would refuse a later reuse of that token on behalf of a
+        // resource the service has forgotten.
+        self.volume_modification_tokens
+            .retain(|(claim_region, _), claim| {
+                !(claim_region == &removed.region && claim.resource_id == removed.id)
+            });
         Some(removed)
     }
 
@@ -2038,15 +2218,31 @@ pub fn invalid_next_token() -> ValidationException {
 /// [`INSTANCE_NOT_FOUND_MESSAGE`]), which is why the refusal renderer in
 /// `crate::service` states a boundary violation the same way.
 pub fn field_validation_failed(name: &str, why: impl Into<String>) -> ValidationException {
+    members_validation_failed(&[name], why)
+}
+
+/// [`field_validation_failed`] for a rule that faults SEVERAL members at once.
+///
+/// A request that must name at least one of a set of members and names none of them
+/// has no single bad member, so every member of the set is named in `FieldList` and
+/// the one wording states the rule they share. The `Reason` and the way the wording
+/// reaches both places a client reads it are [`field_validation_failed`]'s, which is
+/// this function with a one-member set.
+pub fn members_validation_failed(names: &[&str], why: impl Into<String>) -> ValidationException {
     let why = why.into();
     ValidationException {
         message: why.clone(),
         reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
-        field_list: Some(vec![ValidationExceptionField {
-            name: name.to_string(),
-            reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
-            message: why,
-        }]),
+        field_list: Some(
+            names
+                .iter()
+                .map(|name| ValidationExceptionField {
+                    name: (*name).to_string(),
+                    reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+                    message: why.clone(),
+                })
+                .collect(),
+        ),
     }
 }
 
@@ -2306,6 +2502,42 @@ pub fn volume_zone_mismatch() -> ValidationException {
 pub const VOLUME_IN_USE_MESSAGE: &str =
     "Workspace managed EBS volume is attached to a workspace instance and must be \
      detached before it is deleted";
+
+/// The `Message` for a `ModifyVolume` of a volume whose previous modification has not
+/// finished.
+///
+/// The condition is the one the operation documents — "You can modify a volume only
+/// after any previous modification for that volume has finished" — and the model's own
+/// doc for `VolumeModificationRateExceededException` states it as "The volume has a
+/// previous modification that is still in progress". A FIXED sentence, like
+/// [`VOLUME_IN_USE_MESSAGE`]: the identity of the volume travels in `ResourceId`.
+pub const VOLUME_MODIFICATION_IN_PROGRESS_MESSAGE: &str =
+    "Workspace managed EBS volume has a previous modification that is still in progress";
+
+/// The `Message` for a `ModifyVolume` of a volume that has reached the rolling
+/// modification limit, as the model's own doc for
+/// `VolumeModificationRateExceededException` words it: "has reached the limit of four
+/// modifications in a rolling 24-hour period". The figure it spells is
+/// [`VOLUME_MODIFICATIONS_PER_WINDOW`], counted over
+/// [`VOLUME_MODIFICATION_WINDOW`].
+pub const VOLUME_MODIFICATION_LIMIT_MESSAGE: &str =
+    "Workspace managed EBS volume has reached the limit of four modifications in a \
+     rolling 24-hour period";
+
+/// The modelled `VolumeModificationRateExceededException` (HTTP 429) for a modify this
+/// service will not accept yet: `ResourceId` names the volume it was asked for and
+/// `ResourceType` its kind ([`VOLUME_RESOURCE_TYPE`]), with `message` one of the two
+/// fixed sentences above — which of the two the caller has to wait for.
+pub fn volume_modification_rate_exceeded(
+    volume_id: &str,
+    message: &str,
+) -> VolumeModificationRateExceededException {
+    VolumeModificationRateExceededException {
+        message: message.to_string(),
+        resource_id: volume_id.to_string(),
+        resource_type: VOLUME_RESOURCE_TYPE.to_string(),
+    }
+}
 
 /// The modelled `ServiceQuotaExceededException` (HTTP 402) for a create that would
 /// pass [`MAX_VOLUMES`]. The quota is scoped to one account in one Region and no

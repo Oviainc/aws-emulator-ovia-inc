@@ -223,11 +223,10 @@ async fn a_rule_with_no_remediation_configuration_is_refused_as_that() {
                 let answered = emulator
                     .ok("StartRemediationExecution", &start(name, keys))
                     .await;
-                assert!(
-                    answered
-                        .get("FailedItems")
-                        .is_none_or(|failed| failed.as_array().is_some_and(Vec::is_empty)),
-                    "case {case:?}: every key started, so none is reported failed, got \
+                assert_eq!(
+                    answered.get("FailedItems").and_then(Value::as_array),
+                    Some(&Vec::new()),
+                    "case {case:?}: every key started, so FailedItems is reported empty, got \
                      {answered}"
                 );
                 let states = reported(case, &emulator, name).await;
@@ -453,10 +452,9 @@ async fn a_resource_whose_execution_has_not_finished_is_not_started_again() {
     let answered = emulator
         .ok("StartRemediationExecution", &start(name, keys))
         .await;
-    assert!(
-        answered
-            .get("FailedItems")
-            .is_none_or(|failed| failed.as_array().is_some_and(Vec::is_empty)),
+    assert_eq!(
+        answered.get("FailedItems").and_then(Value::as_array),
+        Some(&Vec::new()),
         "a finished execution does not stand in the way of the next one, got {answered}"
     );
     let states = reported("restarted", &emulator, name).await;

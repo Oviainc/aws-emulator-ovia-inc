@@ -623,6 +623,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 pending_due_at: None,
                 running_due_at,
                 stopped_due_at: None,
+                // Scale-in protection is `UpdateTaskProtection`'s to set; a task nobody
+                // has protected holds none.
+                protection_expires_at: None,
             };
             // `RunTask` has no `include` member to narrow the response with, so the
             // task it just created is reported with the tags it was created with.

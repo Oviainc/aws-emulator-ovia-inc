@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteProject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteProject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteProject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one IoT SiteWise Monitor project from the store, with everything that
+//! project CONTAINS: a dashboard is created in a project (`CreateDashboard` refuses a
+//! `projectId` the store does not hold) and every read of a dashboard reports the
+//! project it lives in, so a dashboard cannot outlive its project. An id that
+//! resolves to no stored project is the modelled 404; the operation declares no
+//! conflict error, so a project that still holds dashboards is deleted rather than
+//! refused.
 //!
 //! ## Shape of an operation
 //!
@@ -145,20 +143,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteProject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteProjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteProject"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteProjectError::Modeled(DeleteProjectErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+
+        // The project goes, ARN and tags with it: the record owns its own tag set, so
+        // removing it is what makes the tagging operations stop resolving its ARN. An
+        // id that resolves to no stored project is the modelled 404 rather than a
+        // silent success — which is also what a retry carrying the `clientToken` of a
+        // delete that already landed gets, because this store keeps no token ->
+        // answer mapping to replay from, exactly as the creates in this crate leave it
+        // to the idempotency issue.
+        let mut store = state.lock();
+        if store.projects.remove(&input.project_id).is_none() {
+            return Err(not_found(&input.project_id));
+        }
+
+        // The dashboards the project CONTAINED go with it: a dashboard is created in a
+        // project and names that project on every read, so one whose project is gone
+        // could never have been created. The access policies that name the project are
+        // left alone — a policy is a resource of its own, addressed by its own id and
+        // removed by `DeleteAccessPolicy`.
+        store
+            .dashboards
+            .retain(|_, dashboard| dashboard.project_id != input.project_id);
+
+        Ok(DeleteProjectOutput {})
     }
 }
+
+/// HTTP 404 `ResourceNotFoundException` naming the id that resolved to nothing, in
+/// the one wording every not-found refusal in this service carries.
+fn not_found(project_id: &str) -> DeleteProjectError {
+    DeleteProjectError::Modeled(DeleteProjectErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(crate::state::RESOURCE_PROJECT, project_id),
+        },
+    ))
+}
+

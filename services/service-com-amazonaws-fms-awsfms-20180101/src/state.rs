@@ -1655,6 +1655,37 @@ pub fn merge_tags(existing: &mut Vec<Tag>, added: &[Tag]) {
     }
 }
 
+/// The first tag key `tag_list` carries more than once, if any.
+///
+/// Keys are case-SENSITIVE (`com.amazonaws.fms#Tag$Key`: "Tag keys are
+/// case-sensitive"), so `env` and `Env` are two keys, not one repeated.
+fn first_duplicate_tag_key(tag_list: &[Tag]) -> Option<&str> {
+    tag_list
+        .iter()
+        .enumerate()
+        .find(|(index, tag)| {
+            tag_list[..*index]
+                .iter()
+                .any(|earlier| earlier.key == tag.key)
+        })
+        .map(|(_, tag)| tag.key.as_str())
+}
+
+/// Why `tag_list` cannot be written as a tag set, or `None` when every key in it
+/// is distinct.
+///
+/// Tags are a key:value MAP (`com.amazonaws.fms#Tag` is one key and one value),
+/// so a resource can never hold two values for one key: a `TagList` naming one
+/// key twice has no single outcome and is refused rather than silently resolved.
+/// The rule is about the `TagList` a request carries, not about one operation,
+/// so EVERY operation that writes one — the tagging operation and each resource
+/// writer whose input carries a `TagList` — refuses it here, with the modelled
+/// `InvalidInputException` and this one wording.
+pub fn duplicate_tag_key_message(tag_list: &[Tag]) -> Option<String> {
+    first_duplicate_tag_key(tag_list)
+        .map(|duplicate| format!("TagList contains the tag key {duplicate} more than once"))
+}
+
 /// The reason `arn` is not an Amazon Resource Name at all, or `None` when it is
 /// shaped like one.
 ///

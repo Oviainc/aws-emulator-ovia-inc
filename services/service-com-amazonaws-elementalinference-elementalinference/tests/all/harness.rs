@@ -87,6 +87,29 @@ pub fn tags_path(resource_arn: &str) -> String {
     format!("/v1/tags/{}", percent_encode(resource_arn))
 }
 
+/// `DELETE /v1/tags/{resourceArn}?tagKeys=…`: the one path every suite deletes tags
+/// through.
+///
+/// `tagKeys` is an `@httpQuery` bound to a list, so a client repeats the parameter once
+/// per key, each value percent-encoded ([`percent_encode`]).
+pub async fn untag_resource(
+    router: &MultiServiceRouter,
+    resource_arn: &str,
+    tag_keys: &[String],
+) -> (u16, Value) {
+    assert!(
+        !tag_keys.is_empty(),
+        "tagKeys is @required, so every request under test names at least one key"
+    );
+    let query = tag_keys
+        .iter()
+        .map(|key| format!("tagKeys={}", percent_encode(key)))
+        .collect::<Vec<String>>()
+        .join("&");
+    let uri = format!("{}?{query}", tags_path(resource_arn));
+    call(router, "DELETE", &uri, None).await
+}
+
 /// A router serving this service alone over one shared engine.
 pub fn router() -> MultiServiceRouter {
     router_with_engine().0
@@ -156,6 +179,25 @@ pub async fn call_in_region(
         })
     };
     (status, parsed)
+}
+
+/// The path one resource kind's collection is listed under (`ListFeeds` /
+/// `ListDictionaries`).
+pub fn list_path(kind: &str) -> &'static str {
+    match kind {
+        "feed" => "/v1/feeds",
+        "dictionary" => "/v1/dictionaries",
+        other => panic!("no such resource kind: {other}"),
+    }
+}
+
+/// The member a list response of `kind` reports its page under.
+pub fn list_member(kind: &str) -> &'static str {
+    match kind {
+        "feed" => "feeds",
+        "dictionary" => "dictionaries",
+        other => panic!("no such resource kind: {other}"),
+    }
 }
 
 /// One `outputConfig` of each kind the `OutputConfig` union models

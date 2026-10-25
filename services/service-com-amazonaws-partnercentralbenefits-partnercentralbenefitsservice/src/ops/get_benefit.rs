@@ -182,16 +182,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
 
         let store = state.lock();
-        if !store.catalogs.contains_key(&input.catalog) {
-            return Err(GetBenefitErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::not_found_message(
-                        crate::state::CATALOG_KIND,
-                        &input.catalog,
-                    ),
-                },
-            )
-            .into());
+        // The catalog the request names is resolved FIRST: a benefit lives inside a
+        // catalog, so a catalog that does not exist is the missing resource and is what
+        // the answer names — see [`crate::state::catalog_refusal`].
+        if let Some(missing) = store.catalog_refusal(&input.catalog) {
+            return Err(GetBenefitErrorModeled::ResourceNotFoundException(missing).into());
         }
 
         // Either form the modelled `Identifier` admits names the same record; an ARN of

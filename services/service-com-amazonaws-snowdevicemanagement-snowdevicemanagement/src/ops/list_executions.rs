@@ -4,8 +4,10 @@
 //! Enumerates the execution records `CreateTask` created for `taskId` — one per target
 //! device, in `managedDeviceId` order — narrowed to one `state` when the request names
 //! one: `@paginated(items: executions)`, so a page is cut at `maxResults` and
-//! `nextToken` carries the device id the next page resumes at. A `taskId` naming no
-//! task is answered with the modelled `ResourceNotFoundException`.
+//! `nextToken` is an opaque cursor — bound to this operation, the signed Region, the
+//! task and the `state` filter the page was served under — naming where the next page
+//! resumes. A `taskId` naming no task is answered with the modelled
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -175,19 +177,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The token carries the device id the next page resumes at; a value this
-        // service never issued is refused rather than silently serving page one.
+        // The token is an opaque cursor this operation minted for THIS enumeration:
+        // the executions of ONE task in the signed Region, narrowed by the `state` the
+        // previous page was served under. A value this service never issued — and one
+        // it issued for another operation, Region, task or filter — names no position
+        // here and is refused rather than reinterpreted as a resume key.
+        let cursor = crate::state::CursorScope {
+            operation: Self::NAME,
+            region: &region,
+            filters: &[Some(input.task_id.as_str()), input.state.as_deref()],
+        };
         let resume_at = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match crate::state::decode_token(token) {
+            Some(token) => match crate::state::decode_token(token, &cursor) {
                 Some(key) => Some(key),
                 None => {
                     return Err(ListExecutionsErrorModeled::ValidationException(
-                        ValidationException {
-                            message: format!(
-                                "nextToken {token:?} is not a token returned by ListExecutions"
-                            ),
-                        },
+                        crate::state::invalid_next_token(Self::NAME),
                     )
                     .into())
                 }
@@ -223,7 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
             if executions.len() == page_size {
-                next_token = Some(crate::state::encode_token(managed_device_id));
+                next_token = Some(crate::state::encode_token(&cursor, managed_device_id));
                 break;
             }
             executions.push(execution.to_summary());

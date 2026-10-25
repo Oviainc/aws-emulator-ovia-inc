@@ -79,6 +79,8 @@ mod resource_set_listing;
 mod resource_set_resources;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_list_duplicate_keys_on_writers.rs"]
+mod tag_list_duplicate_keys_on_writers;
 #[path = "all/tag_removal.rs"]
 mod tag_removal;
 #[path = "all/tagging_across_resource_kinds.rs"]
