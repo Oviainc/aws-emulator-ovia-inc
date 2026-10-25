@@ -34,7 +34,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use service_com_amazonaws_memorydb_amazonmemorydb::ops::types::AUTHENTICATION_TYPE_VALUES;
 use service_com_amazonaws_memorydb_amazonmemorydb::state::{
-    user_arn, StoredUser, MAX_MAX_RESULTS, MIN_MAX_RESULTS,
+    user_arn, StoredUser, ACCESS_CONTROL_PAGE_SIZE_WINDOW,
 };
 use service_com_amazonaws_memorydb_amazonmemorydb::{
     ComAmazonawsMemorydbAmazonmemorydbState, EmulatedService,
@@ -466,8 +466,8 @@ async fn filters_select_the_users_whose_named_property_matches() {
     }
 }
 
-/// The users the paging case seeds: MORE of them than the smallest page the service
-/// serves (`MIN_MAX_RESULTS`), so a page size at the bottom of the page-size window has
+/// The users the paging case seeds: MORE of them than the smallest page the user
+/// listing serves, so a page size at the bottom of its page-size window has
 /// to walk several pages to cover the set.
 const PAGED_USER_NAMES: &[&str] = &[
     "page-a", "page-b", "page-c", "page-d", "page-e", "page-f", "page-g", "page-h",
@@ -476,9 +476,9 @@ const PAGED_USER_NAMES: &[&str] = &[
 ];
 
 /// The listing pages over its whole set, in name order, for any `MaxResults` the
-/// service's page-size window admits: each page is at most `MaxResults` long, the token
-/// resumes exactly where the page ended, and the pages concatenated are the full set
-/// with nothing repeated or dropped.
+/// access-control page-size window admits: each page is at most `MaxResults` long, the
+/// token resumes exactly where the page ended, and the pages concatenated are the full
+/// set with nothing repeated or dropped.
 #[tokio::test]
 async fn users_page_over_the_whole_set_for_any_page_size() {
     let harness = harness();
@@ -503,7 +503,11 @@ async fn users_page_over_the_whole_set_for_any_page_size() {
     all.sort();
 
     // At the bottom of the window, one past it, and at the top.
-    for page_size in [MIN_MAX_RESULTS, MIN_MAX_RESULTS + 1, MAX_MAX_RESULTS] {
+    for page_size in [
+        ACCESS_CONTROL_PAGE_SIZE_WINDOW.min,
+        ACCESS_CONTROL_PAGE_SIZE_WINDOW.min + 1,
+        ACCESS_CONTROL_PAGE_SIZE_WINDOW.max,
+    ] {
         let case = format!("MaxResults={page_size}");
         let mut seen: Vec<String> = Vec::new();
         let mut token: Option<String> = None;
@@ -676,12 +680,12 @@ async fn refusals_come_from_state_and_from_the_filterable_properties() {
             "InvalidParameterValueException",
         ),
         (
-            json!({ "MaxResults": MIN_MAX_RESULTS - 1 }),
+            json!({ "MaxResults": ACCESS_CONTROL_PAGE_SIZE_WINDOW.min - 1 }),
             400,
             "InvalidParameterValueException",
         ),
         (
-            json!({ "MaxResults": MAX_MAX_RESULTS + 1 }),
+            json!({ "MaxResults": ACCESS_CONTROL_PAGE_SIZE_WINDOW.max + 1 }),
             400,
             "InvalidParameterValueException",
         ),

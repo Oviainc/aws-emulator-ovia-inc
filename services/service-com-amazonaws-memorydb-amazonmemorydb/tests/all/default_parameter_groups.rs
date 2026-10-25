@@ -19,7 +19,7 @@
 use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_memorydb_amazonmemorydb::state::MIN_MAX_RESULTS;
+use service_com_amazonaws_memorydb_amazonmemorydb::state::PARAMETER_PAGE_SIZE_WINDOW;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cluster_lifecycle::{call, error_code, ok, router};
@@ -221,7 +221,13 @@ async fn every_catalog_family_has_a_default_parameter_group_nobody_created() {
         );
         // Paged at the smallest page size the service serves, which is smaller than the
         // baseline, so the walk really covers several pages.
-        let paged = parameters(&router, &name, Some(i64::from(MIN_MAX_RESULTS)), &case).await;
+        let paged = parameters(
+            &router,
+            &name,
+            Some(i64::from(PARAMETER_PAGE_SIZE_WINDOW.min)),
+            &case,
+        )
+        .await;
         assert_eq!(
             paged, baseline,
             "case {case:?}: paging the baseline must yield the same parameters"

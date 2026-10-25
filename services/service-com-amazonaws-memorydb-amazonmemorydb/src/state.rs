@@ -116,22 +116,82 @@ pub const MAX_PASSWORD_LEN: usize = 128;
 /// `InvalidParameterValueException`; a name of exactly this length is accepted.
 pub const MAX_RESOURCE_NAME_LEN: usize = 40;
 
-/// The smallest page size a MemoryDB listing accepts for `MaxResults`.
+/// The page sizes ONE MemoryDB resource surface serves for `MaxResults`, and the noun
+/// its refusal names the page size with.
 ///
-/// `MaxResults` is an `IntegerOptional` the model puts no `@range` on; the WINDOW comes
-/// from the service's own refusal, which names both of its bounds — a page size below
-/// this one, or above [`MAX_MAX_RESULTS`], is answered with
-/// `InvalidParameterValueException` naming the window, and a size at either bound is
-/// served. So the bound lives here and every paginated listing in this service reads it
-/// through [`max_results_rejection`], rather than each one inventing its own: a page
-/// size the service will not serve cannot be accepted by one listing and refused by the
-/// next.
-pub const MIN_MAX_RESULTS: i32 = 20;
+/// `MaxResults` is an `IntegerOptional` the model puts no `@range` on, so the window is
+/// the SERVICE's own and is read off its refusal, which names both bounds: a size at
+/// either bound is served, one outside is answered with
+/// `InvalidParameterValueException` naming the window. The window belongs to the
+/// RESOURCE SURFACE the listing reads, not to the service as a whole — the
+/// access-control listings serve page sizes the cluster listings refuse and vice versa —
+/// so every paginated listing validates its page size against the window ITS surface
+/// publishes ([`ACCESS_CONTROL_PAGE_SIZE_WINDOW`], [`CLUSTER_PAGE_SIZE_WINDOW`],
+/// [`PARAMETER_PAGE_SIZE_WINDOW`]) through [`PageSizeWindow::rejection`], rather than
+/// one window standing in for all of them or each listing inventing its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageSizeWindow {
+    /// The smallest page size the listings of this surface serve.
+    pub min: i32,
+    /// The largest page size the listings of this surface serve.
+    pub max: i32,
+    /// How this surface's refusal names the page size it rejected: this service words
+    /// the same rule with two nouns, so the window carries the one its own listings
+    /// answer with.
+    noun: &'static str,
+}
 
-/// The largest page size a MemoryDB listing accepts for `MaxResults`, the upper bound
-/// of the same refusal as [`MIN_MAX_RESULTS`], read through the same
-/// [`max_results_rejection`].
-pub const MAX_MAX_RESULTS: i32 = 100;
+impl PageSizeWindow {
+    /// Why a listing of this surface cannot serve `max_results`, or `None` when it can.
+    ///
+    /// A request that names no page size is never refused: the window bounds a value the
+    /// caller supplied, it is not a size the listing requires. The caller maps the
+    /// refusal onto its own modelled `InvalidParameterValueException`.
+    pub fn rejection(self, max_results: Option<i32>) -> Option<String> {
+        let max = max_results?;
+        (!(self.min..=self.max).contains(&max)).then(|| {
+            format!(
+                "Invalid value for {}. Must be between {} and {}",
+                self.noun, self.min, self.max
+            )
+        })
+    }
+}
+
+/// The window the ACCESS-CONTROL listings serve — `DescribeUsers` and `DescribeACLs`.
+///
+/// Recorded behaviour: a page size of 1 is served (one item per page, the token
+/// advancing until the set is exhausted) and only a size outside these bounds is
+/// refused, with the page size named "max results". So a client may page users and ACLs
+/// one at a time, which the cluster-side window ([`CLUSTER_PAGE_SIZE_WINDOW`]) does not
+/// allow.
+pub const ACCESS_CONTROL_PAGE_SIZE_WINDOW: PageSizeWindow = PageSizeWindow {
+    min: 1,
+    max: 50,
+    noun: "max results",
+};
+
+/// The window the CLUSTER-side listings serve — `DescribeClusters`, `DescribeEvents` and
+/// `DescribeEngineVersions`.
+///
+/// Their refusal names the page size "max records", the noun every `MaxResults` member's
+/// own documentation uses ("The maximum number of records to include in the response").
+pub const CLUSTER_PAGE_SIZE_WINDOW: PageSizeWindow = PageSizeWindow {
+    min: 20,
+    max: 100,
+    noun: "max records",
+};
+
+/// The window the PARAMETER-GROUP surface serves — `DescribeParameterGroups` and
+/// `DescribeParameters`.
+///
+/// The same bounds as the cluster-side listings, but its refusal calls the page size
+/// "max results".
+pub const PARAMETER_PAGE_SIZE_WINDOW: PageSizeWindow = PageSizeWindow {
+    min: 20,
+    max: 100,
+    noun: "max results",
+};
 
 /// The number of hash slots a cluster spreads over its shards. Fixed by the Redis
 /// OSS / Valkey cluster protocol MemoryDB implements (slots `0..=16383`).
@@ -2565,53 +2625,6 @@ pub fn default_user_membership_rejection<'a>(
     .then(|| format!("{DEFAULT_USER_NAME} user can't be added to another ACL."))
 }
 
-/// How one listing's refusal names the page size it rejected.
-///
-/// The BOUND is one rule for every paginated listing in this service
-/// ([`MIN_MAX_RESULTS`]..=[`MAX_MAX_RESULTS`], read through
-/// [`max_results_rejection`]); the NOUN is per listing, because that is how this
-/// service's wire words it: most of its listings call the page size "max records" — the
-/// noun every `MaxResults` member's own documentation uses ("The maximum number of
-/// records to include in the response") — while the parameter-group surface calls it
-/// "max results". So each handler names the noun its own listing answers with and reads
-/// the rule itself from one place.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PageSizeNoun {
-    /// "max records": the noun the model's own `MaxResults` documentation uses, and the
-    /// one the cluster, ACL, event and engine-version listings answer with.
-    Records,
-    /// "max results": the noun the parameter-group surface (`DescribeParameterGroups`,
-    /// `DescribeParameters`) answers with.
-    Results,
-}
-
-impl PageSizeNoun {
-    /// The noun as the refusal spells it.
-    fn phrase(self) -> &'static str {
-        match self {
-            Self::Records => "max records",
-            Self::Results => "max results",
-        }
-    }
-}
-
-/// Why a listing cannot serve this `MaxResults`, or `None` when it can.
-///
-/// EVERY paginated listing in this service reads the page-size window through here, so
-/// one request's page size is refused by the same rule, with the same bounds, whichever
-/// listing it was sent to; `noun` is only how that listing names the page size (see
-/// [`PageSizeNoun`]). The caller maps the refusal onto its own modelled
-/// `InvalidParameterValueException`.
-pub fn max_results_rejection(noun: PageSizeNoun, max_results: Option<i32>) -> Option<String> {
-    let max = max_results?;
-    (!(MIN_MAX_RESULTS..=MAX_MAX_RESULTS).contains(&max)).then(|| {
-        format!(
-            "Invalid value for {}. Must be between {MIN_MAX_RESULTS} and {MAX_MAX_RESULTS}",
-            noun.phrase()
-        )
-    })
-}
-
 /// The canonical form of an access string, which is what the service stores and
 /// reports for `User$AccessString`.
 ///
@@ -2997,8 +3010,8 @@ pub fn paginate<T>(
 }
 
 /// The already-validated page size of a listing request: `None` for "every remaining
-/// item". Only reached once the caller has refused a `MaxResults` outside
-/// [`MIN_MAX_RESULTS`]..=[`MAX_MAX_RESULTS`], so the value is bounded before it is used.
+/// item". Only reached once the caller has refused a `MaxResults` outside its own
+/// surface's [`PageSizeWindow`], so the value is bounded before it is used.
 pub fn page_limit(max_results: Option<i32>) -> Option<usize> {
     max_results.and_then(|max| usize::try_from(max).ok())
 }

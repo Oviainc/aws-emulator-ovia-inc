@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBParameters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBParameters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the parameters of one DB (instance) parameter group. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBParameters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A group carries the parameters a CALLER set (reported `Source` `user`); the engine's own
+//! defaults belong to the FAMILY and are published by it
+//! (`crate::state::published_db_parameters`), so a `Source` naming the engine reports the
+//! family's published defaults and a request naming no source at all reports every type:
+//! each published parameter under the value the group sets for it, or under the engine's
+//! default where the group sets none.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +80,8 @@
 //!
 //! * `DBParameterGroupNotFoundFault` (HTTP 404) — DBParameterGroupName doesn't refer to an
 //!   existing DB parameter group.
+
+use std::collections::BTreeMap;
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -152,18 +154,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBParameters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBParametersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBParameters"))
+        let region =
+            crate::state::request_region(ctx).map_err(DescribeDBParametersError::validation)?;
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeDBParametersError::invalid_parameter_value)?;
+        // `Filters`: "The only supported filter is parameter-name", so any other filter name
+        // is refused rather than ignored — ignoring one would report parameters the caller
+        // excluded.
+        let filters = input.filters.unwrap_or_default();
+        check_filter_names(&filters).map_err(DescribeDBParametersError::invalid_parameter_value)?;
+        crate::state::check_filter_terms(&filters)
+            .map_err(DescribeDBParametersError::validation)?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let store = state.lock();
+
+        // `DBParameterGroupName` is "stored as a lowercase string" and RDS is regional, so
+        // the group is looked up by the lowercased name in the region the request was signed
+        // for; a name that matches none is the modelled 404, not an empty page.
+        let name = input.db_parameter_group_name.to_ascii_lowercase();
+        let Some(group) = store.db_parameter_groups.get(&(region, name)) else {
+            return Err(
+                DescribeDBParametersErrorModeled::DBParameterGroupNotFoundFault(
+                    DBParameterGroupNotFoundFault {
+                        message: Some(format!(
+                            "DBParameterGroup not found: {}",
+                            input.db_parameter_group_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Which parameter types the caller asked for decides what is reported. `Source`'s
+        // own documentation is the rule: "Default: All parameter types returned", so a
+        // request naming no source reports every type at once, which is this operation's
+        // difference from the cluster-level describe (whose `Source` documents no such
+        // default).
+        let reported: BTreeMap<String, Parameter> = match input.source.as_deref() {
+            None => every_parameter_type(group),
+            Some(source) => match crate::state::parameter_source_filter(Some(source)) {
+                // The family's published defaults, with the values the engine runs with.
+                crate::state::ParameterSourceFilter::Engine => published_defaults(group),
+                // The group's own parameters: the ones a caller set.
+                crate::state::ParameterSourceFilter::Customer => group
+                    .parameters
+                    .keys()
+                    .map(|name| (name.clone(), group.parameter_to_wire(name)))
+                    .collect(),
+                // Nothing for `system`, because this emulator sets no service-sourced
+                // parameter, and nothing for a value naming no source at all.
+                crate::state::ParameterSourceFilter::Service
+                | crate::state::ParameterSourceFilter::Unknown => BTreeMap::new(),
+            },
+        };
+
+        // "The results list only includes information about the DB parameters with these
+        // names": a parameter is reported only when EVERY filter names it — the intersection
+        // a repeated filter asks for.
+        let records: Vec<(String, Parameter)> = reported
+            .into_iter()
+            .filter(|(name, _)| {
+                filters
+                    .iter()
+                    .all(|filter| filter.values.iter().any(|value| value == name))
+            })
+            .collect();
+
+        // A `Marker` no prior page issued is refused rather than resynchronised: see
+        // `crate::state::paginate`.
+        let page = crate::state::paginate(records, input.marker.as_deref(), page_size)
+            .map_err(DescribeDBParametersError::invalid_parameter_value)?;
+        Ok(DescribeDBParametersOutput {
+            parameters: Some(page.items),
+            marker: page.next_marker,
+        })
     }
+}
+
+/// The one filter name this operation's `Filters` member documents: "The only supported
+/// filter is `parameter-name`."
+const SUPPORTED_FILTER_NAMES: [&str; 1] = ["parameter-name"];
+
+/// Refuse a filter this operation does not support. "Filter names are case-sensitive."
+///
+/// The caller answers this with `InvalidParameterValue` — the Query API common error Amazon
+/// RDS itself answers an unrecognized filter name with.
+fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
+    for filter in filters {
+        if !SUPPORTED_FILTER_NAMES.contains(&filter.name.as_str()) {
+            return Err(format!(
+                "unrecognized filter name: {}; supported filters are {}",
+                filter.name,
+                SUPPORTED_FILTER_NAMES.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The parameters `group`'s family publishes, each with the default value the engine runs
+/// with and `Source` `engine-default`: what a `Source` naming the engine reports, and the
+/// half of [`every_parameter_type`] the group has set nothing for.
+fn published_defaults(
+    group: &crate::state::DbParameterGroupRecord,
+) -> BTreeMap<String, Parameter> {
+    crate::state::published_db_parameters(&group.family)
+        .unwrap_or_default()
+        .iter()
+        .map(|spec| {
+            (
+                spec.name.to_string(),
+                crate::state::engine_default_parameter_to_wire(spec),
+            )
+        })
+        .collect()
+}
+
+/// Every parameter type of `group` at once, which is what a request naming no `Source`
+/// reports: each parameter its family publishes, under the value and apply method the GROUP
+/// sets for it where it sets one (`Source` `user`) and under the engine's own default where
+/// it does not (`Source` `engine-default`), plus any parameter the group carries that the
+/// family publishes nothing for.
+///
+/// Keyed by parameter name, so the report is in name order whichever half an entry came
+/// from — the order its pagination marker walks.
+fn every_parameter_type(
+    group: &crate::state::DbParameterGroupRecord,
+) -> BTreeMap<String, Parameter> {
+    let mut reported = published_defaults(group);
+    for name in group.parameters.keys() {
+        reported.insert(name.clone(), group.parameter_to_wire(name));
+    }
+    reported
 }
