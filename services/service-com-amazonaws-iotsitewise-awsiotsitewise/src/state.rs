@@ -30,8 +30,9 @@
 //! status a poll reports is derived rather than stored. A workspace's
 //! asynchronous queries live in
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::queries`], keyed the same way,
-//! each record carrying what running its statement produced and the instant it
-//! was submitted, from which a read DERIVES the status the clock has made due. An
+//! each record carrying what running its statement produced, the instant it was
+//! submitted and the instant a cancel was recorded on it, from which a read
+//! DERIVES the status the clock has made due. An
 //! execution of an action lives in
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::executions`], keyed by its own
 //! id, which is what `ListExecutions` summarises for the target resource a
@@ -3119,10 +3120,11 @@ pub fn check_compute_nodes(computations: &[ComputeNode]) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// The asynchronous queries of a workspace: what `StartQuery` starts and
-// `DescribeQuery` reports. A query's STATUS is derived from the instant it was
-// submitted, exactly as a dataset export job's is, so a read reports what the
-// clock has made due without writing anything.
+// The asynchronous queries of a workspace: what `StartQuery` starts,
+// `CancelQuery` cancels and `DescribeQuery` reports. A query's STATUS is derived
+// from the instant it was submitted — and, once one is recorded, from the instant
+// its cancel was asked for — exactly as a dataset export job's is, so a read
+// reports what the clock has made due without writing anything.
 // ---------------------------------------------------------------------------
 
 /// The `QueryStatus` a query reports from the instant it is submitted: "The
@@ -3139,6 +3141,31 @@ pub const QUERY_COMPLETED: &str = "COMPLETED";
 /// The value a query whose run did not finish reports, beside the message saying
 /// why. Terminal.
 pub const QUERY_FAILED: &str = "FAILED";
+
+/// The value a query a cancel was recorded on reports until that cancellation has
+/// taken effect: the `QueryStatus` value the enum carries for a cancel in flight.
+pub const QUERY_CANCELING: &str = "CANCELING";
+
+/// The value a cancelled query reports once its cancellation has taken effect.
+/// Terminal.
+pub const QUERY_CANCELED: &str = "CANCELED";
+
+/// The resource type section a query's ARN carries, which is what the modelled
+/// conflict refusal reports for one.
+pub const QUERY_RESOURCE_TYPE: &str = "query";
+
+/// The canonical ARN of a query in `region`.
+///
+/// The resource section carries the WORKSPACE as well as the id, for the reason
+/// [`pipeline_arn`] states: a query is addressed only inside the workspace it was
+/// started in.
+pub fn query_arn(region: &str, workspace_name: &str, query_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{QUERY_RESOURCE_TYPE}/{workspace_name}/{query_id}"),
+    )
+}
 
 /// How long each step of a query's lifecycle takes: a submitted query stays
 /// `SUBMITTED` for this long, then reports `RUNNING` for this long, then is in its
@@ -3187,6 +3214,11 @@ pub struct QueryRecord {
     pub client_token: Option<String>,
     /// When the query was submitted, which is the `submittedAt` a read reports.
     pub submitted_at: SystemTime,
+    /// When a cancel was recorded on this query, if one was. A cancel is recorded
+    /// only while the query has not reached a terminal status, and from then on it
+    /// is this instant — not [`Self::submitted_at`] — the query's remaining
+    /// lifecycle is owed from.
+    pub cancel_requested_at: Option<SystemTime>,
     /// What running the statement produced.
     pub outcome: QueryOutcome,
 }
@@ -3218,36 +3250,62 @@ impl QueryRecord {
     /// has elapsed, `RUNNING` until the second has, and then the terminal status
     /// its run earned — `COMPLETED` for a run that answered rows, `FAILED` for one
     /// that did not finish. A terminal status never moves again.
+    ///
+    /// A cancelled query reports `CANCELING` until its cancellation takes effect
+    /// and `CANCELED` from then on, whatever its run produced: the cancel is
+    /// recorded only on a query that had not reached a terminal status, so the
+    /// cancellation is the terminal state it reaches.
     pub fn status(&self, now: SystemTime) -> &'static str {
-        match self.completed_at(now) {
-            Some(_) => match self.outcome {
+        match (self.cancel_requested_at, self.completed_at(now)) {
+            (Some(_), None) => QUERY_CANCELING,
+            (Some(_), Some(_)) => QUERY_CANCELED,
+            (None, Some(_)) => match self.outcome {
                 QueryOutcome::Completed { .. } => QUERY_COMPLETED,
                 QueryOutcome::Failed { .. } => QUERY_FAILED,
             },
-            None if now >= self.submitted_at + QUERY_STEP => QUERY_RUNNING,
-            None => QUERY_SUBMITTED,
+            (None, None) if now >= self.submitted_at + QUERY_STEP => QUERY_RUNNING,
+            (None, None) => QUERY_SUBMITTED,
         }
     }
 
     /// "The date and time when the query reached a terminal state": the instant
     /// the terminal status fell due, and `None` until it has.
     pub fn completed_at(&self, now: SystemTime) -> Option<SystemTime> {
-        let completes_at = self.submitted_at + 2 * QUERY_STEP;
+        let completes_at = self.terminal_at();
         (now >= completes_at).then_some(completes_at)
     }
 
+    /// The instant this query's terminal status falls due: one step after the
+    /// cancel that was recorded on it, and otherwise the end of the run-through
+    /// span [`QUERY_STEP`] describes. A recorded cancel REPLACES the span the
+    /// submission owed, because it is what the query now settles into.
+    fn terminal_at(&self) -> SystemTime {
+        match self.cancel_requested_at {
+            Some(requested_at) => requested_at + QUERY_STEP,
+            None => self.submitted_at + 2 * QUERY_STEP,
+        }
+    }
+
+    /// Whether a cancel may still be recorded on this query at `now`: one the
+    /// clock has not yet taken to a terminal status. A query a cancel was already
+    /// recorded on is not cancelled again — the repeat is a no-op reporting the
+    /// status it stands in.
+    pub fn is_cancelable(&self, now: SystemTime) -> bool {
+        self.cancel_requested_at.is_none() && self.completed_at(now).is_none()
+    }
+
     /// The query's `statistics` at `now`: "statistics about a COMPLETED query
-    /// execution", so a query that has not reached its terminal status yet, and one
-    /// whose run failed, reports none.
+    /// execution", so a query that has not reached its terminal status yet, one
+    /// whose run failed, and one that was cancelled report none.
     pub fn statistics(&self, now: SystemTime) -> Option<QueryStatistics> {
-        match (&self.outcome, self.completed_at(now)) {
+        match (&self.outcome, self.status(now)) {
             (
                 QueryOutcome::Completed {
                     row_count,
                     bytes_scanned,
                     execution_time_in_millis,
                 },
-                Some(_),
+                QUERY_COMPLETED,
             ) => Some(QueryStatistics {
                 row_count: *row_count,
                 bytes_scanned: *bytes_scanned,
@@ -3258,10 +3316,12 @@ impl QueryRecord {
     }
 
     /// The query's `errorMessage` at `now`: the message its failed run carried,
-    /// and `None` until that failure is the status the query reports.
+    /// and `None` unless that failure is the status the query reports — a query
+    /// cancelled before its run's failure fell due reports no message, because the
+    /// status it reached is the cancellation and not the failure.
     pub fn error_message(&self, now: SystemTime) -> Option<String> {
-        match (&self.outcome, self.completed_at(now)) {
-            (QueryOutcome::Failed { error_message }, Some(_)) => Some(error_message.clone()),
+        match (&self.outcome, self.status(now)) {
+            (QueryOutcome::Failed { error_message }, QUERY_FAILED) => Some(error_message.clone()),
             _ => None,
         }
     }
