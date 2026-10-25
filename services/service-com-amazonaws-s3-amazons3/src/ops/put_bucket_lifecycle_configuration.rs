@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutBucketLifecycleConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutBucketLifecycleConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutBucketLifecycleConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the configuration a request carries is recorded on the named bucket, and
+//! `GetBucketLifecycleConfiguration` reports it back until `DeleteBucketLifecycle` removes
+//! it.
 //!
 //! ## Shape of an operation
 //!
@@ -138,14 +132,22 @@ use super::types::*;
 // `PutBucketLifecycleConfigurationError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `PutBucketLifecycleConfigurationError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#PutBucketLifecycleConfiguration")]
+// The operation's MODELED errors, widened by `NoSuchBucket`.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="PutBucketLifecycleConfiguration")` reports
+// `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket that does
+// not exist and AWS answers the service-wide `NoSuchBucket` ("The specified bucket does
+// not exist", `httpError 404`). `extra_errors` widens the set with that shape, which the
+// SERVICE models, so this handler answers the same 404 every other bucket-scoped
+// operation does rather than inventing a second rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#PutBucketLifecycleConfiguration",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum PutBucketLifecycleConfigurationErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -199,18 +201,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutBucketLifecycleConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutBucketLifecycleConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutBucketLifecycleConfiguration"))
+        // Everything this write needs is in its deserialized input: the expected owner, the
+        // configuration and the minimum-object-size behaviour all travel as members.
+        let _ = ctx;
+
+        // "The account ID of the expected bucket owner. If the account ID that you provide
+        // does not match the actual owner of the bucket, the request fails with the HTTP
+        // status code 403 Forbidden (access denied)"
+        // (`PutBucketLifecycleConfigurationRequest$ExpectedBucketOwner`), judged the way
+        // `PutBucketReplication` judges it: this emulator serves one account, so that
+        // account owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                ACCESS_DENIED_STATUS,
+                "Access Denied",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The store is unreachable only when this service is mounted on an engine
+            // that is not the shared `InMemoryEngine`; nothing can then be persisted, and
+            // this operation models no server-fault error to say so, so the scaffold's
+            // 501 carries "this emulator cannot serve it" rather than a false success.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutBucketLifecycleConfiguration",
+            ));
+        };
+
+        // Every refusal below is decided BEFORE anything is written, so a refused put
+        // leaves the bucket's current configuration exactly as it was; and the bucket is
+        // looked up FIRST, so a request naming a bucket this emulator does not hold answers
+        // that rather than reporting whatever is wrong with a configuration the bucket
+        // could never have carried (the order `PutBucketReplication` keeps).
+        let mut store = state.lock();
+        if store.bucket(&input.bucket).is_none() {
+            return Err(
+                PutBucketLifecycleConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {}).into(),
+            );
+        }
+
+        // "You specify the lifecycle configuration in your request body": a request that
+        // carries none names no configuration to apply, which S3 answers with
+        // `MissingRequestBodyError` ("Request body is empty", HTTP 400) — the channel
+        // `PutBucketAcl` answers a request that names no ACL at all through.
+        let Some(configuration) = input.lifecycle_configuration else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::MISSING_REQUEST_BODY_CODE,
+                LIFECYCLE_REFUSAL_STATUS,
+                crate::state::MISSING_REQUEST_BODY_MESSAGE,
+            ));
+        };
+
+        // The published rules the configuration has to satisfy, reported by the store so
+        // the put and any later writer are judged by one set of them.
+        if let Err(rejection) =
+            crate::state::validate_lifecycle_configuration(&configuration.rules)
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                rejection.code(),
+                LIFECYCLE_REFUSAL_STATUS,
+                rejection.message(),
+            ));
+        }
+
+        // "Indicates which default minimum object size behavior is applied to the lifecycle
+        // configuration": the request's value when it names one, and otherwise the
+        // behaviour that applies by default — objects smaller than 128 KB do not transition
+        // ([`crate::state::DEFAULT_TRANSITION_MINIMUM_OBJECT_SIZE`]). The applied value is
+        // what this response reports and what a later read reports, so it is recorded with
+        // the configuration rather than re-derived.
+        let applied_minimum_object_size = input
+            .transition_default_minimum_object_size
+            .unwrap_or_else(|| crate::state::DEFAULT_TRANSITION_MINIMUM_OBJECT_SIZE.to_string());
+
+        // `ChecksumAlgorithm` is NOT verified here, for the reason `PutBucketReplication`
+        // gives for `ContentMD5`: by the time this handler runs the payload is the
+        // deserialized container rather than the bytes a digest was computed over.
+        if store
+            .put_lifecycle_configuration(
+                &input.bucket,
+                configuration.rules,
+                applied_minimum_object_size.clone(),
+            )
+            .is_none()
+        {
+            // Unreachable: the lookup above ran under this same guard.
+            return Err(
+                PutBucketLifecycleConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {}).into(),
+            );
+        }
+
+        Ok(PutBucketLifecycleConfigurationOutput {
+            transition_default_minimum_object_size: Some(applied_minimum_object_size),
+        })
     }
 }
+
+/// The status `ExpectedBucketOwner` names for a mismatch: "the request fails with the HTTP
+/// status code 403 Forbidden (access denied)".
+const ACCESS_DENIED_STATUS: u16 = 403;
+
+/// The HTTP status every refusal of a lifecycle configuration goes out with: 400.
+///
+/// The three codes [`crate::state::LifecycleConfigurationRejection::code`] chooses between
+/// — `MalformedXML`, `InvalidArgument` and `InvalidRequest` — are each published with HTTP
+/// 400 in Amazon S3's "Error responses" list, as is the `MissingRequestBodyError` a request
+/// that carries no configuration at all answers.
+const LIFECYCLE_REFUSAL_STATUS: u16 = 400;
