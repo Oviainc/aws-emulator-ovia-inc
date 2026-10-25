@@ -12,8 +12,10 @@
 //!
 //! * a rejected `ruleRevision` reports the rule's CURRENT revision and no
 //!   resource identifier;
-//! * `ResourceNotFoundException` carries one fixed, resource-independent
-//!   message;
+//! * a REPORTING operation's `ResourceNotFoundException` carries one fixed,
+//!   resource-independent message, while a MUTATION of a rule names the ARN it
+//!   was sent — [`crate::not_found_wording`] asserts that split over the whole
+//!   family of rule operations;
 //! * a refusal on a member's constraint is AWS's validation report — how many
 //!   members failed, then the member and the requirement it failed, with no
 //!   rejected value echoed and a `@pattern` reported unanchored;
@@ -27,7 +29,8 @@ use crate::automation_rule_lifecycle::{
     call, call_ok, emulator, error_code, member, minimal_rule, string_member,
 };
 
-/// The fixed message every `ResourceNotFoundException` of this service carries.
+/// The fixed message a REPORTING operation's `ResourceNotFoundException`
+/// carries.
 const NOT_FOUND_MESSAGE: &str = "The specified resource could not be found";
 
 /// The fixed message every `IdempotentParameterMismatchException` carries.
@@ -230,11 +233,13 @@ async fn the_loser_of_a_revision_race_is_told_the_winning_revision() {
 // Not found
 // ---------------------------------------------------------------------------
 
-/// Every `ResourceNotFoundException` carries the same fixed message, whichever
-/// operation raised it and whichever ARN the request named — and names neither
-/// the ARN nor the rule id.
+/// Every REPORTING operation's `ResourceNotFoundException` carries the same
+/// fixed message, whichever report raised it and whichever ARN the request
+/// named — and names neither the ARN nor the rule id. A MUTATION of the same
+/// rule names the ARN it was sent instead; [`crate::not_found_wording`] asserts
+/// that half.
 #[tokio::test]
-async fn not_found_is_one_fixed_message_naming_no_resource() {
+async fn a_reports_not_found_is_one_fixed_message_naming_no_resource() {
     let router = emulator();
     let created = call_ok(
         &router,
@@ -275,26 +280,6 @@ async fn not_found_is_one_fixed_message_naming_no_resource() {
             "get-a-name-that-never-existed",
             "GetAutomationRule",
             json!({"ruleArn": absent_named}),
-        ),
-        (
-            "update-a-deleted-rule",
-            "UpdateAutomationRule",
-            json!({"ruleArn": deleted_arn, "ruleRevision": revision, "description": "gone"}),
-        ),
-        (
-            "update-a-rule-that-never-existed",
-            "UpdateAutomationRule",
-            json!({"ruleArn": absent_hex, "ruleRevision": 1}),
-        ),
-        (
-            "delete-a-deleted-rule",
-            "DeleteAutomationRule",
-            json!({"ruleArn": deleted_arn, "ruleRevision": revision}),
-        ),
-        (
-            "delete-a-rule-that-never-existed",
-            "DeleteAutomationRule",
-            json!({"ruleArn": absent_named, "ruleRevision": 1}),
         ),
         (
             "list-the-tags-of-a-deleted-rule",
