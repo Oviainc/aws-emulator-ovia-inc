@@ -30,7 +30,8 @@ use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
 use crate::flow_lifecycle::{Emulator, REGION};
 use crate::router_input_restart::{
-    configuration_rows, create_body, past_transition_span, settle_router_input_in, stored_state,
+    create_body, minted_configuration_rows, past_transition_span, settle_router_input_in,
+    stored_state,
     union, union_member,
 };
 
@@ -165,7 +166,8 @@ async fn a_start_activates_every_kind_of_router_input_and_the_clock_settles_it()
     let state_rows = [mc::ROUTER_INPUT_STATE_STANDBY, mc::ROUTER_INPUT_STATE_ERROR];
 
     let mut started: Vec<(String, String, Value)> = Vec::new();
-    for (kind, member_name, json_name, configuration, expected_input_type) in configuration_rows()
+    for (kind, member_name, json_name, configuration, expected_input_type) in
+        minted_configuration_rows(&emulator, "start-kinds").await
     {
         for started_in in state_rows {
             let case = format!("{kind} from {started_in}");
@@ -365,7 +367,8 @@ fn maintenance_rows() -> Vec<MaintenanceRow> {
 #[tokio::test]
 async fn a_preferred_maintenance_time_that_is_not_a_time_of_day_is_refused() {
     let emulator = Emulator::new();
-    let (_, _, _, configuration, _) = configuration_rows()
+    let (_, _, _, configuration, _) = minted_configuration_rows(&emulator, "bad-time")
+        .await
         .into_iter()
         .next()
         .expect("the configuration table has rows");
@@ -419,7 +422,8 @@ async fn a_preferred_maintenance_time_that_is_not_a_time_of_day_is_refused() {
 #[tokio::test]
 async fn the_window_a_start_schedules_is_the_next_occurrence_of_the_inputs_preference() {
     let emulator = Emulator::new();
-    let (_, _, _, configuration, _) = configuration_rows()
+    let (_, _, _, configuration, _) = minted_configuration_rows(&emulator, "window")
+        .await
         .into_iter()
         .next()
         .expect("the configuration table has rows");
@@ -510,7 +514,8 @@ async fn the_window_a_start_schedules_is_the_next_occurrence_of_the_inputs_prefe
 #[tokio::test]
 async fn a_maintenance_window_the_clock_has_passed_is_rescheduled() {
     let emulator = Emulator::new();
-    let (_, _, _, configuration, _) = configuration_rows()
+    let (_, _, _, configuration, _) = minted_configuration_rows(&emulator, "spent-window")
+        .await
         .into_iter()
         .next()
         .expect("the configuration table has rows");
@@ -594,7 +599,8 @@ async fn a_maintenance_window_the_clock_has_passed_is_rescheduled() {
 #[tokio::test]
 async fn a_start_is_refused_while_a_state_change_is_in_flight() {
     let emulator = Emulator::new();
-    let (_, _, _, configuration, _) = configuration_rows()
+    let (_, _, _, configuration, _) = minted_configuration_rows(&emulator, "start-in-flight")
+        .await
         .into_iter()
         .next()
         .expect("the configuration table has rows");

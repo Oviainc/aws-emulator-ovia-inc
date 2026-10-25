@@ -1,0 +1,27 @@
+Issue-Severity: MEDIUM
+Issue-Corpus: simparity-behavioral-ga-prod-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cloudwatch__lambda.obs-lambda-1-reserved-burst-meters-function-concurrency-and-claimed-account-identity
+Issue-Key: cloudwatch__lambda.obs-lambda-1-reserved-burst-meters-function-concurrency-and-claimed-account-identity|_poll_until#24|Timeout|time.sleep(interval_s)
+Issue-Commit: cfbb9a1e24eec7d8c98af7d6e9e62a0e8013f018
+
+# cloudwatch__lambda: the reserved-burst concurrency-metering check never converges past its allocation setup, hanging to the 60 s cap, so ConcurrentExecutions / UnreservedConcurrentExecutions / ClaimedAccountConcurrency are never readable (1 cause)
+
+> _Note: this issue was identified against the code base at commit `cfbb9a1e24eec7d8c98af7d6e9e62a0e8013f018`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+PutProvisionedConcurrencyConfig
+
+## Description
+Cause 1 of 1 — the Lambda concurrency-allocation flow this check builds never reaches the point where its AWS/Lambda concurrency series can be read, so none of the three metered identities is observable.
+AWS: recorded behavior only for the metric side (Lambda's Smithy model gives the allocation surface — PutFunctionConcurrency(ReservedConcurrentExecutions), PutProvisionedConcurrencyConfig/GetProvisionedConcurrencyConfig with a Status that becomes READY, GetAccountSettings -> AccountLimit.UnreservedConcurrentExecutions — and says nothing about CloudWatch series). The recording shows: a function with ReservedConcurrentExecutions=6 taking a 4-way overlapping burst reports ConcurrentExecutions Maximum == 4 and Invocations Sum == 4 with no Throttles datapoint; the dimensionless UnreservedConcurrentExecutions Maximum counts only the unreserved function's burst; and at the same timestamp ClaimedAccountConcurrency Maximum minus UnreservedConcurrentExecutions Maximum equals the account's allocated concurrency (reserved + provisioned on unreserved functions).
+Emulator: the check is killed by the harness at 60s ('Error: Check timed out after 60.0s') before any metric read. GetAccountSettings and the function/role creation return, so the stall is in the allocation-convergence stage that precedes the burst. Hypothesis: the first unbounded wait in the check is the alias' provisioned-concurrency Status reaching READY (the check declares _PC_READY_BUDGET_S=420.0; _ROLE_PROPAGATION_BUDGET_S=120.0 is the other candidate) — the replay output does not localize it further, so the fixer should confirm which wait does not terminate.
+Why: a client that reserves concurrency and provisions an alias, then waits for READY before driving traffic, blocks instead of proceeding; and the account-level concurrency accounting (what is charged to the reserved pool vs the unreserved pool, and whether provisioned allocations are included in ClaimedAccountConcurrency) is unverifiable, so autoscaling and capacity-guard logic built on those series silently has no input.
+Fix: the provisioned-concurrency state machine behind PutProvisionedConcurrencyConfig/GetProvisionedConcurrencyConfig must reach READY (services/service-com-amazonaws-lambda-awsgirapiservice), and the per-function and account-level concurrency series must be published into the CloudWatch metric store (services/service-com-amazonaws-cloudwatch-graniteserviceversion20100801). Note for the fixer: this check declares budgets totalling well over 60s, so re-replay it with its own declared budget rather than the 60s cap.
+Related open issue that does NOT carry this check's replay key: 20261022T213144Z-lambda-invoke-refuses-every-real-invocation-with-notimplemented.md owns the sibling cloudwatch__lambda checks, but an unimplemented Invoke would surface as an error on the burst, not as a hang before it, and that issue names none of the three concurrency series this check reads.
+
+## Evidence
+Expected (real-AWS recording): after PutFunctionConcurrency(ReservedConcurrentExecutions=6) on A, a 3-way burst on unreserved B and provisioned concurrency 1 on an alias of C reaching READY, GetMetricStatistics/GetMetricData over a minute wholly after the allocations report A's ConcurrentExecutions Maximum == 4, A's Invocations Sum == 4, no Throttles datapoint for A, dimensionless UnreservedConcurrentExecutions Maximum >= 3, and ClaimedAccountConcurrency Maximum - UnreservedConcurrentExecutions Maximum == the account's allocated concurrency (including this run's 6 + 1). Actual: the check never reaches any metric read — it is terminated with 'Error: Check timed out after 60.0s' during allocation convergence (declared waits: provisioned-concurrency READY 420s, role propagation 120s, metric visibility 300s).
+
+## Steps to Reproduce
+Create an execution role and three functions; PutFunctionConcurrency(FunctionName=A, ReservedConcurrentExecutions=6); publish a version/alias of C and PutProvisionedConcurrencyConfig(..., ProvisionedConcurrentExecutions=1), then poll GetProvisionedConcurrencyConfig until Status=='READY'; then drive a 4-way overlapping 10s Invoke burst on A and a 3-way burst on B and read AWS/Lambda ConcurrentExecutions (per FunctionName), UnreservedConcurrentExecutions and ClaimedAccountConcurrency (dimensionless) from CloudWatch. Replay cloudwatch__lambda.obs-lambda-1-reserved-burst-meters-function-concurrency-and-claimed-account-identity with the check's own declared budget.

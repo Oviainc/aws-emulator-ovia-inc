@@ -29,7 +29,7 @@ use service_com_amazonaws_workmailmessageflow_giraffemessageintransitservice::Em
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every test signs with unless it is exercising the region rule itself.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// `messageId` is `len 1..120, pattern ^[a-z0-9\-]*$` on both operations (model:
 /// `smithy_query(query="operation", operation="GetRawMessageContent")`).
@@ -46,16 +46,16 @@ const GENERATED_CASES: usize = 32;
 
 /// One wire answer, reduced to what a client branches on.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
-    error_type: String,
-    payload: Bytes,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) error_type: String,
+    pub(crate) payload: Bytes,
 }
 
 impl Reply {
     /// The payload as JSON, or `Value::Null` when it is not JSON (a
     /// `GetRawMessageContent` success payload is raw MIME, not JSON).
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         if self.payload.is_empty() {
             return Value::Null;
         }
@@ -66,13 +66,13 @@ impl Reply {
     /// payload is not an error document with one. The member is modeled as
     /// `message` with no `jsonName` (`smithy_query(query="shape",
     /// shape="ResourceNotFoundException")`), so that is the wire key.
-    fn error_message(&self) -> String {
+    pub(crate) fn error_message(&self) -> String {
         self.json()["message"].as_str().unwrap_or_default().to_string()
     }
 
     /// The payload rendered for an assertion message, without dumping a megabyte
     /// of MIME into the test log.
-    fn summary(&self) -> String {
+    pub(crate) fn summary(&self) -> String {
         let shown = String::from_utf8_lossy(&self.payload[..self.payload.len().min(120)]);
         format!(
             "{} byte(s) {shown:?}{}",
@@ -84,13 +84,13 @@ impl Reply {
 
 /// An emulator with just this service mounted on a fresh engine, driven in-process
 /// through the production router.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signatures are not what these tests are about; the router still routes by
@@ -103,21 +103,21 @@ impl Emulator {
 
     /// Reach the store, to stand in for one of the two producers this API does not
     /// model. Never used to read a response value: those come off the wire.
-    fn with_state<R>(&self, apply: impl FnOnce(&mut FlowState) -> R) -> R {
+    pub(crate) fn with_state<R>(&self, apply: impl FnOnce(&mut FlowState) -> R) -> R {
         let state = service_state(&*self.engine).expect("this service's store is reachable");
         let mut guard = state.lock();
         apply(&mut guard)
     }
 
     /// Put `content` in transit under `message_id`, as WorkMail delivery does.
-    fn seed_message(&self, message_id: &str, content: &[u8]) {
+    pub(crate) fn seed_message(&self, message_id: &str, content: &[u8]) {
         self.with_state(|state| {
             state.seed_in_transit_message(message_id, content.to_vec());
         });
     }
 
     /// Make `content` resolvable at `reference`, as an S3 `PutObject` does.
-    fn seed_object(&self, reference: &S3Ref, object: S3Object) {
+    pub(crate) fn seed_object(&self, reference: &S3Ref, object: S3Object) {
         self.with_state(|state| state.seed_s3_object(reference.clone(), object));
     }
 
@@ -154,12 +154,12 @@ impl Emulator {
         }
     }
 
-    async fn get_raw_message_content(&self, region: &str, message_id: &str) -> Reply {
+    pub(crate) async fn get_raw_message_content(&self, region: &str, message_id: &str) -> Reply {
         self.send("GET", &format!("/messages/{message_id}"), region, None)
             .await
     }
 
-    async fn put_raw_message_content(
+    pub(crate) async fn put_raw_message_content(
         &self,
         region: &str,
         message_id: &str,
@@ -182,13 +182,13 @@ impl Emulator {
 
 /// A well-formed MIME message whose `Subject` is `subject` and whose body is
 /// `body`.
-fn mime(subject: &str, body: &str) -> Vec<u8> {
+pub(crate) fn mime(subject: &str, body: &str) -> Vec<u8> {
     format!("From: sender@example.com\r\nSubject: {subject}\r\n\r\n{body}\r\n").into_bytes()
 }
 
 /// The bucket every test that is not exercising the location rules resolves
 /// against. 3..63 chars, `^[a-z0-9][a-z0-9\-]*$` (model: `S3Reference$bucket`).
-const BUCKET: &str = "mailbucket";
+pub(crate) const BUCKET: &str = "mailbucket";
 
 /// A reference to `key` in [`BUCKET`], unversioned.
 ///
@@ -196,7 +196,7 @@ const BUCKET: &str = "mailbucket";
 /// `S3Reference$key` to `^[a-zA-Z0-9\-/]*$` (`smithy_query(query="shape",
 /// shape="S3Reference")`), which excludes it, so a key like `updated/message.mime`
 /// is refused at the boundary before any handler runs.
-fn reference(key: &str) -> S3Ref {
+pub(crate) fn reference(key: &str) -> S3Ref {
     S3Ref::new(BUCKET, key, None)
 }
 
@@ -509,8 +509,7 @@ async fn an_accepted_reference_is_retained_with_its_object_version() {
 
         let retained = emulator.with_state(|state| {
             state
-                .messages
-                .get(message_id)
+                .message(REGION, message_id)
                 .and_then(|message| message.last_s3_reference.clone())
         });
         assert_eq!(
@@ -818,7 +817,11 @@ async fn an_object_resolves_only_in_the_region_the_request_was_made_in() {
         let message_id = "region-0";
         let original = mime("original", "body");
         let replacement = mime("rewritten", "body");
-        emulator.seed_message(message_id, &original);
+        emulator.with_state(|state| {
+            // The message is in transit in the region the request is made in, so
+            // this row turns only on the bucket's region.
+            state.seed_in_transit_message_in_region(request_region, message_id, original.clone());
+        });
         let s3_reference = reference("updated/object");
         emulator.seed_object(
             &s3_reference,

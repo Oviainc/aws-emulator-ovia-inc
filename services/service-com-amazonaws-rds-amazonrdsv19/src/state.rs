@@ -3,12 +3,13 @@
 //! Engine state for the com-amazonaws-rds-amazonrdsv19 service.
 //!
 //! The DB instance, DB snapshot, DB cluster, DB shard group, option group, DB subnet
-//! group, cluster parameter group, event subscription and global cluster records the
+//! group, cluster parameter group, DB parameter group, event subscription and global
+//! cluster records the
 //! implemented handlers read and write, plus the projection of a stored record onto the
 //! modelled
 //! `DBInstance` / `DBSnapshot` / `DBCluster` / `DBShardGroup` / `OptionGroup` /
 //! `DBSubnetGroup` /
-//! `DBClusterParameterGroup` / `EventSubscription` /
+//! `DBClusterParameterGroup` / `DBParameterGroup` / `EventSubscription` /
 //! `GlobalCluster` wire shapes. These live here rather than in one operation file because
 //! every implemented operation shares them: `CreateDBInstance`, `DescribeDBInstances`,
 //! `ModifyDBInstance`, `CreateDBSnapshot`, `DescribeDBSnapshots`, `DeleteDBInstance`,
@@ -16,7 +17,8 @@
 //! `CreateDBShardGroup`, `DescribeDBShardGroups`,
 //! `CreateOptionGroup`, `ModifyOptionGroup`, `DescribeOptionGroups`,
 //! `DeleteOptionGroup`, `CreateDBSubnetGroup`, `DescribeDBSubnetGroups`, the six
-//! cluster-parameter-group operations, `CreateEventSubscription`,
+//! cluster-parameter-group operations, `CreateDBParameterGroup`,
+//! `DescribeDBParameterGroups`, `CreateEventSubscription`,
 //! `DescribeEventSubscriptions`, `CreateGlobalCluster` and `DescribeGlobalClusters` all
 //! project the same records.
 //!
@@ -43,6 +45,9 @@
 //! [`MAX_FREE_FORM_LEN`] characters, a family string of at most [`MAX_FREE_FORM_LEN`]
 //! characters and at most [`MAX_TAGS_PER_RESOURCE`] tags of at most [`MAX_TAG_KEY_LEN`] /
 //! [`MAX_TAG_VALUE_LEN`] characters — at most
+//! `MAX_REGIONS * DB_PARAMETER_GROUP_QUOTA_PER_REGION` DB parameter groups, each carrying
+//! a family string and a description of at most [`MAX_FREE_FORM_LEN`] characters and the
+//! same bounded tag list, at most
 //! `MAX_REGIONS * CUSTOM_DB_ENGINE_VERSION_QUOTA_PER_REGION` custom engine versions,
 //! and at most one CA certificate override per region,
 //! whatever sequence of requests arrives, and every
@@ -55,7 +60,7 @@ use crate::ops::types::{
     Certificate, CertificateDetails, ClusterPendingModifiedValues, CreateDBShardGroupOutput,
     DBCluster, DBClusterAutomatedBackup, DBClusterMember, DBClusterOptionGroupStatus,
     DBClusterParameterGroup, DBClusterRole, DBClusterSnapshot, DBClusterSnapshotAttribute,
-    DBClusterSnapshotAttributesResult, DBInstance, DBParameterGroupStatus,
+    DBClusterSnapshotAttributesResult, DBInstance, DBParameterGroup, DBParameterGroupStatus,
     DBSecurityGroupMembership, DBSnapshot, DBSubnetGroup,
     DomainMembership, Endpoint, EventCategoriesMap, EventSubscription, GlobalCluster,
     GlobalClusterMember, Option2, OptionGroup, OptionGroupMembership, OptionSetting, Parameter,
@@ -211,6 +216,16 @@ pub const SNAPSHOT_STATUS_AVAILABLE: &str = "available";
 /// `DBParameterGroupQuotaExceededFault` — "this request would cause you to exceed the
 /// allowed number of parameter groups" — rather than an unbounded store.
 pub const DB_CLUSTER_PARAMETER_GROUP_QUOTA_PER_REGION: usize = 100;
+
+/// How many DB (instance) parameter groups one region may hold.
+///
+/// Emulator resource guard, NOT an AWS quota, for the same reason as
+/// [`DB_CLUSTER_PARAMETER_GROUP_QUOTA_PER_REGION`]: every group is created by a caller and
+/// reclaimed only by an explicit delete, so the growth site carries a cap. Reaching it is
+/// the modelled `DBParameterGroupQuotaExceededFault` — "The request would result in the
+/// user exceeding the allowed number of DB parameter groups" — rather than an unbounded
+/// store.
+pub const DB_PARAMETER_GROUP_QUOTA_PER_REGION: usize = 100;
 
 /// How many parameters one cluster parameter group may carry.
 ///
@@ -920,6 +935,18 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     /// always stored lowercased, as the model documents. Ordered, so
     /// `DescribeDBClusterParameterGroups` pages deterministically within a region.
     pub db_cluster_parameter_groups: BTreeMap<RegionalKey, DbClusterParameterGroupRecord>,
+    /// DB (instance) parameter groups by `(region, DBParameterGroupName)` — the name always
+    /// stored lowercased, as `CreateDBParameterGroupMessage$DBParameterGroupName` documents
+    /// ("This value is stored as a lowercase string"). Ordered, so
+    /// `DescribeDBParameterGroups` pages deterministically within a region.
+    ///
+    /// `CreateDBParameterGroup` inserts here — bounded by
+    /// [`DB_PARAMETER_GROUP_QUOTA_PER_REGION`] per region and by [`MAX_REGIONS`] regions —
+    /// and `DescribeDBParameterGroups` reports what is here. Separate from
+    /// [`Self::db_cluster_parameter_groups`] because AWS keeps the two namespaces apart: a
+    /// cluster parameter group and a DB parameter group of the same name are different
+    /// resources with different ARNs.
+    pub db_parameter_groups: BTreeMap<RegionalKey, DbParameterGroupRecord>,
     /// Event notification subscriptions by `(region, SubscriptionName)`. Ordered, so
     /// `DescribeEventSubscriptions` pages deterministically within a region.
     ///
@@ -1434,6 +1461,11 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .find(|record| record.arn() == named)
     }
 
+    /// The DB (instance) parameter groups stored in `region`, in name order.
+    pub fn parameter_groups_in(&self, region: &str) -> Vec<&DbParameterGroupRecord> {
+        range_in(&self.db_parameter_groups, region)
+    }
+
     /// The event notification subscriptions stored in `region`, in subscription-name
     /// order.
     pub fn event_subscriptions_in(&self, region: &str) -> Vec<&EventSubscriptionRecord> {
@@ -1618,6 +1650,7 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .chain(self.db_cluster_snapshots.keys())
             .chain(self.db_clusters.keys())
             .chain(self.db_cluster_parameter_groups.keys())
+            .chain(self.db_parameter_groups.keys())
             .chain(self.event_subscriptions.keys())
             .chain(self.option_groups.keys())
             .chain(self.db_subnet_groups.keys())
@@ -2657,6 +2690,46 @@ impl DbClusterParameterGroupRecord {
             minimum_engine_version: spec.map(|spec| spec.minimum_engine_version.to_string()),
             apply_method: setting.map(|setting| setting.apply_method.clone()),
             supported_engine_modes: None,
+        }
+    }
+}
+
+/// A persisted DB (instance) parameter group.
+///
+/// The name is stored lowercased and is half of this record's key:
+/// `CreateDBParameterGroupMessage$DBParameterGroupName` states "This value is stored as a
+/// lowercase string."
+#[derive(Debug, Clone)]
+pub struct DbParameterGroupRecord {
+    /// The lowercased `DBParameterGroupName`.
+    pub name: String,
+    /// `DBParameterGroupFamily`, as the caller named it.
+    pub family: String,
+    /// `Description`.
+    pub description: String,
+    /// The region whose credential scope the create was signed with.
+    pub region: String,
+    /// The tags `CreateDBParameterGroup$Tags` assigned to the group. The modelled
+    /// `DBParameterGroup` shape carries no tag member, so nothing reports them yet —
+    /// `ListTagsForResource`, which does, is still scaffolded — but the caller's input is
+    /// kept rather than dropped, so it is here when that operation lands.
+    pub tags: Vec<Tag>,
+}
+
+impl DbParameterGroupRecord {
+    /// `DBParameterGroupArn`. The resource type is `pg`, the one AWS uses for a DB
+    /// parameter group under this service's `rds` ARN namespace.
+    pub fn arn(&self) -> String {
+        emulator_server::emulator_arn(ARN_NAMESPACE, &self.region, &format!("pg:{}", self.name))
+    }
+
+    /// This record as the modelled `DBParameterGroup`.
+    pub fn to_wire(&self) -> DBParameterGroup {
+        DBParameterGroup {
+            db_parameter_group_name: Some(self.name.clone()),
+            db_parameter_group_family: Some(self.family.clone()),
+            description: Some(self.description.clone()),
+            db_parameter_group_arn: Some(self.arn()),
         }
     }
 }

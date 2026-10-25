@@ -8,9 +8,11 @@
 //!
 //! The APP BUNDLE is a resource of its own and the entry point of every path under
 //! `/appbundles/{appBundleIdentifier}`: an identifier naming no stored bundle is the
-//! HTTP 404 `ResourceNotFoundException` this operation models, the same answer
-//! `GetIngestionDestination`, `CreateIngestionDestination` and the sibling
-//! `DeleteIngestion` give for an absent bundle.
+//! HTTP 404 `ResourceNotFoundException` this operation models. This call WRITES, so
+//! the refusal carries the mutation-path sentence
+//! ([`crate::state::app_bundle_id_not_valid`]) that `CreateIngestionDestination`,
+//! `UpdateIngestionDestination` and the sibling `DeleteIngestion` give for an absent
+//! bundle — not the reporting-path sentence `GetAppBundle` answers.
 //!
 //! Below it the call is `@idempotent`: a destination the bundle's ingestion does not
 //! hold — and a destination whose owning INGESTION is itself already gone, which is a
@@ -185,12 +187,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // The bundle is the outer parent of this path and a resource of its own:
         // an identifier naming no stored bundle is the not-found this operation
-        // models, the same answer `GetIngestionDestination` and `DeleteIngestion`
-        // give.
+        // models. This is a WRITE path, so the refusal is worded the way every
+        // other mutation into a bundle words it (`crate::state::
+        // app_bundle_id_not_valid`) — the same answer the sibling
+        // `DeleteIngestion` one level up gives.
         let Some(bundle) = store.resolve_bundle_mut(&input.app_bundle_identifier) else {
             return Err(
                 DeleteIngestionDestinationErrorModeled::ResourceNotFoundException(
-                    crate::state::app_bundle_not_found(&input.app_bundle_identifier),
+                    crate::state::app_bundle_id_not_valid(&input.app_bundle_identifier),
                 )
                 .into(),
             );

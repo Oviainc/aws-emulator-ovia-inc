@@ -23,8 +23,8 @@ use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
 use crate::flow_lifecycle::{Emulator, REGION};
 use crate::router_input_restart::{
-    configuration_rows, create_body, create_router_input, get_router_input, past_transition_span,
-    union, union_member,
+    create_body, create_router_input, get_router_input, minted_configuration_rows,
+    past_transition_span, union, union_member,
 };
 use crate::router_network_interfaces::{create_network_interface, public_configuration};
 use crate::router_output_lifecycle::delete_router_output;
@@ -86,7 +86,7 @@ fn assert_ipv4(case: &str, address: &str) {
 #[tokio::test]
 async fn every_kind_of_router_input_is_persisted_with_the_address_its_configuration_implies() {
     let emulator = Emulator::new();
-    let rows = configuration_rows();
+    let rows = minted_configuration_rows(&emulator, "create-kinds").await;
     let row_count = rows.len();
 
     let mut minted: Vec<(String, String, String, Option<String>)> = Vec::new();
@@ -201,7 +201,8 @@ async fn every_kind_of_router_input_is_persisted_with_the_address_its_configurat
 #[tokio::test]
 async fn the_routing_scope_and_tier_are_stored_and_a_name_is_not_unique() {
     let emulator = Emulator::new();
-    let (_, _, _, configuration, _) = configuration_rows()
+    let (_, _, _, configuration, _) = minted_configuration_rows(&emulator, "scope-tier")
+        .await
         .into_iter()
         .next()
         .expect("the configuration table has rows");
@@ -292,7 +293,8 @@ async fn a_replayed_client_token_answers_the_router_input_as_the_clock_leaves_it
     const TOKEN: &str = "ri-replayed-token";
 
     let emulator = Emulator::new();
-    let (_, _, _, configuration, _) = configuration_rows()
+    let (_, _, _, configuration, _) = minted_configuration_rows(&emulator, "replayed-token")
+        .await
         .into_iter()
         .next()
         .expect("the configuration table has rows");
@@ -532,7 +534,8 @@ async fn a_replayed_client_token_answers_the_sibling_router_resources_as_of_the_
 #[tokio::test]
 async fn a_create_stores_only_a_tag_map_the_service_would_accept() {
     let emulator = Emulator::new();
-    let (_, _, _, configuration, _) = configuration_rows()
+    let (_, _, _, configuration, _) = minted_configuration_rows(&emulator, "tags")
+        .await
         .into_iter()
         .next()
         .expect("the configuration table has rows");
@@ -650,7 +653,8 @@ async fn a_create_stores_only_a_tag_map_the_service_would_accept() {
 #[tokio::test]
 async fn a_maintenance_preference_must_name_a_time_of_day() {
     let emulator = Emulator::new();
-    let (_, _, _, configuration, _) = configuration_rows()
+    let (_, _, _, configuration, _) = minted_configuration_rows(&emulator, "maintenance")
+        .await
         .into_iter()
         .next()
         .expect("the configuration table has rows");
