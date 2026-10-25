@@ -249,10 +249,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let unreserved = crate::state::CONCURRENT_EXECUTIONS_LIMIT
             .saturating_sub(committed_elsewhere.saturating_add(requested));
         if unreserved < crate::state::MIN_UNRESERVED_CONCURRENT_EXECUTIONS {
-            return Err(invalid_parameter(format!(
-                "Specified ReservedConcurrentExecutions for function decreases account's \
-                 UnreservedConcurrentExecution below its minimum value of [{floor}]",
-                floor = crate::state::MIN_UNRESERVED_CONCURRENT_EXECUTIONS
+            return Err(invalid_parameter(crate::state::unreserved_floor_message(
+                "ReservedConcurrentExecutions",
+                crate::state::MIN_UNRESERVED_CONCURRENT_EXECUTIONS,
             )));
         }
 
