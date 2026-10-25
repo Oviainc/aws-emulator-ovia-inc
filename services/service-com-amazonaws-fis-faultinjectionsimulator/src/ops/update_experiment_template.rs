@@ -205,6 +205,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(UpdateExperimentTemplateErrorModeled::ValidationException(refusal).into());
         }
+        // A log configuration says WHERE the experiment's logs are delivered, so the
+        // candidate's — the one this request named, or the stored one it left alone — is
+        // refused when it names no destination.
+        if let Some(refusal) =
+            crate::state::log_configuration_refusal(candidate.log_configuration.as_ref())
+        {
+            return Err(UpdateExperimentTemplateErrorModeled::ValidationException(refusal).into());
+        }
         if let Some(refusal) = crate::state::actions_quota_refusal(&candidate.actions) {
             return Err(
                 UpdateExperimentTemplateErrorModeled::ServiceQuotaExceededException(refusal).into(),
