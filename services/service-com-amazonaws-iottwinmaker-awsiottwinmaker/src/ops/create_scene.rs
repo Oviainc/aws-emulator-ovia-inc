@@ -207,9 +207,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // mint and a taken id is a conflict.
         if workspace.scenes.contains_key(&input.scene_id) {
             return Err(CreateSceneErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "scene {} already exists in workspace {}",
-                    input.scene_id, input.workspace_id
+                message: Some(crate::state::already_exists_message(
+                    "Scene",
+                    &input.scene_id,
+                    Some(&input.workspace_id),
                 )),
             })
             .into());
