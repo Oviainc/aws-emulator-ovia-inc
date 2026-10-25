@@ -47,6 +47,8 @@ mod application_describe;
 mod application_grants;
 #[path = "all/application_grants_list.rs"]
 mod application_grants_list;
+#[path = "all/application_list.rs"]
+mod application_list;
 #[path = "all/application_provider_describe.rs"]
 mod application_provider_describe;
 #[path = "all/application_providers.rs"]

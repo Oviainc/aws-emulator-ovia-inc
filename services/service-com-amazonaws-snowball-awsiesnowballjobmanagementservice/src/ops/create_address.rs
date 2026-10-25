@@ -399,11 +399,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // interpret and reporting it back from `DescribeAddress`.
         if let Some(address_type) = submitted.r#type.as_deref() {
             if !ADDRESS_TYPE_VALUES.contains(&address_type) {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "Value '{address_type}' at 'address.type' failed to satisfy constraint: \
-                     Member must satisfy enum value set: [{}]",
-                    ADDRESS_TYPE_VALUES.join(", ")
-                )));
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::outside_catalog_message(
+                        "address.type",
+                        address_type,
+                        ADDRESS_TYPE_VALUES,
+                    ),
+                ));
             }
         }
 

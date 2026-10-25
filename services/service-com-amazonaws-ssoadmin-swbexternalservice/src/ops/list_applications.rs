@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListApplications
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListApplications`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: enumerates the applications stored under one instance in this service's
+//! state (`crate::state`), narrowed by the request's `ListApplicationsFilter`. This is
 //! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListApplications::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read, paged by `MaxResults` with a `NextToken` that resumes from the
+//! `ApplicationArn` the previous page ended on, and absent on the last page. Each listed
+//! application is projected through `state::ApplicationRecord::to_shape`, the same view
+//! `DescribeApplication` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +170,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListApplications` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListApplicationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListApplications"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListApplicationsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the SSO Admin state store is unavailable".to_string()),
+            })
+        })?;
+
+        // "Filters response results": each member of the filter NARROWS the enumeration
+        // to the applications whose own member equals it, and a filter member the caller
+        // left out narrows nothing. Both are read once here, so the cursor scope and the
+        // row selection cannot disagree about which enumeration this is.
+        let application_account = input
+            .filter
+            .as_ref()
+            .and_then(|filter| filter.application_account.as_deref());
+        let application_provider = input
+            .filter
+            .as_ref()
+            .and_then(|filter| filter.application_provider.as_deref());
+
+        // The cursor is scoped to THIS enumeration: the operation, the instance whose
+        // applications it walks and the filter that selected the rows.
+        let scope = crate::state::cursor_applications(
+            &input.instance_arn,
+            application_account,
+            application_provider,
+        );
+        // A `NextToken` this service did not issue for THIS enumeration is a bad request,
+        // not an empty page: answering an empty page would silently end a caller's
+        // enumeration early.
+        let after = crate::state::cursor_after(&scope, input.next_token.as_deref()).map_err(
+            |message| {
+                ListApplicationsErrorModeled::ValidationException(ValidationException {
+                    message: Some(message.to_string()),
+                    // The model's `ValidationExceptionReason` enum carries only KMS key
+                    // states, none of which this refusal is.
+                    reason: None,
+                })
+            },
+        )?;
+
+        let ordered: Vec<(String, Application)> = {
+            let mut store = state.lock();
+            // A READ, except for what the CLOCK already owes: an instance whose deletion
+            // instant has passed is gone, and the applications held inside it with it,
+            // whether or not anybody listed them. The account's ambient instance is
+            // enabled here too if nothing has decided the account's enablement yet, so
+            // this read resolves the instance every other read at this instant resolves.
+            store.on_request(
+                &crate::state::request_region(ctx.parts()),
+                ::std::time::SystemTime::now(),
+            );
+            // Applications are enumerated UNDER an instance, so an `InstanceArn` this
+            // account holds no instance for is refused rather than answered with an empty
+            // page that would read as "this instance has no applications". This operation
+            // models no `ResourceNotFoundException`, so the refusal goes on the
+            // client-input channel it does model, naming the ARN that resolved to nothing.
+            if store.instance(&input.instance_arn).is_none() {
+                return Err(ListApplicationsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::instance_not_found_message(
+                            &input.instance_arn,
+                        )),
+                        reason: None,
+                    },
+                )
+                .into());
+            }
+            // Exactly the stored applications the request selects, keyed and ordered by
+            // `ApplicationArn` — both the page order and the cursor order — and projected
+            // through the SAME view `DescribeApplication` reports, so a listed
+            // application and a described one agree member for member.
+            store
+                .applications
+                .values()
+                .filter(|record| record.instance_arn == input.instance_arn)
+                .filter(|record| {
+                    application_account.is_none_or(|account| record.application_account == account)
+                })
+                .filter(|record| {
+                    application_provider
+                        .is_none_or(|provider| record.application_provider_arn == provider)
+                })
+                .map(|record| (record.application_arn.clone(), record.to_shape()))
+                .collect()
+        };
+
+        // `MaxResults` admits up to 100, but a page is also a modelled `ApplicationList`,
+        // which holds at most 50 — see [`crate::state::MAX_APPLICATIONS_PER_PAGE`]. The
+        // lower bound is the model's own (`range(min: 1)`), already enforced before this
+        // handler runs; clamping both ends keeps the page size sound here regardless.
+        let limit = input
+            .max_results
+            .unwrap_or(crate::state::MAX_APPLICATIONS_PER_PAGE)
+            .clamp(1, crate::state::MAX_APPLICATIONS_PER_PAGE);
+        let (applications, next_token) =
+            crate::state::page(&scope, ordered, after.as_deref(), Some(limit));
+        Ok(ListApplicationsOutput {
+            applications: Some(applications),
+            next_token,
+        })
     }
 }
