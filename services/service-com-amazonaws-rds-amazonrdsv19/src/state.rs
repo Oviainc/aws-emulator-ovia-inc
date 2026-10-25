@@ -101,6 +101,7 @@ pub mod db_proxies;
 pub mod engine_log;
 pub mod export_tasks;
 pub mod integrations;
+pub mod tags;
 pub mod tenant_databases;
 
 pub use blue_green::{
@@ -132,6 +133,10 @@ pub use integrations::{
     check_integration_target_arn, check_kms_key_id, mint_integration_id, IntegrationRecord,
     INTEGRATION_QUOTA_PER_REGION, INTEGRATION_STATUS_ACTIVE, INTEGRATION_STATUS_CREATING,
     INVALID_TARGET_TYPE_MESSAGE,
+};
+pub use tags::{
+    added_key_count, check_tag_capacity, check_tags_to_write, merge_tags, TagTarget,
+    TagTargetMiss, TaggedKind, RESERVED_TAG_PREFIXES, TAGGABLE_ARN_RESOURCE_TYPES,
 };
 pub use tenant_databases::{
     is_multi_tenant_engine, mint_tenant_database_resource_id, tenant_database_key,
@@ -5131,6 +5136,12 @@ pub fn check_stored_text(member: &str, value: &str, max: usize) -> Result<(), St
 /// Refuse a `Tags` list this service will not store: more tags than one resource may
 /// carry, or a key or value past AWS's published tag lengths. Every tag a create stores is
 /// request data, so all three bounds are checked before the store is touched.
+///
+/// The rules `Tag$Key` documents for the key ITSELF — that a key is required, and that
+/// neither key nor value may carry a reserved prefix — belong to a caller's own tag write
+/// and live in [`tags::check_tags_to_write`]: the tags a create carries include the ones
+/// another service of this emulator assigns to a resource it provisions, which AWS assigns
+/// under exactly those reserved prefixes.
 pub fn check_tags(tags: &[Tag]) -> Result<(), String> {
     check_request_list_len("Tags", tags.len(), MAX_TAGS_PER_RESOURCE)?;
     for tag in tags {

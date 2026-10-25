@@ -3,7 +3,9 @@
 //! @op DescribeBudgets
 //!
 //! Lists the budgets stored for an account, ordered by `BudgetName` and paginated
-//! with `MaxResults` / `NextToken`. Reporting only — nothing is written.
+//! with `MaxResults` / `NextToken` — a request that names no `MaxResults` is served
+//! the documented default page size ([`DEFAULT_MAX_RESULTS`]). Reporting only —
+//! nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -121,6 +123,13 @@ impl From<DescribeBudgetsErrorModeled> for DescribeBudgetsError {
     }
 }
 
+/// The page size a request that names none gets: "An integer that represents how many
+/// budgets a paginated response contains. The default is 100."
+/// (`DescribeBudgetsRequest$MaxResults`, from this service's model). A page size the
+/// model documents a default for is served that default, not the whole list, so a
+/// caller that leaves `MaxResults` out still paginates.
+const DEFAULT_MAX_RESULTS: i32 = 100;
+
 /// The `DescribeBudgets` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -182,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let budgets = crate::state::budgets_for_account(&store, &input.account_id, now);
         let (page, next_token) = crate::state::page(
             &budgets,
-            input.max_results,
+            Some(input.max_results.unwrap_or(DEFAULT_MAX_RESULTS)),
             input.next_token.as_deref(),
         )
         .ok_or_else(|| {

@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePartition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePartition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePartition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Persists ONE partition — "a slice of table data" — on the table the request names,
+//! addressed by the `Values` of its `PartitionInput`: one value per partition key of
+//! that table, "ordered in the same order as the partition keys"
+//! (`PartitionInput$Values`), so a later `GetPartition` of those values serves what the
+//! client sent plus the one member only the server sets, `CreationTime`.
+//!
+//! The create decision is the SAME one each item of `BatchCreatePartition` makes
+//! ([`crate::state::TableEntry::create_partition`]); only the reporting differs. A batch
+//! reports a refusal as a per-item `ErrorDetail`, while this single-partition create
+//! raises the modelled exception that error code names: an input carrying no values or a
+//! value count that is not the table's partition-key count is `InvalidInputException`, a
+//! value list the table already holds a partition for is `AlreadyExistsException`, and a
+//! create past the stored-partition ceiling is `ResourceNumberLimitExceededException`. A
+//! database or table the catalog does not hold is `EntityNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +161,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePartition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePartitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePartition"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreatePartitionErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // The store is resident memory and this create is reachable by any caller, so the
+        // number of partition records one process will hold is bounded store-wide as well
+        // as per table. The store-wide answer is read BEFORE the parent database is
+        // borrowed, but used AFTER the table is resolved, so a request naming a database
+        // or table the catalog does not hold still gets the precise
+        // `EntityNotFoundException`.
+        let store_has_room = store.can_store_partition();
+        let Some(database) = store.database_mut(&catalog_id, &input.database_name) else {
+            return Err(CreatePartitionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::database_not_found(
+                        &input.database_name,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        let database_name = database.name.clone();
+        let Some(table) = database
+            .tables
+            .get_mut(&crate::state::fold_name(&input.table_name))
+        else {
+            return Err(CreatePartitionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::table_not_found(&input.table_name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        let table_name = table.name.clone();
+        match table.create_partition(&input.partition_input, now, store_has_room) {
+            Ok(created) => {
+                ::tracing::info!(
+                    operation = "CreatePartition",
+                    catalog_id = %catalog_id,
+                    database = %database_name,
+                    table = %table_name,
+                    values = ?created.values,
+                    "created a Data Catalog partition"
+                );
+                Ok(CreatePartitionOutput {})
+            }
+            // The refusal already carries the error code it is reported under and its
+            // wording; this create raises the modelled exception that code names, so the
+            // single create and the batch refuse the same inputs for the same reasons.
+            Err(refusal) => {
+                let message = Some(refusal.message());
+                Err(match refusal {
+                    crate::state::PartitionCreateRefusal::ValuesRequired
+                    | crate::state::PartitionCreateRefusal::ValuesDoNotMatchPartitionKeys {
+                        ..
+                    } => CreatePartitionErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message,
+                            from_federation_source: None,
+                        },
+                    ),
+                    crate::state::PartitionCreateRefusal::AlreadyExists => {
+                        CreatePartitionErrorModeled::AlreadyExistsException(
+                            AlreadyExistsException { message },
+                        )
+                    }
+                    crate::state::PartitionCreateRefusal::LimitExceeded { .. } => {
+                        CreatePartitionErrorModeled::ResourceNumberLimitExceededException(
+                            ResourceNumberLimitExceededException { message },
+                        )
+                    }
+                }
+                .into())
+            }
+        }
     }
 }

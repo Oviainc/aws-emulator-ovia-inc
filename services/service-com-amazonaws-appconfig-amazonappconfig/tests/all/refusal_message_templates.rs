@@ -2,7 +2,7 @@
 
 //! How AppConfig WORDS a refusal, over the set of lookups and conflicts that produce one.
 //!
-//! Two rules are under test, each one level more general than any single request:
+//! Three rules are under test, each one level more general than any single request:
 //!
 //! 1. A `ResourceNotFoundException` message is the looked-up resource KIND's own AppConfig
 //!    template, filled in from the request's identifiers: the identifier labels that
@@ -11,15 +11,22 @@
 //!    deployment strategy's names no account and the extension's echoes no identifier —
 //!    so one invented sentence shape cannot serve them all, and every operation that
 //!    reaches the same lookup must word it the same way.
-//! 2. `StartDeployment`'s in-flight guard is a `ConflictException` attributed to the
+//! 2. A mutation naming one of AppConfig's predefined deployment strategies is refused
+//!    with a `BadRequestException` whose message is built from the request: the fixed
+//!    prefix `Cannot <verb> predefined Deployment Strategy ` followed by the submitted
+//!    `DeploymentStrategyId`, with no trailing full stop. The guard is about the published
+//!    catalogue, so a strategy this account created still takes the same mutations.
+//! 3. `StartDeployment`'s in-flight guard is a `ConflictException` attributed to the
 //!    ENVIRONMENT: it names the environment and the state it currently has, and nothing
 //!    about the deployment holding it.
 //!
 //! The tables span what those rules generalise over: the resource kind, the operation
 //! reaching the lookup (read, write and delete paths), the shape of the identifier the
 //! request sent (minted id, a name, an ARN, both branches of `DeploymentStrategyId`'s
-//! pattern), and — for rule 2 — the state the blocking deployment is in, across strategies
-//! whose rollout window and bake time put it in each of them.
+//! pattern), — for rule 2 — every entry of the published catalogue, both mutating
+//! operations and the members and values the request carries, and — for rule 3 — the state
+//! the blocking deployment is in, across strategies whose rollout window and bake time put
+//! it in each of them.
 //!
 //! Rule 1 is also asserted ACROSS resource kinds, one row per kind, by
 //! `control_plane_fidelity`'s own not-found table (configuration profile, hosted
@@ -314,7 +321,229 @@ async fn a_not_found_message_is_the_looked_up_kinds_own_template() {
 }
 
 // =============================================================================
-// 2. the in-flight-deployment conflict
+// 2. the predefined-strategy immutability refusal
+// =============================================================================
+
+/// One mutation AppConfig will not apply to a catalogue entry: the operation, the verb its
+/// refusal carries, and the route the model binds it to.
+struct CatalogueMutation {
+    operation: &'static str,
+    verb: &'static str,
+    method: &'static str,
+    /// The collection segment this operation's route uses. The delete's is the model's own
+    /// misspelling (`/deployementstrategies/{DeploymentStrategyId}`, from
+    /// `smithy_query(query="operation", operation="DeleteDeploymentStrategy")`), which is
+    /// why it is carried per row rather than shared.
+    collection: &'static str,
+}
+
+/// The two operations that ask to mutate a deployment strategy.
+const CATALOGUE_MUTATIONS: [CatalogueMutation; 2] = [
+    CatalogueMutation {
+        operation: "UpdateDeploymentStrategy",
+        verb: "update",
+        method: "PATCH",
+        collection: "/deploymentstrategies",
+    },
+    CatalogueMutation {
+        operation: "DeleteDeploymentStrategy",
+        verb: "delete",
+        method: "DELETE",
+        collection: "/deployementstrategies",
+    },
+];
+
+/// The request body for a row: the mutations differ along which members the patch carries
+/// and which values, at both published bounds of `MinutesBetween0And24Hours` (range
+/// 0..1440) and `GrowthFactor` (range 1..100) and over each `GrowthType` the model lists
+/// (`smithy_query(query="operation", operation="UpdateDeploymentStrategy")`). The delete
+/// carries no body at all, so the refusal cannot be keyed to the request's shape.
+fn patch_body(index: usize) -> Value {
+    let bodies = [
+        json!({ "DeploymentDurationInMinutes": 0 }),
+        json!({ "GrowthFactor": 100 }),
+        json!({ "Description": "", "GrowthType": "LINEAR" }),
+        json!({
+            "Description": "a patch carrying every member at once",
+            "DeploymentDurationInMinutes": 1440,
+            "FinalBakeTimeInMinutes": 1440,
+            "GrowthFactor": 1,
+            "GrowthType": "EXPONENTIAL",
+        }),
+    ];
+    bodies[index % bodies.len()].clone()
+}
+
+/// `GET /deploymentstrategies/{Id}`.
+async fn get_strategy(router: &MultiServiceRouter, id: &str) -> Answer {
+    json_call(
+        router,
+        "GET",
+        &format!("/deploymentstrategies/{id}"),
+        &Value::Null,
+    )
+    .await
+}
+
+/// A mutation naming one of AppConfig's predefined deployment strategies is refused with a
+/// 400 `BadRequestException` whose message is the fixed prefix `Cannot <verb> predefined
+/// Deployment Strategy ` followed by the id the request submitted — for every entry of the
+/// published catalogue, on both mutating operations, whatever the request body carries.
+#[tokio::test]
+async fn a_predefined_strategy_mutation_is_refused_with_appconfigs_template() {
+    let router = router();
+
+    // Rows are the whole predefined catalogue (`state::PREDEFINED_DEPLOYMENT_STRATEGIES`,
+    // the AWS AppConfig User Guide's "Predefined deployment strategies" table) crossed
+    // with both mutations, so every entry is asserted rather than the one a caller
+    // happens to name.
+    for (index, predefined) in PREDEFINED_DEPLOYMENT_STRATEGIES.iter().enumerate() {
+        for mutation in &CATALOGUE_MUTATIONS {
+            let case = format!("{} on {}", mutation.operation, predefined.id);
+            let before = get_strategy(&router, predefined.id).await;
+            assert_eq!(
+                before.status,
+                200,
+                "case {case:?}: the catalogue entry must be readable first, got {} / {}",
+                before.status,
+                String::from_utf8_lossy(&before.body)
+            );
+
+            let body = match mutation.method {
+                "PATCH" => patch_body(index),
+                _ => Value::Null,
+            };
+            let refused = json_call(
+                &router,
+                mutation.method,
+                &format!("{}/{}", mutation.collection, predefined.id),
+                &body,
+            )
+            .await;
+            assert_eq!(
+                refused.status,
+                400,
+                "case {case:?}: expected 400, got {} / {}",
+                refused.status,
+                String::from_utf8_lossy(&refused.body)
+            );
+            assert_eq!(
+                refused
+                    .error_code()
+                    .split('#')
+                    .next_back()
+                    .unwrap_or_default(),
+                "BadRequestException",
+                "case {case:?}: expected BadRequestException, got {}",
+                refused.error_code()
+            );
+            let expected = format!(
+                "Cannot {} predefined Deployment Strategy {}",
+                mutation.verb, predefined.id
+            );
+            let message = refused.string("Message").unwrap_or_default();
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected message {expected:?}, got {message:?}"
+            );
+
+            // The refusal changed nothing: the catalogue entry still reports exactly what
+            // it did before the mutation was asked for.
+            let after = get_strategy(&router, predefined.id).await;
+            assert_eq!(
+                after.json(),
+                before.json(),
+                "case {case:?}: a refused mutation must change nothing, expected {}, got {}",
+                before.json(),
+                after.json()
+            );
+        }
+    }
+}
+
+/// The guard is about the catalogue, not about mutating a strategy: a strategy this
+/// account created takes both mutations, so neither carries the immutability sentence.
+#[tokio::test]
+async fn a_created_strategy_takes_both_mutations() {
+    let router = router();
+
+    // Rows differ along the criteria the created strategy carries, at the bounds the model
+    // publishes and over each growth type it lists.
+    for (case, growth_type, duration, bake, growth_factor) in [
+        ("a linear strategy at the lower bounds", "LINEAR", 0, 0, 1.0),
+        (
+            "an exponential strategy at the upper bounds",
+            "EXPONENTIAL",
+            1440,
+            1440,
+            100.0,
+        ),
+    ] {
+        let created = json_call(
+            &router,
+            "POST",
+            "/deploymentstrategies",
+            &json!({
+                "Name": format!("control-{}", growth_type.to_lowercase()),
+                "DeploymentDurationInMinutes": duration,
+                "FinalBakeTimeInMinutes": bake,
+                "GrowthFactor": growth_factor,
+                "GrowthType": growth_type,
+                "ReplicateTo": "NONE",
+            }),
+        )
+        .await;
+        assert_eq!(
+            created.status,
+            201,
+            "case {case:?}: CreateDeploymentStrategy expected 201, got {} / {}",
+            created.status,
+            String::from_utf8_lossy(&created.body)
+        );
+        let id = created
+            .string("Id")
+            .unwrap_or_else(|| panic!("case {case:?}: no Id in {}", created.json()));
+
+        let patched = json_call(
+            &router,
+            "PATCH",
+            &format!("/deploymentstrategies/{id}"),
+            &json!({ "Description": "patched by the control row" }),
+        )
+        .await;
+        assert_eq!(
+            patched.status,
+            200,
+            "case {case:?}: patching this account's own strategy expected 200, got {} / {}",
+            patched.status,
+            String::from_utf8_lossy(&patched.body)
+        );
+        assert_eq!(
+            patched.string("Description").as_deref(),
+            Some("patched by the control row"),
+            "case {case:?}: the patch must be read back, got {}",
+            patched.json()
+        );
+
+        let deleted = json_call(
+            &router,
+            "DELETE",
+            &format!("/deployementstrategies/{id}"),
+            &Value::Null,
+        )
+        .await;
+        assert_eq!(
+            deleted.status,
+            204,
+            "case {case:?}: deleting this account's own strategy expected 204, got {} / {}",
+            deleted.status,
+            String::from_utf8_lossy(&deleted.body)
+        );
+    }
+}
+
+// =============================================================================
+// 3. the in-flight-deployment conflict
 // =============================================================================
 
 /// One blocking deployment: the criteria of the strategy that paces it, chosen so the

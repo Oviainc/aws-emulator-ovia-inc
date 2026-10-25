@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFieldLevelEncryptionProfileConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFieldLevelEncryptionProfileConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFieldLevelEncryptionProfileConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the CONFIGURATION of one field-level encryption profile from this service's
+//! store, beside the version token the last mutation handed back. A REPORTING operation — it
+//! answers from the record the create left behind and writes nothing of its own.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +136,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFieldLevelEncryptionProfileConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFieldLevelEncryptionProfileConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFieldLevelEncryptionProfileConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let store = state.lock();
+
+        // "Get the ID for the field-level encryption profile configuration information": an
+        // id no stored profile carries names no profile, whatever shape it has.
+        let Some(stored) = store.field_level_encryption_profile(&input.id) else {
+            return Err(
+                GetFieldLevelEncryptionProfileConfigErrorModeled::NoSuchFieldLevelEncryptionProfile(
+                    crate::state::no_such_field_level_encryption_profile(),
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetFieldLevelEncryptionProfileConfigOutput {
+            // "Return the field-level encryption profile configuration information" — the
+            // configuration as the create stored it, read from that record rather than
+            // rebuilt from anything.
+            field_level_encryption_profile_config: Some(stored.config.clone()),
+            // "The current version of the field level encryption profile configuration
+            // result": the token the last mutation handed back, the same one the profile
+            // itself is read at.
+            e_tag: Some(stored.etag.clone()),
+        })
     }
 }

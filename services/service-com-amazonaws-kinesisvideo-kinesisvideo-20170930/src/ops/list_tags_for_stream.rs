@@ -136,7 +136,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for ListTagsForStream<Eng>
 {
     type Input = ListTagsForStreamInput;
-    type Output = ListTagsForStreamReport;
+    type Output = Report<ListTagsForStreamOutput>;
     type Error = ListTagsForStreamError;
 
     const NAME: &'static str = "ListTagsForStream";
@@ -185,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .resolve(input.stream_name.as_deref(), input.stream_arn.as_deref())
             .map_err(lookup_error)?;
 
-        Ok(ListTagsForStreamReport::of(ListTagsForStreamOutput {
+        Ok(Report::of(ListTagsForStreamOutput {
             tags: Some(
                 stream
                     .tags
@@ -194,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .collect(),
             ),
             // Never truncated, so there is no next page to resume from; the member
-            // still reaches the wire, as JSON `null` (see [`ListTagsForStreamReport`]).
+            // still reaches the wire, as JSON `null` (see [`Report`]).
             next_token: None,
         }))
     }
@@ -207,17 +207,17 @@ fn lookup_error(error: crate::state::LookupError) -> ListTagsForStreamError {
     match error {
         crate::state::LookupError::NoIdentifier => {
             ListTagsForStreamErrorModeled::InvalidArgumentException(InvalidArgumentException {
-                message: Some("Either StreamName or StreamARN must be specified.".to_string()),
+                message: Some(crate::state::STREAM_IDENTIFIER_REQUIRED_MESSAGE.to_string()),
             })
         }
         crate::state::LookupError::Mismatch => {
             ListTagsForStreamErrorModeled::InvalidArgumentException(InvalidArgumentException {
-                message: Some("StreamName and StreamARN refer to different streams.".to_string()),
+                message: Some(crate::state::STREAM_IDENTIFIER_MISMATCH_MESSAGE.to_string()),
             })
         }
         crate::state::LookupError::NotFound => {
             ListTagsForStreamErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some("The requested stream is not found or not active.".to_string()),
+                message: Some(crate::state::STREAM_NOT_FOUND_MESSAGE.to_string()),
             })
         }
     }

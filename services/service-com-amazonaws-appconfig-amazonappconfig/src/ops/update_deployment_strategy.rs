@@ -200,10 +200,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if store.resolve_strategy(&input.deployment_strategy_id).is_some() {
                 return Err(UpdateDeploymentStrategyErrorModeled::BadRequestException(
                     BadRequestException {
-                        message: Some(format!(
-                            "Deployment strategy {} is an AppConfig predefined deployment \
-                             strategy and cannot be updated.",
-                            input.deployment_strategy_id
+                        message: Some(crate::state::predefined_deployment_strategy_immutable(
+                            crate::state::StrategyMutation::Update,
+                            &input.deployment_strategy_id,
                         )),
                         reason: None,
                         details: None,

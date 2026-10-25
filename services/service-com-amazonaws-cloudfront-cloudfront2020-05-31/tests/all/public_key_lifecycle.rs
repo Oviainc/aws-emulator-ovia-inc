@@ -59,7 +59,7 @@ use crate::response_headers_policy_lifecycle::escape;
 
 /// `POST /2020-05-31/public-key` with the `PublicKeyConfig` document `body` — the member
 /// the operation binds to the HTTP payload.
-async fn create_key(router: &MultiServiceRouter, body: &str) -> Answer {
+pub(crate) async fn create_key(router: &MultiServiceRouter, body: &str) -> Answer {
     call(
         router,
         "POST",
@@ -194,7 +194,7 @@ impl Key {
 /// trailing newline: the XML text of an element is read with its surrounding whitespace
 /// stripped at the request boundary, so a value is compared as the boundary hands it to a
 /// handler.
-fn pem(lines: usize, filler: char) -> String {
+pub(crate) fn pem(lines: usize, filler: char) -> String {
     let body: Vec<String> = (0..lines)
         .map(|index| {
             let mut line: String = std::iter::repeat_n(filler, 63).collect();

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMedicalVocabulary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMedicalVocabulary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMedicalVocabulary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -172,23 +163,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UPDATE_MEDICAL_VOCABULARY_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Overwrite the stored custom medical vocabulary this request names.
+    ///
+    /// "This operation overwrites all existing information with your new values; you
+    /// cannot append new terms onto an existing custom vocabulary" (the operation's
+    /// own doc), so the record's language and table-file location become the ones
+    /// this request carries and the rebuild starts over: the vocabulary is `PENDING`
+    /// again, with the one transition the clock owes it due from this call. Its
+    /// identity — the name, the Region it lives in, its creation order and its tag
+    /// set, none of which this operation models an input for — is untouched.
+    ///
+    /// As on the create, the terms themselves can only come from the file at
+    /// `VocabularyFileUri`, which this operation models `@required` with no inline
+    /// alternative; reading it is work this emulator cannot perform, so the rebuild
+    /// ends in the service's own modelled `FAILED` state with a `FailureReason` (see
+    /// [`crate::state::MedicalVocabularyRecord`]).
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMedicalVocabulary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMedicalVocabularyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMedicalVocabulary"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateMedicalVocabularyErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no Transcribe state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // "US English (en-US) is the only language supported with Amazon Transcribe
+        // Medical" (model doc for `UpdateMedicalVocabularyRequest$LanguageCode`). The
+        // member targets the service-wide `LanguageCode` enum, so no constraint trait
+        // expresses that narrowing and the handler is where it is refused — the same
+        // rule, and the same wording, as `CreateMedicalVocabulary`.
+        if input.language_code != crate::state::MEDICAL_LANGUAGE_CODE {
+            return Err(bad_request(&format!(
+                "The LanguageCode {language} is not supported by Amazon Transcribe \
+                 Medical. Use {only} and try your request again.",
+                language = input.language_code,
+                only = crate::state::MEDICAL_LANGUAGE_CODE,
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        let Some(existing) = store
+            .medical_vocabularies
+            .get(&region, &input.vocabulary_name)
+        else {
+            // A medical vocabulary this Region does not hold is this service's
+            // `BadRequestException`, as it is for `GetMedicalVocabulary` and
+            // `UpdateVocabulary`: the shape whose own documentation covers an entity
+            // that "doesn't exist", and the one this service's recorded not-found
+            // responses carry — not the modelled `NotFoundException`.
+            return Err(bad_request(&crate::state::not_found_message(
+                crate::state::KIND_MEDICAL_VOCABULARY,
+            )));
+        };
+
+        // The replacement record, built through the family's own `PENDING`
+        // constructor so the create and this update cannot disagree about the
+        // invariant that a `PENDING` record carries the instant its transition falls
+        // due. The Region a resource lives in is fixed when it is created — it is
+        // half of the record's key — so an update reaches only its own Region's
+        // resource and never migrates one.
+        let record = crate::state::MedicalVocabularyRecord::pending(
+            existing.name.clone(),
+            existing.sequence,
+            input.language_code,
+            input.vocabulary_file_uri,
+            existing.region.clone(),
+            existing.tags.clone(),
+            now,
+        );
+
+        // The response is the record just stored, never the request echoed back.
+        let output = UpdateMedicalVocabularyOutput {
+            vocabulary_name: Some(record.name.clone()),
+            language_code: Some(record.language_code.clone()),
+            last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
+            vocabulary_state: Some(record.state.clone()),
+        };
+        ::tracing::info!(
+            operation = "UpdateMedicalVocabulary",
+            vocabulary = %record.name,
+            state = %record.state,
+            "custom medical vocabulary overwritten; its file is not read"
+        );
+        let name = record.name.clone();
+        store.medical_vocabularies.insert(&region, &name, record);
+
+        Ok(output)
     }
+}
+
+/// A `BadRequestException` (HTTP 400) refusing a request the model's own constraint
+/// traits cannot express.
+fn bad_request(message: &str) -> UpdateMedicalVocabularyError {
+    UpdateMedicalVocabularyErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }
