@@ -59,6 +59,8 @@ mod function_url_deletion;
 mod function_version_listing;
 #[path = "all/layer_listing.rs"]
 mod layer_listing;
+#[path = "all/layer_version_by_arn.rs"]
+mod layer_version_by_arn;
 #[path = "all/layer_version_listing.rs"]
 mod layer_version_listing;
 #[path = "all/layer_version_permissions.rs"]

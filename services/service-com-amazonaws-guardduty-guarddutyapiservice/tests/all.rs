@@ -37,6 +37,8 @@ mod custom_detection_rules;
 mod detector_data_sources_projection;
 #[path = "all/detector_lifecycle.rs"]
 mod detector_lifecycle;
+#[path = "all/detector_sub_resource_creates.rs"]
+mod detector_sub_resource_creates;
 #[path = "all/filter_delete.rs"]
 mod filter_delete;
 #[path = "all/filter_lifecycle.rs"]

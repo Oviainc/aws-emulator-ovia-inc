@@ -392,6 +392,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // starts on the modelled default of `AssignmentRequired` until a
             // `PutApplicationAssignmentConfiguration` sets one.
             assignment_required: crate::state::APPLICATION_ASSIGNMENT_REQUIRED_DEFAULT,
+            // …and no session configuration either, so it reports the default status
+            // until a `PutApplicationSessionConfiguration` sets one.
+            user_background_session_status: None,
             portal_options,
             created_date: ::aws_smithy_types::DateTime::from(now),
             // "CreatedFrom" — the Region this create ran in, which is the only Region
