@@ -510,7 +510,10 @@ async fn tags_are_read_from_the_resource_record() {
 /// are the rules the model cannot state — at most one tag per key, at most
 /// [`MAX_TAGS_PER_RESOURCE`] tags — and the two `ValidationException` rows are one past
 /// `TagKey`'s documented maximum length (128) and one past `TagValue`'s (256).
-fn tag_sets_no_resource_can_carry() -> Vec<(&'static str, Vec<SubmittedTag>, u16, &'static str)> {
+///
+/// `pub(crate)` so a sibling suite asserting the SAME tagging rule on another resource
+/// kind runs the same rows rather than declaring a second copy of them.
+pub(crate) fn tag_sets_no_resource_can_carry() -> Vec<(&'static str, Vec<SubmittedTag>, u16, &'static str)> {
     vec![
         (
             "duplicate-key",

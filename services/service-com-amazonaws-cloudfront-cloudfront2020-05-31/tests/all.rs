@@ -23,6 +23,8 @@ mod cache_policy_update;
 mod connection_function_lifecycle;
 #[path = "all/connection_function_publish.rs"]
 mod connection_function_publish;
+#[path = "all/connection_group_tags.rs"]
+mod connection_group_tags;
 #[path = "all/connection_groups.rs"]
 mod connection_groups;
 #[path = "all/continuous_deployment_policies.rs"]
