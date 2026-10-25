@@ -183,8 +183,12 @@ pub struct ThrottlingException {
     pub message: Option<String>,
 }
 
+// `PartialEq`/`Eq` beyond the generated derives: `CreateHealthCheck`'s
+// `CallerReference` rule turns on whether a repeated request carries the SAME
+// settings as the health check that reference already names, which is a
+// comparison of two whole configurations.
 #[smithy_macros::smithy(shape = "com.amazonaws.route53#HealthCheckConfig")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HealthCheckConfig {
     pub ip_address: Option<String>,
     pub port: Option<i32>,
@@ -206,8 +210,10 @@ pub struct HealthCheckConfig {
     pub routing_control_arn: Option<String>,
 }
 
+// `PartialEq`/`Eq` so a `HealthCheckConfig` carrying one can be compared whole
+// (see the note on `HealthCheckConfig`).
 #[smithy_macros::smithy(shape = "com.amazonaws.route53#AlarmIdentifier")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AlarmIdentifier {
     pub region: String,
     pub name: String,

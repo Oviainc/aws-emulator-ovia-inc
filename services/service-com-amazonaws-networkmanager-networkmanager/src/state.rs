@@ -347,6 +347,9 @@ pub const FIELD_CONNECT_ATTACHMENT_ID: &str = "connectAttachmentId";
 pub const FIELD_INSIDE_CIDR_BLOCKS: &str = "insideCidrBlocks";
 /// See [`FIELD_CONNECT_ATTACHMENT_ID`].
 pub const FIELD_SUBNET_ARN: &str = "subnetArn";
+/// See [`FIELD_GLOBAL_NETWORK_ID`]: the same lowerCamelCase spelling of the request
+/// member, for the version id a put of a core network policy asserts the history ends at.
+pub const FIELD_LATEST_VERSION_ID: &str = "latestVersionId";
 
 /// How a resource kind of this service reads in prose: the ARN resource type
 /// ([`GLOBAL_NETWORK_KIND`] and friends) with its hyphens as spaces and a leading

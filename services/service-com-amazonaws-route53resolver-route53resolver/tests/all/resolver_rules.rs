@@ -82,13 +82,17 @@ async fn forward_rule(
     string_member(rule(&created), "Id")
 }
 
-/// One row of the create table: a request, and the `TargetIps` the stored rule
-/// must then report once the service has applied the documented defaults.
+/// One row of the create table: a request, the `DomainName` the stored rule must
+/// report, and the `TargetIps` it must report once the service has applied the
+/// documented defaults.
 struct CreateCase {
     case: &'static str,
     /// `{endpoint}` in `ResolverEndpointId` is replaced by the id of the stored
     /// OUTBOUND endpoint.
     body: Value,
+    /// The request's `DomainName` as a fully-qualified DNS name, written out per
+    /// row rather than recomputed by the code under test.
+    domain_name: Option<&'static str>,
     target_ips: Option<Value>,
 }
 
@@ -99,7 +103,8 @@ struct CreateCase {
 /// The table spans what the rule generalises over: `RuleType` (every value a
 /// caller may create, out of the model's `RuleTypeOption` enum), the number of
 /// target addresses, their family (IPv4, IPv6), `Port` and `Protocol` present
-/// or defaulted, and `Name` present or absent.
+/// or defaulted, `Name` present or absent, and a `DomainName` written relative
+/// or already fully qualified.
 #[tokio::test]
 async fn a_created_rule_is_read_back_from_state() {
     let cases = vec![
@@ -113,6 +118,7 @@ async fn a_created_rule_is_read_back_from_state() {
                 "ResolverEndpointId": "{endpoint}",
                 "TargetIps": [{ "Ip": "192.0.2.10", "Port": 5353 }],
             }),
+            domain_name: Some("example.com."),
             target_ips: Some(json!([
                 { "Ip": "192.0.2.10", "Port": 5353, "Protocol": "Do53" }
             ])),
@@ -131,6 +137,7 @@ async fn a_created_rule_is_read_back_from_state() {
                     { "Ip": "192.0.2.13" },
                 ],
             }),
+            domain_name: Some("corp.example.com."),
             target_ips: Some(json!([
                 { "Ip": "192.0.2.11", "Port": DNS_PORT, "Protocol": "Do53" },
                 { "Ip": "192.0.2.12", "Port": DNS_PORT, "Protocol": "Do53" },
@@ -151,6 +158,7 @@ async fn a_created_rule_is_read_back_from_state() {
                     "ServerNameIndication": "doh.example.com",
                 }],
             }),
+            domain_name: Some("v6.example.com."),
             target_ips: Some(json!([{
                 "Ipv6": "2001:db8::53",
                 "Port": 443,
@@ -166,6 +174,7 @@ async fn a_created_rule_is_read_back_from_state() {
                 "RuleType": "SYSTEM",
                 "DomainName": "apex.example.com",
             }),
+            domain_name: Some("apex.example.com."),
             target_ips: None,
         },
         CreateCase {
@@ -177,13 +186,29 @@ async fn a_created_rule_is_read_back_from_state() {
                 "DelegationRecord": "ns.example.com",
                 "Tags": [{ "Key": "team", "Value": "networking" }],
             }),
+            domain_name: Some("delegated.example.com."),
             target_ips: None,
+        },
+        CreateCase {
+            case: "FORWARD, a DomainName the request already wrote fully qualified",
+            body: json!({
+                "CreatorRequestId": "req-forward-fqdn",
+                "RuleType": "FORWARD",
+                "DomainName": "fqdn.example.com.",
+                "ResolverEndpointId": "{endpoint}",
+                "TargetIps": [{ "Ip": "192.0.2.14" }],
+            }),
+            domain_name: Some("fqdn.example.com."),
+            target_ips: Some(json!([
+                { "Ip": "192.0.2.14", "Port": DNS_PORT, "Protocol": "Do53" }
+            ])),
         },
     ];
 
     for CreateCase {
         case,
         body,
+        domain_name,
         target_ips,
     } in cases
     {
@@ -224,13 +249,18 @@ async fn a_created_rule_is_read_back_from_state() {
             ACCOUNT,
             "case {case:?}: the owner is the emulator account, got {made}"
         );
-        for member in ["CreatorRequestId", "RuleType", "DomainName", "Name", "DelegationRecord"] {
+        for member in ["CreatorRequestId", "RuleType", "Name", "DelegationRecord"] {
             assert_eq!(
                 made.get(member),
                 request.get(member),
                 "case {case:?}: {member} must come back exactly as requested, got {made}"
             );
         }
+        assert_eq!(
+            made.get("DomainName").and_then(Value::as_str),
+            domain_name,
+            "case {case:?}: DomainName must be reported as a fully-qualified name, got {made}"
+        );
         assert_eq!(
             made.get("TargetIps"),
             target_ips.as_ref(),
@@ -280,6 +310,89 @@ async fn a_repeated_creator_request_id_does_not_create_a_second_rule() {
     );
 }
 
+/// The domain name a rule selects on is reported as a fully-qualified DNS name:
+/// the requested name followed by exactly one root label (RFC 1035 §3.1), so
+/// two requests that differ only in how they wrote the root label describe one
+/// domain.
+///
+/// The table spans what the rule generalises over: the number of labels, a name
+/// written relative, one already fully qualified, one carrying more than one
+/// root label, and a name whose canonical form reaches `DomainName`'s published
+/// maximum length (256, `smithy_query(query="shape",shape="DomainName")`).
+#[tokio::test]
+async fn a_rule_domain_name_is_reported_fully_qualified() {
+    // Four maximum-length DNS labels (63 octets each) joined by dots: 255
+    // characters, whose canonical form is exactly DomainName's 256-character
+    // maximum.
+    let longest = vec!["a".repeat(63); 4].join(".");
+    let cases: Vec<(&str, String, String)> = vec![
+        (
+            "a relative name",
+            "example.com".to_string(),
+            "example.com.".to_string(),
+        ),
+        (
+            "a name already written fully qualified",
+            "example.com.".to_string(),
+            "example.com.".to_string(),
+        ),
+        (
+            "a name written with more than one root label",
+            "example.com..".to_string(),
+            "example.com.".to_string(),
+        ),
+        (
+            "a single label",
+            "internal".to_string(),
+            "internal.".to_string(),
+        ),
+        (
+            "six labels",
+            "a.b.c.d.e.example.com".to_string(),
+            "a.b.c.d.e.example.com.".to_string(),
+        ),
+        (
+            "a name whose canonical form is the longest DomainName",
+            longest.clone(),
+            format!("{longest}."),
+        ),
+    ];
+
+    let router = emulator();
+    let endpoint = endpoint_id(&router, "ep-fqdn", "OUTBOUND").await;
+
+    for (index, (case, requested, expected)) in cases.iter().enumerate() {
+        let created = ok(
+            &router,
+            "CreateResolverRule",
+            json!({
+                "CreatorRequestId": format!("req-fqdn-{index}"),
+                "RuleType": "FORWARD",
+                "DomainName": requested,
+                "ResolverEndpointId": endpoint,
+                "TargetIps": [{ "Ip": "192.0.2.40" }],
+            }),
+        )
+        .await;
+        let made = rule(&created).clone();
+        let actual = string_member(&made, "DomainName");
+        assert_eq!(
+            &actual, expected,
+            "case {case:?}: the created rule must report {expected:?} for {requested:?}, got {actual:?}"
+        );
+
+        // The canonical name is what was stored, not a projection the create
+        // alone applies.
+        let id = string_member(&made, "Id");
+        let fetched = ok(&router, "GetResolverRule", json!({ "ResolverRuleId": id })).await;
+        let read = string_member(rule(&fetched), "DomainName");
+        assert_eq!(
+            &read, expected,
+            "case {case:?}: GetResolverRule must report {expected:?} for {requested:?}, got {read:?}"
+        );
+    }
+}
+
 /// A request the documented semantics forbid is refused with the modelled
 /// error, and never with a 501 or an empty success.
 ///
@@ -307,6 +420,30 @@ async fn a_rule_the_documentation_forbids_is_refused() {
                 "RuleType": "SYSTEM",
                 "DomainName": "system.example.com",
                 "TargetIps": [{ "Ip": "192.0.2.30" }],
+            }),
+            "InvalidRequestException",
+        ),
+        (
+            // A rule type that names no target IPs has nothing to route
+            // through an endpoint either, so the endpoint member is refused on
+            // its own as well.
+            "SYSTEM with a ResolverEndpointId",
+            json!({
+                "CreatorRequestId": "req-system-endpoint",
+                "RuleType": "SYSTEM",
+                "DomainName": "system-endpoint.example.com",
+                "ResolverEndpointId": "{endpoint}",
+            }),
+            "InvalidRequestException",
+        ),
+        (
+            "SYSTEM with both a ResolverEndpointId and TargetIps",
+            json!({
+                "CreatorRequestId": "req-system-endpoint-targets",
+                "RuleType": "SYSTEM",
+                "DomainName": "system-both.example.com",
+                "ResolverEndpointId": "{endpoint}",
+                "TargetIps": [{ "Ip": "192.0.2.37" }],
             }),
             "InvalidRequestException",
         ),

@@ -607,8 +607,12 @@ fn planned_instances(
     let mut taken_disk_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut planned = Vec::with_capacity(input.instance_names.len());
     for name in &input.instance_names {
-        let add_ons =
-            crate::state::add_ons_from_requests(name, &add_on_requests).map_err(invalid)?;
+        let add_ons = crate::state::add_ons_from_requests(
+            crate::state::ADD_ONS_LIST_MEMBER,
+            name,
+            &add_on_requests,
+        )
+        .map_err(invalid)?;
         let mut disks: Vec<PlannedDisk> = Vec::new();
         // Keyed, not scanned, so planning one instance's mapping costs time
         // linear in its (already bounded) entries.
