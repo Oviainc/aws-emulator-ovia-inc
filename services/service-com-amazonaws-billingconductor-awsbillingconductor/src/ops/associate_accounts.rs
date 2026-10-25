@@ -263,9 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         for account_id in to_add {
-            state
-                .account_associations
-                .insert(account_id, group_arn.clone());
+            state.associate_account(&account_id, &group_arn);
         }
 
         Ok(AssociateAccountsOutput {

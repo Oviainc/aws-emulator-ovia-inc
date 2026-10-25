@@ -4,11 +4,12 @@
 //! Reads billing groups back out of state, applying the modelled filters and
 //! `MaxResults`/`NextToken` paging. A pure read: it writes nothing.
 //!
-//! LIMITATION: `BillingPeriod` selects the month to report for. This emulator keeps
-//! no per-billing-period history of a group's membership or preferences, so every
-//! period reports the group's CURRENT state. A page is always bounded — by the
-//! request's `MaxResults`, or by `crate::state::DEFAULT_PAGE_SIZE` when it names
-//! none.
+//! LIMITATION: `BillingPeriod` selects the month to report for. A group's `Size` is
+//! the membership that was in force in that month
+//! (`crate::state::billing_group_sizes_in`); this emulator keeps no
+//! per-billing-period history of a group's own preferences, so those report the
+//! group's CURRENT ones. A page is always bounded — by the request's `MaxResults`, or
+//! by `crate::state::DEFAULT_PAGE_SIZE` when it names none.
 //!
 //! ## Shape of an operation
 //!
@@ -196,8 +197,10 @@ fn matches(
 }
 
 /// The modelled view of a stored group. `Size`, `Status`, `StatusReason` and
-/// `BillingGroupType` are derived from the record, never stored beside it.
-fn element(group: &crate::state::BillingGroupRecord) -> BillingGroupListElement {
+/// `BillingGroupType` are derived from the record, never stored beside it; `Size` is
+/// the membership in force in the billing period the read is scoped to, which the
+/// caller passes in.
+fn element(group: &crate::state::BillingGroupRecord, size: i64) -> BillingGroupListElement {
     BillingGroupListElement {
         name: Some(group.name.clone()),
         arn: Some(group.arn.clone()),
@@ -206,7 +209,7 @@ fn element(group: &crate::state::BillingGroupRecord) -> BillingGroupListElement 
         computation_preference: Some(ComputationPreference {
             pricing_plan_arn: group.pricing_plan_arn.clone(),
         }),
-        size: group.size(),
+        size,
         creation_time: group.creation_time_millis,
         last_modified_time: group.last_modified_time_millis,
         status: Some(group.status().to_string()),
@@ -267,26 +270,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let state = state.lock();
 
-        // `BillingPeriod` selects the month the report is read for. This emulator
-        // keeps no per-billing-period history of a group's membership, so every
-        // period reports the group's current state; the modelled pattern is enforced
-        // before the handler runs.
+        // `BillingPeriod` selects the month the report is read for, and an absent one
+        // means the current month ("If you don't provide a billing group, the current
+        // billing period is used"): a group's `Size` is the membership that was in
+        // force then. The modelled pattern is enforced before the handler runs.
+        let billing_period = input
+            .billing_period
+            .unwrap_or_else(crate::state::current_billing_period);
         let filters = input.filters.unwrap_or_default();
-        let mut selected: Vec<(String, BillingGroupListElement)> = Vec::new();
+        let mut selected: Vec<(String, &crate::state::BillingGroupRecord)> = Vec::new();
         // `billing_groups` is ordered by ARN, and an ARN carries the monotonic id
         // this service mints, so the sequence is creation order and a `NextToken`
         // names the same cut point on the next call.
         for (arn, group) in &state.billing_groups {
             if matches(group, &filters)? {
-                selected.push((arn.clone(), element(group)));
+                selected.push((arn.clone(), group));
             }
         }
 
-        let (billing_groups, next_token) = crate::state::paginate(
-            selected,
-            input.next_token.as_deref(),
-            input.max_results,
-        );
+        // The page is cut FIRST, so the per-period `Size` is computed for at most one
+        // page of groups — bounded by the request's `MaxResults`, or by
+        // `DEFAULT_PAGE_SIZE` when it names none — in a single pass over the stored
+        // memberships rather than one pass per stored group.
+        let (page, next_token) =
+            crate::state::paginate(selected, input.next_token.as_deref(), input.max_results);
+        let page_arns: Vec<String> = page.iter().map(|group| group.arn.clone()).collect();
+        let sizes = state.billing_group_sizes_in(&page_arns, &billing_period);
+        let billing_groups: Vec<BillingGroupListElement> = page
+            .iter()
+            .map(|group| {
+                element(
+                    group,
+                    sizes.get(&group.arn).copied().unwrap_or_default(),
+                )
+            })
+            .collect();
 
         Ok(ListBillingGroupsOutput {
             billing_groups: Some(billing_groups),
