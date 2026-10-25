@@ -751,6 +751,35 @@ pub const COMMIT_ID_REQUIRED_MESSAGE: &str = "A commit ID was not specified.";
 /// sentence, worded here once for every operation that raises the code.
 pub const INVALID_COMMIT_ID_MESSAGE: &str = "The specified commit ID is not valid.";
 
+/// The longest `clientRequestToken` CodeCommit accepts, in characters — the upper
+/// bound the service's own `InvalidClientRequestTokenException` text states for the
+/// member ("Client request tokens must be between 1 and 256 ... characters"). The
+/// lower bound of that same sentence is why a token that carries no character at all
+/// is malformed rather than absent.
+pub const CLIENT_REQUEST_TOKEN_MAX_LENGTH: usize = 256;
+
+/// Is this EXPLICITLY supplied `clientRequestToken` a token CodeCommit accepts?
+///
+/// An idempotency token is an opaque string a client computes, so its characters are
+/// not constrained here — the SDKs prepopulate the member with a UUID, whose hyphens
+/// are part of a token every caller sends — but its LENGTH is: a token has to carry
+/// at least one character to name a request, and no more than
+/// [`CLIENT_REQUEST_TOKEN_MAX_LENGTH`]. A present token that fails this names no
+/// request and is not a token one could be deduplicated against, which is why every
+/// operation carrying the member refuses it with `InvalidClientRequestTokenException`
+/// instead of treating it as the member having been left out.
+pub fn is_client_request_token(candidate: &str) -> bool {
+    let characters = candidate.chars().count();
+    (1..=CLIENT_REQUEST_TOKEN_MAX_LENGTH).contains(&characters)
+}
+
+/// `InvalidClientRequestTokenException`'s message: the sentence pair the service
+/// words that code with — the failure, then the rule — naming nothing from the
+/// request. Worded here once for every operation that takes a `clientRequestToken`.
+pub const INVALID_CLIENT_REQUEST_TOKEN_MESSAGE: &str =
+    "The client request token is not valid. Client request tokens must be between 1 and 256 \
+     alphanumeric characters.";
+
 /// Why a commit id named in a request addresses no commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitIdProblem {
@@ -905,6 +934,14 @@ impl ComAmazonawsCodecommitCodecommit20150413State {
             .values()
             .find_map(|repository| repository.pull_requests.get(&pull_request_id))
     }
+
+    /// The same lookup, for a caller that goes on to modify the pull request.
+    pub fn pull_request_mut(&mut self, pull_request_id: u64) -> Option<&mut PullRequestRecord> {
+        self.repositories
+            .values_mut()
+            .find_map(|repository| repository.pull_requests.get_mut(&pull_request_id))
+    }
+
     /// The comment this `commentId` names, wherever it was posted.
     ///
     /// A comment id is addressable on its own — `GetComment` takes nothing else —
@@ -2269,6 +2306,17 @@ pub struct PullRequestRecord {
 }
 
 impl PullRequestRecord {
+    /// The approval rule this pull request holds under this name, if it holds one.
+    ///
+    /// An `approvalRuleName` is unique within one pull request, so at most one rule
+    /// can match, and both the operation that adds a rule and the one that deletes
+    /// it ask here rather than each scanning its own way.
+    pub fn approval_rule(&self, name: &str) -> Option<&ApprovalRuleRecord> {
+        self.approval_rules
+            .iter()
+            .find(|rule| rule.approval_rule_name == name)
+    }
+
     /// The system-generated `revisionId` of this pull request's CURRENT
     /// revision: a digest over the pull request's identity, how many times its
     /// reviewable state has moved, and the tips each target is between.
@@ -2438,6 +2486,53 @@ pub fn approval_rule_id(pull_request_id: u64, name: &str, created: SystemTime) -
         ::engine::emulator_account_id()
     ))
 }
+
+/// How many approval rules this emulator holds on one pull request.
+///
+/// `CreatePullRequestApprovalRule` models `NumberOfRulesExceededException` ("The
+/// approval rule cannot be added. The pull request has the maximum number of
+/// approval rules associated with it"), so a bound has to exist; this is the one
+/// this emulator holds, and it is the number the CodeCommit quota for approval
+/// rules on a single pull request publishes.
+pub const MAX_APPROVAL_RULES_PER_PULL_REQUEST: usize = 30;
+
+/// `ApprovalRuleNameRequiredException`'s message: a FIXED sentence, worded here
+/// once for every operation that takes an `approvalRuleName`.
+pub const APPROVAL_RULE_NAME_REQUIRED_MESSAGE: &str =
+    "An approval rule name is required, but was not specified.";
+
+/// `ApprovalRuleNameAlreadyExistsException`'s message, built from the name the
+/// request asked for: an approval rule name is unique within one pull request.
+pub fn approval_rule_name_already_exists_message(name: &str) -> String {
+    format!(
+        "An approval rule with the name {name} already exists for this pull request. Approval \
+         rule names must be unique within a pull request."
+    )
+}
+
+/// `NumberOfRulesExceededException`'s message, stating the bound this emulator
+/// holds ([`MAX_APPROVAL_RULES_PER_PULL_REQUEST`]).
+pub fn number_of_rules_exceeded_message() -> String {
+    format!(
+        "The approval rule cannot be added. The pull request has the maximum number of approval \
+         rules associated with it. The maximum number of approval rules for a pull request is {}.",
+        MAX_APPROVAL_RULES_PER_PULL_REQUEST
+    )
+}
+
+/// `CannotDeleteApprovalRuleFromTemplateException`'s message: a FIXED sentence,
+/// naming nothing from the request — the wording CodeCommit answers that code with
+/// (the model's documentation for the shape states the same sentence with its last
+/// two phrases in the other order).
+pub const CANNOT_DELETE_APPROVAL_RULE_FROM_TEMPLATE_MESSAGE: &str =
+    "The approval rule cannot be deleted from the pull request because it was created by an \
+     approval rule template and automatically applied to the pull request.";
+
+/// `PullRequestAlreadyClosedException`'s message: the sentence the model documents
+/// for the shape, worded here once for every operation that refuses to change a
+/// pull request that is no longer open.
+pub const PULL_REQUEST_ALREADY_CLOSED_MESSAGE: &str =
+    "The pull request status cannot be updated because it is already closed.";
 
 /// Does an approval rule template's content apply to a pull request whose
 /// destination is this fully qualified reference?

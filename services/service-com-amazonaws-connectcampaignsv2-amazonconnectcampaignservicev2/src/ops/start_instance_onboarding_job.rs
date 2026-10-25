@@ -227,12 +227,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Starting the job is what persists the instance's config, so the write
         // happens here rather than in the reporting operations; the job itself is
         // owed by the clock, which is why the record carries the instant it is due
-        // to have finished rather than a status nothing would ever move.
+        // to have finished rather than a status nothing would ever move. The
+        // configuration belongs to the region the request was signed for: an instance
+        // onboarded there is a campaign target there and nowhere else.
         let now = std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
         let mut store = state.lock();
-        let Some(stored) =
-            store.start_instance_onboarding(&input.connect_instance_id, input.encryption_config, now)
-        else {
+        let Some(stored) = store.start_instance_onboarding(
+            &region,
+            &input.connect_instance_id,
+            input.encryption_config,
+            now,
+        ) else {
             // The store is bounded: past its ceiling the call is refused rather than
             // growing the process without limit. Of the errors this operation
             // models, the conflict is the one that fits — the service's own state,

@@ -2619,6 +2619,29 @@ pub fn tag_page(
     }
 }
 
+/// The tag set an entity holding `held` carries after an untag call naming
+/// `keys`.
+///
+/// The rule every IAM untag operation follows, in one place: the call "removes the
+/// specified tags from the role" (`UntagRole`), so each held tag whose key is named
+/// is dropped and every tag it does not name keeps its value and its position in
+/// the held order. Keys compare exactly: "tag keys and values are case sensitive"
+/// ("Tagging IAM resources", IAM User Guide), so a key spelled in another case
+/// names a different tag. A named key the entity does not hold removes nothing —
+/// these operations model no error for one — so the call is idempotent and naming
+/// no keys at all leaves the held set as it was.
+pub fn remove_tags<'a, I: IntoIterator<Item = &'a str>>(
+    held: Option<&Vec<Tag>>,
+    keys: I,
+) -> Vec<Tag> {
+    let removed: BTreeSet<&str> = keys.into_iter().collect();
+    held.into_iter()
+        .flatten()
+        .filter(|tag| !removed.contains(tag.key.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// Whether `document` is an IAM policy document.
 ///
 /// An IAM policy document is a JSON object whose top-level elements are `Version`

@@ -45,6 +45,8 @@ mod container_image_registry_login;
 mod container_service_deployment;
 #[path = "all/container_service_lifecycle.rs"]
 mod container_service_lifecycle;
+#[path = "all/container_service_log.rs"]
+mod container_service_log;
 #[path = "all/container_service_metric_data.rs"]
 mod container_service_metric_data;
 #[path = "all/container_service_public_endpoint.rs"]
@@ -113,6 +115,8 @@ mod instance_restore_from_snapshot;
 mod instance_snapshot_listing;
 #[path = "all/instance_snapshot_read.rs"]
 mod instance_snapshot_read;
+#[path = "all/instance_start_addresses.rs"]
+mod instance_start_addresses;
 #[path = "all/load_balancer_delete.rs"]
 mod load_balancer_delete;
 #[path = "all/load_balancer_instance_attachment.rs"]

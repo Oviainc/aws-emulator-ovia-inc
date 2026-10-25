@@ -172,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // A `config` outside the model's own `CommunicationTimeConfigType` catalog
         // names no channel, so there is no communication time config for it to
@@ -213,8 +213,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // One guard spans the lookup and the write, so a concurrent delete of the
         // campaign itself cannot leave this edit on a record no longer in the store.
+        // A campaign is reachable only through the endpoint of the region it was
+        // created in, so the id is resolved in the region this request was signed for
+        // and the write never reaches another region's campaign.
+        let region = crate::state::request_region(ctx);
         let mut store = state.lock();
-        let Some(campaign) = store.campaign_mut(&input.id) else {
+        let Some(campaign) = store.campaign_mut(&region, &input.id) else {
             return Err(
                 DeleteCampaignCommunicationTimeErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {

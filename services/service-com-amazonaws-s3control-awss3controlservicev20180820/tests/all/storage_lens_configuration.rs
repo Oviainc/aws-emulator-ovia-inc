@@ -246,9 +246,11 @@ pub(crate) fn tags_xml(tags: Option<&[(String, String)]>) -> String {
 
 /// The tag set a tagging answer reports, in the order the document lists it.
 ///
-/// `Key` and `Value` are both required on `StorageLensTag`, so every `<Tag>`
-/// carries exactly one of each and a `Key` leaf opens a tag.
-fn reported_tags(body: &str) -> Vec<(String, String)> {
+/// `Key` and `Value` are both required on `StorageLensTag` and on `S3Tag`, so
+/// every tag element carries exactly one of each and a `Key` leaf opens a tag.
+/// Matching on the path's last segment is what lets the job tagging suite read
+/// an `S3TagSet` (wrapped in `<member>`) with this same reader.
+pub(crate) fn reported_tags(body: &str) -> Vec<(String, String)> {
     let mut tags: Vec<(String, String)> = Vec::new();
     for (path, value) in leaves_of(body) {
         if path.ends_with("Key") {

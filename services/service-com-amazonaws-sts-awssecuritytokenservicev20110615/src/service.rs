@@ -45,6 +45,16 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The error code AWS answers a request whose signing credential it cannot resolve
+/// with: an access key id that was never issued, or one that has been deleted. It is
+/// distinct from an authorization denial — the call failed before any principal was
+/// found — and is the code an SDK's credential-refresh path keys on.
+const UNRESOLVED_CREDENTIAL_CODE: &str = "InvalidClientTokenId";
+
+/// How AWS words that refusal.
+const UNRESOLVED_CREDENTIAL_MESSAGE: &str =
+    "The security token included in the request is invalid.";
+
 /// The `com-amazonaws-sts-awssecuritytokenservicev20110615` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -99,14 +109,34 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
         // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // wording.
+        match refusal {
+            // AWS answers a request whose signing credential it cannot resolve with the
+            // code SDKs key their credential-refresh path on, not with an authorization
+            // denial: the credential was never issued, so there is no principal to
+            // authorize. The framework collapses every pre-dispatch authentication
+            // refusal into one structural case, so this service states that one case
+            // the way AWS states it.
+            Refusal::Unauthenticated => Some(Refused {
+                code: UNRESOLVED_CREDENTIAL_CODE.to_string(),
+                message: UNRESOLVED_CREDENTIAL_MESSAGE.to_string(),
+            }),
+            // A refusal of the request's VALUES is stated the way AWS states one: the
+            // framework's own envelope and member paths, with the code STS answers a
+            // constraint violation with, and a `@pattern` quoted back WITHOUT the
+            // anchors a whole-value pattern is written with — the tree's one rendering
+            // of that rule. The CHECK still uses the model's pattern as written; only
+            // the quoting changes.
+            Refusal::Invalid(_) => {
+                ::service_common::validation_message::aws_validation_refusal(refusal).map(
+                    |stated| Refused {
+                        code: crate::scaffolded::VALIDATION_ERROR_CODE.to_string(),
+                        message: stated.message,
+                    },
+                )
+            }
+            _ => None,
+        }
     }
 
     fn override_routing_error(

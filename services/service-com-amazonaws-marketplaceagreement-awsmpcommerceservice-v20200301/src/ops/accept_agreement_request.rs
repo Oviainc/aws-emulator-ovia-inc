@@ -258,6 +258,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a seller act under, so it is the proposer too — see
         // `crate::state::agreement_parties` for the one place that decides it.
         let (acceptor, proposer) = crate::state::agreement_parties();
+        // The terms this agreement holds: the proposal's own term, as the
+        // published offer document carries it, for each term the request asked
+        // for — plus this agreement's own window where a term reports one. The
+        // context is built once for the whole agreement, so every term of it
+        // reports the same contract length and the same dates, and the
+        // agreement's end date is the one its accepted validity term states.
+        let context = crate::state::AcceptedTermContext::new(
+            &request.requested_terms,
+            now,
+            source.as_ref(),
+        );
+        let accepted_terms = crate::state::accepted_terms(&request.requested_terms, &context);
+        let end_time = crate::state::agreement_end_time(&accepted_terms, &context);
         let agreement = crate::state::Agreement {
             // "When an agreement isn't derived from another agreement, its
             // InitialAgreementId is its own AgreementId."
@@ -277,14 +290,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             start_time: now,
             acceptance_time: now,
             // "The field is null for pay-as-you-go agreements, which don't have
-            // end dates" — see `crate::state::Agreement::end_time`.
-            end_time: None,
+            // end dates" — this agreement ends when its accepted validity term
+            // says it does, and has no end date when its terms carry none.
+            end_time,
             proposal_summary,
-            accepted_terms: request
-                .requested_terms
-                .iter()
-                .map(crate::state::accepted_term)
-                .collect(),
+            accepted_terms,
             purchase_orders: purchase_orders
                 .into_iter()
                 .map(|order| PurchaseOrder {

@@ -88,6 +88,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Why a job that has finished was refused for cancellation — the requirement the
+/// rejected member failed, which `crate::state::validation_failed` states in the
+/// service's own envelope. It states the RULE, so it names neither the job the caller
+/// addressed nor the status it had reached.
+const INELIGIBLE_FOR_CANCELLATION_REQUIREMENT: &str = "A harvest job can be cancelled \
+    only before it reaches a terminal status. Verify the status of the harvest job and \
+    then try again";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -218,17 +226,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if job.is_terminal() {
             return Err(CancelHarvestJobErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(
-                        "The harvest job has already reached a terminal status and cannot be \
-                         cancelled"
-                            .to_string(),
-                    ),
-                    validation_exception_type: Some(
-                        crate::state::VALIDATION_HARVEST_JOB_INELIGIBLE_FOR_CANCELLATION
-                            .to_string(),
-                    ),
-                },
+                crate::state::validation_failed(
+                    "harvestJobName",
+                    INELIGIBLE_FOR_CANCELLATION_REQUIREMENT,
+                    crate::state::VALIDATION_HARVEST_JOB_INELIGIBLE_FOR_CANCELLATION,
+                ),
             )
             .into());
         }

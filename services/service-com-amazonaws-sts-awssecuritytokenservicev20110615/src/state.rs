@@ -57,6 +57,40 @@ pub const SESSION_TOKEN_SIZE_LIMIT: usize = 4096;
 /// emulator publishes at start, or an unsigned request).
 pub const AMBIENT_USER_NAME: &str = "emulator";
 
+/// The most managed session policies one mint may name: "You can provide up to 10
+/// managed policy ARNs" (`AssumeRoleRequest$PolicyArns`, this service's model). The
+/// model declares no length on `policyDescriptorListType`, so the ceiling is enforced
+/// here.
+pub const MAX_MANAGED_SESSION_POLICIES: usize = 10;
+
+/// A role's session length when IAM holds no `MaxSessionDuration` for it: "The maximum
+/// session duration setting can have a value from 1 hour to 12 hours"
+/// (`AssumeRoleRequest$DurationSeconds`), and IAM's own default is the low end of that
+/// range, which is also this operation's default duration.
+pub const ROLE_DEFAULT_MAX_SESSION_DURATION_SECONDS: i32 = ASSUME_ROLE_DEFAULT_DURATION_SECONDS;
+
+/// The ceiling on a ROLE-CHAINED session: "Role chaining limits your Amazon Web
+/// Services CLI or Amazon Web Services API role session to a maximum of one hour"
+/// (`AssumeRoleRequest$DurationSeconds`, this service's model).
+pub const ROLE_CHAINING_MAX_DURATION_SECONDS: i32 = 3600;
+
+/// The IAM action a role's trust policy must allow for a principal to assume it.
+pub const ASSUME_ROLE_ACTION: &str = "sts:AssumeRole";
+
+/// The IAM action a role's trust policy must allow for a mint to carry session tags.
+pub const TAG_SESSION_ACTION: &str = "sts:TagSession";
+
+/// The IAM action a role's trust policy must allow for a mint to set a source identity.
+pub const SET_SOURCE_IDENTITY_ACTION: &str = "sts:SetSourceIdentity";
+
+/// The condition key a trust policy tests a request's `ExternalId` through.
+pub const EXTERNAL_ID_CONDITION_KEY: &str = "sts:ExternalId";
+
+/// The `Principal` spelling that names a whole account: the account's root user.
+fn account_root_arn(account: &str) -> String {
+    format!("arn:aws:iam::{account}:root")
+}
+
 /// The alphabet AWS unique ids (`AIDA…`, `AROA…`) are drawn from: uppercase
 /// letters and digits. Matches the alphabet the emulator's own key ids use.
 const UNIQUE_ID_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
@@ -102,6 +136,10 @@ pub struct Session {
     pub transitive_tag_keys: Vec<String>,
     pub packed_policy_size: Option<i32>,
     pub external_id: Option<String>,
+    /// The ARN of the role an `AssumeRole` session was minted for, exactly as IAM holds
+    /// it — the spelling a trust policy names when this session chains into another
+    /// role. `None` for every other kind of session.
+    pub role_arn: Option<String>,
     /// Set once the credential has been deleted from the credential store because
     /// the session expired, so the deletion happens exactly once.
     pub revoked: bool,
@@ -126,6 +164,8 @@ pub struct NewSession {
     pub transitive_tag_keys: Vec<String>,
     pub packed_policy_size: Option<i32>,
     pub external_id: Option<String>,
+    /// See [`Session::role_arn`].
+    pub role_arn: Option<String>,
 }
 
 impl NewSession {
@@ -141,6 +181,7 @@ impl NewSession {
             transitive_tag_keys: Vec::new(),
             packed_policy_size: None,
             external_id: None,
+            role_arn: None,
         }
     }
 }
@@ -221,8 +262,12 @@ impl MintError {
 #[derive(Debug, Default)]
 pub struct ComAmazonawsStsAwssecuritytokenservicev20110615State {
     /// Every session this service minted and has not pruned, keyed by its access key
-    /// id. At most [`MAX_SESSIONS`] entries; each entry's tags and transitive tag
-    /// keys are bounded by the model (`tagListType` / `tagKeyListType`, 0..50).
+    /// id. At most [`MAX_SESSIONS`] entries; each entry's tags and transitive tag keys
+    /// are bounded by [`MAX_SESSION_TAGS`] — the model's own `tagListType` /
+    /// `tagKeyListType` maximum, which the mint path checks over the EFFECTIVE set (a
+    /// chained mint's own tags plus the ones it carries forward), so a role chain
+    /// cannot grow one record past it — and each key and value by
+    /// [`MAX_TAG_KEY_CHARS`] / [`MAX_TAG_VALUE_CHARS`].
     pub sessions: HashMap<String, Session>,
     /// Every encoded authorization message the account has issued and not yet let
     /// expire, keyed by the token the blob carries. At most
@@ -633,14 +678,430 @@ pub fn resolve_caller(
     now: SystemTime,
     store: &CredentialStore,
 ) -> Result<Identity, ExpiredSession> {
+    resolve_request_caller(state, access_key_id, now, store, ambient_identity())
+        .map(|caller| caller.identity)
+}
+
+/// Who a request speaks for, and everything about its credential a later decision needs:
+/// which operation minted it (`None` for a long-term access key), and — for a session —
+/// the source identity and session tags it carries forward.
+#[derive(Debug, Clone)]
+pub struct Caller {
+    pub identity: Identity,
+    /// Which STS operation minted the credential, or `None` when the key names no
+    /// session here: a long-term IAM access key, or the key this emulator publishes.
+    pub kind: Option<SessionKind>,
+    pub source_identity: Option<String>,
+    pub tags: Vec<(String, String)>,
+    pub transitive_tag_keys: Vec<String>,
+    /// The role ARN of an assumed-role credential; see [`Session::role_arn`].
+    pub role_arn: Option<String>,
+}
+
+impl Caller {
+    /// A caller presenting no session credential: the long-term identity `identity`.
+    fn long_term(identity: Identity) -> Self {
+        Self {
+            identity,
+            kind: None,
+            source_identity: None,
+            tags: Vec::new(),
+            transitive_tag_keys: Vec::new(),
+            role_arn: None,
+        }
+    }
+
+    /// Every spelling of this caller a role's trust policy may name in its `Principal`
+    /// element: its own ARN, the account's root user (which delegates to the whole
+    /// account) and the bare account id AWS accepts in that root's place — plus, for an
+    /// assumed-role session, the ARN of the ROLE it is a session of, because that is the
+    /// principal a trust policy names to admit a chained assume.
+    #[must_use]
+    pub fn trust_policy_principals(&self) -> Vec<String> {
+        let mut named = vec![
+            self.identity.arn.clone(),
+            account_root_arn(&self.identity.account),
+            self.identity.account.clone(),
+        ];
+        if let Some(role_arn) = &self.role_arn {
+            named.push(role_arn.clone());
+        }
+        named
+    }
+}
+
+/// The caller a request's access key id names, with everything its credential carries.
+///
+/// `long_term` is the identity the key speaks for when it names no session this registry
+/// minted — the IAM user that holds the access key ([`long_term_identity`]), or the
+/// ambient identity when nothing holds it. Expiries the clock has made due are
+/// materialised first, so an expired session is refused rather than answered.
+pub fn resolve_request_caller(
+    state: &mut StsState,
+    access_key_id: &str,
+    now: SystemTime,
+    store: &CredentialStore,
+    long_term: Identity,
+) -> Result<Caller, ExpiredSession> {
     state.revoke_expired(now, store);
     match state.session(access_key_id) {
         Some(session) if session.is_expired(now) => Err(ExpiredSession {
             access_key_id: access_key_id.to_string(),
         }),
-        Some(session) => Ok(session.identity.clone()),
-        None => Ok(ambient_identity()),
+        Some(session) => Ok(Caller {
+            identity: session.identity.clone(),
+            kind: Some(session.kind),
+            source_identity: session.source_identity.clone(),
+            tags: session.tags.clone(),
+            transitive_tag_keys: session.transitive_tag_keys.clone(),
+            role_arn: session.role_arn.clone(),
+        }),
+        None => Ok(Caller::long_term(long_term)),
     }
+}
+
+/// This service's view of the IAM store in the SAME shared engine: the account's users,
+/// their access keys and their roles.
+///
+/// The IAM service's OWN accessor is called rather than copied, so STS resolves a role
+/// and an access key against the very records `iam:CreateRole` and `iam:CreateAccessKey`
+/// wrote. `None` means the engine carries no IAM store — a router that mounts STS
+/// without IAM, where the account can hold no role and no user at all.
+pub type IamState = ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::ComAmazonawsIamAwsidentitymanagementv20100508State;
+
+/// See [`IamState`].
+pub fn iam_state<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<IamState>> {
+    ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::service_state(engine)
+}
+
+/// The identity a LONG-TERM access key speaks for: the IAM user that holds it.
+///
+/// "Returns details about the IAM user or role whose credentials are used to call the
+/// operation" (`GetCallerIdentity`, this service's model), so a request signed with an
+/// IAM user's own access key speaks for THAT user — its `UserId` and its ARN as IAM
+/// holds them, never a fixed one. A key IAM holds no record of is the ambient identity
+/// ([`ambient_identity`]): the long-term key this emulator publishes at start.
+///
+/// The key's `AccessKey$Status` is deliberately NOT consulted. Whether a credential
+/// verifies at all is the emulator's AUTHENTICATION layer's decision, taken from the
+/// credential store before any handler runs — this service never checks a signature —
+/// and that store, not IAM's record, is where a deactivated key would have to stop
+/// verifying. Reading the status here would instead report an Inactive key as some OTHER
+/// identity, which is the very substitution this function exists to remove.
+pub fn long_term_identity(iam: Option<&IamState>, access_key_id: &str) -> Identity {
+    let user = iam.and_then(|iam| {
+        let record = iam.access_keys.get(access_key_id)?;
+        iam.users.get(&record.user_key)
+    });
+    match user {
+        Some(user) => Identity {
+            user_id: user.user_id.clone(),
+            account: ::engine::emulator_account_id().to_string(),
+            arn: user.arn.clone(),
+        },
+        None => ambient_identity(),
+    }
+}
+
+/// A role as IAM holds it, reduced to the facts an `AssumeRole` decision needs.
+#[derive(Debug, Clone)]
+pub struct ResolvedRole {
+    /// `Role$RoleId`, exactly the value `iam:CreateRole`/`iam:GetRole` reported, which
+    /// is what `AssumedRoleUser$AssumedRoleId` is built from.
+    pub role_id: String,
+    /// The role name in the case IAM holds it.
+    pub role_name: String,
+    /// `Role$Arn`, the resource a trust-policy decision is made about.
+    pub arn: String,
+    /// The account the role belongs to.
+    pub account: String,
+    /// `Role$AssumeRolePolicyDocument`: the trust policy, as IAM stored it.
+    pub trust_policy: Option<String>,
+    /// `Role$MaxSessionDuration`, defaulted to
+    /// [`ROLE_DEFAULT_MAX_SESSION_DURATION_SECONDS`] when IAM holds none.
+    pub max_session_duration: i32,
+}
+
+/// The role an `AssumeRole` request's `RoleArn` names, as IAM holds it.
+///
+/// `None` when the account holds no such role — which is also the answer for a role ARN
+/// in ANOTHER account, because this emulator holds exactly one account's IAM records. The
+/// stored role's own ARN must match the one the request named, so a role of the same name
+/// under a different path is not resolved either.
+pub fn resolve_role(iam: &IamState, role_arn: &str) -> Option<ResolvedRole> {
+    let named = parse_role_arn(role_arn)?;
+    let key = ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::name_key(
+        &named.name,
+    );
+    let role = iam.roles.get(&key).filter(|role| role.arn == role_arn)?;
+    Some(ResolvedRole {
+        role_id: role.role_id.clone(),
+        role_name: role.role_name.clone(),
+        arn: role.arn.clone(),
+        account: named.account,
+        trust_policy: role.assume_role_policy_document.clone(),
+        max_session_duration: role
+            .max_session_duration
+            .unwrap_or(ROLE_DEFAULT_MAX_SESSION_DURATION_SECONDS),
+    })
+}
+
+impl ResolvedRole {
+    /// Whether this role's trust policy lets `principals` perform `action` on it, given
+    /// the condition keys `context` carries.
+    ///
+    /// The DECISION is [`::service_common::iam_authorization`], the tree's one evaluation
+    /// of IAM policy documents against a request, read as the RESOURCE-based policy it is
+    /// — a trust policy is attached to the role, so its statements name the principals
+    /// they grant to and a statement naming no resource covers the role itself. A role
+    /// whose trust policy this cannot read as a policy, or which carries none at all,
+    /// grants nothing: nothing is assumed on evidence the account does not hold.
+    #[must_use]
+    pub fn trust_policy_allows(
+        &self,
+        action: &str,
+        principals: &[String],
+        context: &[(String, String)],
+    ) -> bool {
+        let Some(document) = self.trust_policy.as_deref() else {
+            return false;
+        };
+        let request = ::service_common::iam_authorization::Request::new(action, &self.arn, principals)
+            .with_context(context)
+            .with_published_keys(ASSUME_ROLE_PUBLISHED_CONDITION_KEYS);
+        ::service_common::iam_authorization::resource_decision(document, &request)
+            == ::service_common::iam_authorization::Decision::Allowed
+    }
+}
+
+/// How AWS words an authorization refusal: the principal, the action and the resource.
+///
+/// STS does not disclose whether the resource EXISTS, so a role the account does not
+/// hold and a role whose trust policy withholds the grant are worded alike.
+pub fn not_authorized_message(caller_arn: &str, action: &str, resource: &str) -> String {
+    format!("User: {caller_arn} is not authorized to perform: {action} on resource: {resource}")
+}
+
+/// Whether a credential of `kind` may call the STS operation `operation`.
+///
+/// Each kind of temporary credential this service vends is documented with the STS
+/// operations it may NOT call, and they differ, so the rule is the credential's class
+/// rather than one blanket ban:
+///
+/// * an `AssumeRole` session "cannot call the Amazon Web Services STS
+///   `GetFederationToken` or `GetSessionToken` API operations" (`AssumeRole`);
+/// * a `GetSessionToken` session "cannot call any STS API except `AssumeRole` or
+///   `GetCallerIdentity`" (`GetSessionToken`);
+/// * a `GetFederationToken` session "cannot call any STS operations except
+///   `GetCallerIdentity`" (`GetFederationToken`).
+///
+/// A long-term access key (`None`) may call every one of them: `GetSessionToken` and
+/// `GetFederationToken` "must be called by using the long-term ... credentials of an IAM
+/// user" (both operations' documentation, this service's model).
+#[must_use]
+pub fn caller_may_call(kind: Option<SessionKind>, operation: &str) -> bool {
+    match kind {
+        None => true,
+        Some(SessionKind::AssumedRole) => {
+            !matches!(operation, "GetFederationToken" | "GetSessionToken")
+        }
+        Some(SessionKind::SessionToken) => {
+            matches!(operation, "AssumeRole" | "GetCallerIdentity")
+        }
+        Some(SessionKind::FederationToken) => operation == "GetCallerIdentity",
+    }
+}
+
+/// The condition keys an `AssumeRole` mint MODELS — the keys whose absence from
+/// [`assume_role_condition_context`] means the request carried no value for them, rather
+/// than this emulator not knowing the key. Only these get IAM's empty-set reading under a
+/// `ForAllValues:` / `ForAnyValue:` qualifier; a clause over any other key stays
+/// undecided and withholds the grant.
+pub const ASSUME_ROLE_PUBLISHED_CONDITION_KEYS: &[&str] = &[
+    "sts:RoleSessionName",
+    "sts:ExternalId",
+    "sts:SourceIdentity",
+    "sts:TransitiveTagKeys",
+    "aws:PrincipalArn",
+    "aws:PrincipalAccount",
+    "aws:PrincipalType",
+    "aws:userid",
+    "aws:TagKeys",
+];
+
+/// The condition keys STS publishes about one role-session mint, for a trust policy's
+/// `Condition` to be decided against.
+///
+/// Each is a key AWS documents for an `sts:AssumeRole` request: the `aws:` keys that
+/// describe the CALLING principal, the `sts:` keys the operation's own members supply,
+/// the `aws:RequestTag/<key>` of each session tag the mint sets, and the multi-valued
+/// `aws:TagKeys` / `sts:TransitiveTagKeys` — passed as one pair per value, which is how
+/// [`::service_common::iam_authorization`] reads a multi-valued key. Nothing is invented:
+/// a key the request does not determine is left out, so a clause over it stays undecided
+/// and withholds the grant.
+pub fn assume_role_condition_context(
+    caller: &Caller,
+    role_session_name: &str,
+    external_id: Option<&str>,
+    source_identity: Option<&str>,
+    tags: &[(String, String)],
+    transitive_tag_keys: &[String],
+) -> Vec<(String, String)> {
+    let mut context = vec![
+        (
+            "sts:RoleSessionName".to_string(),
+            role_session_name.to_string(),
+        ),
+        // For a role session the principal AWS names here is the ROLE, not the session:
+        // the session's own spelling is `aws:userid`.
+        (
+            "aws:PrincipalArn".to_string(),
+            caller
+                .role_arn
+                .clone()
+                .unwrap_or_else(|| caller.identity.arn.clone()),
+        ),
+        (
+            "aws:PrincipalAccount".to_string(),
+            caller.identity.account.clone(),
+        ),
+        (
+            "aws:PrincipalType".to_string(),
+            caller_principal_type(caller.kind).to_string(),
+        ),
+        ("aws:userid".to_string(), caller.identity.user_id.clone()),
+    ];
+    if let Some(external_id) = external_id {
+        context.push((
+            EXTERNAL_ID_CONDITION_KEY.to_string(),
+            external_id.to_string(),
+        ));
+    }
+    if let Some(source_identity) = source_identity {
+        context.push((
+            "sts:SourceIdentity".to_string(),
+            source_identity.to_string(),
+        ));
+    }
+    // The tags the CALLING principal already carries, which is what a target role's trust
+    // policy tests when it gates a chained assume on the session it is being made from.
+    for (key, value) in &caller.tags {
+        context.push((format!("aws:PrincipalTag/{key}"), value.clone()));
+    }
+    for (key, value) in tags {
+        context.push((format!("aws:RequestTag/{key}"), value.clone()));
+        context.push(("aws:TagKeys".to_string(), key.clone()));
+    }
+    for key in transitive_tag_keys {
+        context.push(("sts:TransitiveTagKeys".to_string(), key.clone()));
+    }
+    context
+}
+
+/// How `aws:PrincipalType` names the calling principal's kind.
+fn caller_principal_type(kind: Option<SessionKind>) -> &'static str {
+    match kind {
+        Some(SessionKind::AssumedRole) => "AssumedRole",
+        Some(SessionKind::FederationToken) => "FederatedUser",
+        Some(SessionKind::SessionToken) | None => "User",
+    }
+}
+
+/// The modelled character class a session tag's key and value must satisfy
+/// (`tagKeyType` / `tagValueType`, this service's model): letters, separators, numbers
+/// and `_.:/=+-@`. The two shapes declare the same class, differing only in whether the
+/// empty string is admitted, which the length bounds below state.
+const TAG_TEXT_PATTERN: &str = r"^[\p{L}\p{Z}\p{N}_.:/=+\-@]*$";
+
+/// The most session tags one session may hold: "You can pass up to 50 session tags"
+/// (`AssumeRoleRequest$Tags`), which is also the model's own `tagListType` and
+/// `tagKeyListType` length maximum.
+///
+/// The boundary walk bounds only the list a REQUEST carries. A chained mint also carries
+/// the calling session's transitive tags forward, so the EFFECTIVE set is bounded by this
+/// same maximum before a session is recorded — otherwise one stored session record would
+/// grow by a request's worth of tags at every step of a role chain.
+pub const MAX_SESSION_TAGS: usize = 50;
+
+/// The longest session tag KEY the model admits (`tagKeyType`, length 1..128), counted
+/// the way the operation's own documentation counts it: "The plaintext session tag keys
+/// can't exceed 128 characters" (`AssumeRoleRequest$Tags`).
+pub const MAX_TAG_KEY_CHARS: usize = 128;
+
+/// The longest session tag VALUE the model admits (`tagValueType`, length 0..256): "the
+/// values can't exceed 256 characters" (`AssumeRoleRequest$Tags`).
+pub const MAX_TAG_VALUE_CHARS: usize = 256;
+
+/// The compiled [`TAG_TEXT_PATTERN`], compiled once for the process.
+fn tag_text_regex() -> &'static ::regex::Regex {
+    static COMPILED: ::std::sync::OnceLock<::regex::Regex> = ::std::sync::OnceLock::new();
+    COMPILED.get_or_init(|| {
+        ::regex::Regex::new(TAG_TEXT_PATTERN).expect("the modelled tag pattern compiles")
+    })
+}
+
+/// The first session tag whose key or value falls outside what the model admits, worded
+/// the way AWS words a constraint violation: the member path, the value it rejected and
+/// the requirement it broke.
+///
+/// The model constrains a session tag's key and value (`tagKeyType` length 1..128 and
+/// `tagValueType` length 0..256, both over one character class), but those constraints sit
+/// on members NESTED inside `tagListType`, which the boundary walk does not descend into
+/// — so they are checked here, before anything is minted. Lengths are counted in
+/// CHARACTERS, as the operation's documentation states the same limits.
+pub fn invalid_session_tag(tags: Option<&[Tag]>) -> Option<String> {
+    let violation = |position: usize, member: &str, value: &str, requirement: String| {
+        Some(format!(
+            "1 validation error detected: Value '{value}' at 'tags.{position}.member.{member}' \
+             failed to satisfy constraint: {requirement}"
+        ))
+    };
+    for (index, tag) in tags.unwrap_or(&[]).iter().enumerate() {
+        let position = index + 1;
+        let key_length = tag.key.chars().count();
+        if key_length == 0 || key_length > MAX_TAG_KEY_CHARS {
+            return violation(
+                position,
+                "key",
+                &tag.key,
+                format!(
+                    "Member must have length less than or equal to {MAX_TAG_KEY_CHARS} and \
+                     greater than or equal to 1"
+                ),
+            );
+        }
+        if tag.value.chars().count() > MAX_TAG_VALUE_CHARS {
+            return violation(
+                position,
+                "value",
+                &tag.value,
+                format!("Member must have length less than or equal to {MAX_TAG_VALUE_CHARS}"),
+            );
+        }
+        for (member, value) in [("key", &tag.key), ("value", &tag.value)] {
+            if !tag_text_regex().is_match(value) {
+                return violation(
+                    position,
+                    member,
+                    value,
+                    format!(
+                        "Member must satisfy regular expression pattern: {}",
+                        ::service_common::validation::unanchored(TAG_TEXT_PATTERN)
+                    ),
+                );
+            }
+        }
+    }
+    None
+}
+
+/// How AWS words the refusal of an STS operation a temporary credential may not call:
+/// the operation, and the fact that the request presented session credentials.
+#[must_use]
+pub fn session_credentials_message(operation: &str) -> String {
+    format!("Cannot call {operation} with session credentials")
 }
 
 /// The role id STS reports for a role ARN: a pure function of the ARN, so the same
@@ -783,6 +1244,64 @@ pub fn duplicate_tag_key(tags: Option<&[Tag]>) -> Option<&str> {
             .any(|earlier| earlier.key.eq_ignore_ascii_case(&tag.key))
             .then_some(tag.key.as_str())
     })
+}
+
+/// The transitive session tag key the calling session carries forward that the request
+/// passes AGAIN — `None` when it passes none of them.
+///
+/// A key the calling session carries forward is already set on the session this mint
+/// continues, so a request may not set it a second time: "if you used temporary
+/// credentials to perform this operation, the new session inherits any transitive session
+/// tags from the calling session. If you pass a session tag with the same key as an
+/// inherited tag, the operation fails" (`AssumeRoleRequest$Tags`, this service's model).
+/// Keys are compared without case, as a repeat within one request is
+/// ([`duplicate_tag_key`]).
+pub fn inherited_tag_key_collision<'a>(
+    caller: &'a Caller,
+    requested: &[(String, String)],
+) -> Option<&'a str> {
+    caller
+        .tags
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .find(|key| {
+            caller
+                .transitive_tag_keys
+                .iter()
+                .any(|transitive| transitive.eq_ignore_ascii_case(key))
+                && requested
+                    .iter()
+                    .any(|(named, _)| named.eq_ignore_ascii_case(key))
+        })
+}
+
+/// The transitive session tags a chained mint carries FORWARD from the calling session:
+/// "If you set a tag key as transitive, the corresponding key and value passes to
+/// subsequent sessions in a role chain" (`AssumeRoleRequest$TransitiveTagKeys`, this
+/// service's model).
+///
+/// A tag the new request names itself is not inherited — a request that names one is
+/// refused before this is reached ([`inherited_tag_key_collision`]) — and tag keys are
+/// compared without case because they "are not case sensitive, but case is preserved"
+/// (`GetFederationToken`, this service's model).
+pub fn inherited_transitive_tags(
+    caller: &Caller,
+    requested: &[(String, String)],
+) -> Vec<(String, String)> {
+    caller
+        .tags
+        .iter()
+        .filter(|(key, _)| {
+            caller
+                .transitive_tag_keys
+                .iter()
+                .any(|transitive| transitive.eq_ignore_ascii_case(key))
+                && !requested
+                    .iter()
+                    .any(|(named, _)| named.eq_ignore_ascii_case(key))
+        })
+        .cloned()
+        .collect()
 }
 
 /// Why a session policy is not a JSON policy document, as the message
@@ -972,6 +1491,7 @@ pub fn mint_session(
         transitive_tag_keys: request.transitive_tag_keys,
         packed_policy_size: request.packed_policy_size,
         external_id: request.external_id,
+        role_arn: request.role_arn,
         revoked: false,
     };
     if let Err(full) = state.insert(session.clone()) {

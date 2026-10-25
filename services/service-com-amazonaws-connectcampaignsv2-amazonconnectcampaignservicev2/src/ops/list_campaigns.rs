@@ -139,7 +139,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         /// The page size when the caller names none: the model's `maxResults`
         /// upper bound (`range 1..50`), so an unpaged call sees as much as one
@@ -164,9 +164,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|filters| filters.instance_id_filter.as_ref())
             .map(|filter| filter.value.clone());
 
+        // The page is the campaigns of the region this request was signed for: a
+        // campaign lives in one region, the operation models no region input, so the
+        // credential scope is what the result set is scoped by and a campaign created
+        // through another region's endpoint is not in it.
+        let region = crate::state::request_region(ctx);
         let store = state.lock();
         let matching: Vec<(u64, &crate::state::StoredCampaign)> = store
-            .campaigns_in_order()
+            .campaigns_in_order(&region)
             .filter(|(_, campaign)| {
                 instance_id
                     .as_deref()

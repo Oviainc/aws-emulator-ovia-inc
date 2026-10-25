@@ -31,6 +31,8 @@ mod application_access_scopes;
 mod application_assignment_configuration;
 #[path = "all/application_assignment_delete.rs"]
 mod application_assignment_delete;
+#[path = "all/application_assignment_describe.rs"]
+mod application_assignment_describe;
 #[path = "all/application_assignments.rs"]
 mod application_assignments;
 #[path = "all/application_authentication_methods.rs"]

@@ -7,7 +7,8 @@
 //! service mints. Both live here so every operation reads and writes the same
 //! store; the helpers below are the bits of derivation several handlers share
 //! (the request's Region, the policy ARN, the `PolicySummary` projection and the
-//! pagination token codec), kept in one place so two handlers cannot disagree.
+//! pagination token codec and page-size rule), kept in one place so two handlers
+//! cannot disagree.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
@@ -2243,6 +2244,31 @@ pub fn emulator_partition() -> String {
     parse_arn(&minted)
         .map(|arn| arn.partition.to_string())
         .unwrap_or_default()
+}
+
+/// The largest page any paginated operation of this service serves, which is
+/// the maximum the model's `com.amazonaws.fms#PaginationMaxResults` declares for
+/// `MaxResults` (range 1..100). It bounds the response for EVERY caller,
+/// including one whose operation leaves `MaxResults` optional and sends none.
+pub const MAX_PAGE_SIZE: usize = 100;
+
+/// How many items one page carries for a request asking for `max_results`: the
+/// ONE page-size rule every paginated operation of this service follows. A
+/// request that names no bound gets [`MAX_PAGE_SIZE`]; one that names a bound
+/// gets it clamped into `1..=MAX_PAGE_SIZE`.
+///
+/// Clamped rather than only capped: the modelled range already refuses a page
+/// size below 1, and this keeps a page from ever being empty-with-a-token (which
+/// a client would follow forever) if that validation ever changes.
+///
+/// An operation whose `MaxResults` member is REQUIRED passes
+/// `Some(input.max_results)`, so the required and the optional member resolve
+/// through the same rule and no two handlers can disagree about the bound the
+/// model declares once.
+pub fn page_size(max_results: Option<i32>) -> usize {
+    max_results
+        .map_or(MAX_PAGE_SIZE, |max| usize::try_from(max).unwrap_or(0))
+        .clamp(1, MAX_PAGE_SIZE)
 }
 
 /// Encode a page boundary (the key the next page starts at — a `PolicyId` for

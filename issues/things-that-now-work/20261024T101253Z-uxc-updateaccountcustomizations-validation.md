@@ -31,3 +31,18 @@ Tests: coverage asserts the OPPOSITE of the recorded behavior — `tests/all/vis
 4. Observe HTTP 200 with the bogus identifier echoed, where AWS answers HTTP 400 ValidationException ("Invalid services provided") and leaves the stored list unchanged.
 5. GET /v1/account-customizations and observe visibleServices = ["totally-made-up-service-xyz"] — the prior ["s3"] was overwritten by a call AWS rejects.
 6. Optionally walk GET /v1/services to confirm the identifier is absent from the catalog the service itself publishes.
+
+## Resolution
+
+Fixed in `services/service-com-amazonaws-uxc-awsaccountuxsetting`.
+
+- **Observable difference:** `PATCH /v1/account-customizations` with `visibleServices` naming an identifier that satisfies `Service`'s `@length(1, 64)` and `@pattern` but that `GET /v1/services` never reports answered HTTP 200, overwrote the previously stored list, and `GetAccountCustomizations` then reported the made-up identifier; expected HTTP 400 `ValidationException` ("Invalid services provided") with the stored list intact.
+- **Rule:** where a setting's members are documented as identifiers of a catalog the service itself enumerates, membership in that catalog is part of a member's validity, so a member the catalog does not name is refused in the modelled validation channel before any state is written.
+- **Root cause:** `src/ops/update_account_customizations.rs` deliberately performed no membership check (its own comment said so) and the write path stored whatever the body supplied; `src/state.rs` carried the catalog but exposed no membership predicate.
+
+The handler now refuses, under the same state guard as the write and before reaching the account's record, any supplied `visibleServices` member for which the new `ComAmazonawsUxcAwsaccountuxsettingState::is_catalog_service` is false — HTTP 400, modelled `ValidationException`, message "Invalid services provided", no `fieldList` (no member's own modelled constraint was broken), and no setting of the refused request applied. Shape violations keep the front door's `BadRequestException`, so the two channels stay distinct.
+
+`visibleRegions` is unchanged: this service publishes no catalog of Region codes (no operation enumerates them and the model offers only the member's `@pattern`), so there is nothing to decide membership against and a refusal there would be against a list no caller can discover.
+
+Pinned by the new `tests/all/visible_service_catalog_membership.rs` (a table spanning the form, position, count and list size of non-members — generated identifiers, both `@length` bounds, invented names, near misses of catalog entries spread across the catalog, and endpoint prefixes the console namespace does not name — each asserted model-legal and absent from the catalog first; plus the entry-versus-near-miss contrast, the front-door-code contrast, and the reset case). The suites that pinned the old acceptance now draw their service identifiers from the catalog.
+

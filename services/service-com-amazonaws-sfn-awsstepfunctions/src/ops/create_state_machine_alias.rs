@@ -300,7 +300,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The date the state machine alias was last updated. For a newly
             // created state machine, this is the same as the creation date."
             update_date: created,
-            // Measured and counted by `insert_state_machine_alias`.
+            // Stamped, measured and counted by `insert_state_machine_alias`.
+            creation_sequence: 0,
             retained_bytes: 0,
         };
 

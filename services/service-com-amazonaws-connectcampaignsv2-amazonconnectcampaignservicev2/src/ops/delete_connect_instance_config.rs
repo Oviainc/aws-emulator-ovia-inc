@@ -221,11 +221,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One guard spans the existence check and every removal, so a concurrent
         // delete of the same configuration cannot have both calls report success, and
         // a campaign created against the instance meanwhile is either fully stored or
-        // not stored at all.
+        // not stored at all. The configuration and the campaigns that go with it are
+        // the ones the region this request was signed for holds.
         let now = ::std::time::SystemTime::now();
-        let deleted = state
-            .lock()
-            .delete_instance_config(&input.connect_instance_id, delete_campaigns, now);
+        let region = crate::state::request_region(ctx);
+        let deleted = state.lock().delete_instance_config(
+            &region,
+            &input.connect_instance_id,
+            delete_campaigns,
+            now,
+        );
 
         if !deleted {
             // The instance holds no configuration at `now` — the same predicate

@@ -315,7 +315,7 @@ async fn each_instance_holds_its_own_config_whatever_its_id() {
             engine.state::<ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State>();
         let held = state
             .lock()
-            .instance_onboarding(&instance)
+            .instance_onboarding("eu-west-1", &instance)
             .map(|record| stored_entries(record.communication_limits.as_ref()));
         let expected = Some(Some(vec![(
             i32::try_from(count).expect("a small count"),
@@ -370,7 +370,7 @@ async fn an_unconfigured_instance_reports_no_config() {
     let state = engine.state::<ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State>();
     let held = state
         .lock()
-        .instance_onboarding(instance)
+        .instance_onboarding(REGION, instance)
         .map(|record| record.communication_limits.clone());
     assert!(
         matches!(held, Some(None)),

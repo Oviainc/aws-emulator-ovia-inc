@@ -33,8 +33,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ssoadmin_permission_sets::{
-    call, call_in_region, error_code, hold_deletion, router, router_over, seeded_instance_arn,
-    with_store, TEST_REGION,
+    call, call_in_region, create_application_assignment as create_assignment,
+    describe_application_assignment as describe_assignment, error_code, hold_deletion, router,
+    router_over, seeded_instance_arn, with_store, TEST_REGION,
 };
 
 /// The AWS-owned provider a customer managed OAuth 2.0 application is created under. Its
@@ -44,8 +45,11 @@ use crate::ssoadmin_permission_sets::{
 const CUSTOM_PROVIDER_ARN: &str = "arn:aws:sso::aws:applicationProvider/custom";
 
 /// One application to create: the parameters, as a row of the table.
+///
+/// Shared with the other suites of this slice, so an application a rule is asserted over
+/// is built one way (`application_assignment_describe.rs` varies `Status` over it).
 #[derive(Debug, Clone)]
-struct Application {
+pub(crate) struct Application {
     label: String,
     provider_arn: String,
     name: String,
@@ -57,7 +61,7 @@ struct Application {
 }
 
 impl Application {
-    fn new(label: &str, name: &str) -> Self {
+    pub(crate) fn new(label: &str, name: &str) -> Self {
         Self {
             label: label.to_string(),
             provider_arn: CUSTOM_PROVIDER_ARN.to_string(),
@@ -80,7 +84,7 @@ impl Application {
         self
     }
 
-    fn with_status(mut self, status: &str) -> Self {
+    pub(crate) fn with_status(mut self, status: &str) -> Self {
         self.status = Some(status.to_string());
         self
     }
@@ -277,44 +281,8 @@ async fn describe_application(router: &MultiServiceRouter, application_arn: &str
     .await
 }
 
-async fn create_assignment(
-    router: &MultiServiceRouter,
-    application_arn: &str,
-    principal_type: &str,
-    principal_id: &str,
-) -> (u16, Value) {
-    call(
-        router,
-        "CreateApplicationAssignment",
-        &json!({
-            "ApplicationArn": application_arn,
-            "PrincipalType": principal_type,
-            "PrincipalId": principal_id,
-        }),
-    )
-    .await
-}
-
-async fn describe_assignment(
-    router: &MultiServiceRouter,
-    application_arn: &str,
-    principal_type: &str,
-    principal_id: &str,
-) -> (u16, Value) {
-    call(
-        router,
-        "DescribeApplicationAssignment",
-        &json!({
-            "ApplicationArn": application_arn,
-            "PrincipalType": principal_type,
-            "PrincipalId": principal_id,
-        }),
-    )
-    .await
-}
-
 /// Create one application and return the ARN it minted, failing the test if it did not.
-async fn minted_application(
+pub(crate) async fn minted_application(
     router: &MultiServiceRouter,
     instance_arn: &str,
     application: &Application,

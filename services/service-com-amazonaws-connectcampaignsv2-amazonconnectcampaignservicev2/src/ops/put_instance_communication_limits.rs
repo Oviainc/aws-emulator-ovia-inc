@@ -198,10 +198,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // The limits are configuration of the instance as the region this request was
+        // signed for holds it, so the instance is resolved in that region alone.
+        //
         // One guard spans the onboarding check and the write, so a concurrent delete
         // of the instance's record cannot leave these limits on a record that is no
         // longer in the store.
+        let region = crate::state::request_region(ctx);
         let stored = state.lock().put_instance_communication_limits(
+            &region,
             &input.connect_instance_id,
             input.communication_limits_config,
             now,

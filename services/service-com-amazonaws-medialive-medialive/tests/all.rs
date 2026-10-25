@@ -26,6 +26,9 @@ mod channel_class_update;
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
 
+#[path = "all/channel_maintenance_and_egress.rs"]
+mod channel_maintenance_and_egress;
+
 #[path = "all/channel_pipeline_restart.rs"]
 mod channel_pipeline_restart;
 

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateHealthCheck
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateHealthCheck`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateHealthCheck::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -175,6 +166,154 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    health_check_config_problem, health_check_config_with_defaults, health_check_member_given,
+    no_such_health_check, StoredHealthCheck,
+};
+
+/// The refusal text this operation answers a `HealthCheckVersion` that is not
+/// the health check's current one with (`HealthCheckVersionMismatch`, HTTP 409).
+///
+/// A CONSTANT, naming neither version: the shape's own documentation states the
+/// rule without either ("The value of HealthCheckVersion in the request doesn't
+/// match the value of HealthCheckVersion in the health check"), and the health
+/// check's current version is in state, where `GetHealthCheck` reads it — which
+/// is what the member's documentation tells a caller to do before retrying.
+const HEALTH_CHECK_VERSION_MISMATCH_MESSAGE: &str =
+    "The value of HealthCheckVersion in the request doesn't match the value of \
+     HealthCheckVersion in the health check.";
+
+/// The `ResettableElementName` that resets `FullyQualifiedDomainName`.
+const RESET_FULLY_QUALIFIED_DOMAIN_NAME: &str = "FullyQualifiedDomainName";
+/// The `ResettableElementName` that resets `Regions`.
+const RESET_REGIONS: &str = "Regions";
+/// The `ResettableElementName` that resets `ResourcePath`.
+const RESET_RESOURCE_PATH: &str = "ResourcePath";
+/// The `ResettableElementName` that resets `ChildHealthChecks`.
+const RESET_CHILD_HEALTH_CHECKS: &str = "ChildHealthChecks";
+
+/// `config` with the elements `reset_elements` names put back to their default.
+///
+/// `ResetElements`' own documentation names one default per element:
+/// `ChildHealthChecks`, `FullyQualifiedDomainName` and `ResourcePath` are reset
+/// "to null", and `Regions` to "the default set of regions" — which for this
+/// store is the absent list, exactly what a create that named no region holds,
+/// because a health check that names none is checked from every region Route 53
+/// checks from. So every reset clears the element, and the configuration that
+/// results is the one a create that left that element out would have persisted.
+fn reset_in(config: &mut HealthCheckConfig, reset_elements: &[String]) {
+    for element in reset_elements {
+        match element.as_str() {
+            RESET_FULLY_QUALIFIED_DOMAIN_NAME => config.fully_qualified_domain_name = None,
+            RESET_REGIONS => config.regions = None,
+            RESET_RESOURCE_PATH => config.resource_path = None,
+            RESET_CHILD_HEALTH_CHECKS => config.child_health_checks = None,
+            // `ResettableElementName` is a modelled enum, so a value outside it
+            // is refused before this handler runs; a value inside it that this
+            // match does not name would be a new element of the enum, and
+            // clearing a member the service does not know about is not this
+            // operation's to guess.
+            _ => {}
+        }
+    }
+}
+
+/// `existing` with every member `input` carries applied to it, leaving the
+/// members it carries none of as they were.
+///
+/// The members `UpdateHealthCheck` takes are exactly the settings of a health
+/// check that are editable: `Type`, `RequestInterval`, `MeasureLatency` and
+/// `RoutingControlArn` are not in its input at all, so an update cannot reach
+/// them, and the remaining members are applied one for one onto the stored
+/// configuration.
+fn configuration_after(
+    input: &UpdateHealthCheckInput,
+    existing: &HealthCheckConfig,
+) -> HealthCheckConfig {
+    let mut config = existing.clone();
+    // The resets come first, so a request that both names a value and resets
+    // the element it names ends up with the value it asked for: the explicit
+    // setting is the more specific of the two instructions.
+    reset_in(
+        &mut config,
+        input.reset_elements.as_deref().unwrap_or_default(),
+    );
+    if let Some(ip_address) = input.ip_address.clone() {
+        config.ip_address = Some(ip_address);
+    }
+    if let Some(port) = input.port {
+        config.port = Some(port);
+    }
+    if let Some(resource_path) = input.resource_path.clone() {
+        config.resource_path = Some(resource_path);
+    }
+    if let Some(name) = input.fully_qualified_domain_name.clone() {
+        config.fully_qualified_domain_name = Some(name);
+    }
+    if let Some(search_string) = input.search_string.clone() {
+        config.search_string = Some(search_string);
+    }
+    if let Some(failure_threshold) = input.failure_threshold {
+        config.failure_threshold = Some(failure_threshold);
+    }
+    if let Some(inverted) = input.inverted {
+        config.inverted = Some(inverted);
+    }
+    if let Some(disabled) = input.disabled {
+        config.disabled = Some(disabled);
+    }
+    if let Some(health_threshold) = input.health_threshold {
+        config.health_threshold = Some(health_threshold);
+    }
+    if let Some(children) = input.child_health_checks.clone() {
+        config.child_health_checks = Some(children);
+    }
+    if let Some(enable_sni) = input.enable_sni {
+        config.enable_sni = Some(enable_sni);
+    }
+    if let Some(regions) = input.regions.clone() {
+        config.regions = Some(regions);
+    }
+    if let Some(alarm) = input.alarm_identifier.clone() {
+        config.alarm_identifier = Some(alarm);
+    }
+    if let Some(status) = input.insufficient_data_health_status.clone() {
+        config.insufficient_data_health_status = Some(status);
+    }
+    // The same defaults a create fills in, applied to what the update leaves
+    // behind: a member this update cleared is reported with the value the
+    // service would fill in for it, not as absent.
+    health_check_config_with_defaults(&config)
+}
+
+/// Why the endpoint `requested` names cannot replace the one `existing` holds,
+/// or `None` when it can.
+///
+/// `UpdateHealthCheck`'s own documentation for `FullyQualifiedDomainName`: "If a
+/// health check already has a value for IPAddress, you can change the value.
+/// However, you can't update an existing health check to add or remove the value
+/// of IPAddress." So whether the check probes an address or resolves a name is
+/// fixed when it is created; only the address itself is editable.
+fn ip_address_problem(
+    requested: &HealthCheckConfig,
+    existing: &HealthCheckConfig,
+) -> Option<String> {
+    let had = health_check_member_given(existing.ip_address.as_deref());
+    let has = health_check_member_given(requested.ip_address.as_deref());
+    if had == has {
+        return None;
+    }
+    Some(if has {
+        "HealthCheckConfig.IPAddress cannot be added to a health check that was created \
+         without one"
+            .to_string()
+    } else {
+        "HealthCheckConfig.IPAddress cannot be removed from a health check that was created \
+         with one"
+            .to_string()
+    })
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -243,20 +382,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateHealthCheck` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateHealthCheckErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateHealthCheck"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            UpdateHealthCheckErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        // A health check is addressed by the bare id `CreateHealthCheck`
+        // assigned it, which is the id the store is keyed by.
+        let existing: StoredHealthCheck = store
+            .health_checks
+            .get(&input.health_check_id)
+            .cloned()
+            .ok_or_else(|| {
+                UpdateHealthCheckErrorModeled::NoSuchHealthCheck(no_such_health_check(
+                    &input.health_check_id,
+                ))
+            })?;
+
+        // `HealthCheckVersion` is the optimistic-concurrency token: "If the
+        // value in the UpdateHealthCheck request matches the value of
+        // HealthCheckVersion in the health check, Route 53 updates the health
+        // check with the new settings. If the value of HealthCheckVersion in the
+        // health check is greater, the health check was changed after you got
+        // the version number. Route 53 does not update the health check, and it
+        // returns a HealthCheckVersionMismatch error." A request that carries no
+        // version asks for no such guard, so the update proceeds.
+        if input
+            .health_check_version
+            .is_some_and(|requested| requested != existing.version)
+        {
+            return Err(UpdateHealthCheckErrorModeled::HealthCheckVersionMismatch(
+                HealthCheckVersionMismatch {
+                    message: Some(HEALTH_CHECK_VERSION_MISMATCH_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let config = configuration_after(&input, &existing.config);
+
+        // What the update would leave behind has to hold together as a
+        // configuration in its own right: the type's members are as conditional
+        // on each other after an update as they are on a create, which is why
+        // both paths ask the same question of the resulting configuration.
+        if let Some(problem) = ip_address_problem(&config, &existing.config)
+            .or_else(|| health_check_config_problem(&config))
+        {
+            return Err(UpdateHealthCheckErrorModeled::InvalidInput(InvalidInput {
+                message: Some(format!("Invalid request: {problem}")),
+            })
+            .into());
+        }
+        if let Some(missing) = store.missing_child_health_check(&config) {
+            return Err(UpdateHealthCheckErrorModeled::InvalidInput(InvalidInput {
+                message: Some(format!(
+                    "Invalid request: ChildHealthChecks names no health check of this \
+                     account: {missing}"
+                )),
+            })
+            .into());
+        }
+
+        // The write this operation exists for, and the version that records it:
+        // `HealthCheckVersion` is "a sequential counter that Amazon Route 53
+        // sets to 1 when you create a health check and increments by 1 each time
+        // you update settings for the health check", so every update that is
+        // applied moves it on — which is what makes the token above reject a
+        // caller holding a version from before this update.
+        let stored = store
+            .health_checks
+            .get_mut(&input.health_check_id)
+            .ok_or_else(|| {
+                UpdateHealthCheckErrorModeled::NoSuchHealthCheck(no_such_health_check(
+                    &input.health_check_id,
+                ))
+            })?;
+        stored.config = config;
+        stored.version += 1;
+
+        // The response is read back out of the store, so what the caller is told
+        // is what a later GetHealthCheck will tell it.
+        Ok(UpdateHealthCheckOutput {
+            health_check: stored.to_health_check(),
+        })
     }
 }
