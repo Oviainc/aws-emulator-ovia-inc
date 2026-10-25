@@ -793,6 +793,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 due_at: now + crate::state::STATUS_TRANSITION_DELAY,
             }),
             changes,
+            // The Hook invocations CloudFormation would plan while creating this change
+            // set: none, because nothing here can activate a Hook or configure one to
+            // target an operation (see `state::change_set_hooks`), so there is no Hook for
+            // a resource of this plan to be evaluated against.
+            hooks: Vec::new(),
         });
 
         Ok(CreateChangeSetOutput {
