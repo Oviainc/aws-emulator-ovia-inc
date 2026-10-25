@@ -275,7 +275,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .is_none_or(|ids| ids.contains(&application.benefit_id))
                     && crate::state::matches_any(
                         input.stages.as_ref(),
-                        application.stage.as_slice(),
+                        application.stage().as_slice(),
                     )
                     && application.matches_resource_arns(&resource_arns)
             })
@@ -305,7 +305,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             &application.fulfillment_types,
                         ),
                         status: Some(application.status.clone()),
-                        stage: application.stage.clone(),
+                        stage: application.stage(),
                         created_at: Some(crate::state::timestamp(application.created_at_millis)),
                         updated_at: Some(crate::state::timestamp(application.updated_at_millis)),
                         benefit_application_details: application.summary_details(),

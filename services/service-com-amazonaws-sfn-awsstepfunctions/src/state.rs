@@ -724,6 +724,17 @@ impl StateMachineAlias {
         self.description.as_deref() == description
             && same_routing(&self.routing_configuration, routing_configuration)
     }
+
+    /// Whether this alias's routing configuration names the version `version_arn`.
+    ///
+    /// The ONE place that question is answered, so every operation that asks it —
+    /// listing the aliases a version is reached through, and refusing to delete a
+    /// version an alias still points at — reads the same records the same way.
+    pub fn routes_to(&self, version_arn: &str) -> bool {
+        self.routing_configuration
+            .iter()
+            .any(|item| item.state_machine_version_arn == version_arn)
+    }
 }
 
 /// Whether two routing configurations name the same versions at the same weights, in
@@ -1936,6 +1947,21 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         versions
     }
 
+    /// Remove one published version, uncounting what it retained.
+    ///
+    /// A version is an immutable snapshot keyed by its own qualified ARN, so this
+    /// touches nothing else: "deleting a state machine version won't terminate its
+    /// in-progress executions", and the state machine's version counter only ever
+    /// increases, so the number this frees is never handed out again.
+    pub fn remove_state_machine_version(
+        &mut self,
+        version_arn: &str,
+    ) -> Option<StateMachineVersion> {
+        let version = self.state_machine_versions.remove(version_arn)?;
+        self.retained_bytes = self.retained_bytes.saturating_sub(version.retained_bytes);
+        Some(version)
+    }
+
     /// The published versions of one state machine, in no particular order.
     ///
     /// Every version ARN of one state machine begins with its ARN and a colon, so
@@ -1994,6 +2020,19 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
                 .then_with(|| left.arn.cmp(&right.arn))
         });
         aliases
+    }
+
+    /// The aliases of `state_machine_arn` whose routing configuration names the
+    /// version `version_arn`, newest first.
+    pub fn aliases_routing_to(
+        &self,
+        state_machine_arn: &str,
+        version_arn: &str,
+    ) -> Vec<&StateMachineAlias> {
+        self.aliases_newest_first(state_machine_arn)
+            .into_iter()
+            .filter(|alias| alias.routes_to(version_arn))
+            .collect()
     }
 
     /// Why the store cannot take one more alias of `bytes` for `state_machine_arn`,
@@ -2899,6 +2938,35 @@ pub fn not_redrivable_message(execution_arn: &str, reason: &str) -> String {
 /// `StateMachineDoesNotExist`'s own name, as its message spells it. RECORDED text.
 pub const STATE_MACHINE_DOES_NOT_EXIST: &str = "State Machine Does Not Exist";
 
+/// What the same error says when the ARN named a state machine VERSION that the store
+/// holds nothing for. RECORDED text.
+///
+/// One rule, stated by [`resource_error_message`]: the condition names the resource
+/// the request's ARN REFERRED to, and a version-qualified ARN refers to a version
+/// rather than to the state machine behind it — so the condition is the version's,
+/// even though the error shape is the state machine's (the model declares no
+/// version-specific one).
+pub const STATE_MACHINE_VERSION_DOES_NOT_EXIST: &str = "State Machine Version Does Not Exist";
+
+/// The condition a resource-absent refusal names for the state machine ARN `parsed`:
+/// the VERSION condition for an ARN qualified with a version number, and the state
+/// machine's own otherwise.
+///
+/// The ONE place that choice is made, so every operation that resolves a qualified
+/// ARN words the refusal the same way. An alias qualifier keeps the state machine's
+/// condition: an alias is a route to a version rather than a resource the request
+/// asked to read.
+pub fn absent_state_machine_condition(parsed: &StateMachineArn) -> &'static str {
+    match parsed.qualifier.as_deref() {
+        Some(qualifier)
+            if parsed.label().is_none() && qualifier_version(qualifier).is_some() =>
+        {
+            STATE_MACHINE_VERSION_DOES_NOT_EXIST
+        }
+        _ => STATE_MACHINE_DOES_NOT_EXIST,
+    }
+}
+
 /// `StateMachineDeleting`'s, for [`resource_error_message`]. RECORDED text: the
 /// service words this condition as a SENTENCE rather than as the words of the
 /// shape name (`sfn-state-machine-deleting-rejections#task#6` records
@@ -3140,6 +3208,40 @@ pub fn read_state_machine_alias_arn(
         return Err(not_an_alias());
     };
     Ok((state_machine_arn.to_string(), qualifier.to_string()))
+}
+
+/// The `(stateMachineArn, version)` `arn` names, read as a state machine VERSION ARN
+/// of this service in `endpoint_region`, or the message the modelled `InvalidArn`
+/// carries.
+///
+/// A version ARN is a state machine ARN qualified with the version number, so text
+/// that carries no qualifier, a map-run label, or a qualifier that is not a version
+/// number ([`qualifier_version`]) does not name a version at all — a defect in the
+/// ARN, which is what `InvalidArn` reports, rather than a version that is absent.
+/// This is [`read_state_machine_alias_arn`] for the other qualified form, and the two
+/// are exclusive: a qualifier of nothing but digits is a version and never an alias.
+pub fn read_state_machine_version_arn(
+    arn: &str,
+    endpoint_region: &str,
+) -> Result<(String, u32), String> {
+    let parsed = read_state_machine_arn(arn, endpoint_region)?;
+    let not_a_version =
+        || invalid_arn_message(format!("Invalid ARN {STATE_MACHINE_RESOURCE} version: {arn}"));
+    let Some(qualifier) = parsed.qualifier.as_deref() else {
+        return Err(not_a_version());
+    };
+    if parsed.label().is_some() {
+        return Err(not_a_version());
+    }
+    let Some(version) = qualifier_version(qualifier) else {
+        return Err(not_a_version());
+    };
+    // The state machine is the ARN without the qualifier, which is its last
+    // colon-delimited field — and a version number carries no colon.
+    let Some((state_machine_arn, _)) = arn.rsplit_once(':') else {
+        return Err(not_a_version());
+    };
+    Ok((state_machine_arn.to_string(), version))
 }
 
 /// The version number a state machine ARN's qualifier names, or `None` when the

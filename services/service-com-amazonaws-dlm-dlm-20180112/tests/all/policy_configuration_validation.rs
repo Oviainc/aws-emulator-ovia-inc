@@ -8,9 +8,10 @@
 //! the documentation states two alternative forms, exactly one of them — and a
 //! request that does not is refused with `InvalidRequestException` (HTTP 400,
 //! `Code` `InvalidParameter`) before anything is stored or changed, naming the
-//! omitted members in `RequiredParameters` and the ones that cannot be combined
-//! in `MutuallyExclusiveParameters`. A complete configuration is accepted and
-//! read back.
+//! omitted members in `RequiredParameters`. A refusal of the FORM a rule nested
+//! inside the configuration was stated in carries neither structured parameter
+//! list — those name the request's own parameters — so it is reported by its
+//! message and code alone. A complete configuration is accepted and read back.
 //!
 //! None of these members can be `@required` in the model, because which ones a
 //! request must carry depends on the kind of policy it configures. The
@@ -190,13 +191,14 @@ enum Owed {
     Accepted,
     /// Refused, with these wire paths reported in `RequiredParameters`.
     Required(Vec<String>),
-    /// Refused, with these wire paths reported in `MutuallyExclusiveParameters`.
-    Exclusive(Vec<String>),
+    /// Refused because a rule nested in the configuration stated BOTH of its two
+    /// alternative forms: reported by the message and the code alone.
+    BothForms,
 }
 
-/// Assert `answer` is this service's modelled refusal and reports `parameters`
-/// in the `member` list the class of refusal fills in.
-fn assert_refused(case: &str, answer: &Answer, member: &str, parameters: &[String]) {
+/// Assert `answer` is this service's modelled refusal: the status and `Code` of
+/// `InvalidRequestException`, and a message saying why.
+fn assert_refusal(case: &str, answer: &Answer) {
     assert_eq!(
         answer.status, INVALID_REQUEST_STATUS,
         "case {case:?}: expected HTTP {INVALID_REQUEST_STATUS}, got {} with {:?}",
@@ -213,6 +215,28 @@ fn assert_refused(case: &str, answer: &Answer, member: &str, parameters: &[Strin
         "case {case:?}: expected Code {INVALID_PARAMETER_CODE:?}, got {:?}",
         at(&answer.body, "/Code")
     );
+    assert!(
+        !answer.message().is_empty(),
+        "case {case:?}: a refusal must say why, got {:?}",
+        answer.body
+    );
+}
+
+/// Assert the refusal leaves the `member` parameter list unset.
+fn assert_no_parameter_list(case: &str, answer: &Answer, member: &str) {
+    let reported = at(&answer.body, &format!("/{member}"));
+    assert_eq!(
+        reported,
+        Value::Null,
+        "case {case:?}: {member} must be absent, got {reported:?}"
+    );
+}
+
+/// Assert `answer` is this service's modelled refusal and reports `parameters`
+/// in the `member` list the class of refusal fills in, and nothing in the other
+/// list.
+fn assert_refused(case: &str, answer: &Answer, member: &str, parameters: &[String]) {
+    assert_refusal(case, answer);
     let reported = at(&answer.body, &format!("/{member}"));
     for parameter in parameters {
         assert!(
@@ -222,11 +246,12 @@ fn assert_refused(case: &str, answer: &Answer, member: &str, parameters: &[Strin
             "case {case:?}: {member} must name {parameter:?}, got {reported:?}"
         );
     }
-    assert!(
-        !answer.message().is_empty(),
-        "case {case:?}: a refusal must say why, got {:?}",
-        answer.body
-    );
+    for other in ["RequiredParameters", "MutuallyExclusiveParameters"]
+        .into_iter()
+        .filter(|name| *name != member)
+    {
+        assert_no_parameter_list(case, answer, other);
+    }
 }
 
 /// Assert `answer` satisfies `owed`, whatever class of refusal it is.
@@ -249,8 +274,12 @@ fn assert_owed(case: &str, answer: &Answer, owed: &Owed) {
                 );
             }
         }
-        Owed::Exclusive(parameters) => {
-            assert_refused(case, answer, "MutuallyExclusiveParameters", parameters)
+        Owed::BothForms => {
+            // Neither structured list: each names the request's own parameters,
+            // and this refusal is about the form a nested rule was stated in.
+            assert_refusal(case, answer);
+            assert_no_parameter_list(case, answer, "RequiredParameters");
+            assert_no_parameter_list(case, answer, "MutuallyExclusiveParameters");
         }
     }
 }
@@ -547,26 +576,25 @@ struct RuleCase {
     /// Member paths RELATIVE to the schedule a refusal must report in
     /// `RequiredParameters`.
     required: &'static [&'static str],
-    /// Member paths relative to the schedule a refusal must report in
-    /// `MutuallyExclusiveParameters`.
-    exclusive: &'static [&'static str],
+    /// Whether the schedule states BOTH alternative forms of one of its rules,
+    /// which is refused by the message and the code alone.
+    both_forms: bool,
 }
 
 impl RuleCase {
     /// What the service owes this row when the schedule sits at `position`
     /// (1-based) in `Schedules`.
     fn owed(&self, position: usize) -> Owed {
-        let qualify = |members: &[&str]| -> Vec<String> {
-            members
-                .iter()
-                .map(|member| format!("PolicyDetails.Schedules[{position}].{member}"))
-                .collect()
-        };
-        if !self.exclusive.is_empty() {
-            return Owed::Exclusive(qualify(self.exclusive));
+        if self.both_forms {
+            return Owed::BothForms;
         }
         if !self.required.is_empty() {
-            return Owed::Required(qualify(self.required));
+            return Owed::Required(
+                self.required
+                    .iter()
+                    .map(|member| format!("PolicyDetails.Schedules[{position}].{member}"))
+                    .collect(),
+            );
         }
         Owed::Accepted
     }
@@ -674,26 +702,26 @@ async fn a_schedule_states_when_to_create_in_exactly_one_form() {
             case: "a schedule carrying no CreateRule at all",
             schedule: json!({"RetainRule": {"Count": 1}}),
             required: &["CreateRule"],
-            exclusive: &[],
+            both_forms: false,
         },
         RuleCase {
             // The request the issue reproduced.
             case: "an empty CreateRule",
             schedule: json!({"CreateRule": {}, "RetainRule": {"Count": 1}}),
             required: &["CreateRule"],
-            exclusive: &[],
+            both_forms: false,
         },
         RuleCase {
             case: "a CreateRule stating only a Location",
             schedule: json!({"CreateRule": {"Location": "CLOUD"}, "RetainRule": {"Count": 1}}),
             required: &["CreateRule"],
-            exclusive: &[],
+            both_forms: false,
         },
         RuleCase {
             case: "the interval form without its IntervalUnit",
             schedule: json!({"CreateRule": {"Interval": 12}, "RetainRule": {"Count": 1}}),
             required: &["CreateRule.IntervalUnit"],
-            exclusive: &[],
+            both_forms: false,
         },
         RuleCase {
             case: "the interval form without its Interval",
@@ -702,13 +730,13 @@ async fn a_schedule_states_when_to_create_in_exactly_one_form() {
                 "RetainRule": {"Count": 1},
             }),
             required: &["CreateRule.Interval"],
-            exclusive: &[],
+            both_forms: false,
         },
         RuleCase {
             case: "a CreateRule stating only Times",
             schedule: json!({"CreateRule": {"Times": ["03:00"]}, "RetainRule": {"Count": 1}}),
             required: &["CreateRule.Interval", "CreateRule.IntervalUnit"],
-            exclusive: &[],
+            both_forms: false,
         },
         RuleCase {
             case: "the cron form beside an Interval",
@@ -717,7 +745,31 @@ async fn a_schedule_states_when_to_create_in_exactly_one_form() {
                 "RetainRule": {"Count": 1},
             }),
             required: &[],
-            exclusive: &["CreateRule.CronExpression", "CreateRule.Interval"],
+            both_forms: true,
+        },
+        RuleCase {
+            // The request the issue reproduced: every member of the interval
+            // form beside the cron form.
+            case: "the cron form beside a complete interval form",
+            schedule: json!({
+                "CreateRule": {
+                    "CronExpression": "cron(0 12 * * ? *)",
+                    "Interval": 12,
+                    "IntervalUnit": CREATE_INTERVAL_UNIT,
+                },
+                "RetainRule": {"Count": 1},
+            }),
+            required: &[],
+            both_forms: true,
+        },
+        RuleCase {
+            case: "the cron form beside the Times the interval form may state",
+            schedule: json!({
+                "CreateRule": {"CronExpression": "cron(0 12 * * ? *)", "Times": ["03:00"]},
+                "RetainRule": {"Count": 1},
+            }),
+            required: &[],
+            both_forms: true,
         },
         RuleCase {
             case: "the cron form beside an IntervalUnit",
@@ -729,7 +781,7 @@ async fn a_schedule_states_when_to_create_in_exactly_one_form() {
                 "RetainRule": {"Count": 1},
             }),
             required: &[],
-            exclusive: &["CreateRule.CronExpression", "CreateRule.IntervalUnit"],
+            both_forms: true,
         },
         RuleCase {
             case: "the interval form alone",
@@ -738,7 +790,7 @@ async fn a_schedule_states_when_to_create_in_exactly_one_form() {
                 "RetainRule": {"Count": 1},
             }),
             required: &[],
-            exclusive: &[],
+            both_forms: false,
         },
         RuleCase {
             case: "the interval form with the Times it may also state",
@@ -751,7 +803,7 @@ async fn a_schedule_states_when_to_create_in_exactly_one_form() {
                 "RetainRule": {"Count": 1},
             }),
             required: &[],
-            exclusive: &[],
+            both_forms: false,
         },
         RuleCase {
             case: "the cron form alone",
@@ -760,7 +812,7 @@ async fn a_schedule_states_when_to_create_in_exactly_one_form() {
                 "RetainRule": {"Count": 1},
             }),
             required: &[],
-            exclusive: &[],
+            both_forms: false,
         },
     ])
     .await;
@@ -782,7 +834,7 @@ async fn a_retain_rule_retains_by_exactly_one_mode() {
                 "CreateRule": {"Interval": 24, "IntervalUnit": CREATE_INTERVAL_UNIT},
             }),
             required: &[],
-            exclusive: &[],
+            both_forms: false,
         },
         RuleCase {
             // The request the issue reproduced.
@@ -792,7 +844,7 @@ async fn a_retain_rule_retains_by_exactly_one_mode() {
                 "RetainRule": {},
             }),
             required: &["RetainRule"],
-            exclusive: &[],
+            both_forms: false,
         },
         RuleCase {
             case: "count-based retention",
@@ -801,7 +853,7 @@ async fn a_retain_rule_retains_by_exactly_one_mode() {
                 "RetainRule": {"Count": 3},
             }),
             required: &[],
-            exclusive: &[],
+            both_forms: false,
         },
         RuleCase {
             // `StandardTierRetainRuleCount` is `@range(min: 0, max: 1000)`, and a
@@ -813,7 +865,7 @@ async fn a_retain_rule_retains_by_exactly_one_mode() {
                 "RetainRule": {"Count": 0},
             }),
             required: &[],
-            exclusive: &[],
+            both_forms: false,
         },
         RuleCase {
             case: "count-based retention at the ceiling of its range",
@@ -822,7 +874,7 @@ async fn a_retain_rule_retains_by_exactly_one_mode() {
                 "RetainRule": {"Count": 1000},
             }),
             required: &[],
-            exclusive: &[],
+            both_forms: false,
         },
         RuleCase {
             case: "age-based retention without its IntervalUnit",
@@ -831,7 +883,7 @@ async fn a_retain_rule_retains_by_exactly_one_mode() {
                 "RetainRule": {"Interval": 7},
             }),
             required: &["RetainRule.IntervalUnit"],
-            exclusive: &[],
+            both_forms: false,
         },
         RuleCase {
             case: "age-based retention without its Interval",
@@ -840,7 +892,7 @@ async fn a_retain_rule_retains_by_exactly_one_mode() {
                 "RetainRule": {"IntervalUnit": "MONTHS"},
             }),
             required: &["RetainRule.Interval"],
-            exclusive: &[],
+            both_forms: false,
         },
         RuleCase {
             // The request the issue reproduced.
@@ -850,11 +902,7 @@ async fn a_retain_rule_retains_by_exactly_one_mode() {
                 "RetainRule": {"Count": 3, "Interval": 7, "IntervalUnit": "DAYS"},
             }),
             required: &[],
-            exclusive: &[
-                "RetainRule.Count",
-                "RetainRule.Interval",
-                "RetainRule.IntervalUnit",
-            ],
+            both_forms: true,
         },
         RuleCase {
             case: "a count beside a retention unit alone",
@@ -863,7 +911,7 @@ async fn a_retain_rule_retains_by_exactly_one_mode() {
                 "RetainRule": {"Count": 3, "IntervalUnit": "WEEKS"},
             }),
             required: &[],
-            exclusive: &["RetainRule.Count", "RetainRule.IntervalUnit"],
+            both_forms: true,
         },
         RuleCase {
             case: "a count beside a retention interval alone",
@@ -872,7 +920,7 @@ async fn a_retain_rule_retains_by_exactly_one_mode() {
                 "RetainRule": {"Count": 3, "Interval": 7},
             }),
             required: &[],
-            exclusive: &["RetainRule.Count", "RetainRule.Interval"],
+            both_forms: true,
         },
         RuleCase {
             // "If you specify an ArchiveRule for the schedule, then you can
@@ -884,7 +932,7 @@ async fn a_retain_rule_retains_by_exactly_one_mode() {
                 "RetainRule": {"Interval": 0, "IntervalUnit": "DAYS"},
             }),
             required: &[],
-            exclusive: &[],
+            both_forms: false,
         },
     ])
     .await;

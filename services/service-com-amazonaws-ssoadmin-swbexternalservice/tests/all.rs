@@ -35,6 +35,8 @@ mod application_create;
 mod application_create_providers;
 #[path = "all/application_grants.rs"]
 mod application_grants;
+#[path = "all/application_grants_list.rs"]
+mod application_grants_list;
 #[path = "all/application_provider_describe.rs"]
 mod application_provider_describe;
 #[path = "all/application_providers.rs"]

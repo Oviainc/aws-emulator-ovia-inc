@@ -19,8 +19,9 @@ pub mod network;
 
 use crate::ops::types::{
     Action, AvailabilityZone, Certificate, Listener, ListenerAttribute, LoadBalancer,
-    LoadBalancerAddress, LoadBalancerState, Matcher, Rule, TargetDescription, TargetGroup,
-    TargetGroupAttribute, TargetHealth, TargetHealthDescription, TrustStore,
+    LoadBalancerAddress, LoadBalancerState, Matcher, Rule, RuleCondition, RuleTransform,
+    TargetDescription, TargetGroup, TargetGroupAttribute, TargetHealth, TargetHealthDescription,
+    TrustStore,
 };
 
 /// How long after the call that starts it a load balancer owes its move out of
@@ -57,6 +58,20 @@ pub const TARGET_GROUP_QUOTA: usize = 1_000;
 /// listener store is bounded by this times [`LOAD_BALANCER_QUOTA`], and deleting a load
 /// balancer releases its listeners.
 pub const LISTENERS_PER_LOAD_BALANCER: usize = 100;
+
+/// How many rules one load balancer carries across its listeners before `CreateRule`
+/// refuses with the modelled `TooManyRulesException`: the published default
+/// `DescribeAccountLimits` reports as `rules-per-application-load-balancer` (and as
+/// `rules-per-network-load-balancer`), which counts the rules a caller added and not the
+/// default rule every listener carries.
+///
+/// A rule exists only under a listener, so the store's rules are bounded by this times
+/// [`LOAD_BALANCER_QUOTA`], and deleting a listener or its load balancer releases them.
+pub const RULES_PER_LOAD_BALANCER: usize = 100;
+
+/// How many values one condition of a rule carries, from the published default
+/// `DescribeAccountLimits` reports as `condition-values-per-alb-rule`.
+pub const CONDITION_VALUES_PER_RULE: usize = 5;
 
 /// How many targets one target group of an APPLICATION Load Balancer holds before
 /// `RegisterTargets` refuses with the modelled `TooManyTargetsException`: the per-Region
@@ -1435,6 +1450,45 @@ impl TrustStoreRecord {
     }
 }
 
+/// A persisted listener RULE: one a caller added with `CreateRule`, which is every rule
+/// of a listener except the default rule the listener itself carries
+/// ([`ListenerRecord::default_rule`]).
+///
+/// A rule belongs to exactly one listener and is stored on that listener's record, so
+/// releasing the listener releases its rules with it and no second store can disagree
+/// about which listener a rule belongs to.
+#[derive(Debug, Clone, Default)]
+pub struct RuleRecord {
+    pub arn: String,
+    /// "Rules are evaluated in priority order, from the lowest value to the highest
+    /// value" — which is the order a read walks them in. Modelled as an integer on the
+    /// way in (`RulePriority`) and as text on the way out (`Rule$Priority`), so the
+    /// record keeps the number and the shape renders it.
+    pub priority: i32,
+    pub conditions: Vec<RuleCondition>,
+    pub actions: Vec<Action>,
+    /// The transforms applied to a request this rule matches. Empty is reported as
+    /// nothing rather than as an empty list, which is what a rule carrying none answers.
+    pub transforms: Vec<RuleTransform>,
+    /// The tags this rule was created with, which `DescribeTags` reports: a listener
+    /// rule is a taggable Elastic Load Balancing resource.
+    pub tags: HashMap<String, String>,
+}
+
+impl RuleRecord {
+    pub fn to_shape(&self) -> Rule {
+        Rule {
+            rule_arn: Some(self.arn.clone()),
+            priority: Some(self.priority.to_string()),
+            conditions: Some(self.conditions.clone()),
+            actions: Some(self.actions.clone()),
+            // Only the rule a listener mints with itself is the default one.
+            is_default: Some(false),
+            transforms: (!self.transforms.is_empty()).then(|| self.transforms.clone()),
+        }
+    }
+}
+
 /// A persisted listener.
 #[derive(Debug, Clone, Default)]
 pub struct ListenerRecord {
@@ -1462,7 +1516,10 @@ pub struct ListenerRecord {
     /// listener has one, it carries the listener's default actions, and it is what
     /// `DescribeRules` reports for a listener nothing else has added a rule to.
     pub default_rule_id: String,
-    pub rule_arns: Vec<String>,
+    /// The rules a caller added to this listener with `CreateRule`, in the order they
+    /// were added; a read orders them by priority
+    /// ([`ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State::rules_of`]).
+    pub rules: Vec<RuleRecord>,
 }
 
 impl ListenerRecord {
@@ -1528,19 +1585,24 @@ impl ListenerRecord {
             .collect()
     }
 
-    /// The ARN of this listener's default rule.
+    /// The ARN a rule of this listener carrying the resource id `rule_id` has.
     ///
     /// A listener rule's ARN is its listener's with the resource type `listener-rule` and
     /// the rule's own id appended — the segments this service's ARNs carry
     /// (`listener/<type>/<name>/<lb-id>/<id>` and
     /// `listener-rule/<type>/<name>/<lb-id>/<listener-id>/<id>`), so it is derived from
-    /// the stored listener ARN rather than rebuilt from parts.
-    pub fn default_rule_arn(&self) -> String {
+    /// the stored listener ARN rather than rebuilt from parts. Every rule of a listener,
+    /// the default one included, is named through here, so one place decides the form.
+    pub fn rule_arn(&self, rule_id: &str) -> String {
         format!(
-            "{}/{}",
-            self.arn.replacen(":listener/", ":listener-rule/", 1),
-            self.default_rule_id
+            "{}/{rule_id}",
+            self.arn.replacen(":listener/", ":listener-rule/", 1)
         )
+    }
+
+    /// The ARN of this listener's default rule.
+    pub fn default_rule_arn(&self) -> String {
+        self.rule_arn(&self.default_rule_id)
     }
 
     /// This listener's default rule: the rule that forwards everything the listener's
@@ -1587,6 +1649,21 @@ impl ListenerRecord {
                 value: Some(value),
             })
             .collect()
+    }
+
+    /// Every target group an ACTION of this listener forwards to: its default actions,
+    /// and the actions of every rule a caller added to it.
+    ///
+    /// One place answers "what does this listener route to", because two questions are
+    /// decided by it — which load balancers a target group reports under
+    /// `LoadBalancerArns`, and whether a target group is "referenced by any actions" and
+    /// so cannot be deleted.
+    pub fn forwarded_target_group_arns(&self) -> Vec<String> {
+        let mut arns = action_target_group_arns(&self.default_actions);
+        for rule in &self.rules {
+            arns.extend(action_target_group_arns(&rule.actions));
+        }
+        arns
     }
 }
 
@@ -1725,17 +1802,17 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
         }
     }
 
-    /// Whether any load balancer, target group or listener in the store already
+    /// Whether any load balancer, target group, listener or rule in the store already
     /// carries `id`.
     fn id_in_use(&self, id: &str) -> bool {
         let suffix = format!("/{id}");
         self.load_balancers.values().any(|lb| lb.id == id)
             || self.target_groups.keys().any(|arn| arn.ends_with(&suffix))
             || self.listeners.keys().any(|arn| arn.ends_with(&suffix))
-            || self
-                .listeners
-                .values()
-                .any(|listener| listener.default_rule_id == id)
+            || self.listeners.values().any(|listener| {
+                listener.default_rule_id == id
+                    || listener.rules.iter().any(|rule| rule.arn.ends_with(&suffix))
+            })
             || self.trust_stores.keys().any(|arn| arn.ends_with(&suffix))
     }
 
@@ -1762,9 +1839,9 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
     /// resource with that ARN.
     ///
     /// Every taggable resource keeps its tags on its own record, so one lookup per store
-    /// finds them whatever kind the ARN names. A listener rule is never found: this
-    /// service's `CreateRule` is still a scaffold stub, so the store holds no rule for
-    /// any ARN — the day it does, its record's tags join the chain below.
+    /// finds them whatever kind the ARN names. A listener rule's record lives on its
+    /// listener, which [`Self::rule_record`] resolves through the ARN itself rather than
+    /// through a scan.
     pub fn tags_of(&self, arn: &str) -> Option<&HashMap<String, String>> {
         self.load_balancers
             .get(arn)
@@ -1772,6 +1849,7 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
             .or_else(|| self.target_groups.get(arn).map(|record| &record.tags))
             .or_else(|| self.listeners.get(arn).map(|record| &record.tags))
             .or_else(|| self.trust_stores.get(arn).map(|record| &record.tags))
+            .or_else(|| self.rule_record(arn).map(|record| &record.tags))
     }
 
     /// Load balancers in a stable order (oldest first, ARN breaking ties), which is
@@ -1863,13 +1941,15 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
     /// Called after a listener's actions change or a listener goes away, so the
     /// association a target group reports is derived from the listeners that exist
     /// rather than accumulated. The association is dropped only when nothing else keeps
-    /// it: a second listener of the same load balancer still forwarding there does.
+    /// it: a second listener of the same load balancer still forwarding there does, and
+    /// so does a RULE of one — a load balancer routes to a target group an action of any
+    /// of its rules forwards to, not only one its default actions name.
     pub fn refresh_target_group_associations(&mut self, load_balancer_arn: &str) {
         let forwarded: Vec<String> = self
             .listeners
             .values()
             .filter(|listener| listener.load_balancer_arn == load_balancer_arn)
-            .flat_map(|listener| action_target_group_arns(&listener.default_actions))
+            .flat_map(ListenerRecord::forwarded_target_group_arns)
             .collect();
         for (arn, group) in &mut self.target_groups {
             let holds = group
@@ -1896,30 +1976,66 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
 
     /// Every rule of one listener, in the order a paginated read walks them.
     ///
-    /// A listener's rules are its DEFAULT rule plus the ones a caller added, and the
-    /// default rule is the last AWS reports. `CreateRule` — which mints the others onto
-    /// `ListenerRecord::rule_arns` — is still a scaffold stub with its own issue, so
-    /// every stored listener's rules are its default rule alone today; the rules that
-    /// operation persists join the walk here rather than in a second place.
+    /// A listener's rules are the ones a caller added, in EVALUATION order — "rules are
+    /// evaluated in priority order, from the lowest value to the highest value" — and
+    /// then its DEFAULT rule, which is last because it is what runs when no other rule's
+    /// conditions are met. Two rules of one listener never share a priority
+    /// (`CreateRule` refuses that), so the order is total; the ARN breaks a tie only so
+    /// that a page walk is stable whatever the store's iteration order.
     pub fn rules_of(&self, listener: &ListenerRecord) -> Vec<Rule> {
-        vec![listener.default_rule()]
+        let mut added: Vec<&RuleRecord> = listener.rules.iter().collect();
+        added.sort_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then_with(|| left.arn.cmp(&right.arn))
+        });
+        let mut rules: Vec<Rule> = added.into_iter().map(RuleRecord::to_shape).collect();
+        rules.push(listener.default_rule());
+        rules
+    }
+
+    /// The record of the rule `arn` names, or `None` when the listener it belongs to
+    /// holds no such rule. The listener's DEFAULT rule has no record: it is derived from
+    /// the listener itself ([`ListenerRecord::default_rule`]).
+    ///
+    /// ONE listener lookup, never a scan over the store: a rule ARN is its listener's
+    /// with the resource type `listener-rule` and the rule's own id appended
+    /// ([`ListenerRecord::default_rule_arn`]), so the owning listener is a pure string
+    /// transform of the value asked for.
+    pub fn rule_record(&self, arn: &str) -> Option<&RuleRecord> {
+        let listener = self.listeners.get(&rule_listener_arn(arn)?)?;
+        listener.rules.iter().find(|rule| rule.arn == arn)
     }
 
     /// The rule `arn` names, or `None` when no listener in this store holds it.
     ///
-    /// ONE lookup, never a scan: a rule ARN is its listener's with the resource type
-    /// `listener-rule` and the rule's own id appended
-    /// ([`ListenerRecord::default_rule_arn`]), so the owning listener is a pure string
-    /// transform of the value asked for and the cost of resolving one does not grow with
-    /// the number of listeners the store holds.
+    /// Resolved through the same one listener lookup [`Self::rule_record`] uses, so the
+    /// cost of resolving one rule does not grow with the number of listeners the store
+    /// holds; the listener's own rule list is bounded by [`RULES_PER_LOAD_BALANCER`].
     pub fn rule_by_arn(&self, arn: &str) -> Option<Rule> {
-        let (listener_part, _rule_id) = arn.rsplit_once('/')?;
-        let listener_arn = listener_part.replacen(":listener-rule/", ":listener/", 1);
-        let listener = self.listeners.get(&listener_arn)?;
+        let listener = self.listeners.get(&rule_listener_arn(arn)?)?;
         self.rules_of(listener)
             .into_iter()
             .find(|rule| rule.rule_arn.as_deref() == Some(arn))
     }
+
+    /// How many rules a caller has added across every listener of `load_balancer_arn`,
+    /// which is what [`RULES_PER_LOAD_BALANCER`] bounds.
+    pub fn rule_count_of_load_balancer(&self, load_balancer_arn: &str) -> usize {
+        self.listeners
+            .values()
+            .filter(|listener| listener.load_balancer_arn == load_balancer_arn)
+            .map(|listener| listener.rules.len())
+            .sum()
+    }
+}
+
+/// The ARN of the listener the rule `arn` belongs to, or `None` when `arn` carries no
+/// rule id at all. A pure string transform of the rule ARN: the two differ in their
+/// resource type and in the rule id the rule ARN appends.
+fn rule_listener_arn(arn: &str) -> Option<String> {
+    let (listener_part, _rule_id) = arn.rsplit_once('/')?;
+    Some(listener_part.replacen(":listener-rule/", ":listener/", 1))
 }
 
 /// Why a page request could not be served.

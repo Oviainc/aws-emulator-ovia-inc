@@ -4,10 +4,14 @@
 //!
 //! The rule under test: `StartImageScan` records ONE basic scan on the stored image its
 //! identifier resolves to, which answers `IN_PROGRESS` until the clock makes its
-//! completion due ([`state::IMAGE_SCAN_DELAY`]) and `COMPLETE` afterwards;
+//! completion due ([`state::IMAGE_SCAN_DELAY`]) and the TERMINAL status that run came to
+//! afterwards — the outcome of examining that image (`state::basic_scan_outcome`), which
+//! for an image whose operating system nothing identified is `FAILED` with the
+//! unsupported-image description and never a clean `COMPLETE`;
 //! `DescribeImageScanFindings` derives its whole answer from that one record and changes
-//! nothing, the findings (and the severity counts over them) are reported once the scan
-//! has completed, an image carrying no scan is `ScanNotFoundException` while an
+//! nothing, the findings (and the severity counts over them) are reported once a scan that
+//! examined the image has completed, an image carrying no scan is `ScanNotFoundException`
+//! while an
 //! identifier naming no stored image is `ImageNotFoundException`, a second start inside
 //! [`state::BASIC_SCAN_INTERVAL`] is `LimitExceededException`, an image in Amazon ECR
 //! archive is `ImageArchivedException`, and an image whose manifest declares no
@@ -30,7 +34,7 @@ use crate::wire::{
     at, emulator, emulator_with_engine, given_layer, layer_digest, ok, refused, REGISTRY_ID,
 };
 
-use ecr::ops::types::{Attribute, ImageScanFinding, FINDING_SEVERITY_VALUES};
+use ecr::ops::types::{Attribute, ImageScanFinding, ImageScanStatus, FINDING_SEVERITY_VALUES};
 use ecr::state;
 
 /// Long enough past [`state::IMAGE_SCAN_DELAY`] that the completion the clock owes is
@@ -354,9 +358,13 @@ async fn a_started_scan_is_reported_until_the_clock_completes_it() {
 
         let completed = findings(&router, case, repository, &image_id).await;
         assert_eq!(
-            at(&completed, "/imageScanStatus/status"),
-            json!(state::SCAN_STATUS_COMPLETE),
-            "case {case:?}: past the owed completion the scan is COMPLETE, got {:?}",
+            at(&completed, "/imageScanStatus"),
+            json!({
+                "status": state::SCAN_STATUS_FAILED,
+                "description": state::UNSUPPORTED_IMAGE_SCAN_DESCRIPTION,
+            }),
+            "case {case:?}: past the owed completion the scan reports the outcome of \
+             examining this image, got {:?}",
             at(&completed, "/imageScanStatus")
         );
         assert_eq!(
@@ -365,30 +373,19 @@ async fn a_started_scan_is_reported_until_the_clock_completes_it() {
             "case {case:?}: the read reports the image it scanned, got {:?}",
             at(&completed, "/imageId")
         );
-        // The registry holds no layer CONTENT, so a basic scan of a stored image has
-        // nothing to examine: it reports no finding and therefore counts none.
+        // The registry holds no layer CONTENT, so a basic scan of a stored image
+        // identified no operating system to examine: the run reports that outcome and no
+        // findings block, which would state a scan of content nothing read.
         assert_eq!(
-            at(&completed, "/imageScanFindings/findings"),
-            json!([]),
-            "case {case:?}: a scan of an image whose layer bytes nothing has read reports \
-             no finding, got {:?}",
-            at(&completed, "/imageScanFindings/findings")
-        );
-        assert_eq!(
-            at(&completed, "/imageScanFindings/findingSeverityCounts"),
-            json!({}),
-            "case {case:?}: the severity counts count the findings reported, got {:?}",
-            at(&completed, "/imageScanFindings/findingSeverityCounts")
-        );
-        assert!(
-            at(&completed, "/imageScanFindings/imageScanCompletedAt").is_number(),
-            "case {case:?}: a completed scan reports when it completed, got {:?}",
-            at(&completed, "/imageScanFindings/imageScanCompletedAt")
+            at(&completed, "/imageScanFindings"),
+            Value::Null,
+            "case {case:?}: a run that examined nothing reports no findings, got {:?}",
+            at(&completed, "/imageScanFindings")
         );
         assert_eq!(
             at(&completed, "/nextToken"),
             Value::Null,
-            "case {case:?}: one page holds every finding, so no token follows it, got {:?}",
+            "case {case:?}: with no findings reported no token follows them, got {:?}",
             at(&completed, "/nextToken")
         );
 
@@ -756,8 +753,8 @@ async fn an_archived_image_cannot_be_scanned_until_it_is_restored() {
     let completed = findings(&router, "restored", repository, &image_id).await;
     assert_eq!(
         at(&completed, "/imageScanStatus/status"),
-        json!(state::SCAN_STATUS_COMPLETE),
-        "case \"restored\": the scan completes on the clock, got {:?}",
+        json!(state::SCAN_STATUS_FAILED),
+        "case \"restored\": the scan reaches its terminal status on the clock, got {:?}",
         at(&completed, "/imageScanStatus")
     );
 }
@@ -780,10 +777,11 @@ fn finding(index: usize, severity: &str) -> ImageScanFinding {
 /// Seed `findings` as the completed scan of one stored image, straight into the store the
 /// handlers read.
 ///
-/// A basic scan of a stored image finds nothing — this registry holds no layer CONTENT to
-/// examine (`state::basic_scan_findings`) — so a scan CARRYING findings is a record the
-/// start path cannot produce, and the paging and the severity counting over it are
-/// exercised from the same store instead. Every other case here goes through the wire.
+/// A basic scan of a stored image identifies no operating system to examine — this registry
+/// holds no layer CONTENT (`state::basic_scan_outcome`) — so a run that EXAMINED the image
+/// and carries findings is a record the start path cannot produce, and the paging and the
+/// severity counting over it are exercised from the same store instead. Every other case
+/// here goes through the wire.
 fn seed_findings(
     engine: &engine::InMemoryEngine,
     repository: &str,
@@ -802,8 +800,14 @@ fn seed_findings(
     let now = SystemTime::now();
     image.scan = Some(state::ImageScan {
         started_at: now,
-        // Already due, so the scan is COMPLETE and its findings are readable.
+        // Already due, so the scan has reached its terminal status.
         complete_due_at: now,
+        // A run that examined the image: the status whose findings are a statement about
+        // it, and therefore the one whose findings are readable.
+        terminal: ImageScanStatus {
+            status: Some(state::SCAN_STATUS_COMPLETE.to_string()),
+            description: Some(state::SCAN_COMPLETE_DESCRIPTION.to_string()),
+        },
         findings,
     });
 }

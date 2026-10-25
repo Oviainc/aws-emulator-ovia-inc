@@ -17,6 +17,8 @@ mod certificate_override;
 mod cluster_parameter_groups;
 #[path = "all/control_plane_operations.rs"]
 mod control_plane_operations;
+#[path = "all/custom_db_engine_versions.rs"]
+mod custom_db_engine_versions;
 #[path = "all/db_cluster_deletion.rs"]
 mod db_cluster_deletion;
 #[path = "all/db_cluster_snapshots.rs"]

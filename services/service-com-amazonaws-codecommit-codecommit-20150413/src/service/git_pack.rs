@@ -19,7 +19,6 @@
 //! megabyte of claimed output).
 
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
 
 use flate2::{Compression, Decompress, FlushDecompress, Status};
 
@@ -70,24 +69,26 @@ const OUTPUT_CHUNK: usize = 16 * 1024;
 ///
 /// One budget is threaded through every growth site of a single [`read_pack`] —
 /// each entry's inflate and each delta's expansion — so the SUM is what is
-/// bounded, not each term.
+/// bounded, not each term. The deadline is the crate's one
+/// [`crate::state::Deadline`], the same reading of "out of time" the push
+/// projection's and a merge's budgets use.
 struct Budget {
     bytes_left: usize,
-    deadline: Instant,
+    deadline: crate::state::Deadline,
 }
 
 impl Budget {
     fn new() -> Self {
         Self {
             bytes_left: MAX_PACK_INFLATED_BYTES,
-            deadline: Instant::now() + Duration::from_secs(MAX_PACK_SECONDS),
+            deadline: crate::state::Deadline::in_seconds(MAX_PACK_SECONDS),
         }
     }
 
     /// Charge `bytes` of output to the budget, refusing the pack when it would go
     /// past its total or has run out of time.
     fn spend(&mut self, bytes: usize) -> Result<(), PackError> {
-        if Instant::now() > self.deadline {
+        if self.deadline.passed() {
             return fail(format!(
                 "the pack took longer than the {MAX_PACK_SECONDS} seconds this emulator spends reading one"
             ));

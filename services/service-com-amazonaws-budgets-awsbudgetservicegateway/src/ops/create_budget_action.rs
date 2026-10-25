@@ -252,7 +252,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = crate::state::store_at(&state, now);
         // An action is a resource OF the budget it names (`Action$BudgetName`), so the
         // budget has to exist before the action can hang off it.
         let stored = store
@@ -313,7 +314,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &mut held,
             crate::state::EVENT_TYPE_CREATE_ACTION,
             "The budget action was created.",
-            ::std::time::SystemTime::now(),
+            now,
         );
         stored.actions.push(held);
 

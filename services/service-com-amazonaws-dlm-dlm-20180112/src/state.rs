@@ -797,6 +797,12 @@ pub fn invalid_request(message: String) -> InvalidRequestException {
 
 /// The `InvalidRequestException` for a request that stated `parameters` which
 /// cannot be provided together.
+///
+/// `MutuallyExclusiveParameters` is "the request included parameters that cannot
+/// be provided together", so it lists the REQUEST's own parameters — the names a
+/// caller passed to the operation. A rule about which FORM a structure nested
+/// inside a request parameter was stated in is not a pair of request parameters:
+/// it is reported by [`invalid_request`], through the message and code alone.
 pub fn parameters_cannot_be_combined(
     message: String,
     parameters: Vec<String>,
@@ -1253,25 +1259,9 @@ fn create_rule_violation(
         || rule.is_some_and(|rule| rule.times.as_ref().is_some_and(|times| !times.is_empty()));
 
     match (cron_based, interval_based) {
-        (true, true) => Some(parameters_cannot_be_combined(
-            format!(
-                "Interval based CreateRule and Cron based CreateRule cannot both be present in \
-                 schedule {{{label}}}."
-            ),
-            stated_members(
-                &format!("{path}.CreateRule"),
-                [
-                    ("CronExpression", true),
-                    ("Interval", interval.is_some()),
-                    ("IntervalUnit", interval_unit.is_some()),
-                    (
-                        "Times",
-                        rule.is_some_and(|rule| {
-                            rule.times.as_ref().is_some_and(|times| !times.is_empty())
-                        }),
-                    ),
-                ],
-            ),
+        (true, true) => Some(both_forms_stated(
+            label,
+            "Interval based CreateRule and Cron based CreateRule",
         )),
         (false, false) => Some(required_in_schedule(
             label,
@@ -1316,19 +1306,9 @@ fn retain_rule_violation(
         || rule.interval.is_some_and(|value| value != UNSET_RULE_INTERVAL);
 
     match (count_based, age_based) {
-        (true, true) => Some(parameters_cannot_be_combined(
-            format!(
-                "Count based RetainRule and interval based RetainRule cannot both be present in \
-                 schedule {{{label}}}."
-            ),
-            stated_members(
-                &format!("{path}.RetainRule"),
-                [
-                    ("Count", true),
-                    ("Interval", rule.interval.is_some()),
-                    ("IntervalUnit", rule.interval_unit.is_some()),
-                ],
-            ),
+        (true, true) => Some(both_forms_stated(
+            label,
+            "Count based RetainRule and interval based RetainRule",
         )),
         (false, false) => Some(required_in_schedule(
             label,
@@ -1356,14 +1336,20 @@ fn retain_rule_violation(
     }
 }
 
-/// The wire paths of the members of `path` that are STATED, for the
-/// `MutuallyExclusiveParameters` of a refusal.
-fn stated_members<const N: usize>(path: &str, members: [(&str, bool); N]) -> Vec<String> {
-    members
-        .into_iter()
-        .filter(|(_, stated)| *stated)
-        .map(|(name, _)| format!("{path}.{name}"))
-        .collect()
+/// The `InvalidRequestException` for a schedule rule that states BOTH of the two
+/// alternative forms its documentation offers, where exactly one of them says
+/// what the rule does. `forms` names the two, and the message names the schedule,
+/// which is what tells a caller which of its schedules to correct.
+///
+/// The refusal is carried by the message and the code alone: this is a rule about
+/// the FORM of a structure nested inside the configuration a request parameter
+/// carries, not about two of the request's own parameters, so the structured
+/// [`MutuallyExclusiveParameters`](parameters_cannot_be_combined) list a client
+/// reads as the authoritative set of combined request parameters stays unset.
+fn both_forms_stated(label: &str, forms: &str) -> InvalidRequestException {
+    invalid_request(format!(
+        "{forms} cannot both be present in schedule {{{label}}}."
+    ))
 }
 
 /// The wire paths of the members of `path` that are OMITTED, for the

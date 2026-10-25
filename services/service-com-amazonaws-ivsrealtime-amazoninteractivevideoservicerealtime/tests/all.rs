@@ -27,6 +27,8 @@ mod encoder_configurations;
 mod error_envelope;
 #[path = "all/ingest_configurations.rs"]
 mod ingest_configurations;
+#[path = "all/participant_events.rs"]
+mod participant_events;
 #[path = "all/participant_replication.rs"]
 mod participant_replication;
 #[path = "all/participants.rs"]

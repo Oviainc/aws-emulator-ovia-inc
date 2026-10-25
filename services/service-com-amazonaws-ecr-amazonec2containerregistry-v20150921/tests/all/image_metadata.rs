@@ -656,9 +656,10 @@ async fn archiving_one_image_moves_that_image_s_status_and_no_other() {
             );
         }
 
-        // Archiving an image that is already archived transitions nothing: the request is
-        // already satisfied, and the recorded instant is the real transition's.
-        let again = ok(
+        // Archiving an image that is already in Amazon ECR archive is not a supported
+        // storage class update: there is no transition to make, so the call is refused and
+        // the recorded instant stays the real transition's.
+        refused(
             &router,
             case,
             "UpdateImageStorageClass",
@@ -667,19 +668,20 @@ async fn archiving_one_image_moves_that_image_s_status_and_no_other() {
                 "imageId": {"imageDigest": digests[index].clone()},
                 "targetStorageClass": "ARCHIVE",
             }),
+            "ImageStorageClassUpdateNotSupportedException",
         )
         .await;
-        assert_eq!(
-            at(&again, "/imageStatus"),
-            json!("ARCHIVED"),
-            "case {case:?}: a repeated archive still reports ARCHIVED, got {:?}",
-            at(&again, "/imageStatus")
-        );
         let after = detail_of(&router, case, repository, &digests[index]).await;
+        assert_eq!(
+            at(&after, "/imageStatus"),
+            json!("ARCHIVED"),
+            "case {case:?}: the refused re-archive leaves the image in archive, got {:?}",
+            at(&after, "/imageStatus")
+        );
         assert_eq!(
             at(&after, "/lastArchivedAt").as_f64(),
             archived_at,
-            "case {case:?}: a repeated archive must not re-stamp lastArchivedAt"
+            "case {case:?}: a refused re-archive must not re-stamp lastArchivedAt"
         );
 
         // The restore starts the image activating, stamping the instant it was restored

@@ -163,7 +163,7 @@ impl Response {
     }
 
     /// A plain-text refusal, the form a git client prints as the server's reason.
-    fn text(status: u16, message: &str) -> Self {
+    pub fn text(status: u16, message: &str) -> Self {
         Self {
             status,
             content_type: "text/plain; charset=utf-8".to_string(),
@@ -240,17 +240,19 @@ pub fn split_uri(uri: &str) -> (String, Option<String>) {
     }
 }
 
+/// The largest request body this transport reads, before any decoding: the pack a
+/// `receive-pack` request may carry ([`git_pack::MAX_PACK_BYTES`]) plus room for the
+/// pkt-line prelude that names the ref updates and the capabilities. A larger body is
+/// refused by the caller without being decoded or read, so neither the decompressor
+/// nor the pack reader is ever handed a body the transport could not accept anyway.
+pub const MAX_REQUEST_BODY_BYTES: usize = git_pack::MAX_PACK_BYTES + 64 * 1024;
+
 /// Serve one git transport request against the store.
 ///
-/// `content_encoding` is the request's `Content-Encoding`: a git client may gzip
-/// the body of an `upload-pack` request, and a body that declares an encoding
-/// this server cannot decode is refused rather than read as plain bytes.
-pub fn serve(
-    store: &mut Store,
-    request: &Request,
-    content_encoding: Option<&str>,
-    body: &[u8],
-) -> Response {
+/// `body` is the request body with its `Content-Encoding` already undone
+/// ([`decode_body`]), so the decompression — caller-driven CPU over caller-supplied
+/// bytes — happens before the store guard this function is handed is taken.
+pub fn serve(store: &mut Store, request: &Request, body: &[u8]) -> Response {
     let Some(repository) = store.repositories.get_mut(&request.repository) else {
         // The same refusal a git host gives for a path that names no repository;
         // a git client prints it as "repository not found".
@@ -266,19 +268,18 @@ pub fn serve(
              request info/refs with service=git-upload-pack or service=git-receive-pack",
         ),
         Endpoint::Advertisement(Some(service)) => advertise(repository, *service),
-        Endpoint::UploadPack => match decode_body(content_encoding, body) {
-            Ok(body) => upload_pack(repository, &body),
-            Err(message) => Response::text(400, &message),
-        },
-        Endpoint::ReceivePack => match decode_body(content_encoding, body) {
-            Ok(body) => receive_pack(repository, &body),
-            Err(message) => Response::text(400, &message),
-        },
+        Endpoint::UploadPack => upload_pack(repository, body),
+        Endpoint::ReceivePack => receive_pack(repository, body),
     }
 }
 
 /// The request body with its `Content-Encoding` undone.
-fn decode_body(content_encoding: Option<&str>, body: &[u8]) -> Result<Vec<u8>, String> {
+///
+/// `content_encoding` is the request's `Content-Encoding`: a git client may gzip the
+/// body of an `upload-pack` request, and a body that declares an encoding this server
+/// cannot decode is refused rather than read as plain bytes. The inflated size is
+/// capped, so a small body that expands without bound is refused instead of read.
+pub fn decode_body(content_encoding: Option<&str>, body: &[u8]) -> Result<Vec<u8>, String> {
     match content_encoding.map(str::trim) {
         None | Some("") | Some("identity") => Ok(body.to_vec()),
         Some("gzip") | Some("x-gzip") => {
