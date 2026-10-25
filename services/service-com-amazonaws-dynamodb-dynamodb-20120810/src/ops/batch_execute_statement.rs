@@ -10,6 +10,10 @@
 //! `BatchStatementErrorCodeEnum` code for what was wrong with it — while the slots
 //! beside it are served, and the batch still answers 200.
 //!
+//! Each statement that changes an item publishes the same stream record the equivalent
+//! classic write does ([`crate::state::publish_item_changes`]), in the order the batch
+//! applied them.
+//!
 //! The dialect itself is parsed in [`crate::state::partiql`] and the value semantics
 //! are [`crate::state::ParsedCondition`]/[`crate::state::ParsedUpdate`], so which
 //! comparison holds between two attribute values, and what an update action does to an
@@ -264,6 +268,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Err(failure) => responses.push(failure.into_response()),
             }
         }
+        // Every statement that changed an item owes its table's stream a record, in the
+        // order the batch applied them.
+        crate::state::publish_item_changes(&*self.engine, &mut store, now);
 
         Ok(BatchExecuteStatementOutput {
             responses: Some(responses),

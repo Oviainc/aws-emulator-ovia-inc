@@ -114,7 +114,7 @@ fn generated(count: usize) -> Vec<EvaluationResultEntry> {
 }
 
 /// `at` as the epoch seconds the wire carries a modelled timestamp as.
-fn epoch_seconds(at: SystemTime) -> f64 {
+pub(crate) fn epoch_seconds(at: SystemTime) -> f64 {
     at.duration_since(SystemTime::UNIX_EPOCH)
         .expect("every seeded instant is after the epoch")
         .as_secs_f64()
@@ -123,7 +123,7 @@ fn epoch_seconds(at: SystemTime) -> f64 {
 /// `value` with every number widened to f64 and every null member dropped, so an
 /// epoch-second timestamp compares equal however the serializer wrote it and an absent
 /// member compares equal to one serialized as null.
-fn normalised(value: &Value) -> Value {
+pub(crate) fn normalised(value: &Value) -> Value {
     match value {
         Value::Number(number) => json!(number.as_f64().unwrap_or_default()),
         Value::Array(items) => Value::Array(items.iter().map(normalised).collect()),
@@ -139,8 +139,13 @@ fn normalised(value: &Value) -> Value {
     }
 }
 
-/// `result` as the wire object the operation must report it as.
-fn wire(rule: &str, result: &EvaluationResultEntry) -> Value {
+/// `result` as the wire object an evaluation-details read must report it as, under the
+/// rule `rule` that recorded it.
+///
+/// Shared with the suites of the API's other evaluation-details reads: an
+/// `EvaluationResult` is one shape, so what one read must report it as is what the
+/// others must too.
+pub(crate) fn wire(rule: &str, result: &EvaluationResultEntry) -> Value {
     let mut value = json!({
         "EvaluationResultIdentifier": {
             "EvaluationResultQualifier": {

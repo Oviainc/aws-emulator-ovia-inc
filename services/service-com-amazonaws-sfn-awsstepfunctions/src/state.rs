@@ -3736,6 +3736,26 @@ pub fn not_redrivable_message(execution_arn: &str, reason: &str) -> String {
     format!("Execution {execution_arn} invalid for redrive as: {reason}")
 }
 
+/// What the modelled `ConflictException` says when a publish pins a `revisionId`
+/// that is not the one the state machine currently holds.
+///
+/// RECORDED text, and the third construction this service builds from the request:
+/// the service answers this refusal with two sentences — the revision the caller
+/// ASKED to publish, then the revision the state machine actually holds — because
+/// `ConflictException` carries nothing but `message`, so the body is the only place
+/// a caller using `revisionId` as an optimistic-concurrency guard can read which
+/// revision to re-drive the publish from. The fixed text is the service's;
+/// `requested` is the request's own `revisionId` member and `current` is the
+/// revision `DescribeStateMachine` reports, which is [`INITIAL_REVISION_ID`] for a
+/// state machine no update has revised yet — the name that API gives that state.
+pub fn stale_revision_message(requested: &str, current: Option<&str>) -> String {
+    let current = current.unwrap_or(INITIAL_REVISION_ID);
+    format!(
+        "Failed to publish the State Machine version for revision {requested}. The current \
+         State Machine revision is {current}."
+    )
+}
+
 /// `StateMachineDoesNotExist`'s own name, as its message spells it. RECORDED text.
 pub const STATE_MACHINE_DOES_NOT_EXIST: &str = "State Machine Does Not Exist";
 
