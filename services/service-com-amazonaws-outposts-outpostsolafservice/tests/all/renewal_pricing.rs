@@ -61,10 +61,6 @@ const UNPUBLISHED_SKU: &str = "OR-0000001";
 /// quoted to, which is also the precision the service rounds to.
 const CENT: f64 = 0.01;
 
-/// The `OrderStatus` of a cancelled order, the one status in which an order no longer
-/// subscribes the hardware it bought.
-const ORDER_CANCELLED: &str = "CANCELLED";
-
 /// The route `GetRenewalPricing` binds, for one identifier form.
 fn route(identifier: &str) -> String {
     format!("/outpost/{}/renewal-pricing", segment(identifier))
@@ -152,25 +148,32 @@ async fn an_outpost(outposts: &Outposts, name: &str) -> String {
     text(&outpost, "OutpostId")
 }
 
-/// Put a stored order in `CANCELLED` through the store seam
-/// [`crate::quote_lifecycle`] ages a quote through: `CancelOrder` is still a 501
-/// scaffold stub with an issue of its own, and a case about what a cancelled order no
-/// longer subscribes must not wait on that.
-fn cancel_order(outposts: &Outposts, order_id: &str, case: &str) {
-    let store = outposts.store();
-    let mut store = store.lock();
-    let record = store
-        .orders
-        .get_mut(order_id)
-        .unwrap_or_else(|| panic!("case {case:?}: the create persisted order {order_id}"));
-    record.order.status = Some(ORDER_CANCELLED.to_string());
+/// Cancel a stored order, over the wire: `CancelOrder` is the call that cancels one,
+/// so a case about what a cancelled order no longer subscribes reaches that status
+/// through the service's own front door. What the call leaves behind is stated in
+/// [`crate::order_cancellation`]; this only needs the order cancelled.
+async fn cancel_order(outposts: &Outposts, order_id: &str, case: &str) {
+    let reply = outposts
+        .call(
+            "POST",
+            &format!("/orders/{}/cancel", segment(order_id)),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(
+        reply.status,
+        200,
+        "case {case:?}: expected the cancellation of order {order_id} to be served, got {} {}",
+        reply.status,
+        reply.body
+    );
 }
 
-/// Let every order placed on `outpost_id` FINISH, through the same store seam as
-/// [`cancel_order`]: an Outpost an order is still outstanding on cannot be deleted at
-/// all (`crate::delete_conflicts`), and the clock does not carry an order to a
-/// terminal status on its own. A finished order still subscribes the hardware it
-/// bought, so what the row using this asserts is unchanged.
+/// Let every order placed on `outpost_id` FINISH, through the store seam
+/// [`crate::quote_lifecycle`] ages a quote through: an Outpost an order is still
+/// outstanding on cannot be deleted at all (`crate::delete_conflicts`), and the clock
+/// does not carry an order to a terminal status on its own. A finished order still
+/// subscribes the hardware it bought, so what the row using this asserts is unchanged.
 fn finish_orders_on(outposts: &Outposts, outpost_id: &str, case: &str) {
     let store = outposts.store();
     let mut store = store.lock();
@@ -218,7 +221,7 @@ async fn place_orders(outposts: &Outposts, outpost_id: &str, specs: &[OrderSpec]
         let placed = outposts.ok("POST", "/orders", Some(&body)).await;
         let order_id = text(&placed["Order"], "OrderId");
         if spec.cancelled {
-            cancel_order(outposts, &order_id, case);
+            cancel_order(outposts, &order_id, case).await;
         }
     }
 }
