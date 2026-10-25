@@ -162,9 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A token this service did not issue never silently restarts the listing.
         let after = match input.next_token.as_deref() {
             Some(token) => Some(st::decode_page_token(token).ok_or_else(|| {
-                ListWebAppsErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
-                    message: "The NextToken is not valid".to_string(),
-                })
+                ListWebAppsErrorModeled::InvalidNextTokenException(st::invalid_next_token())
             })?),
             None => None,
         };

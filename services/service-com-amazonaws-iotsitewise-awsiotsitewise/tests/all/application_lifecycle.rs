@@ -187,19 +187,23 @@ fn create_body(case: &CreateCase) -> Value {
 }
 
 /// `CreateApplication` with `body`.
-async fn create(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
+pub(crate) async fn create(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
     call(router, "POST", APPLICATIONS, Some(body)).await
 }
 
 /// `DescribeApplication`.
-async fn describe(router: &MultiServiceRouter, workspace: &str, id: &str) -> (u16, Value) {
+pub(crate) async fn describe(
+    router: &MultiServiceRouter,
+    workspace: &str,
+    id: &str,
+) -> (u16, Value) {
     call(router, "GET", &application_uri(workspace, id), None).await
 }
 
 /// `CreateWorkspace` for `name`, with the service's default encryption: an
 /// application is created IN a workspace, so every suite below opens the
 /// workspace it works in first.
-async fn create_workspace(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn create_workspace(router: &MultiServiceRouter, name: &str) {
     let (status, body) = call(
         router,
         "POST",

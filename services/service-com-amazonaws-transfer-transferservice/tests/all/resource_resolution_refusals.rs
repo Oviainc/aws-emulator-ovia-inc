@@ -367,16 +367,18 @@ async fn delete_access_refuses_every_server_without_a_directory() {
                 )
                 .await;
             let message = assert_invalid_request(&case, &answer);
-            assert!(
-                message.contains("IdentityProviderType")
-                    && message.contains(st::IDENTITY_PROVIDER_AWS_DIRECTORY_SERVICE),
-                "case {case:?}: expected the refusal to name the member and the type an \
-                 access requires, got {message:?}"
+            assert_eq!(
+                message,
+                format!(
+                    "Cannot delete access on server with IdP type: {}",
+                    idp_type_of(&emulator, &server_id)
+                ),
+                "case {case:?}: expected the fixed directory-provider refusal for this \
+                 operation, got {message:?}"
             );
             assert!(
-                !message.contains(external_id),
-                "case {case:?}: the ExternalId was never looked up, so it must not be \
-                 reported as missing; got {message:?}"
+                !message.contains(external_id) && !message.contains(server_id.as_str()),
+                "case {case:?}: the refusal carries nothing the request sent; got {message:?}"
             );
         }
     }
@@ -692,6 +694,20 @@ async fn start_file_transfer_on_a_created_connector_refuses_a_request_naming_no_
             answer.body
         );
     }
+}
+
+/// The `IdentityProviderType` the STORED server resolved to — what the
+/// directory-provider refusal names, read off the record rather than restated by the
+/// test, so a row that sends no `IdentityProviderType` is checked against the type its
+/// server actually has.
+fn idp_type_of(emulator: &Emulator, server_id: &str) -> String {
+    let state = emulator.store();
+    let guard = state.lock();
+    guard
+        .servers
+        .get(server_id)
+        .map(|server| server.identity_provider_type.clone())
+        .unwrap_or_else(|| panic!("the test created server {server_id}"))
 }
 
 /// Seed one access grant on `server_id` — `CreateAccess` is still a scaffolded stub, so
