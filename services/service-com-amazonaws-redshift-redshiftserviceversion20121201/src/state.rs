@@ -2451,6 +2451,41 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             .find(|grant| grant.snapshot_copy_grant_name.as_deref() == Some(name))
     }
 
+    /// The position of the snapshot copy grant with this
+    /// `SnapshotCopyGrantName`, if any.
+    ///
+    /// The name is compared exactly as [`Self::snapshot_copy_grant`] compares
+    /// it. A position rather than a reference, because the delete needs to
+    /// REMOVE the record it finds, and `remove` keeps the insertion order the
+    /// `Marker` cursor pages over.
+    pub fn snapshot_copy_grant_position(&self, name: &str) -> Option<usize> {
+        self.snapshot_copy_grants
+            .iter()
+            .position(|grant| grant.snapshot_copy_grant_name.as_deref() == Some(name))
+    }
+
+    /// The identifier of every cluster this store holds whose cross-region
+    /// snapshot copy is configured to encrypt copied snapshots under the
+    /// snapshot copy grant `name` names, in creation order.
+    ///
+    /// A cluster records the grant its snapshot copy uses on its
+    /// `ClusterSnapshotCopyStatus`, so that membership is the whole of what
+    /// "used by one or more clusters" can mean for this store.
+    pub fn clusters_using_snapshot_copy_grant(&self, name: &str) -> Vec<String> {
+        self.clusters
+            .iter()
+            .filter(|stored| {
+                stored
+                    .cluster
+                    .cluster_snapshot_copy_status
+                    .as_ref()
+                    .and_then(|status| status.snapshot_copy_grant_name.as_deref())
+                    == Some(name)
+            })
+            .filter_map(|stored| stored.cluster.cluster_identifier.clone())
+            .collect()
+    }
+
     /// The position of the registered QEV2 IAM Identity Center application with
     /// this `Qev2IdcApplicationArn`, if any.
     ///

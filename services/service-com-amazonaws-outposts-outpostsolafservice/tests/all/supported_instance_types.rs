@@ -35,11 +35,12 @@
 //!    `ValidationException`.
 //!
 //! Where the recorded assets come from: an asset is a PHYSICAL unit of hardware that
-//! Amazon Web Services installs once an order is fulfilled, so no call in this API
-//! creates one — the rows below therefore record their own hardware on the stored
-//! Outpost through the same store seam [`crate::outpost_assets`] records its assets
-//! through, and then ask over the wire. The emulator is never expected to produce an
-//! asset of its own.
+//! Amazon Web Services installs, so no call in this API creates one — the rows below
+//! therefore record their own hardware on the stored Outpost, while it is still
+//! provisioning, through the same store seam [`crate::outpost_assets`] records its
+//! assets through, and then ask over the wire. What a unit of the hardware an Outpost
+//! settles with reports, and what this report answers when scoped to one of those
+//! units, is [`crate::outpost_hardware_installation`].
 
 use serde_json::{json, Value};
 

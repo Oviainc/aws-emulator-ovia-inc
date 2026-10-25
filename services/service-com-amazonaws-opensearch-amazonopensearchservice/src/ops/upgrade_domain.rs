@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpgradeDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpgradeDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpgradeDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a service-managed engine version upgrade of a domain — or, when the request
+//! asks for a check only, an upgrade eligibility check, which performs no upgrade.
+//!
+//! The run is recorded on the domain as a [`crate::state::UpgradeRun`], the ONE record
+//! `GetUpgradeHistory` reports; the version a domain can be upgraded to is
+//! [`crate::state::compatible_target_versions`]'s answer, the same relation
+//! `GetCompatibleVersions` publishes, so a target that table does not offer is refused
+//! rather than started.
+//!
+//! An upgrade is a configuration change of the domain: it goes
+//! `UpgradingEngineVersion` with its `EngineVersion` option `Processing`, and reports
+//! the version it was upgraded to only once the clock makes the run due.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +175,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpgradeDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpgradeDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpgradeDomain"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The upgrade belongs to the domain the request names, so a name the account
+        // holds no domain under names nothing to upgrade. Settling it first makes the
+        // version this upgrade starts from the version every other reader sees — the
+        // target of an earlier upgrade whose span has passed among them.
+        let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
+            UpgradeDomainErrorModeled::ResourceNotFoundException(crate::state::domain_not_found(
+                &input.domain_name,
+            ))
+        })?;
+
+        // "Allows you to either upgrade your domain or perform an upgrade eligibility
+        // check": the service performs one run at a time, so a call landing while one
+        // is still being performed names that run rather than starting a second.
+        if let Some(running) = domain
+            .latest_upgrade()
+            .filter(|run| run.in_progress(now))
+            .map(|run| run.upgrade_id.clone())
+        {
+            return Err(UpgradeDomainErrorModeled::ResourceAlreadyExistsException(
+                crate::state::upgrade_already_in_progress(&domain.domain_name, &running),
+            )
+            .into());
+        }
+
+        // "OpenSearch or Elasticsearch version to which you want to upgrade": an
+        // upgrade only ever goes to a version the domain's current one can be upgraded
+        // to — the same relation `GetCompatibleVersions` publishes — so a target
+        // outside that set is a malformed request rather than a run that goes nowhere.
+        // This holds for an eligibility check too: whether that upgrade is possible is
+        // the whole of what the check answers.
+        if !crate::state::compatible_target_versions(&domain.engine_version)
+            .iter()
+            .any(|candidate| candidate == &input.target_version)
+        {
+            return Err(UpgradeDomainErrorModeled::ValidationException(
+                crate::state::incompatible_target_version(
+                    &domain.domain_name,
+                    &domain.engine_version,
+                    &input.target_version,
+                ),
+            )
+            .into());
+        }
+
+        // "Only supports the override_main_response_version parameter and not other
+        // advanced options": the options the request carried are kept with the run and
+        // applied to the domain when the upgrade lands, so a check that performs no
+        // upgrade changes none of them.
+        let advanced_options: ::std::collections::BTreeMap<String, String> = input
+            .advanced_options
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        // "When true, indicates that an upgrade eligibility check needs to be
+        // performed": a request that omits it asks for the upgrade itself.
+        let perform_check_only = input.perform_check_only.unwrap_or(false);
+
+        let run = domain.begin_upgrade(
+            &input.target_version,
+            perform_check_only,
+            advanced_options,
+            now,
+        );
+
+        Ok(UpgradeDomainOutput {
+            upgrade_id: Some(run.upgrade_id),
+            domain_name: Some(domain.domain_name.clone()),
+            target_version: Some(run.target_version),
+            perform_check_only: Some(run.perform_check_only),
+            advanced_options: input.advanced_options,
+            // "Container for information about a configuration change happening on a
+            // domain": the change this upgrade started, the same record
+            // `DescribeDomainChangeProgress` answers about. A check starts none, so it
+            // reports none.
+            change_progress_details: if perform_check_only {
+                None
+            } else {
+                domain
+                    .latest_change()
+                    .map(crate::state::ConfigChange::to_details)
+            },
+        })
     }
 }

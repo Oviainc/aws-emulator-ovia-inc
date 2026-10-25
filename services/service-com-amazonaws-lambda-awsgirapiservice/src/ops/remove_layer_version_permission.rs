@@ -15,7 +15,7 @@
 //! policy either way while saying which of the two states the version is in (see
 //! [`crate::state::LayerVersionRecord::policy_read_absence_message`]). A removal has
 //! nothing to act on in either state and refuses with
-//! [`crate::state::LAYER_VERSION_NO_POLICY_MESSAGE`].
+//! [`crate::state::NO_POLICY_MESSAGE`].
 //!
 //! ## Shape of an operation
 //!
@@ -239,7 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ResourceNotFoundException {
                         r#type: None,
                         message: Some(
-                            crate::state::LAYER_VERSION_NO_POLICY_MESSAGE.to_string(),
+                            crate::state::NO_POLICY_MESSAGE.to_string(),
                         ),
                     },
                 )
@@ -249,19 +249,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Only update the policy if the revision ID matches the ID specified." The id
         // to match is the policy's own, which is the one `GetLayerVersionPolicy`
-        // reports.
+        // reports. `PreconditionFailedException` puts every operation but
+        // `AddPermission`/`RemovePermission` on its second branch, so the refusal is the
+        // sentence naming `GetFunction`/`GetAlias`.
         if let Some(expected) = input.revision_id.as_deref() {
             if policy.revision_id != expected {
                 return Err(
                     RemoveLayerVersionPermissionErrorModeled::PreconditionFailedException(
                         PreconditionFailedException {
                             r#type: None,
-                            message: Some(format!(
-                                "The RevisionId ({expected}) provided does not match the latest \
-                                 RevisionId for the resource {resource}. Call \
-                                 GetLayerVersionPolicy to retrieve the latest RevisionId for \
-                                 your resource."
-                            )),
+                            message: Some(
+                                crate::state::CONFIGURATION_REVISION_PRECONDITION_MESSAGE
+                                    .to_string(),
+                            ),
                         },
                     )
                     .into(),

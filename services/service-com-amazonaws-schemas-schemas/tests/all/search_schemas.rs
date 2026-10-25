@@ -34,8 +34,9 @@ const REGISTRY: &str = "search-registry";
 ///
 /// Rows differ along everything the keyword rule generalises over: which of the two
 /// extensions carries the keyword, where in the document they sit (an `OpenApi3`
-/// component, a draft-04 document's own root), the case of the declared text, and
-/// whether the schema declares any event keyword at all.
+/// component, a draft-04 document's own root), the case of the declared text, whether
+/// the schema declares any event keyword at all, and whether the keyword that selects
+/// it comes from its name or from its declared event.
 struct Stored {
     /// The schema's name — which is how it is ADDRESSED, not something it is indexed
     /// under.

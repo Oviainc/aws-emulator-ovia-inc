@@ -270,11 +270,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     (Some(current), Some(expected))
                         if current.revision_id.as_deref() != Some(expected) =>
                     {
-                        // The revision the caller held was superseded, which the service
-                        // reports as a conflict against the resource rather than as a bad
-                        // parameter: the caller is to re-read the policy and retry. The
-                        // text is the error class's own, naming neither the revision
-                        // presented nor the stored one.
+                        // A value the service never issued as a revision id — one in
+                        // another form, or one no update has reached — is a bad PARAMETER:
+                        // no retry can make it match, so it is not the conflict below. The
+                        // well-formedness check comes FIRST and is distinct from the
+                        // comparison against the current revision.
+                        if !store.issued_revision_id(expected) {
+                            return Err(invalid(
+                                crate::state::INVALID_EXPECTED_REVISION_ID_MESSAGE,
+                            ));
+                        }
+                        // The revision the caller held was issued and has since been
+                        // superseded, which the service reports as a conflict against the
+                        // resource rather than as a bad parameter: the caller is to re-read
+                        // the policy and retry. The text is the error class's own, naming
+                        // neither the revision presented nor the stored one.
                         return Err(
                             PutResourcePolicyErrorModeled::OperationAbortedException(
                                 OperationAbortedException {

@@ -243,14 +243,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        if let Some(existing) = store.rule_names.get(&st::rule_name_key(&region, &input.name)) {
+        if store
+            .rule_names
+            .contains_key(&st::rule_name_key(&region, &input.name))
+        {
             return Err(
                 CreateNotificationRuleErrorModeled::ResourceAlreadyExistsException(
                     ResourceAlreadyExistsException {
-                        message: Some(format!(
-                            "A notification rule with the name {:?} already exists in this account and region: {existing}",
-                            input.name
-                        )),
+                        // The service's own fixed text for this error class. It states
+                        // the name-uniqueness rule and nothing of the request or of the
+                        // rule that holds the name — see `st::RULE_NAME_ALREADY_IN_USE`.
+                        message: Some(st::RULE_NAME_ALREADY_IN_USE.to_string()),
                     },
                 )
                 .into(),

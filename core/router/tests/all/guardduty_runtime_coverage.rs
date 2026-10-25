@@ -5,8 +5,9 @@
 //!
 //! This suite needs more than one service on one engine — GuardDuty reaches EC2 and
 //! Amazon EKS through the in-process callback, so a single-service router has nobody to
-//! ask — which is why it lives here rather than in the GuardDuty crate, whose own suite
-//! (`coverage_listing.rs`) covers the refusals and the empty report.
+//! ask — which is why it lives here rather than in the GuardDuty crate, whose own suites
+//! (`coverage_listing.rs` and `coverage_statistics.rs`) cover the refusals and the empty
+//! report.
 //!
 //! The rules under test, each asserted over a SET of inputs rather than one recorded
 //! call:
@@ -26,10 +27,15 @@
 //!   names (`Equals` admitting, `NotEquals` excluding, several criteria all holding),
 //!   `sortCriteria` orders it by any of the sort keys in either direction, and
 //!   `maxResults`/`nextToken` page it with every row appearing exactly once.
+//! * THE COUNTS. `GetCoverageStatistics` aggregates those same rows: each map the
+//!   request names carries one entry per group at least one of the admitted resources
+//!   falls into, and the entries sum to the number of rows the list reports for the
+//!   same criteria — so the count and the list cannot disagree about one resource.
 //!
 //! Assembling the whole router costs stack (see `boot_serve.rs`), so it is built — and
 //! the requests driven — on a sized thread.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -238,6 +244,81 @@ fn row_of<'rows>(
         .find(|row| text_at(row, &["resourceId"]) == id)
         .unwrap_or_else(|| panic!("case {case:?}: expected a row for {id:?}, got {rows:?}"))
 }
+
+/// One `GetCoverageStatistics` answer's `coverageStatistics`, failing the test unless
+/// the call succeeded and reported one.
+fn coverage_statistics(
+    router: &MultiServiceRouter,
+    runtime: &tokio::runtime::Runtime,
+    detector_id: &str,
+    body: serde_json::Value,
+    case: &str,
+) -> serde_json::Value {
+    let answer = guardduty(
+        router,
+        runtime,
+        "POST",
+        &format!("/detector/{detector_id}/coverage/statistics"),
+        Some(body),
+    );
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: get-coverage-statistics expected 200, got {answer:?}"
+    );
+    answer
+        .body
+        .get("coverageStatistics")
+        .cloned()
+        .unwrap_or_else(|| panic!("case {case:?}: expected coverageStatistics, got {answer:?}"))
+}
+
+/// How many of `rows` carry each value at `path`: the histogram a count statistic has to
+/// agree with, computed from the rows the list reports rather than written down.
+fn histogram(rows: &[serde_json::Value], path: &[&str]) -> BTreeMap<String, u64> {
+    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+    for row in rows {
+        *counts.entry(text_at(row, path)).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// One reported count map, as a comparable histogram. The member must be PRESENT: a
+/// statistic the request named is answered even when it counts nothing.
+fn reported_histogram(
+    statistics: &serde_json::Value,
+    member: &str,
+    case: &str,
+) -> BTreeMap<String, u64> {
+    let map = statistics
+        .get(member)
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or_else(|| panic!("case {case:?}: expected the map {member}, got {statistics:?}"));
+    map.iter()
+        .map(|(key, value)| {
+            let count = value.as_u64().unwrap_or_else(|| {
+                panic!("case {case:?}: expected a numeric count for {key:?}, got {value:?}")
+            });
+            (key.clone(), count)
+        })
+        .collect()
+}
+
+/// The `CoverageStatisticsType` members, with the `CoverageStatistics` member each one
+/// fills and the row attribute it groups by
+/// (`smithy_query(shape="CoverageStatisticsType")`,
+/// `smithy_query(shape="CoverageStatistics")`).
+const STATISTICS: [(&str, &str, &[&str]); 2] = [
+    (
+        "COUNT_BY_RESOURCE_TYPE",
+        "countByResourceType",
+        &["resourceDetails", "resourceType"],
+    ),
+    (
+        "COUNT_BY_COVERAGE_STATUS",
+        "countByCoverageStatus",
+        &["coverageStatus"],
+    ),
+];
 
 /// A `features` entry for a `CreateDetector`/`UpdateDetector` body.
 fn feature(name: &str, status: &str, additional: &[(&str, &str)]) -> serde_json::Value {
@@ -650,19 +731,64 @@ fn guardduty_reports_the_runtime_coverage_of_the_accounts_own_resources() {
                 ),
             ];
             for (case, criterion, expected) in filter_rows {
-                let rows = coverage_rows(
-                    &router,
-                    &runtime,
-                    &detector_id,
-                    serde_json::json!({"filterCriteria": {"filterCriterion": criterion}}),
-                    &case,
-                );
+                let filter =
+                    serde_json::json!({"filterCriteria": {"filterCriterion": criterion}});
+                let rows =
+                    coverage_rows(&router, &runtime, &detector_id, filter.clone(), &case);
                 let mut got = row_ids(&rows);
                 got.sort();
                 assert_eq!(
                     got, expected,
                     "case {case:?}: expected the rows {expected:?}, got {got:?}"
                 );
+
+                // ---------------------------------------------------------------
+                // RULE: the counts are those same rows, grouped. Asserted under the
+                // SAME criteria, so a count computed over anything else than the
+                // resources the request admits cannot pass.
+                // ---------------------------------------------------------------
+                let mut body = filter.clone();
+                body["statisticsType"] = serde_json::json!(
+                    STATISTICS.map(|(kind, _, _)| kind)
+                );
+                let statistics =
+                    coverage_statistics(&router, &runtime, &detector_id, body, &case);
+                for (_, member, path) in STATISTICS {
+                    let expected_counts = histogram(&rows, path);
+                    let reported = reported_histogram(&statistics, member, &case);
+                    assert_eq!(
+                        reported, expected_counts,
+                        "case {case:?}: {member} must count the rows the same criteria select, got {statistics:?}"
+                    );
+                    assert_eq!(
+                        reported.values().sum::<u64>(),
+                        rows.len() as u64,
+                        "case {case:?}: the entries of {member} must sum to the reported rows, got {statistics:?}"
+                    );
+                }
+
+                // Only the statistic the request names is answered: a client reading a
+                // map it did not ask for would read an absence as "no resources".
+                for (kind, member, path) in STATISTICS {
+                    let case = format!("{case}, {kind} alone");
+                    let mut body = filter.clone();
+                    body["statisticsType"] = serde_json::json!([kind]);
+                    let statistics =
+                        coverage_statistics(&router, &runtime, &detector_id, body, &case);
+                    assert_eq!(
+                        reported_histogram(&statistics, member, &case),
+                        histogram(&rows, path),
+                        "case {case:?}: got {statistics:?}"
+                    );
+                    for (_, other, _) in STATISTICS {
+                        if other != member {
+                            assert!(
+                                statistics.get(other).is_none_or(serde_json::Value::is_null),
+                                "case {case:?}: {other} was not asked for, got {statistics:?}"
+                            );
+                        }
+                    }
+                }
             }
 
             // ---------------------------------------------------------------

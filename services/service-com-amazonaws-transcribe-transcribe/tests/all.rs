@@ -23,6 +23,8 @@ mod call_analytics_job_delete;
 mod call_analytics_job_results;
 #[path = "all/call_analytics_job_start_limits.rs"]
 mod call_analytics_job_start_limits;
+#[path = "all/call_analytics_job_tagging.rs"]
+mod call_analytics_job_tagging;
 #[path = "all/call_analytics_jobs.rs"]
 mod call_analytics_jobs;
 #[path = "all/call_analytics_rule_time_ranges.rs"]
@@ -49,6 +51,8 @@ mod medical_scribe_jobs;
 mod medical_scribe_settings_references;
 #[path = "all/medical_transcription_job_listing.rs"]
 mod medical_transcription_job_listing;
+#[path = "all/medical_transcription_job_name_lifetime.rs"]
+mod medical_transcription_job_name_lifetime;
 #[path = "all/medical_transcription_jobs.rs"]
 mod medical_transcription_jobs;
 #[path = "all/medical_vocabularies.rs"]

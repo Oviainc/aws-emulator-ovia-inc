@@ -442,8 +442,9 @@ async fn the_unsupported_type_message_is_a_constant() {
 async fn a_refused_value_renders_in_the_members_modelled_type() {
     let emulator = Emulator::new();
 
-    // `None` means the boundary ACCEPTS the row, so it reaches the operation —
-    // `UpdateMapRun` is still a scaffold, which answers 501 `NotImplemented`.
+    // `None` means the boundary ACCEPTS the row, so it reaches the operation — and
+    // the Map Run ARN below names no record, which `UpdateMapRun` refuses with its
+    // own modelled `ResourceNotFound`.
     let cases: Vec<(&str, &str, Value, Option<String>)> = vec![
         // `toleratedFailurePercentage` targets `ToleratedFailurePercentage`,
         // modelled `float` with range 0..100
@@ -591,13 +592,13 @@ async fn a_refused_value_renders_in_the_members_modelled_type() {
             None => {
                 let (status, code, message) = failure(&emulator, case, operation, &body).await;
                 assert_eq!(
-                    status, 501,
-                    "case {case:?}: expected the boundary to accept the value and the scaffold to \
-                     answer 501, got {status} with message {message:?}"
+                    status, 404,
+                    "case {case:?}: expected the boundary to accept the value and the operation \
+                     to refuse the absent Map Run, got {status} with message {message:?}"
                 );
                 assert_eq!(
-                    code, "NotImplemented",
-                    "case {case:?}: expected error code NotImplemented, got {code:?}"
+                    code, "ResourceNotFound",
+                    "case {case:?}: expected error code ResourceNotFound, got {code:?}"
                 );
             }
         }

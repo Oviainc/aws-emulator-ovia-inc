@@ -21,6 +21,8 @@ mod api_lifecycle;
 mod api_reimport;
 #[path = "all/api_update.rs"]
 mod api_update;
+#[path = "all/authorizer_deletion.rs"]
+mod authorizer_deletion;
 #[path = "all/authorizer_lifecycle.rs"]
 mod authorizer_lifecycle;
 #[path = "all/cors_configuration.rs"]
@@ -71,6 +73,8 @@ mod portal_product_update;
 mod portal_publication;
 #[path = "all/portal_update.rs"]
 mod portal_update;
+#[path = "all/product_page_lifecycle.rs"]
+mod product_page_lifecycle;
 #[path = "all/product_rest_endpoint_page_lifecycle.rs"]
 mod product_rest_endpoint_page_lifecycle;
 #[path = "all/product_rest_endpoint_page_update.rs"]

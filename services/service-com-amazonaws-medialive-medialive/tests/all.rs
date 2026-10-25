@@ -212,6 +212,9 @@ mod partner_input;
 #[path = "all/rejection_messages.rs"]
 mod rejection_messages;
 
+#[path = "all/reserved_tag_namespace.rs"]
+mod reserved_tag_namespace;
+
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 

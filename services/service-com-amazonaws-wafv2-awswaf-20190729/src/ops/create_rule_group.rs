@@ -414,6 +414,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 rule_group,
                 lock_token,
                 tags: input.tags.unwrap_or_default(),
+                // A rule group is created unshared: a permission policy is attached
+                // by `PutPermissionPolicy`, never by the create call, which models no
+                // policy member at all.
+                permission_policy: None,
             },
         );
         crate::state::audit("CreateRuleGroup", &input.scope, &input.name, &id, "created");

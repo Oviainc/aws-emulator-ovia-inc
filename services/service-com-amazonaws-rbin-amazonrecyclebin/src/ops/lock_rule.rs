@@ -198,23 +198,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You can't lock tag-level retention rules, or Region-level retention rules
         // that have exclusion tags." A rule carrying resource tags is tag-level; one
         // carrying exclusion tags is a Region-level rule with exclusions. For neither
-        // can a lock request be completed.
-        if !rule.resource_tags.is_empty() {
+        // can a lock request be completed — the same decision `CreateRule` makes about a
+        // rule it has not minted yet.
+        if let Some(blocker) = rule.unlockable() {
             return Err(LockRuleErrorModeled::ConflictException(
                 crate::state::rule_state_conflict(
                     crate::state::BlockedAction::Lock,
                     &rule.identifier,
-                    crate::state::BlockingCondition::TagLevelRule,
-                ),
-            )
-            .into());
-        }
-        if !rule.exclude_resource_tags.is_empty() {
-            return Err(LockRuleErrorModeled::ConflictException(
-                crate::state::rule_state_conflict(
-                    crate::state::BlockedAction::Lock,
-                    &rule.identifier,
-                    crate::state::BlockingCondition::RuleWithExclusionTags,
+                    blocker.blocking_condition(),
                 ),
             )
             .into());

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDelivery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDelivery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: pairs one stored delivery source with one stored delivery destination,
+//! minting the delivery `DescribeDeliveries` and `GetDelivery` then report. This is the
+//! ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`CreateDelivery::handle`] with real behaviour and
@@ -179,18 +179,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDelivery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDeliveryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDelivery"))
+        // The ARN of the delivery this call creates names the Region the request was signed
+        // for, so it is read off the request's credential scope.
+        let region = crate::state::request_region(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDeliveryError::from(CreateDeliveryErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let mut store = state.lock();
+
+        let not_found = |message: &str| {
+            CreateDeliveryError::from(CreateDeliveryErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(message.to_string()),
+                },
+            ))
+        };
+
+        // "The ARN of the delivery destination to use for this delivery": a value that is
+        // not an ARN at all names no destination, which is a request-shape problem rather
+        // than a missing resource.
+        if let Some(message) = crate::state::unparsable_arn_message(
+            "deliveryDestinationArn",
+            &input.delivery_destination_arn,
+        ) {
+            return Err(CreateDeliveryErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // A delivery pairs "a logical delivery source and a logical delivery destination that
+        // you have already created", so BOTH have to be in the account before this call can
+        // connect them. The source is checked first, in the order the request names them.
+        if !store.delivery_sources.contains_key(&input.delivery_source_name) {
+            return Err(not_found(
+                crate::state::DELIVERY_SOURCE_NOT_FOUND_MESSAGE,
+            ));
+        }
+        if store
+            .delivery_destination_by_arn(&input.delivery_destination_arn)
+            .is_none()
+        {
+            return Err(not_found(
+                crate::state::DELIVERY_DESTINATION_NOT_FOUND_MESSAGE,
+            ));
+        }
+        // "Displays whether the delivery destination associated with this delivery is
+        // CloudWatch Logs, Amazon S3, Firehose, or X-Ray": that is a fact about the
+        // DESTINATION, which carries it, rather than about the logical destination's own ARN
+        // — so it is read off the stored destination.
+        let delivery_destination_type = store
+            .delivery_destination_by_arn(&input.delivery_destination_arn)
+            .and_then(|destination| destination.delivery_destination_type.clone());
+
+        // "Use CreateDelivery to create a delivery by pairing exactly one delivery source and
+        // one delivery destination": the PAIR is what a delivery is, so a second create of a
+        // pair the account already holds is the conflict the operation models ("This
+        // operation attempted to create a resource that already exists") rather than a second
+        // delivery of the same pair.
+        if let Some(existing) = store.deliveries.values().find(|delivery| {
+            delivery.delivery_source_name == input.delivery_source_name
+                && delivery.delivery_destination_arn == input.delivery_destination_arn
+        }) {
+            return Err(CreateDeliveryErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "A delivery already exists between delivery source {} and delivery \
+                         destination {}: {}",
+                        input.delivery_source_name, input.delivery_destination_arn, existing.id
+                    )),
+                },
+            )
+            .into());
+        }
+        if store.deliveries.len() >= crate::state::MAX_DELIVERIES {
+            return Err(CreateDeliveryErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "an account can have up to {} deliveries",
+                        crate::state::MAX_DELIVERIES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The id and the ARN are the service's to mint, and the destination TYPE is a fact
+        // about the destination resource rather than a value the request carries: all three
+        // are derived rather than taken from the caller.
+        let id = crate::state::mint_delivery_id(store.take_delivery_seq());
+        let mut record = crate::state::DeliveryRecord::new(
+            &id,
+            &region,
+            &input.delivery_source_name,
+            &input.delivery_destination_arn,
+        );
+        record.delivery_destination_type = delivery_destination_type;
+        // "The list of record fields to be delivered to the destination, in order": stored as
+        // given, and left absent when the request named no list at all, which is not the same
+        // as the empty list it may name.
+        record.record_fields = input.record_fields.clone();
+        record.field_delimiter = input.field_delimiter.clone();
+        record.s3_delivery_configuration = input.s3_delivery_configuration.clone();
+        record.tags = input
+            .tags
+            .as_ref()
+            .map(|tags| {
+                tags.iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        store.deliveries.insert(id.clone(), record);
+
+        Ok(CreateDeliveryOutput {
+            // "A structure that contains information about the delivery that you just
+            // created" — read back out of the store, so what this call reports is what
+            // `GetDelivery` and `DescribeDeliveries` report afterwards.
+            delivery: store
+                .deliveries
+                .get(&id)
+                .map(crate::state::DeliveryRecord::reported),
+        })
     }
 }

@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reads the X.509 certificate the request carries, refuses a body or a
+//! private key that breaks one of the guidelines this operation documents, and stores
+//! ONE certificate record whose every reported fact is read out of that certificate —
+//! the names it covers, its subject and issuer, its serial, its validity window, its
+//! key and signature algorithms and its key-usage extensions — typed `IMPORTED`,
+//! already `ISSUED`, with the key pair origin of a key the client generated. The
+//! response is the ARN that record is stored under, so `DescribeCertificate` and the
+//! list and search operations report the imported certificate rather than anything
+//! this service invented.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A request that names `CertificateArn` replaces the certificate stored under it
+//! ("include this argument only when you want to replace a previously imported
+//! certificate") instead of minting a second ARN, keeping the ACM resource's own
+//! facts — its tags and the resources using it.
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +125,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::x509_cert::der::asn1::{Any, Ia5StringRef, PrintableStringRef, Utf8StringRef};
+use ::x509_cert::der::oid::AssociatedOid;
+use ::x509_cert::der::{Decode, DecodePem};
+use ::x509_cert::ext::pkix;
+use ::x509_cert::name::Name;
+use ::x509_cert::spki::{ObjectIdentifier, SubjectPublicKeyInfoOwned};
+// The modelled `Certificate*` shapes come in through the glob above, so the X.509
+// object is named apart from them.
+use ::x509_cert::Certificate as X509Certificate;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -196,18 +211,721 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportCertificate"))
+        // Unreachable in the assembled emulator (the engine is the shared store), and
+        // this operation models no server fault, so the modelled validation failure is
+        // the one honest answer left.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ImportCertificateErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some("the acm certificate store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // ONE instant answers the whole request: it decides whether the certificate is
+        // inside its own validity window, materialises what the clock already owes the
+        // store, and dates the import.
+        let now = ::std::time::SystemTime::now();
+
+        // Everything the record will report comes from the bodies the request carries,
+        // read before the store is touched, so a refused import changes nothing.
+        let imported = imported_certificate(&input, now)?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        // "To import a new certificate, omit the CertificateArn argument. Include this
+        // argument only when you want to replace a previously imported certificate"
+        // (`ImportCertificate` doc).
+        if let Some(target) = input.certificate_arn.as_deref() {
+            if crate::state::certificate_id_from_arn(target).is_none() {
+                return Err(ImportCertificateErrorModeled::InvalidArnException(
+                    InvalidArnException {
+                        message: Some(crate::state::invalid_arn_message(target)),
+                    },
+                )
+                .into());
+            }
+            // "You cannot apply tags when reimporting a certificate"
+            // (`ImportCertificateRequest$Tags` doc).
+            if input.tags.is_some() {
+                return Err(invalid_parameter(
+                    "tags cannot be applied when reimporting a certificate",
+                ));
+            }
+            let Some(existing) = store.certificates.get_mut(target) else {
+                return Err(ImportCertificateErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::certificate_not_found_message(target)),
+                    },
+                )
+                .into());
+            };
+            // The argument names "an imported certificate to replace"
+            // (`ImportCertificateRequest$CertificateArn` doc): a certificate ACM issued
+            // is not one, and a revoked certificate has nothing left to replace —
+            // "revoking a certificate is permanent" (`RevokeCertificate` doc).
+            if !existing.is_imported() {
+                return Err(invalid_parameter(format!(
+                    "the certificate {target} was not imported, so an import cannot replace it"
+                )));
+            }
+            if existing.is_revoked() {
+                return Err(invalid_parameter(format!(
+                    "the certificate {target} is revoked, and a revocation is permanent"
+                )));
+            }
+            // A reimport replaces the CERTIFICATE, not the ACM resource it is stored
+            // as: the tags it carries, the resources using it, the options it was
+            // created with and the instant it first entered the store stay as they are,
+            // and everything the new certificate itself decides is replaced.
+            let replaced = imported.record(target.to_string(), existing.tags.clone(), now);
+            *existing = crate::state::Certificate {
+                in_use_by: existing.in_use_by.clone(),
+                options: existing.options.clone(),
+                created_at: existing.created_at,
+                exported: existing.exported,
+                ..replaced
+            };
+            return Ok(ImportCertificateOutput {
+                certificate_arn: Some(target.to_string()),
+            });
+        }
+
+        let tags = crate::state::tag_map(input.tags.as_deref().unwrap_or_default()).map_err(
+            |message| {
+                ImportCertificateErrorModeled::InvalidTagException(InvalidTagException {
+                    message: Some(message),
+                })
+            },
+        )?;
+
+        // The cap on the WHOLE store, checked first because it is the one bound nothing
+        // in the request can partition: the Region an ARN is minted in comes off the
+        // caller's own credential scope, so the per-Region quota alone would let a
+        // caller that varies the Region string grow the store without limit.
+        let stored = store.certificates.len();
+        let tokens = store.idempotency.len();
+        if stored >= crate::state::CERTIFICATE_STORE_LIMIT
+            || tokens >= crate::state::CERTIFICATE_STORE_LIMIT
+        {
+            // Name whichever count reached the cap, so the refusal says what is full.
+            let (full, held) = if stored >= crate::state::CERTIFICATE_STORE_LIMIT {
+                ("ACM certificates", stored)
+            } else {
+                ("certificate idempotency tokens", tokens)
+            };
+            return Err(ImportCertificateErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this emulator already holds {held} {full}, the most it stores ({})",
+                        crate::state::CERTIFICATE_STORE_LIMIT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The per-account certificate quota: refused BEFORE the record is inserted, so
+        // the store cannot grow past it however many times the call is repeated.
+        if store.certificates.len() >= crate::state::CERTIFICATE_LIMIT {
+            let held = store.certificates.len();
+            return Err(ImportCertificateErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this account already holds {held} ACM certificates, the quota of {} for this Region",
+                        crate::state::CERTIFICATE_LIMIT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let certificate_id = uuid::Uuid::new_v4().to_string();
+        let arn = crate::state::certificate_arn(&region, &certificate_id);
+        let certificate = imported.record(arn.clone(), tags, now);
+        store.certificates.insert(arn.clone(), certificate);
+
+        Ok(ImportCertificateOutput {
+            certificate_arn: Some(arn),
+        })
     }
+}
+
+/// `InvalidParameterException` ("an input parameter was invalid"), the refusal ACM
+/// answers for a request whose bodies break one of the guidelines this operation's own
+/// documentation lists for a third-party certificate.
+fn invalid_parameter(message: impl Into<String>) -> ImportCertificateError {
+    ImportCertificateErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// What one import reads out of the bodies the request carries. Every member is a fact
+/// of the certificate itself, so the stored record reports the certificate the client
+/// brought rather than the request's own framing.
+struct ImportedCertificate {
+    /// The certificate's primary name: its subject common name, or its first DNS
+    /// subject alternative name when the subject names none.
+    domain_name: String,
+    /// Every name the certificate covers: [`Self::domain_name`] first, then the DNS
+    /// subject alternative names, deduplicated.
+    subject_alternative_names: Vec<String>,
+    /// The subject distinguished name, as RFC 4514 writes one.
+    subject: String,
+    /// The issuer distinguished name — "the name of the certificate authority that
+    /// issued and signed the certificate" (`CertificateDetail$Issuer` doc).
+    issuer: String,
+    /// The X.509 serial number, lowercase hex of its big-endian bytes (the form the
+    /// sibling Private CA service reports a serial in).
+    serial: String,
+    /// A `KeyAlgorithm` value, decided by the public key's own algorithm and size.
+    key_algorithm: String,
+    /// A `<digest>WITH<key family>` signature algorithm, or `None` for a signature
+    /// algorithm this service has no spelling for — an absent member rather than a
+    /// wrong one.
+    signature_algorithm: Option<String>,
+    /// The `KeyUsageName` values of the certificate's Key Usage extension.
+    key_usages: Vec<String>,
+    /// The `ExtendedKeyUsageName` values of its Extended Key Usage extension.
+    extended_key_usages: Vec<String>,
+    not_before: ::std::time::SystemTime,
+    not_after: ::std::time::SystemTime,
+}
+
+impl ImportedCertificate {
+    /// The certificate record this import stores under `arn`, carrying `tags`.
+    ///
+    /// An imported certificate is already signed, so there is nothing for ACM to
+    /// validate and nothing the clock owes it: it is stored `ISSUED`, with no
+    /// validation record and no validation method, and "ACM does not provide managed
+    /// renewal for certificates that you import" (`ImportCertificate` doc) so it is
+    /// never eligible for renewal.
+    fn record(
+        self,
+        arn: String,
+        tags: ::std::collections::BTreeMap<String, String>,
+        now: ::std::time::SystemTime,
+    ) -> crate::state::Certificate {
+        crate::state::Certificate {
+            arn,
+            domain_name: self.domain_name,
+            subject_alternative_names: self.subject_alternative_names,
+            status: crate::state::STATUS_ISSUED.to_string(),
+            cert_type: crate::state::TYPE_IMPORTED.to_string(),
+            key_algorithm: self.key_algorithm,
+            subject: Some(self.subject),
+            issuer: Some(self.issuer),
+            signature_algorithm: self.signature_algorithm,
+            // The client generated this key pair and sent the private key with the
+            // certificate.
+            key_pair_origin: crate::state::KEY_PAIR_ORIGIN_CUSTOMER_PROVIDED.to_string(),
+            validation_method: None,
+            domain_validations: Vec::new(),
+            options: None,
+            certificate_authority_arn: None,
+            managed_by: None,
+            renewal_eligibility: crate::state::RENEWAL_INELIGIBLE.to_string(),
+            failure_reason: None,
+            pending_validation: None,
+            in_use_by: Vec::new(),
+            // The X.509 extensions the imported certificate itself carries.
+            key_usages: self.key_usages,
+            extended_key_usages: self.extended_key_usages,
+            exported: false,
+            validation_email_sent_at: None,
+            pending_validation_email: None,
+            revoked_at: None,
+            revocation_reason: None,
+            created_at: now,
+            // `IssuedAt` "exists only when the certificate type is AMAZON_ISSUED"
+            // (`CertificateDetail$IssuedAt` doc); the instant that belongs to this
+            // certificate is the one it was imported at.
+            issued_at: None,
+            imported_at: Some(now),
+            serial: Some(self.serial),
+            // The validity window is the certificate's own, not a window ACM chose.
+            not_before: Some(self.not_before),
+            not_after: Some(self.not_after),
+            tags,
+        }
+    }
+}
+
+/// Read the request's bodies as the certificate they carry, refusing anything this
+/// operation's documented guidelines exclude:
+///
+/// * "The certificate, private key, and certificate chain must be PEM-encoded";
+/// * "The private key must be unencrypted";
+/// * "You must enter the private key that matches the certificate you are importing";
+/// * "The current time must be between the Not Before and Not After certificate
+///   fields";
+/// * "The Issuer field must not be empty".
+///
+/// A key whose algorithm or size is outside the `KeyAlgorithm` enum is refused too:
+/// ACM has no `KeyAlgorithm` to report such a certificate under. A chain is held to
+/// the one link that needs no signature verification — its first certificate is the
+/// one that issued the certificate being imported, so its SUBJECT is that
+/// certificate's issuer — and a chain of some other authority is refused rather than
+/// stored beside a certificate it says nothing about. Nothing here verifies a
+/// signature: no key of the issuing authority is reachable from this service.
+fn imported_certificate(
+    input: &ImportCertificateInput,
+    now: ::std::time::SystemTime,
+) -> Result<ImportedCertificate, ImportCertificateError> {
+    let certificate = X509Certificate::from_pem(&input.certificate).map_err(|_| {
+        invalid_parameter("the Certificate must be one PEM-encoded X.509 certificate")
+    })?;
+
+    if let Some(chain) = input.certificate_chain.as_deref() {
+        let chain = X509Certificate::load_pem_chain(chain).map_err(|_| {
+            invalid_parameter("the CertificateChain must be PEM-encoded X.509 certificates")
+        })?;
+        let Some(issuer) = chain.first() else {
+            return Err(invalid_parameter(
+                "the CertificateChain must carry at least one PEM-encoded X.509 certificate",
+            ));
+        };
+        // A chain "consists of the certificate of the issuing CA and the intermediate
+        // certificates of any other subordinate CAs" (`GetCertificate` doc), so its
+        // first certificate is the one that issued this certificate: its subject is
+        // this certificate's issuer. A chain whose first certificate names another
+        // subject belongs to some other authority and says nothing about the
+        // certificate it was sent with.
+        if issuer.tbs_certificate.subject != certificate.tbs_certificate.issuer {
+            return Err(invalid_parameter(
+                "the CertificateChain must begin with the certificate of the authority that \
+                 issued the Certificate",
+            ));
+        }
+    }
+
+    let tbs = &certificate.tbs_certificate;
+
+    if tbs.issuer.0.is_empty() {
+        return Err(invalid_parameter(
+            "the certificate's Issuer field must not be empty",
+        ));
+    }
+
+    let not_before = tbs.validity.not_before.to_system_time();
+    let not_after = tbs.validity.not_after.to_system_time();
+    if now < not_before || now > not_after {
+        return Err(invalid_parameter(
+            "the current time must be between the certificate's Not Before and Not After fields",
+        ));
+    }
+
+    // The name set the certificate covers: its subject common name first, then the DNS
+    // names of its Subject Alternative Name extension, each name once however often
+    // the certificate carries it.
+    let mut names: Vec<String> = Vec::new();
+    for name in attribute_value(&tbs.subject, oid::COMMON_NAME)
+        .into_iter()
+        .chain(dns_names(&certificate))
+    {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    let Some(domain_name) = names.first().cloned() else {
+        return Err(invalid_parameter(
+            "the certificate must carry a subject common name or a DNS subject alternative name",
+        ));
+    };
+
+    let public_key = public_key(&tbs.subject_public_key_info).ok_or_else(|| {
+        invalid_parameter(
+            "the certificate's public key algorithm and size are not ones ACM supports",
+        )
+    })?;
+    check_private_key(&input.private_key, &public_key)?;
+
+    Ok(ImportedCertificate {
+        domain_name,
+        subject_alternative_names: names,
+        subject: tbs.subject.to_string(),
+        issuer: tbs.issuer.to_string(),
+        serial: ::hex::encode(tbs.serial_number.as_bytes()),
+        key_algorithm: public_key.key_algorithm,
+        signature_algorithm: signature_algorithm(&certificate.signature_algorithm.oid),
+        key_usages: key_usage_names(&certificate),
+        extended_key_usages: extended_key_usage_names(&certificate),
+        not_before,
+        not_after,
+    })
+}
+
+/// The public key a certificate's `SubjectPublicKeyInfo` carries, with the
+/// `KeyAlgorithm` it is reported under: `RSA_<size>` for an RSA key, taken from the
+/// modulus' own bit length, and `EC_<curve>` for an elliptic-curve key, taken from the
+/// named curve its parameters carry.
+///
+/// `None` for a key of any other algorithm, or an RSA key of a size the `KeyAlgorithm`
+/// enum does not declare — ACM reports a certificate under one of those values or not
+/// at all.
+fn public_key(spki: &SubjectPublicKeyInfoOwned) -> Option<PublicKey> {
+    let bits = spki.subject_public_key.as_bytes()?;
+    if spki.algorithm.oid == oid::RSA_ENCRYPTION {
+        let key = ::pkcs1::RsaPublicKey::from_der(bits).ok()?;
+        let modulus = key.modulus.as_bytes().to_vec();
+        let exponent = key.public_exponent.as_bytes().to_vec();
+        let size = integer_bits(&modulus);
+        // The RSA sizes `KeyAlgorithm` declares
+        // (`smithy_query(query="shape", shape="com.amazonaws.acm#KeyAlgorithm")`).
+        if ![1024, 2048, 3072, 4096].contains(&size) {
+            return None;
+        }
+        Some(PublicKey {
+            key_algorithm: format!("RSA_{size}"),
+            material: KeyMaterial::Rsa { modulus, exponent },
+        })
+    } else if spki.algorithm.oid == oid::EC_PUBLIC_KEY {
+        // The named curve the key's algorithm parameters carry (RFC 5480 section
+        // 2.1.1).
+        let curve = spki
+            .algorithm
+            .parameters
+            .as_ref()?
+            .decode_as::<ObjectIdentifier>()
+            .ok()?;
+        // The elliptic curves `KeyAlgorithm` declares, each under the name that enum
+        // spells it with.
+        let key_algorithm = if curve == oid::PRIME256V1 {
+            "EC_prime256v1"
+        } else if curve == oid::SECP384R1 {
+            "EC_secp384r1"
+        } else if curve == oid::SECP521R1 {
+            "EC_secp521r1"
+        } else {
+            return None;
+        };
+        Some(PublicKey {
+            key_algorithm: key_algorithm.to_string(),
+            material: KeyMaterial::Ec {
+                point: bits.to_vec(),
+            },
+        })
+    } else {
+        None
+    }
+}
+
+/// A certificate's public key: the `KeyAlgorithm` it is reported under, and the
+/// material the private key sent with it has to agree with.
+struct PublicKey {
+    key_algorithm: String,
+    material: KeyMaterial,
+}
+
+/// The public-key material of each key family ACM supports, as the matching private
+/// key also carries it.
+enum KeyMaterial {
+    /// RFC 8017 `RSAPublicKey`: the modulus and the public exponent, which an
+    /// `RSAPrivateKey` for the same key pair repeats verbatim.
+    Rsa { modulus: Vec<u8>, exponent: Vec<u8> },
+    /// SEC1 section 2.3.3 encoding of the public point, which an `ECPrivateKey` for
+    /// the same key pair may carry beside its secret scalar.
+    Ec { point: Vec<u8> },
+}
+
+/// Refuse a `PrivateKey` that is not an unencrypted PEM-encoded private key for
+/// `public`.
+///
+/// "You must enter the private key that matches the certificate you are importing. The
+/// private key must be unencrypted" (`ImportCertificate` doc): the key is read as the
+/// PKCS#8 `PrivateKeyInfo`, PKCS#1 `RSAPrivateKey` or SEC1 `ECPrivateKey` its PEM label
+/// frames (RFC 7468 sections 10, 11 and 13), and the public key it belongs to is
+/// compared with the certificate's. An encrypted key carries a label of its own
+/// ("ENCRYPTED PRIVATE KEY") and is refused by the same match.
+///
+/// Nothing here derives a public key from a secret scalar — no key material leaves
+/// this function, and none is stored — so an `ECPrivateKey` that omits the optional
+/// public key it may carry (SEC1 appendix C.4) is checked on its algorithm alone.
+fn check_private_key(
+    private_key: &[u8],
+    public: &PublicKey,
+) -> Result<(), ImportCertificateError> {
+    let malformed = || {
+        invalid_parameter("the PrivateKey must be an unencrypted PEM-encoded private key")
+    };
+    let mismatched = || {
+        invalid_parameter("the PrivateKey does not match the public key in the certificate")
+    };
+
+    let text = ::std::str::from_utf8(private_key).map_err(|_| malformed())?;
+    let (label, document) = ::pkcs8::SecretDocument::from_pem(text).map_err(|_| malformed())?;
+    let (algorithm, key) = match label {
+        "PRIVATE KEY" => {
+            let info =
+                ::pkcs8::PrivateKeyInfo::try_from(document.as_bytes()).map_err(|_| malformed())?;
+            (info.algorithm.oid, info.private_key)
+        }
+        "RSA PRIVATE KEY" => (oid::RSA_ENCRYPTION, document.as_bytes()),
+        "EC PRIVATE KEY" => (oid::EC_PUBLIC_KEY, document.as_bytes()),
+        _ => return Err(malformed()),
+    };
+
+    match &public.material {
+        KeyMaterial::Rsa { modulus, exponent } => {
+            if algorithm != oid::RSA_ENCRYPTION {
+                return Err(mismatched());
+            }
+            let key = ::pkcs1::RsaPrivateKey::from_der(key).map_err(|_| malformed())?;
+            if key.modulus.as_bytes() != modulus.as_slice()
+                || key.public_exponent.as_bytes() != exponent.as_slice()
+            {
+                return Err(mismatched());
+            }
+        }
+        KeyMaterial::Ec { point } => {
+            if algorithm != oid::EC_PUBLIC_KEY {
+                return Err(mismatched());
+            }
+            let key = ::sec1::EcPrivateKey::from_der(key).map_err(|_| malformed())?;
+            if key.public_key.is_some_and(|carried| carried != point.as_slice()) {
+                return Err(mismatched());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The bit length of a DER integer's big-endian bytes.
+fn integer_bits(integer: &[u8]) -> usize {
+    let mut bytes = integer.iter().skip_while(|byte| **byte == 0);
+    match bytes.next() {
+        None => 0,
+        Some(first) => 8 * bytes.count() + (8 - first.leading_zeros() as usize),
+    }
+}
+
+/// `CertificateDetail$SignatureAlgorithm`: "the algorithm that was used to sign the
+/// certificate", in the `<digest>WITH<key family>` spelling AWS reports it in — the
+/// same spelling [`crate::state::signature_algorithm`] renders for a certificate ACM
+/// signs itself, and the one the sibling Private CA model's `SigningAlgorithm` values
+/// use.
+///
+/// `None` for a signature algorithm outside the digests and families those values
+/// name: an absent member rather than a wrong one.
+fn signature_algorithm(algorithm: &ObjectIdentifier) -> Option<String> {
+    // RSA signatures: RFC 8017 appendix C (`1.2.840.113549.1.1.*`); ECDSA signatures:
+    // RFC 5758 section 3.2 and RFC 5480 (`1.2.840.10045.4.*`).
+    let (digest, family) = if *algorithm == oid::SHA1_WITH_RSA {
+        ("SHA1", "RSA")
+    } else if *algorithm == oid::SHA256_WITH_RSA {
+        ("SHA256", "RSA")
+    } else if *algorithm == oid::SHA384_WITH_RSA {
+        ("SHA384", "RSA")
+    } else if *algorithm == oid::SHA512_WITH_RSA {
+        ("SHA512", "RSA")
+    } else if *algorithm == oid::ECDSA_WITH_SHA1 {
+        ("SHA1", "ECDSA")
+    } else if *algorithm == oid::ECDSA_WITH_SHA256 {
+        ("SHA256", "ECDSA")
+    } else if *algorithm == oid::ECDSA_WITH_SHA384 {
+        ("SHA384", "ECDSA")
+    } else if *algorithm == oid::ECDSA_WITH_SHA512 {
+        ("SHA512", "ECDSA")
+    } else {
+        return None;
+    };
+    Some(format!("{digest}WITH{family}"))
+}
+
+/// The DNS names of a certificate's Subject Alternative Name extension, in the order
+/// the extension lists them. A name of any other kind (an IP address, an email
+/// address) is not a domain name an ACM certificate covers, so it is left out.
+fn dns_names(certificate: &X509Certificate) -> Vec<String> {
+    extension::<pkix::SubjectAltName>(certificate)
+        .map(|names| {
+            names
+                .0
+                .iter()
+                .filter_map(|name| match name {
+                    pkix::name::GeneralName::DnsName(dns) => Some(dns.as_str().to_string()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `KeyUsageName` values of a certificate's Key Usage extension, in the bit order
+/// RFC 5280 section 4.2.1.3 fixes. A certificate carrying no such extension asserts no
+/// key usage, which is the empty list.
+fn key_usage_names(certificate: &X509Certificate) -> Vec<String> {
+    let Some(usage) = extension::<pkix::KeyUsage>(certificate) else {
+        return Vec::new();
+    };
+    // Each bit RFC 5280 section 4.2.1.3 defines, with the `KeyUsageName` the model
+    // spells it with (`smithy_query(query="shape",
+    // shape="com.amazonaws.acm#KeyUsageName")`).
+    [
+        (pkix::KeyUsages::DigitalSignature, "DIGITAL_SIGNATURE"),
+        (pkix::KeyUsages::NonRepudiation, "NON_REPUDIATION"),
+        (pkix::KeyUsages::KeyEncipherment, "KEY_ENCIPHERMENT"),
+        (pkix::KeyUsages::DataEncipherment, "DATA_ENCIPHERMENT"),
+        (pkix::KeyUsages::KeyAgreement, "KEY_AGREEMENT"),
+        (pkix::KeyUsages::KeyCertSign, "CERTIFICATE_SIGNING"),
+        (pkix::KeyUsages::CRLSign, "CRL_SIGNING"),
+        (pkix::KeyUsages::EncipherOnly, "ENCIPHER_ONLY"),
+        (pkix::KeyUsages::DecipherOnly, "DECIPHER_ONLY"),
+    ]
+    .into_iter()
+    .filter(|(bit, _)| usage.0.contains(*bit))
+    .map(|(_, name)| name.to_string())
+    .collect()
+}
+
+/// The `ExtendedKeyUsageName` values of a certificate's Extended Key Usage extension,
+/// in the order the extension lists them. A purpose outside the ones the model names
+/// is reported as `CUSTOM`, the value that enum declares for exactly that.
+fn extended_key_usage_names(certificate: &X509Certificate) -> Vec<String> {
+    let Some(usage) = extension::<pkix::ExtendedKeyUsage>(certificate) else {
+        return Vec::new();
+    };
+    usage
+        .0
+        .iter()
+        .map(|purpose| extended_key_usage_name(purpose).to_string())
+        .collect()
+}
+
+/// One extended key purpose as the `ExtendedKeyUsageName` the model spells it with
+/// (`smithy_query(query="shape", shape="com.amazonaws.acm#ExtendedKeyUsageName")`),
+/// from the key-purpose identifiers RFC 5280 section 4.2.1.12 defines.
+fn extended_key_usage_name(purpose: &ObjectIdentifier) -> &'static str {
+    if *purpose == oid::ANY_EXTENDED_KEY_USAGE {
+        "ANY"
+    } else if *purpose == oid::ID_KP_SERVER_AUTH {
+        "TLS_WEB_SERVER_AUTHENTICATION"
+    } else if *purpose == oid::ID_KP_CLIENT_AUTH {
+        "TLS_WEB_CLIENT_AUTHENTICATION"
+    } else if *purpose == oid::ID_KP_CODE_SIGNING {
+        "CODE_SIGNING"
+    } else if *purpose == oid::ID_KP_EMAIL_PROTECTION {
+        "EMAIL_PROTECTION"
+    } else if *purpose == oid::ID_KP_TIME_STAMPING {
+        "TIME_STAMPING"
+    } else if *purpose == oid::ID_KP_OCSP_SIGNING {
+        "OCSP_SIGNING"
+    } else if *purpose == oid::ID_KP_IPSEC_END_SYSTEM {
+        "IPSEC_END_SYSTEM"
+    } else if *purpose == oid::ID_KP_IPSEC_TUNNEL {
+        "IPSEC_TUNNEL"
+    } else if *purpose == oid::ID_KP_IPSEC_USER {
+        "IPSEC_USER"
+    } else {
+        "CUSTOM"
+    }
+}
+
+/// The certificate extension of type `T`, decoded, or `None` when the certificate
+/// carries no extension of that type or one that does not decode as `T`.
+fn extension<T>(certificate: &X509Certificate) -> Option<T>
+where
+    T: AssociatedOid + for<'der> Decode<'der>,
+{
+    certificate
+        .tbs_certificate
+        .extensions
+        .as_ref()?
+        .iter()
+        .find(|extension| extension.extn_id == T::OID)
+        .and_then(|extension| T::from_der(extension.extn_value.as_bytes()).ok())
+}
+
+/// The value of the first `attribute` a distinguished name carries, as the string a
+/// `DirectoryString` (RFC 5280 appendix A.1) holds it in.
+fn attribute_value(name: &Name, attribute: ObjectIdentifier) -> Option<String> {
+    name.0
+        .iter()
+        .flat_map(|rdn| rdn.0.iter())
+        .find(|pair| pair.oid == attribute)
+        .and_then(|pair| directory_string(&pair.value))
+}
+
+/// An X.500 attribute value as the text it carries: a `DirectoryString` is any of the
+/// string types RFC 5280 appendix A.1 allows, and the ones a domain name appears in
+/// hold it as ASCII-compatible text.
+fn directory_string(value: &Any) -> Option<String> {
+    value
+        .decode_as::<Utf8StringRef<'_>>()
+        .map(|text| text.as_str().to_string())
+        .or_else(|_| {
+            value
+                .decode_as::<PrintableStringRef<'_>>()
+                .map(|text| text.as_str().to_string())
+        })
+        .or_else(|_| {
+            value
+                .decode_as::<Ia5StringRef<'_>>()
+                .map(|text| text.as_str().to_string())
+        })
+        .ok()
+}
+
+/// The object identifiers this operation names in the certificate and the private key
+/// it reads, each from the specification that assigns it:
+///
+/// * the X.500 attribute type `commonName`: RFC 4519 section 2.3 (`2.5.4.3`);
+/// * RSA keys and RSA signatures: RFC 8017 appendix C (`1.2.840.113549.1.1.*`);
+/// * elliptic-curve keys, their named curves and the ECDSA signatures: RFC 5480
+///   sections 2.1.1 and 2.1.1.1 and RFC 5758 section 3.2 (`1.2.840.10045.*`,
+///   `1.3.132.0.*`);
+/// * the extended key purposes: RFC 5280 section 4.2.1.12 (`1.3.6.1.5.5.7.3.*`) and
+///   `anyExtendedKeyUsage` (`2.5.29.37.0`).
+mod oid {
+    use super::ObjectIdentifier;
+
+    pub const COMMON_NAME: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.3");
+
+    pub const RSA_ENCRYPTION: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
+    pub const EC_PUBLIC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
+    pub const PRIME256V1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.7");
+    pub const SECP384R1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.34");
+    pub const SECP521R1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.35");
+
+    pub const SHA1_WITH_RSA: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.5");
+    pub const SHA256_WITH_RSA: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
+    pub const SHA384_WITH_RSA: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.12");
+    pub const SHA512_WITH_RSA: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.13");
+    pub const ECDSA_WITH_SHA1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.1");
+    pub const ECDSA_WITH_SHA256: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+    pub const ECDSA_WITH_SHA384: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.3");
+    pub const ECDSA_WITH_SHA512: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.4");
+
+    pub const ANY_EXTENDED_KEY_USAGE: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("2.5.29.37.0");
+    pub const ID_KP_SERVER_AUTH: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.1");
+    pub const ID_KP_CLIENT_AUTH: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.2");
+    pub const ID_KP_CODE_SIGNING: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3");
+    pub const ID_KP_EMAIL_PROTECTION: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.4");
+    pub const ID_KP_IPSEC_END_SYSTEM: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.5");
+    pub const ID_KP_IPSEC_TUNNEL: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.6");
+    pub const ID_KP_IPSEC_USER: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.7");
+    pub const ID_KP_TIME_STAMPING: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.8");
+    pub const ID_KP_OCSP_SIGNING: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.9");
 }

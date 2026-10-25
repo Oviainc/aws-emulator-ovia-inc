@@ -1697,6 +1697,56 @@ pub fn platform_application_arn(region: &str, platform: &str, name: &str) -> Str
     )
 }
 
+/// The platform-application attributes a caller WRITES and SNS never reads back.
+///
+/// `PlatformCredential` is "the credential received from the notification service"
+/// and `PlatformPrincipal` "the principal received from the notification service"
+/// (`SetPlatformApplicationAttributesInput$Attributes` doc) — the secret half of the
+/// push credential pair. Every reporting path goes through
+/// [`PlatformApplicationRecord::reported_attributes`], so a stored credential is
+/// never published back to a caller.
+pub const PLATFORM_CREDENTIAL_ATTRIBUTE_NAMES: &[&str] =
+    &["PlatformCredential", "PlatformPrincipal"];
+
+/// Whether `name` names one of the write-only credential attributes listed on
+/// [`PLATFORM_CREDENTIAL_ATTRIBUTE_NAMES`].
+pub fn is_platform_credential_attribute(name: &str) -> bool {
+    PLATFORM_CREDENTIAL_ATTRIBUTE_NAMES.contains(&name)
+}
+
+/// One platform application object of the calling account, as
+/// `CreatePlatformApplication` registered it.
+#[derive(Debug, Clone)]
+pub struct PlatformApplicationRecord {
+    /// The application's ARN, as [`platform_application_arn`] spells it: the key this
+    /// record is held under, and what every mobile-push call names it by.
+    pub arn: String,
+    /// The push notification service this application targets (`ADM`, `APNS`,
+    /// `APNS_SANDBOX`, `GCM`, …), as the request that created it spelled it.
+    pub platform: String,
+    /// The application name the request that created it carried.
+    pub name: String,
+    /// The application's attributes, as the create and the attribute write left them
+    /// — including the write-only credential material, which
+    /// [`Self::reported_attributes`] withholds from every report. Bounded by
+    /// [`MAX_ATTRIBUTE_BYTES_PER_RECORD`], like every other attribute map here.
+    pub attributes: HashMap<String, String>,
+    pub created_at: SystemTime,
+}
+
+impl PlatformApplicationRecord {
+    /// The attributes a report of this application carries: every attribute the
+    /// record holds except the write-only credential material named on
+    /// [`PLATFORM_CREDENTIAL_ATTRIBUTE_NAMES`].
+    pub fn reported_attributes(&self) -> HashMap<String, String> {
+        self.attributes
+            .iter()
+            .filter(|(name, _)| !is_platform_credential_attribute(name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect()
+    }
+}
+
 /// A device endpoint's ARN: the endpoint resource of the platform application named by
 /// `platform` and `application`, plus the id that tells one of its devices from
 /// another.
@@ -1759,7 +1809,8 @@ pub struct PlatformEndpointRecord {
 /// Per-service state for com-amazonaws-sns-amazonsimplenotificationservice. A handler reaches it through [`service_state`].
 ///
 /// Every CALLER-DRIVEN store here is therefore BOUNDED: `topics`,
-/// `subscriptions` and `sandbox_phone_numbers` at [`MAX_RECORDS_PER_STORE`] records
+/// `subscriptions`, `sandbox_phone_numbers` and `platform_applications` at
+/// [`MAX_RECORDS_PER_STORE`] records
 /// each (a request that would cross it is refused with a modelled error), and
 /// `delivered` at
 /// [`MAX_RETAINED_MESSAGES_PER_SUBSCRIPTION`] messages per subscription AND
@@ -1776,6 +1827,11 @@ pub struct ComAmazonawsSnsAmazonsimplenotificationserviceState {
     /// phone number itself: the sandbox holds one record per destination number. At
     /// most [`MAX_RECORDS_PER_STORE`].
     pub sandbox_phone_numbers: HashMap<String, SandboxPhoneNumberRecord>,
+    /// The calling account's mobile-push platform applications, keyed by their ARN.
+    /// At most [`MAX_RECORDS_PER_STORE`]: an operation that registers one must refuse
+    /// a request that would cross that ceiling, as the topic and subscription stores
+    /// do.
+    pub platform_applications: HashMap<String, PlatformApplicationRecord>,
     /// The SMS opt-out state this account knows per phone number, keyed by the number
     /// itself. NOT caller-grown, so it needs no ceiling of its own: a record appears
     /// when a number opts OUT, which the recipient does out of band and no SNS API
@@ -1844,6 +1900,20 @@ impl ComAmazonawsSnsAmazonsimplenotificationserviceState {
             a.created_at
                 .cmp(&b.created_at)
                 .then_with(|| a.phone_number.cmp(&b.phone_number))
+        });
+        found
+    }
+
+    /// Every platform application of this account, oldest first (the ARN breaking a
+    /// tie), so a listing and its pagination token are stable across calls — see
+    /// [`Self::subscriptions_of`].
+    pub fn platform_applications_in_order(&self) -> Vec<&PlatformApplicationRecord> {
+        let mut found: Vec<&PlatformApplicationRecord> =
+            self.platform_applications.values().collect();
+        found.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.arn.cmp(&b.arn))
         });
         found
     }
@@ -2223,6 +2293,17 @@ pub const RESOURCE_DOES_NOT_EXIST: &str = "Resource does not exist";
 /// every operation that writes an attribute by name, so the sentence does not depend
 /// on which call carried it.
 pub const INVALID_ATTRIBUTE_NAME_REFUSAL: &str = "Invalid parameter: AttributeName";
+
+/// The sentence SNS refuses a `NextToken` that is not one it minted with.
+///
+/// `Invalid parameter:` plus the parameter as SNS names it, then `Reason:` and the
+/// reason the service states — the token is opaque, so the reason says only that the
+/// token is not usable and the sentence echoes none of the value back. Shared by
+/// every paginated listing, because the sentence does not depend on which listing the
+/// token was handed to. Recorded evidence: `ListPlatformApplications` with a token it
+/// never issued answers `400 InvalidParameter` with exactly this sentence.
+pub const INVALID_NEXT_TOKEN_REFUSAL: &str =
+    "Invalid parameter: NextToken Reason: token is invalid or expired";
 
 /// The sentence SNS refuses an unacceptable topic name with.
 ///

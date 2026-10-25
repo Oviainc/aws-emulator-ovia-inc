@@ -19,6 +19,8 @@ mod appconfig_workflow;
 mod application_name_uniqueness;
 #[path = "all/aws_authored_extensions.rs"]
 mod aws_authored_extensions;
+#[path = "all/configuration_profile_deletion_protection.rs"]
+mod configuration_profile_deletion_protection;
 #[path = "all/configuration_profile_type.rs"]
 mod configuration_profile_type;
 #[path = "all/control_plane_fidelity.rs"]
@@ -83,5 +85,7 @@ mod update_configuration_profile;
 mod update_deployment_strategy;
 #[path = "all/update_experiment_definition.rs"]
 mod update_experiment_definition;
+#[path = "all/update_experiment_run.rs"]
+mod update_experiment_run;
 #[path = "all/update_extension.rs"]
 mod update_extension;

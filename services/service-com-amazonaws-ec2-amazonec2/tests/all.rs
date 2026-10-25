@@ -144,6 +144,10 @@ mod ec2_query_envelope;
 mod ec2_query_error_request_id;
 #[path = "all/elastic_ip_addresses.rs"]
 mod elastic_ip_addresses;
+// What `DescribeExportTasks` reports out of the export task store, and how `ExportTaskIds`
+// and the filters narrow it.
+#[path = "all/export_tasks.rs"]
+mod export_tasks;
 #[path = "all/fast_launch_images.rs"]
 mod fast_launch_images;
 // What `DisableFastSnapshotRestores` answers per (snapshot, Availability Zone) pair.

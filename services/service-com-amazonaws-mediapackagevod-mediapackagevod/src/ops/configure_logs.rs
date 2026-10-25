@@ -5,6 +5,12 @@
 //! subscription with the one the request carries, persists it, and answers the
 //! group's full current representation read back from state.
 //!
+//! The subscription it carries names a CloudWatch Logs log group this group's egress
+//! access logs are WRITTEN into, so the name is judged against what CloudWatch Logs can
+//! hold before anything is stored ([`crate::state::check_egress_access_logs`]): a name it
+//! could not hold is refused with `UnprocessableEntityException` (422) keyed by the member,
+//! and the group keeps the subscription it already had.
+//!
 //! It is a PUT on the group's `configure_logs` sub-resource, so the member it owns is
 //! REPLACED rather than merged: a request carrying no `EgressAccessLogs` leaves the
 //! group with no log subscription. Every other member of the group — `Arn`,
@@ -190,6 +196,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
+
+        // The subscription this request carries names the CloudWatch Logs log group the
+        // group's egress access logs are written INTO, so the name is judged before
+        // anything is stored: a name CloudWatch Logs could not hold is refused and the
+        // group keeps the subscription it already had.
+        crate::state::check_egress_access_logs(input.egress_access_logs.as_ref())?;
 
         // A PUT on the sub-resource REPLACES the member it owns, exactly as supplied:
         // a request carrying no `EgressAccessLogs` leaves the group unsubscribed.

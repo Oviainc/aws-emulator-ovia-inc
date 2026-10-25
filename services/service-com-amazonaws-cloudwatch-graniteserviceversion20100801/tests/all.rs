@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/alarm_action_dispatch.rs"]
 mod alarm_action_dispatch;
+#[path = "all/alarm_actions_switch.rs"]
+mod alarm_actions_switch;
 #[path = "all/alarm_configuration.rs"]
 mod alarm_configuration;
 #[path = "all/alarm_evaluation.rs"]
@@ -45,9 +47,13 @@ mod metric_streams;
 mod metrics_and_alarms;
 #[path = "all/query_form_metrics.rs"]
 mod query_form_metrics;
+#[path = "all/replay_probe.rs"]
+mod replay_probe;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/sns_action_queue_policy.rs"]
 mod sns_action_queue_policy;
+#[path = "all/sns_action_topic_policy.rs"]
+mod sns_action_topic_policy;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

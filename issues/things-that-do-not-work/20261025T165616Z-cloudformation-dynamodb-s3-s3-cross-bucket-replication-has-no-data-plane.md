@@ -1,0 +1,46 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-ga-prod-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cloudformation__dynamodb__s3.s3-replication-role-trust-s3-positive cloudformation__dynamodb__s3.cfn-deploy-iam-role-trust-mismatched-principal-negative
+Issue-Key: cloudformation__dynamodb__s3.s3-replication-role-trust-s3-positive|_wait_for_replica#16|Timeout|time.sleep(interval_s)
+Issue-Key: cloudformation__dynamodb__s3.cfn-deploy-iam-role-trust-mismatched-principal-negative|run#17|Timeout|time.sleep(10)
+Issue-Commit: 43dd92083bbe4a523a6e412ad7369f223744f0d8
+
+# S3 cross-bucket replication has no data plane: a replication configuration is stored and read back but no object is ever copied to the destination bucket
+
+> _Note: this issue was identified against the code base at commit `43dd92083bbe4a523a6e412ad7369f223744f0d8`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+PutBucketReplication
+
+## Description
+Cause 1 of 1: S3 replication is configuration-only — the asynchronous effect PutBucketReplication exists to produce never happens.
+
+AWS: on a versioning-enabled source bucket, PutBucketReplication(Bucket, ReplicationConfiguration={Role: <IAM role ARN trusted by s3.amazonaws.com>, Rules: [{ID, Status: 'Enabled', Priority, Filter/Prefix, Destination: {Bucket: 'arn:aws:s3:::<dest>'}}]}) returns 200, GetBucketReplication reports the stored container back, and S3 then ASSUMES that role and asynchronously copies every newly written matching object version into the destination bucket; within seconds GetObject/HeadObject on the destination succeeds and returns the replica's bytes. The model carries this effect explicitly: Smithy s3#ReplicationRule.Destination.Bucket (required) names the bucket 'where you want Amazon S3 to store the results', ReplicationRule.Status is the enabled switch, and s3#ReplicationStatus (PENDING | COMPLETE/COMPLETED | FAILED | REPLICA) is the per-object status S3 publishes for that copy — REPLICA being what the destination copy reports. Which role S3 can assume is what decides whether the copy happens: a Role whose trust policy names s3.amazonaws.com replicates, a Role trusting some other principal (e.g. ec2.amazonaws.com) is accepted at config time but produces no replica, ever.
+
+Emulator: PutBucketReplication is implemented purely as storage — services/service-com-amazonaws-s3-amazons3/src/ops/put_bucket_replication.rs validates the payload (versioning Enabled, 1..=MAX_REPLICATION_RULES rules, Role is an IAM role ARN, Destination.Bucket is an S3 bucket ARN) and ends with `bucket.set_replication(input.replication_configuration)`; nothing in the PutObject path consults that stored configuration. So a PutObject into a source bucket with an Enabled rule produces no object in the destination bucket at all: the checks poll the destination with HeadObject/GetObject and only ever see 404/NoSuchKey until the replay budget expires ('Check timed out after 60.0s'). The source object also never reports a ReplicationStatus. Note the role's trust policy is never consulted either, so the emulator makes a correctly-trusted role and a mismatched-trust role indistinguishable — both replicate nothing.
+
+Why: a client that configures replication gets a configuration that round-trips and an effect that never occurs. Every disaster-recovery / cross-bucket-fanout workflow silently loses data on the emulator, and — worse for test fidelity — the negative case is unfalsifiable: a mis-trusted replication role, the single most common real misconfiguration, looks exactly like a correctly trusted one, so no test can distinguish 'replication is broken because the role is wrong' from 'replication works'. Clients that poll the destination (the documented way to observe replication) hang instead of converging.
+
+Fix: the replication effect belongs in the S3 object-write path and its state — after a successful object-version write, the source bucket's stored replication configuration (crate::state, set by set_replication) must be evaluated (rule Status == 'Enabled', Filter/Prefix match), the configuration's Role resolved against IAM and required to be assumable by s3.amazonaws.com before any copy, and the matching object version then materialized in the Destination.Bucket of each matching rule, with the source object's ReplicationStatus reported (PENDING then COMPLETED, or FAILED when the role cannot be assumed) and the destination copy reporting REPLICA. Related but distinct: open issue 20261022T194351Z-events-firehose-s3-eventbridge-firehose-s3-eventing-eventbridge-tagresource-and-s3.md filed PutBucketReplication as a 501 scaffold stub for the events__firehose__s3 group; the handler now answers 200 and persists, so the surviving divergence here is the absent data plane, not the stub, and neither of the two check ids below is on that issue's replay list.
+
+Traces: cloudformation__dynamodb__s3.s3-replication-role-trust-s3-positive is the decisive example — it creates two versioned buckets, creates a role trusting s3.amazonaws.com with the standard replication permission policy, puts the replication configuration, asserts the Role/ID/Status round-trip (that part is satisfied), writes s3://<source>/replicated/hello.txt and then calls _wait_for_replica(dest, key, timeout_s=300), whose GetObject on the destination is the only operation in the check that can consume the whole budget. cloudformation__dynamodb__s3.cfn-deploy-iam-role-trust-mismatched-principal-negative exercises the same effect from the other side (bad-trust role must NOT replicate, then an otherwise identical good-trust role MUST replicate within 180s); its timeout is partly budget-bound — the check's own absence poll is a fixed 90s plus a CloudFormation stack deploy, so it cannot finish inside the 60s replay budget even against correct behavior — so treat its positive-control leg, not its timeout, as the grounding, and expect a re-replay of it to need a longer budget.
+
+## Evidence
+Both checks fail with 'Error: Check timed out after 60.0s'.
+
+s3-replication-role-trust-s3-positive — expected: after put_bucket_replication succeeds (it does) and get_bucket_replication round-trips Role/Rules[0].ID/Rules[0].Status (it does), s3.put_object(Bucket=<source>, Key='replicated/hello.txt', Body=b'sim2real replication payload') is followed within seconds by s3.get_object(Bucket=<dest>, Key='replicated/hello.txt') returning that same body. Actual: GetObject on the destination keeps raising NoSuchKey for the whole poll (interval 5s, budget 300s), so the check is still inside _wait_for_replica when the 60s replay budget expires; its own failure text on exhaustion would be "object 'replicated/hello.txt' never replicated into '<dest>' within 300.0s".
+
+cfn-deploy-iam-role-trust-mismatched-principal-negative — expected: with the ec2.amazonaws.com-trusted role, head_object on dest_bad stays 404 forever (correct, and the emulator does answer 404); then with the only-thing-changed s3.amazonaws.com-trusted role, head_object on dest_good must start succeeding and get_object must return b'should-replicate'. Actual: nothing is replicated under either role, so the two states are indistinguishable; the check exhausts its budget (its fixed 90s absence poll plus the CFN deploy already exceed the 60s replay budget).
+
+Code: services/service-com-amazonaws-s3-amazons3/src/ops/put_bucket_replication.rs:361 is the handler's last action — `bucket.set_replication(input.replication_configuration)` — and no write path reads that configuration back out.
+
+## Steps to Reproduce
+1. Boot the emulator and point botocore at it.
+2. s3.create_bucket(Bucket=SRC); s3.put_bucket_versioning(Bucket=SRC, VersioningConfiguration={'Status':'Enabled'}). Same for DEST.
+3. iam.create_role(RoleName=R, AssumeRolePolicyDocument={'Version':'2012-10-17','Statement':[{'Effect':'Allow','Principal':{'Service':'s3.amazonaws.com'},'Action':'sts:AssumeRole'}]}) and iam.put_role_policy(...) granting s3:GetReplicationConfiguration/s3:ListBucket on SRC, s3:GetObjectVersion* on SRC/*, s3:ReplicateObject/s3:ReplicateDelete on DEST/*.
+4. s3.put_bucket_replication(Bucket=SRC, ReplicationConfiguration={'Role': 'arn:aws:iam::<account>:role/R', 'Rules':[{'ID':'r1','Status':'Enabled','Priority':1,'Filter':{'Prefix':''},'DeleteMarkerReplication':{'Status':'Disabled'},'Destination':{'Bucket':'arn:aws:s3:::DEST'}}]}) -> 200, and s3.get_bucket_replication(Bucket=SRC) round-trips it.
+5. s3.put_object(Bucket=SRC, Key='replicated/hello.txt', Body=b'payload').
+6. Poll s3.head_object(Bucket=DEST, Key='replicated/hello.txt'). Expected: succeeds within seconds and get_object returns b'payload'; observed: 404/NoSuchKey indefinitely. s3.head_object(Bucket=SRC, Key='replicated/hello.txt') also reports no ReplicationStatus.
+7. Repeat steps 3-6 with the role's trust Principal changed to ec2.amazonaws.com: expected still-no-replica (and on AWS the put_bucket_replication config is accepted), observed identical to step 6 — the two cases cannot be told apart.
+8. Re-replay the check ids in trace_ids (allow the negative check more than 60s: its own polls are 90s + 180s).
