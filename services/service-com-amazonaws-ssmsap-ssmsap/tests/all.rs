@@ -51,5 +51,7 @@ mod state_roundtrip;
 mod sub_check_result_cursor;
 #[path = "all/sub_check_results.rs"]
 mod sub_check_results;
+#[path = "all/tag_resource.rs"]
+mod tag_resource;
 #[path = "all/validation_message_rendering.rs"]
 mod validation_message_rendering;
