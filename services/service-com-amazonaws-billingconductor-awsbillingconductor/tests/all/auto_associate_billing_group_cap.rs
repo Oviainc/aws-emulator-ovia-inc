@@ -180,8 +180,11 @@ impl Emulator {
             .unwrap_or_default()
     }
 
-    /// The `AutoAssociate` one group reads back with, through the read-only lister.
-    async fn listed_flag(&self, arn: &str) -> Option<bool> {
+    /// The whole modelled view one group reads back with, through the read-only
+    /// lister: every member a write could have touched (`Name`, `Description`,
+    /// `ComputationPreference`, `Status`, `LastModifiedTime`, `AccountGrouping`), so
+    /// comparing it across a call decides whether the call wrote anything at all.
+    async fn listed_group(&self, arn: &str) -> Value {
         let (status, body) = self
             .post(LIST_GROUPS_PATH, &json!({"Filters": {"Arns": [arn]}}))
             .await;
@@ -192,8 +195,35 @@ impl Emulator {
         body["BillingGroups"]
             .as_array()
             .and_then(|groups| groups.first())
-            .and_then(|group| group["AccountGrouping"]["AutoAssociate"].as_bool())
+            .cloned()
+            .unwrap_or(Value::Null)
     }
+
+    /// The `AutoAssociate` one group reads back with, through the read-only lister.
+    async fn listed_flag(&self, arn: &str) -> Option<bool> {
+        self.listed_group(arn).await["AccountGrouping"]["AutoAssociate"].as_bool()
+    }
+
+    /// `CreateBillingGroup` that must succeed, spelled as `Name` plus the computation
+    /// preference naming `plan`, with the members of `extra` merged in beside them.
+    async fn create_group(&self, name: &str, plan: &str, extra: &Value) -> String {
+        let mut body = json!({
+            "Name": name,
+            "ComputationPreference": { "PricingPlanArn": plan },
+        });
+        if let Some(members) = extra.as_object() {
+            for (member, value) in members {
+                body[member] = value.clone();
+            }
+        }
+        self.created(&body).await
+    }
+}
+
+/// The bare `[a-zA-Z0-9]{10,12}` id the `BillingGroupArn` pattern accepts beside the
+/// full ARN; both name the same stored group.
+fn bare_id(arn: &str) -> String {
+    arn.rsplit('/').next().unwrap_or(arn).to_string()
 }
 
 /// The wire error code of a failure response (`__type`), without any namespace.
@@ -547,5 +577,274 @@ async fn handing_the_election_back_frees_it_for_the_next_group() {
         enabled,
         vec![fresh],
         "case \"a create after the handover\": expected exactly the new group, got {enabled:?}"
+    );
+}
+
+/// One row of the `UpdateBillingGroup` cap table: a stored group of some shape, and an
+/// update that asks it for the election while another group already holds it.
+struct UpdateCase {
+    /// What makes this row different from the others.
+    case: &'static str,
+    /// The members the challenger group is CREATED with, beside its name and its
+    /// computation preference.
+    group: Value,
+    /// The members the refused `UpdateBillingGroup` carries beside `Arn`.
+    patch: Value,
+    /// Whether the update addresses the group by the bare id the `BillingGroupArn`
+    /// pattern accepts rather than by its full ARN.
+    bare: bool,
+}
+
+/// RULE: the cap is on STATE, so an `UpdateBillingGroup` that would leave a SECOND
+/// group with `AutoAssociate` enabled is refused 400
+/// `TOO_MANY_AUTO_ASSOCIATE_BILLING_GROUPS` whatever else that request carries, and
+/// writes NOTHING — not the flag, and not the other members of the same patch.
+///
+/// Rows differ along the shape of the group that asks (its membership count, its
+/// billing-owner class, whether it already carries the flag as `false`), the other
+/// members riding along in the patch (a rename, a description, another computation
+/// preference, a `Status`, the transfer ARN it already holds), and the form the request
+/// names the group in (full ARN / bare id).
+#[tokio::test]
+async fn an_update_cannot_elect_a_second_group_whatever_else_it_carries() {
+    let em = Emulator::new();
+    let plan = em.create_plan("AutoAssociateUpdateTablePlan").await;
+    let second_plan = em.create_plan("AutoAssociateUpdateTablePlanTwo").await;
+    let holder = elected_holder(&em, &plan).await;
+    let held_transfer = transfer_arn("beef1234");
+
+    let rows = [
+        UpdateCase {
+            case: "only AutoAssociate, on a group with a primary account",
+            group: json!({
+                "AccountGrouping": { "LinkedAccountIds": [] },
+                "PrimaryAccountId": "222233334444",
+            }),
+            patch: json!({ "AccountGrouping": { "AutoAssociate": true } }),
+            bare: false,
+        },
+        UpdateCase {
+            case: "AutoAssociate beside a rename",
+            group: json!({
+                "AccountGrouping": { "LinkedAccountIds": ["333344445555"] },
+                "PrimaryAccountId": "333344445555",
+            }),
+            patch: json!({
+                "Name": "RenamedChallenger",
+                "AccountGrouping": { "AutoAssociate": true },
+            }),
+            bare: false,
+        },
+        UpdateCase {
+            case: "AutoAssociate beside a description and another pricing plan",
+            group: json!({
+                "AccountGrouping": {},
+                "Description": "the description the group already holds",
+                "PrimaryAccountId": "444455556666",
+            }),
+            patch: json!({
+                "Description": "a description the refusal must not persist",
+                "ComputationPreference": { "PricingPlanArn": second_plan },
+                "AccountGrouping": { "AutoAssociate": true },
+            }),
+            bare: false,
+        },
+        UpdateCase {
+            case: "AutoAssociate beside a Status the group's billing owner admits",
+            group: json!({
+                "AccountGrouping": { "LinkedAccountIds": [] },
+                "PrimaryAccountId": "555566667777",
+            }),
+            patch: json!({
+                "Status": "ACTIVE",
+                "AccountGrouping": { "AutoAssociate": true },
+            }),
+            bare: false,
+        },
+        UpdateCase {
+            case: "AutoAssociate beside the transfer ARN the group already holds",
+            group: json!({
+                "AccountGrouping": {
+                    "LinkedAccountIds": ["666677778888"],
+                    "ResponsibilityTransferArn": held_transfer,
+                },
+            }),
+            patch: json!({
+                "AccountGrouping": {
+                    "AutoAssociate": true,
+                    "ResponsibilityTransferArn": held_transfer,
+                },
+            }),
+            bare: false,
+        },
+        UpdateCase {
+            case: "three linked accounts, the group addressed by its bare id",
+            group: json!({
+                "AccountGrouping": {
+                    "LinkedAccountIds": ["777788889999", "888899990000", "999900001111"],
+                },
+                "PrimaryAccountId": "777788889999",
+            }),
+            patch: json!({ "AccountGrouping": { "AutoAssociate": true } }),
+            bare: true,
+        },
+        UpdateCase {
+            case: "a group that already carries the flag as false asks for true",
+            group: json!({
+                "AccountGrouping": { "LinkedAccountIds": [], "AutoAssociate": false },
+                "PrimaryAccountId": "111100002222",
+            }),
+            patch: json!({ "AccountGrouping": { "AutoAssociate": true } }),
+            bare: false,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let arn = em
+            .create_group(&format!("Challenger{index}"), &plan, &row.group)
+            .await;
+        let before = em.listed_group(&arn).await;
+
+        let addressed = if row.bare { bare_id(&arn) } else { arn.clone() };
+        let (status, response) = em.update(&addressed, &row.patch).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {response}"
+        );
+        assert_eq!(
+            response["Reason"].as_str(),
+            Some(TOO_MANY),
+            "case {case:?}: expected Reason {TOO_MANY}, got {response}"
+        );
+        assert_eq!(
+            response["Fields"][0]["Name"].as_str(),
+            Some("AccountGrouping.AutoAssociate"),
+            "case {case:?}: the refusal must name the member at fault, got {response}"
+        );
+
+        // A refusal writes nothing: every member the patch also carried is still what
+        // the group held, and `LastModifiedTime` did not move.
+        let after = em.listed_group(&arn).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: a refused update must leave the group untouched, got {after}"
+        );
+        let enabled = em.enabled_groups().await;
+        assert_eq!(
+            enabled,
+            vec![holder.clone()],
+            "case {case:?}: the election must still be held by exactly one group, got {enabled:?}"
+        );
+    }
+
+    // Every challenger is still stored, so the refusals cost no resource: the holder
+    // plus one group per row.
+    let names = em.all_names().await;
+    assert_eq!(
+        names.len(),
+        rows.len() + 1,
+        "case \"the refusals delete nothing\": expected {} stored groups, got {names:?}",
+        rows.len() + 1
+    );
+}
+
+/// RULE: an update that does not RAISE the number of enabled groups is served while the
+/// election is held — the cap bounds the enabled groups, not the requests that mention
+/// the member.
+///
+/// Rows differ along how the update declines the election (explicitly `false`, an
+/// `AccountGrouping` carrying other members but no flag, an empty `AccountGrouping`, no
+/// `AccountGrouping` at all), and the last case is the holder restating the flag it
+/// already has — by its bare id, so the cap's exclusion of the addressed group holds for
+/// either ARN form.
+#[tokio::test]
+async fn an_update_that_does_not_raise_the_enabled_count_is_served() {
+    let em = Emulator::new();
+    let plan = em.create_plan("AutoAssociateServedUpdatePlan").await;
+    let holder = elected_holder(&em, &plan).await;
+
+    let served: Vec<(&str, Value, Value, Option<bool>)> = vec![
+        (
+            "AutoAssociate false beside a rename",
+            json!({
+                "AccountGrouping": { "LinkedAccountIds": [] },
+                "PrimaryAccountId": "222233334444",
+            }),
+            json!({
+                "Name": "DeclinedTheElection",
+                "AccountGrouping": { "AutoAssociate": false },
+            }),
+            Some(false),
+        ),
+        (
+            "a description and no AccountGrouping at all",
+            json!({
+                "AccountGrouping": { "LinkedAccountIds": ["333344445555"] },
+                "PrimaryAccountId": "333344445555",
+            }),
+            json!({ "Description": "named no flag" }),
+            None,
+        ),
+        (
+            "an empty AccountGrouping",
+            json!({ "AccountGrouping": {}, "PrimaryAccountId": "444455556666" }),
+            json!({ "AccountGrouping": {} }),
+            None,
+        ),
+        (
+            "a group that already has the flag off restating false",
+            json!({
+                "AccountGrouping": { "LinkedAccountIds": [], "AutoAssociate": false },
+                "PrimaryAccountId": "555566667777",
+            }),
+            json!({ "AccountGrouping": { "AutoAssociate": false } }),
+            Some(false),
+        ),
+    ];
+
+    for (index, (case, group, patch, expected)) in served.iter().enumerate() {
+        let arn = em
+            .create_group(&format!("Served{index}"), &plan, group)
+            .await;
+        let (status, response) = em.update(&arn, patch).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with {response}"
+        );
+        let flag = em.listed_flag(&arn).await;
+        assert_eq!(
+            flag, *expected,
+            "case {case:?}: expected the persisted AutoAssociate {expected:?}, got {flag:?}"
+        );
+        let enabled = em.enabled_groups().await;
+        assert_eq!(
+            enabled,
+            vec![holder.clone()],
+            "case {case:?}: the enabled set must be unchanged, got {enabled:?}"
+        );
+    }
+
+    // The holder restating the election it already holds, named by its bare id.
+    let (status, response) = em.enable(&bare_id(&holder)).await;
+    assert_eq!(
+        status, 200,
+        "case \"the holder restates the election by its bare id\": expected HTTP 200, got {status} with {response}"
+    );
+    assert_eq!(
+        response["AccountGrouping"]["AutoAssociate"].as_bool(),
+        Some(true),
+        "case \"the holder restates the election by its bare id\": expected AutoAssociate true, got {response}"
+    );
+    let enabled = em.enabled_groups().await;
+    assert_eq!(
+        enabled,
+        vec![holder.clone()],
+        "case \"the holder restates the election by its bare id\": the enabled set must be unchanged, got {enabled:?}"
     );
 }
