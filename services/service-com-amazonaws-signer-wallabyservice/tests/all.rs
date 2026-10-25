@@ -29,6 +29,9 @@ mod region_scoping;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 
+#[path = "all/signature_revocation.rs"]
+mod signature_revocation;
+
 #[path = "all/signing_platform_catalog.rs"]
 mod signing_platform_catalog;
 

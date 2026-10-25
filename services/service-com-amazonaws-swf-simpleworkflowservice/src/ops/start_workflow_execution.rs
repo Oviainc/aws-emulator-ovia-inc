@@ -378,96 +378,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let started_at = crate::state::now();
-        // The per-domain ordinal is what makes the minted id unique; it is taken only
-        // once every check above has passed, so a refused start consumes nothing.
-        domain.next_run_sequence += 1;
-        let run_id = crate::state::new_run_id(
-            &domain.name,
-            &input.workflow_id,
-            domain.next_run_sequence,
-            started_at,
-        );
-        let tag_list = input.tag_list.clone().unwrap_or_default();
-
-        let mut execution = crate::state::Execution {
-            workflow_id: input.workflow_id.clone(),
-            run_id: run_id.clone(),
-            workflow_type: type_key,
-            status: crate::state::EXECUTION_STATUS_OPEN.to_string(),
-            close_status: None,
-            start_timestamp: started_at,
-            close_timestamp: None,
-            tag_list: tag_list.clone(),
-            cancel_requested: false,
-            input: input.input.clone(),
-            effective_config: effective_config.clone(),
-            history: Vec::new(),
-            next_event_id: 1,
-            open_decision_tasks: 0,
-            open_activity_tasks: 0,
-            open_timers: 0,
-            open_child_executions: 0,
-            open_lambda_functions: 0,
-            latest_execution_context: None,
-            latest_activity_task_timestamp: None,
-        };
-
-        execution.append_event(
-            started_at,
-            crate::state::EventAttributes::WorkflowExecutionStarted(Box::new(
-                WorkflowExecutionStartedEventAttributes {
-                    input: input.input.clone(),
-                    execution_start_to_close_timeout: Some(
-                        effective_config.execution_start_to_close_timeout.clone(),
-                    ),
-                    task_start_to_close_timeout: Some(
-                        effective_config.task_start_to_close_timeout.clone(),
-                    ),
-                    child_policy: effective_config.child_policy.clone(),
-                    task_list: TaskList {
-                        name: effective_config.task_list.clone(),
-                    },
-                    task_priority: effective_config.task_priority.clone(),
+        // The ONE place a run comes into existence: the stored record, its
+        // `WorkflowExecutionStarted` event and the first decision task SWF schedules as
+        // soon as an execution starts. A `ContinueAsNewWorkflowExecution` or
+        // `StartChildWorkflowExecution` decision starts its run through the same path,
+        // which is also where the per-domain run bound is enforced — the check above is
+        // this operation's own early refusal of a domain that is already full.
+        let run_id = domain
+            .start_run(
+                crate::state::NewRun {
+                    workflow_id: input.workflow_id.clone(),
                     workflow_type: workflow_type.workflow_type(),
-                    tag_list: (!tag_list.is_empty()).then_some(tag_list),
-                    // Only ContinueAsNewWorkflowExecution and a parent's
-                    // StartChildWorkflowExecution decision set these, and neither is
-                    // reachable in this slice.
+                    input: input.input.clone(),
+                    tag_list: input.tag_list.clone().unwrap_or_default(),
+                    config: effective_config,
+                    // Only a decider's continue-as-new or a parent's child start carries
+                    // either of these, and this call is a client's own start.
                     continued_execution_run_id: None,
-                    parent_workflow_execution: None,
-                    parent_initiated_event_id: 0,
-                    lambda_role: effective_config.lambda_role.clone(),
+                    parent: None,
                 },
-            )),
-        );
-        // SWF schedules the first decision task as soon as the execution starts, so
-        // the run begins with exactly one open decision task.
-        execution.append_event(
-            started_at,
-            crate::state::EventAttributes::DecisionTaskScheduled(
-                DecisionTaskScheduledEventAttributes {
-                    task_list: TaskList {
-                        name: effective_config.task_list.clone(),
-                    },
-                    task_priority: effective_config.task_priority.clone(),
-                    start_to_close_timeout: Some(
-                        effective_config.task_start_to_close_timeout.clone(),
-                    ),
-                    // A decision task's schedule-to-start timeout comes from the task
-                    // list's own registered default, which no implemented operation
-                    // sets in this slice.
-                    schedule_to_start_timeout: None,
-                },
-            ),
-        );
-        execution.open_decision_tasks = 1;
-
-        domain
-            .executions
-            .insert((input.workflow_id.clone(), run_id.clone()), execution);
-        domain
-            .open_by_workflow_id
-            .insert(input.workflow_id.clone(), run_id.clone());
+                started_at,
+            )
+            .ok_or_else(|| {
+                StartWorkflowExecutionErrorModeled::LimitExceededFault(LimitExceededFault {
+                    message: Some(format!(
+                        "this emulator retains at most {} workflow executions per domain",
+                        crate::state::MAX_EXECUTIONS_PER_DOMAIN
+                    )),
+                })
+            })?;
 
         Ok(StartWorkflowExecutionOutput {
             run_id: Some(run_id),

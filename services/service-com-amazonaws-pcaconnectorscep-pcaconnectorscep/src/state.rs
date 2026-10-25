@@ -14,8 +14,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    Challenge, ChallengeMetadataSummary, Connector, ConnectorSummary, IntuneConfiguration,
-    MobileDeviceManagement, OpenIdConfiguration,
+    Challenge, ChallengeMetadata, ChallengeMetadataSummary, Connector, ConnectorSummary,
+    IntuneConfiguration, MobileDeviceManagement, OpenIdConfiguration,
 };
 
 /// The signing name, endpoint prefix and ARN namespace of this service, from the model's
@@ -199,6 +199,19 @@ impl StoredChallenge {
             connector_arn: Some(self.connector_arn.clone()),
             created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
             updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
+        }
+    }
+
+    /// The modelled `ChallengeMetadata`, as `GetChallengeMetadata` returns it. Its members
+    /// are the same four `ChallengeMetadataSummary` carries, and neither shape models a
+    /// password, so the single read and the listing report one record identically.
+    pub fn to_metadata(&self) -> ChallengeMetadata {
+        let summary = self.to_metadata_summary();
+        ChallengeMetadata {
+            arn: summary.arn,
+            connector_arn: summary.connector_arn,
+            created_at: summary.created_at,
+            updated_at: summary.updated_at,
         }
     }
 }

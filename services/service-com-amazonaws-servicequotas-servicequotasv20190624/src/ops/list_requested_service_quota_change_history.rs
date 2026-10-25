@@ -22,7 +22,10 @@
 //! * only requests created inside the documented
 //!   [`crate::state::REQUEST_HISTORY_WINDOW`] are reported;
 //! * `MaxResults` / `NextToken` page the listing, and a token this service did not
-//!   issue for THIS listing is `InvalidPaginationTokenException` (400).
+//!   issue for THIS listing is `InvalidPaginationTokenException` (400). `MaxResults`
+//!   bounds what a CALLER may ask for, not what this listing serves when none is
+//!   named: a caller that names no `MaxResults` is served the whole filtered history
+//!   in one page with no `NextToken` ([`crate::state::UNASKED_PAGE_SIZE`]).
 //!
 //! Before answering it materialises the decisions the clock has already made due, so
 //! the status a request is filtered on is the one it has at the instant of the call.

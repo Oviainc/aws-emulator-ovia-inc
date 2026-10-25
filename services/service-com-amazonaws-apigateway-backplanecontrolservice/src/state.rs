@@ -1691,6 +1691,19 @@ pub const MAX_DOMAIN_NAME_CHARS: usize = 253;
 /// The longest one dot-separated label of a domain name can be: 63 characters (RFC 1035).
 pub const MAX_DOMAIN_LABEL_CHARS: usize = 63;
 
+/// Whether `code` is an HTTP status code, as the model's `StatusCode` shape is
+/// constrained to be (`^[1-5]\d\d$`): a gateway response's, a method response's and an
+/// integration response's status code are all that one shape.
+///
+/// A request member typed `StatusCode` is refused against the pattern at the boundary, so
+/// this is for a status code that reaches a handler as a BARE string — a `patchOperations`
+/// value, or one read out of an imported API definition — which no boundary check covers.
+pub fn is_status_code(code: &str) -> bool {
+    code.len() == 3
+        && code.starts_with(['1', '2', '3', '4', '5'])
+        && code.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 /// A caller-supplied map as it is STORED and reported: absent when the caller set no
 /// entry, so an empty map in the request does not become an empty map in every later
 /// read.

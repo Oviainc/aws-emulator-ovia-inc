@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDataSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDataSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDataSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches a data source to an existing knowledge base: it mints a
+//! `dataSourceId`, persists the connection configuration the request supplied
+//! in [`crate::state::DataSourceRecord`], and answers with that stored record.
+//! `GetDataSource` reports the same record back.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +175,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDataSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDataSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateDataSourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the bedrock-agent store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `dataSourceConfiguration.type` is a discriminator: it names which
+        // sibling member carries that kind's connection details. A request that
+        // does not satisfy its own discriminator is a bad request, not a
+        // missing resource.
+        if let Some(problem) =
+            crate::state::data_source_configuration_problem(&input.data_source_configuration)
+        {
+            return Err(CreateDataSourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(problem.message()),
+                    field_list: None,
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialise_due_transitions(now);
+
+        // A data source belongs to a knowledge base, so the knowledge base the
+        // URI names has to exist: this operation "connects a knowledge base to
+        // a data source".
+        let Some(knowledge_base) = state.knowledge_bases.get(&input.knowledge_base_id) else {
+            return Err(CreateDataSourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "could not find knowledge base with identifier {}",
+                        input.knowledge_base_id
+                    )),
+                },
+            )
+            .into());
+        };
+        let knowledge_base_type = knowledge_base.knowledge_base_configuration.r#type.clone();
+
+        // `clientToken` is an @idempotencyToken: a repeat of the same request
+        // returns the data source it already created rather than attaching a
+        // second one.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| state.data_source_client_tokens.get(token))
+            .cloned();
+        if let Some(existing) = replayed
+            .as_deref()
+            .and_then(|data_source_id| state.data_source_of(&input.knowledge_base_id, data_source_id))
+        {
+            return Ok(CreateDataSourceOutput {
+                data_source: existing.to_data_source(),
+            });
+        }
+
+        // The store is bounded: past its quota a create is refused rather than
+        // adding another record, and `ServiceQuotaExceededException` is the
+        // modelled refusal for exactly that. Checked AFTER the idempotency
+        // replay above, so a retry of an accepted create is still served.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDataSource"))
+        // No name check: `Name` carries no uniqueness constraint in the model
+        // (only its pattern), and a data source's identity is the minted
+        // `dataSourceId` — so two data sources of one knowledge base may share
+        // a name and the modelled `ConflictException` is not owed here.
+        if state.data_source_count(&input.knowledge_base_id) >= crate::state::DATA_SOURCE_QUOTA {
+            return Err(
+                CreateDataSourceErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "knowledge base {} already holds the maximum of {} data sources",
+                            input.knowledge_base_id,
+                            crate::state::DATA_SOURCE_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(data_source_id) = state.mint_data_source_id(now) else {
+            return Err(CreateDataSourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("could not mint an unused dataSourceId".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let record = crate::state::DataSourceRecord {
+            knowledge_base_id: input.knowledge_base_id.clone(),
+            data_source_id: data_source_id.clone(),
+            name: input.name,
+            description: input.description,
+            data_source_configuration: input.data_source_configuration,
+            server_side_encryption_configuration: input.server_side_encryption_configuration,
+            vector_ingestion_configuration: input.vector_ingestion_configuration,
+            // Only a managed knowledge base publishes a default deletion
+            // policy; for every other kind the member stays as the request left
+            // it, so nothing is invented for it.
+            data_deletion_policy: input.data_deletion_policy.or_else(|| {
+                (knowledge_base_type == crate::state::MANAGED_KNOWLEDGE_BASE_TYPE)
+                    .then(|| crate::state::MANAGED_DATA_DELETION_POLICY.to_string())
+            }),
+            // This operation completes synchronously (HTTP 200) and the
+            // modelled `DataSource$status` documents AVAILABLE as the status of
+            // a data source that has been created and is ready for ingestion,
+            // so no transition is owed here.
+            status: crate::state::DataSourceStatus::Available,
+            // Nothing has failed on a data source this call just created.
+            failure_reasons: Vec::new(),
+            client_token: input.client_token.clone(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let data_source = record.to_data_source();
+        if let Some(token) = input.client_token {
+            state
+                .data_source_client_tokens
+                .insert(token, data_source_id.clone());
+        }
+        state.data_sources.insert(data_source_id, record);
+
+        Ok(CreateDataSourceOutput { data_source })
     }
 }
+

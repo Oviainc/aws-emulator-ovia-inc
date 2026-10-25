@@ -133,6 +133,22 @@
 //! counted off the subnet's `AvailableIpAddressCount`, so the subnet, interface, instance
 //! and route server stores cannot disagree about which addresses are in use.
 //!
+//! ## EC2 Fleets
+//!
+//! [`ComAmazonawsEc2Amazonec2State::fleets`] holds the account's EC2 Fleets as
+//! [`FleetRecord`]s: the modelled [`FleetData`](crate::ops::types::FleetData) every
+//! operation that reports a fleet answers with, plus the instances the fleet has launched
+//! ([`FleetInstanceRecord`]), which the modelled shape carries no member for outside an
+//! `instant` fleet. Keyed by `FleetId`
+//! in a [`BTreeMap`], the same stable order the other stores are kept in.
+//!
+//! A fleet record names its instances by id rather than copying them: the instance itself
+//! stays in [`ComAmazonawsEc2Amazonec2State::instances`], so [`fleet_active_instances`] —
+//! the projection of a fleet's instances into the modelled
+//! [`ActiveInstance`](crate::ops::types::ActiveInstance) shape every operation that reports
+//! one answers with — reads the instance type and the state out of the SAME record
+//! `DescribeInstances` reports, and the two can never disagree about one instance.
+//!
 //! ## Windows fast launch
 //!
 //! [`ComAmazonawsEc2Amazonec2State::fast_launch_images`] holds the Windows fast launch
@@ -676,6 +692,22 @@
 //! `TransitGatewayOptions$AssociationDefaultRouteTableId` and
 //! `$PropagationDefaultRouteTableId` report name that record.
 //!
+//! ## Virtual private gateways
+//!
+//! [`ComAmazonawsEc2Amazonec2State::vpn_gateways`] holds the account's virtual private
+//! gateways as [`VpnGatewayRecord`]s, keyed by `VpnGatewayId` in a [`BTreeMap`]: the
+//! modelled [`VpnGateway`] shape every operation that reports one answers with — so a
+//! member a writer sets round-trips through `DescribeVpnGateways` without a field-by-field
+//! copy — plus the one thing that shape carries no member for, the [`PendingStateMove`] the
+//! clock owes the gateway.
+//!
+//! `CreateVpnGateway` answers a gateway in the non-terminal `pending` state, so the clock
+//! owes it `available` one [`TRANSITION_DELAY`] later, and `DeleteVpnGateway` leaves it in
+//! the non-terminal `deleting` state with `deleted` owed the same way — `VpnState`'s four
+//! members are `pending`, `available`, `deleting` and `deleted`, so a deleted gateway is
+//! still a gateway the API reports rather than a record that vanishes.
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies both moves.
+//!
 //! ## Transit gateway policy tables and their associations
 //!
 //! [`ComAmazonawsEc2Amazonec2State::transit_gateway_policy_tables`] holds the account's
@@ -980,7 +1012,7 @@ use crate::ops::types::{
     TransitGatewayVpcAttachment,
     UserIdGroupPair, Vpc, VpcBlockPublicAccessExclusion, VpcCidrBlockAssociation,
     VpcCidrBlockState, VpcEndpoint,
-    VpcEndpointConnection,
+    VpcEndpointConnection, VpnGateway,
 };
 use crate::scaffolded::Scaffolded;
 
@@ -2202,6 +2234,9 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Every Capacity Block the account holds, by `CapacityBlockId` — see the module docs.
     /// Ordered by id, which is the order `DescribeCapacityBlocks` reports and pages over.
     pub capacity_blocks: BTreeMap<String, CapacityBlockRecord>,
+    /// Every EC2 Fleet the account holds, by `FleetId` — see the module docs. Ordered by
+    /// id, which is the order `DescribeFleets` reports and pages over.
+    pub fleets: BTreeMap<String, FleetRecord>,
     /// Every Capacity Reservation the account holds, by `CapacityReservationId`, as
     /// [`CapacityReservationRecord`]s — see the "Capacity Reservations" section below.
     /// Ordered by id, the stable order a report of them pages over.
@@ -2284,6 +2319,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// a pair either propagates or does not; ordered by route table and then by attachment,
     /// which is the order `GetTransitGatewayRouteTablePropagations` reports and pages over.
     pub transit_gateway_propagations: BTreeMap<(String, String), TransitGatewayPropagationRecord>,
+    /// Every virtual private gateway the account holds, by `VpnGatewayId`, as
+    /// [`VpnGatewayRecord`]s — the modelled [`VpnGateway`] shape plus the state move the
+    /// clock owes it (see the module docs). Ordered by id, which is the order
+    /// `DescribeVpnGateways` reports in.
+    pub vpn_gateways: BTreeMap<String, VpnGatewayRecord>,
     /// Which prefix list is referenced as a route of which transit gateway route table, by
     /// (`TransitGatewayRouteTableId`, `PrefixListId`) — see
     /// [`TransitGatewayPrefixListReferenceRecord`] and the module docs. One entry per pair,
@@ -2650,6 +2690,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             public_ipv4_pools: BTreeMap::new(),
             coip_pools: BTreeMap::new(),
             capacity_blocks: BTreeMap::new(),
+            fleets: BTreeMap::new(),
             capacity_reservations: BTreeMap::new(),
             interruptible_allocation_client_tokens: HashMap::new(),
             capacity_reservation_client_tokens: HashMap::new(),
@@ -2666,6 +2707,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             transit_gateway_available_at: BTreeMap::new(),
             transit_gateway_route_tables: BTreeMap::new(),
             transit_gateway_propagations: BTreeMap::new(),
+            vpn_gateways: BTreeMap::new(),
             transit_gateway_prefix_list_references: BTreeMap::new(),
             dedicated_hosts: BTreeMap::new(),
             dedicated_host_client_tokens: HashMap::new(),
@@ -4865,6 +4907,21 @@ impl ComAmazonawsEc2Amazonec2State {
             }
         }
         for record in self.transit_gateway_route_table_announcements.values_mut() {
+            if let Some(state) = record
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.due_by(now))
+                .map(str::to_string)
+            {
+                record.view.state = Some(state);
+                record.pending = None;
+            }
+        }
+        // A virtual private gateway `CreateVpnGateway` left `pending` or `DeleteVpnGateway`
+        // left `deleting`: each reaches the terminal `VpnState` the write recorded for it at
+        // the instant it was owed, whether or not anybody called again — the same contract
+        // as the records above.
+        for record in self.vpn_gateways.values_mut() {
             if let Some(state) = record
                 .pending
                 .as_ref()
@@ -16998,6 +17055,36 @@ pub const AMAZON_SIDE_ASN_16_BIT: ::std::ops::RangeInclusive<i64> = 64_512..=65_
 /// (`TransitGatewayRequestOptions$AmazonSideAsn`).
 pub const AMAZON_SIDE_ASN_32_BIT: ::std::ops::RangeInclusive<i64> = 4_200_000_000..=4_294_967_294;
 
+/// The Amazon-side ASN a create asks for, or [`DEFAULT_AMAZON_SIDE_ASN`] when it asks for
+/// none — refusing anything outside the two published private ranges rather than defaulting
+/// it, so a typo never reads as "the default".
+///
+/// The ONE place that rule lives: both operations that let a caller choose an Amazon-side
+/// ASN publish the same two ranges and the same default — "If you're using a 16-bit ASN, it
+/// must be in the 64512 to 65534 range. If you're using a 32-bit ASN, it must be in the
+/// 4200000000 to 4294967294 range. Default: 64512" (`CreateVpnGatewayRequest$AmazonSideAsn`,
+/// and `TransitGatewayRequestOptions$AmazonSideAsn` in the same words) — so neither can
+/// accept an ASN the other refuses.
+pub fn private_amazon_side_asn<E>(requested: Option<i64>) -> Result<i64, Scaffolded<E>> {
+    match requested {
+        None => Ok(DEFAULT_AMAZON_SIDE_ASN),
+        Some(asn)
+            if AMAZON_SIDE_ASN_16_BIT.contains(&asn) || AMAZON_SIDE_ASN_32_BIT.contains(&asn) =>
+        {
+            Ok(asn)
+        }
+        Some(asn) => Err(invalid_parameter_value(format!(
+            "Value ({asn}) for parameter amazonSideAsn is invalid. \
+             The range is {min_16} to {max_16} for 16-bit ASNs and \
+             {min_32} to {max_32} for 32-bit ASNs.",
+            min_16 = AMAZON_SIDE_ASN_16_BIT.start(),
+            max_16 = AMAZON_SIDE_ASN_16_BIT.end(),
+            min_32 = AMAZON_SIDE_ASN_32_BIT.start(),
+            max_32 = AMAZON_SIDE_ASN_32_BIT.end(),
+        ))),
+    }
+}
+
 /// The longest IPv4 prefix a transit gateway CIDR block may have: "Must be a size /24 CIDR
 /// block or larger for IPv4" (`TransitGatewayRequestOptions$TransitGatewayCidrBlocks`) —
 /// larger block, so a prefix no longer than this.
@@ -17112,25 +17199,7 @@ pub fn canonical_transit_gateway_cidr(value: &str) -> Result<String, CidrProblem
 pub fn transit_gateway_options<E>(
     requested: Option<&TransitGatewayRequestOptions>,
 ) -> Result<TransitGatewayOptions, Scaffolded<E>> {
-    let asn = match requested.and_then(|options| options.amazon_side_asn) {
-        None => DEFAULT_AMAZON_SIDE_ASN,
-        Some(asn)
-            if AMAZON_SIDE_ASN_16_BIT.contains(&asn) || AMAZON_SIDE_ASN_32_BIT.contains(&asn) =>
-        {
-            asn
-        }
-        Some(asn) => {
-            return Err(invalid_parameter_value(format!(
-                "Value ({asn}) for parameter amazonSideAsn is invalid. \
-                 The range is {min_16} to {max_16} for 16-bit ASNs and \
-                 {min_32} to {max_32} for 32-bit ASNs.",
-                min_16 = AMAZON_SIDE_ASN_16_BIT.start(),
-                max_16 = AMAZON_SIDE_ASN_16_BIT.end(),
-                min_32 = AMAZON_SIDE_ASN_32_BIT.start(),
-                max_32 = AMAZON_SIDE_ASN_32_BIT.end(),
-            )))
-        }
-    };
+    let asn = private_amazon_side_asn(requested.and_then(|options| options.amazon_side_asn))?;
     let mut cidr_blocks: Vec<String> = Vec::new();
     for requested_block in requested
         .and_then(|options| options.transit_gateway_cidr_blocks.as_deref())
@@ -24469,6 +24538,415 @@ impl ComAmazonawsEc2Amazonec2State {
     }
 }
 
+// =============================================================================
+// EC2 Fleets
+// =============================================================================
+
+/// The prefix of every EC2 Fleet id.
+pub const FLEET_ID_PREFIX: &str = "fleet-";
+
+/// The hexadecimal-digit groups of the UUID an EC2 Fleet id carries after
+/// [`FLEET_ID_PREFIX`]: AWS issues a fleet id as `fleet-` followed by a UUID — five
+/// hyphen-separated groups of 8, 4, 4, 4 and 12 lowercase hexadecimal digits, as in
+/// `fleet-73fbd2ce-aa30-494c-8788-1cee4048d614`.
+///
+/// This is NOT the `<prefix>-<8|17 hex>` long-id form [`prefixed_id_is_well_formed`] reads
+/// for the rest of EC2's resources: a 17-hexadecimal-digit `fleet-…` id is not a fleet id
+/// at all, and the recorded unit `ec2-fleet-describe-lifecycle#task#13` has AWS answering
+/// `InvalidFleetId.Malformed` for exactly that. The model publishes no `@pattern` for
+/// `FleetId` (`smithy_query(query="shape",shape="FleetId")` is a plain `String`), so the
+/// form lives here.
+///
+/// Only LOWERCASE hexadecimal digits, the case AWS renders a UUID in and the case
+/// [`prefixed_id_is_well_formed`] holds every other EC2 resource id to, so one choice is
+/// made once for the whole module; the recorded unit does not settle case either way.
+const FLEET_ID_UUID_GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+
+/// Whether `id` is a well-formed EC2 Fleet id: [`FLEET_ID_PREFIX`] and the UUID
+/// [`FLEET_ID_UUID_GROUPS`] describes.
+///
+/// EC2 answers [`INVALID_FLEET_ID_MALFORMED`] for anything else, BEFORE it looks the id up,
+/// so a caller can tell "not a fleet id" from "no such fleet".
+pub fn fleet_id_is_well_formed(id: &str) -> bool {
+    let Some(uuid) = id.strip_prefix(FLEET_ID_PREFIX) else {
+        return false;
+    };
+    let mut groups = uuid.split('-');
+    for length in FLEET_ID_UUID_GROUPS {
+        let Some(group) = groups.next() else {
+            return false;
+        };
+        if group.len() != length
+            || !group
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return false;
+        }
+    }
+    // Nothing may follow the fifth group: `fleet-<uuid>-<anything>` is not a fleet id.
+    groups.next().is_none()
+}
+
+/// `InvalidFleetId.Malformed` (HTTP 400): the request named something that is not an EC2
+/// Fleet id at all, so there is nothing to look up.
+pub const INVALID_FLEET_ID_MALFORMED: &str = "InvalidFleetId.Malformed";
+
+/// `InvalidFleetId.NotFound` (HTTP 400): the request named a fleet id this account holds no
+/// EC2 Fleet for.
+pub const INVALID_FLEET_ID_NOT_FOUND: &str = "InvalidFleetId.NotFound";
+
+/// `UnsupportedOperation` (HTTP 400): the request asked for something this service does not
+/// support for the resource it named — EC2's own code for an operation that is not
+/// applicable, as opposed to a parameter whose value is wrong.
+pub const UNSUPPORTED_OPERATION: &str = "UnsupportedOperation";
+
+/// The catalogs of the modelled fleet enums, re-exported from the generated types so this
+/// module names the ONE copy of each: `FleetType` (`FleetData$Type`), `FleetStateCode`
+/// (`FleetData$FleetState`) and `FleetActivityStatus` (`FleetData$ActivityStatus`). The
+/// single-member aliases below name a member of one of them; a second array here could
+/// drift from the model.
+pub use crate::ops::types::{
+    FLEET_ACTIVITY_STATUS_VALUES, FLEET_STATE_CODE_VALUES, FLEET_TYPE_VALUES,
+};
+
+/// The `instant` member of [`FLEET_TYPE_VALUES`]: a fleet that places its requests once and
+/// reports the instances it launched on the fleet itself.
+pub const FLEET_TYPE_INSTANT: &str = "instant";
+
+/// The `maintain` member of [`FLEET_TYPE_VALUES`], which is also what a `CreateFleet`
+/// request that names no type gets: "Default: `maintain`" (`FleetData$Type`).
+pub const FLEET_TYPE_MAINTAIN: &str = "maintain";
+
+/// The `active` member of [`FLEET_STATE_CODE_VALUES`].
+pub const FLEET_STATE_ACTIVE: &str = "active";
+
+/// The `fulfilled` member of [`FLEET_ACTIVITY_STATUS_VALUES`]: "`fulfilled` when the fleet
+/// size meets or exceeds target capacity" (`FleetData$ActivityStatus`).
+pub const FLEET_ACTIVITY_STATUS_FULFILLED: &str = "fulfilled";
+
+/// The `healthy` member of the modelled `InstanceHealthStatus` catalog
+/// ([`crate::ops::types::INSTANCE_HEALTH_STATUS_VALUES`]).
+///
+/// "If the status of either the instance status check or the system status check is
+/// `impaired`, the health status of the instance is `unhealthy`. Otherwise, the health
+/// status is `healthy`" (`ActiveInstance$InstanceHealth`). No operation of this emulator
+/// impairs either status check — nothing stores a status check at all — so an instance it
+/// reports is healthy; this is the ONE place that derivation lives, for status checks to be
+/// read from once something models them.
+pub const INSTANCE_HEALTH_HEALTHY: &str = "healthy";
+
+/// One instance an EC2 Fleet has launched.
+///
+/// The instance ITSELF is a record of [`ComAmazonawsEc2Amazonec2State::instances`], named
+/// here by id: a fleet keeps only what is true of the instance *as the fleet's* — the Spot
+/// request it was placed through — so the type and the state a fleet reports for an
+/// instance are always the ones the instance store holds.
+#[derive(Debug, Clone)]
+pub struct FleetInstanceRecord {
+    /// The `InstanceId`, a key of [`ComAmazonawsEc2Amazonec2State::instances`].
+    pub instance_id: String,
+    /// "The ID of the Spot Instance request" (`ActiveInstance$SpotInstanceRequestId`) the
+    /// instance was placed through, or `None` for an On-Demand instance, which is placed
+    /// through no Spot request.
+    pub spot_instance_request_id: Option<String>,
+}
+
+/// One stored EC2 Fleet: the modelled [`FleetData`](crate::ops::types::FleetData) every
+/// operation that reports a fleet answers with, plus the instances it has launched.
+#[derive(Debug, Clone)]
+pub struct FleetRecord {
+    /// The fleet as `DescribeFleets` reports it.
+    pub fleet: crate::ops::types::FleetData,
+    /// The instances the fleet has launched, in launch order.
+    pub instances: Vec<FleetInstanceRecord>,
+}
+
+impl FleetRecord {
+    /// This fleet's `FleetId`.
+    pub fn fleet_id(&self) -> &str {
+        self.fleet.fleet_id.as_deref().unwrap_or_default()
+    }
+
+    /// This fleet's `FleetType` — one of [`FLEET_TYPE_VALUES`].
+    pub fn fleet_type(&self) -> &str {
+        self.fleet.r#type.as_deref().unwrap_or_default()
+    }
+}
+
+/// What one stored EC2 Fleet is created with, for
+/// [`ComAmazonawsEc2Amazonec2State::insert_fleet`].
+///
+/// One field per `FleetData` member a writer decides, with the instants as [`SystemTime`]s
+/// rather than modelled timestamps because every writer computes them from the clock it
+/// already holds; the store converts them once. The `FleetId` is NOT here: it is minted by
+/// the store ([`ComAmazonawsEc2Amazonec2State::mint_fleet_id`]), never taken from a request.
+#[derive(Debug, Clone)]
+pub struct FleetSpec {
+    /// `FleetData$Type` — one of [`FLEET_TYPE_VALUES`].
+    pub fleet_type: String,
+    /// `FleetData$FleetState` — one of [`FLEET_STATE_CODE_VALUES`].
+    pub fleet_state: String,
+    /// `FleetData$ActivityStatus` — one of [`FLEET_ACTIVITY_STATUS_VALUES`].
+    pub activity_status: Option<String>,
+    /// `FleetData$ClientToken`, the idempotency token the create carried.
+    pub client_token: Option<String>,
+    /// `FleetData$CreateTime`.
+    pub create_time: SystemTime,
+    /// `FleetData$LaunchTemplateConfigs`, "the launch template and overrides".
+    pub launch_template_configs: Vec<crate::ops::types::FleetLaunchTemplateConfig>,
+    /// `FleetData$TargetCapacitySpecification`, "the number of units to request".
+    pub target_capacity_specification: Option<crate::ops::types::TargetCapacitySpecification>,
+    /// `FleetData$FulfilledCapacity`.
+    pub fulfilled_capacity: Option<f64>,
+    /// `FleetData$FulfilledOnDemandCapacity`.
+    pub fulfilled_on_demand_capacity: Option<f64>,
+    /// `FleetData$TerminateInstancesWithExpiration`.
+    pub terminate_instances_with_expiration: Option<bool>,
+    /// `FleetData$ReplaceUnhealthyInstances`.
+    pub replace_unhealthy_instances: Option<bool>,
+    /// `FleetData$ExcessCapacityTerminationPolicy`.
+    pub excess_capacity_termination_policy: Option<String>,
+    /// `FleetData$ValidFrom`, when the request starts being fulfilled.
+    pub valid_from: Option<SystemTime>,
+    /// `FleetData$ValidUntil`, after which no new instance requests are placed.
+    pub valid_until: Option<SystemTime>,
+    /// `FleetData$Tags`, "the tags for an EC2 Fleet resource".
+    pub tags: Vec<Tag>,
+    /// `FleetData$Context` — "Reserved".
+    pub context: Option<String>,
+    /// The instances the fleet has launched, in launch order.
+    pub instances: Vec<FleetInstanceRecord>,
+}
+
+/// The caller-chosen bytes one stored fleet holds: its client token, its context, its tags
+/// and the launch template names, versions and overrides it keeps, plus the id of each
+/// instance and Spot request it names.
+///
+/// The ONE definition of that charge, the way [`capacity_block_payload_bytes`] is for a
+/// Capacity Block: a writer charges exactly it, on top of the fixed
+/// [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs.
+pub fn fleet_payload_bytes(
+    fleet: &crate::ops::types::FleetData,
+    instances: &[FleetInstanceRecord],
+) -> usize {
+    let text = |value: Option<&String>| value.map_or(0, String::len);
+    let template_bytes: usize = fleet
+        .launch_template_configs
+        .iter()
+        .flatten()
+        .map(|config| {
+            let specification = config
+                .launch_template_specification
+                .as_ref()
+                .map_or(0, |specification| {
+                    text(specification.launch_template_id.as_ref())
+                        .saturating_add(text(specification.launch_template_name.as_ref()))
+                        .saturating_add(text(specification.version.as_ref()))
+                });
+            let overrides: usize = config
+                .overrides
+                .iter()
+                .flatten()
+                .map(|overridden| {
+                    text(overridden.instance_type.as_ref())
+                        .saturating_add(text(overridden.availability_zone.as_ref()))
+                        .saturating_add(text(overridden.subnet_id.as_ref()))
+                        .saturating_add(text(overridden.max_price.as_ref()))
+                })
+                .fold(0usize, usize::saturating_add);
+            specification.saturating_add(overrides)
+        })
+        .fold(0usize, usize::saturating_add);
+    let instance_bytes: usize = instances
+        .iter()
+        .map(|instance| {
+            instance.instance_id.len().saturating_add(
+                instance
+                    .spot_instance_request_id
+                    .as_ref()
+                    .map_or(0, String::len),
+            )
+        })
+        .fold(0usize, usize::saturating_add);
+    text(fleet.client_token.as_ref())
+        .saturating_add(text(fleet.context.as_ref()))
+        .saturating_add(tag_list_bytes(fleet.tags.as_deref().unwrap_or_default()))
+        .saturating_add(template_bytes)
+        .saturating_add(instance_bytes)
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// A fresh, unused `FleetId`.
+    ///
+    /// The form [`fleet_id_is_well_formed`] reads — `fleet-` and a UUID — with the store's
+    /// own monotonic counter rendered into the UUID's first and last groups, so the id is
+    /// unique without being drawn from a request and is never the null UUID. The three
+    /// middle groups are deliberately reserved zeros: nothing distinguishes two fleets but
+    /// the counter, and a reader comparing ids never needs them.
+    pub fn mint_fleet_id(&mut self) -> String {
+        self.id_counter = self.id_counter.saturating_add(1);
+        let counter = self.id_counter;
+        format!(
+            "{FLEET_ID_PREFIX}{:08x}-0000-0000-0000-{:012x}",
+            counter >> 48,
+            counter & 0xffff_ffff_ffff
+        )
+    }
+
+    /// Whether another EC2 Fleet fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of
+    /// [`Self::has_transit_gateway_attachment_capacity`]: a writer asks this BEFORE storing
+    /// anything and refuses the request with EC2's own quota code when it answers `false`.
+    pub fn has_fleet_capacity(&self) -> bool {
+        self.fleets.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Store one EC2 Fleet and answer the `FleetId` it was given — or `None` when the store
+    /// is at [`MAX_STORED_RECORDS_PER_STORE`], or the fleet's caller-chosen bytes would
+    /// cross [`MAX_STORED_BYTES`], and NOTHING was stored.
+    ///
+    /// The one place a fleet enters this store, so every writer of one — and every operation
+    /// that reports what this wrote — agrees on the id form, the stored shape and which
+    /// members a fleet carries. Both ceilings are asked BEFORE anything is written, the way
+    /// [`Self::insert_capacity_block`]'s caller does, so a refused write charges nothing and
+    /// no path can store caller-chosen bytes uncharged.
+    pub fn insert_fleet(&mut self, spec: FleetSpec) -> Option<String> {
+        if !self.has_fleet_capacity() {
+            return None;
+        }
+        let fleet_id = self.mint_fleet_id();
+        let fleet = crate::ops::types::FleetData {
+            activity_status: spec.activity_status,
+            create_time: Some(system_time_to_date_time(spec.create_time)),
+            fleet_id: Some(fleet_id.clone()),
+            fleet_state: Some(spec.fleet_state),
+            client_token: spec.client_token,
+            excess_capacity_termination_policy: spec.excess_capacity_termination_policy,
+            fulfilled_capacity: spec.fulfilled_capacity,
+            fulfilled_on_demand_capacity: spec.fulfilled_on_demand_capacity,
+            launch_template_configs: Some(spec.launch_template_configs),
+            target_capacity_specification: spec.target_capacity_specification,
+            terminate_instances_with_expiration: spec.terminate_instances_with_expiration,
+            r#type: Some(spec.fleet_type),
+            valid_from: spec.valid_from.map(system_time_to_date_time),
+            valid_until: spec.valid_until.map(system_time_to_date_time),
+            replace_unhealthy_instances: spec.replace_unhealthy_instances,
+            // The option structures, the launch errors and the per-fleet instance report
+            // belong to the operations that create and report a fleet; a fleet carries none
+            // of them just by being stored.
+            spot_options: None,
+            on_demand_options: None,
+            reserved_capacity_options: None,
+            tags: Some(spec.tags),
+            errors: None,
+            instances: None,
+            context: spec.context,
+        };
+        let charge = STORED_RECORD_OVERHEAD_BYTES + fleet_payload_bytes(&fleet, &spec.instances);
+        // The byte ceiling is asked before the record is stored, not after: a fleet carries
+        // caller-chosen text (its tags, its client token, its launch-template overrides), so
+        // a write that would cross [`MAX_STORED_BYTES`] stores nothing at all and its caller
+        // refuses the request.
+        if self.would_exceed_stored_bytes(charge) {
+            return None;
+        }
+        self.add_stored_bytes(charge);
+        self.fleets.insert(
+            fleet_id.clone(),
+            FleetRecord {
+                fleet,
+                instances: spec.instances,
+            },
+        );
+        Some(fleet_id)
+    }
+}
+
+/// The running instances of `record`, as the modelled
+/// [`ActiveInstance`](crate::ops::types::ActiveInstance) shape.
+///
+/// "Describes the running instances for the specified EC2 Fleet" (`DescribeFleetInstances`),
+/// so an instance of the fleet that the instance store reports in any other state — one
+/// still `pending`, one `stopped`, one the account has terminated — is not an active
+/// instance, and one the store no longer holds at all is not one either.
+///
+/// Projected from the INSTANCE store rather than from anything the fleet record copies, so
+/// the instance type a fleet reports for an instance is the one `DescribeInstances` reports
+/// for it. The caller sees them in launch order; a report that pages puts them in id order
+/// itself.
+pub fn fleet_active_instances(
+    store: &ComAmazonawsEc2Amazonec2State,
+    record: &FleetRecord,
+) -> Vec<crate::ops::types::ActiveInstance> {
+    record
+        .instances
+        .iter()
+        .filter_map(|launched| {
+            let instance = store.instances.get(&launched.instance_id)?;
+            (instance.state == InstanceStateName::Running).then(|| {
+                crate::ops::types::ActiveInstance {
+                    instance_id: Some(instance.instance_id.clone()),
+                    instance_type: Some(instance.instance_type.clone()),
+                    spot_instance_request_id: launched.spot_instance_request_id.clone(),
+                    instance_health: Some(INSTANCE_HEALTH_HEALTHY.to_string()),
+                }
+            })
+        })
+        .collect()
+}
+
+/// Refuse a request that named something that is not an EC2 Fleet id: HTTP 400
+/// `InvalidFleetId.Malformed`, with the message naming the value the request sent.
+pub fn invalid_fleet_id_malformed<E>(fleet_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_FLEET_ID_MALFORMED,
+        400,
+        format!("The fleet ID '{fleet_id}' is malformed"),
+    )
+}
+
+/// Refuse a request that named a fleet id no EC2 Fleet of the account has: HTTP 400
+/// `InvalidFleetId.NotFound`, through the one helper that words every such refusal
+/// ([`id_not_found`]).
+pub fn invalid_fleet_id_not_found<E>(fleet_id: &str) -> Scaffolded<E> {
+    id_not_found(INVALID_FLEET_ID_NOT_FOUND, "fleet ID", fleet_id)
+}
+
+/// Refuse `fleet_id` unless it is a well-formed EC2 Fleet id, BEFORE any lookup: the
+/// question "is this a fleet id at all" is asked ahead of "does this account hold it", so
+/// "not an id of this kind" is never reported as "no such fleet".
+///
+/// A handler calls this to refuse a malformed id WITHOUT taking the state lock;
+/// [`require_known_fleet`] asks it again, so the ordering holds even for a caller that
+/// goes straight to the lookup.
+pub fn require_well_formed_fleet_id<E>(fleet_id: &str) -> Result<(), Scaffolded<E>> {
+    if fleet_id_is_well_formed(fleet_id) {
+        return Ok(());
+    }
+    Err(invalid_fleet_id_malformed(fleet_id))
+}
+
+/// The EC2 Fleet `fleet_id` names, refusing a malformed id first and an id this account
+/// holds no fleet for second — the order [`require_well_formed_id`] establishes for every
+/// resource of this module.
+pub fn require_known_fleet<'a, E>(
+    store: &'a ComAmazonawsEc2Amazonec2State,
+    fleet_id: &str,
+) -> Result<&'a FleetRecord, Scaffolded<E>> {
+    require_well_formed_fleet_id(fleet_id)?;
+    store
+        .fleets
+        .get(fleet_id)
+        .ok_or_else(|| invalid_fleet_id_not_found(fleet_id))
+}
+
+/// Refuse a request this service does not serve for the resource it named: HTTP 400
+/// `UnsupportedOperation`.
+pub fn unsupported_operation<E>(message: impl Into<String>) -> Scaffolded<E> {
+    Scaffolded::service_error(UNSUPPORTED_OPERATION, 400, message)
+}
+
 // ---------------------------------------------------------------------------
 // Allowed AMIs: the account's image-criteria setting in one Region
 // ---------------------------------------------------------------------------
@@ -25558,6 +26036,212 @@ impl ComAmazonawsEc2Amazonec2State {
         delta_id: &str,
     ) -> Option<&IpamRoutingPolicyRegistrationDeltaRecord> {
         self.ipam_routing_policy_registration_deltas.get(delta_id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Virtual private gateways
+// ---------------------------------------------------------------------------
+//
+// See the module docs for why a gateway is stored as the modelled shape beside the move the
+// clock owes it. The words below are members of the model's own enums, named here so the
+// operations that create, report and delete a gateway cannot spell one value two ways.
+
+/// The id prefix EC2 gives a virtual private gateway (`vgw-0123456789abcdef0`), which
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] mints the long form of.
+pub const VPN_GATEWAY_ID_PREFIX: &str = "vgw";
+
+/// `VpnState`'s `pending` member: a gateway a create has just minted, which is not usable
+/// yet. The generated catalog of the four states is
+/// [`crate::ops::types::VPN_STATE_VALUES`].
+pub const VPN_GATEWAY_STATE_PENDING: &str = "pending";
+
+/// `VpnState`'s `available` member: a gateway that has finished coming up.
+pub const VPN_GATEWAY_STATE_AVAILABLE: &str = "available";
+
+/// `VpnState`'s `deleting` member: a gateway a delete has started on, which is not gone yet.
+pub const VPN_GATEWAY_STATE_DELETING: &str = "deleting";
+
+/// `VpnState`'s `deleted` member: a gateway whose deletion has finished. The enum carries
+/// this state, so a deleted gateway is still a gateway `DescribeVpnGateways` reports rather
+/// than a record that vanished.
+pub const VPN_GATEWAY_STATE_DELETED: &str = "deleted";
+
+/// `GatewayType`'s only member: "Currently the only supported type is `ipsec.1`"
+/// (`DescribeVpnGatewaysRequest$Filters`). The generated catalog is
+/// [`crate::ops::types::GATEWAY_TYPE_VALUES`].
+pub const GATEWAY_TYPE_IPSEC_1: &str = "ipsec.1";
+
+/// The `ResourceType` a `CreateVpnGateway` tag specification may name: the virtual private
+/// gateway it creates ("The tags to apply to the virtual private gateway",
+/// `CreateVpnGatewayRequest$TagSpecifications`).
+pub const RESOURCE_TYPE_VPN_GATEWAY: &str = "vpn-gateway";
+
+/// EC2's error code for a request naming a virtual private gateway id this account holds no
+/// gateway for.
+pub const INVALID_VPN_GATEWAY_ID_NOT_FOUND: &str = "InvalidVpnGatewayID.NotFound";
+
+/// EC2's error code for a request naming something that is not a virtual private gateway id
+/// at all, so there is nothing to look up.
+pub const INVALID_VPN_GATEWAY_ID_MALFORMED: &str = "InvalidVpnGatewayID.Malformed";
+
+/// EC2's error code for a create that would take the account past its virtual private
+/// gateway quota.
+pub const VPN_GATEWAY_LIMIT_EXCEEDED: &str = "VpnGatewayLimitExceeded";
+
+/// The largest number of virtual private gateways this in-memory store holds.
+///
+/// A capacity bound in the same style as [`MAX_TRANSIT_GATEWAYS`], not an AWS quota: each
+/// gateway is a record in this process's memory, so the number a caller can create has to be
+/// finite. [`ComAmazonawsEc2Amazonec2State::has_vpn_gateway_capacity`] is the predicate a
+/// writer asks before inserting; a create past it refuses with
+/// [`vpn_gateway_limit_exceeded`].
+pub const MAX_VPN_GATEWAYS: usize = 1_000;
+
+/// One stored virtual private gateway: what every operation that reports one answers with,
+/// plus the move the clock owes it.
+#[derive(Debug, Clone)]
+pub struct VpnGatewayRecord {
+    /// The gateway as `CreateVpnGateway` and `DescribeVpnGateways` report it.
+    pub view: VpnGateway,
+    /// The state this gateway is due to move to, while it is in a non-terminal one:
+    /// `available` after a create, `deleted` after a delete. `None` once nothing is owed.
+    pub pending: Option<PendingStateMove>,
+}
+
+/// Everything [`ComAmazonawsEc2Amazonec2State::insert_vpn_gateway`] needs that it does not
+/// derive itself: what the REQUEST said.
+#[derive(Debug, Clone)]
+pub struct VpnGatewaySpec {
+    /// "The type of VPN connection this virtual private gateway supports"
+    /// (`CreateVpnGatewayRequest$Type`) — the modelled `GatewayType`, which the boundary
+    /// validator has already held to [`GATEWAY_TYPE_IPSEC_1`].
+    pub gateway_type: String,
+    /// "The Availability Zone for the virtual private gateway"
+    /// (`CreateVpnGatewayRequest$AvailabilityZone`), absent when the request named none —
+    /// "This field may be empty or not returned" (`VpnGateway$AvailabilityZone`).
+    pub availability_zone: Option<String>,
+    /// The resolved Amazon-side ASN ([`private_amazon_side_asn`]).
+    pub amazon_side_asn: i64,
+    /// The tags of a `vpn-gateway` tag specification.
+    pub tags: Vec<Tag>,
+}
+
+/// The caller-chosen bytes one stored virtual private gateway holds: its tags and the
+/// Availability Zone name the request named. Everything else on the record — the id, the
+/// state, the type, the ASN — is derived by this module or bounded by the model, so it is
+/// fixed-size.
+///
+/// The ONE definition of that charge: `CreateVpnGateway` asks it before the write and
+/// [`ComAmazonawsEc2Amazonec2State::insert_vpn_gateway`] charges exactly it.
+pub fn vpn_gateway_payload_bytes(spec: &VpnGatewaySpec) -> usize {
+    tag_list_bytes(&spec.tags)
+        .saturating_add(spec.availability_zone.as_deref().map_or(0, str::len))
+}
+
+/// Refuse a request that named a virtual private gateway id this account holds no gateway
+/// for: HTTP 400 [`INVALID_VPN_GATEWAY_ID_NOT_FOUND`], worded by the one place this module
+/// words a missing resource id ([`id_not_found`]).
+pub fn invalid_vpn_gateway_id_not_found<E>(vpn_gateway_id: &str) -> Scaffolded<E> {
+    id_not_found(
+        INVALID_VPN_GATEWAY_ID_NOT_FOUND,
+        "vpnGateway ID",
+        vpn_gateway_id,
+    )
+}
+
+/// Refuse a create that would take the store past [`MAX_VPN_GATEWAYS`]: HTTP 400
+/// [`VPN_GATEWAY_LIMIT_EXCEEDED`].
+pub fn vpn_gateway_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        VPN_GATEWAY_LIMIT_EXCEEDED,
+        400,
+        format!(
+            "The maximum number of virtual private gateways has been reached \
+             ({MAX_VPN_GATEWAYS})"
+        ),
+    )
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another virtual private gateway fits inside the store's ceiling
+    /// ([`MAX_VPN_GATEWAYS`]).
+    ///
+    /// The same contract as [`Self::has_transit_gateway_capacity`]: a create asks first and
+    /// refuses with [`vpn_gateway_limit_exceeded`] when it answers `false`.
+    pub fn has_vpn_gateway_capacity(&self) -> bool {
+        self.vpn_gateways.len() < MAX_VPN_GATEWAYS
+    }
+
+    /// Insert a virtual private gateway in `pending`, and answer the `VpnGatewayId` it was
+    /// given.
+    ///
+    /// Everything the service itself owns is derived here rather than taken from the caller
+    /// — the id and the state — so two writers cannot report the same gateway differently.
+    /// Like [`Self::insert_transit_gateway`], the caller-chosen bytes of the record are
+    /// charged against the store's byte budget here, so a writer cannot store them
+    /// uncharged, and the clock-owed `available` move is recorded rather than slept for.
+    pub fn insert_vpn_gateway(&mut self, spec: VpnGatewaySpec) -> String {
+        let vpn_gateway_id = self.next_id(VPN_GATEWAY_ID_PREFIX);
+        self.add_stored_bytes(vpn_gateway_payload_bytes(&spec));
+        let view = VpnGateway {
+            vpn_gateway_id: Some(vpn_gateway_id.clone()),
+            state: Some(VPN_GATEWAY_STATE_PENDING.to_string()),
+            r#type: Some(spec.gateway_type),
+            availability_zone: spec.availability_zone,
+            amazon_side_asn: Some(spec.amazon_side_asn),
+            // "Any VPCs attached to the virtual private gateway"
+            // (`VpnGateway$VpcAttachments`): a gateway is created detached — "You must
+            // first attach the virtual private gateway to the VPC" is `AttachVpnGateway`'s
+            // job — so it carries no attachment yet.
+            vpc_attachments: Some(Vec::new()),
+            tags: Some(spec.tags),
+        };
+        self.vpn_gateways.insert(
+            vpn_gateway_id.clone(),
+            VpnGatewayRecord {
+                view,
+                // What the clock now owes this gateway: `available`, one TRANSITION_DELAY
+                // from now — the same span, off the same monotonic clock, as a VPC's
+                // pending move.
+                pending: Some(PendingStateMove::starting_now(VPN_GATEWAY_STATE_AVAILABLE)),
+            },
+        );
+        vpn_gateway_id
+    }
+
+    /// The virtual private gateway `vpn_gateway_id` names, refusing an id that is not shaped
+    /// like one with [`INVALID_VPN_GATEWAY_ID_MALFORMED`] and one the account holds no
+    /// gateway for with [`INVALID_VPN_GATEWAY_ID_NOT_FOUND`] — in that order, so "not a
+    /// virtual private gateway id" is never reported as "no such gateway".
+    pub fn require_vpn_gateway<E>(
+        &self,
+        vpn_gateway_id: &str,
+    ) -> Result<&VpnGatewayRecord, Scaffolded<E>> {
+        require_well_formed_id(
+            VPN_GATEWAY_ID_PREFIX,
+            vpn_gateway_id,
+            INVALID_VPN_GATEWAY_ID_MALFORMED,
+        )?;
+        self.vpn_gateways
+            .get(vpn_gateway_id)
+            .ok_or_else(|| invalid_vpn_gateway_id_not_found(vpn_gateway_id))
+    }
+
+    /// [`Self::require_vpn_gateway`], for a writer: the same two refusals in the same order,
+    /// handing back the record to change.
+    pub fn require_vpn_gateway_mut<E>(
+        &mut self,
+        vpn_gateway_id: &str,
+    ) -> Result<&mut VpnGatewayRecord, Scaffolded<E>> {
+        require_well_formed_id(
+            VPN_GATEWAY_ID_PREFIX,
+            vpn_gateway_id,
+            INVALID_VPN_GATEWAY_ID_MALFORMED,
+        )?;
+        self.vpn_gateways
+            .get_mut(vpn_gateway_id)
+            .ok_or_else(|| invalid_vpn_gateway_id_not_found(vpn_gateway_id))
     }
 }
 

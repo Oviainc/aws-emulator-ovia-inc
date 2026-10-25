@@ -337,6 +337,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A keyspace whose own deletion is already in progress takes no new table: it and
+        // everything in it are on their way out, so storing one would create a table that
+        // vanishes with the keyspace. That is the modelled conflict — "you try to perform
+        // an action and the same or a different action is already in progress".
+        if keyspace.is_deleting() {
+            return Err(CreateTableErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::keyspace_deleting_rejection(&input.keyspace_name)),
+            })
+            .into());
+        }
+
         // A column's type may name "other user-defined types that are contained in the
         // same keyspace" (`FieldDefinition$type`, the same rule for a column), so a name
         // in it that is neither a native type nor a type constructor must be a type of

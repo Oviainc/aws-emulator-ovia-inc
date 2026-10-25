@@ -356,6 +356,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect(),
             version_id: FIRST_VERSION.to_string(),
             version: FIRST_VERSION,
+            version_seq: FIRST_VERSION,
             status: crate::state::TeamStatus::Pending,
             status_code: Some(crate::state::TeamStatusCode::PendingActivation),
             status_message: None,
@@ -363,6 +364,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_update_time: None,
             deletion_start_time: None,
             deletion_completion_time: None,
+            // A freshly created team has asked its approvers for nothing beyond their
+            // invitations: no change is waiting on their approval.
+            pending_update: None,
             tags: input
                 .tags
                 .as_ref()

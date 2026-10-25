@@ -7,20 +7,40 @@
 //! computes its response from what is stored here — nothing is canned and nothing is
 //! echoed back out of the request that asked for it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use ::aws_smithy_types::DateTime;
 use ::sha2::{Digest, Sha256};
 
 use crate::ops::types::{
+    ActivityTaskCancelRequestedEventAttributes, ActivityTaskCanceledEventAttributes,
     ActivityTaskScheduledEventAttributes, ActivityType, ActivityTypeConfiguration, ActivityTypeInfo,
+    CancelTimerFailedEventAttributes, CancelWorkflowExecutionFailedEventAttributes,
+    ChildWorkflowExecutionCanceledEventAttributes, ChildWorkflowExecutionCompletedEventAttributes,
+    ChildWorkflowExecutionFailedEventAttributes, ChildWorkflowExecutionStartedEventAttributes,
+    ChildWorkflowExecutionTerminatedEventAttributes, ChildWorkflowExecutionTimedOutEventAttributes,
+    CompleteWorkflowExecutionFailedEventAttributes,
+    ContinueAsNewWorkflowExecutionFailedEventAttributes,
     DecisionTaskCompletedEventAttributes, DecisionTaskScheduledEventAttributes,
     DecisionTaskStartedEventAttributes, DecisionTaskTimedOutEventAttributes, DomainConfiguration,
-    DomainInfo, ExecutionTimeFilter,
-    HistoryEvent, ResourceTag, TagFilter, TaskList, WorkflowExecution,
-    WorkflowExecutionCancelRequestedEventAttributes,
-    WorkflowExecutionConfiguration, WorkflowExecutionFilter, WorkflowExecutionInfo,
+    DomainInfo, ExecutionTimeFilter, ExternalWorkflowExecutionCancelRequestedEventAttributes,
+    ExternalWorkflowExecutionSignaledEventAttributes, FailWorkflowExecutionFailedEventAttributes,
+    HistoryEvent, LambdaFunctionScheduledEventAttributes, MarkerRecordedEventAttributes,
+    RequestCancelActivityTaskFailedEventAttributes,
+    RequestCancelExternalWorkflowExecutionFailedEventAttributes,
+    RequestCancelExternalWorkflowExecutionInitiatedEventAttributes, ResourceTag,
+    ScheduleActivityTaskFailedEventAttributes, ScheduleLambdaFunctionFailedEventAttributes,
+    SignalExternalWorkflowExecutionFailedEventAttributes,
+    SignalExternalWorkflowExecutionInitiatedEventAttributes,
+    StartChildWorkflowExecutionFailedEventAttributes,
+    StartChildWorkflowExecutionInitiatedEventAttributes, StartLambdaFunctionFailedEventAttributes,
+    StartTimerFailedEventAttributes, TagFilter, TaskList, TimerCanceledEventAttributes,
+    TimerFiredEventAttributes, TimerStartedEventAttributes, WorkflowExecution,
+    WorkflowExecutionCancelRequestedEventAttributes, WorkflowExecutionCanceledEventAttributes,
+    WorkflowExecutionCompletedEventAttributes, WorkflowExecutionConfiguration,
+    WorkflowExecutionContinuedAsNewEventAttributes, WorkflowExecutionFailedEventAttributes,
+    WorkflowExecutionFilter, WorkflowExecutionInfo,
     WorkflowExecutionOpenCounts, WorkflowExecutionSignaledEventAttributes,
     WorkflowExecutionStartedEventAttributes,
     WorkflowExecutionTerminatedEventAttributes, WorkflowExecutionTimedOutEventAttributes,
@@ -57,6 +77,40 @@ pub const EXECUTION_STATUS_CLOSED: &str = "CLOSED";
 /// [`crate::ops::types::CLOSE_STATUS_VALUES`].
 pub const CLOSE_STATUS_TERMINATED: &str = "TERMINATED";
 
+/// `CloseStatus` of an execution a `CompleteWorkflowExecution` decision closed. One of
+/// [`crate::ops::types::CLOSE_STATUS_VALUES`].
+pub const CLOSE_STATUS_COMPLETED: &str = "COMPLETED";
+
+/// `CloseStatus` of an execution a `FailWorkflowExecution` decision closed. One of
+/// [`crate::ops::types::CLOSE_STATUS_VALUES`].
+pub const CLOSE_STATUS_FAILED: &str = "FAILED";
+
+/// `CloseStatus` of an execution a `CancelWorkflowExecution` decision closed. One of
+/// [`crate::ops::types::CLOSE_STATUS_VALUES`].
+pub const CLOSE_STATUS_CANCELED: &str = "CANCELED";
+
+/// `CloseStatus` of an execution a `ContinueAsNewWorkflowExecution` decision closed in
+/// favour of a new run of the same `workflowId`. One of
+/// [`crate::ops::types::CLOSE_STATUS_VALUES`].
+pub const CLOSE_STATUS_CONTINUED_AS_NEW: &str = "CONTINUED_AS_NEW";
+
+/// The `cause` a `WorkflowExecutionTerminated` or `WorkflowExecutionCancelRequested`
+/// event carries when the SERVICE closed or asked to cancel the run because its PARENT
+/// run closed and the parent's `childPolicy` said so. One of
+/// [`crate::ops::types::WORKFLOW_EXECUTION_TERMINATED_CAUSE_VALUES`] and the only
+/// member of [`crate::ops::types::WORKFLOW_EXECUTION_CANCEL_REQUESTED_CAUSE_VALUES`].
+pub const CAUSE_CHILD_POLICY_APPLIED: &str = "CHILD_POLICY_APPLIED";
+
+/// The `childPolicy` that terminates a closing run's open children. One of
+/// [`crate::ops::types::CHILD_POLICY_VALUES`], whose own doc calls it "TERMINATE – The
+/// child executions are terminated".
+pub const CHILD_POLICY_TERMINATE: &str = "TERMINATE";
+
+/// The `childPolicy` that asks a closing run's open children to cancel themselves. One
+/// of [`crate::ops::types::CHILD_POLICY_VALUES`]: "REQUEST_CANCEL – A request to cancel
+/// is attempted for each child execution".
+pub const CHILD_POLICY_REQUEST_CANCEL: &str = "REQUEST_CANCEL";
+
 /// `CloseStatus` of an execution the service itself closed because its
 /// `executionStartToCloseTimeout` ran out. One of
 /// [`crate::ops::types::CLOSE_STATUS_VALUES`], whose own doc calls it "TIMED_OUT – the
@@ -86,7 +140,7 @@ pub const TERMINATED_CAUSE_EVENT_LIMIT_EXCEEDED: &str = "EVENT_LIMIT_EXCEEDED";
 /// How many history events one workflow execution holds. Amazon SWF Quotas records a
 /// maximum of 25,000 events per workflow execution history, and an execution that
 /// reaches it is terminated by the service rather than grown further — which is what
-/// [`Execution::terminate_for_event_limit`] does, and what bounds the memory one run's
+/// [`RunClose::event_limit_exceeded`] records, and what bounds the memory one run's
 /// history can take however many times a caller signals or polls it.
 pub const MAX_HISTORY_EVENTS_PER_EXECUTION: usize = 25_000;
 
@@ -166,6 +220,13 @@ pub const MAX_EXECUTION_PAGE_SIZE: usize = 1_000;
 /// task is considered timed out if it doesn't completed within this duration."). One of
 /// [`crate::ops::types::DECISION_TASK_TIMEOUT_TYPE_VALUES`].
 pub const DECISION_TASK_TIMEOUT_START_TO_CLOSE: &str = "START_TO_CLOSE";
+
+/// The `timeoutType` of a decision task that was scheduled on an overridden task list
+/// and not started within the `taskListScheduleToStartTimeout` the override carried
+/// ("If a decision task scheduled on the override task list is not started within the
+/// timeout, the decision task will time out"). One of
+/// [`crate::ops::types::DECISION_TASK_TIMEOUT_TYPE_VALUES`].
+pub const DECISION_TASK_TIMEOUT_SCHEDULE_TO_START: &str = "SCHEDULE_TO_START";
 
 /// The duration value every SWF timeout member accepts for "unlimited": `NONE`, as
 /// `startToCloseTimeout`'s own doc puts it ("You can use NONE to specify unlimited
@@ -407,10 +468,81 @@ pub enum EventAttributes {
     /// `ActivityTaskScheduledEventAttributes` carries eleven members, several times the
     /// size of the other variants.
     ActivityTaskScheduled(Box<ActivityTaskScheduledEventAttributes>),
+    ScheduleActivityTaskFailed(ScheduleActivityTaskFailedEventAttributes),
+    ActivityTaskCancelRequested(ActivityTaskCancelRequestedEventAttributes),
+    ActivityTaskCanceled(ActivityTaskCanceledEventAttributes),
+    RequestCancelActivityTaskFailed(RequestCancelActivityTaskFailedEventAttributes),
+    MarkerRecorded(MarkerRecordedEventAttributes),
+    TimerStarted(TimerStartedEventAttributes),
+    TimerFired(TimerFiredEventAttributes),
+    TimerCanceled(TimerCanceledEventAttributes),
+    StartTimerFailed(StartTimerFailedEventAttributes),
+    CancelTimerFailed(CancelTimerFailedEventAttributes),
     WorkflowExecutionSignaled(WorkflowExecutionSignaledEventAttributes),
+    WorkflowExecutionCompleted(WorkflowExecutionCompletedEventAttributes),
+    CompleteWorkflowExecutionFailed(CompleteWorkflowExecutionFailedEventAttributes),
+    WorkflowExecutionFailed(WorkflowExecutionFailedEventAttributes),
+    FailWorkflowExecutionFailed(FailWorkflowExecutionFailedEventAttributes),
+    WorkflowExecutionCanceled(WorkflowExecutionCanceledEventAttributes),
+    CancelWorkflowExecutionFailed(CancelWorkflowExecutionFailedEventAttributes),
+    /// Boxed for the same reason as the started attributes above: eleven members.
+    WorkflowExecutionContinuedAsNew(Box<WorkflowExecutionContinuedAsNewEventAttributes>),
+    ContinueAsNewWorkflowExecutionFailed(ContinueAsNewWorkflowExecutionFailedEventAttributes),
     WorkflowExecutionTerminated(WorkflowExecutionTerminatedEventAttributes),
     WorkflowExecutionTimedOut(WorkflowExecutionTimedOutEventAttributes),
     WorkflowExecutionCancelRequested(WorkflowExecutionCancelRequestedEventAttributes),
+    /// Boxed for the same reason as the started attributes above: twelve members.
+    StartChildWorkflowExecutionInitiated(Box<StartChildWorkflowExecutionInitiatedEventAttributes>),
+    StartChildWorkflowExecutionFailed(StartChildWorkflowExecutionFailedEventAttributes),
+    ChildWorkflowExecutionStarted(ChildWorkflowExecutionStartedEventAttributes),
+    ChildWorkflowExecutionCompleted(ChildWorkflowExecutionCompletedEventAttributes),
+    ChildWorkflowExecutionFailed(ChildWorkflowExecutionFailedEventAttributes),
+    ChildWorkflowExecutionCanceled(ChildWorkflowExecutionCanceledEventAttributes),
+    ChildWorkflowExecutionTimedOut(ChildWorkflowExecutionTimedOutEventAttributes),
+    ChildWorkflowExecutionTerminated(ChildWorkflowExecutionTerminatedEventAttributes),
+    SignalExternalWorkflowExecutionInitiated(SignalExternalWorkflowExecutionInitiatedEventAttributes),
+    ExternalWorkflowExecutionSignaled(ExternalWorkflowExecutionSignaledEventAttributes),
+    SignalExternalWorkflowExecutionFailed(SignalExternalWorkflowExecutionFailedEventAttributes),
+    RequestCancelExternalWorkflowExecutionInitiated(
+        RequestCancelExternalWorkflowExecutionInitiatedEventAttributes,
+    ),
+    ExternalWorkflowExecutionCancelRequested(ExternalWorkflowExecutionCancelRequestedEventAttributes),
+    RequestCancelExternalWorkflowExecutionFailed(
+        RequestCancelExternalWorkflowExecutionFailedEventAttributes,
+    ),
+    LambdaFunctionScheduled(LambdaFunctionScheduledEventAttributes),
+    ScheduleLambdaFunctionFailed(ScheduleLambdaFunctionFailedEventAttributes),
+    StartLambdaFunctionFailed(StartLambdaFunctionFailedEventAttributes),
+}
+
+/// What one recorded event does to the work its run has in flight, and whether a
+/// decider has to see it.
+///
+/// Every field is read off ONE exhaustive match ([`EventAttributes::effect`]), so an
+/// event type added later cannot be forgotten by any of the readers: each of them asks
+/// for a field of this rather than matching the variant itself.
+#[derive(Debug, Clone, Default)]
+pub struct EventEffect {
+    /// The `scheduledEventId` of the decision task this event takes OUT of its task
+    /// list: a decider was handed it, or it timed out waiting there.
+    pub decision_task_left_task_list: Option<i64>,
+    /// The `startedEventId` of the decision task this event CLOSES — what tells a
+    /// started decision task that is still outstanding from one already answered.
+    pub decision_task_closed: Option<i64>,
+    /// The `scheduledEventId` of the activity task this event takes OUT of its task
+    /// list: a worker was handed it, or it left the list without being handed over.
+    pub activity_task_left_task_list: Option<i64>,
+    /// The `scheduledEventId` of the activity task this event takes out of flight.
+    pub activity_task_closed: Option<i64>,
+    /// The `startedEventId` of the timer this event takes out of flight: it fired or
+    /// it was cancelled.
+    pub timer_closed: Option<i64>,
+    /// The `scheduledEventId` of the Lambda task this event takes out of flight.
+    pub lambda_function_closed: Option<i64>,
+    /// Whether a decider has to act on this event. An event recorded while a decision
+    /// task was outstanding — or recorded by the completion of one — gets a decision
+    /// task of its own, which is how the decider is told about it.
+    pub needs_decision: bool,
 }
 
 impl EventAttributes {
@@ -424,81 +556,169 @@ impl EventAttributes {
             Self::DecisionTaskCompleted(_) => "DecisionTaskCompleted",
             Self::DecisionTaskTimedOut(_) => "DecisionTaskTimedOut",
             Self::ActivityTaskScheduled(_) => "ActivityTaskScheduled",
+            Self::ScheduleActivityTaskFailed(_) => "ScheduleActivityTaskFailed",
+            Self::ActivityTaskCancelRequested(_) => "ActivityTaskCancelRequested",
+            Self::ActivityTaskCanceled(_) => "ActivityTaskCanceled",
+            Self::RequestCancelActivityTaskFailed(_) => "RequestCancelActivityTaskFailed",
+            Self::MarkerRecorded(_) => "MarkerRecorded",
+            Self::TimerStarted(_) => "TimerStarted",
+            Self::TimerFired(_) => "TimerFired",
+            Self::TimerCanceled(_) => "TimerCanceled",
+            Self::StartTimerFailed(_) => "StartTimerFailed",
+            Self::CancelTimerFailed(_) => "CancelTimerFailed",
             Self::WorkflowExecutionSignaled(_) => "WorkflowExecutionSignaled",
+            Self::WorkflowExecutionCompleted(_) => "WorkflowExecutionCompleted",
+            Self::CompleteWorkflowExecutionFailed(_) => "CompleteWorkflowExecutionFailed",
+            Self::WorkflowExecutionFailed(_) => "WorkflowExecutionFailed",
+            Self::FailWorkflowExecutionFailed(_) => "FailWorkflowExecutionFailed",
+            Self::WorkflowExecutionCanceled(_) => "WorkflowExecutionCanceled",
+            Self::CancelWorkflowExecutionFailed(_) => "CancelWorkflowExecutionFailed",
+            Self::WorkflowExecutionContinuedAsNew(_) => "WorkflowExecutionContinuedAsNew",
+            Self::ContinueAsNewWorkflowExecutionFailed(_) => "ContinueAsNewWorkflowExecutionFailed",
             Self::WorkflowExecutionTerminated(_) => "WorkflowExecutionTerminated",
             Self::WorkflowExecutionTimedOut(_) => "WorkflowExecutionTimedOut",
             Self::WorkflowExecutionCancelRequested(_) => "WorkflowExecutionCancelRequested",
+            Self::StartChildWorkflowExecutionInitiated(_) => "StartChildWorkflowExecutionInitiated",
+            Self::StartChildWorkflowExecutionFailed(_) => "StartChildWorkflowExecutionFailed",
+            Self::ChildWorkflowExecutionStarted(_) => "ChildWorkflowExecutionStarted",
+            Self::ChildWorkflowExecutionCompleted(_) => "ChildWorkflowExecutionCompleted",
+            Self::ChildWorkflowExecutionFailed(_) => "ChildWorkflowExecutionFailed",
+            Self::ChildWorkflowExecutionCanceled(_) => "ChildWorkflowExecutionCanceled",
+            Self::ChildWorkflowExecutionTimedOut(_) => "ChildWorkflowExecutionTimedOut",
+            Self::ChildWorkflowExecutionTerminated(_) => "ChildWorkflowExecutionTerminated",
+            Self::SignalExternalWorkflowExecutionInitiated(_) => {
+                "SignalExternalWorkflowExecutionInitiated"
+            }
+            Self::ExternalWorkflowExecutionSignaled(_) => "ExternalWorkflowExecutionSignaled",
+            Self::SignalExternalWorkflowExecutionFailed(_) => {
+                "SignalExternalWorkflowExecutionFailed"
+            }
+            Self::RequestCancelExternalWorkflowExecutionInitiated(_) => {
+                "RequestCancelExternalWorkflowExecutionInitiated"
+            }
+            Self::ExternalWorkflowExecutionCancelRequested(_) => {
+                "ExternalWorkflowExecutionCancelRequested"
+            }
+            Self::RequestCancelExternalWorkflowExecutionFailed(_) => {
+                "RequestCancelExternalWorkflowExecutionFailed"
+            }
+            Self::LambdaFunctionScheduled(_) => "LambdaFunctionScheduled",
+            Self::ScheduleLambdaFunctionFailed(_) => "ScheduleLambdaFunctionFailed",
+            Self::StartLambdaFunctionFailed(_) => "StartLambdaFunctionFailed",
+        }
+    }
+
+    /// What this event does to its run's work in flight. The ONE exhaustive match over
+    /// the event types, so a variant added later cannot be forgotten by the readers
+    /// ([`Execution::pending_decision_tasks_on`],
+    /// [`Execution::pending_activity_tasks_on`], [`Execution::open_timer`] and the
+    /// rest), which each read one field of the answer.
+    pub fn effect(&self) -> EventEffect {
+        match self {
+            // A scheduled decision task waits in its task list until a decider is
+            // handed it, or it times out there first; both events name the task by its
+            // `scheduledEventId`, and both close a task that had been handed over by
+            // its `startedEventId`.
+            Self::DecisionTaskStarted(started) => EventEffect {
+                decision_task_left_task_list: Some(started.scheduled_event_id),
+                ..Default::default()
+            },
+            Self::DecisionTaskTimedOut(timed_out) => EventEffect {
+                decision_task_left_task_list: Some(timed_out.scheduled_event_id),
+                decision_task_closed: Some(timed_out.started_event_id),
+                ..Default::default()
+            },
+            Self::DecisionTaskCompleted(completed) => EventEffect {
+                decision_task_closed: Some(completed.started_event_id),
+                ..Default::default()
+            },
+            // A scheduled activity task that is cancelled before a worker took it both
+            // leaves its task list and goes out of flight, and the decider has to see
+            // the cancellation.
+            Self::ActivityTaskCanceled(canceled) => EventEffect {
+                activity_task_left_task_list: Some(canceled.scheduled_event_id),
+                activity_task_closed: Some(canceled.scheduled_event_id),
+                needs_decision: true,
+                ..Default::default()
+            },
+            Self::TimerFired(fired) => EventEffect {
+                timer_closed: Some(fired.started_event_id),
+                needs_decision: true,
+                ..Default::default()
+            },
+            Self::TimerCanceled(canceled) => EventEffect {
+                timer_closed: Some(canceled.started_event_id),
+                ..Default::default()
+            },
+            Self::StartLambdaFunctionFailed(failed) => EventEffect {
+                lambda_function_closed: Some(failed.scheduled_event_id),
+                needs_decision: true,
+                ..Default::default()
+            },
+            // Everything a decider has to act on but that takes nothing out of flight:
+            // what arrived from outside the run, what a decision of its own failed on,
+            // and what a child run reported back.
+            Self::WorkflowExecutionSignaled(_)
+            | Self::WorkflowExecutionCancelRequested(_)
+            | Self::ScheduleActivityTaskFailed(_)
+            | Self::RequestCancelActivityTaskFailed(_)
+            | Self::StartTimerFailed(_)
+            | Self::CancelTimerFailed(_)
+            | Self::CompleteWorkflowExecutionFailed(_)
+            | Self::FailWorkflowExecutionFailed(_)
+            | Self::CancelWorkflowExecutionFailed(_)
+            | Self::ContinueAsNewWorkflowExecutionFailed(_)
+            | Self::StartChildWorkflowExecutionFailed(_)
+            | Self::ChildWorkflowExecutionCompleted(_)
+            | Self::ChildWorkflowExecutionFailed(_)
+            | Self::ChildWorkflowExecutionCanceled(_)
+            | Self::ChildWorkflowExecutionTimedOut(_)
+            | Self::ChildWorkflowExecutionTerminated(_)
+            | Self::ExternalWorkflowExecutionSignaled(_)
+            | Self::SignalExternalWorkflowExecutionFailed(_)
+            | Self::ExternalWorkflowExecutionCancelRequested(_)
+            | Self::RequestCancelExternalWorkflowExecutionFailed(_)
+            | Self::ScheduleLambdaFunctionFailed(_) => EventEffect {
+                needs_decision: true,
+                ..Default::default()
+            },
+            // Everything else either starts work the decider is now waiting on, or
+            // records what has already happened to the run as a whole.
+            Self::WorkflowExecutionStarted(_)
+            | Self::DecisionTaskScheduled(_)
+            | Self::ActivityTaskScheduled(_)
+            | Self::ActivityTaskCancelRequested(_)
+            | Self::MarkerRecorded(_)
+            | Self::TimerStarted(_)
+            | Self::WorkflowExecutionCompleted(_)
+            | Self::WorkflowExecutionFailed(_)
+            | Self::WorkflowExecutionCanceled(_)
+            | Self::WorkflowExecutionContinuedAsNew(_)
+            | Self::WorkflowExecutionTerminated(_)
+            | Self::WorkflowExecutionTimedOut(_)
+            | Self::StartChildWorkflowExecutionInitiated(_)
+            | Self::ChildWorkflowExecutionStarted(_)
+            | Self::SignalExternalWorkflowExecutionInitiated(_)
+            | Self::RequestCancelExternalWorkflowExecutionInitiated(_)
+            | Self::LambdaFunctionScheduled(_) => EventEffect::default(),
         }
     }
 
     /// The `scheduledEventId` of the decision task these attributes take OUT of its
     /// task list, when that is what the event records.
-    ///
-    /// A scheduled decision task waits in its task list until a decider is handed it
-    /// (`DecisionTaskStarted`, whose `scheduledEventId` names the task it started) or
-    /// it times out there first (`DecisionTaskTimedOut`, same member). This exhaustive
-    /// match is the single place that enumerates them, so a variant added later cannot
-    /// be forgotten by [`Execution::pending_decision_tasks_on`].
     pub fn decision_task_left_task_list(&self) -> Option<i64> {
-        match self {
-            Self::DecisionTaskStarted(started) => Some(started.scheduled_event_id),
-            Self::DecisionTaskTimedOut(timed_out) => Some(timed_out.scheduled_event_id),
-            Self::WorkflowExecutionStarted(_)
-            | Self::DecisionTaskScheduled(_)
-            | Self::DecisionTaskCompleted(_)
-            | Self::ActivityTaskScheduled(_)
-            | Self::WorkflowExecutionSignaled(_)
-            | Self::WorkflowExecutionTerminated(_)
-            | Self::WorkflowExecutionTimedOut(_)
-            | Self::WorkflowExecutionCancelRequested(_) => None,
-        }
+        self.effect().decision_task_left_task_list
     }
 
-    /// The `startedEventId` of the decision task these attributes CLOSE: a decider
-    /// completed it (`DecisionTaskCompleted`) or it timed out after being handed over
-    /// (`DecisionTaskTimedOut`). Both members are modelled on exactly those two events,
-    /// so this is what tells a started decision task that is still outstanding from one
-    /// that has already been answered.
+    /// The `startedEventId` of the decision task these attributes CLOSE.
     pub fn decision_task_closed(&self) -> Option<i64> {
-        match self {
-            Self::DecisionTaskCompleted(completed) => Some(completed.started_event_id),
-            Self::DecisionTaskTimedOut(timed_out) => Some(timed_out.started_event_id),
-            Self::WorkflowExecutionStarted(_)
-            | Self::DecisionTaskScheduled(_)
-            | Self::DecisionTaskStarted(_)
-            | Self::ActivityTaskScheduled(_)
-            | Self::WorkflowExecutionSignaled(_)
-            | Self::WorkflowExecutionTerminated(_)
-            | Self::WorkflowExecutionTimedOut(_)
-            | Self::WorkflowExecutionCancelRequested(_) => None,
-        }
+        self.effect().decision_task_closed
     }
 
     /// The `scheduledEventId` of the activity task these attributes take OUT of its
     /// task list, when that is what the event records.
-    ///
-    /// A scheduled activity task waits in its task list until a worker is handed it
-    /// (`ActivityTaskStarted`, whose `scheduledEventId` names the task it started), it
-    /// times out there first (`ActivityTaskTimedOut`, same member) or the scheduling is
-    /// cancelled (`ActivityTaskCanceled`, same member). No stored variant records any of
-    /// them yet — the operations that would write them (`PollForActivityTask`, the
-    /// activity-task responders and the schedule-to-start sweep behind them) are still
-    /// scaffolds tracked by their own gap issues — so every event answers `None` today.
-    /// This exhaustive match is the single place that enumerates them, so a variant
-    /// added later cannot be forgotten by [`Execution::pending_activity_tasks_on`].
     pub fn activity_task_left_task_list(&self) -> Option<i64> {
-        match self {
-            Self::WorkflowExecutionStarted(_)
-            | Self::DecisionTaskScheduled(_)
-            | Self::DecisionTaskStarted(_)
-            | Self::DecisionTaskCompleted(_)
-            | Self::DecisionTaskTimedOut(_)
-            | Self::ActivityTaskScheduled(_)
-            | Self::WorkflowExecutionSignaled(_)
-            | Self::WorkflowExecutionTerminated(_)
-            | Self::WorkflowExecutionTimedOut(_)
-            | Self::WorkflowExecutionCancelRequested(_) => None,
-        }
+        self.effect().activity_task_left_task_list
     }
 }
 
@@ -540,8 +760,66 @@ impl HistoryEventRecord {
             EventAttributes::ActivityTaskScheduled(attributes) => {
                 event.activity_task_scheduled_event_attributes = Some(attributes.as_ref().clone());
             }
+            EventAttributes::ScheduleActivityTaskFailed(attributes) => {
+                event.schedule_activity_task_failed_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::ActivityTaskCancelRequested(attributes) => {
+                event.activity_task_cancel_requested_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::ActivityTaskCanceled(attributes) => {
+                event.activity_task_canceled_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::RequestCancelActivityTaskFailed(attributes) => {
+                event.request_cancel_activity_task_failed_event_attributes =
+                    Some(attributes.clone());
+            }
+            EventAttributes::MarkerRecorded(attributes) => {
+                event.marker_recorded_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::TimerStarted(attributes) => {
+                event.timer_started_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::TimerFired(attributes) => {
+                event.timer_fired_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::TimerCanceled(attributes) => {
+                event.timer_canceled_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::StartTimerFailed(attributes) => {
+                event.start_timer_failed_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::CancelTimerFailed(attributes) => {
+                event.cancel_timer_failed_event_attributes = Some(attributes.clone());
+            }
             EventAttributes::WorkflowExecutionSignaled(attributes) => {
                 event.workflow_execution_signaled_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::WorkflowExecutionCompleted(attributes) => {
+                event.workflow_execution_completed_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::CompleteWorkflowExecutionFailed(attributes) => {
+                event.complete_workflow_execution_failed_event_attributes =
+                    Some(attributes.clone());
+            }
+            EventAttributes::WorkflowExecutionFailed(attributes) => {
+                event.workflow_execution_failed_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::FailWorkflowExecutionFailed(attributes) => {
+                event.fail_workflow_execution_failed_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::WorkflowExecutionCanceled(attributes) => {
+                event.workflow_execution_canceled_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::CancelWorkflowExecutionFailed(attributes) => {
+                event.cancel_workflow_execution_failed_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::WorkflowExecutionContinuedAsNew(attributes) => {
+                event.workflow_execution_continued_as_new_event_attributes =
+                    Some(attributes.as_ref().clone());
+            }
+            EventAttributes::ContinueAsNewWorkflowExecutionFailed(attributes) => {
+                event.continue_as_new_workflow_execution_failed_event_attributes =
+                    Some(attributes.clone());
             }
             EventAttributes::WorkflowExecutionTerminated(attributes) => {
                 event.workflow_execution_terminated_event_attributes = Some(attributes.clone());
@@ -552,6 +830,68 @@ impl HistoryEventRecord {
             EventAttributes::WorkflowExecutionCancelRequested(attributes) => {
                 event.workflow_execution_cancel_requested_event_attributes =
                     Some(attributes.clone());
+            }
+            EventAttributes::StartChildWorkflowExecutionInitiated(attributes) => {
+                event.start_child_workflow_execution_initiated_event_attributes =
+                    Some(attributes.as_ref().clone());
+            }
+            EventAttributes::StartChildWorkflowExecutionFailed(attributes) => {
+                event.start_child_workflow_execution_failed_event_attributes =
+                    Some(attributes.clone());
+            }
+            EventAttributes::ChildWorkflowExecutionStarted(attributes) => {
+                event.child_workflow_execution_started_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::ChildWorkflowExecutionCompleted(attributes) => {
+                event.child_workflow_execution_completed_event_attributes =
+                    Some(attributes.clone());
+            }
+            EventAttributes::ChildWorkflowExecutionFailed(attributes) => {
+                event.child_workflow_execution_failed_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::ChildWorkflowExecutionCanceled(attributes) => {
+                event.child_workflow_execution_canceled_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::ChildWorkflowExecutionTimedOut(attributes) => {
+                event.child_workflow_execution_timed_out_event_attributes =
+                    Some(attributes.clone());
+            }
+            EventAttributes::ChildWorkflowExecutionTerminated(attributes) => {
+                event.child_workflow_execution_terminated_event_attributes =
+                    Some(attributes.clone());
+            }
+            EventAttributes::SignalExternalWorkflowExecutionInitiated(attributes) => {
+                event.signal_external_workflow_execution_initiated_event_attributes =
+                    Some(attributes.clone());
+            }
+            EventAttributes::ExternalWorkflowExecutionSignaled(attributes) => {
+                event.external_workflow_execution_signaled_event_attributes =
+                    Some(attributes.clone());
+            }
+            EventAttributes::SignalExternalWorkflowExecutionFailed(attributes) => {
+                event.signal_external_workflow_execution_failed_event_attributes =
+                    Some(attributes.clone());
+            }
+            EventAttributes::RequestCancelExternalWorkflowExecutionInitiated(attributes) => {
+                event.request_cancel_external_workflow_execution_initiated_event_attributes =
+                    Some(attributes.clone());
+            }
+            EventAttributes::ExternalWorkflowExecutionCancelRequested(attributes) => {
+                event.external_workflow_execution_cancel_requested_event_attributes =
+                    Some(attributes.clone());
+            }
+            EventAttributes::RequestCancelExternalWorkflowExecutionFailed(attributes) => {
+                event.request_cancel_external_workflow_execution_failed_event_attributes =
+                    Some(attributes.clone());
+            }
+            EventAttributes::LambdaFunctionScheduled(attributes) => {
+                event.lambda_function_scheduled_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::ScheduleLambdaFunctionFailed(attributes) => {
+                event.schedule_lambda_function_failed_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::StartLambdaFunctionFailed(attributes) => {
+                event.start_lambda_function_failed_event_attributes = Some(attributes.clone());
             }
         }
         event
@@ -625,6 +965,214 @@ fn blank_history_event(event_id: i64, event_timestamp: DateTime, event_type: &st
     }
 }
 
+/// How a run CLOSED: the close event the service records for it, and the `closeStatus`
+/// that close leaves on the record.
+///
+/// Every close goes through [`Domain::close_run`] carrying one of these, so the close
+/// event, the `closeStatus`, the domain's open-run index, the child policy and the
+/// parent run's notification can never disagree about how a run ended.
+#[derive(Debug, Clone)]
+pub enum RunClose {
+    /// A `CompleteWorkflowExecution` decision: "Closes the workflow execution and
+    /// records a `WorkflowExecutionCompleted` event in the history".
+    Completed {
+        result: Option<String>,
+        decision_task_completed_event_id: i64,
+    },
+    /// A `FailWorkflowExecution` decision.
+    Failed {
+        reason: Option<String>,
+        details: Option<String>,
+        decision_task_completed_event_id: i64,
+    },
+    /// A `CancelWorkflowExecution` decision.
+    Canceled {
+        details: Option<String>,
+        decision_task_completed_event_id: i64,
+    },
+    /// A `ContinueAsNewWorkflowExecution` decision: this run closes and the run its
+    /// attributes name carries on in its place.
+    ContinuedAsNew(Box<WorkflowExecutionContinuedAsNewEventAttributes>),
+    /// The run's own `executionStartToCloseTimeout` ran out.
+    TimedOut,
+    /// A terminate: a caller's, or the service's own when it carries a `cause`.
+    Terminated {
+        reason: Option<String>,
+        details: Option<String>,
+        cause: Option<String>,
+        /// The policy to apply to this run's open children, when the terminate named
+        /// one; `None` leaves the run's own `childPolicy` in force.
+        child_policy: Option<String>,
+    },
+}
+
+impl RunClose {
+    /// The close of a run that has reached the history-size quota: the service's own
+    /// terminate, carrying the cause that says so.
+    ///
+    /// `WorkflowExecutionTerminatedCause` models exactly this cause, and `cause`'s own
+    /// doc — "If set, indicates that the workflow execution was automatically
+    /// terminated, and specifies the cause" — says the service, not a caller, did it.
+    pub fn event_limit_exceeded() -> Self {
+        Self::Terminated {
+            reason: None,
+            details: None,
+            cause: Some(TERMINATED_CAUSE_EVENT_LIMIT_EXCEEDED.to_string()),
+            child_policy: None,
+        }
+    }
+
+    /// The `closeStatus` this close leaves on the record — one of
+    /// [`crate::ops::types::CLOSE_STATUS_VALUES`].
+    pub fn close_status(&self) -> &'static str {
+        match self {
+            Self::Completed { .. } => CLOSE_STATUS_COMPLETED,
+            Self::Failed { .. } => CLOSE_STATUS_FAILED,
+            Self::Canceled { .. } => CLOSE_STATUS_CANCELED,
+            Self::ContinuedAsNew(_) => CLOSE_STATUS_CONTINUED_AS_NEW,
+            Self::TimedOut => CLOSE_STATUS_TIMED_OUT,
+            Self::Terminated { .. } => CLOSE_STATUS_TERMINATED,
+        }
+    }
+
+    /// The policy this close applies to the run's open child executions: the one the
+    /// close named, else the run's own `childPolicy`.
+    fn child_policy(&self, run_policy: &str) -> String {
+        match self {
+            Self::Terminated {
+                child_policy: Some(policy),
+                ..
+            } => policy.clone(),
+            _ => run_policy.to_string(),
+        }
+    }
+
+    /// Whether this close is one the run's `childPolicy` applies to: `childPolicy`
+    /// "specifies the policy to use for the child workflow executions of this workflow
+    /// execution IF IT IS TERMINATED, by calling the TerminateWorkflowExecution action
+    /// explicitly or due to an expired timeout" — so a run that completed, failed, was
+    /// cancelled or continued as new leaves its children running.
+    fn applies_child_policy(&self) -> bool {
+        matches!(self, Self::Terminated { .. } | Self::TimedOut)
+    }
+
+    /// The `reason` this close carried, which only a failure has.
+    fn closed_reason(&self) -> Option<String> {
+        match self {
+            Self::Failed { reason, .. }
+            | Self::Terminated { reason, .. } => reason.clone(),
+            _ => None,
+        }
+    }
+
+    /// The result or details this close carried — what a parent run is told its child
+    /// ended with.
+    fn closed_payload(&self) -> Option<String> {
+        match self {
+            Self::Completed { result, .. } => result.clone(),
+            Self::Failed { details, .. }
+            | Self::Canceled { details, .. }
+            | Self::Terminated { details, .. } => details.clone(),
+            Self::ContinuedAsNew(_) | Self::TimedOut => None,
+        }
+    }
+
+    /// The one history event this close records, carrying the run's own `childPolicy`
+    /// where the event models it.
+    fn event(self, run_policy: String) -> EventAttributes {
+        let child_policy = self.child_policy(&run_policy);
+        match self {
+            Self::Completed {
+                result,
+                decision_task_completed_event_id,
+            } => EventAttributes::WorkflowExecutionCompleted(
+                WorkflowExecutionCompletedEventAttributes {
+                    result,
+                    decision_task_completed_event_id,
+                },
+            ),
+            Self::Failed {
+                reason,
+                details,
+                decision_task_completed_event_id,
+            } => {
+                EventAttributes::WorkflowExecutionFailed(WorkflowExecutionFailedEventAttributes {
+                    reason,
+                    details,
+                    decision_task_completed_event_id,
+                })
+            }
+            Self::Canceled {
+                details,
+                decision_task_completed_event_id,
+            } => EventAttributes::WorkflowExecutionCanceled(
+                WorkflowExecutionCanceledEventAttributes {
+                    details,
+                    decision_task_completed_event_id,
+                },
+            ),
+            Self::ContinuedAsNew(attributes) => {
+                EventAttributes::WorkflowExecutionContinuedAsNew(attributes)
+            }
+            Self::TimedOut => EventAttributes::WorkflowExecutionTimedOut(
+                WorkflowExecutionTimedOutEventAttributes {
+                    timeout_type: WORKFLOW_EXECUTION_TIMEOUT_START_TO_CLOSE.to_string(),
+                    child_policy,
+                },
+            ),
+            Self::Terminated {
+                reason,
+                details,
+                cause,
+                ..
+            } => EventAttributes::WorkflowExecutionTerminated(
+                WorkflowExecutionTerminatedEventAttributes {
+                    reason,
+                    details,
+                    child_policy,
+                    cause,
+                },
+            ),
+        }
+    }
+}
+
+/// The run a start is asked for: everything the stored record needs that the caller has
+/// already resolved. Passed to [`Domain::start_run`], the one place a run is created.
+#[derive(Debug, Clone)]
+pub struct NewRun {
+    pub workflow_id: String,
+    /// The registered type this run is of; its `(name, version)` is what the stored
+    /// record is keyed by.
+    pub workflow_type: WorkflowType,
+    pub input: Option<String>,
+    pub tag_list: Vec<String>,
+    /// The timeouts, task list and child policy the run actually runs under, resolved
+    /// once at start from the request and the type's registered defaults.
+    pub config: ExecutionConfig,
+    /// The `runId` this run continues, when a `ContinueAsNewWorkflowExecution` decision
+    /// started it.
+    pub continued_execution_run_id: Option<String>,
+    /// The run that started this one as a child and the `eventId` of the
+    /// `StartChildWorkflowExecutionInitiated` event that did.
+    pub parent: Option<(WorkflowExecution, i64)>,
+}
+
+/// What a run that just closed ended with, read off it before it was closed, so the
+/// parent run can be told (see [`Domain::close_run`]).
+#[derive(Debug, Clone)]
+struct CloseOutcome {
+    /// The `closeStatus` the close left — one of
+    /// [`crate::ops::types::CLOSE_STATUS_VALUES`].
+    status: &'static str,
+    reason: Option<String>,
+    payload: Option<String>,
+    execution: WorkflowExecution,
+    workflow_type: WorkflowType,
+    parent: Option<WorkflowExecution>,
+    parent_initiated_event_id: i64,
+}
+
 /// One workflow execution — a `(workflowId, runId)` pair — and its history.
 #[derive(Debug, Clone)]
 pub struct Execution {
@@ -658,6 +1206,32 @@ pub struct Execution {
     /// `DescribeWorkflowExecution`'s `latestActivityTaskTimestamp` reports. Written by
     /// the activity-task operations, which are tracked as their own gap issues.
     pub latest_activity_task_timestamp: Option<DateTime>,
+    /// The run that started this one as a child, and the `eventId` of the
+    /// `StartChildWorkflowExecutionInitiated` event that did — what
+    /// `WorkflowExecutionInfo.parent` and the started event's own
+    /// `parentWorkflowExecution`/`parentInitiatedEventId` report, and who is told when
+    /// this run closes. `None` for a run a client started directly.
+    pub parent: Option<WorkflowExecution>,
+    pub parent_initiated_event_id: i64,
+    /// A task-list override that is in force only for as long as its timeout allows
+    /// (`RespondDecisionTaskCompleted`'s `taskListScheduleToStartTimeout`); `None` when
+    /// the run's task list is simply the one it runs under.
+    pub task_list_override: Option<TaskListOverride>,
+}
+
+/// A `taskList` override a decider asked for WITH a
+/// `taskListScheduleToStartTimeout`: "This parameter makes it possible to temporarily
+/// override the task list. If a decision task scheduled on the override task list is
+/// not started within the timeout, the decision task will time out. Amazon SWF will
+/// revert the override and schedule a new decision task to the original task list."
+#[derive(Debug, Clone)]
+pub struct TaskListOverride {
+    /// The task list the run goes back to when a decision task on the override list is
+    /// not started in time.
+    pub revert_to: String,
+    /// The schedule-to-start timeout every decision task scheduled while the override
+    /// is in force carries.
+    pub schedule_to_start_timeout: String,
 }
 
 impl Execution {
@@ -695,9 +1269,9 @@ impl Execution {
             close_timestamp: self.close_timestamp,
             execution_status: self.status.clone(),
             close_status: self.close_status.clone(),
-            // Child executions are not startable in this slice (the decision
-            // operations are still 501), so no stored run has a parent to report.
-            parent: None,
+            // The run that started this one as a child, when a
+            // `StartChildWorkflowExecution` decision did.
+            parent: self.parent.clone(),
             tag_list: (!self.tag_list.is_empty()).then(|| self.tag_list.clone()),
             cancel_requested: self.cancel_requested,
         }
@@ -741,7 +1315,8 @@ impl Execution {
         .max(MIN_OPEN_EXECUTION_SPAN);
         let nanos =
             u64::from(self.start_timestamp.subsec_nanos()) + u64::from(budget.subsec_nanos());
-        let seconds = i64::try_from(budget.as_secs() + nanos / 1_000_000_000).ok()?;
+        let seconds =
+            i64::try_from(budget.as_secs().checked_add(nanos / 1_000_000_000)?).ok()?;
         Some(DateTime::from_secs_and_nanos(
             self.start_timestamp.secs().checked_add(seconds)?,
             u32::try_from(nanos % 1_000_000_000).ok()?,
@@ -763,30 +1338,24 @@ impl Execution {
         (instant_key(due) <= instant_key(at)).then_some(due)
     }
 
-    /// Close this run as the start-to-close timeout the clock made due at `at`: exactly
-    /// one `WorkflowExecutionTimedOut` event (`timeoutType=START_TO_CLOSE`, carrying the
-    /// run's own `childPolicy`), `executionStatus=CLOSED` with
-    /// `closeStatus=TIMED_OUT`, and nothing left in flight.
+    /// Close this run as `close` describes, as of `at`: the one close event that kind of
+    /// close records, `executionStatus=CLOSED` with the matching `closeStatus`, and
+    /// nothing left in flight.
     ///
-    /// Only ever called on an open run (see [`Execution::due_start_to_close_timeout`]),
-    /// which is what makes the event appear exactly once however many times the sweep
-    /// runs.
-    pub fn time_out(&mut self, at: DateTime) {
+    /// Reached only through [`Domain::close_run`], which is what also drops the run from
+    /// its domain's open-run index and tells its parent run; closing it here alone would
+    /// leave those two records disagreeing with this one.
+    fn close(&mut self, at: DateTime, close: RunClose) {
         self.status = EXECUTION_STATUS_CLOSED.to_string();
-        self.close_status = Some(CLOSE_STATUS_TIMED_OUT.to_string());
+        self.close_status = Some(close.close_status().to_string());
         self.close_timestamp = Some(at);
         self.open_decision_tasks = 0;
         self.open_activity_tasks = 0;
         self.open_timers = 0;
         self.open_child_executions = 0;
         self.open_lambda_functions = 0;
-        self.append_event(
-            at,
-            EventAttributes::WorkflowExecutionTimedOut(WorkflowExecutionTimedOutEventAttributes {
-                timeout_type: WORKFLOW_EXECUTION_TIMEOUT_START_TO_CLOSE.to_string(),
-                child_policy: self.effective_config.child_policy.clone(),
-            }),
-        );
+        let child_policy = self.effective_config.child_policy.clone();
+        self.append_event(at, close.event(child_policy));
     }
 
     /// Whether this run's history can take `events` more events and still hold the one
@@ -797,35 +1366,6 @@ impl Execution {
     /// run's history can hold however many times a caller signals or polls it.
     pub fn has_history_room_for(&self, events: usize) -> bool {
         self.history.len() + events < MAX_HISTORY_EVENTS_PER_EXECUTION
-    }
-
-    /// Close this run the way Amazon SWF closes one that has reached the history-size
-    /// quota: `WorkflowExecutionTerminated` with `cause=EVENT_LIMIT_EXCEEDED`, carrying
-    /// the run's own `childPolicy`, and `closeStatus=TERMINATED`.
-    ///
-    /// `WorkflowExecutionTerminatedCause` models exactly this cause, and `cause`'s own
-    /// doc — "If set, indicates that the workflow execution was automatically
-    /// terminated, and specifies the cause" — says the service, not a caller, did it.
-    pub fn terminate_for_event_limit(&mut self, at: DateTime) {
-        self.status = EXECUTION_STATUS_CLOSED.to_string();
-        self.close_status = Some(CLOSE_STATUS_TERMINATED.to_string());
-        self.close_timestamp = Some(at);
-        self.open_decision_tasks = 0;
-        self.open_activity_tasks = 0;
-        self.open_timers = 0;
-        self.open_child_executions = 0;
-        self.open_lambda_functions = 0;
-        self.append_event(
-            at,
-            EventAttributes::WorkflowExecutionTerminated(
-                WorkflowExecutionTerminatedEventAttributes {
-                    reason: None,
-                    details: None,
-                    child_policy: self.effective_config.child_policy.clone(),
-                    cause: Some(TERMINATED_CAUSE_EVENT_LIMIT_EXCEEDED.to_string()),
-                },
-            ),
-        );
     }
 
     /// How many of this run's decision tasks are still WAITING in `task_list`: one per
@@ -885,6 +1425,20 @@ impl Execution {
     /// [`Execution::pending_decision_tasks_on`] counts, in the order the events were
     /// recorded.
     pub fn waiting_decision_tasks_on(&self, task_list: &str) -> Vec<&HistoryEventRecord> {
+        self.waiting_decision_tasks()
+            .into_iter()
+            .filter(|event| match &event.attributes {
+                EventAttributes::DecisionTaskScheduled(scheduled) => {
+                    scheduled.task_list.name == task_list
+                }
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// Every decision task of this run still waiting in a task list, whichever list
+    /// that is: the `DecisionTaskScheduled` events no later event has taken out of one.
+    pub fn waiting_decision_tasks(&self) -> Vec<&HistoryEventRecord> {
         let taken: HashSet<i64> = self
             .history
             .iter()
@@ -892,13 +1446,239 @@ impl Execution {
             .collect();
         self.history
             .iter()
-            .filter(|event| match &event.attributes {
-                EventAttributes::DecisionTaskScheduled(scheduled) => {
-                    scheduled.task_list.name == task_list && !taken.contains(&event.event_id)
-                }
-                _ => false,
+            .filter(|event| {
+                matches!(event.attributes, EventAttributes::DecisionTaskScheduled(_))
+                    && !taken.contains(&event.event_id)
             })
             .collect()
+    }
+
+    /// The `scheduledEventId` of the activity task of this run with `activity_id` that
+    /// is still in flight — scheduled and neither finished nor cancelled — which is
+    /// what makes a second schedule of that id a collision and a cancel of an id with
+    /// none unknown.
+    pub fn open_activity_task(&self, activity_id: &str) -> Option<i64> {
+        let closed: HashSet<i64> = self
+            .history
+            .iter()
+            .filter_map(|event| event.attributes.effect().activity_task_closed)
+            .collect();
+        self.history
+            .iter()
+            .rev()
+            .find_map(|event| match &event.attributes {
+                EventAttributes::ActivityTaskScheduled(scheduled)
+                    if scheduled.activity_id == activity_id
+                        && !closed.contains(&event.event_id) =>
+                {
+                    Some(event.event_id)
+                }
+                _ => None,
+            })
+    }
+
+    /// Whether the activity task scheduled by `scheduled_event_id` has been handed to a
+    /// worker. No operation of this slice hands activity tasks out yet (the
+    /// activity-task operations are tracked by their own gap issues), so a scheduled
+    /// task is never started — which is why a cancel of one cancels it outright.
+    pub fn activity_task_is_started(&self, scheduled_event_id: i64) -> bool {
+        self.history.iter().any(|event| {
+            event
+                .attributes
+                .effect()
+                .activity_task_left_task_list
+                .is_some_and(|scheduled| scheduled == scheduled_event_id)
+        })
+    }
+
+    /// The `startedEventId` of the timer of this run with `timer_id` that is still
+    /// running — started and neither fired nor cancelled.
+    pub fn open_timer(&self, timer_id: &str) -> Option<i64> {
+        let closed: HashSet<i64> = self
+            .history
+            .iter()
+            .filter_map(|event| event.attributes.effect().timer_closed)
+            .collect();
+        self.history
+            .iter()
+            .rev()
+            .find_map(|event| match &event.attributes {
+                EventAttributes::TimerStarted(started)
+                    if started.timer_id == timer_id && !closed.contains(&event.event_id) =>
+                {
+                    Some(event.event_id)
+                }
+                _ => None,
+            })
+    }
+
+    /// The `scheduledEventId` of the Lambda task of this run with `id` that is still in
+    /// flight, which is what makes a second schedule of that id a collision.
+    pub fn open_lambda_function(&self, id: &str) -> Option<i64> {
+        let closed: HashSet<i64> = self
+            .history
+            .iter()
+            .filter_map(|event| event.attributes.effect().lambda_function_closed)
+            .collect();
+        self.history
+            .iter()
+            .rev()
+            .find_map(|event| match &event.attributes {
+                EventAttributes::LambdaFunctionScheduled(scheduled)
+                    if scheduled.id == id && !closed.contains(&event.event_id) =>
+                {
+                    Some(event.event_id)
+                }
+                _ => None,
+            })
+    }
+
+    /// Whether this run's history holds an event after `event_id` that a decider has to
+    /// act on (see [`EventEffect::needs_decision`]).
+    ///
+    /// Measured from the `DecisionTaskStarted` event of the task a decider is holding,
+    /// this is exactly what it has NOT seen: a signal or a result that arrived while it
+    /// was deciding, which is why a closing decision taken without it is refused, and
+    /// why completing a decision task schedules another one.
+    pub fn needs_decision_since(&self, event_id: i64) -> bool {
+        self.history
+            .iter()
+            .any(|event| event.event_id > event_id && event.attributes.effect().needs_decision)
+    }
+
+    /// Schedule one decision task on this run's effective task list at `at`, unless a
+    /// decision task of this run is already in flight or the run is closed. Returns the
+    /// `eventId` of the `DecisionTaskScheduled` event when one was recorded.
+    ///
+    /// A run that already has a decision task in flight does not get a second: whatever
+    /// the new task would carry is in the history that task's decider is handed, which
+    /// is why SWF batches what arrives while a decision task is outstanding.
+    pub fn schedule_decision_task_if_idle(&mut self, at: DateTime) -> Option<i64> {
+        if !self.is_open() || self.open_decision_tasks != 0 || !self.has_history_room_for(1) {
+            return None;
+        }
+        let attributes = DecisionTaskScheduledEventAttributes {
+            task_list: TaskList {
+                name: self.effective_config.task_list.clone(),
+            },
+            task_priority: self.effective_config.task_priority.clone(),
+            start_to_close_timeout: Some(
+                self.effective_config.task_start_to_close_timeout.clone(),
+            ),
+            // A decision task carries a schedule-to-start timeout only while a
+            // temporary task-list override is in force; that timeout is the override's
+            // own (`taskListScheduleToStartTimeout`).
+            schedule_to_start_timeout: self
+                .task_list_override
+                .as_ref()
+                .map(|override_| override_.schedule_to_start_timeout.clone()),
+        };
+        let event_id = self.append_event(at, EventAttributes::DecisionTaskScheduled(attributes));
+        self.open_decision_tasks = 1;
+        Some(event_id)
+    }
+
+    /// Fire every timer of this run the clock has already made due at `now`: "This timer
+    /// fires after the specified delay and record a `TimerFired` event." Each event is
+    /// stamped at the instant its own `startToFireTimeout` ran out, whether or not
+    /// anybody called then, and a decision task is scheduled so the decider is told.
+    ///
+    /// Returns how many fired.
+    pub fn fire_due_timers(&mut self, now: DateTime) -> usize {
+        if !self.is_open() {
+            return 0;
+        }
+        let closed: HashSet<i64> = self
+            .history
+            .iter()
+            .filter_map(|event| event.attributes.effect().timer_closed)
+            .collect();
+        let mut due: Vec<(DateTime, i64, String)> = self
+            .history
+            .iter()
+            .filter_map(|event| match &event.attributes {
+                EventAttributes::TimerStarted(started) if !closed.contains(&event.event_id) => {
+                    let fires_at =
+                        deadline_after(event.event_timestamp, Some(&started.start_to_fire_timeout))?;
+                    (instant_key(fires_at) <= instant_key(now))
+                        .then(|| (fires_at, event.event_id, started.timer_id.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        due.sort_by_key(|(fires_at, started_event_id, _)| {
+            (instant_key(*fires_at), *started_event_id)
+        });
+
+        let mut fired = 0;
+        for (fires_at, started_event_id, timer_id) in due {
+            if !self.has_history_room_for(2) {
+                break;
+            }
+            self.append_event(
+                fires_at,
+                EventAttributes::TimerFired(TimerFiredEventAttributes {
+                    timer_id,
+                    started_event_id,
+                }),
+            );
+            self.open_timers = self.open_timers.saturating_sub(1);
+            self.schedule_decision_task_if_idle(fires_at);
+            fired += 1;
+        }
+        fired
+    }
+
+    /// Record every decision-task SCHEDULE-to-start timeout `now` has already made due:
+    /// a task scheduled while a temporary task-list override was in force and not
+    /// started within the override's own `taskListScheduleToStartTimeout`. "Amazon SWF
+    /// will revert the override and schedule a new decision task to the original task
+    /// list", so each one times out at the instant the duration ran out, the override is
+    /// reverted, and a replacement task is scheduled on the reverted list.
+    ///
+    /// Returns how many were recorded.
+    fn expire_due_schedule_to_start(&mut self, now: DateTime) -> usize {
+        if !self.is_open() {
+            return 0;
+        }
+        let due: Vec<(DateTime, i64)> = self
+            .waiting_decision_tasks()
+            .into_iter()
+            .filter_map(|event| match &event.attributes {
+                EventAttributes::DecisionTaskScheduled(scheduled) => {
+                    let deadline = deadline_after(
+                        event.event_timestamp,
+                        scheduled.schedule_to_start_timeout.as_deref(),
+                    )?;
+                    (instant_key(deadline) <= instant_key(now))
+                        .then_some((deadline, event.event_id))
+                }
+                _ => None,
+            })
+            .collect();
+
+        for (deadline, scheduled_event_id) in &due {
+            if !self.has_history_room_for(2) {
+                break;
+            }
+            self.append_event(
+                *deadline,
+                EventAttributes::DecisionTaskTimedOut(DecisionTaskTimedOutEventAttributes {
+                    timeout_type: DECISION_TASK_TIMEOUT_SCHEDULE_TO_START.to_string(),
+                    scheduled_event_id: *scheduled_event_id,
+                    // The task was never handed to a decider, so no `DecisionTaskStarted`
+                    // event closes with it; the member's own modelled default says so.
+                    started_event_id: 0,
+                }),
+            );
+            // The override lasted exactly as long as its timeout allowed.
+            if let Some(reverted) = self.task_list_override.take() {
+                self.effective_config.task_list = reverted.revert_to;
+            }
+            self.open_decision_tasks = 0;
+            self.schedule_decision_task_if_idle(*deadline);
+        }
+        due.len()
     }
 
     /// The `DecisionTaskScheduled` attributes of the task scheduled by event
@@ -963,16 +1743,24 @@ impl Execution {
     /// appends `DecisionTaskTimedOut` and then schedules a replacement decision task on
     /// the same list with the same attributes, so the run keeps exactly one decision
     /// task to hand out and a decider that lost its task is given a new one.
+    ///
+    /// The schedule-to-start timeout of a task still waiting in an overridden task list
+    /// falls due the same way, so it is materialised here too (see
+    /// [`Execution::expire_due_schedule_to_start`]).
     pub fn expire_due_decision_tasks(&mut self, now: DateTime) -> usize {
+        if !self.is_open() {
+            return 0;
+        }
+        let reverted = self.expire_due_schedule_to_start(now);
         let due: Vec<(i64, i64)> = self
             .outstanding_decision_tasks()
             .into_iter()
             .filter(|(scheduled_event_id, _, started_at)| {
                 self.scheduled_decision_task(*scheduled_event_id)
                     .and_then(|scheduled| {
-                        start_to_close_deadline(*started_at, &scheduled.start_to_close_timeout)
+                        deadline_after(*started_at, scheduled.start_to_close_timeout.as_deref())
                     })
-                    .is_some_and(|deadline| instant_key(now) >= deadline)
+                    .is_some_and(|deadline| instant_key(now) >= instant_key(deadline))
             })
             .map(|(scheduled_event_id, started_event_id, _)| {
                 (scheduled_event_id, started_event_id)
@@ -980,6 +1768,12 @@ impl Execution {
             .collect();
 
         for (scheduled_event_id, started_event_id) in &due {
+            // The timeout and the replacement task it schedules are two events, and a
+            // run with no room for them has reached the history quota: it is left for
+            // the writer that finds it to close rather than grown past the bound.
+            if !self.has_history_room_for(2) {
+                break;
+            }
             let Some(replacement) = self.scheduled_decision_task(*scheduled_event_id).cloned()
             else {
                 continue;
@@ -994,7 +1788,7 @@ impl Execution {
             );
             self.append_event(now, EventAttributes::DecisionTaskScheduled(replacement));
         }
-        due.len()
+        due.len() + reverted
     }
 
     /// The `startedEventId` of the last decision task of this run a decider actually
@@ -1032,19 +1826,21 @@ impl Execution {
     }
 }
 
-/// The instant a decision task started at `started_at` is timed out at under
-/// `start_to_close_timeout`, or `None` when that duration is unlimited
-/// ([`DURATION_NONE`], or absent) and the task therefore never times out.
-fn start_to_close_deadline(
-    started_at: DateTime,
-    start_to_close_timeout: &Option<String>,
-) -> Option<(i64, u32)> {
-    let seconds = start_to_close_timeout
-        .as_deref()
+/// The instant `timeout` seconds after `from`, or `None` when that duration is
+/// unlimited ([`DURATION_NONE`], or absent) and so names no instant at all.
+///
+/// Every SWF duration member is "specified in seconds, an integer greater than or equal
+/// to 0", so one deadline helper serves them all: a decision task's start-to-close and
+/// schedule-to-start budgets and a timer's start-to-fire delay.
+fn deadline_after(from: DateTime, timeout: Option<&str>) -> Option<DateTime> {
+    let seconds = timeout
         .filter(|timeout| *timeout != DURATION_NONE)
         .and_then(decimal)?;
     let seconds = i64::try_from(seconds).ok()?;
-    Some((started_at.secs().checked_add(seconds)?, started_at.subsec_nanos()))
+    Some(DateTime::from_secs_and_nanos(
+        from.secs().checked_add(seconds)?,
+        from.subsec_nanos(),
+    ))
 }
 
 /// One decision task waiting in a task list, as the dispatcher sees it: which run it
@@ -1267,26 +2063,344 @@ impl Domain {
     }
 
     /// Close every run of this domain whose start-to-close budget the clock has
-    /// already spent, as of `at`.
+    /// already spent, and fire every timer it has already made due, as of `at`.
     ///
-    /// This is the service's own reaping of abandoned executions: the close was owed at
-    /// the deadline whether or not anybody called, so every operation materialises what
-    /// is already due before it answers — which is why a run left completely unattended
-    /// still reads back CLOSED/TIMED_OUT, is gone from the open listings and appears in
-    /// the closed ones.
+    /// This is the service's own reaping of abandoned executions: each move was owed at
+    /// its own instant whether or not anybody called, so every operation materialises
+    /// what is already due before it answers — which is why a run left completely
+    /// unattended still reads back CLOSED/TIMED_OUT, is gone from the open listings and
+    /// appears in the closed ones, and why a timer started by a decider fires without
+    /// anyone polling for it.
     pub fn materialise_due_timeouts(&mut self, at: DateTime) {
         let mut timed_out: Vec<(String, String)> = Vec::new();
         for execution in self.executions.values_mut() {
-            if let Some(due) = execution.due_start_to_close_timeout(at) {
-                execution.time_out(due);
+            if !execution.is_open() {
+                continue;
+            }
+            let close_due = execution.due_start_to_close_timeout(at);
+            // A timer due only AFTER the run's own start-to-close deadline never fires:
+            // by then the run is closed and its history takes nothing more.
+            execution.fire_due_timers(close_due.unwrap_or(at));
+            if close_due.is_some() {
                 timed_out.push((execution.workflow_id.clone(), execution.run_id.clone()));
             }
         }
-        // A timed-out run is no longer the open run of its `workflowId`, so that id
-        // becomes startable again.
-        for (workflow_id, run_id) in timed_out {
-            self.release_open_run(&workflow_id, &run_id);
+        for key in timed_out {
+            // The close is stamped at the DEADLINE, not at `at`: the timeout happened
+            // when the budget ran out, whether or not anybody called in that instant.
+            let Some(due) = self
+                .executions
+                .get(&key)
+                .and_then(|execution| execution.due_start_to_close_timeout(at))
+            else {
+                continue;
+            };
+            self.close_run(&key, RunClose::TimedOut, due);
         }
+    }
+
+    /// Start one run in this domain and return the `runId` it was given: the ONE place a
+    /// workflow execution comes into existence, whether a client started it
+    /// (`StartWorkflowExecution`), a decider continued one as new, or a parent run
+    /// started it as a child.
+    ///
+    /// The run is stored OPEN with its `WorkflowExecutionStarted` event and the first
+    /// decision task SWF schedules as soon as an execution starts, and it becomes the
+    /// open run of its `workflowId`. The caller has already resolved the effective
+    /// configuration and checked that the type is registered and the id free.
+    ///
+    /// `None` when this domain already holds [`MAX_EXECUTIONS_PER_DOMAIN`] runs — the
+    /// bound lives HERE, so no caller can start a run past it however it asked: a run
+    /// stays stored after it closes (its history is what the readers answer from), so
+    /// every start, continue-as-new and child start adds to the same bounded store.
+    /// Each call site reports the refusal the way its own operation models it.
+    #[must_use = "a start that the per-domain run bound refused must be reported"]
+    pub fn start_run(&mut self, run: NewRun, at: DateTime) -> Option<String> {
+        if self.executions.len() >= MAX_EXECUTIONS_PER_DOMAIN {
+            return None;
+        }
+        // The per-domain ordinal is what makes the minted id unique.
+        self.next_run_sequence += 1;
+        let run_id = new_run_id(&self.name, &run.workflow_id, self.next_run_sequence, at);
+        let (parent, parent_initiated_event_id) = match &run.parent {
+            Some((execution, initiated_event_id)) => {
+                (Some(execution.clone()), *initiated_event_id)
+            }
+            None => (None, 0),
+        };
+        let mut execution = Execution {
+            workflow_id: run.workflow_id.clone(),
+            run_id: run_id.clone(),
+            workflow_type: (
+                run.workflow_type.name.clone(),
+                run.workflow_type.version.clone(),
+            ),
+            status: EXECUTION_STATUS_OPEN.to_string(),
+            close_status: None,
+            start_timestamp: at,
+            close_timestamp: None,
+            tag_list: run.tag_list.clone(),
+            cancel_requested: false,
+            input: run.input.clone(),
+            effective_config: run.config.clone(),
+            history: Vec::new(),
+            next_event_id: 1,
+            open_decision_tasks: 0,
+            open_activity_tasks: 0,
+            open_timers: 0,
+            open_child_executions: 0,
+            open_lambda_functions: 0,
+            latest_execution_context: None,
+            latest_activity_task_timestamp: None,
+            parent,
+            parent_initiated_event_id,
+            task_list_override: None,
+        };
+
+        execution.append_event(
+            at,
+            EventAttributes::WorkflowExecutionStarted(Box::new(
+                WorkflowExecutionStartedEventAttributes {
+                    input: run.input,
+                    execution_start_to_close_timeout: Some(
+                        run.config.execution_start_to_close_timeout.clone(),
+                    ),
+                    task_start_to_close_timeout: Some(
+                        run.config.task_start_to_close_timeout.clone(),
+                    ),
+                    child_policy: run.config.child_policy.clone(),
+                    task_list: TaskList {
+                        name: run.config.task_list.clone(),
+                    },
+                    task_priority: run.config.task_priority.clone(),
+                    workflow_type: run.workflow_type,
+                    tag_list: (!run.tag_list.is_empty()).then_some(run.tag_list),
+                    continued_execution_run_id: run.continued_execution_run_id,
+                    parent_workflow_execution: run
+                        .parent
+                        .as_ref()
+                        .map(|(execution, _)| execution.clone()),
+                    parent_initiated_event_id,
+                    lambda_role: run.config.lambda_role.clone(),
+                },
+            )),
+        );
+        // SWF schedules the first decision task as soon as the execution starts, so
+        // the run begins with exactly one open decision task.
+        execution.schedule_decision_task_if_idle(at);
+
+        self.executions
+            .insert((run.workflow_id.clone(), run_id.clone()), execution);
+        self.open_by_workflow_id
+            .insert(run.workflow_id, run_id.clone());
+        Some(run_id)
+    }
+
+    /// Close the run `key` names the way `close` describes, as of `at`: the close event
+    /// and `closeStatus` on the run itself, the `workflowId` released for a new start,
+    /// the `childPolicy` applied to the children a TERMINATED run leaves behind, and the
+    /// parent run told what became of it.
+    ///
+    /// The ONE place a run closes, so those five records can never disagree. A run that
+    /// is already closed is left exactly as it is, which is what makes a close that two
+    /// callers race for record its events once.
+    ///
+    /// A `TERMINATE` child policy cascades down the parent/child chain, and the cascade
+    /// is a WORKLIST rather than recursion: the children a close terminates are pushed
+    /// onto the queue this loop drains, so the chain's depth costs queue entries instead
+    /// of stack frames however deep a decider built it. The loop ends because every turn
+    /// closes one open run and only open runs are pushed, and the runs of a domain are
+    /// bounded by [`MAX_EXECUTIONS_PER_DOMAIN`].
+    pub fn close_run(&mut self, key: &(String, String), close: RunClose, at: DateTime) {
+        let mut pending: VecDeque<((String, String), RunClose)> = VecDeque::new();
+        pending.push_back((key.clone(), close));
+        while let Some((key, close)) = pending.pop_front() {
+            let Some(execution) = self.executions.get_mut(&key) else {
+                continue;
+            };
+            if !execution.is_open() {
+                continue;
+            }
+            let child_policy = close.child_policy(&execution.effective_config.child_policy);
+            let applies_child_policy = close.applies_child_policy();
+            let continued_as_new = matches!(close, RunClose::ContinuedAsNew(_));
+            let closed = CloseOutcome {
+                status: close.close_status(),
+                reason: close.closed_reason(),
+                payload: close.closed_payload(),
+                execution: execution.execution(),
+                workflow_type: WorkflowType {
+                    name: execution.workflow_type.0.clone(),
+                    version: execution.workflow_type.1.clone(),
+                },
+                parent: execution.parent.clone(),
+                parent_initiated_event_id: execution.parent_initiated_event_id,
+            };
+            execution.close(at, close);
+            self.release_open_run(&key.0, &key.1);
+            if applies_child_policy {
+                self.apply_child_policy(&key, &child_policy, at, &mut pending);
+            }
+            // A run that continued as new did not finish: the run that took its place
+            // carries its parent link on, and reports back when IT closes.
+            if !continued_as_new {
+                self.report_close_to_parent(&closed, at);
+            }
+        }
+    }
+
+    /// Apply `child_policy` to every OPEN child of the run `key` names, the move a close
+    /// makes on the children it leaves behind: `TERMINATE` closes each one (queued onto
+    /// `pending` for [`Domain::close_run`]'s own loop, which then applies that child's
+    /// policy to ITS children in turn), `REQUEST_CANCEL` asks each to cancel itself, and
+    /// `ABANDON` leaves them running.
+    fn apply_child_policy(
+        &mut self,
+        key: &(String, String),
+        child_policy: &str,
+        at: DateTime,
+        pending: &mut VecDeque<((String, String), RunClose)>,
+    ) {
+        if child_policy != CHILD_POLICY_TERMINATE && child_policy != CHILD_POLICY_REQUEST_CANCEL {
+            return;
+        }
+        let children: Vec<(String, String)> = self
+            .executions
+            .values()
+            .filter(|execution| {
+                execution.is_open()
+                    && execution.parent.as_ref().is_some_and(|parent| {
+                        parent.workflow_id == key.0 && parent.run_id == key.1
+                    })
+            })
+            .map(|execution| (execution.workflow_id.clone(), execution.run_id.clone()))
+            .collect();
+        for child in children {
+            if child_policy == CHILD_POLICY_TERMINATE {
+                pending.push_back((
+                    child,
+                    RunClose::Terminated {
+                        reason: None,
+                        details: None,
+                        // "If set, indicates that the workflow execution was
+                        // automatically terminated, and specifies the cause": the
+                        // parent's policy is what terminated this child.
+                        cause: Some(CAUSE_CHILD_POLICY_APPLIED.to_string()),
+                        child_policy: None,
+                    },
+                ));
+                continue;
+            }
+            let Some(execution) = self.executions.get_mut(&child) else {
+                continue;
+            };
+            if !execution.has_history_room_for(2) {
+                continue;
+            }
+            execution.cancel_requested = true;
+            execution.append_event(
+                at,
+                EventAttributes::WorkflowExecutionCancelRequested(
+                    WorkflowExecutionCancelRequestedEventAttributes {
+                        // The request came from the parent's policy, not from another
+                        // run's decision, so no external execution initiated it.
+                        external_workflow_execution: None,
+                        external_initiated_event_id: 0,
+                        cause: Some(CAUSE_CHILD_POLICY_APPLIED.to_string()),
+                    },
+                ),
+            );
+            execution.schedule_decision_task_if_idle(at);
+        }
+    }
+
+    /// Record in the PARENT run what became of a child that just closed, and schedule a
+    /// decision task so its decider is told: a child's result is an event of the parent's
+    /// history ("The child workflow execution is a separate workflow execution with its
+    /// own history"), one per way a run can close.
+    ///
+    /// Nothing is recorded when the child had no parent, or when the parent has closed
+    /// too: a closed run's history takes no further events.
+    fn report_close_to_parent(&mut self, closed: &CloseOutcome, at: DateTime) {
+        let Some(parent) = closed.parent.clone() else {
+            return;
+        };
+        let initiated_event_id = closed.parent_initiated_event_id;
+        let Some(parent_execution) = self
+            .executions
+            .get_mut(&(parent.workflow_id.clone(), parent.run_id.clone()))
+        else {
+            return;
+        };
+        if !parent_execution.is_open() || !parent_execution.has_history_room_for(2) {
+            return;
+        }
+        // The `startedEventId` of the child's own start, as the parent recorded it.
+        let started_event_id = parent_execution
+            .history
+            .iter()
+            .find_map(|event| match &event.attributes {
+                EventAttributes::ChildWorkflowExecutionStarted(started)
+                    if started.initiated_event_id == initiated_event_id =>
+                {
+                    Some(event.event_id)
+                }
+                _ => None,
+            })
+            .unwrap_or(0);
+        let execution = closed.execution.clone();
+        let workflow_type = closed.workflow_type.clone();
+        let attributes = match closed.status {
+            CLOSE_STATUS_COMPLETED => EventAttributes::ChildWorkflowExecutionCompleted(
+                ChildWorkflowExecutionCompletedEventAttributes {
+                    workflow_execution: execution,
+                    workflow_type,
+                    result: closed.payload.clone(),
+                    initiated_event_id,
+                    started_event_id,
+                },
+            ),
+            CLOSE_STATUS_FAILED => EventAttributes::ChildWorkflowExecutionFailed(
+                ChildWorkflowExecutionFailedEventAttributes {
+                    workflow_execution: execution,
+                    workflow_type,
+                    reason: closed.reason.clone(),
+                    details: closed.payload.clone(),
+                    initiated_event_id,
+                    started_event_id,
+                },
+            ),
+            CLOSE_STATUS_CANCELED => EventAttributes::ChildWorkflowExecutionCanceled(
+                ChildWorkflowExecutionCanceledEventAttributes {
+                    workflow_execution: execution,
+                    workflow_type,
+                    details: closed.payload.clone(),
+                    initiated_event_id,
+                    started_event_id,
+                },
+            ),
+            CLOSE_STATUS_TIMED_OUT => EventAttributes::ChildWorkflowExecutionTimedOut(
+                ChildWorkflowExecutionTimedOutEventAttributes {
+                    workflow_execution: execution,
+                    workflow_type,
+                    timeout_type: WORKFLOW_EXECUTION_TIMEOUT_START_TO_CLOSE.to_string(),
+                    initiated_event_id,
+                    started_event_id,
+                },
+            ),
+            _ => EventAttributes::ChildWorkflowExecutionTerminated(
+                ChildWorkflowExecutionTerminatedEventAttributes {
+                    workflow_execution: execution,
+                    workflow_type,
+                    initiated_event_id,
+                    started_event_id,
+                },
+            ),
+        };
+        parent_execution.append_event(at, attributes);
+        parent_execution.open_child_executions =
+            parent_execution.open_child_executions.saturating_sub(1);
+        parent_execution.schedule_decision_task_if_idle(at);
     }
 
     /// How many decision-task long polls are open on `task_list` of this domain.

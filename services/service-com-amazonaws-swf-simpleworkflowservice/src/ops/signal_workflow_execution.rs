@@ -237,8 +237,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and a closed run is out of this operation's scope, exactly as above. That is
         // what stops a caller signalling one execution into unbounded memory.
         if !execution.has_history_room_for(2) {
-            execution.terminate_for_event_limit(signaled_at);
-            domain.release_open_run(&input.workflow_id, &run_id);
+            domain.close_run(
+                &(input.workflow_id.clone(), run_id.clone()),
+                crate::state::RunClose::event_limit_exceeded(),
+                signaled_at,
+            );
             return Err(unknown_execution().into());
         }
 
@@ -266,30 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // flight does not get a second: the signal it just recorded is in the history
         // that task's decider is handed, which is why SWF batches signals that arrive
         // while a decision task is outstanding.
-        if execution.open_decision_tasks == 0 {
-            execution.append_event(
-                signaled_at,
-                crate::state::EventAttributes::DecisionTaskScheduled(
-                    DecisionTaskScheduledEventAttributes {
-                        task_list: TaskList {
-                            name: execution.effective_config.task_list.clone(),
-                        },
-                        task_priority: execution.effective_config.task_priority.clone(),
-                        start_to_close_timeout: Some(
-                            execution
-                                .effective_config
-                                .task_start_to_close_timeout
-                                .clone(),
-                        ),
-                        // A decision task's schedule-to-start timeout comes from the
-                        // task list's own registered default, which no implemented
-                        // operation sets in this slice.
-                        schedule_to_start_timeout: None,
-                    },
-                ),
-            );
-            execution.open_decision_tasks = 1;
-        }
+        execution.schedule_decision_task_if_idle(signaled_at);
 
         Ok(SignalWorkflowExecutionOutput)
     }

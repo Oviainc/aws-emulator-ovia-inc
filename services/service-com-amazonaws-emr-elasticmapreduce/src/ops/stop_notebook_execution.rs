@@ -7,9 +7,8 @@
 //! (`NotebookExecution$Status` doc) — so a later `DescribeNotebookExecution` reports
 //! it. An id no execution carries is refused with `InvalidRequestException`.
 //!
-//! `StartNotebookExecution` is what puts an execution in the store, and it is still a
-//! scaffold stub (its own issue), so today every well-formed execution id reaches the
-//! lookup and is refused there rather than at a guess.
+//! `StartNotebookExecution` is what puts an execution in the store; the stop is
+//! asynchronous, so the clock owes a stopping execution the move to `STOPPED`.
 //!
 //! ## Shape of an operation
 //!
@@ -155,9 +154,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::notebook_execution_status;
-
         let _ = ctx;
+        let now = ::std::time::SystemTime::now();
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(StopNotebookExecutionErrorModeled::InternalServerError(
                 InternalServerError {},
@@ -166,10 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
-        let Some(execution) = store
-            .notebook_executions
-            .get_mut(&input.notebook_execution_id)
-        else {
+        let Some(record) = store.notebook_execution_mut(&input.notebook_execution_id, now) else {
             return Err(StopNotebookExecutionErrorModeled::InvalidRequestException(
                 InvalidRequestException {
                     error_code: None,
@@ -185,15 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An execution that has already finished, failed or stopped has nothing left
         // to stop, so the request leaves its status alone rather than moving it
         // backwards out of a state it never leaves.
-        let stoppable = execution
-            .status
-            .as_deref()
-            .is_none_or(|status| !notebook_execution_status::TERMINAL.contains(&status));
-        if stoppable {
-            execution.status = Some(notebook_execution_status::STOP_PENDING.to_string());
-            execution.last_state_change_reason =
-                Some("Stopped by a StopNotebookExecution request".to_string());
-        }
+        record.begin_stop(now);
 
         Ok(StopNotebookExecutionOutput)
     }

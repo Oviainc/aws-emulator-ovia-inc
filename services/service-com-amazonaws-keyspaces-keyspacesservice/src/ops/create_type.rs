@@ -256,6 +256,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A keyspace whose own deletion is already in progress takes no new type, for the
+        // same reason it takes no new table: it and everything in it are on their way out.
+        // That is the modelled conflict — "you try to perform an action and the same or a
+        // different action is already in progress".
+        if keyspace.is_deleting() {
+            return Err(CreateTypeErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::keyspace_deleting_rejection(&input.keyspace_name)),
+            })
+            .into());
+        }
+
         // A type name is taken once per keyspace: creating "a resource that already
         // exists" is the `ConflictException` this operation models. Checked before the
         // cap below, because a name already taken adds no entry.
