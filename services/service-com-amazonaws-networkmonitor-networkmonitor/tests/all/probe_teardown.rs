@@ -15,6 +15,12 @@
 //! postpones it), and the monitor returns to `INACTIVE` only when the last probe
 //! has actually gone.
 //!
+//! An accepted delete also MODIFIES the probe — it is the record's `state` and
+//! its teardown instant that change — so the `modifiedAt` every read of that
+//! probe reports moves to the instant of the call that accepted the delete,
+//! while a call that changes nothing (a repeat of the delete, or a read) leaves
+//! it exactly where that delete put it.
+//!
 //! The tables span the class the rule covers rather than one recorded probe:
 //! both address families, both protocols, a probe deleted while it is still
 //! provisioning and one deleted once it is live, one probe and several, and both
@@ -30,6 +36,7 @@ use super::monitor_and_probe::{
     string_at, PAST_ACTIVATION, PAST_TEARDOWN,
 };
 use super::resource_tags::list_tags;
+use super::update_probe::timestamp;
 
 /// The `ProbeState` values the model declares for the TEARDOWN half of a
 /// probe's lifecycle, in the order a teardown reaches them
@@ -53,6 +60,30 @@ const MAX_SAMPLES: usize = 100;
 /// completed while its record is still readable. A blocking sleep, for the
 /// reason given on `PAST_ACTIVATION`.
 const PAST_FIRST_TEARDOWN_STAGE: Duration = Duration::from_millis(400);
+
+/// A pause short enough to leave a freshly created probe still provisioning
+/// (its activation span is longer than this) and long enough that two instants
+/// either side of it are distinguishable at the precision the wire format
+/// reports a timestamp with. A blocking sleep, for the reason given on
+/// `PAST_ACTIVATION`.
+const INSTANT_APART: Duration = Duration::from_millis(30);
+
+/// The probe a `GetMonitor` body lists under this id, or `None` when the
+/// monitor does not list it at all. The ONE lookup both the state and the
+/// timestamp assertions read through.
+fn listed_probe(monitor: &Value, probe_id: &str) -> Option<Value> {
+    probes_of(monitor)
+        .iter()
+        .find(|probe| string_at(probe, "probeId") == probe_id)
+        .cloned()
+}
+
+/// The probe this monitor must be listing, for a case that has already
+/// established it is there.
+fn must_list_probe(monitor: &Value, probe_id: &str) -> Value {
+    listed_probe(monitor, probe_id)
+        .unwrap_or_else(|| panic!("the monitor must list probe {probe_id}, got {monitor:?}"))
+}
 
 async fn get_probe(router: &MultiServiceRouter, name: &str, probe_id: &str) -> (u16, Value) {
     call(
@@ -115,10 +146,8 @@ async fn probe_fixture(
 /// The `state` a `GetMonitor` body reports for the probe with this id, or
 /// `"<not listed>"` when the monitor does not list it at all.
 fn listed_state(monitor: &Value, probe_id: &str) -> String {
-    probes_of(monitor)
-        .iter()
-        .find(|probe| string_at(probe, "probeId") == probe_id)
-        .map_or_else(|| "<not listed>".to_string(), |probe| string_at(probe, "state"))
+    listed_probe(monitor, probe_id)
+        .map_or_else(|| "<not listed>".to_string(), |probe| string_at(&probe, "state"))
 }
 
 /// Sample `GetProbe` until it reports the probe not found, and answer every
@@ -529,4 +558,198 @@ async fn repeating_the_delete_neither_restarts_nor_postpones_the_teardown() {
         "case \"the deadline the first delete set\": expected ResourceNotFoundException, \
          got {gone:?}"
     );
+}
+
+/// An accepted delete MODIFIES the probe, so the probe's own `modifiedAt` moves
+/// to the instant of that call, and every later call that changes nothing — a
+/// repeat of the delete, a read — leaves it exactly there. `createdAt` never
+/// moves.
+///
+/// The table spans the class the rule covers rather than the one recorded
+/// probe: both address families, both protocols (so a probe with a
+/// `destinationPort` and one without), `packetSize` at the ceiling of its
+/// `@range(56..8500)`, a probe deleted while it is still provisioning beside
+/// ones deleted once they are live, and a `modifiedAt` baseline that is still
+/// the creation instant beside ones an earlier `UpdateProbe` already moved (a
+/// configuration member, and the caller-settable `state`).
+#[tokio::test]
+async fn an_accepted_delete_moves_the_probes_own_modified_at() {
+    // (case, probe body, whether the probe is live before the delete, an
+    // UpdateProbe body sent before the delete to move the baseline off the
+    // creation instant)
+    let cases: Vec<(&str, String, bool, Option<&str>)> = vec![
+        (
+            "the recorded case: a live ICMP IPv4 probe still at its creation instant",
+            probe_json("10.0.4.1", "ICMP", r#","packetSize":56"#),
+            true,
+            None,
+        ),
+        (
+            "a live TCP probe whose packetSize an update already moved",
+            probe_json("192.0.2.77", "TCP", r#","destinationPort":443,"packetSize":8500"#),
+            true,
+            Some(r#"{"packetSize":1500}"#),
+        ),
+        (
+            "a live IPv6 probe an update already deactivated",
+            probe_json("2001:db8::4", "ICMP", r#","packetSize":56"#),
+            true,
+            Some(r#"{"state":"INACTIVE"}"#),
+        ),
+        (
+            "a probe deleted while it is still provisioning",
+            probe_json("10.0.4.2", "ICMP", r#","packetSize":56"#),
+            false,
+            None,
+        ),
+    ];
+
+    for (case, probe, live, update) in cases {
+        let router = router();
+        let (probe_id, _) = probe_fixture(&router, "modified-at-host", &probe).await;
+        let (status, created) = get_probe(&router, "modified-at-host", &probe_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: setup GetProbe expected 200, got {status} {created:?}"
+        );
+        let created_at = timestamp(&created, "createdAt");
+        let mut baseline = timestamp(&created, "modifiedAt");
+        assert!(
+            (baseline - created_at).abs() < f64::EPSILON,
+            "case {case:?}: a freshly created probe has modifiedAt == createdAt {created_at}, \
+             got {baseline}"
+        );
+
+        if live {
+            std::thread::sleep(PAST_ACTIVATION);
+            let (_, settled) = get_probe(&router, "modified-at-host", &probe_id).await;
+            assert_eq!(
+                string_at(&settled, "state"),
+                "ACTIVE",
+                "case {case:?}: the probe must be live before the delete, got {settled:?}"
+            );
+            assert!(
+                (timestamp(&settled, "modifiedAt") - baseline).abs() < f64::EPSILON,
+                "case {case:?}: no call modified the probe, so modifiedAt must stay {baseline}, \
+                 got {settled:?}"
+            );
+        } else {
+            std::thread::sleep(INSTANT_APART);
+        }
+
+        if let Some(body) = update {
+            let (status, updated) = update_probe(&router, "modified-at-host", &probe_id, body).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: setup UpdateProbe expected 200, got {status} {updated:?}"
+            );
+            let moved = timestamp(&updated, "modifiedAt");
+            assert!(
+                moved > baseline,
+                "case {case:?}: the update changed the record, so modifiedAt must move past \
+                 {baseline}, got {moved}"
+            );
+            baseline = moved;
+            std::thread::sleep(INSTANT_APART);
+        }
+
+        let (_, before) = get_monitor(&router, "modified-at-host").await;
+        let monitor_baseline = timestamp(&before, "modifiedAt");
+
+        let accepted_at = Instant::now();
+        let (status, accepted) = delete_probe(&router, "modified-at-host", &probe_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected DeleteProbe 200, got {status} {accepted:?}"
+        );
+
+        let (status, got) = get_probe(&router, "modified-at-host", &probe_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the deleted probe is still readable, got {status} {got:?}"
+        );
+        assert_eq!(
+            string_at(&got, "state"),
+            TEARDOWN_STATES[0],
+            "case {case:?}: expected {:?} straight after the delete, got {got:?}",
+            TEARDOWN_STATES[0]
+        );
+        let torn_down_at = timestamp(&got, "modifiedAt");
+        assert!(
+            torn_down_at > baseline,
+            "case {case:?}: the accepted delete changed the probe's state, so its modifiedAt \
+             must move past {baseline}, got {torn_down_at} in {got:?}"
+        );
+        assert!(
+            (timestamp(&got, "createdAt") - created_at).abs() < f64::EPSILON,
+            "case {case:?}: createdAt never moves, got {got:?}"
+        );
+
+        // A read changes nothing, so a second one reports the same instant, and
+        // the probe `GetMonitor` lists is the same record.
+        let (_, reread) = get_probe(&router, "modified-at-host", &probe_id).await;
+        assert!(
+            (timestamp(&reread, "modifiedAt") - torn_down_at).abs() < f64::EPSILON,
+            "case {case:?}: a read modifies nothing, so modifiedAt must stay {torn_down_at}, \
+             got {reread:?}"
+        );
+        let (_, monitor) = get_monitor(&router, "modified-at-host").await;
+        let listed = must_list_probe(&monitor, &probe_id);
+        assert!(
+            (timestamp(&listed, "modifiedAt") - torn_down_at).abs() < f64::EPSILON,
+            "case {case:?}: GetMonitor reports the same record as GetProbe, so modifiedAt must \
+             be {torn_down_at}, got {listed:?}"
+        );
+        // The monitor gave up one of its probes, which modified the monitor too.
+        let monitor_modified_at = timestamp(&monitor, "modifiedAt");
+        assert!(
+            monitor_modified_at > monitor_baseline,
+            "case {case:?}: the delete changed the monitor's probes, so its modifiedAt must \
+             move past {monitor_baseline}, got {monitor_modified_at} in {monitor:?}"
+        );
+
+        // The teardown is idempotent, so a repeat changes nothing — and moves
+        // neither timestamp.
+        let (status, repeated) = delete_probe(&router, "modified-at-host", &probe_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a repeated delete answers the same 200, got {status} {repeated:?}"
+        );
+        let (_, after_repeat) = get_probe(&router, "modified-at-host", &probe_id).await;
+        assert!(
+            (timestamp(&after_repeat, "modifiedAt") - torn_down_at).abs() < f64::EPSILON,
+            "case {case:?}: a repeat changed nothing, so modifiedAt must stay {torn_down_at}, \
+             got {after_repeat:?}"
+        );
+        let (_, monitor_after_repeat) = get_monitor(&router, "modified-at-host").await;
+        assert!(
+            (timestamp(&monitor_after_repeat, "modifiedAt") - monitor_modified_at).abs()
+                < f64::EPSILON,
+            "case {case:?}: a repeat changed nothing, so the monitor's modifiedAt must stay \
+             {monitor_modified_at}, got {monitor_after_repeat:?}"
+        );
+
+        // Once the teardown has completed the record still carries the instant
+        // the accepted delete put on it: nothing has moved it back.
+        if let Some(remaining) = PAST_FIRST_TEARDOWN_STAGE.checked_sub(accepted_at.elapsed()) {
+            std::thread::sleep(remaining);
+        }
+        let (status, drained) = get_probe(&router, "modified-at-host", &probe_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a probe whose teardown just completed is still readable, \
+             got {status} {drained:?}"
+        );
+        assert_eq!(
+            string_at(&drained, "state"),
+            TEARDOWN_STATES[1],
+            "case {case:?}: expected {:?} once the teardown completed, got {drained:?}",
+            TEARDOWN_STATES[1]
+        );
+        assert!(
+            timestamp(&drained, "modifiedAt") >= torn_down_at,
+            "case {case:?}: modifiedAt never goes back behind the accepted delete's \
+             {torn_down_at}, got {drained:?}"
+        );
+    }
 }

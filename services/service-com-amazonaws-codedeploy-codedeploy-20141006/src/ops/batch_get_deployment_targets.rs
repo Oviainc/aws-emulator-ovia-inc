@@ -213,7 +213,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The region the request was signed for: a refusal that names a target
+        // by its ARN renders it in the caller's own region.
+        let region = crate::state::request_region(ctx.parts());
         let deployment_id = input.deployment_id;
         let target_ids = input.target_ids;
 
@@ -344,7 +346,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         BatchGetDeploymentTargetsErrorModeled::DeploymentTargetDoesNotExistException(
                             DeploymentTargetDoesNotExistException {
                                 message: Some(crate::state::deployment_target_not_found(
-                                    &deployment_id,
+                                    state,
+                                    deployment,
+                                    &region,
                                     target_id,
                                 )),
                             },

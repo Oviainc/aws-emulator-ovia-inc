@@ -12900,6 +12900,38 @@ impl ComAmazonawsEc2Amazonec2State {
         inserted
     }
 
+    /// Every public Systems Manager parameter name this account can resolve, and the id of
+    /// the AMI it resolves to.
+    ///
+    /// `Image$PublicSsmParameterName` is "the name of the public Systems Manager parameter
+    /// that resolves to this AMI, under the `aws/service/` namespace", so the stored images
+    /// are what a `resolve:ssm:` value is resolved against — the one place this emulator
+    /// records which AMI a parameter names, rather than a second table of ids that could
+    /// disagree with the catalog. The member holds ONE name per image while AWS publishes
+    /// some images under more than one name, so the names that share an image's entry
+    /// ([`PUBLIC_SSM_PARAMETER_ALIASES`]) are resolved to the same id here.
+    ///
+    /// Only an image `account` can see resolves: a parameter whose image has been
+    /// deregistered or recycled names no AMI, the same way the describe reports none.
+    pub fn public_ssm_parameter_image_ids(&self, account: &str) -> BTreeMap<String, String> {
+        let mut resolved: BTreeMap<String, String> = self
+            .images
+            .values()
+            .filter(|image| image_is_visible(image, account))
+            .filter_map(|image| {
+                Some((
+                    image.public_ssm_parameter_name.clone()?,
+                    image.image_id.clone()?,
+                ))
+            })
+            .collect();
+        for (alias, published_as) in PUBLIC_SSM_PARAMETER_ALIASES {
+            if let Some(image_id) = resolved.get(*published_as).cloned() {
+                resolved.insert((*alias).to_string(), image_id);
+            }
+        }
+        resolved
+    }
 }
 
 /// A public AMI Amazon publishes: owned by Amazon's publishing account
@@ -13074,6 +13106,43 @@ pub fn published_image_specs() -> Vec<ImageSpec> {
         },
     ]
 }
+
+/// The public Systems Manager parameter names AWS publishes as a SECOND name for an image
+/// [`published_image_specs`] already publishes under one: `(the other name, the published
+/// name that names the same AMI)`.
+///
+/// Amazon publishes the latest Amazon Linux image both under a KERNEL-VERSION-PINNED name
+/// and under a `kernel-default` name, and while that kernel is the distribution's default
+/// the two resolve to the same AMI (Amazon Linux 2023 User Guide, "Find an AMI" and Amazon
+/// EC2 User Guide, "Use a Systems Manager parameter instead of an AMI ID", which list the
+/// `/aws/service/ami-amazon-linux-latest/` names): kernel 6.1 is the default for Amazon
+/// Linux 2023 and kernel 5.10 for Amazon Linux 2. `Image$PublicSsmParameterName` carries
+/// one name per image, so the second name of an image is recorded here and resolved to the
+/// same id by
+/// [`ComAmazonawsEc2Amazonec2State::public_ssm_parameter_image_ids`] — rather than as a
+/// second image record, which would make one AMI resolve to two ids.
+pub const PUBLIC_SSM_PARAMETER_ALIASES: &[(&str, &str)] = &[
+    (
+        "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64",
+        "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64",
+    ),
+    (
+        "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64",
+        "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64",
+    ),
+    (
+        "/aws/service/ami-amazon-linux-latest/al2023-ami-minimal-kernel-default-x86_64",
+        "/aws/service/ami-amazon-linux-latest/al2023-ami-minimal-kernel-6.1-x86_64",
+    ),
+    (
+        "/aws/service/ami-amazon-linux-latest/al2023-ami-minimal-kernel-default-arm64",
+        "/aws/service/ami-amazon-linux-latest/al2023-ami-minimal-kernel-6.1-arm64",
+    ),
+    (
+        "/aws/service/ami-amazon-linux-latest/amzn2-ami-kernel-default-hvm-x86_64-gp2",
+        "/aws/service/ami-amazon-linux-latest/amzn2-ami-kernel-5.10-hvm-x86_64-gp2",
+    ),
+];
 
 // ---------------------------------------------------------------------------
 // Application status: what `DescribeApplicationStatus` aggregates
@@ -14866,14 +14935,58 @@ impl ComAmazonawsEc2Amazonec2State {
         found
     }
 
+    /// The network interfaces that still name the security group `group_id` among their
+    /// `NetworkInterface$Groups`.
+    ///
+    /// The ONE definition of "an interface still holds that group", so every path that asks
+    /// what a group is held by reads the same set.
+    pub fn network_interfaces_with_security_group(&self, group_id: &str) -> Vec<String> {
+        self.network_interfaces
+            .iter()
+            .filter(|(_, interface)| {
+                interface
+                    .groups
+                    .iter()
+                    .flatten()
+                    .any(|group| group.group_id.as_deref() == Some(group_id))
+            })
+            .map(|(network_interface_id, _)| network_interface_id.clone())
+            .collect()
+    }
+
+    /// The network interfaces that still hold a place in `subnet_id`.
+    ///
+    /// An interface is created in a subnet and names it for as long as it is stored, so it
+    /// occupies that subnet — and the private addresses it took — until it is deleted.
+    pub fn network_interfaces_in_subnet(&self, subnet_id: &str) -> Vec<String> {
+        self.network_interfaces
+            .iter()
+            .filter(|(_, interface)| interface.subnet_id.as_deref() == Some(subnet_id))
+            .map(|(network_interface_id, _)| network_interface_id.clone())
+            .collect()
+    }
+
+    /// What still depends on the subnet `subnet_id`, as the ids of the depending resources.
+    ///
+    /// "You must terminate all running instances in the subnet before you can delete the
+    /// subnet" (`DeleteSubnet`), and an interface created in the subnet holds a place in it
+    /// the same way an instance does — the delete is refused while either is still stored,
+    /// rather than leaving a stored record naming a subnet that no longer exists.
+    pub fn subnet_dependencies(&self, subnet_id: &str) -> Vec<String> {
+        let mut found = self.instances_in_subnet(subnet_id);
+        found.extend(self.network_interfaces_in_subnet(subnet_id));
+        found.sort();
+        found
+    }
+
     /// What still depends on the security group `group_id`, as the ids of the depending
     /// resources.
     ///
     /// "If you attempt to delete a security group that is associated with an instance or
     /// network interface, is referenced by another security group in the same VPC, or has a
     /// VPC association, the operation fails with `DependencyViolation`"
-    /// (`DeleteSecurityGroup`): an instance that holds the group, and another group of the
-    /// same VPC whose rules name it.
+    /// (`DeleteSecurityGroup`): an instance that holds the group, a network interface that
+    /// holds it, and another group of the same VPC whose rules name it.
     pub fn security_group_dependencies(&self, group_id: &str) -> Vec<String> {
         let vpc_id = self
             .security_groups
@@ -14891,6 +15004,12 @@ impl ComAmazonawsEc2Amazonec2State {
             })
             .map(|instance| instance.instance_id.clone())
             .collect();
+        // A network interface holds the groups it names for as long as the interface is
+        // stored, attached to an instance or not: a stored interface is a reference to the
+        // group, and there is no interface state that stops being one — so unlike an
+        // instance, which lets go of its groups once it has reached `terminated`, an
+        // interface is a dependency until it is deleted.
+        found.extend(self.network_interfaces_with_security_group(group_id));
         for (other_id, other) in &self.security_groups {
             if other_id == group_id || other.vpc_id != vpc_id {
                 continue;
@@ -14917,10 +15036,10 @@ impl ComAmazonawsEc2Amazonec2State {
     /// in the VPC, delete all security groups associated with the VPC (except the default
     /// one) … When you delete the VPC, it deletes the default security group, network ACL,
     /// and route table for the VPC" (`DeleteVpc`). So the dependencies are this VPC's
-    /// subnets, its security groups other than the default one, and the instances still
-    /// running in it; the default group is NOT one, because the delete removes it. A
-    /// carrier gateway of the VPC is one too: it is a gateway "associated with the VPC",
-    /// and `DeleteVpc` does not remove it.
+    /// subnets, its security groups other than the default one, the network interfaces
+    /// created in it and the instances still running in it; the default group is NOT one,
+    /// because the delete removes it. A carrier gateway of the VPC is one too: it is a
+    /// gateway "associated with the VPC", and `DeleteVpc` does not remove it.
     pub fn vpc_dependencies(&self, vpc_id: &str) -> Vec<String> {
         let mut found: Vec<String> = Vec::new();
         for (subnet_id, subnet) in &self.subnets {
@@ -14938,6 +15057,11 @@ impl ComAmazonawsEc2Amazonec2State {
                 && group.group_name.as_deref() != Some(DEFAULT_SECURITY_GROUP_NAME)
             {
                 found.push(group_id.clone());
+            }
+        }
+        for (network_interface_id, interface) in &self.network_interfaces {
+            if interface.vpc_id.as_deref() == Some(vpc_id) {
+                found.push(network_interface_id.clone());
             }
         }
         for instance in self.instances.values() {

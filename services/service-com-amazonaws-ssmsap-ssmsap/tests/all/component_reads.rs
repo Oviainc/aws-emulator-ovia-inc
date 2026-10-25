@@ -10,12 +10,14 @@
 //! `GetComponent` call reports it back out of what a `RegisterApplication` persisted.
 //!
 //! The rule under test: a component of an application is what that application's
-//! registration declared about it — its `ComponentType`, its `Sid` and the EC2 instance
+//! registration described about it — its `ComponentType`, its `Sid` and the EC2 instance
 //! it runs on, under the `ComponentId` those identify it by — reported with the
 //! application it belongs to, the sub-resource ARN of that pair, the status the
 //! application is in, and the SAP HANA databases of the application that belong to it;
-//! a reference naming no such component of this account and Region is refused, and
-//! nothing the registration did not state is reported for it.
+//! a registration describes a component in each `ComponentsInfo` entry and, in its own
+//! `Sid`, the SAP HANA component of its SAP system. A reference naming no such component
+//! of this account and Region is refused, and nothing the registration did not state is
+//! reported for it.
 //!
 //! The table spans what that rule generalises over: component count (0, 1, 2, and the 5
 //! the model's `ComponentInfoList` admits), component type, whether the component's
@@ -63,13 +65,15 @@ const UNDISCOVERED_MEMBERS: &[&str] = &[
     "PrimaryHost",
 ];
 
-/// One component a registration declared, and what `GetComponent` must report for it.
+/// One component a registration described, and what `GetComponent` must report for it.
 #[derive(Debug)]
 struct Expected {
     component_id: &'static str,
     component_type: &'static str,
     sid: &'static str,
-    /// The EC2 instance the `ComponentsInfo` entry that declared it named.
+    /// The EC2 instance the component runs on: the one the `ComponentsInfo` entry that
+    /// declared it named, or — for the SAP HANA component of the application's own SAP
+    /// system — the instance the registration named for the application.
     ec2_instance_id: &'static str,
     /// The `SystemNumber` the component must report, or `None` when it must report none.
     system_number: Option<&'static str>,
@@ -161,7 +165,8 @@ impl Case {
 /// The rows: one registration each, spanning component count, type, System ID, repeated
 /// declarations, application type and database count.
 const CASES: &[Case] = &[
-    // A registration that declared no component at all has none to read.
+    // A registration that declared no component still describes one: the SAP HANA
+    // component of the SAP system its own System ID names, which its databases belong to.
     Case {
         name: "no ComponentsInfo",
         application_id: "hdb-no-components",
@@ -171,7 +176,14 @@ const CASES: &[Case] = &[
         components_info: &[],
         database_names: &["HDB"],
         tags: &[],
-        expected: &[],
+        expected: &[Expected {
+            component_id: "HDB-HANA",
+            component_type: "HANA",
+            sid: "HDB",
+            ec2_instance_id: "i-0123456789abcdef0",
+            system_number: Some("00"),
+            databases: &["HDB"],
+        }],
     },
     // One HANA component, which is the component the registration's databases belong to.
     Case {
@@ -194,7 +206,8 @@ const CASES: &[Case] = &[
         }],
     },
     // Two components, one of them declared under a System ID that is not the
-    // application's, and a database that belongs to neither of them.
+    // application's, beside the SAP HANA component of the application's own SAP system,
+    // which its one database belongs to.
     Case {
         name: "a component declared under another System ID",
         application_id: "abap.prod_01",
@@ -225,6 +238,14 @@ const CASES: &[Case] = &[
                 // component of another system reports none.
                 system_number: None,
                 databases: &[],
+            },
+            Expected {
+                component_id: "PRD-HANA",
+                component_type: "HANA",
+                sid: "PRD",
+                ec2_instance_id: "i-0123456789abcdef0",
+                system_number: Some("01"),
+                databases: &["PRD"],
             },
         ],
     },
@@ -264,7 +285,8 @@ const CASES: &[Case] = &[
     },
     // The largest `ComponentsInfo` the model allows
     // (`smithy_query(query="operation", operation="RegisterApplication")`: length 0..5),
-    // on an application with no database at all.
+    // on an application with no database at all — beside the SAP HANA component its own
+    // System ID names, which no declaration describes.
     Case {
         name: "five components and no database",
         application_id: "abap-five-components",
@@ -318,6 +340,14 @@ const CASES: &[Case] = &[
                 component_type: "WEBDISP",
                 sid: "ABC",
                 ec2_instance_id: "i-00000000000000010",
+                system_number: Some("42"),
+                databases: &[],
+            },
+            Expected {
+                component_id: "ABC-HANA",
+                component_type: "HANA",
+                sid: "ABC",
+                ec2_instance_id: "i-0123456789abcdef0",
                 system_number: Some("42"),
                 databases: &[],
             },
@@ -382,6 +412,9 @@ async fn get_component(emulator: &Emulator, application_id: &str, component_id: 
         .await
 }
 
+/// RULE: `GetComponent` reports every component a registration described — each
+/// `ComponentsInfo` entry and the SAP HANA component of the application's own SAP system
+/// — out of what that registration persisted.
 #[tokio::test]
 async fn get_component_reports_every_component_a_registration_declared() {
     for case in CASES {
@@ -398,7 +431,7 @@ async fn get_component_reports_every_component_a_registration_declared() {
             assert_eq!(
                 component_str(&reply, "ComponentId"),
                 expected.component_id,
-                "case {:?} at {expected:?}: expected the declared ComponentId, got {reply:?}",
+                "case {:?} at {expected:?}: expected the described ComponentId, got {reply:?}",
                 case.name
             );
             assert_eq!(

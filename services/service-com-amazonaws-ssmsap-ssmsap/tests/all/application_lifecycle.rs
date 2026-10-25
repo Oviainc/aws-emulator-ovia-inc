@@ -461,12 +461,20 @@ impl RegisterCase {
         Value::Object(body)
     }
 
-    /// The component ids the registration describes: a component is identified by the
-    /// SID and type it was declared with, so duplicates collapse.
+    /// The component ids the registration describes: one per `ComponentsInfo` entry (a
+    /// component is identified by the SID and type it was declared with, so duplicates
+    /// collapse), plus the SAP HANA component of the SAP system the registration's own
+    /// `Sid` names, when no declaration already describes it.
     fn expected_components(&self) -> Vec<String> {
         let mut ids: Vec<String> = Vec::new();
         for (component_type, sid, _) in self.components_info {
             let id = format!("{sid}-{component_type}");
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        if let Some(sid) = self.sid {
+            let id = format!("{sid}-HANA");
             if !ids.contains(&id) {
                 ids.push(id);
             }
@@ -606,7 +614,7 @@ async fn register_persists_the_application_and_every_reader_reports_it() {
         assert_eq!(
             string_list(registered.app("Components")),
             case.expected_components(),
-            "case {case:?}: Components come from ComponentsInfo, got {:?}",
+            "case {case:?}: Components come from the registration, got {:?}",
             registered.app("Components")
         );
         assert!(

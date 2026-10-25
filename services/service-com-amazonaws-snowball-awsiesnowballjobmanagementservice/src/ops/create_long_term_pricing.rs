@@ -106,7 +106,11 @@ fn store_full_message() -> String {
 /// ends on the last day of the following month, and a three-year one spans the leap days
 /// in between. `chrono` does that arithmetic (including clamping a day the target month
 /// does not have), so this service does not carry a calendar of its own.
-fn plus_calendar_months(
+///
+/// Public so the crate's suites can hold it to a calendar of their own: a contract is
+/// always bought "now", so a test cannot otherwise reach a term that crosses a month
+/// boundary it chose.
+pub fn plus_calendar_months(
     start: ::std::time::SystemTime,
     months: u32,
 ) -> Option<::std::time::SystemTime> {

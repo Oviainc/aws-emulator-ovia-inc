@@ -232,7 +232,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 sse_algorithm,
                                 kms_master_key_id: rule.kms_master_key_id.clone(),
                             }),
-                        bucket_key_enabled: rule.bucket_key_enabled,
+                        // Materialised, never omitted: `BucketKeyEnabled` is a switch with
+                        // a documented off state ("General purpose buckets - By default,
+                        // S3 Bucket Key is not enabled",
+                        // `ServerSideEncryptionRule$BucketKeyEnabled`), so a rule that
+                        // names none has it OFF — and a reader that dropped the member
+                        // would leave a caller unable to tell "off" from "not reported".
+                        bucket_key_enabled: Some(
+                            rule.bucket_key_enabled
+                                .unwrap_or(crate::state::DEFAULT_BUCKET_KEY_ENABLED),
+                        ),
                         blocked_encryption_types: rule.blocked_encryption_types.clone().map(
                             |encryption_type| BlockedEncryptionTypes {
                                 encryption_type: Some(encryption_type),

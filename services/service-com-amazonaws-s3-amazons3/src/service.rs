@@ -24,10 +24,9 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording; THIS service rewords exactly one member (see `abac_status_refusal`)
-//!   and keeps that wording for everything else. See the inline note on that
-//!   method for how to reword.
+//!   before any handler ran. S3 answers every one of them with one of its OWN
+//!   error codes (see `s3_refusal`), never the framework's generic
+//!   `ValidationException`, because a client branches on the S3 code.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -96,37 +95,103 @@ fn addresses_peer_path(parts: &http::request::Parts, peer_segments: &[&str]) -> 
     }
 }
 
-/// The dotted boundary-validation path of `PutBucketAbacRequest$AbacStatus$Status`.
+/// The INPUT members this service binds as the request's XML DOCUMENT: every `@httpPayload`
+/// member of an operation input whose target is a structured shape (a structure, union,
+/// list or map), named the way a validation path names it — lowerCamel.
 ///
-/// The validator reports a violation by the trail of Smithy member names from the
-/// operation input inwards, each segment lowerCamel-ed — so the `Status` inside the
-/// `AbacStatus` container `PutBucketAbac` carries as its payload is this. `AbacStatus` is
-/// reached by no other INPUT in this service
-/// (`smithy_query(query="shape",shape="AbacStatus")` is referenced by
-/// `PutBucketAbacRequest` and by `GetBucketAbacOutput`, and an output is not validated),
-/// so the path names that one member.
-const ABAC_STATUS_STATUS_PATH: &str = "abacStatus.status";
+/// This is the one thing a refusal needs to know that a [`Violation`] does not carry: a
+/// value that failed a constraint INSIDE the request document is a document that does not
+/// validate against S3's published schema, and a value that failed in a header, a query
+/// parameter or a URI label is a bad argument. The two are different wire codes (see
+/// [`s3_refusal`]), and the only thing that tells them apart is whether the violation's
+/// path starts at one of these members.
+///
+/// Source: the `@httpPayload` members of this service's operation inputs, re-derived from
+/// the model by `tests/all/refusal_codes.rs` so a model update that binds another document
+/// cannot quietly start reporting it as a bad argument.
+pub const XML_DOCUMENT_PAYLOAD_MEMBERS: &[&str] = &[
+    "abacStatus",
+    "accelerateConfiguration",
+    "accessControlPolicy",
+    "analyticsConfiguration",
+    "annotationTableConfiguration",
+    "bucketLoggingStatus",
+    "cORSConfiguration",
+    "createBucketConfiguration",
+    "delete",
+    "intelligentTieringConfiguration",
+    "inventoryConfiguration",
+    "inventoryTableConfiguration",
+    "journalTableConfiguration",
+    "legalHold",
+    "lifecycleConfiguration",
+    "metadataConfiguration",
+    "metadataTableConfiguration",
+    "metricsConfiguration",
+    "multipartUpload",
+    "notificationConfiguration",
+    "objectEncryption",
+    "objectLockConfiguration",
+    "ownershipControls",
+    "publicAccessBlockConfiguration",
+    "replicationConfiguration",
+    "requestPaymentConfiguration",
+    "restoreRequest",
+    "retention",
+    "serverSideEncryptionConfiguration",
+    "tagging",
+    "versioningConfiguration",
+    "websiteConfiguration",
+];
 
-/// Reword a boundary refusal of the `Status` inside a `PutBucketAbac` payload as the code
-/// S3 answers a document that does not validate against its published schema with.
+/// Whether `violation` names a value that arrived inside the request's XML document.
 ///
-/// `AbacStatus$Status` targets an `enum` shape, so a value outside `BucketAbacStatus` is
-/// refused by the boundary validator before the handler runs, and the framework's generic
-/// code for that is `ValidationException`. S3 answers a payload that does not match the
-/// schema it publishes with `MalformedXML` instead — which is also what
-/// [`crate::ops::put_bucket_abac`] answers the same payload naming no `Status` at all with,
-/// so without this reword one operation would report one logical failure under two codes.
-/// Nothing else is reworded: every other operation and member keeps the framework's
-/// wording.
-fn abac_status_refusal(violation: &Violation) -> Option<Refused> {
-    matches!(
-        (violation.path.as_str(), &violation.kind),
-        (ABAC_STATUS_STATUS_PATH, ViolationKind::EnumValue(_))
-    )
-    .then(|| Refused {
-        code: crate::state::MALFORMED_XML_CODE.to_string(),
-        message: crate::state::MALFORMED_XML_MESSAGE.to_string(),
-    })
+/// Two things decide it. The path is the trail of member names from the operation input
+/// inwards, so its FIRST segment is the input member the value came in on and everything
+/// below it travelled INSIDE that member — which is why a value refused in the document
+/// always names a member of the container, and so always has a path that descends past
+/// it. A path that is the member ALONE is either the DOCUMENT itself, which is the one
+/// refusal this service mints for a body (the XML charset rule in
+/// [`wire::xml_charset_violation`]), or a SCALAR binding of a member whose name another
+/// operation uses for its document — `Tagging` is the one such name in this service, the
+/// `@httpPayload` of the two tagging writes and the `x-amz-tagging` HEADER of the three
+/// object writes — and a header is not a document.
+fn violation_is_in_request_document(violation: &Violation) -> bool {
+    let mut segments = violation.path.split('.');
+    let Some(root) = segments.next() else {
+        return false;
+    };
+    if !XML_DOCUMENT_PAYLOAD_MEMBERS.contains(&root) {
+        return false;
+    }
+    segments.next().is_some()
+        || violation.kind == ViolationKind::Pattern(wire::XML_CHARACTER_SET.to_string())
+}
+
+/// The S3 error code and message for one boundary refusal.
+///
+/// S3 is a restXml service: every refusal it answers carries an S3 error code in an
+/// `<Error><Code>` body, and which code depends on WHERE the offending value came from.
+/// A value that fails a constraint inside the request's XML document is a document that
+/// "did not validate against our published schema", which is `MalformedXML`; a value that
+/// fails one in a header, a query parameter or a URI label is `InvalidArgument`, "invalid
+/// argument". Both are HTTP 400, the status the protocol already renders a refusal with.
+///
+/// `MalformedXML` carries the fixed text its own error-responses entry publishes, because
+/// that is what S3 sends however the document failed to validate. `InvalidArgument` keeps
+/// the clause the validator built from the request — which member, and the constraint it
+/// broke — since that is the only thing that says which argument was rejected.
+fn s3_refusal(violation: &Violation) -> Refused {
+    if violation_is_in_request_document(violation) {
+        return Refused {
+            code: crate::state::MALFORMED_XML_CODE.to_string(),
+            message: crate::state::MALFORMED_XML_MESSAGE.to_string(),
+        };
+    }
+    Refused {
+        code: crate::state::INVALID_ARGUMENT_CODE.to_string(),
+        message: violation.message(),
+    }
 }
 
 /// The `com-amazonaws-s3-amazons3` emulated service: the generated [`ServiceDefinition`] plus
@@ -196,14 +261,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. S3 keeps the framework's generic `ValidationException`
-        // report for all but one member: the `Status` inside a `PutBucketAbac`
-        // payload, where the boundary's refusal and the handler's own would
-        // otherwise answer one logical failure under two codes. See
-        // [`abac_status_refusal`]; every other operation and member is declined, so
-        // the framework's wording stays in place for them.
+        // service word it. S3's refusals carry S3's own error codes, never the
+        // framework's generic `ValidationException`: see [`s3_refusal`] for the
+        // rule — a value refused inside the request's XML document is
+        // `MalformedXML`, one refused in a header, a query parameter or a URI
+        // label is `InvalidArgument`. The FIRST violation is what the answer
+        // names, the way the protocol's own envelope reports one code.
         match refusal {
-            Refusal::Invalid(violations) => violations.iter().find_map(abac_status_refusal),
+            Refusal::Invalid(violations) => violations.first().map(s3_refusal),
             // Authentication refusals, and any refusal kind added later, keep the
             // framework's wording.
             _ => None,

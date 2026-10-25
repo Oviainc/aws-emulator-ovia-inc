@@ -301,6 +301,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // object from a versioning-enabled bucket" — the permanent delete, which
                 // removes exactly the version named.
                 Some(version_id) => {
+                    // A `versionId` that is not SHAPED like one cannot name a version of
+                    // anything, so it is a malformed ARGUMENT rather than an absent
+                    // version — this identifier's own failure, reported beside the keys
+                    // that did delete, the way every other per-key failure here is.
+                    if !crate::state::version_id_is_well_formed(version_id) {
+                        errors.push(Error {
+                            key: Some(key.to_string()),
+                            version_id: Some(version_id.to_string()),
+                            code: Some(crate::state::INVALID_ARGUMENT_CODE.to_string()),
+                            message: Some(crate::state::INVALID_VERSION_ID_MESSAGE.to_string()),
+                        });
+                        continue;
+                    }
                     let removed_marker = store
                         .bucket(&input.bucket)
                         .and_then(|bucket| bucket.stored_version(key, version_id))

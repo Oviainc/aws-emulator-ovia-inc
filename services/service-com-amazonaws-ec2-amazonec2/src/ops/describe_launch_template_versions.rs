@@ -419,7 +419,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // lookup per version rather than a scan of the image store.
         let resolve_alias = input.resolve_alias.unwrap_or(false);
         let resolvable_parameters = if resolve_alias {
-            public_ssm_parameter_image_ids(&store)
+            store.public_ssm_parameter_image_ids(::engine::emulator_account_id())
         } else {
             ::std::collections::BTreeMap::new()
         };
@@ -746,32 +746,6 @@ fn ssm_image_alias_parameter(image_id: &str) -> Option<&str> {
     image_id
         .strip_prefix(SSM_IMAGE_ALIAS_PREFIX)
         .filter(|parameter| !parameter.is_empty())
-}
-
-/// The public Systems Manager parameter of every image this account can see that publishes
-/// one, and the id of the image it resolves to.
-///
-/// `Image$PublicSsmParameterName` is "the name of the public Systems Manager parameter that
-/// resolves to this AMI", so the stored images are what an alias is resolved against — the
-/// one place this emulator records which AMI a parameter names, rather than a second table
-/// that could disagree with the catalog. Built ONCE per request and then looked up, so
-/// resolving the aliases of many versions costs one pass over the image store
-/// ([`crate::state::MAX_IMAGES`] bounds it) instead of one pass per version.
-fn public_ssm_parameter_image_ids(
-    store: &crate::state::ComAmazonawsEc2Amazonec2State,
-) -> ::std::collections::BTreeMap<String, String> {
-    let account = ::engine::emulator_account_id();
-    store
-        .images
-        .values()
-        .filter(|image| crate::state::image_is_visible(image, account))
-        .filter_map(|image| {
-            Some((
-                image.public_ssm_parameter_name.clone()?,
-                image.image_id.clone()?,
-            ))
-        })
-        .collect()
 }
 
 /// One stored launch template version as this operation reports it: the modelled

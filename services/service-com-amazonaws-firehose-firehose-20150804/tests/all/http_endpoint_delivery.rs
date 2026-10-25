@@ -229,13 +229,21 @@ impl Emulator {
     }
 
     /// `PUT /<bucket>` — Amazon S3's `CreateBucket`, so the destination's backup exists.
+    ///
+    /// The create names its `LocationConstraint`: a create that names none can only mean
+    /// us-east-1, the Region the unspecified constraint stands for, so S3 refuses one sent
+    /// to any other Region's endpoint and this harness signs for [`REGION`].
     async fn create_bucket(&self, bucket: &str) {
+        let payload = format!(
+            "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <LocationConstraint>{REGION}</LocationConstraint></CreateBucketConfiguration>"
+        );
         let request = http::Request::builder()
             .method("PUT")
             .uri(format!("https://127.0.0.1:9297/{bucket}"))
             .header("host", "127.0.0.1:9297")
             .header("authorization", authorization("s3"))
-            .body(bytes::Bytes::new())
+            .body(bytes::Bytes::from(payload))
             .expect("the request builds");
         let response = self.router.dispatch(request).await;
         assert_eq!(

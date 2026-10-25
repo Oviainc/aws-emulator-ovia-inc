@@ -21,11 +21,9 @@
 //! reads one: by quoting its id on `CreateJob`, which the service accepts only for a
 //! contract it holds and reports back through `DescribeJob`. Its own stored fields — the
 //! term window, the status and the auto-renew choice — are also checked off the engine
-//! directly, which is deliberate and is the one place in this crate's tests that does so:
-//! the only operation that reports those members to a client is `ListLongTermPricing`,
-//! which is still a scaffold stub with its own open issue
-//! (`issues/things-that-do-not-work/20261024T040304Z-snowball-listlongtermpricing-stub.md`),
-//! so until it is implemented the store is the only observer of them.
+//! directly, which pins what the create persisted independently of any reader; the operation
+//! that reports those members to a client is `ListLongTermPricing`, whose own suite
+//! (`long_term_pricing_listing`) asserts them over the wire.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;

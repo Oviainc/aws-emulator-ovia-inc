@@ -334,6 +334,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             Some(group) => group.retention_in_days,
         };
+        // Whether this group's Embedded Metric Format events publish metrics is a question
+        // about the ACCOUNT's metric extraction policies and this group, answered here —
+        // before anything is written — so the answer is the one that held when the batch
+        // arrived.
+        let extract_emf_metrics = store
+            .log_groups
+            .get(&input.log_group_name)
+            .is_some_and(|group| store.emf_extraction_enabled_for(group));
 
         // The documented batch constraints, which bound what one request may store:
         // "The maximum batch size is 1,048,576 bytes. This size is calculated as the sum
@@ -429,6 +437,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
         let accepted_any = !batch.is_empty();
+        // The messages that were actually STORED, each with its own timestamp: the events an
+        // Embedded Metric Format document can be extracted from below. Taken only when this
+        // group extracts them, so a suppressed group copies nothing.
+        let stored_messages: Vec<(i64, String)> = if extract_emf_metrics {
+            batch
+                .iter()
+                .map(|event| (event.timestamp, event.message.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let added_bytes: i64 = batch
             .iter()
             .map(crate::state::StoredEvent::stored_bytes)
@@ -487,6 +506,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .saturating_add(added_bytes)
             .saturating_sub(discarded_bytes)
             .max(0);
+
+        // An accepted event whose message is an Embedded Metric Format document publishes
+        // the metrics that document declares — "EMF metric creation is enabled for all log
+        // groups" unless an account-level metric extraction policy selects this group — so
+        // the datapoints are extracted from the events that were actually STORED, stamped
+        // with each event's own timestamp.
+        let extracted: Vec<crate::state::emf::ExtractedDatapoint> = stored_messages
+            .iter()
+            .flat_map(|(timestamp, message)| {
+                crate::state::emf::extracted_datapoints(message, *timestamp)
+            })
+            .collect();
+        // The metric store is written with no log-store guard held, so the two services'
+        // stores are never locked at once.
+        drop(store);
+        crate::state::emf::publish(&*self.engine, &extracted);
 
         Ok(PutLogEventsOutput {
             next_sequence_token: Some(next_sequence_token),

@@ -421,6 +421,19 @@ pub const CERTIFICATE_STATUS_ISSUED: &str = "issued";
 /// it.
 pub const CERTIFICATE_VALIDATION_DELAY: Duration = Duration::from_millis(500);
 
+/// The `ValidationTokenHost` that asks CLOUDFRONT to serve the HTTP validation token of a
+/// CloudFront managed ACM certificate: "For `cloudfront`, CloudFront will automatically
+/// serve the validation token. Choose this mode if you can point the domain's DNS to
+/// CloudFront immediately"
+/// (`smithy_query(query="shape",shape="ManagedCertificateRequest")`).
+///
+/// Serving the token AT the domain is only possible once the domain resolves to a
+/// CloudFront resource, which is why this mode — and not the other one, which leaves the
+/// token to the caller's own infrastructure — makes the create check the domain's DNS
+/// before it admits the request
+/// ([`ComAmazonawsCloudfrontCloudfront20200531State::unverifiable_certificate_domain`]).
+pub const VALIDATION_TOKEN_HOST_CLOUDFRONT: &str = "cloudfront";
+
 /// The well-known path an HTTP domain validation token is served at, between the host and
 /// the token's own file name.
 pub const VALIDATION_TOKEN_PATH: &str = "/.well-known/pki-validation/";
@@ -2764,6 +2777,20 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             .find(|tenant| tenant.arn == identifier || tenant.name == identifier)
     }
 
+    /// The distribution tenant `domain` is associated with, or `None` when no tenant this
+    /// store holds claims it.
+    ///
+    /// "A domain name associated with the target distribution tenant": the association is
+    /// the tenant's own `Domains`, and a domain routes to at most one CloudFront resource
+    /// ([`ComAmazonawsCloudfrontCloudfront20200531State::domain_in_use`]), so at most one
+    /// tenant answers. DNS names are case-insensitive, so the lookup is too
+    /// ([`StoredDistributionTenant::holds_domain`]).
+    pub fn distribution_tenant_by_domain(&self, domain: &str) -> Option<&StoredDistributionTenant> {
+        self.distribution_tenants
+            .values()
+            .find(|tenant| tenant.holds_domain(domain))
+    }
+
     /// Whether `domain` is already associated with a CloudFront resource this store holds:
     /// a domain of a distribution tenant other than `except_tenant_id`, or an alias of a
     /// distribution.
@@ -2822,6 +2849,44 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             .values()
             .find(|distribution| same_domain(&distribution.domain_name, name))
             .map(|distribution| distribution.domain_name.clone())
+    }
+
+    /// The first domain a CloudFront managed ACM certificate `request` would cover whose
+    /// ownership this service cannot verify, or `None` when the request asks for no
+    /// verification or every covered domain is verified.
+    ///
+    /// `ManagedCertificateRequest$ValidationTokenHost` decides WHO serves the HTTP
+    /// validation token: [`VALIDATION_TOKEN_HOST_CLOUDFRONT`] asks CloudFront to serve it at
+    /// the domain itself, which it can only do once that domain resolves to a CloudFront
+    /// resource — so the request is admitted only for a domain this service resolves to one,
+    /// and the other mode ("you serve the validation token from your existing
+    /// infrastructure") leaves the validation to the caller and demands nothing of DNS.
+    ///
+    /// The DNS view is the one and only one this service has
+    /// ([`ComAmazonawsCloudfrontCloudfront20200531State::resolved_cloudfront_endpoint`]), so
+    /// the names a certificate request is admitted for are exactly the names a verification
+    /// of the DNS configuration can read a record for. The covered domains are the ones the
+    /// resource claims plus the `PrimaryDomainName` the request names, if any: CloudFront
+    /// has to serve a token at every one of them.
+    pub fn unverifiable_certificate_domain(
+        &self,
+        request: &ManagedCertificateRequest,
+        domains: &[String],
+    ) -> Option<String> {
+        if request.validation_token_host != VALIDATION_TOKEN_HOST_CLOUDFRONT {
+            return None;
+        }
+        domains
+            .iter()
+            .map(String::as_str)
+            .chain(
+                request
+                    .primary_domain_name
+                    .as_deref()
+                    .filter(|domain| !domain.is_empty()),
+            )
+            .find(|domain| self.resolved_cloudfront_endpoint(domain).is_none())
+            .map(str::to_string)
     }
 
     /// Whether `id` names a connection group this store holds — an id no connection group
@@ -6046,6 +6111,24 @@ pub fn distribution_not_found(id: &str) -> EntityNotFound {
 pub fn distribution_tenant_not_found() -> EntityNotFound {
     EntityNotFound {
         message: Some("The specified distribution tenant doesn't exist.".to_string()),
+    }
+}
+
+/// The sentence CloudFront answers a certificate request whose domain ownership it could
+/// not verify with: the condition is a property of the domain's DNS rather than of any
+/// value the caller sent, so the sentence names none of them — no domain, no tenant name
+/// and no id appears in it. Recorded behaviour.
+pub const DOMAIN_OWNERSHIP_UNVERIFIED_MESSAGE: &str =
+    "The provided Domain Name is not valid. Could not verify Domain Name ownership. It may \
+     not be pointing to a valid CloudFront resource.";
+
+/// The modelled `InvalidArgument` (HTTP 400) for a CloudFront managed ACM certificate
+/// request that asks CloudFront itself to serve the HTTP validation token of a domain whose
+/// ownership this service cannot verify
+/// ([`ComAmazonawsCloudfrontCloudfront20200531State::unverifiable_certificate_domain`]).
+pub fn domain_ownership_unverified() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(DOMAIN_OWNERSHIP_UNVERIFIED_MESSAGE.to_string()),
     }
 }
 

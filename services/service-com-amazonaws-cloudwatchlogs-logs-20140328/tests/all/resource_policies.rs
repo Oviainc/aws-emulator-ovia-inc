@@ -388,22 +388,26 @@ async fn resource_scoped_put_is_guarded_by_the_revision_id() {
         "InvalidParameterException",
         "case update without a revision: an update must present the current revision"
     );
-    for stale in ["ffffffffffffffffffffffffffffffff", "not-a-revision"] {
+    // A value this service never ISSUED as a revision id — one in the form of a revision no
+    // write ever minted, and one that is no revision at all — is an invalid parameter: no
+    // retry of it can succeed, which is what separates it from the superseded revision below.
+    for never_issued in ["ffffffffffffffffffffffffffffffff", "not-a-revision"] {
         assert_ne!(
-            stale, first_revision,
-            "case stale revision {stale}: the test's stale value must not be the live one"
+            never_issued, first_revision,
+            "case never-issued revision {never_issued}: the test's value must not be the live one"
         );
         assert_eq!(
             logs.err(
                 "PutResourcePolicy",
                 &json!({
                     "policyName": "p", "policyDocument": document, "resourceArn": arn,
-                    "expectedRevisionId": stale,
+                    "expectedRevisionId": never_issued,
                 }),
             )
             .await,
-            "OperationAbortedException",
-            "case stale revision {stale}: a put at the wrong revision is a conflict"
+            "InvalidParameterException",
+            "case never-issued revision {never_issued}: a revision the service never issued is \
+             an invalid parameter"
         );
     }
 
@@ -423,6 +427,23 @@ async fn resource_scoped_put_is_guarded_by_the_revision_id() {
     assert_ne!(
         second_revision, first_revision,
         "case accepted update: an update moves the policy to a new revision"
+    );
+
+    // The revision the first put ISSUED has now been superseded by the update: presenting it
+    // is the optimistic-lock conflict the caller is to re-read and retry, which is a
+    // different condition from the never-issued values refused above.
+    assert_eq!(
+        logs.err(
+            "PutResourcePolicy",
+            &json!({
+                "policyName": "p", "policyDocument": document, "resourceArn": arn,
+                "expectedRevisionId": first_revision,
+            }),
+        )
+        .await,
+        "OperationAbortedException",
+        "case superseded revision: a put at a revision the service issued and has since \
+         superseded is a conflict"
     );
 
     let page = logs
@@ -632,8 +653,9 @@ async fn delete_removes_the_policy_it_names() {
             &json!({"resourceArn": arn, "expectedRevisionId": "ffffffffffffffffffffffffffffffff"}),
         )
         .await,
-        "OperationAbortedException",
-        "case resource delete at a stale revision: a delete at the wrong revision is a conflict"
+        "InvalidParameterException",
+        "case resource delete at a never-issued revision: a revision the service never issued \
+         is an invalid parameter"
     );
     logs.ok(
         "DeleteResourcePolicy",

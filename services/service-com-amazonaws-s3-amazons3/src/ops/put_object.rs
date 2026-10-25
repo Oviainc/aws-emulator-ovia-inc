@@ -449,13 +449,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Judged against the OBJECT's published tag-set limits, the same ones
         // `PutObjectTagging` judges its container against — "Amazon S3 limits the maximum
         // number of tags to 10 tags per object", with the shared key and value character
-        // bounds and the key-uniqueness a tag set has. AWS refuses these with
-        // `InvalidTag`, a code this service's model does not declare as a shape and so
-        // cannot render, so the refusal goes out through the framework's 400
-        // `ValidationException` channel — and BEFORE anything is written, so a refused
-        // write leaves whatever was at the key exactly as it was. The parse and that
-        // judgement are one seam, so a header naming more pairs than an object may hold is
-        // refused without this process holding a tag set it would never store.
+        // bounds and the key-uniqueness a tag set has. The wire code is the rejection's
+        // own ([`crate::state::TagSetRejection::code`]) — `BadRequest` for a set past the
+        // count an object may hold, `InvalidTag` for a tag that does not pass input
+        // validation — and the refusal is decided BEFORE anything is written, so a
+        // refused write leaves whatever was at the key exactly as it was. The parse and
+        // that judgement are one seam, so a header naming more pairs than an object may
+        // hold is refused without this process holding a tag set it would never store.
         let tags = match input.tagging.as_deref() {
             Some(header) => {
                 match crate::state::tag_set_from_header(
@@ -464,7 +464,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ) {
                     Ok(tags) => tags,
                     Err(rejection) => {
-                        return Err(crate::scaffolded::Scaffolded::validation(
+                        return Err(crate::scaffolded::Scaffolded::unmodeled(
+                            rejection.code(),
+                            crate::state::TAG_REJECTION_STATUS,
                             rejection.to_string(),
                         ))
                     }
@@ -559,7 +561,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .storage_class
                 .clone()
                 .unwrap_or_else(|| crate::state::DEFAULT_STORAGE_CLASS.to_string()),
-            content_type: input.content_type.clone(),
+            // S3 never infers a type from the key: a write that names no `Content-Type`
+            // stores `binary/octet-stream`, so a later read reports that rather than a
+            // type nobody sent.
+            content_type: Some(
+                input
+                    .content_type
+                    .clone()
+                    .unwrap_or_else(|| crate::state::DEFAULT_CONTENT_TYPE.to_string()),
+            ),
             cache_control: input.cache_control.clone(),
             content_disposition: input.content_disposition.clone(),
             content_encoding: input.content_encoding.clone(),
