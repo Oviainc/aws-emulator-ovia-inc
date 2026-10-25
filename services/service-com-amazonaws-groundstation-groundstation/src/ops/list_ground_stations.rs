@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGroundStations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListGroundStations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the ground stations this account is served by, a page at a time: one
+//! `GroundStationData` per station, carrying its name as both the `groundStationId` an
+//! operation addresses it by and the `groundStationName` it is called, plus the Region the
+//! request addressed.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListGroundStations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A ground station is not created through this API (the model declares no operation that
+//! builds one), so what this reads is the inventory written when this service's store was
+//! created — see [`crate::state::GROUND_STATIONS_ENV`] — together with the stations the
+//! account's on-boarded satellites are on-boarded to, which are ground stations it reaches
+//! too. A `satelliteId` narrows the answer to the stations THAT satellite is on-boarded
+//! to, and one naming no onboarding of this account is refused as the missing resource it
+//! names.
 //!
 //! ## Shape of an operation
 //!
@@ -141,23 +144,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_GROUND_STATIONS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report the ground stations this account is served by, a page at a time.
+    ///
+    /// `@readonly`: the answer is computed from
+    /// [`crate::state::ComAmazonawsGroundstationGroundstationState::known_ground_stations`]
+    /// and nothing is written, so a listing changes nothing a later caller sees. A ground
+    /// station is not created through this API — AWS builds and operates it outside this
+    /// API — so the store holds exactly the stations
+    /// [`crate::state::GROUND_STATIONS_ENV`] describes plus those this account's
+    /// onboardings reach, and an account told about none lists none.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListGroundStations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListGroundStationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListGroundStations"))
+        /// Names this listing inside its pagination tokens, so a token another listing
+        /// issued is not accepted here.
+        const LISTING: &str = "ground-stations";
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListGroundStationsErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        // An offset counts within the FILTERED sequence, so the satellite filter is part
+        // of the scope its token is issued under: resuming with a different satellite (or
+        // with none) is refused rather than landing at an offset into a different
+        // sequence, which would skip or repeat ground stations.
+        let satellite_filter = input.satellite_id.clone().unwrap_or_default();
+        let scope = crate::state::page_scope(LISTING, ::std::slice::from_ref(&satellite_filter));
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_page_token(&scope, token).ok_or_else(|| {
+                ListGroundStationsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            "nextToken was not issued by a previous ListGroundStations call with \
+                             these filters"
+                                .to_string(),
+                        ),
+                        parameter_name: Some("nextToken".to_string()),
+                    },
+                )
+            })?,
+        };
+
+        // A ground station's Region is the Region the request addressed: these are the
+        // ground stations serving THIS account, reached through the regional endpoint the
+        // caller signed for — the same region every ARN this service mints carries.
+        let region = crate::state::request_region(ctx.parts());
+
+        let guard = state.lock();
+
+        // A satellite filter names a satellite of this account; one this account is not
+        // on-boarded to references nothing, so the request is answered as the missing
+        // resource it names rather than with the empty page it would otherwise select —
+        // which a caller could not tell from "that satellite reaches no ground station".
+        let names = match input.satellite_id.as_deref() {
+            None => guard.known_ground_stations(),
+            Some(satellite_id) => {
+                if !guard.satellites.contains_key(satellite_id) {
+                    return Err(ListGroundStationsErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::satellite_not_found_message(satellite_id)),
+                        },
+                    )
+                    .into());
+                }
+                guard.ground_stations_of_satellite(satellite_id)
+            }
+        };
+
+        let items: Vec<GroundStationData> = names
+            .into_iter()
+            .map(|name| GroundStationData {
+                // One name: the `groundStationId` a request addresses the station by and
+                // the `groundStationName` it is called target the same shape in the model,
+                // so both members carry the recorded name.
+                ground_station_id: Some(name.clone()),
+                ground_station_name: Some(name),
+                region: Some(region.clone()),
+            })
+            .collect();
+
+        let (page, next_token) = crate::state::paginate(&scope, &items, input.max_results, offset);
+
+        Ok(ListGroundStationsOutput {
+            next_token,
+            // Present and empty for an account served by no ground station, so a client's
+            // pagination loop reads the same member on every page.
+            ground_station_list: Some(page),
+        })
     }
 }
