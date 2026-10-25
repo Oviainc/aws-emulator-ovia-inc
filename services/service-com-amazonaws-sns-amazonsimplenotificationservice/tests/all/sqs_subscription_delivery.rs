@@ -1,0 +1,427 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! `Publish` DELIVERS the message to the SQS queues subscribed to the topic, end to end over
+//! the wire (awsQuery for SNS, `awsJson1_0` for SQS) through the real `MultiServiceRouter`,
+//! with SQS mounted on the same engine so a delivery is observed where a client observes it:
+//! on the queue.
+//!
+//! The RULE asserted here: "Sends a message to an Amazon SNS topic […] When a messageId is
+//! returned, the message has been saved and Amazon SNS will attempt to deliver it shortly"
+//! (`Publish`) — every CONFIRMED subscription of the topic whose endpoint is an SQS queue
+//! receives exactly one message per publish. Its body is the SNS notification envelope
+//! (`Type`, `MessageId`, `TopicArn`, `Subject`, `Message`, `Timestamp`, `MessageAttributes`),
+//! or the published message EXACTLY as it was published when the subscription's
+//! `RawMessageDelivery` is `true`: "When set to true, enables raw message delivery to Amazon
+//! SQS […] endpoints. This eliminates the need for the endpoints to process JSON formatting,
+//! which is otherwise created for Amazon SNS metadata."
+//! (`GetSubscriptionAttributesResponse$Attributes`).
+//!
+//! The rows differ along what the rule generalises over: how many queues are subscribed,
+//! whether the subscription asked for raw delivery, whether the publish carried a subject or
+//! message attributes, and whether the subscribed queue belongs to the topic published to at
+//! all.
+
+use std::sync::Arc;
+
+use serde_json::{json, Value};
+use smithy_server_runtime::MultiServiceRouter;
+
+use crate::topics_subscriptions_publish::percent_encode;
+
+/// The Region every call below is signed for.
+const REGION: &str = "us-east-1";
+
+/// SNS and SQS on ONE engine: a subscription's endpoint is a queue, and the delivery is
+/// asserted on the queue.
+struct Emulator {
+    router: MultiServiceRouter,
+}
+
+fn emulator() -> Emulator {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(
+        service_com_amazonaws_sns_amazonsimplenotificationservice::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
+        Arc::clone(&engine),
+    ));
+    Emulator { router }
+}
+
+/// One awsQuery form call against SNS.
+async fn sns(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> String {
+    let mut body = format!("Action={action}&Version=2010-03-31");
+    for (name, value) in params {
+        body.push('&');
+        body.push_str(name);
+        body.push('=');
+        // The form encoding is the suite-shared one, not a second copy.
+        body.push_str(&percent_encode(value));
+    }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", format!("sns.{REGION}.amazonaws.com"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDTESTTESTTEST/20260101/{REGION}/sns/aws4_request, \
+                 SignedHeaders=host, Signature=0000"
+            ),
+        )
+        .body(bytes::Bytes::from(body))
+        .expect("the test request is well formed");
+    let response = emulator.router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let text = String::from_utf8_lossy(response.body()).to_string();
+    assert_eq!(
+        status, 200,
+        "{action}: expected HTTP 200, got {status} / {text}"
+    );
+    text
+}
+
+/// One `awsJson1_0` call against SQS.
+async fn sqs(emulator: &Emulator, operation: &str, body: &Value) -> Value {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", format!("sqs.{REGION}.amazonaws.com"))
+        .header("content-type", "application/x-amz-json-1.0")
+        .header("x-amz-target", format!("AmazonSQS.{operation}"))
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDTESTTESTTEST/20260101/{REGION}/sqs/aws4_request, \
+                 SignedHeaders=host, Signature=0000"
+            ),
+        )
+        .body(bytes::Bytes::from(body.to_string()))
+        .expect("the test request is well formed");
+    let response = emulator.router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let payload = response.into_body();
+    let parsed: Value = if payload.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&payload).unwrap_or(Value::Null)
+    };
+    assert_eq!(
+        status, 200,
+        "{operation}: expected HTTP 200, got {status} with {parsed}"
+    );
+    parsed
+}
+
+/// The text of the first `<tag>…</tag>` element of an awsQuery response.
+fn element(body: &str, tag: &str) -> String {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = body
+        .find(&open)
+        .unwrap_or_else(|| panic!("no <{tag}> in {body}"))
+        + open.len();
+    let end = body[start..]
+        .find(&close)
+        .unwrap_or_else(|| panic!("no </{tag}> in {body}"));
+    body[start..start + end].to_string()
+}
+
+/// A queue called `name`: its url and the ARN a subscription names it by.
+async fn given_queue(emulator: &Emulator, name: &str) -> (String, String) {
+    let created = sqs(emulator, "CreateQueue", &json!({"QueueName": name})).await;
+    let url = created["QueueUrl"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreateQueue {name}: no QueueUrl in {created}"))
+        .to_string();
+    let attributes = sqs(
+        emulator,
+        "GetQueueAttributes",
+        &json!({"QueueUrl": url, "AttributeNames": ["QueueArn"]}),
+    )
+    .await;
+    let arn = attributes["Attributes"]["QueueArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("GetQueueAttributes {name}: no QueueArn in {attributes}"))
+        .to_string();
+    (url, arn)
+}
+
+/// Every message body waiting on the queue at `url`, as raw text, with the message
+/// attributes each one carries.
+async fn drain(emulator: &Emulator, url: &str) -> Vec<(String, Value)> {
+    let received = sqs(
+        emulator,
+        "ReceiveMessage",
+        &json!({
+            "QueueUrl": url,
+            "MaxNumberOfMessages": 10,
+            "MessageAttributeNames": ["All"],
+        }),
+    )
+    .await;
+    received["Messages"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|message| {
+            (
+                message["Body"].as_str().unwrap_or_default().to_string(),
+                message["MessageAttributes"].clone(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_published_message_reaches_every_subscribed_queue() {
+    let emulator = emulator();
+    let topic = element(&sns(&emulator, "CreateTopic", &[("Name", "orders")]).await, "TopicArn");
+    let other_topic = element(
+        &sns(&emulator, "CreateTopic", &[("Name", "invoices")]).await,
+        "TopicArn",
+    );
+
+    // (case, the queue's name, the topic it subscribes to, whether it asked for raw delivery,
+    //  how many messages it must receive)
+    let rows: &[(&str, &str, bool, bool, usize)] = &[
+        ("the first subscriber of the topic", "fan-out-one", true, false, 1),
+        ("a second subscriber of the same topic", "fan-out-two", true, false, 1),
+        ("a raw-delivery subscriber", "raw-delivery", true, true, 1),
+        ("a subscriber of another topic", "another-topic", false, false, 0),
+    ];
+
+    let mut queues: Vec<(&str, String, bool)> = Vec::new();
+    for (case, name, own_topic, raw, _) in rows {
+        let (url, arn) = given_queue(&emulator, name).await;
+        let subscription = element(
+            &sns(
+                &emulator,
+                "Subscribe",
+                &[
+                    ("TopicArn", if *own_topic { &topic } else { &other_topic }),
+                    ("Protocol", "sqs"),
+                    ("Endpoint", &arn),
+                ],
+            )
+            .await,
+            "SubscriptionArn",
+        );
+        if *raw {
+            sns(
+                &emulator,
+                "SetSubscriptionAttributes",
+                &[
+                    ("SubscriptionArn", &subscription),
+                    ("AttributeName", "RawMessageDelivery"),
+                    ("AttributeValue", "true"),
+                ],
+            )
+            .await;
+        }
+        assert!(
+            subscription.contains(':'),
+            "case {case:?}: an SQS subscription is confirmed at once, got {subscription:?}"
+        );
+        queues.push((case, url, *raw));
+    }
+
+    let message = r#"{"orderId":"A-1"}"#;
+    sns(
+        &emulator,
+        "Publish",
+        &[
+            ("TopicArn", &topic),
+            ("Message", message),
+            ("Subject", "an order"),
+            ("MessageAttributes.entry.1.Name", "kind"),
+            ("MessageAttributes.entry.1.Value.DataType", "String"),
+            ("MessageAttributes.entry.1.Value.StringValue", "created"),
+        ],
+    )
+    .await;
+
+    for ((case, url, raw), (_, _, _, _, expected)) in queues.iter().zip(rows) {
+        let delivered = drain(&emulator, url).await;
+        assert_eq!(
+            delivered.len(),
+            *expected,
+            "case {case:?}: expected {expected} delivered message(s), got {delivered:?}"
+        );
+        let Some((body, attributes)) = delivered.first() else {
+            continue;
+        };
+        if *raw {
+            // "enables raw message delivery […] This eliminates the need for the endpoints to
+            // process JSON formatting, which is otherwise created for Amazon SNS metadata."
+            assert_eq!(
+                body, message,
+                "case {case:?}: a raw delivery must carry the published message exactly, got \
+                 {body:?}"
+            );
+            assert_eq!(
+                attributes["kind"]["StringValue"].as_str(),
+                Some("created"),
+                "case {case:?}: a raw delivery must carry the published message attributes as \
+                 the queue's own, got {attributes}"
+            );
+            continue;
+        }
+        let envelope: Value = serde_json::from_str(body)
+            .unwrap_or_else(|error| panic!("case {case:?}: body is not JSON ({error}): {body}"));
+        assert_eq!(
+            envelope["Type"].as_str(),
+            Some("Notification"),
+            "case {case:?}: the envelope must declare its type, got {envelope}"
+        );
+        assert_eq!(
+            envelope["TopicArn"].as_str(),
+            Some(topic.as_str()),
+            "case {case:?}: the envelope must name the topic, got {envelope}"
+        );
+        assert_eq!(
+            envelope["Message"].as_str(),
+            Some(message),
+            "case {case:?}: the envelope must carry the message as published, got {envelope}"
+        );
+        assert_eq!(
+            envelope["Subject"].as_str(),
+            Some("an order"),
+            "case {case:?}: the envelope must carry the subject as published, got {envelope}"
+        );
+        assert_eq!(
+            envelope["MessageAttributes"]["kind"],
+            json!({"Type": "String", "Value": "created"}),
+            "case {case:?}: the envelope must carry the published attributes, got {envelope}"
+        );
+        assert!(
+            envelope["MessageId"].as_str().is_some_and(|id| !id.is_empty()),
+            "case {case:?}: the envelope must carry the id of the published message, got \
+             {envelope}"
+        );
+        assert!(
+            envelope.get("Signature").is_none(),
+            "case {case:?}: nothing signs a message here, so the envelope must claim no \
+             signature, got {envelope}"
+        );
+        assert_eq!(
+            *attributes,
+            Value::Null,
+            "case {case:?}: an enveloped delivery carries the attributes IN the envelope, not \
+             as the queue's own, got {attributes}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_batched_publish_reaches_the_subscribed_queue_once_per_entry() {
+    let emulator = emulator();
+    let topic = element(&sns(&emulator, "CreateTopic", &[("Name", "batched")]).await, "TopicArn");
+    let (url, arn) = given_queue(&emulator, "batched-queue").await;
+    sns(
+        &emulator,
+        "Subscribe",
+        &[
+            ("TopicArn", &topic),
+            ("Protocol", "sqs"),
+            ("Endpoint", &arn),
+        ],
+    )
+    .await;
+
+    // The rule the batched form must satisfy is the same one a single publish does: every
+    // confirmed queue subscription receives one message per PUBLISHED message. Rows differ in
+    // how many entries the batch carries and whether an entry is refused on its own ("an
+    // entry that breaks a per-message rule fails on its own, and the rest are still
+    // published") — a refused entry delivers nothing.
+    let rows: &[(&str, &[&str], usize)] = &[
+        ("one entry", &["first"], 1),
+        ("three entries", &["a", "b", "c"], 3),
+        ("one entry refused for an empty message", &["kept", ""], 1),
+    ];
+
+    for (case, messages, expected) in rows {
+        let mut params: Vec<(String, String)> = vec![("TopicArn".to_string(), topic.clone())];
+        for (index, message) in messages.iter().enumerate() {
+            let prefix = format!("PublishBatchRequestEntries.member.{}", index + 1);
+            params.push((format!("{prefix}.Id"), format!("e{index}")));
+            params.push((format!("{prefix}.Message"), (*message).to_string()));
+        }
+        let borrowed: Vec<(&str, &str)> = params
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        sns(&emulator, "PublishBatch", &borrowed).await;
+
+        let delivered = drain(&emulator, &url).await;
+        assert_eq!(
+            delivered.len(),
+            *expected,
+            "case {case:?}: expected {expected} delivered message(s), got {delivered:?}"
+        );
+        for (body, _) in &delivered {
+            let envelope: Value = serde_json::from_str(body).unwrap_or_else(|error| {
+                panic!("case {case:?}: body is not the SNS envelope ({error}): {body}")
+            });
+            assert!(
+                messages.contains(&envelope["Message"].as_str().unwrap_or_default()),
+                "case {case:?}: the envelope must carry one of the published messages, got \
+                 {envelope}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn each_publish_delivers_once_and_only_to_confirmed_subscriptions() {
+    let emulator = emulator();
+    let topic = element(&sns(&emulator, "CreateTopic", &[("Name", "events")]).await, "TopicArn");
+    let (url, arn) = given_queue(&emulator, "events-queue").await;
+    sns(
+        &emulator,
+        "Subscribe",
+        &[
+            ("TopicArn", &topic),
+            ("Protocol", "sqs"),
+            ("Endpoint", &arn),
+        ],
+    )
+    .await;
+    // An endpoint that has to confirm its subscription receives nothing, and its presence
+    // must not change what the confirmed queue receives.
+    sns(
+        &emulator,
+        "Subscribe",
+        &[
+            ("TopicArn", &topic),
+            ("Protocol", "https"),
+            ("Endpoint", "https://example.invalid/hook"),
+        ],
+    )
+    .await;
+
+    // Rows differ in how many publishes precede the read: each one delivers exactly one
+    // message, so the queue holds as many as were published.
+    for (case, publishes) in [("one publish", 1_usize), ("three more publishes", 3)] {
+        for index in 0..publishes {
+            sns(
+                &emulator,
+                "Publish",
+                &[("TopicArn", &topic), ("Message", &format!("event-{index}"))],
+            )
+            .await;
+        }
+        let delivered = drain(&emulator, &url).await;
+        assert_eq!(
+            delivered.len(),
+            publishes,
+            "case {case:?}: expected {publishes} delivered message(s), got {delivered:?}"
+        );
+    }
+}

@@ -169,9 +169,9 @@ async fn an_experiment_template_fis_never_created_is_not_reported_as_created() {
 
         assert_eq!(
             xml_text(&body, "StackStatus").as_deref(),
-            Some("CREATE_FAILED"),
-            "case {:?}: expected the stack to fail rather than publish an experiment \
-             template id FIS never minted, got {body}",
+            Some("ROLLBACK_COMPLETE"),
+            "case {:?}: expected the failed create to be rolled back rather than publish \
+             an experiment template id FIS never minted, got {body}",
             row.case
         );
         let reason = xml_text(&body, "StackStatusReason").unwrap_or_default();

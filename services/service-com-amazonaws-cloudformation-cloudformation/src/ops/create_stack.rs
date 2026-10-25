@@ -9,15 +9,22 @@
 //! CloudFormation's documented naming rules give it, and each declared output is
 //! evaluated against those resources and the stack's parameters, which is what
 //! `DescribeStacks` reports once the create completes. A request naming a live stack's
-//! name is refused with the modelled `AlreadyExistsException`, and one naming a `RoleARN`
+//! name IN THE REGION IT IS SIGNED FOR is refused with the modelled
+//! `AlreadyExistsException` — a stack name is a per-Region namespace, so the same name in
+//! another Region is a second stack — and one naming a `RoleARN`
 //! the account's IAM records show CloudFormation cannot assume is refused with the
 //! service's `ValidationError` (see `crate::state::role_trust_refusal`).
 //!
 //! It then CREATES those resources in the services that own them, through this
 //! emulator's own in-process callback: see [`crate::state::provisioning`] for which
 //! resource types are created and what a type with no provisioner yet records instead. A
-//! resource an owning service refuses leaves the stack in `CREATE_FAILED` with that
-//! service's own refusal as the reason.
+//! resource an owning service refuses fails the create with that service's own refusal as
+//! the reason, and the stack is then ROLLED BACK — the resources the create had already
+//! made are removed again and the stack settles into `ROLLBACK_COMPLETE` — because
+//! "ROLLBACK — Roll back the stack creation" is `OnFailure`'s documented default. The
+//! other two documented behaviours are honoured as documented: `DO_NOTHING` (which
+//! `DisableRollback=true` also spells) leaves the stack `CREATE_FAILED` with everything
+//! the create made, and `DELETE` takes the stack away with them.
 //!
 //! Members this handler stores but does not act on: `StackPolicyBody` (a stack policy
 //! governs which resources an update may change; `GetStackPolicy` reports it back) and
@@ -206,6 +213,10 @@ use crate::state::{status, StoredStack};
 /// documents the two as alternative spellings: "You can specify either OnFailure or
 /// DisableRollback, but not both").
 const ON_FAILURE_DO_NOTHING: &str = "DO_NOTHING";
+
+/// The `OnFailure` value that asks for the stack itself to go when its creation fails:
+/// "DELETE — Delete the stack if stack creation failed."
+const ON_FAILURE_DELETE: &str = "DELETE";
 
 // `CreateStackInput$StackName`'s documented rule lives in
 // `crate::state::validate_stack_name`, which `CreateChangeSet` holds a new stack's name
@@ -427,10 +438,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.settle(now);
 
             // "The name must be unique in the Region in which you are creating the stack"
-            // — unique among the LIVE stacks: a name is free again once its stack's
-            // deletion has completed.
+            // — unique among the LIVE stacks OF THAT REGION: the same name in another
+            // Region is another stack and both coexist, and a name is free again once its
+            // stack's deletion has completed.
             if store
-                .live_stacks()
+                .live_stacks(&region)
                 .any(|live| live.stack_name == input.stack_name)
             {
                 return Err(CreateStackErrorModeled::AlreadyExistsException(
@@ -442,18 +454,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             // "The quota for the resource has already been reached": the store holds at
-            // most `MAX_STACKS` live stacks, which is what bounds its growth. Nothing
-            // above this point WROTE a stack, so a refused request adds none — the one
-            // change it can leave behind is `settle`'s, which only materialises the
-            // transitions the clock already owed and would have happened on any other
-            // request at this instant.
-            if store.live_stacks().count() >= crate::state::MAX_STACKS {
+            // most `MAX_STACKS` live stacks PER REGION, which is the quota CloudFormation
+            // meters ("no more than N stacks can exist in this account and Region") and
+            // what bounds its growth. Nothing above this point WROTE a stack, so a refused
+            // request adds none — the one change it can leave behind is `settle`'s, which
+            // only materialises the transitions the clock already owed and would have
+            // happened on any other request at this instant.
+            if store.live_stacks(&region).count() >= crate::state::MAX_STACKS {
                 return Err(CreateStackErrorModeled::LimitExceededException(
                     LimitExceededException {
                         message: Some(format!(
                             "Limit for stacks exceeded: no more than {} stacks can exist in \
                              this account and Region",
                             crate::state::MAX_STACKS
+                        )),
+                    },
+                )
+                .into());
+            }
+            // The Region that quota is metered in comes from the request's own credential
+            // scope, so it is a value the CALLER chooses: this is the ceiling on the store
+            // as a whole, which is what bounds its growth however many Regions a caller
+            // signs for.
+            if store.live_stack_count() >= crate::state::MAX_LIVE_STACKS {
+                return Err(CreateStackErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "Limit for stacks exceeded: no more than {} stacks can exist in \
+                             this account",
+                            crate::state::MAX_LIVE_STACKS
                         )),
                     },
                 )
@@ -493,21 +522,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stack_id: Some(stack_id.clone()),
             operation_id: Some(operation_id),
         };
-        let mut store = state.lock();
-        // Unreachable unless the stack was deleted while its resources were being created:
-        // there is then nothing left to record them on.
-        let Some(stack) = store.resolve_mut(&stack_id) else {
-            return Ok(output);
+        // What the failure (if any) owes the stack beyond the CREATE_FAILED it records:
+        // the resources to remove again, and the status that removal settles the stack
+        // into.
+        let unwind = {
+            let mut store = state.lock();
+            // Unreachable unless the stack was deleted while its resources were being
+            // created: there is then nothing left to record them on.
+            let Some(stack) = store.resolve_mut(&region, &stack_id) else {
+                return Ok(output);
+            };
+            stack.record_materialised_resources(materialised.resources);
+            match materialised.failure {
+                None => None,
+                Some(failure) => {
+                    // A resource an owning service refused to create: the stack never
+                    // reaches CREATE_COMPLETE, and the reason reported is the one that
+                    // service gave.
+                    let failed_at = ::std::time::SystemTime::now();
+                    stack.fail_transition(failed_at, status::CREATE_FAILED, failure.clone());
+                    // "ROLLBACK — Roll back the stack creation. This is the default": the
+                    // failed create does not stop there. What the caller asked for decides
+                    // which of the three documented `OnFailure` behaviours it gets —
+                    // DO_NOTHING (which `DisableRollback` also spells) keeps the failed
+                    // state and everything the create had already made, DELETE takes the
+                    // stack itself away, and ROLLBACK removes what the create made and
+                    // leaves the stack reporting that it was rolled back.
+                    if stack.disable_rollback {
+                        None
+                    } else {
+                        let deletes_the_stack =
+                            input.on_failure.as_deref() == Some(ON_FAILURE_DELETE);
+                        if deletes_the_stack {
+                            stack.begin_transition(
+                                failed_at,
+                                status::DELETE_IN_PROGRESS,
+                                status::DELETE_COMPLETE,
+                                Some(crate::state::new_operation_id()),
+                                input.client_request_token.clone(),
+                            );
+                        } else {
+                            stack.begin_rollback(failed_at, failure);
+                        }
+                        Some(stack.current_resources())
+                    }
+                }
+            }
         };
-        stack.record_materialised_resources(materialised.resources);
-        if let Some(failure) = materialised.failure {
-            // A resource an owning service refused to create: the stack never reaches
-            // CREATE_COMPLETE, and the reason reported is the one that service gave.
-            stack.fail_transition(
-                ::std::time::SystemTime::now(),
-                status::CREATE_FAILED,
-                failure,
-            );
+
+        // The resources the failed create had already made in the services that own them
+        // are removed again, with the store UNLOCKED: each delete reaches another service's
+        // own handler, exactly as the creates above did. The status the removal settles
+        // into is already due on the stack's clock; only a delete the owning service
+        // REFUSES changes it, and then to the failed status for that unwind rather than to
+        // one that claims the resources are gone.
+        if let Some(resources) = unwind {
+            let deleted = crate::state::provisioning::unwind(ctx, &region, &resources).await;
+            let mut store = state.lock();
+            if let Some(stack) = store.resolve_mut(&region, &stack_id) {
+                stack.record_materialised_resources(deleted.resources);
+                if let Some(failure) = deleted.failure {
+                    let failed_status = if stack.status == status::DELETE_IN_PROGRESS {
+                        status::DELETE_FAILED
+                    } else {
+                        status::ROLLBACK_FAILED
+                    };
+                    stack.fail_transition(
+                        ::std::time::SystemTime::now(),
+                        failed_status,
+                        failure,
+                    );
+                }
+            }
         }
 
         Ok(output)

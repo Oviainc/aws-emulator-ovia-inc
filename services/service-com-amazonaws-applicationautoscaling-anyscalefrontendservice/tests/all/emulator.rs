@@ -24,6 +24,9 @@ pub const ACCOUNT: &str = "000000000000";
 /// One emulator over one shared engine.
 pub struct Emulator {
     router: MultiServiceRouter,
+    /// The shared engine, kept so a suite can seed the store of a service no client call can
+    /// write — see [`Emulator::seed_metric_data`].
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -62,10 +65,57 @@ impl Emulator {
         );
         router.register_service(
             service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(
-                engine,
+                Arc::clone(&engine),
             ),
         );
-        Self { router }
+        Self { router, engine }
+    }
+
+    /// Write datapoints straight into the CloudWatch metric store, the way the AWS service
+    /// that OWNS the metric writes them.
+    ///
+    /// A client cannot publish into the AWS-reserved namespace space: `PutMetricData` refuses
+    /// a `Namespace` beginning with `AWS/` ("To avoid conflicts with Amazon Web Services
+    /// service namespaces, you should not specify a namespace that begins with AWS/"), so a
+    /// row whose load metric is a service-authored series (`AWS/ECS`) seeds it here rather
+    /// than over the wire. A customer-namespace series is published over the wire instead, by
+    /// the handler, exactly as a client publishes it.
+    pub fn seed_metric_data(
+        &self,
+        namespace: &str,
+        metric_name: &str,
+        dimensions: &[(&str, &str)],
+        at_secs: f64,
+        values: &[f64],
+    ) {
+        use service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state as cloudwatch;
+
+        let key = cloudwatch::MetricKey {
+            namespace: namespace.to_string(),
+            metric_name: metric_name.to_string(),
+            dimensions: dimensions
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
+        };
+        let data: Vec<cloudwatch::StoredDatum> = values
+            .iter()
+            .map(|value| cloudwatch::StoredDatum {
+                timestamp_secs: at_secs,
+                sample_count: 1.0,
+                sum: *value,
+                minimum: *value,
+                maximum: *value,
+                unit: None,
+                // The default `StorageResolution` of a published datum.
+                storage_resolution: 60,
+            })
+            .collect();
+        self.engine
+            .state::<cloudwatch::ComAmazonawsCloudwatchGraniteserviceversion20100801State>()
+            .lock()
+            .append_datapoints(key, data)
+            .expect("the metric store has room for the seeded series");
     }
 
     /// Call an Application Auto Scaling operation.
