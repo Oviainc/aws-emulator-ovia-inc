@@ -9,7 +9,10 @@
 //! (`crate::state::STOPPABLE_SEARCH_JOB_STATES`) — so a job that has not started
 //! scanning yet (`CREATING`) and one that ended in a status this operation does not
 //! produce (`COMPLETED`, `FAILED`) are both a `ConflictException` (409), and an
-//! identifier this account holds no job for is a `ResourceNotFoundException` (404).
+//! identifier this account holds no job for is a `ResourceNotFoundException` (404). An
+//! identifier that is not a well-formed one at all is refused before the lookup as
+//! invalid input — `ValidationException` (400), see
+//! [`crate::state::check_job_identifier`].
 //!
 //! A stop moves the job to `STOPPING`, the transient status, and the clock owes it
 //! `STOPPED` — so a `GetSearchJob` straight after this call observes the stop in
@@ -152,6 +155,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The identifier's SYNTAX is judged before any store lookup: a string that cannot
+        // be an identifier of this service is invalid input, not a missing resource.
+        crate::state::check_job_identifier(&input.search_job_identifier)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
         let now = SystemTime::now();
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(StopSearchJobErrorModeled::InternalServerException(
