@@ -16,7 +16,9 @@
 //!   already is the quantity the target names, with the scale-in alarm a fixed margin below
 //!   it;
 //! * a direction that is disabled (`DisableScaleIn`) or suspended (`SuspendedState`) has no
-//!   alarm, and resuming it brings the alarm back;
+//!   alarm on the tracked metric, and resuming it brings the alarm back — while the pair
+//!   that watches the provisioned capacity follows the direction only where the owning
+//!   service's integration pairs it with one, and is named as that service names it;
 //! * an alarm belongs to the policy that minted it, so deleting that policy retires it and
 //!   leaves every sibling policy's alarms alone.
 
@@ -78,6 +80,15 @@ const CAPACITY_ALARMS: &[&str] = &[
 
 /// Both scaling directions of a metric that is already the quantity the target names.
 const UTILISATION_ALARMS: &[&str] = &["AlarmHigh", "AlarmLow"];
+
+/// The same four alarms for an Amazon Keyspaces table: the capacity pair there is named
+/// for that service's own provisioned-capacity series.
+const CASSANDRA_CAPACITY_ALARMS: &[&str] = &[
+    "AlarmHigh",
+    "AlarmLow",
+    "CassandraProvisionedCapacityHigh",
+    "CassandraProvisionedCapacityLow",
+];
 
 /// The catalog. Each row differs along what the rule generalises over: the namespace and
 /// resource type, whether the tracked metric is a consumed-units count or a percentage, the
@@ -190,6 +201,49 @@ const ALARM_CATALOG: &[AlarmRow] = &[
         expected_period: 60,
         expected_threshold: 0.7,
         expected_dimensions: &[("FunctionName", "ingest"), ("Resource", "ingest:green")],
+    },
+    AlarmRow {
+        // The namespace Amazon Keyspaces registers its tables under. The harness holds no
+        // Keyspaces store, so the target's capacity is its MinCapacity of one unit: 40% of
+        // one provisioned unit over a 60-second period is a threshold of 24.
+        case: "an Amazon Keyspaces table's read capacity",
+        namespace: "cassandra",
+        resource_id: "keyspace/orders_ks/table/orders",
+        dimension: "cassandra:table:ReadCapacityUnits",
+        metric_type: "CassandraReadCapacityUtilization",
+        target_value: 40.0,
+        resource: Resource::External,
+        disable_scale_in: false,
+        expected_kinds: CASSANDRA_CAPACITY_ALARMS,
+        expected_namespace: "AWS/Cassandra",
+        expected_metric: "ConsumedReadCapacityUnits",
+        expected_statistic: "Sum",
+        expected_period: 60,
+        expected_threshold: 24.0,
+        expected_dimensions: &[("Keyspace", "orders_ks"), ("TableName", "orders")],
+    },
+    AlarmRow {
+        // Scale-in disabled takes the tracked metric's scale-in alarm, and in THIS
+        // namespace leaves the capacity pair whole.
+        case: "an Amazon Keyspaces table's write capacity with DisableScaleIn",
+        namespace: "cassandra",
+        resource_id: "keyspace/orders_ks/table/orders",
+        dimension: "cassandra:table:WriteCapacityUnits",
+        metric_type: "CassandraWriteCapacityUtilization",
+        target_value: 70.0,
+        resource: Resource::External,
+        disable_scale_in: true,
+        expected_kinds: &[
+            "AlarmHigh",
+            "CassandraProvisionedCapacityHigh",
+            "CassandraProvisionedCapacityLow",
+        ],
+        expected_namespace: "AWS/Cassandra",
+        expected_metric: "ConsumedWriteCapacityUnits",
+        expected_statistic: "Sum",
+        expected_period: 60,
+        expected_threshold: 42.0,
+        expected_dimensions: &[("Keyspace", "orders_ks"), ("TableName", "orders")],
     },
     AlarmRow {
         case: "DisableScaleIn withholds both scale-in alarms",
@@ -388,9 +442,14 @@ async fn a_target_tracking_policy_mints_the_alarms_that_drive_it() {
         }
 
         // The capacity pair watches the provisioned capacity the thresholds above were
-        // computed from, not the tracked metric.
-        if row.expected_kinds.contains(&"ProvisionedCapacityHigh") {
-            let capacity = alarm_of(&alarms, "ProvisionedCapacityHigh", case);
+        // computed from, not the tracked metric — whichever of its namespace's two
+        // spellings it carries.
+        if let Some(kind) = row
+            .expected_kinds
+            .iter()
+            .find(|kind| kind.ends_with("ProvisionedCapacityHigh"))
+        {
+            let capacity = alarm_of(&alarms, kind, case);
             let expected_metric = if row.dimension.ends_with("ReadCapacityUnits") {
                 "ProvisionedReadCapacityUnits"
             } else {
