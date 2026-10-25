@@ -205,18 +205,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every `FleetCapacity` member this request carries counts machines, so a
         // count below one describes a fleet that cannot run a build. The model puts
         // no `@range` on `FleetCapacity`, so the boundary validator passed it
-        // through and the service refuses it here with its modelled input error.
-        for (member, capacity) in capacity_members(&input) {
-            if capacity < crate::state::MIN_FLEET_CAPACITY {
-                return Err(self.refuse(
-                    ctx,
-                    &input.name,
-                    format!(
-                        "Invalid input: {member} must be at least {}, got {capacity}",
-                        crate::state::MIN_FLEET_CAPACITY
-                    ),
-                ));
-            }
+        // through and the service refuses it here with its modelled input error,
+        // worded by the one sentence CodeBuild answers a capacity below the floor
+        // with: it names no member and echoes no value, so which capacity member
+        // carried it does not change the text.
+        if requested_capacities(&input)
+            .into_iter()
+            .any(|capacity| capacity < crate::state::MIN_FLEET_CAPACITY)
+        {
+            return Err(self.refuse(
+                ctx,
+                &input.name,
+                crate::state::capacity_below_floor_message(),
+            ));
         }
 
         // `maxCapacity` is the ceiling auto-scaling may grow the fleet to, so it
@@ -399,20 +400,19 @@ impl<Eng> CreateFleet<Eng> {
     }
 }
 
-/// Every `FleetCapacity` member this request carries, with the input path a
-/// refusal names it by.
+/// Every `FleetCapacity` count this request carries.
 ///
 /// `baseCapacity` is required; `scalingConfiguration.maxCapacity` is present only
 /// when the request configures auto-scaling. Both target the model's
 /// `FleetCapacity`, so both answer to the same lower bound.
-fn capacity_members(input: &CreateFleetInput) -> Vec<(&'static str, i32)> {
-    let mut members = vec![("baseCapacity", input.base_capacity)];
+fn requested_capacities(input: &CreateFleetInput) -> Vec<i32> {
+    let mut capacities = vec![input.base_capacity];
     if let Some(max) = input
         .scaling_configuration
         .as_ref()
         .and_then(|scaling| scaling.max_capacity)
     {
-        members.push(("scalingConfiguration.maxCapacity", max));
+        capacities.push(max);
     }
-    members
+    capacities
 }

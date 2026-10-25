@@ -25,6 +25,8 @@ mod host_listing;
 mod host_reads;
 #[path = "all/host_reference_resolution.rs"]
 mod host_reference_resolution;
+#[path = "all/host_update.rs"]
+mod host_update;
 #[path = "all/repository_link_lifecycle.rs"]
 mod repository_link_lifecycle;
 #[path = "all/repository_link_listing.rs"]

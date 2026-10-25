@@ -84,7 +84,7 @@ fn update_xml_with_config(config_xml: &str, code: &[u8]) -> String {
 
 /// `PUT /2020-05-31/function/{Name}` with `update`'s configuration and code, under the
 /// `If-Match` header `if_match` (left out of the request entirely when `None`).
-async fn update_function(
+pub(crate) async fn update_function(
     router: &MultiServiceRouter,
     name: &str,
     update: &Create,

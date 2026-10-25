@@ -210,6 +210,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // page's id from the seed beside this map.
             product_rest_endpoint_pages: ::std::collections::BTreeMap::new(),
             product_rest_endpoint_page_id_seed: 0,
+            // A freshly created product owns no product pages either; each one is added
+            // by its own `CreateProductPage` call, which mints the page's id from the
+            // seed beside this map.
+            product_pages: ::std::collections::BTreeMap::new(),
+            product_page_id_seed: 0,
         };
 
         // Persist, then read the response back out of the STORE, so what the caller gets

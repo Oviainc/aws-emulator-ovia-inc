@@ -151,9 +151,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = guard.sandboxes.get_mut(&input.id) else {
             return Err(StopSandboxErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    // Named by the id the request gave, exactly as given — the same
-                    // shape of refusal `StopBuild` reports for an absent build.
-                    message: Some(format!("Sandbox {} does not exist", input.id)),
+                    // The one sentence CodeBuild answers an unresolvable sandbox with
+                    // ([`crate::state::SANDBOX_NOT_FOUND_MESSAGE`]), shared with every
+                    // other operation that resolves a sandbox: it names no identifier.
+                    message: Some(crate::state::SANDBOX_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

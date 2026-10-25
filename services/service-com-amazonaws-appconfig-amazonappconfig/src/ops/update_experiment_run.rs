@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateExperimentRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateExperimentRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateExperimentRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -174,20 +165,189 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateExperimentRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateExperimentRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateExperimentRunErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        // `DeploymentParameters$Tags` are the tags of the deployment this update drives, so
+        // every key it carries is checked through the same function `TagResource` refuses
+        // through, and before anything is written — a key this service will not store is
+        // refused whichever member carried it.
+        if let Some(reason) = input
+            .deployment_parameters
+            .as_ref()
+            .and_then(|parameters| parameters.tags.as_ref())
+            .and_then(crate::state::first_tag_key_rejection)
+        {
+            return Err(UpdateExperimentRunErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(reason),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        }
+
+        let now = std::time::SystemTime::now();
+        // ONE lock for the whole read-check-write: the exposure this request is checked
+        // against is the exposure it then replaces, so the two are not separable.
+        let mut store = state.lock();
+
+        // Both path identifiers are `Identifier` members, documented as the resource's "ID
+        // or name", so either addresses the record — and the whole path resolves BEFORE
+        // anything is written, so a refused update leaves the stored run exactly as it was.
+        let Some(application_id) = store.resolve_application_id(&input.application_identifier)
+        else {
+            return Err(UpdateExperimentRunErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::application_not_found(
+                        &input.application_identifier,
+                    )),
+                    resource_name: Some(input.application_identifier),
+                },
+            )
+            .into());
+        };
+        let Some(application) = store.applications.get_mut(&application_id) else {
+            return Err(UpdateExperimentRunErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The application could not be read while updating the experiment run"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let Some(definition_id) =
+            application.resolve_experiment_definition_id(&input.experiment_definition_identifier)
+        else {
+            return Err(UpdateExperimentRunErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::experiment_definition_not_found(
+                        &input.application_identifier,
+                        &input.experiment_definition_identifier,
+                    )),
+                    resource_name: Some(input.experiment_definition_identifier),
+                },
+            )
+            .into());
+        };
+        let Some(definition) = application.experiment_definitions.get_mut(&definition_id) else {
+            return Err(UpdateExperimentRunErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The experiment definition could not be read after it was resolved"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        // A run number the definition never issued addresses no run, and neither does one
+        // whose record the definition no longer holds.
+        let Some(run) = definition.runs.get_mut(&input.run) else {
+            return Err(UpdateExperimentRunErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::experiment_run_not_found(
+                        &input.application_identifier,
+                        &input.experiment_definition_identifier,
+                        input.run,
+                    )),
+                    resource_name: Some(input.run.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // This operation "updates a running experiment" (its own documentation), and a run
+        // the experiment has already finished with is delivering nothing left to change —
+        // so an update of it conflicts with the current state of the resource and writes
+        // nothing.
+        if !run.is_active() {
+            return Err(UpdateExperimentRunErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::experiment_run_not_running(
+                        &run.experiment_definition_id,
+                        run.run,
+                        &run.status,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Audience exposure can only be increased, not decreased" (this operation's own
+        // documentation), so an exposure below the one the run is already delivering is an
+        // input this service will not satisfy, and nothing is written for it. A run holding
+        // no exposure has none to decrease, and an exposure equal to the stored one lowers
+        // nothing.
+        if let (Some(requested), Some(current)) =
+            (input.exposure_percentage, run.exposure_percentage)
+        {
+            if requested < current {
+                return Err(UpdateExperimentRunErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(crate::state::experiment_run_exposure_decrease(
+                            &run.experiment_definition_id,
+                            run.run,
+                            current,
+                            requested,
+                        )),
+                        reason: None,
+                        details: None,
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A PATCH over the stored record: a member the request carries replaces the stored
+        // one, a member it omits keeps the value the run already holds. The empty string is
+        // a value the caller sent, not an omission (`Description` is len 0..1024), so it
+        // replaces the stored text with the empty one. Supplying `TreatmentOverrides`
+        // replaces the assignment map rather than merging into it: the member is the
+        // override set itself.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateExperimentRun"))
+        // `Run`, `Status`, `StartedAt`, `EndedAt`, `Result`, the definition snapshot and the
+        // run's own tags are not members of this request — which run of which definition
+        // this is, and what the experiment concluded, are not rewritten here — so each is
+        // reported back out of the stored record untouched.
+        if let Some(description) = input.description {
+            run.description = Some(description);
+        }
+        if let Some(exposure_percentage) = input.exposure_percentage {
+            run.exposure_percentage = Some(exposure_percentage);
+        }
+        if let Some(treatment_overrides) = input.treatment_overrides {
+            run.treatment_overrides = Some(treatment_overrides);
+        }
+        // This call wrote the record, so the record was last updated now; `StartedAt` is the
+        // instant the run started and does not move.
+        run.updated_at = now;
+
+        // Answered from the updated record, so this response and a later `GetExperimentRun`
+        // report the same run.
+        Ok(UpdateExperimentRunOutput {
+            application_id: Some(run.application_id.clone()),
+            experiment_definition_id: Some(run.experiment_definition_id.clone()),
+            run: run.run,
+            description: run.description.clone(),
+            status: Some(run.status.clone()),
+            exposure_percentage: run.exposure_percentage,
+            treatment_overrides: run.treatment_overrides.clone(),
+            result: run.result.clone(),
+            started_at: Some(crate::state::to_date_time(run.started_at)),
+            updated_at: Some(crate::state::to_date_time(run.updated_at)),
+            ended_at: run.ended_at.map(crate::state::to_date_time),
+            experiment_definition_snapshot: Some(run.definition_snapshot.clone()),
+        })
     }
 }
