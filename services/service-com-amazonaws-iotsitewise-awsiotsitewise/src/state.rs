@@ -4282,6 +4282,22 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         Some(record)
     }
 
+    /// Forget a gateway and everything keyed off it: its capability
+    /// configurations and its tags (both on the record), and the
+    /// [`Self::gateway_devices`] entry that reserved its platform device.
+    ///
+    /// The index entry goes with the record, so the device the gateway ran on is
+    /// free for the next `CreateGateway`: one device hosts at most one gateway,
+    /// and a gateway this service no longer holds occupies none. Every entry
+    /// naming this gateway is dropped, rather than only the one
+    /// [`gateway_device_key`] rebuilds from the stored platform, so no index
+    /// entry can outlive the gateway it pointed at.
+    pub fn forget_gateway(&mut self, gateway_id: &str) -> Option<GatewayRecord> {
+        let record = self.gateways.remove(gateway_id)?;
+        self.gateway_devices.retain(|_, id| id != gateway_id);
+        Some(record)
+    }
+
     /// Forget an asset model, its external-id entry and every interface
     /// relationship it stood on either side of.
     ///

@@ -21,7 +21,13 @@ pub struct GetSchemaInput {
 /// (`@timestampFormat("date-time")`), so this shape's schema comes from
 /// `vp_schema_and_codec!` rather than `#[smithy_macros::smithy(shape = ...)]` — see
 /// `types/date_time_wire.rs`. Member set, order and requiredness from
-/// `smithy_query(query="shape", shape="GetSchemaOutput")`.
+/// `smithy_query(query="shape", shape="GetSchemaOutput")`, plus `definition`.
+///
+/// `definition` is NOT in the checked-in model's `GetSchemaOutput`: the recorded
+/// `GetSchema` response carries it beside `schema`, holding the same document in
+/// the `SchemaDefinition` union form `PutSchema` takes, and the recording is what
+/// the wire is. It takes the member index after the modelled members, so every
+/// modelled member keeps the index the model gives it.
 #[derive(Debug, Clone)]
 pub struct GetSchemaOutput {
     pub policy_store_id: String,
@@ -29,6 +35,7 @@ pub struct GetSchemaOutput {
     pub created_date: ::aws_smithy_types::DateTime,
     pub last_updated_date: ::aws_smithy_types::DateTime,
     pub namespaces: Option<Vec<String>>,
+    pub definition: SchemaDefinition,
 }
 
 vp_schema_and_codec!(
@@ -42,5 +49,6 @@ vp_schema_and_codec!(
     (M_CREATED_DATE, created_date, "createdDate", 2, req, date_time),
     (M_LAST_UPDATED_DATE, last_updated_date, "lastUpdatedDate", 3, req, date_time),
     (M_NAMESPACES, namespaces, "namespaces", 4, opt, list_of_string),
+    (M_DEFINITION, definition, "definition", 5, req, union_of(SchemaDefinition)),
 );
 

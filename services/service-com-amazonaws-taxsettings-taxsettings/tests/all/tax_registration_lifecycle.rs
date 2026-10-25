@@ -214,7 +214,11 @@ fn round_trip_cases() -> Vec<Case> {
                 "registrationType": "CPF",
                 "legalName": "Maria Exemplo",
                 "sector": "Individual",
-                "legalAddress": { "postalCode": "22041-001", "countryCode": "BR" },
+                "legalAddress": {
+                    "stateOrRegion": "Rio de Janeiro",
+                    "postalCode": "22041-001",
+                    "countryCode": "BR",
+                },
                 "verificationDetails": { "dateOfBirth": "1980-07-15" },
             }),
         },

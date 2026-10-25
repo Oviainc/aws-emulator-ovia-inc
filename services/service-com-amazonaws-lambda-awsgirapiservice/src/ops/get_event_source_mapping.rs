@@ -240,7 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetEventSourceMappingErrorModeled::ServiceException(
@@ -253,9 +253,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        // A mapping is addressed by its own `UUID` and reports the ARNs it was created
-        // with, so no request metadata takes part in this report.
-        let _ = ctx;
         let mut store = state.lock();
 
         // A read reports the mapping as of now, so the store is first brought up to
@@ -268,6 +265,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(GetEventSourceMappingErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     r#type: None,
+                    // A mapping is addressed by its own identifier, which the request
+                    // already carries, so the refusal is the fixed sentence rather than
+                    // the resource named back.
                     message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )

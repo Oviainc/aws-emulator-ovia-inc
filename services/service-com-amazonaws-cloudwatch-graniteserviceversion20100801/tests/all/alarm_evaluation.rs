@@ -20,11 +20,14 @@
 //!    comparison, the statistic, the datapoint values and their count, how many of the
 //!    evaluated periods carry one, the age of a datapoint, its unit, its dimension set and
 //!    the `TreatMissingData` setting.
-//! 3. The `StateReason` of an evaluated state explains how that state was decided: a window
-//!    that held no datapoint of the metric is reported as the hole it was, naming the
-//!    missing-data arm applied to it, and only the datapoints the evaluation really had are
-//!    reported as graded. Rows differ in the arm in force, how many of the evaluated windows
-//!    hold a real datapoint, the number of evaluation periods and whether the comparison held.
+//! 3. The `StateReason` of an evaluated state explains how that state was decided: it NAMES
+//!    the datapoints the evaluation graded, each value with the instant of the window it
+//!    aggregates, and a window that held no datapoint of the metric is reported as the hole it
+//!    was, naming the missing-data arm applied to it, rather than being reported as a
+//!    datapoint the evaluation graded. Rows differ in the arm in force, how many of the
+//!    evaluated windows hold a real datapoint, the number of evaluation periods and whether
+//!    the comparison held. The datapoints a reason names are a table of their own
+//!    (`alarm_reason_datapoints`).
 //!
 //! The recorded case the issue was filed about (a `SearchableDocuments` datapoint driven
 //! past an alarm's threshold, and a forged `AWS/ES` datapoint) is one row of each table.
@@ -57,7 +60,7 @@ const SHORTEST_PERIOD_SECS: i32 = 10;
 ///
 /// Each row watches its OWN dimension set — the one its `DomainName` dimension names — so
 /// every row has its own time series and the rows share one emulator.
-fn base_alarm(name: &str) -> Value {
+pub(crate) fn base_alarm(name: &str) -> Value {
     json!({
         "AlarmName": name,
         "Namespace": NAMESPACE,
@@ -75,14 +78,14 @@ fn base_alarm(name: &str) -> Value {
 /// stamp lies, and the extra members that make the row what it is (another `Unit`, another
 /// dimension set).
 #[derive(Clone, Debug)]
-struct Datum {
+pub(crate) struct Datum {
     value: f64,
     age_secs: f64,
     extra: Value,
 }
 
 /// A datapoint of `value`, stamped `age_secs` before the publish.
-fn datum(value: f64, age_secs: f64) -> Datum {
+pub(crate) fn datum(value: f64, age_secs: f64) -> Datum {
     Datum {
         value,
         age_secs,
@@ -113,7 +116,7 @@ impl Datum {
 }
 
 /// Publish `data` as the series the `DomainName` dimension `domain` names, in one call.
-async fn publish(router: &MultiServiceRouter, domain: &str, data: &[Datum]) {
+pub(crate) async fn publish(router: &MultiServiceRouter, domain: &str, data: &[Datum]) {
     if data.is_empty() {
         return;
     }
@@ -133,7 +136,7 @@ async fn publish(router: &MultiServiceRouter, domain: &str, data: &[Datum]) {
 /// Apply a row's patch to the base alarm: every member the row names replaces the base one,
 /// and a member the row names `null` is REMOVED — an alarm carries `Statistic` or
 /// `ExtendedStatistic`, never both, so a row that names one has to drop the other.
-fn patched(name: &str, patch: &Value) -> Value {
+pub(crate) fn patched(name: &str, patch: &Value) -> Value {
     let mut alarm = base_alarm(name);
     for (member, value) in patch.as_object().cloned().unwrap_or_default() {
         if value.is_null() {

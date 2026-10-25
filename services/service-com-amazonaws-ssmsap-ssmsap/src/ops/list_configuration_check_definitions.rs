@@ -11,9 +11,11 @@
 //! The catalogue is the SERVICE's own — which checks exist to run, not what an account
 //! has run — so it is derived from the model's `ConfigurationCheckType` enum and is the
 //! same set `StartConfigurationChecks` starts when a request names no check
-//! ([`crate::state::configuration_checks_to_run`]). It is therefore identical for every
-//! caller and every Region: this listing resolves no per-account record and writes
-//! nothing at all.
+//! ([`crate::state::configuration_checks_to_run`]). Each definition's `Name` and
+//! `Description` come from [`crate::state::CONFIGURATION_CHECK_CATALOGUE`], which is the
+//! same prose every `ConfigurationCheckOperation` of that check reports. It is therefore
+//! identical for every caller and every Region: this listing resolves no per-account
+//! record and writes nothing at all.
 //!
 //! ## Shape of an operation
 //!

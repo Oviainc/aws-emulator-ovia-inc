@@ -1068,8 +1068,11 @@ async fn a_policy_template_update_that_is_refused_changes_nothing() {
         );
         let fields = body["fieldList"].as_array().cloned().unwrap_or_default();
         assert!(
-            !fields.is_empty() && fields.iter().all(|f| f["path"].as_str() == Some("/statement")),
-            "case {case:?}: every refusal must name /statement in fieldList, got {body}"
+            !fields.is_empty()
+                && fields
+                    .iter()
+                    .all(|f| f["path"].as_str() == Some("/template/statement")),
+            "case {case:?}: every refusal must name /template/statement in fieldList, got {body}"
         );
         assert_eq!(
             fetched["statement"].as_str(),

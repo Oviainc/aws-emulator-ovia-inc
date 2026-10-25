@@ -350,7 +350,11 @@ enum Term {
     Text {
         attribute: TextAttribute,
         operator: Operator,
+        /// The term's values, folded to lower case when the attribute's value
+        /// set is a published one (see [`AttributeRule::values`]), so the
+        /// comparison in [`Self::matches`] is the case-insensitive one.
         values: Vec<String>,
+        case_insensitive: bool,
     },
     /// `TierType`: "The environment tiers that platform versions in this branch
     /// support" is a LIST, so the comparison is membership in it — negated for
@@ -366,11 +370,21 @@ impl Term {
                 attribute,
                 operator,
                 values,
+                case_insensitive: false,
             } => operator.applies(attribute.of(branch), values),
+            Self::Text {
+                attribute,
+                operator,
+                values,
+                case_insensitive: true,
+            } => operator.applies(&attribute.of(branch).to_ascii_lowercase(), values),
             Self::Tier { negated, values } => {
-                let supported = values
-                    .iter()
-                    .any(|value| branch.supported_tiers.iter().any(|tier| tier == value));
+                let supported = values.iter().any(|value| {
+                    branch
+                        .supported_tiers
+                        .iter()
+                        .any(|tier| tier.eq_ignore_ascii_case(value))
+                });
                 supported != *negated
             }
         }
@@ -383,7 +397,18 @@ struct AttributeRule {
     /// `Some` for a string-valued attribute, `None` for `TierType`.
     text: Option<TextAttribute>,
     operators: &'static [Operator],
-    /// `None` where the attribute's values are free text (a name).
+    /// The closed value set the attribute's values come from, or `None` where
+    /// they are free text (a name).
+    ///
+    /// An attribute with such a set is compared CASE-INSENSITIVELY, in both
+    /// directions: the set is the value set the service PUBLISHES for the
+    /// attribute, and the service publishes a branch life-cycle state in two
+    /// spellings — the lower-case one this operation's filter grammar documents
+    /// (`supported`) and the capitalized one every response carries it in
+    /// (`Supported`, see [`crate::state::reported_branch_lifecycle_state`]) —
+    /// so a client filtering on the state it was just told would otherwise be
+    /// refused the value the service itself reported. A name is free text and is
+    /// compared exactly, since no value set says how it is spelled.
     values: Option<&'static [&'static str]>,
 }
 
@@ -486,7 +511,10 @@ fn parse_filter(filter: &SearchFilter) -> Result<Term, ListPlatformBranchesError
     }
     if let Some(allowed_values) = rule.values {
         for value in values {
-            if !allowed_values.contains(&value.as_str()) {
+            if !allowed_values
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(value))
+            {
                 return Err(ListPlatformBranchesError::invalid_parameter_value(format!(
                     "Invalid SearchFilter value for Attribute {attribute}: {value}. \
                      Valid values: {}",
@@ -496,12 +524,22 @@ fn parse_filter(filter: &SearchFilter) -> Result<Term, ListPlatformBranchesError
         }
     }
 
-    let values = values.to_vec();
+    // A closed-value attribute is compared case-insensitively, so its values are
+    // held folded and the branch's own value is folded at the comparison.
+    let case_insensitive = rule.values.is_some();
+    let values: Vec<String> = match case_insensitive {
+        true => values
+            .iter()
+            .map(|value| value.to_ascii_lowercase())
+            .collect(),
+        false => values.to_vec(),
+    };
     Ok(match rule.text {
         Some(attribute) => Term::Text {
             attribute,
             operator,
             values,
+            case_insensitive,
         },
         // `TIER_TYPE_OPERATORS` is `=` | `!=`, so the operator is fully
         // captured by whether the membership test is negated.

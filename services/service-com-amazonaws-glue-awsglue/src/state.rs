@@ -70,7 +70,7 @@ use crate::ops::types::{
     LakeFormationConfiguration, LineageConfiguration, NotificationProperty, PrincipalPermissions,
     RLSProperties, RecrawlPolicy, RegistryId, Schedule, SchemaChangePolicy, SchemaId,
     SourceControlDetails, StartColumnStatisticsTaskRunInput, StartJobRunInput, StorageDescriptor,
-    Table, TableIdentifier, TableInput, TableVersion,
+    Table, TableIdentifier, TableInput, TableVersion, UpdateCrawlerInput,
 };
 
 /// Ceiling on the databases one catalog may hold.
@@ -186,6 +186,15 @@ pub const MAX_FORM_TYPES: usize = 1_000;
 /// `StartCrawler`/`StopCrawler` are implemented. One of the modelled `CrawlerState`
 /// values (`READY`, `RUNNING`, `STOPPING`).
 pub const CRAWLER_STATE_READY: &str = "READY";
+
+/// The `CrawlerState` of a crawler whose crawl is in progress — "indicates whether the
+/// crawler is running, or whether a run is pending" (`Crawler$State`). A write that
+/// changes the crawler's definition is refused while it is in this state.
+pub const CRAWLER_STATE_RUNNING: &str = "RUNNING";
+
+/// The `CrawlerState` of a crawler whose crawl has been asked to stop and has not
+/// finished: a run is still in progress, so a definition write is refused here too.
+pub const CRAWLER_STATE_STOPPING: &str = "STOPPING";
 
 /// The `Schedule$State` reported for a crawler that carries a cron expression. One of
 /// the modelled `ScheduleState` values (`SCHEDULED`, `NOT_SCHEDULED`,
@@ -1385,6 +1394,79 @@ impl CrawlerEntry {
         }
     }
 
+    /// Apply an `UpdateCrawler` request to this stored crawler, member by member.
+    ///
+    /// Every member the request CARRIES replaces the stored one; every member it OMITS
+    /// is preserved. That is what the model states for the one member whose preservation
+    /// it spells out — "if you omit this value, the existing value on the crawler is
+    /// preserved" (`UpdateCrawlerRequest$CatalogId`) — and what the update's own
+    /// `Description` requires: it targets the REMOVABLE description shape where the
+    /// create targets the plain one, so sending an empty description is how a caller
+    /// takes the description OFF a crawler, a distinction that exists only because
+    /// omitting a member leaves it alone.
+    ///
+    /// `catalog_id` is the catalog the request named, already resolved and checked by the
+    /// handler, or `None` when the request named none.
+    ///
+    /// The server-set members move with the write: `Version` advances by one (the first
+    /// version of a crawler is [`FIRST_CRAWLER_VERSION`] and an update moves it on) and
+    /// `LastUpdated` becomes `now`. The crawler's `Name`, `CreationTime`, `State` and
+    /// tags are not this request's to change: `UpdateCrawlerRequest` has no member for
+    /// any of them.
+    pub fn apply_update(
+        &mut self,
+        input: &UpdateCrawlerInput,
+        catalog_id: Option<String>,
+        now: SystemTime,
+    ) {
+        if let Some(role) = input.role.as_ref() {
+            self.role = role.clone();
+        }
+        if let Some(targets) = input.targets.as_ref() {
+            self.targets = targets.clone();
+        }
+        if let Some(database_name) = input.database_name.as_ref() {
+            self.database_name = Some(database_name.clone());
+        }
+        // The removable description: empty takes it off the crawler rather than storing
+        // a description that is the empty string.
+        if let Some(description) = input.description.as_ref() {
+            self.description = (!description.is_empty()).then(|| description.clone());
+        }
+        if let Some(classifiers) = input.classifiers.as_ref() {
+            self.classifiers = classifiers.clone();
+        }
+        if let Some(table_prefix) = input.table_prefix.as_ref() {
+            self.table_prefix = Some(table_prefix.clone());
+        }
+        if let Some(schema_change_policy) = input.schema_change_policy.as_ref() {
+            self.schema_change_policy = Some(schema_change_policy.clone());
+        }
+        if let Some(recrawl_policy) = input.recrawl_policy.as_ref() {
+            self.recrawl_policy = Some(recrawl_policy.clone());
+        }
+        if let Some(lineage_configuration) = input.lineage_configuration.as_ref() {
+            self.lineage_configuration = Some(lineage_configuration.clone());
+        }
+        if let Some(lake_formation_configuration) = input.lake_formation_configuration.as_ref() {
+            self.lake_formation_configuration = Some(lake_formation_configuration.clone());
+        }
+        if let Some(configuration) = input.configuration.as_ref() {
+            self.configuration = Some(configuration.clone());
+        }
+        if let Some(security_configuration) = input.crawler_security_configuration.as_ref() {
+            self.crawler_security_configuration = Some(security_configuration.clone());
+        }
+        if let Some(schedule) = input.schedule.as_ref() {
+            self.schedule_expression = Some(schedule.clone());
+        }
+        if let Some(catalog_id) = catalog_id {
+            self.catalog_id = catalog_id;
+        }
+        self.version = self.version.saturating_add(1);
+        self.last_updated = now;
+    }
+
     /// Rebuild the modelled `Crawler` output shape from what is stored.
     pub fn to_crawler(&self) -> Crawler {
         Crawler {
@@ -2250,6 +2332,52 @@ pub fn has_crawl_target(targets: &CrawlerTargets) -> bool {
         || any(&targets.hudi_targets)
 }
 
+/// Whether an `UpdateCrawler` request names at least one member of the crawler to
+/// change.
+///
+/// `Name` ADDRESSES the crawler rather than changing it (`UpdateCrawlerRequest` has no
+/// rename member), so a request carrying nothing besides it asks for no change: there is
+/// nothing to write, and the crawler's `Version` and `LastUpdated` stay where the last
+/// write that did change something left them. No recording or doc states what the service
+/// answers such a call, so what is NOT done here is advancing a write counter for a change
+/// nobody asked for; a recording of that call would settle it. Written as an exhaustive
+/// destructuring so a member added to the request shape cannot be silently left out of the
+/// answer.
+pub fn crawler_update_names_a_change(input: &UpdateCrawlerInput) -> bool {
+    let UpdateCrawlerInput {
+        name: _,
+        role,
+        database_name,
+        description,
+        targets,
+        schedule,
+        classifiers,
+        table_prefix,
+        schema_change_policy,
+        recrawl_policy,
+        lineage_configuration,
+        lake_formation_configuration,
+        configuration,
+        crawler_security_configuration,
+        catalog_id,
+    } = input;
+
+    role.is_some()
+        || database_name.is_some()
+        || description.is_some()
+        || targets.is_some()
+        || schedule.is_some()
+        || classifiers.is_some()
+        || table_prefix.is_some()
+        || schema_change_policy.is_some()
+        || recrawl_policy.is_some()
+        || lineage_configuration.is_some()
+        || lake_formation_configuration.is_some()
+        || configuration.is_some()
+        || crawler_security_configuration.is_some()
+        || catalog_id.is_some()
+}
+
 /// Whether `expression` has the form the service documents for a crawler schedule: a
 /// `cron(..)` expression of six fields ("to run something every day at 12:15 UTC, you
 /// would specify: `cron(15 12 * * ? *)`" — `Schedule$ScheduleExpression`). Only the
@@ -2939,10 +3067,20 @@ pub fn next_version_id(current: &str) -> String {
 /// the sentence follows the per-resource template the catalog slice's recorded misses
 /// use.
 pub mod messages {
-    /// A crawler lookup (`GetCrawler`) for a name no crawler in this account has.
-    /// Built from the request's `Name`, which is stored and matched exactly as sent.
+    /// A crawler lookup (`GetCrawler`, and the `UpdateCrawler` that addresses one the
+    /// same way) for a name no crawler in this account has. Built from the request's
+    /// `Name`, which is stored and matched exactly as sent.
     pub fn crawler_not_found(name: &str) -> String {
         format!("Crawler entry with name {name} does not exist")
+    }
+
+    /// `UpdateCrawler` for a crawler whose crawl is still in progress ("if a crawler is
+    /// running, you must stop it using `StopCrawler` before updating it"). NOT recorded:
+    /// what is pinned is the behaviour — 400 with the operation's modelled
+    /// `CrawlerRunningException` — and, like the recorded crawler miss above, a sentence
+    /// carrying only the requested `Name`.
+    pub fn crawler_running(name: &str) -> String {
+        format!("Crawler with name {name} is running")
     }
 
     /// `CreateCrawler` for a name already taken. NOT recorded: inferred from the

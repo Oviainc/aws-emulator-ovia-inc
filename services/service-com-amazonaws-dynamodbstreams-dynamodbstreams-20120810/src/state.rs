@@ -450,6 +450,37 @@ impl StoredStream {
     pub fn shard(&self, shard_id: &str) -> Option<&StoredShard> {
         self.shards.iter().find(|shard| shard.shard_id == shard_id)
     }
+
+    /// The shards a CONSUMER can read at `now`.
+    ///
+    /// A stream is `ENABLING` while "Streams is currently being enabled on the
+    /// DynamoDB table" (`StreamStatus`), so the enable the clock owes has not
+    /// finished and the stream has nothing to read yet: it exposes NO shards until
+    /// it is enabled. That is what makes the status a consumer gates on agree with
+    /// what the stream serves — a stream that hands out shards and iterators is
+    /// `ENABLED`, never `ENABLING` — and it is why the shards of a table's stream
+    /// appear only once the table behind them is serving.
+    ///
+    /// A `DISABLING`/`DISABLED` stream keeps its shards: AWS deletes it only after
+    /// the documented 24 hours, so a consumer can still drain what it captured.
+    #[must_use]
+    pub fn shards_at(&self, now: SystemTime) -> &[StoredShard] {
+        if self.status_at(now) == StreamStatus::Enabling {
+            &[]
+        } else {
+            &self.shards
+        }
+    }
+
+    /// The shard with this id as a consumer can read it at `now` — the lookup
+    /// [`Self::shards_at`] scopes, so a shard of a stream whose enable is not due
+    /// yet is not addressable either.
+    #[must_use]
+    pub fn shard_at(&self, shard_id: &str, now: SystemTime) -> Option<&StoredShard> {
+        self.shards_at(now)
+            .iter()
+            .find(|shard| shard.shard_id == shard_id)
+    }
 }
 
 /// What a `ShardIterator` token a client presented resolves to.

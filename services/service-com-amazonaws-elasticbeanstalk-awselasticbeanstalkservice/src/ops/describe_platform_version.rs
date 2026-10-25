@@ -171,13 +171,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let description = match store.platform_versions.get(platform_arn) {
             Some(platform_version) => platform_version.to_description(),
             None => {
-                let stack = crate::state::managed_platform_version(&region, platform_arn)
+                let version = crate::state::managed_platform_version(&region, platform_arn)
                     .ok_or_else(|| {
                         DescribePlatformVersionError::invalid_parameter_value(
                             crate::state::missing_platform_message(platform_arn),
                         )
                     })?;
-                stack.to_description(&region, &store)
+                version.to_description(&region, &store)
             }
         };
 

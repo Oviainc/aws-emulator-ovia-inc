@@ -1205,6 +1205,26 @@ pub const PROVISIONED_CONCURRENCY_QUALIFIER_MESSAGE: &str =
 pub const PROVISIONED_CONCURRENCY_CONFIG_NOT_FOUND_MESSAGE: &str =
     "No Provisioned Concurrency Config found for this function";
 
+/// The message a delete of a qualifier that still holds a provisioned concurrency
+/// configuration is refused with: `ResourceConflictException`'s own subject ("another
+/// operation is in progress", the qualifier's capacity still being held), naming the
+/// qualifier the request addressed and the configuration that has to go first.
+///
+/// A provisioned concurrency configuration is attached to the alias or version it was
+/// added to, so that qualifier is IN USE by it: deleting the qualifier out from under an
+/// allocation would leave capacity committed to a resource that no longer exists, which
+/// is why the configuration is deleted first. `qualifier_arn` is the ARN of the resolved
+/// alias or version ([`FunctionRecord::versioned_arn`]), so the sentence names the
+/// resource the caller asked to delete and tells it what to delete first.
+#[must_use]
+pub fn provisioned_concurrency_in_use_message(qualifier_arn: &str) -> String {
+    format!(
+        "The operation cannot be performed at this time. Provisioned concurrency is \
+         configured for {qualifier_arn}. Delete the provisioned concurrency configuration \
+         before deleting this resource."
+    )
+}
+
 /// One provisioned concurrency configuration: the concurrency a
 /// `PutProvisionedConcurrencyConfig` call asked Lambda to keep initialised for one alias
 /// or version of a function, and how far that allocation has got.
@@ -2633,19 +2653,26 @@ pub const EVENT_SOURCE_MAPPING_STATE_DISABLED: &str = "Disabled";
 /// call that moves a mapping into it: "When you delete an event source mapping, it
 /// enters a Deleting state and might not be completely deleted for several seconds."
 pub const EVENT_SOURCE_MAPPING_STATE_DELETING: &str = "Deleting";
+/// See [`EVENT_SOURCE_MAPPING_STATE_CREATING`]. `UpdateEventSourceMapping` is the one
+/// call that moves a mapping into it, and `ResourceInUseException` names that state as
+/// one a mapping is not available in: "you tried to delete an event source mapping
+/// currently UPDATING".
+pub const EVENT_SOURCE_MAPPING_STATE_UPDATING: &str = "Updating";
 
 /// `StateTransitionReason`: "Indicates whether a user or Lambda made the last change to
 /// the event source mapping." A mapping this store holds only ever changes because a
 /// caller asked it to, which Lambda reports as `USER_INITIATED`.
 pub const EVENT_SOURCE_MAPPING_USER_INITIATED: &str = "USER_INITIATED";
 
-/// How long after `CreateEventSourceMapping` the move out of `Creating` becomes due.
+/// How long after `CreateEventSourceMapping` or `UpdateEventSourceMapping` the move out
+/// of `Creating` or `Updating` becomes due.
 ///
-/// An EMULATOR-CHOSEN span (how long Lambda takes to stand a poller up is not in the
-/// model), deliberately non-zero for the same reason as [`ACTIVATION_DELAY`]: a caller
-/// that reads the mapping straight after creating it sees the `Creating` state the
-/// create answered with. The instant it becomes due is stored on the record and nothing
-/// sleeps for it.
+/// An EMULATOR-CHOSEN span (how long Lambda takes to stand a poller up, or to apply a
+/// change to a running one, is not in the model), deliberately non-zero for the same
+/// reason as [`ACTIVATION_DELAY`]: a caller that reads the mapping straight after
+/// creating or updating it sees the `Creating` or `Updating` state the call answered
+/// with, and so does a second write arriving inside that window. The instant it becomes
+/// due is stored on the record and nothing sleeps for it.
 pub const EVENT_SOURCE_MAPPING_SETTLE_DELAY: Duration = Duration::from_millis(500);
 
 /// How long after `DeleteEventSourceMapping` the mapping's REMOVAL becomes due.
@@ -3005,13 +3032,14 @@ impl EventSourceMappingRecord {
     /// Bring this record up to whatever the clock has already made due.
     ///
     /// The ONLY transition it applies is the one the clock owed at `now`: a mapping whose
-    /// poller has finished being stood up leaves `Creating` for the state its `Enabled`
-    /// setting asks for — "When true, the event source mapping is active. When false,
-    /// Lambda pauses polling and invocation." It would have been owed at the same instant
-    /// even if nobody had called, so applying it on a read reports the truth rather than
-    /// inventing a change.
+    /// poller has finished being stood up, or whose accepted change has finished being
+    /// applied, leaves `Creating` or `Updating` for the state its `Enabled` setting asks
+    /// for — "When true, the event source mapping is active. When false, Lambda pauses
+    /// polling and invocation." It would have been owed at the same instant even if nobody
+    /// had called, so applying it on a read reports the truth rather than inventing a
+    /// change.
     pub fn materialize(&mut self, now: SystemTime) {
-        if self.state == EVENT_SOURCE_MAPPING_STATE_CREATING && now >= self.settled_due {
+        if self.is_settling() && now >= self.settled_due {
             self.state = if self.enabled {
                 EVENT_SOURCE_MAPPING_STATE_ENABLED.to_string()
             } else {
@@ -3023,6 +3051,36 @@ impl EventSourceMappingRecord {
             // the record, so that is what is stored.
             self.last_modified = self.settled_due;
         }
+    }
+
+    /// Whether this mapping is still moving into the state its settings ask for — the
+    /// window `Creating` and `Updating` name, which the clock closes at
+    /// [`Self::settled_due`].
+    ///
+    /// Read it only after [`Self::materialize`], so a window the clock has already closed
+    /// is not reported as still open.
+    #[must_use]
+    pub fn is_settling(&self) -> bool {
+        matches!(
+            self.state.as_str(),
+            EVENT_SOURCE_MAPPING_STATE_CREATING | EVENT_SOURCE_MAPPING_STATE_UPDATING
+        )
+    }
+
+    /// Accept an `UpdateEventSourceMapping` of this mapping.
+    ///
+    /// The operation answers 202 Accepted, so the change is not in effect at the instant
+    /// the call returns: the mapping moves into `Updating` and the move to the state its
+    /// `Enabled` setting asks for is owed by the CLOCK
+    /// ([`EVENT_SOURCE_MAPPING_SETTLE_DELAY`]) exactly as the move out of `Creating` is.
+    /// Nothing sleeps for it.
+    pub fn begin_update(&mut self, now: SystemTime) {
+        self.state = EVENT_SOURCE_MAPPING_STATE_UPDATING.to_string();
+        self.state_transition_reason = EVENT_SOURCE_MAPPING_USER_INITIATED.to_string();
+        // "The date that the event source mapping was last updated or that its state
+        // changed": both happened now.
+        self.last_modified = now;
+        self.settled_due = now + EVENT_SOURCE_MAPPING_SETTLE_DELAY;
     }
 
     /// Accept a `DeleteEventSourceMapping` of this mapping.

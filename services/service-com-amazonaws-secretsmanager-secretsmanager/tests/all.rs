@@ -27,6 +27,8 @@ mod secret_restore;
 mod secret_rotation;
 #[path = "all/secret_rotation_cancel.rs"]
 mod secret_rotation_cancel;
+#[path = "all/secret_stop_replication_refusal.rs"]
+mod secret_stop_replication_refusal;
 #[path = "all/secret_tags_and_replication.rs"]
 mod secret_tags_and_replication;
 #[path = "all/secret_version_ids.rs"]

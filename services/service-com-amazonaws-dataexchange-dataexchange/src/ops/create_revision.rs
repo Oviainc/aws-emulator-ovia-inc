@@ -219,6 +219,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // A fresh revision is open for assets and has not been revoked; both
                 // members are modelled `@default: false`.
                 finalized: false,
+                // A fresh revision holds no assets: they arrive through an import
+                // job, which is why finalizing one straight away is refused.
+                assets: ::std::vec::Vec::new(),
                 revoked: false,
                 revocation_comment: None,
                 revoked_at: None,

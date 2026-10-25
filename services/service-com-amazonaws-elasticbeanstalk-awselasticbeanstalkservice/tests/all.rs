@@ -57,6 +57,8 @@ mod operations_role;
 mod platform_branch_catalog;
 #[path = "all/platform_branches.rs"]
 mod platform_branches;
+#[path = "all/platform_update_availability.rs"]
+mod platform_update_availability;
 #[path = "all/platform_version_catalog_projection.rs"]
 mod platform_version_catalog_projection;
 #[path = "all/platform_versions.rs"]
