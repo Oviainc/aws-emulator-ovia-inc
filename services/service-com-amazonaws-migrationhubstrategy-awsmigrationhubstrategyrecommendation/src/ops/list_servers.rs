@@ -357,11 +357,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let selection = selection_fingerprint(filter, descending, &groups);
         let page = page_of(input.max_results, input.next_token, &selection)?;
 
-        // A read: the store is only looked at here, so running ListServers changes
-        // nothing a later caller sees. The inventory is the one of the Region this
-        // request was signed for — a Region nothing was imported in reads as empty.
+        // A read: the only write it makes is materialising what the clock already owed
+        // this portfolio — an assessment whose completion was due at this same instant
+        // even if nobody had called, and the per-server status that completion gives the
+        // servers it covered — so the list reports the statuses the clock has reached.
+        // The inventory is the one of the Region this request was signed for: a Region
+        // nothing was imported in reads as empty and gets no partition minted for it.
         let region = crate::state::request_region(ctx.parts());
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        if let Some(portfolio) = store.region_mut(&region) {
+            portfolio.settle_all(now);
+        }
         let selected: Vec<&ServerRecord> = store
             .region(&region)
             .servers

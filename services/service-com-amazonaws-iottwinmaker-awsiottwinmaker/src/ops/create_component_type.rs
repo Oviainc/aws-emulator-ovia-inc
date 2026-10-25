@@ -12,6 +12,9 @@
 //!
 //! The refusals this handler owns:
 //!
+//! * `tags` names a key in the reserved `aws:` namespace
+//!   ([`crate::state::RESERVED_TAG_KEY_PREFIX`], matched however it is cased) —
+//!   a `ValidationException`, since that namespace is Amazon Web Services' own;
 //! * the workspace does not exist — a `ValidationException`, because the model
 //!   declares no `ResourceNotFoundException` for this operation (the same
 //!   choice `CreateEntity` makes);
@@ -226,6 +229,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             component_type_id = %input.component_type_id,
             "serving a request"
         );
+        // The reserved tag-key namespace is AWS's own: a create may no more put a
+        // key under it on the new resource than `TagResource` may add one later,
+        // so a request naming one is refused whole and nothing is created.
+        if let Some(message) = crate::state::reserved_tag_keys_violation(
+            "tags",
+            input
+                .tags
+                .iter()
+                .flat_map(|tags| tags.keys().map(String::as_str)),
+        ) {
+            return Err(CreateComponentTypeErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+            .into());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateComponentTypeErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the iottwinmaker store is unavailable".to_string()),

@@ -280,15 +280,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let configuration_location_uri = profile.location_uri.clone();
         // `ConfigurationVersion` names a hosted version either by its version number or
         // by its version label, so the deployment records the label of the version it
-        // deployed when that version carries one.
+        // deployed when that version carries one. Resolved through the profile's own
+        // lookup, which the data plane that serves the version's content also uses.
         let version_label = profile
-            .hosted_versions
-            .values()
-            .find(|version| {
-                version.version_number.to_string() == input.configuration_version
-                    || version.version_label.as_deref()
-                        == Some(input.configuration_version.as_str())
-            })
+            .resolve_hosted_version(&input.configuration_version)
             .and_then(|version| version.version_label.clone());
 
         let Some(strategy) = store.resolve_strategy(&input.deployment_strategy_id) else {

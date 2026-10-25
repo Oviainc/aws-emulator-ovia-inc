@@ -552,8 +552,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(capacity_provider_config) = input.capacity_provider_config {
             config.capacity_provider_config = Some(capacity_provider_config);
         }
-        if let Some(durable_config) = input.durable_config {
-            config.durable_config = Some(durable_config);
+        if input.durable_config.is_some() {
+            // A durable-execution configuration is a configuration rather than a single
+            // value: the members this request names are changed and the rest of the
+            // configuration stays as it was, with the documented default standing in for
+            // a member nobody has ever set.
+            config.durable_config = crate::state::effective_durable_config(
+                config.durable_config.as_ref(),
+                input.durable_config.as_ref(),
+            );
         }
         // `TenancyConfig` is the one setting this operation models no member for:
         // "Tenant isolation configuration cannot be modified after function creation."

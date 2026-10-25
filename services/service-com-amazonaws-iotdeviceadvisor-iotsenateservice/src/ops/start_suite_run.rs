@@ -166,6 +166,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // The rules the model states in prose for a `SuiteRunConfiguration` and cannot
+        // express as constraints: the run's primary device has to NAME a device, and by an
+        // ARN of the service the naming member belongs to. Checked before the store is
+        // read, so a request that cannot schedule a run against any device changes nothing
+        // — no run is minted and none blocks the next start; see
+        // `crate::state::run_configuration_violation`.
+        if let Some(violation) =
+            crate::state::run_configuration_violation(&input.suite_run_configuration)
+        {
+            return Err(StartSuiteRunErrorModeled::ValidationException(ValidationException {
+                message: Some(violation),
+            })
+            .into());
+        }
+
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();

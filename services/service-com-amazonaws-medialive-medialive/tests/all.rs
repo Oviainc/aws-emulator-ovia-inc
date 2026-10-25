@@ -122,6 +122,9 @@ mod input_device_transfer_accept;
 #[path = "all/input_device_transfers.rs"]
 mod input_device_transfers;
 
+#[path = "all/input_device_update.rs"]
+mod input_device_update;
+
 #[path = "all/input_endpoint_release.rs"]
 mod input_endpoint_release;
 

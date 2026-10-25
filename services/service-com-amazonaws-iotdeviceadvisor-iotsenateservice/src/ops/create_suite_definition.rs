@@ -155,10 +155,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let config = input.suite_definition_configuration;
 
-        // The one rule the model states in prose but cannot express as a constraint
-        // (`SuiteDefinitionConfiguration$rootGroup`) — shared with every other operation
-        // that accepts a configuration; see `crate::state::root_group_violation`.
-        if let Some(violation) = crate::state::root_group_violation(&config) {
+        // The rules the model states in prose for a `SuiteDefinitionConfiguration` and
+        // cannot express as constraints — `rootGroup`, the device-permission role ARN and
+        // each device under test — shared with every other operation that accepts a
+        // configuration; see `crate::state::definition_configuration_violation`.
+        if let Some(violation) = crate::state::definition_configuration_violation(&config) {
             return Err(CreateSuiteDefinitionErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(violation),

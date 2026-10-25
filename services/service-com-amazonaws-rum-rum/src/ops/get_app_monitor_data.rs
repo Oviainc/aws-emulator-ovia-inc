@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAppMonitorData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAppMonitorData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAppMonitorData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the raw performance events `PutRumEvents` appended to the app monitor the
+//! route names: the monitor's own stored buffer, narrowed to the requested time window
+//! and to the requested `Filters`, returned one page at a time. Every event is reported
+//! as the JSON document the data plane accepted, so a read answers from persisted state
+//! and writes nothing of its own.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +152,344 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAppMonitorData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAppMonitorDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAppMonitorData"))
+        // `@readonly`: this reports the events the data plane already stored and writes
+        // nothing, so what a later caller sees is unchanged by the read. `ctx` carries
+        // the credential the authorization decision below is made for.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetAppMonitorDataErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::NO_STORE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // No token starts at the beginning of the matching events; a token resumes after
+        // the ones the pages before it already returned. A token this operation never
+        // issued — or issued for ANOTHER app monitor's query — is refused rather than
+        // read as some other resume point.
+        let already_returned = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => decode_next_token(&input.name, token).ok_or_else(|| {
+                GetAppMonitorDataErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "NextToken {token} is not a pagination token this service issued \
+                         for app monitor {}.",
+                        input.name
+                    ),
+                })
+            })?,
+        };
+
+        // Every filter key is checked before anything is read, so a request naming a key
+        // this operation does not search is refused rather than quietly matching nothing.
+        let filters = input.filters.unwrap_or_default();
+        if let Some(unknown) = filters
+            .iter()
+            .filter_map(|filter| filter.name.as_deref())
+            .find(|name| !is_filter_key(name))
+        {
+            return Err(GetAppMonitorDataErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "Filters Name {unknown} is not a valid filter key: valid values are {}.",
+                        filter_keys().join(" | ")
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // May this caller read THIS app monitor's collected data? Decided per call, like
+        // every other operation's, with the monitor and the policy in force read under a
+        // SHORT lock ([`crate::state::authorization`]).
+        let (resource_arn, held_policy) = {
+            let store = state.lock();
+            let Some(record) = store.app_monitors.get(&input.name) else {
+                return Err(GetAppMonitorDataErrorModeled::ResourceNotFoundException(
+                    crate::state::app_monitor_not_found(&input.name),
+                )
+                .into());
+            };
+            (record.arn.clone(), record.resource_policy_document())
+        };
+        if let Err(denial) = crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            crate::state::authorization::GET_APP_MONITOR_DATA,
+            &resource_arn,
+            held_policy.as_deref(),
+            &[],
+        ) {
+            return Err(GetAppMonitorDataErrorModeled::AccessDeniedException(
+                crate::state::access_denied(&denial),
+            )
+            .into());
+        }
+
+        let window = Window::from(&input.time_range);
+        let page_size = page_size(input.max_results);
+
+        let store = state.lock();
+        // The events are held ON the app monitor record, so a request naming no stored
+        // monitor has no data to report rather than an empty page.
+        let Some(monitor) = store.app_monitors.get(&input.name) else {
+            return Err(GetAppMonitorDataErrorModeled::ResourceNotFoundException(
+                crate::state::app_monitor_not_found(&input.name),
+            )
+            .into());
+        };
+
+        // Oldest first, which is the order the data plane appended them in, so a page
+        // boundary cannot drift: paging only ever walks further into the same prefix. The
+        // scan is bounded by the buffer's own ceiling
+        // ([`crate::state::MAX_EVENTS_PER_APP_MONITOR`]), so a query cannot cost more
+        // than the monitor holds however many pages it asks for.
+        let mut matching = monitor
+            .events
+            .iter()
+            .filter(|stored| match parsed_event(&stored.event_json) {
+                Some(document) => {
+                    window.covers(event_seconds(&document)) && matches_filters(&document, &filters)
+                }
+                // An event whose stored document does not parse cannot be placed in the
+                // window, so it matches no query.
+                None => false,
+            })
+            .skip(already_returned);
+
+        let events: Vec<String> = matching
+            .by_ref()
+            .take(page_size)
+            .map(|stored| stored.event_json.clone())
+            .collect();
+
+        // A token is emitted only when something is actually left to return, so the last
+        // page carries none.
+        let next_token = matching.next().is_some().then(|| {
+            encode_next_token(&input.name, already_returned.saturating_add(events.len()))
+        });
+
+        Ok(GetAppMonitorDataOutput {
+            events: Some(events),
+            next_token,
+        })
+    }
+}
+
+/// The largest page this operation returns: `MaxResults`' modelled maximum
+/// (`MaxQueryResults`, range 0..100).
+const MAX_PAGE_SIZE: usize = 100;
+
+/// The page this operation returns for a request asking for `requested` results.
+///
+/// `MaxQueryResults` is modelled `range 0..100` with `@default(0)`, so the boundary
+/// validator has already refused anything outside it. A maximum of zero results is not
+/// what "the maximum number of results to return" can mean, so the modelled default
+/// stands for a request that named no page size, and that request pages at the modelled
+/// maximum.
+fn page_size(requested: i32) -> usize {
+    usize::try_from(requested)
+        .ok()
+        .filter(|requested| *requested > 0)
+        .unwrap_or(MAX_PAGE_SIZE)
+        .min(MAX_PAGE_SIZE)
+}
+
+/// The marker every token this operation issues carries, so a token the service did not
+/// issue — or one another paginated operation issued — is recognisable rather than being
+/// read as some other resume point. The codec itself is shared:
+/// [`crate::state::encode_pagination_token`].
+const TOKEN_MARKER: &str = "GetAppMonitorData/1/";
+
+/// An opaque continuation token for a query of `app_monitor_name` that has returned
+/// `already_returned` matching events so far.
+///
+/// The app monitor the query is scoped to is part of the key, so a token is only honoured
+/// by the monitor it was issued for: events are per-monitor, and two monitors' queries
+/// have counts in common.
+fn encode_next_token(app_monitor_name: &str, already_returned: usize) -> String {
+    crate::state::encode_pagination_token(
+        TOKEN_MARKER,
+        &[app_monitor_name, &already_returned.to_string()],
+    )
+}
+
+/// How many matching events a token issued by [`encode_next_token`] for
+/// `app_monitor_name` resumes after, or `None` for any value this operation never issued
+/// for that monitor.
+fn decode_next_token(app_monitor_name: &str, token: &str) -> Option<usize> {
+    let key = crate::state::decode_pagination_token(TOKEN_MARKER, token, 2)?;
+    let [issued_for, already_returned] = <[String; 2]>::try_from(key).ok()?;
+    (issued_for == app_monitor_name).then_some(())?;
+    already_returned.parse().ok()
+}
+
+/// The time window a query selects events from.
+struct Window {
+    /// `TimeRange$After`: the first instant the window covers.
+    after: i64,
+    /// The last instant the window covers: `TimeRange$Before`, or now for a request that
+    /// named none.
+    before: i64,
+}
+
+impl Window {
+    /// The window `time_range` asks for.
+    ///
+    /// `TimeRange$Before` is modelled `@default(0)` and documented "If you omit this, the
+    /// time range extends to the time that this operation is performed", so a request
+    /// that left it at the default is answered against the window ending NOW. Both bounds
+    /// are read in the unit this protocol carries a `RumEvent$timestamp` in — seconds
+    /// since the epoch — because they bound that same instant.
+    fn from(time_range: &TimeRange) -> Self {
+        Self {
+            after: time_range.after,
+            before: if time_range.before <= 0 {
+                now_seconds()
+            } else {
+                time_range.before
+            },
+        }
+    }
+
+    /// Whether an event at `seconds` falls in this window. Both bounds are inclusive —
+    /// they are the beginning and the end of the range, not exclusive neighbours of it —
+    /// and an event whose instant cannot be read falls in no window.
+    fn covers(&self, seconds: Option<i64>) -> bool {
+        seconds.is_some_and(|seconds| self.after <= seconds && seconds <= self.before)
+    }
+}
+
+/// Now, in seconds since the epoch.
+fn now_seconds() -> i64 {
+    ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map(|since_epoch| i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
+}
+
+/// One stored event as the JSON document it was stored as, or `None` when it is not a
+/// JSON object.
+fn parsed_event(event_json: &str) -> Option<::serde_json::Value> {
+    let document: ::serde_json::Value = ::serde_json::from_str(event_json).ok()?;
+    document.is_object().then_some(document)
+}
+
+/// The instant a stored event carries, in seconds since the epoch.
+///
+/// The stored document renders `RumEvent$timestamp` as an RFC 3339 instant, so it is read
+/// back through the same codec rather than re-derived from anything else.
+fn event_seconds(document: &::serde_json::Value) -> Option<i64> {
+    let rendered = document.get("timestamp")?.as_str()?;
+    ::aws_smithy_types::DateTime::from_str(rendered, ::aws_smithy_types::date_time::Format::DateTime)
+        .ok()
+        .map(|instant| instant.secs())
+}
+
+/// The event attribute each `QueryFilter$Name` key searches.
+///
+/// The keys are the values the model enumerates for that member
+/// (`smithy_query(query="doc",shape="QueryFilter",member="Name")`: "Valid values for
+/// `Name` are `Browser` | `Device` | `Country` | `Page` | `OS` | `EventType` |
+/// `Invert`"), less the two that search no single attribute: [`EVENT_TYPE_KEY`] and
+/// [`INVERT_KEY`]. Beside each key is the attribute name a RUM web client reports that
+/// dimension under in the event's client JSON, which `RumEvent$metadata` describes as "a
+/// JSON serialization of the identity of the user for this session … from information
+/// such as the HTTP user-agent request header and document interface".
+const FILTER_ATTRIBUTES: &[(&str, &str)] = &[
+    ("Browser", "browserName"),
+    ("Country", "countryCode"),
+    ("Device", "deviceType"),
+    ("OS", "osName"),
+    ("Page", "pageId"),
+];
+
+/// The `QueryFilter$Name` key that searches the event's own `type` rather than an
+/// attribute of its client JSON.
+const EVENT_TYPE_KEY: &str = "EventType";
+
+/// The `QueryFilter$Name` key that NEGATES a match, which `QueryFilter` documents:
+/// "Specifying `Invert` as the `Name` works as a \"not equal to\" filter … specify
+/// `Invert` as the `Name` and specify `Chrome` as the value to return all events except
+/// events from user sessions with the Chrome browser."
+const INVERT_KEY: &str = "Invert";
+
+/// Every `QueryFilter$Name` key this operation searches — what a refusal names.
+fn filter_keys() -> Vec<&'static str> {
+    FILTER_ATTRIBUTES
+        .iter()
+        .map(|(key, _)| *key)
+        .chain([EVENT_TYPE_KEY, INVERT_KEY])
+        .collect()
+}
+
+/// Whether `name` is one of those keys.
+fn is_filter_key(name: &str) -> bool {
+    filter_keys().contains(&name)
+}
+
+/// Whether an event matches EVERY filter the request carries.
+///
+/// `QueryFilter` documents "The only performance events that are returned are those that
+/// have values matching the ones that you specify in one of your `QueryFilter`
+/// structures", so the filters are a conjunction while the `Values` of one filter are a
+/// disjunction.
+fn matches_filters(document: &::serde_json::Value, filters: &[QueryFilter]) -> bool {
+    filters.iter().all(|filter| matches_filter(document, filter))
+}
+
+/// Whether an event matches ONE filter. A filter that names no key, or no values to match
+/// against, selects nothing out and so narrows the query by nothing.
+fn matches_filter(document: &::serde_json::Value, filter: &QueryFilter) -> bool {
+    let (Some(key), Some(values)) = (filter.name.as_deref(), filter.values.as_deref()) else {
+        return true;
+    };
+    if values.is_empty() {
+        return true;
+    }
+    if key == INVERT_KEY {
+        // "not equal to": every dimension is searched, and an event matching any of the
+        // values on any of them is the one case this filter excludes.
+        return !filter_keys()
+            .into_iter()
+            .filter(|key| *key != INVERT_KEY)
+            .filter_map(|key| dimension(document, key))
+            .any(|found| values.contains(&found));
+    }
+    dimension(document, key).is_some_and(|found| values.contains(&found))
+}
+
+/// The value an event carries for one `QueryFilter$Name` key, or `None` when it carries
+/// none.
+///
+/// A dimension other than the event type is an attribute of the client JSON the event
+/// arrived with: looked up in `metadata`, which is where a RUM web client reports the
+/// session's identity, and then in `details`, since the model constrains neither document
+/// and a client may report a page's identity with that page event's own details.
+fn dimension(document: &::serde_json::Value, key: &str) -> Option<String> {
+    if key == EVENT_TYPE_KEY {
+        return document.get("type").and_then(scalar_text);
+    }
+    let attribute = FILTER_ATTRIBUTES
+        .iter()
+        .find(|(filter_key, _)| *filter_key == key)
+        .map(|(_, attribute)| *attribute)?;
+    ["metadata", "details"]
+        .into_iter()
+        .filter_map(|section| document.get(section)?.get(attribute))
+        .find_map(scalar_text)
+}
+
+/// One JSON scalar as the text a `QueryFilterValue` is compared against: a string as
+/// itself, and a number or a boolean as it is written, since a filter value is always a
+/// string while the client JSON it is matched against need not be.
+fn scalar_text(value: &::serde_json::Value) -> Option<String> {
+    match value {
+        ::serde_json::Value::String(text) => Some(text.clone()),
+        ::serde_json::Value::Number(number) => Some(number.to_string()),
+        ::serde_json::Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
     }
 }

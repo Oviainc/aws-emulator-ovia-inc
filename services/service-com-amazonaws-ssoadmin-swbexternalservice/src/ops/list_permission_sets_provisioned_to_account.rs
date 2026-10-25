@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPermissionSetsProvisionedToAccount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPermissionSetsProvisionedToAccount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPermissionSetsProvisionedToAccount::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the permission sets that are PROVISIONED into the Amazon Web Services account
+//! the request names, read from this service's state.
+//!
+//! An account holds a permission set once that permission set has been provisioned there,
+//! which is what granting an account assignment on the account does, so each such
+//! permission set is reported exactly once however many principals were assigned through
+//! it. The `ProvisioningStatus` filter selects by the status each of those permission sets
+//! is in
+//! ([`crate::state::ComAmazonawsSsoadminSwbexternalserviceState::provisioned_permission_sets`]):
+//! the account holds the permission set's current definition, or a copy the permission set
+//! has changed since. A request that names no `ProvisioningStatus` is not filtered and
+//! reports every permission set provisioned into the account.
+//!
+//! Being a report, it writes nothing a later caller sees beyond what the clock already
+//! owes the account's instances.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +173,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPermissionSetsProvisionedToAccount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPermissionSetsProvisionedToAccountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPermissionSetsProvisionedToAccount"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListPermissionSetsProvisionedToAccountErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // The `ProvisioningStatus` the request filters by, as one of the values the
+        // model's enum declares (`PROVISIONING_STATUS_VALUES`, the one source for their
+        // spelling). Reaching this handler means the modelled constraints already hold, so
+        // anything else cannot arrive here; it is still refused rather than answered with
+        // an empty page, which would read as "no permission set is in that state".
+        let filter = match input.provisioning_status.as_deref() {
+            None => None,
+            Some(status) if PROVISIONING_STATUS_VALUES.contains(&status) => Some(status),
+            Some(status) => {
+                return Err(
+                    ListPermissionSetsProvisionedToAccountErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(crate::state::provisioning_status_unknown_message(
+                                status,
+                            )),
+                            // The model's `ValidationExceptionReason` enum carries only
+                            // KMS key states, none of which this refusal is.
+                            reason: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // The cursor is scoped to THIS enumeration: the operation and the whole filter
+        // that selected the rows, since the page key (a permission-set ARN) only
+        // distinguishes rows within it.
+        let scope = crate::state::cursor_permission_sets_provisioned_to_account(
+            &input.instance_arn,
+            &input.account_id,
+            filter,
+        );
+        let after = crate::state::cursor_after(&scope, input.next_token.as_deref()).map_err(
+            |message| {
+                ListPermissionSetsProvisionedToAccountErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message.to_string()),
+                        reason: None,
+                    },
+                )
+            },
+        )?;
+
+        let ordered: Vec<(String, String)> = {
+            let mut store = state.lock();
+            // A READ, except for what the CLOCK already owes the instances themselves,
+            // and the account's ambient instance if nothing has enabled one yet.
+            store.on_request(
+                &crate::state::request_region(ctx.parts()),
+                ::std::time::SystemTime::now(),
+            );
+            // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup:
+            // permission sets are a feature of an organization instance, so on an account
+            // instance none can ever be provisioned into an account and the enumeration is
+            // refused rather than answered empty. An ARN this account holds no instance
+            // for is NOT this refusal — it falls through to the 404 below.
+            if store.permission_set_surface_withdrawn(&input.instance_arn) {
+                return Err(
+                    ListPermissionSetsProvisionedToAccountErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
+                            ),
+                            reason: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            if store.instance(&input.instance_arn).is_none() {
+                return Err(
+                    ListPermissionSetsProvisionedToAccountErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "No instance found with the ARN {}",
+                                input.instance_arn
+                            )),
+                            reason: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // Every permission set provisioned into the account, each once and with the
+            // provisioning status it is in, kept only when it is the status the request
+            // asked for. The permission-set ARN is the page key, so the enumeration walks
+            // the same order `ListPermissionSets` does.
+            store
+                .provisioned_permission_sets(&input.instance_arn, &input.account_id)
+                .into_iter()
+                .filter(|(_, status)| filter.is_none_or(|wanted| wanted == *status))
+                .map(|(permission_set_arn, _)| (permission_set_arn.clone(), permission_set_arn))
+                .collect()
+        };
+
+        let (permission_sets, next_token) =
+            crate::state::page(&scope, ordered, after.as_deref(), input.max_results);
+        Ok(ListPermissionSetsProvisionedToAccountOutput {
+            permission_sets: Some(permission_sets),
+            next_token,
+        })
     }
 }

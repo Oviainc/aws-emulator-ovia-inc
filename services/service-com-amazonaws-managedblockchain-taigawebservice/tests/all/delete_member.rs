@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `DeleteMember`, end to end over HTTP: the member it names is removed from the stored
-//! network together with "all associated resources" (its nodes), so every later read of
-//! them is the modelled 404; the network itself is deleted with its last member; and a
-//! request this operation cannot carry out is refused with the modelled error rather than
-//! changing anything.
+//! `DeleteMember`, end to end over HTTP: the member it names — and "all associated
+//! resources", its nodes — begin deleting, so every later read reports them through the
+//! `DELETING` and `DELETED` of their status enum; the network begins deleting with its
+//! last participating member; and a request this operation cannot carry out is refused
+//! with the modelled error rather than changing anything.
 //!
-//! The tables below span the classes those rules generalise over: the position of the
+//! The staged statuses themselves (and the listings filtered on them) are
+//! [`crate::member_deletion_lifecycle`]'s subject; what the tables here span is the
+//! classes the refusals and the resource bookkeeping generalise over: the position of the
 //! deleted member in the stored ordering (with and without a node of its own), member
 //! counts from one to three, every value `MemberStatus` declares, every standing public
 //! network (the frameworks this operation does not apply to), and both owning-account
@@ -17,10 +19,11 @@ use service_com_amazonaws_managedblockchain_taigawebservice::state::PUBLIC_NETWO
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    call, create_network, create_network_body, router_and_engine, ACCOUNT, PAST_TRANSITION,
+    call, create_network, create_network_body, delete_member, get_member, get_network, get_node,
+    listed_member_ids, network_with_members, router_and_engine, ACCOUNT, PAST_TRANSITION,
 };
 use crate::list_members::{seed_members, Seed, OTHER_ACCOUNT};
-use crate::network_and_node_lifecycle::{create_node, Answer};
+use crate::network_and_node_lifecycle::create_node;
 
 /// An id body with the shape every Managed Blockchain resource id takes (26 characters of
 /// the base-32 alphabet) that no create ever minted: the rows naming a network or member
@@ -32,102 +35,16 @@ fn node_configuration() -> Value {
     serde_json::json!({ "InstanceType": "bc.t3.small" })
 }
 
-/// One `DeleteMember` call: `DELETE /networks/{NetworkId}/members/{MemberId}`.
-async fn delete_member(
-    router: &MultiServiceRouter,
-    network_id: &str,
-    member_id: &str,
-) -> Answer {
-    call(
-        router,
-        "DELETE",
-        &format!("/networks/{network_id}/members/{member_id}"),
-        None,
-    )
-    .await
-}
-
-/// One `GetMember` call.
-async fn get_member(router: &MultiServiceRouter, network_id: &str, member_id: &str) -> Answer {
-    call(
-        router,
-        "GET",
-        &format!("/networks/{network_id}/members/{member_id}"),
-        None,
-    )
-    .await
-}
-
-/// One `GetNetwork` call.
-async fn get_network(router: &MultiServiceRouter, network_id: &str) -> Answer {
-    call(router, "GET", &format!("/networks/{network_id}"), None).await
-}
-
-/// One `GetNode` call, scoped by the member that owns the node.
-async fn get_node(
-    router: &MultiServiceRouter,
-    network_id: &str,
-    member_id: &str,
-    node_id: &str,
-) -> Answer {
-    call(
-        router,
-        "GET",
-        &format!("/networks/{network_id}/nodes/{node_id}?memberId={member_id}"),
-        None,
-    )
-    .await
-}
-
 /// The member ids `ListMembers` reports for `network_id`, in the order it reported them.
-async fn listed_member_ids(router: &MultiServiceRouter, network_id: &str) -> Vec<String> {
-    let answer = call(
-        router,
-        "GET",
-        &format!("/networks/{network_id}/members"),
-        None,
-    )
-    .await;
-    answer.body["Members"]
-        .as_array()
-        .map(|members| {
-            members
-                .iter()
-                .map(|member| member["Id"].as_str().unwrap_or_default().to_string())
-                .collect()
-        })
-        .unwrap_or_default()
+async fn listed_members(router: &MultiServiceRouter, network_id: &str) -> Vec<String> {
+    listed_member_ids(router, network_id, "").await
 }
 
-/// A network that has settled to `AVAILABLE`, holding its founding member plus `extra`
-/// seeded members this account owns and the clock owes nothing. Answers the network id and
-/// every member id on it, in the stored (id) order `ListMembers` pages on.
-async fn network_with_members(token: &str, extra: usize) -> (MultiServiceRouter, String, Vec<String>) {
-    let (router, engine) = router_and_engine();
-    let (network_id, founder) =
-        create_network(&router, create_network_body(token, "delete-member-net")).await;
-    tokio::time::sleep(PAST_TRANSITION).await;
-    // Each seeded record is a copy of the one `CreateNetwork` stored, with only its name,
-    // status and owning account changed, so the rows exercise the handler rather than a
-    // record no create could have produced.
-    let seeds: Vec<Seed> = (0..extra)
-        .map(|_| Seed {
-            name: "seeded-org",
-            status: "AVAILABLE",
-            account: ACCOUNT,
-        })
-        .collect();
-    let mut members = seed_members(&engine, &network_id, &seeds);
-    members.push(founder);
-    members.sort();
-    (router, network_id, members)
-}
-
-/// `DeleteMember` "removes the member and all associated resources from the network": the
-/// member and its nodes answer 404 afterwards, `ListMembers` reports only the survivors,
-/// and every other member and node on the network is untouched.
+/// `DeleteMember` starts the removal of "the member and all associated resources": the
+/// member and its nodes report `DELETING`, `ListMembers` still reports them all, and
+/// every other member and node on the network is untouched.
 #[tokio::test]
-async fn delete_member_removes_the_member_and_its_nodes() {
+async fn delete_member_starts_the_deletion_of_the_member_and_its_nodes() {
     // Rows: the deleted member's position in the stored ordering — first, middle and last
     // — and whether it owned a node of its own.
     let cases: &[(&str, usize, bool)] = &[
@@ -138,7 +55,7 @@ async fn delete_member_removes_the_member_and_its_nodes() {
 
     for &(case, index, with_node) in cases {
         let (router, network_id, mut members) =
-            network_with_members(&format!("remove-{index}"), 2).await;
+            network_with_members(&format!("remove-{index}"), "delete-member-net", 2).await;
         let doomed = members.remove(index);
         let survivor = members[0].clone();
 
@@ -175,36 +92,40 @@ async fn delete_member_removes_the_member_and_its_nodes() {
 
         let answer = get_member(&router, &network_id, &doomed).await;
         assert_eq!(
-            (answer.status, answer.error_type.as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {case}: expected GetMember 404 ResourceNotFoundException after the delete, \
-             got {} {:?}",
+            (answer.status, answer.text(&["Member", "Status"]).as_str()),
+            (200, "DELETING"),
+            "case {case}: expected GetMember 200 DELETING after the delete, got {} {:?}",
             answer.status,
             answer.body
         );
+        let mut still_listed = members.clone();
+        still_listed.push(doomed.clone());
+        still_listed.sort();
         assert_eq!(
-            listed_member_ids(&router, &network_id).await,
-            members,
-            "case {case}: expected ListMembers to report only the surviving members"
+            listed_members(&router, &network_id).await,
+            still_listed,
+            "case {case}: expected ListMembers to keep reporting the deleting member"
         );
 
-        // "All associated resources" go with the member: its node is gone, and no other
-        // member's node is.
+        // "All associated resources" go with the member: its node is deleting with it, and
+        // no other member's node is.
         if let Some(doomed_node) = doomed_node.as_deref() {
             let answer = get_node(&router, &network_id, &doomed, doomed_node).await;
             assert_eq!(
-                (answer.status, answer.error_type.as_str()),
-                (404, "ResourceNotFoundException"),
-                "case {case}: expected the deleted member's node to be gone, got {} {:?}",
+                (answer.status, answer.text(&["Node", "Status"]).as_str()),
+                (200, "DELETING"),
+                "case {case}: expected the deleted member's node to be DELETING, got {} {:?}",
                 answer.status,
                 answer.body
             );
         }
         let answer = get_node(&router, &network_id, &survivor, &survivor_node).await;
         assert_eq!(
-            answer.status, 200,
-            "case {case}: expected another member's node to survive, got {} {:?}",
-            answer.status, answer.body
+            (answer.status, answer.text(&["Node", "Status"]).as_str()),
+            (200, "AVAILABLE"),
+            "case {case}: expected another member's node to be untouched, got {} {:?}",
+            answer.status,
+            answer.body
         );
         let answer = get_member(&router, &network_id, &survivor).await;
         assert_eq!(
@@ -215,26 +136,26 @@ async fn delete_member_removes_the_member_and_its_nodes() {
         // Members are left, so the network stands.
         let answer = get_network(&router, &network_id).await;
         assert_eq!(
-            answer.status, 200,
-            "case {case}: expected the network to survive while it holds members, got {} {:?}",
-            answer.status, answer.body
-        );
-
-        // Deleting it a second time finds nothing to delete.
-        let answer = delete_member(&router, &network_id, &doomed).await;
-        assert_eq!(
-            (answer.status, answer.error_type.as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {case}: expected a repeated DeleteMember to be a 404, got {} {:?}",
+            (answer.status, answer.text(&["Network", "Status"]).as_str()),
+            (200, "AVAILABLE"),
+            "case {case}: expected the network to stand while it holds members, got {} {:?}",
             answer.status,
             answer.body
+        );
+
+        // Deleting it a second time starts no second deletion.
+        let answer = delete_member(&router, &network_id, &doomed).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: expected a repeated DeleteMember to be a 200, got {} {:?}",
+            answer.status, answer.body
         );
     }
 }
 
 /// "If MemberId is the last member in a network specified by the last Amazon Web Services
-/// account, the network is deleted also": the network stands while any member is left and
-/// goes with the last one.
+/// account, the network is deleted also": the network stands while a participating member
+/// is left and begins deleting with the last one.
 #[tokio::test]
 async fn deleting_the_last_member_deletes_the_network() {
     // Rows: member counts from one (the founding member alone) to three, each emptied one
@@ -242,7 +163,7 @@ async fn deleting_the_last_member_deletes_the_network() {
     for extra in 0..3_usize {
         let case = format!("{} member(s)", extra + 1);
         let (router, network_id, members) =
-            network_with_members(&format!("empty-{extra}"), extra).await;
+            network_with_members(&format!("empty-{extra}"), "delete-member-net", extra).await;
 
         for (position, doomed) in members.iter().enumerate() {
             let last = position + 1 == members.len();
@@ -253,17 +174,20 @@ async fn deleting_the_last_member_deletes_the_network() {
                 answer.status, answer.body
             );
 
-            let expected = if last { 404 } else { 200 };
+            let expected = if last { "DELETING" } else { "AVAILABLE" };
             let answer = get_network(&router, &network_id).await;
             assert_eq!(
-                answer.status, expected,
-                "case {case}/{position}: expected GetNetwork {expected} after deleting \
+                (answer.status, answer.text(&["Network", "Status"]).as_str()),
+                (200, expected),
+                "case {case}/{position}: expected GetNetwork 200 {expected} after deleting \
                  {doomed}, got {} {:?}",
-                answer.status, answer.body
+                answer.status,
+                answer.body
             );
         }
 
-        // The network the last member took with it is reported by no listing either.
+        // The network its last member took with it is still the one the listing reports,
+        // under the status it now holds.
         let answer = call(&router, "GET", "/networks", None).await;
         let listed: Vec<String> = answer.body["Networks"]
             .as_array()
@@ -275,8 +199,9 @@ async fn deleting_the_last_member_deletes_the_network() {
             })
             .unwrap_or_default();
         assert!(
-            !listed.contains(&network_id),
-            "case {case}: expected ListNetworks not to report the deleted {network_id}, got {:?}",
+            listed.contains(&network_id),
+            "case {case}: expected ListNetworks to keep reporting the deleting {network_id}, \
+             got {:?}",
             answer.body
         );
     }
@@ -328,10 +253,19 @@ async fn a_member_still_creating_cannot_be_deleted_yet() {
         );
         let read = get_member(&router, &network_id, &member_id).await;
         if expected == 200 {
+            // The delete STARTS the removal, so the record stays readable: a member the
+            // delete moved reports `DELETING`, and one already `DELETED` is left in that
+            // terminal status.
+            let expected_status = if status == "DELETED" {
+                "DELETED"
+            } else {
+                "DELETING"
+            };
             assert_eq!(
-                (read.status, read.error_type.as_str()),
-                (404, "ResourceNotFoundException"),
-                "case {status}: expected the deleted member to be gone, got {} {:?}",
+                (read.status, read.text(&["Member", "Status"]).as_str()),
+                (200, expected_status),
+                "case {status}: expected the deleted member to report {expected_status}, got \
+                 {} {:?}",
                 read.status,
                 read.body
             );
@@ -430,7 +364,7 @@ async fn delete_member_refuses_what_it_cannot_delete() {
     let mut expected = vec![founder.clone(), other_account_member.clone()];
     expected.sort();
     assert_eq!(
-        listed_member_ids(&router, &network_id).await,
+        listed_members(&router, &network_id).await,
         expected,
         "case after the refusals: expected both members still listed"
     );
@@ -477,8 +411,9 @@ async fn a_create_token_is_released_only_once_nothing_it_minted_is_left() {
         "case replay while the network stands: expected the token to replay its original ids"
     );
 
-    // Now the last member goes, so the network goes with it and the token names nothing:
-    // replaying it creates a new network instead of handing back ids nothing holds.
+    // Now the last member goes, so the network begins deleting with it and the token names
+    // nothing a caller can still use: replaying it creates a new network instead of handing
+    // back ids whose resources are on their way out.
     let answer = delete_member(&router, &network_id, &seeded[0]).await;
     assert_eq!(
         answer.status, 200,
@@ -506,10 +441,10 @@ async fn a_create_token_is_released_only_once_nothing_it_minted_is_left() {
     );
     let answer = get_network(&router, &network_id).await;
     assert_eq!(
-        (answer.status, answer.error_type.as_str()),
-        (404, "ResourceNotFoundException"),
-        "case replay after the network was deleted: expected the deleted network to stay \
-         gone, got {} {:?}",
+        (answer.status, answer.text(&["Network", "Status"]).as_str()),
+        (200, "DELETING"),
+        "case replay after the network was deleted: expected the deleted network to keep \
+         reporting its deletion, got {} {:?}",
         answer.status,
         answer.body
     );

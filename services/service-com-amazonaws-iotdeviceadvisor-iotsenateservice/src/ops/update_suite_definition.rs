@@ -165,11 +165,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // The prose rule on `SuiteDefinitionConfiguration$rootGroup` is a property of the
-        // SHAPE, so it holds for the configuration an update carries exactly as it does
-        // for the one a create carries.
+        // The prose rules on `SuiteDefinitionConfiguration` are properties of the SHAPE,
+        // so they hold for the configuration an update carries exactly as they do for the
+        // one a create carries.
         if let Some(violation) =
-            crate::state::root_group_violation(&input.suite_definition_configuration)
+            crate::state::definition_configuration_violation(&input.suite_definition_configuration)
         {
             return Err(UpdateSuiteDefinitionErrorModeled::ValidationException(
                 ValidationException {

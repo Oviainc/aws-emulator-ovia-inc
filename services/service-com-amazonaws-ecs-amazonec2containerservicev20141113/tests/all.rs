@@ -43,6 +43,8 @@ mod list_services;
 mod list_task_definition_families;
 #[path = "all/list_task_definitions.rs"]
 mod list_task_definitions;
+#[path = "all/load_balancer_target_group_placement.rs"]
+mod load_balancer_target_group_placement;
 #[path = "all/load_balancer_target_groups.rs"]
 mod load_balancer_target_groups;
 #[path = "all/reserved_tag_prefix.rs"]
@@ -53,6 +55,8 @@ mod resource_tags;
 mod service_derived_members;
 #[path = "all/service_lifecycle.rs"]
 mod service_lifecycle;
+#[path = "all/service_listing.rs"]
+mod service_listing;
 #[path = "all/service_projection.rs"]
 mod service_projection;
 #[path = "all/service_validation.rs"]

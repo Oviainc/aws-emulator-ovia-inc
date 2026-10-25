@@ -629,8 +629,25 @@ pub struct FunctionConfig {
 pub struct FunctionVersionRecord {
     /// The numeric version label ("1", "2", ...).
     pub version: u64,
-    /// The configuration this version froze.
+    /// The configuration this version froze, carrying the version's OWN
+    /// [`FunctionConfig::revision_id`] (see [`FunctionRecord::publish_next_version`]).
     pub config: FunctionConfig,
+    /// The revision the unpublished configuration was at when this version was
+    /// published.
+    ///
+    /// A published version is a distinct identity with a revision of its own, so the
+    /// revision it was taken FROM is the only thing that can say whether the unpublished
+    /// configuration has changed since — which is the question
+    /// "Lambda doesn't publish a version if the function's configuration and code haven't
+    /// changed since the last version" asks.
+    pub source_revision_id: String,
+    /// The deployment package this version froze.
+    ///
+    /// A version keeps its own copy of the package: `PublishVersion` "Creates a version
+    /// from the current code and configuration of a function", and a later
+    /// `UpdateFunctionCode` changes the unpublished version only — so the bytes a
+    /// published version's `Code$Location` serves stay the ones it was published from.
+    pub code: CodeRecord,
     /// ISO-8601 instant the version was published.
     pub created: String,
 }
@@ -1516,17 +1533,28 @@ impl FunctionRecord {
     /// Versions are numbered from 1 upwards and a number is never reused, so the next
     /// one follows the highest ever published rather than the count held. `None` when no
     /// further number can be assigned.
+    ///
+    /// The version is a SEPARATE identity from the unpublished one: it gets its own
+    /// `RevisionId`, which is what makes a revision precondition mean one identity rather
+    /// than two ("The RevisionId provided does not match the latest RevisionId for the
+    /// Lambda function or alias"), and the revision it was taken from is kept beside it
+    /// as [`FunctionVersionRecord::source_revision_id`]. It also freezes the deployment
+    /// package the function currently holds, because a later `UpdateFunctionCode`
+    /// replaces only the unpublished version's.
     pub fn publish_next_version(
         &mut self,
-        config: FunctionConfig,
+        mut config: FunctionConfig,
         now: SystemTime,
     ) -> Option<u64> {
         let version = self.latest_version.checked_add(1)?;
+        let source_revision_id = ::std::mem::replace(&mut config.revision_id, mint_revision_id());
         self.versions.insert(
             version,
             FunctionVersionRecord {
                 version,
                 config,
+                source_revision_id,
+                code: self.code.clone(),
                 created: iso8601(now),
             },
         );
@@ -1679,7 +1707,10 @@ impl FunctionRecord {
             role: Some(config.role.clone()),
             handler: config.handler.clone(),
             code_size: config.code_size,
-            description: config.description.clone(),
+            // `Description` is a member of every `FunctionConfiguration` AWS reports: a
+            // function created without one carries it as the empty string rather than
+            // not at all, so a client can read it unconditionally.
+            description: Some(config.description.clone().unwrap_or_default()),
             timeout: Some(config.timeout),
             memory_size: Some(config.memory_size),
             last_modified: Some(config.last_modified.clone()),
@@ -1869,17 +1900,40 @@ impl FunctionRecord {
             .unwrap_or_else(|| qualifier.to_string())
     }
 
-    /// The `FunctionCodeLocation` `GetFunction` reports for this function's package.
+    /// The deployment package of `version`: the one a published version froze, and the
+    /// current one for the unpublished version. An alias reads the package of the version
+    /// it invokes, because the package belongs to the version.
     #[must_use]
-    pub fn code_location(&self) -> FunctionCodeLocation {
-        if let Some(image_uri) = &self.code.image_uri {
-            // A container image is a reference into the Amazon ECR registry; the
-            // resolved URI is the one the function was created with, because nothing
-            // here re-tags it.
+    pub fn code_of(&self, version: &str) -> &CodeRecord {
+        let resolved = self.resolved_version(version);
+        let published = resolved
+            .filter(|resolved| resolved != VERSION_LATEST)
+            .and_then(|resolved| resolved.parse::<u64>().ok())
+            .and_then(|number| self.versions.get(&number));
+        match published {
+            Some(published) => &published.code,
+            None => &self.code,
+        }
+    }
+
+    /// The `FunctionCodeLocation` `GetFunction` reports for the package of `version`.
+    ///
+    /// A published version keeps its own package and its own revision, so the location
+    /// reported for it addresses THAT package and keeps serving it after the unpublished
+    /// version's code is replaced.
+    #[must_use]
+    pub fn code_location(&self, version: &str) -> FunctionCodeLocation {
+        let config = self.config_of(version).unwrap_or(&self.config);
+        let code = self.code_of(version);
+        if let Some(image_uri) = &code.image_uri {
+            // A container image is a reference into the Amazon ECR registry, and
+            // `ResolvedImageUri` is "The resolved URI for the image": the image the
+            // function is frozen to, pinned to its content by digest rather than to the
+            // mutable tag the caller named. See [`resolved_image_uri`].
             return FunctionCodeLocation {
                 repository_type: Some(REPOSITORY_TYPE_ECR.to_string()),
                 image_uri: Some(image_uri.clone()),
-                resolved_image_uri: Some(image_uri.clone()),
+                resolved_image_uri: Some(resolved_image_uri(image_uri)),
                 ..FunctionCodeLocation::default()
             };
         }
@@ -1887,8 +1941,8 @@ impl FunctionRecord {
             repository_type: Some(REPOSITORY_TYPE_S3.to_string()),
             location: Some(code_location_url(
                 &self.region,
-                &self.config.name,
-                &self.config.revision_id,
+                &config.name,
+                &config.revision_id,
             )),
             // "The resolved Amazon S3 object that contains the deployment package" — in
             // `REFERENCE` mode that object is the caller's, because "Lambda references
@@ -1897,22 +1951,42 @@ impl FunctionRecord {
             // from storage of its own, so the caller's object is no longer where the
             // package is served from and none is reported — the same rule
             // [`LayerVersionRecord::content`] applies to a layer archive.
-            resolved_s3_object: self
-                .code
+            resolved_s3_object: code
                 .s3_bucket
                 .clone()
                 .filter(|_| {
-                    self.code.s3_object_storage_mode.as_deref()
+                    code.s3_object_storage_mode.as_deref()
                         == Some(S3_OBJECT_STORAGE_MODE_REFERENCE)
                 })
                 .map(|bucket| ResolvedS3Object {
                     s3_bucket: Some(bucket),
-                    s3_key: self.code.s3_key.clone(),
-                    s3_object_version: self.code.s3_object_version.clone(),
+                    s3_key: code.s3_key.clone(),
+                    s3_object_version: code.s3_object_version.clone(),
                 }),
-            source_kms_key_arn: self.code.source_kms_key_arn.clone(),
+            source_kms_key_arn: code.source_kms_key_arn.clone(),
             ..FunctionCodeLocation::default()
         }
+    }
+
+    /// The deployment package this function holds at `revision_id`, or `None` when no
+    /// identity of it is at that revision any more.
+    ///
+    /// A download location is reported for one revision of one identity — the unpublished
+    /// configuration, or a published version, each of which has its own `RevisionId` —
+    /// so the revision in the URL is what says WHICH package it addresses. A published
+    /// version's package stays reachable after the unpublished one's code is replaced,
+    /// which is what makes a version's location serve frozen bytes; the unpublished
+    /// version's old location stops resolving, exactly as AWS stops serving a package
+    /// that is no longer the function's.
+    #[must_use]
+    pub fn package_at_revision(&self, revision_id: &str) -> Option<&CodeRecord> {
+        if self.config.revision_id == revision_id {
+            return Some(&self.code);
+        }
+        self.versions
+            .values()
+            .find(|published| published.config.revision_id == revision_id)
+            .map(|published| &published.code)
     }
 
     /// The provisioned concurrency this function has allocated across its aliases and
@@ -2020,14 +2094,40 @@ pub struct LayerVersionRecord {
     ///
     /// `AddLayerVersionPermission` "Adds permissions to the resource-based policy of a
     /// version of an Lambda layer", so the policy belongs to the single version the call
-    /// addressed rather than to the layer as a whole, and `GetLayerVersionPolicy`
-    /// reports exactly the statements that were added. A version nobody has granted
-    /// anything on holds NO policy — not an empty one — which is what the read's 404
-    /// reports.
+    /// addressed rather than to the layer as a whole, and `GetLayerVersionPolicy` reports
+    /// exactly the statements that were added.
+    ///
+    /// The policy is a RECORD the first grant creates, and it outlives its last
+    /// statement: removing every statement leaves the version holding an EMPTY policy
+    /// rather than none at all. The two states are distinguishable — a version nobody has
+    /// granted anything on has no policy record, and a READ of each answers its own
+    /// refusal (see [`LayerVersionRecord::policy_read_absence_message`]) — so a caller can
+    /// tell a version that never had a policy from one whose statements have all been
+    /// taken out. Neither state is reported as a policy: both are the read's 404.
     pub policy: Option<PolicyRecord>,
 }
 
 impl LayerVersionRecord {
+    /// Why a READ of this version's resource-based policy has nothing to report, as the
+    /// message of its refusal — and `None` when the version holds one.
+    ///
+    /// The version itself EXISTS in both cases (it was resolved out of the store), so
+    /// neither message is the one for an absent layer version, which is what lets a
+    /// caller tell "no policy yet" (add one) from "wrong ARN" (fix the ARN). The two no-
+    /// policy states are distinguished by whether the version has a policy RECORD at all:
+    /// a version nobody has granted anything on has none, and one whose statements have
+    /// all been removed has an empty one, which the read names the version for.
+    #[must_use]
+    pub fn policy_read_absence_message(&self, layer_version_arn: &str) -> Option<String> {
+        match &self.policy {
+            None => Some(LAYER_VERSION_NO_POLICY_MESSAGE.to_string()),
+            Some(policy) if policy.statements.is_empty() => Some(
+                layer_version_without_policy_message(layer_version_arn),
+            ),
+            Some(_) => None,
+        }
+    }
+
     /// The `LayerVersionContentOutput` a read reports for this version's archive,
     /// `location` being the link into the Lambda-held copy of it.
     #[must_use]
@@ -2115,7 +2215,13 @@ impl LayerRecord {
             ))),
             layer_arn: Some(self.arn.clone()),
             layer_version_arn: Some(self.version_arn(version.version)),
-            description: version.description.clone(),
+            // `Description` is a member of every layer version AWS reports from the
+            // version's OWN read: a version published without one carries it as the empty
+            // string rather than not at all, exactly as a function configuration does
+            // (see [`FunctionRecord::configuration`]), so a client can read the member
+            // unconditionally. A LISTING entry is the other way round — see
+            // [`LayerRecord::version_summary`].
+            description: Some(version.description.clone().unwrap_or_default()),
             created_date: Some(version.created.clone()),
             version: version.version,
             // A list the caller named nothing in is absent from the answer rather than
@@ -2148,6 +2254,11 @@ impl LayerRecord {
         LayerVersionsListItem {
             layer_version_arn: Some(self.version_arn(version.version)),
             version: version.version,
+            // A LISTING reports only what the version carries: an omitted description is
+            // absent from the entry, while the version's own read defaults it to the
+            // empty string (see [`LayerRecord::version_detail`]). RECORDED: AWS's
+            // `ListLayerVersions` entry for a version published with no optional member
+            // at all carries exactly `CreatedDate`, `LayerVersionArn` and `Version`.
             description: version.description.clone(),
             created_date: Some(version.created.clone()),
             // A list the caller named nothing in is absent from the answer rather than
@@ -3244,10 +3355,13 @@ pub fn resolve_capacity_provider<'a>(
 /// segment here comes from stored state — the layer's region, its name and the version
 /// number — so two reads of one published version report the same location, and no read
 /// changes what a later one sees.
+///
+/// The URL is one this emulator ANSWERS, exactly as [`code_location_url`] is.
 #[must_use]
 pub fn layer_archive_location(region: &str, name: &str, version: i64) -> String {
     format!(
-        "https://awslambda-{region}-layers.s3.{region}.amazonaws.com/snapshots/{account}/{name}-{version}",
+        "https://{host}{DOWNLOAD_PATH_PREFIX}/{account}/{name}-{version}",
+        host = download_host(region, DOWNLOAD_BUCKET_LAYERS),
         account = ::engine::emulator_account_id(),
     )
 }
@@ -3383,12 +3497,282 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
 /// Every segment here comes from stored state — the function's region, its name and
 /// the revision the stored code belongs to — so two reads of an unchanged function
 /// report the same location, and a new revision reports a new one.
+///
+/// The URL is one this emulator ANSWERS: [`parse_download_target`] reads it back and
+/// `crate::service` serves the stored bytes from it.
 #[must_use]
 pub fn code_location_url(region: &str, name: &str, revision_id: &str) -> String {
     format!(
-        "https://awslambda-{region}-tasks.s3.{region}.amazonaws.com/snapshots/{account}/{name}-{revision_id}",
+        "https://{host}{DOWNLOAD_PATH_PREFIX}/{account}/{name}-{revision_id}",
+        host = download_host(region, DOWNLOAD_BUCKET_TASKS),
         account = ::engine::emulator_account_id(),
     )
+}
+
+/// The bucket label of the per-region store a function's deployment PACKAGE is served
+/// from, as [`code_location_url`] spells it.
+pub const DOWNLOAD_BUCKET_TASKS: &str = "tasks";
+
+/// The bucket label of the per-region store a LAYER version's archive is served from, as
+/// [`layer_archive_location`] spells it.
+pub const DOWNLOAD_BUCKET_LAYERS: &str = "layers";
+
+/// The path prefix every download URL this service hands out carries.
+pub const DOWNLOAD_PATH_PREFIX: &str = "/snapshots";
+
+/// The host a download URL of `bucket` is addressed to in `region`.
+///
+/// ONE place states the form, so the URL this service hands out and the request it
+/// claims back cannot disagree about it (see [`is_download_host`]).
+#[must_use]
+pub fn download_host(region: &str, bucket: &str) -> String {
+    format!("awslambda-{region}-{bucket}.s3.{region}.amazonaws.com")
+}
+
+/// The bucket label of a download host this service publishes, or `None` when `host` is
+/// not one.
+///
+/// The host's first label names no emulated service, so the router cannot resolve a
+/// target from it: recognising it here is what routes a fetch of a URL this service
+/// HANDED OUT back to this service rather than to its `UnknownService` answer. Any
+/// userinfo and port are stripped first, because a `Host` header may carry them.
+#[must_use]
+pub fn download_bucket_of_host(host: &str) -> Option<&'static str> {
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host);
+    let rest = host.strip_prefix("awslambda-")?;
+    [DOWNLOAD_BUCKET_TASKS, DOWNLOAD_BUCKET_LAYERS]
+        .into_iter()
+        .find(|bucket| {
+            rest.split_once(&format!("-{bucket}.s3."))
+                .and_then(|(region, tail)| {
+                    Some((region.to_string(), tail.strip_suffix(".amazonaws.com")?))
+                })
+                .is_some_and(|(region, tail)| !region.is_empty() && tail == region)
+        })
+}
+
+/// Whether `host` is one of the download hosts this service publishes.
+#[must_use]
+pub fn is_download_host(host: &str) -> bool {
+    download_bucket_of_host(host).is_some()
+}
+
+/// What a download URL this service handed out names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DownloadTarget {
+    /// A function's deployment package, at the revision the location was reported for.
+    FunctionPackage {
+        /// The bare function name.
+        name: String,
+        /// The revision the reported location belongs to, which is the unpublished
+        /// configuration's or one published version's.
+        revision_id: String,
+    },
+    /// One layer version's archive.
+    LayerArchive {
+        /// The bare layer name.
+        name: String,
+        /// The version number.
+        version: i64,
+    },
+}
+
+/// The object a download request names, or `None` when it names none this service
+/// publishes.
+///
+/// Read from the SAME two parts the URL is built from — the host's bucket label and the
+/// path — so a URL [`code_location_url`] or [`layer_archive_location`] minted resolves
+/// here and nothing else does.
+#[must_use]
+pub fn parse_download_target(host: &str, path: &str) -> Option<DownloadTarget> {
+    let bucket = download_bucket_of_host(host)?;
+    let rest = path
+        .strip_prefix(DOWNLOAD_PATH_PREFIX)?
+        .strip_prefix('/')?;
+    let (account, key) = rest.split_once('/')?;
+    if account != ::engine::emulator_account_id() || key.contains('/') {
+        return None;
+    }
+    let key = smithy_server_runtime::percent_decode(key);
+    // The key is `<name>-<suffix>`, and a name may itself hold `-`, so the SUFFIX is
+    // what is peeled off: a revision id is a UUID, whose rendering is a fixed width, and
+    // a layer version is the decimal number the archive location carried.
+    match bucket {
+        DOWNLOAD_BUCKET_TASKS => {
+            let split = key.len().checked_sub(UUID_RENDERED_LEN)?;
+            // `get` rather than `split_at`: the key is UNTRUSTED input, and a byte offset
+            // that falls inside a multi-byte character is not a split point — it answers
+            // `None` here instead of panicking.
+            let (name, revision_id) = (key.get(..split)?, key.get(split..)?);
+            if ::uuid::Uuid::parse_str(revision_id).is_err() {
+                return None;
+            }
+            Some(DownloadTarget::FunctionPackage {
+                name: name.strip_suffix('-')?.to_string(),
+                revision_id: revision_id.to_string(),
+            })
+        }
+        _ => {
+            let (name, version) = key.rsplit_once('-')?;
+            Some(DownloadTarget::LayerArchive {
+                name: name.to_string(),
+                version: version.parse::<i64>().ok().filter(|version| *version > 0)?,
+            })
+        }
+    }
+}
+
+/// How many characters a UUID's canonical rendering takes, which is the width
+/// [`mint_revision_id`] produces and so the width a download key's revision suffix has.
+const UUID_RENDERED_LEN: usize = 36;
+
+/// The deployment package bytes this emulator holds for `code`, or `None` when it holds
+/// none (an S3 object or a container image it does not resolve).
+#[must_use]
+pub fn held_package_bytes(code: &CodeRecord) -> Option<&[u8]> {
+    code.zip_bytes.as_deref()
+}
+
+/// The digest-pinned URI `FunctionCodeLocation$ResolvedImageUri` reports for a container
+/// image.
+///
+/// The member is "The resolved URI for the image", and what AWS resolves a mutable tag to
+/// is the same repository pinned to the CONTENT it found behind it
+/// (`<repository>@sha256:<digest>`), which is what makes the resolved URI say which image
+/// the function is frozen to. This emulator pulls no image, so the content it holds for an
+/// image package is the reference itself: the digest is computed from the stored
+/// `ImageUri`, which makes the resolved URI stable across reads, equal for two functions
+/// on the same image and different for two different tags of one repository — and only a
+/// new `ImageUri` changes it.
+#[must_use]
+pub fn resolved_image_uri(image_uri: &str) -> String {
+    let digest = sha2::Sha256::digest(image_uri.as_bytes());
+    let rendered: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("{}@sha256:{rendered}", image_repository(image_uri))
+}
+
+/// The repository part of an image URI: everything before the tag or the digest that
+/// qualifies it.
+///
+/// A tag is separated by the LAST `:` after the final `/`, so a registry carrying a port
+/// (`<host>:<port>/<repository>`) is not read as a tag.
+fn image_repository(image_uri: &str) -> &str {
+    if let Some((repository, _)) = image_uri.split_once('@') {
+        return repository;
+    }
+    match image_uri.rsplit_once(':') {
+        Some((repository, tag)) if !tag.contains('/') => repository,
+        _ => image_uri,
+    }
+}
+
+/// `RetentionPeriodInDays` of a durable-execution configuration that never set one.
+///
+/// The member is "The number of days to retain execution history after a durable
+/// execution completes", and a configuration always has an effective retention, so a
+/// read reports this one until a caller states another. RECORDED from AWS's own answer to
+/// a `CreateFunction` carrying a `DurableConfig` that omits the member; it is inside the
+/// member's modelled range (1..90).
+pub const DEFAULT_DURABLE_RETENTION_PERIOD_DAYS: i32 = 14;
+
+/// The durable-execution configuration a function holds once `requested` is applied to
+/// `previous`.
+///
+/// `DurableConfig` is a configuration rather than a value: a request that names it
+/// changes the members it names and leaves the rest of the configuration where it was,
+/// and a member nobody has ever set carries its documented default
+/// ([`DEFAULT_DURABLE_RETENTION_PERIOD_DAYS`]). A request that does not name it at all
+/// leaves the configuration untouched — including absent, for a function that is not
+/// configured for durability ("The function's durable execution configuration settings,
+/// if the function is configured for durability").
+///
+/// What is RECORDED is the default and a partial update that reads both members back
+/// afterwards; no recorded answer shows a member being CLEARED by omission, so an update
+/// changes what it names rather than replacing the whole configuration.
+#[must_use]
+pub fn effective_durable_config(
+    previous: Option<&DurableConfig>,
+    requested: Option<&DurableConfig>,
+) -> Option<DurableConfig> {
+    let Some(requested) = requested else {
+        return previous.cloned();
+    };
+    Some(DurableConfig {
+        kms_key_arn: requested
+            .kms_key_arn
+            .clone()
+            .or_else(|| previous.and_then(|held| held.kms_key_arn.clone())),
+        retention_period_in_days: requested
+            .retention_period_in_days
+            .or_else(|| previous.and_then(|held| held.retention_period_in_days))
+            .or(Some(DEFAULT_DURABLE_RETENTION_PERIOD_DAYS)),
+        execution_timeout: requested
+            .execution_timeout
+            .or_else(|| previous.and_then(|held| held.execution_timeout)),
+    })
+}
+
+/// The service an event source belongs to, as AWS NAMES it in the duplicate-mapping
+/// refusal below.
+///
+/// One row per vendor an `EventSourceArn` can carry. The SQS row is RECORDED from AWS's
+/// own answer to a second `CreateEventSourceMapping` of one queue-and-function pair; the
+/// others state the service's own name, because no answer for them is recorded. A vendor
+/// with no row is named by the ARN's service field as it stands.
+const EVENT_SOURCE_LABELS: &[(&str, &str)] = &[
+    (EVENT_SOURCE_VENDOR_QUEUE, "SQS"),
+    (EVENT_SOURCE_VENDOR_KINESIS, "Kinesis"),
+    (EVENT_SOURCE_VENDOR_DYNAMODB, "DynamoDB"),
+    (EVENT_SOURCE_VENDOR_KAFKA, "MSK"),
+    (EVENT_SOURCE_VENDOR_MQ, "MQ"),
+    (EVENT_SOURCE_VENDOR_DOCUMENT_DB, "DocumentDB"),
+];
+
+/// How the refusal below names the service `vendor` belongs to.
+fn event_source_label(vendor: Option<&str>) -> String {
+    let vendor = vendor.unwrap_or_default();
+    EVENT_SOURCE_LABELS
+        .iter()
+        .find(|(candidate, _)| *candidate == vendor)
+        .map_or_else(|| vendor.to_string(), |(_, label)| (*label).to_string())
+}
+
+/// The refusal a `CreateEventSourceMapping` of a pair that already has a mapping earns.
+///
+/// The message is built from the mapping that already exists — the event source it
+/// polls, the function it invokes and the UUID a caller updates or deletes it by — so a
+/// client holding many mappings can tell WHICH pair collided from the answer alone.
+#[must_use]
+pub fn duplicate_event_source_mapping_message(
+    event_source_arn: &str,
+    function_name: &str,
+    uuid: &str,
+) -> String {
+    format!(
+        "An event source mapping with {label} arn (\" {event_source_arn} \") and function \
+         (\" {function_name} \") already exists. Please update or delete the existing mapping \
+         with UUID {uuid}",
+        label = event_source_label(event_source_vendor(event_source_arn)),
+    )
+}
+
+/// What a call on a layer version's resource-based policy answers when there is no
+/// statement for it to act on: a REMOVAL always, and a READ of a version that has no
+/// policy record at all — one nobody has ever granted anything on.
+pub const LAYER_VERSION_NO_POLICY_MESSAGE: &str =
+    "No policy is associated with the given resource.";
+
+/// What a READ of a layer version answers when its policy record holds no statement:
+/// every statement it had has been removed, so the version it names is the one that has
+/// no policy left.
+///
+/// The layer version EXISTS in both this case and
+/// [`LAYER_VERSION_NO_POLICY_MESSAGE`]'s, so neither is the refusal for a layer version
+/// this account does not hold.
+#[must_use]
+pub fn layer_version_without_policy_message(layer_version_arn: &str) -> String {
+    format!("Layer version {layer_version_arn} does not have any resource policy.")
 }
 
 /// `at` as the ISO-8601 instant the model's `LastModified` member describes

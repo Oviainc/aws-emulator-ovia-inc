@@ -314,6 +314,110 @@ async fn update_stage_refuses_a_storage_configuration_this_account_does_not_hold
     }
 }
 
+/// A refused update applies NONE of the request: the members sent beside the dangling
+/// reference — the stage's `name`, and the other members of the recording configuration —
+/// are not written either, because the reference is resolved before the record is touched.
+///
+/// Rows differ in what the refused request carries beside the reference, which is what the
+/// rule generalises over here: the reference alone, a new `name`, every other member of
+/// `AutoParticipantRecordingConfiguration`
+/// (`smithy_query(query="shape",shape="AutoParticipantRecordingConfiguration")`), and both.
+#[tokio::test]
+async fn a_refused_update_applies_none_of_the_members_sent_beside_the_reference() {
+    let emulator = Emulator::new();
+    let live = emulator.create_storage_configuration("live").await;
+
+    // The stage under test already carries a name and a configuration this account holds,
+    // so applying any part of a refused request would be visible to a later read.
+    let stage_arn = emulator
+        .create_stage(&json!({
+            "name": "original",
+            "autoParticipantRecordingConfiguration": {
+                "storageConfigurationArn": live.as_str(),
+                "recordingReconnectWindowSeconds": 30,
+            },
+        }))
+        .await;
+    let before = emulator.get_stage("baseline", &stage_arn).await;
+    assert_eq!(
+        before["name"],
+        json!("original"),
+        "baseline: expected the stage to be created as \"original\", got {before}"
+    );
+
+    // Every other member of the configuration, each inside its modelled range or length.
+    let every_other_member = json!({
+        "mediaTypes": ["AUDIO_VIDEO"],
+        "thumbnailConfiguration": {
+            "targetIntervalSeconds": 120,
+            "storage": ["LATEST"],
+            "recordingMode": "INTERVAL",
+        },
+        "recordingReconnectWindowSeconds": 300,
+        "hlsConfiguration": { "targetSegmentDurationSeconds": 6 },
+        "recordParticipantReplicas": false,
+    });
+    let cases: Vec<(&str, Option<&str>, Value)> = vec![
+        ("the dangling reference alone", None, json!({})),
+        ("a new name beside the reference", Some("renamed"), json!({})),
+        (
+            "every other configuration member beside the reference",
+            None,
+            every_other_member.clone(),
+        ),
+        (
+            "a new name and every other configuration member",
+            Some("renamed"),
+            every_other_member,
+        ),
+    ];
+
+    for (case, name, other_members) in cases {
+        for (arn_case, arn) in dangling_arns(&live) {
+            let case = format!("{case}, {arn_case}");
+            let mut configuration = json!({ "storageConfigurationArn": arn.as_str() });
+            for (member, value) in other_members
+                .as_object()
+                .expect("the other-member rows are objects")
+            {
+                configuration[member] = value.clone();
+            }
+            let mut request = json!({
+                "arn": stage_arn.as_str(),
+                "autoParticipantRecordingConfiguration": configuration,
+            });
+            if let Some(name) = name {
+                request["name"] = json!(name);
+            }
+
+            let (status, response) = emulator.call("UpdateStage", &request).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected 400 for {request}, got {status} {response}"
+            );
+            assert_eq!(
+                error_code(&response),
+                "ValidationException",
+                "case {case:?}: expected ValidationException for {request}, got {response}"
+            );
+            assert_names_the_reference(&case, "UpdateStage", &arn, &response);
+
+            let after = emulator.get_stage(&case, &stage_arn).await;
+            assert_eq!(
+                after["name"],
+                json!("original"),
+                "case {case:?}: expected the refused update to leave the name \"original\", \
+                 got {after}"
+            );
+            assert_eq!(
+                after, before,
+                "case {case:?}: expected the refused update to leave the stage as it was \
+                 ({before}), got {after}"
+            );
+        }
+    }
+}
+
 /// A reference this account DOES hold is attached and read back, and so is the documented
 /// empty string, which names no resource at all.
 #[tokio::test]

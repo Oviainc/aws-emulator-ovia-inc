@@ -3,11 +3,12 @@
 //! @op GetLatestConfiguration
 //!
 //! Implemented: resolves the single-use configuration token to its persisted session,
-//! compares the version the session was last served against the version deployed for
-//! the session's (application, environment, configuration profile) triple, and returns
-//! the configuration content only when the two differ. Every answer — the content, the
-//! content type, the version label, the rotated token and the poll interval — is read
-//! out of this service's engine state.
+//! then reads the AppConfig control plane for the configuration version deployed into
+//! the session's (application, environment, configuration profile) triple and returns
+//! the content only when that version differs from the one the session was last
+//! served. Every answer — the content, the content type, the version label, the
+//! rotated token and the poll interval — is read out of persisted state: the session
+//! out of this service's own store, the configuration out of AppConfig's.
 //!
 //! ## Shape of an operation
 //!
@@ -152,20 +153,37 @@ impl<Eng> GetLatestConfiguration<Eng> {
     }
 }
 
-/// The `@httpQuery` name of the member a token arrives in, used as the key of the
+/// The Smithy input MEMBER a token arrives in, used as the key of the
 /// `BadRequestException`'s `InvalidParameters` map so a client is told WHICH request
-/// parameter it got wrong.
-const CONFIGURATION_TOKEN_PARAMETER: &str = "configuration_token";
+/// parameter it got wrong. The map is keyed by the member's modelled name
+/// (`GetLatestConfigurationRequest$ConfigurationToken`), not by the
+/// `@httpQuery(configuration_token)` name it travels under.
+const CONFIGURATION_TOKEN_MEMBER: &str = "ConfigurationToken";
 
 /// `BadRequestReason` has exactly one value in the model (`InvalidParameters`): the
 /// request carried a parameter the service could not use.
 const REASON_INVALID_PARAMETERS: &str = "InvalidParameters";
 
+/// The modelled `InvalidParameterProblem` values, as `INVALID_PARAMETER_PROBLEM_VALUES`
+/// in `crate::ops::types` lists them, paired with the terse sentence AppConfigData
+/// states each one with.
+///
+/// The sentences are the service's OWN fixed text, not prose of the emulator's, and
+/// carry nothing from the request: WHICH problem applies is what a client branches on,
+/// and it travels in `Details.InvalidParameters[…].Problem` rather than in the
+/// sentence. The token itself is never echoed — it is the client's credential for the
+/// session.
+const TOKEN_PROBLEM_MESSAGES: &[(&str, &str)] = &[
+    ("Corrupted", "Token not valid"),
+    ("Expired", "Token expired"),
+    ("PollIntervalNotSatisfied", "Request too early"),
+];
+
 /// Refuse the call with the modelled `BadRequestException` (HTTP 400), naming the
 /// token parameter and `problem` — one of `InvalidParameterProblem`'s modelled
 /// values (`Corrupted`, `Expired`, `PollIntervalNotSatisfied`), see
-/// [`INVALID_PARAMETER_PROBLEM_VALUES`].
-fn bad_configuration_token(problem: &str, message: String) -> GetLatestConfigurationError {
+/// [`INVALID_PARAMETER_PROBLEM_VALUES`] and [`TOKEN_PROBLEM_MESSAGES`].
+fn bad_configuration_token(problem: &str) -> GetLatestConfigurationError {
     debug_assert!(
         INVALID_PARAMETER_PROBLEM_VALUES.contains(&problem),
         "problem must be a modelled InvalidParameterProblem value"
@@ -178,8 +196,15 @@ fn bad_configuration_token(problem: &str, message: String) -> GetLatestConfigura
         problem,
         "refused a configuration token"
     );
+    let message = TOKEN_PROBLEM_MESSAGES
+        .iter()
+        .find(|(modelled, _)| *modelled == problem)
+        .map(|(_, message)| (*message).to_string())
+        .unwrap_or_else(|| {
+            "The input fails to satisfy the constraints specified by the service.".to_string()
+        });
     let invalid_parameters = std::collections::HashMap::from([(
-        CONFIGURATION_TOKEN_PARAMETER.to_string(),
+        CONFIGURATION_TOKEN_MEMBER.to_string(),
         InvalidParameterDetail {
             problem: Some(problem.to_string()),
         },
@@ -210,121 +235,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Request metadata is not read: the token in the query string identifies the
-        // session, and everything else comes out of this service's state.
+        // session, and everything else comes out of persisted state.
         let _ = ctx;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(GetLatestConfigurationErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: Some(
-                        "the AppConfigData session store is unavailable in this emulator"
-                            .to_string(),
-                    ),
-                },
-            )
-            .into());
+            return Err(session_store_unavailable());
         };
 
         let now = std::time::SystemTime::now();
         let token = input.configuration_token;
-        let mut state = state.lock();
 
-        // STEP 1 — resolve the token. It is opaque, so a token this store never
-        // minted carries no session and cannot be understood: `Corrupted`.
-        let Some(session) = state.session(&token).cloned() else {
-            return Err(bad_configuration_token(
-                "Corrupted",
-                "The configuration token is not valid for any configuration session."
-                    .to_string(),
-            ));
-        };
+        // STEP 1 — resolve the token and check it may be used, under this service's
+        // own lock, which is RELEASED before the control plane is read: the two stores
+        // are taken one at a time, never nested.
+        let session = {
+            let state = state.lock();
 
-        // STEP 2 — a token is valid for exactly ONE call, and for at most
-        // `TOKEN_LIFETIME` after it was minted; past either, it can no longer be
-        // used: `Expired`.
-        if session.is_consumed() {
-            return Err(bad_configuration_token(
-                "Expired",
-                "The configuration token has already been used. Use the \
-                 NextPollConfigurationToken from the most recent \
-                 GetLatestConfiguration response."
-                    .to_string(),
-            ));
-        }
-        if now >= session.expires_at {
-            return Err(bad_configuration_token(
-                "Expired",
-                "The configuration token has expired. Call \
-                 StartConfigurationSession to start a new configuration session."
-                    .to_string(),
-            ));
-        }
+            // The token is opaque, so one this store never minted carries no session
+            // and cannot be understood: `Corrupted`.
+            let Some(session) = state.session(&token).cloned() else {
+                return Err(bad_configuration_token("Corrupted"));
+            };
 
-        // STEP 3 — honour the floor the session asked for: a session that set
-        // `RequiredMinimumPollIntervalInSeconds` may not poll faster than that, and
-        // the refusal leaves the token UNCONSUMED so the client can poll again once
-        // the interval has passed.
-        //
-        // ONE value feeds both the floor enforced here and the interval reported
-        // below, so the response never advertises a cadence other than the one
-        // enforced. A non-positive stored value is no floor at all (the modelled
-        // 15..86400 range refuses one at the boundary, before this handler runs).
-        let required_minimum = session
-            .required_minimum_poll_interval_in_seconds
-            .filter(|seconds| *seconds > 0);
-        if let (Some(minimum), Some(last_polled_at)) = (required_minimum, session.last_polled_at) {
-            let minimum = std::time::Duration::from_secs(u64::from(minimum.unsigned_abs()));
-            let since_last_poll = now
-                .duration_since(last_polled_at)
-                .unwrap_or(std::time::Duration::ZERO);
-            if since_last_poll < minimum {
-                return Err(bad_configuration_token(
-                    "PollIntervalNotSatisfied",
-                    format!(
-                        "This session was started with a required minimum poll \
-                         interval of {minimum_seconds} seconds.",
-                        minimum_seconds = minimum.as_secs()
-                    ),
-                ));
+            // A token is valid for exactly ONE call, and for at most `TOKEN_LIFETIME`
+            // after it was minted; past either, it can no longer be used: `Expired`.
+            if let Some(expired) = expiry_refusal(&session, now) {
+                return Err(expired);
             }
-        }
 
-        // STEP 4 — the configuration the session polls must actually be deployed.
-        let key = session.configuration_key();
-        let Some(deployed) = state.deployed_configuration(&key).cloned() else {
-            return Err(GetLatestConfigurationErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "No deployed configuration found for application \
-                         '{application}', environment '{environment}' and \
-                         configuration profile '{profile}'.",
-                        application = key.0,
-                        environment = key.1,
-                        profile = key.2,
-                    )),
-                    resource_type: Some("Configuration".to_string()),
-                    referenced_by: None,
-                },
-            )
-            .into());
+            // Honour the floor the session asked for: a session that set
+            // `RequiredMinimumPollIntervalInSeconds` may not poll faster than that,
+            // and the refusal leaves the token UNCONSUMED so the client can poll again
+            // once the interval has passed.
+            //
+            // ONE value feeds both the floor enforced here and the interval reported
+            // below, so the response never advertises a cadence other than the one
+            // enforced. A non-positive stored value is no floor at all (the modelled
+            // 15..86400 range refuses one at the boundary, before this handler runs).
+            if let (Some(minimum), Some(last_polled_at)) =
+                (required_minimum(&session), session.last_polled_at)
+            {
+                let minimum = std::time::Duration::from_secs(u64::from(minimum.unsigned_abs()));
+                let since_last_poll = now
+                    .duration_since(last_polled_at)
+                    .unwrap_or(std::time::Duration::ZERO);
+                if since_last_poll < minimum {
+                    return Err(bad_configuration_token("PollIntervalNotSatisfied"));
+                }
+            }
+            session
         };
 
-        // STEP 5 — content is returned ONLY when the deployed version differs from
+        // STEP 2 — the configuration the session polls is read out of the AppConfig
+        // CONTROL PLANE: the application, environment and configuration profile the
+        // session named must exist there, and the version the environment's in-force
+        // deployment deployed is what this call serves.
+        let Some(deployed) = crate::state::served_configuration(
+            &*self.engine,
+            &session.application_identifier,
+            &session.environment_identifier,
+            &session.configuration_profile_identifier,
+            now,
+        ) else {
+            return Err(control_plane_unavailable());
+        };
+        let deployed = match deployed {
+            Ok(deployed) => deployed,
+            Err(unresolved) => {
+                return Err(GetLatestConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(unresolved.message),
+                        resource_type: Some(unresolved.resource_type.to_string()),
+                        referenced_by: unresolved.referenced_by.map(|(member, identifier)| {
+                            std::collections::HashMap::from([(member.to_string(), identifier)])
+                        }),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // STEP 3 — content is returned ONLY when the deployed version differs from
         // the one this session was last served. Both values are read out of state,
         // so "unchanged" is a comparison, never an assumption.
-        let already_has_latest = session.last_served_version == Some(deployed.version);
+        let already_has_latest = session.last_served_version.as_deref() == Some(&deployed.version);
 
-        // STEP 6 — rotate the token. The model's own doc for this operation says
+        // STEP 4 — rotate the token. The model's own doc for this operation says
         // each token is valid for one call and "the GetLatestConfiguration response
         // includes a NextPollConfigurationToken that should always replace the token
         // used for the just-completed call", so minting the successor is what this
         // call is defined to do. The successor carries the version just served, so
         // the next poll's comparison is against what the client now holds.
-        state.consume_token(&token, now);
-        let mut next_session = session.clone();
-        next_session.last_served_version = Some(deployed.version);
-        next_session.last_polled_at = Some(now);
-        let next_poll_configuration_token = state.store_session(next_session, now);
+        //
+        // The token is re-checked under the lock it is consumed under: the control
+        // plane was read with no guard held, so another poll could have spent the same
+        // token in between, and a token is good for exactly one call.
+        let next_poll_configuration_token = {
+            let mut state = state.lock();
+            match state.session(&token) {
+                None => return Err(bad_configuration_token("Corrupted")),
+                Some(current) => {
+                    if let Some(expired) = expiry_refusal(current, now) {
+                        return Err(expired);
+                    }
+                }
+            }
+            state.consume_token(&token, now);
+            let mut next_session = session.clone();
+            next_session.last_served_version = Some(deployed.version.clone());
+            next_session.last_polled_at = Some(now);
+            state.store_session(next_session, now)
+        };
 
         // An access record for the poll: which configuration was read and whether
         // content was served. The token values are never recorded.
@@ -335,10 +356,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             } else {
                 "configuration served"
             },
-            application = key.0.as_str(),
-            environment = key.1.as_str(),
-            configuration_profile = key.2.as_str(),
-            version = deployed.version,
+            application = session.application_identifier.as_str(),
+            environment = session.environment_identifier.as_str(),
+            configuration_profile = session.configuration_profile_identifier.as_str(),
+            version = deployed.version.as_str(),
             "served a configuration poll"
         );
 
@@ -346,7 +367,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_poll_configuration_token: Some(next_poll_configuration_token),
             // The interval the session asked for, else the service's default: never
             // the modelled `0` default, which would tell a client to poll in a loop.
-            next_poll_interval_in_seconds: required_minimum
+            next_poll_interval_in_seconds: required_minimum(&session)
                 .unwrap_or(crate::state::DEFAULT_POLL_INTERVAL_IN_SECONDS),
             // An empty payload when the client already has the latest version. The
             // version label is documented to be empty in that case ("If the client
@@ -359,12 +380,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             } else {
                 deployed.content
             }),
-            content_type: Some(deployed.content_type.clone()),
+            content_type: Some(deployed.content_type),
             version_label: if already_has_latest {
                 None
             } else {
-                deployed.version_label.clone()
+                deployed.version_label
             },
         })
     }
+}
+
+/// The poll floor this session asked for, when it asked for a usable one.
+fn required_minimum(session: &crate::state::Session) -> Option<i32> {
+    session
+        .required_minimum_poll_interval_in_seconds
+        .filter(|seconds| *seconds > 0)
+}
+
+/// Why `session`'s token can no longer be used, if it cannot: it has already served
+/// its one call, or its lifetime has passed. Both are `Expired`.
+fn expiry_refusal(
+    session: &crate::state::Session,
+    now: std::time::SystemTime,
+) -> Option<GetLatestConfigurationError> {
+    (session.is_consumed() || now >= session.expires_at)
+        .then(|| bad_configuration_token("Expired"))
+}
+
+/// This service's own session store could not be reached.
+fn session_store_unavailable() -> GetLatestConfigurationError {
+    GetLatestConfigurationErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the AppConfigData session store is unavailable in this emulator".to_string()),
+    })
+    .into()
+}
+
+/// The AppConfig control plane's store — which holds the configuration a poll serves —
+/// could not be reached.
+fn control_plane_unavailable() -> GetLatestConfigurationError {
+    GetLatestConfigurationErrorModeled::InternalServerException(InternalServerException {
+        message: Some(
+            "the AppConfig control plane state is unavailable in this emulator".to_string(),
+        ),
+    })
+    .into()
 }
