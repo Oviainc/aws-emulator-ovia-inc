@@ -599,6 +599,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A write initiates no restore either: a restore is asked for on an
             // already-archived version afterwards, by `RestoreObject`.
             restore: None,
+            // And it attaches no annotation: a write REPLACES the whole object, so the
+            // object it replaces takes its annotations with it, and
+            // `PutObjectAnnotation` is what attaches one to the version this write stores.
+            annotations: ::std::collections::BTreeMap::new(),
             body: input.body,
         };
 

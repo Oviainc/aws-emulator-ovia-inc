@@ -31,6 +31,8 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# Builds the opaque `nextToken` candidates the pagination suites hand back.
+hex = { workspace = true }
 # `tokio::time::sleep` for the clock-owed transitions the tests wait out.
 tokio = { workspace = true, features = ["time"] }
 

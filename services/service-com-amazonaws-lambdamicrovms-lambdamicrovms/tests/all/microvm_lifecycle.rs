@@ -78,15 +78,27 @@ pub(crate) async fn call(
     uri: &str,
     body: Option<Value>,
 ) -> (u16, Value) {
+    call_in_region(router, REGION, method, uri, body).await
+}
+
+/// The same request as [`call`], signed for `region` — so a suite can assert which
+/// region the ARNs of an answer carry.
+pub(crate) async fn call_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
     let payload = body.map(|value| value.to_string()).unwrap_or_default();
     let request = http::Request::builder()
         .method(method)
-        .uri(format!("https://lambda.{REGION}.amazonaws.com{uri}"))
-        .header("host", format!("lambda.{REGION}.amazonaws.com"))
+        .uri(format!("https://lambda.{region}.amazonaws.com{uri}"))
+        .header("host", format!("lambda.{region}.amazonaws.com"))
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTESTKEY/20260101/{REGION}/lambda/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential=AKIDTESTKEY/20260101/{region}/lambda/aws4_request, \
                  SignedHeaders=host, Signature=0"
             ),
         )
