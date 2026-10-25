@@ -16,9 +16,9 @@
 //!   `UpdateDictionary` writes the members the request carried (and only those) into the
 //!   stored dictionary, so `GetDictionary` and `ExportDictionaryEntries` report them;
 //! * `DeleteDictionary` retires the dictionary: it reports `DELETING`, and once the
-//!   deletion falls due the id stops resolving for a read, so `GetDictionary` answers 404
-//!   `ResourceNotFoundException` — forever, not transiently — while a retry of the
-//!   delete itself reports the completed deletion (`tests/all/completed_deletion.rs`);
+//!   deletion falls due the id stops resolving at all, so `GetDictionary` and a repeat
+//!   of the delete both answer 404 `ResourceNotFoundException` — forever, not
+//!   transiently (`tests/all/completed_deletion.rs`);
 //! * a dictionary is `REFERENCED`, with the referencing feed's id in `references`,
 //!   exactly while some feed output's subtitling config names it, whichever call put it
 //!   there; and "you cannot delete a dictionary that is referenced by a feed", which is
@@ -346,7 +346,8 @@ async fn update_dictionary_refuses_an_unknown_id_and_a_value_outside_the_model()
 
 /// DeleteDictionary retires the dictionary: it reports DELETING, repeating the call
 /// inside that window is idempotent, and once the removal falls due the id stops
-/// resolving — while every other dictionary is left alone.
+/// resolving for the delete as well as for the read — while every other dictionary is
+/// left alone.
 #[tokio::test]
 async fn delete_dictionary_retires_the_dictionary_from_state() {
     // Deleting one of several dictionaries must leave the others alone, so the table
@@ -448,14 +449,13 @@ async fn delete_dictionary_retires_the_dictionary_from_state() {
             );
         }
 
-        // Retrying the delete reports the deletion it already served, with the status
-        // the model gives a dictionary after deletion, rather than refusing a call the
-        // service accepted.
+        // Retrying the delete once the removal has fallen due names a dictionary this
+        // Region no longer holds, so it is refused exactly as GetDictionary is.
         let (status, retried) = call(&router, "DELETE", &format!("/v1/dictionary/{id}"), None).await;
         assert_eq!(
-            (status, &retried["status"]),
-            (202, &json!("DELETED")),
-            "case {label:?}: retrying the completed delete reports DELETED, got {status} with \
+            (status, &retried["__type"]),
+            (404, &json!("ResourceNotFoundException")),
+            "case {label:?}: repeating the completed delete is a 404, got {status} with \
              {retried}"
         );
     }

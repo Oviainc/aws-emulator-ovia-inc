@@ -34,7 +34,10 @@
 //! ([`ObservedFunction`]), from which `GetLambdaFunctionRecommendations` DERIVES every
 //! recommendation it reports, and so are the licensed Amazon EC2 instances
 //! ([`ObservedLicensedInstance`]), from which `GetLicenseRecommendations` DERIVES every
-//! license recommendation it reports.
+//! license recommendation it reports, and the Amazon EC2 instances it analyses
+//! ([`ObservedInstance`]), whose observed utilization
+//! `GetEC2RecommendationProjectedMetrics` projects onto each instance type the analysis
+//! recommends.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -1838,7 +1841,7 @@ impl AnalyzedAutoScalingGroup {
     /// The same work runs on whatever capacity the configuration provides, so each
     /// percentage scales with the ratio of the capacity it was observed on to the
     /// capacity it is projected onto — CPU by the group's total vCPUs, memory by the
-    /// group's total memory — and is reported as a percentage, so it is capped at 100.
+    /// group's total memory — through the one projection [`project_percentage`] states.
     pub fn projected_utilization_metrics(
         &self,
         candidate: &GroupConfiguration,
@@ -1851,15 +1854,10 @@ impl AnalyzedAutoScalingGroup {
                 } else {
                     (self.current.total_vcpus(), candidate.total_vcpus())
                 };
-                let projected = if to <= 0.0 {
-                    *observed
-                } else {
-                    (observed * from / to).min(100.0)
-                };
                 UtilizationMetric {
                     name: Some(name.clone()),
                     statistic: Some(METRIC_STATISTIC_MAXIMUM.to_string()),
-                    value: round_hundredths(projected),
+                    value: project_percentage(*observed, from, to),
                 }
             })
             .collect()
@@ -3330,6 +3328,23 @@ pub const RDS_METRIC_MEMORY: &str = "Memory";
 /// The highest value a metric measured as a PERCENTAGE of a capacity can take.
 pub const UTILIZATION_PERCENTAGE_CEILING: f64 = 100.0;
 
+/// `observed` — a percentage of a capacity of `from` — as a percentage of a capacity of `to`.
+///
+/// The same work runs on whatever capacity it is moved to, so the percentage scales with the
+/// ratio of the two capacities: the same work on half the capacity runs at twice the
+/// utilization. It is a percentage, so it cannot pass [`UTILIZATION_PERCENTAGE_CEILING`], and
+/// a capacity of nothing is no ratio at all, so the observation stands.
+///
+/// The ONE percentage projection in this service: a resource's utilization projected onto a
+/// recommendation option means the same thing, and rounds to the same place, for an Amazon EC2
+/// instance, an Auto Scaling group and an Amazon Aurora or RDS database.
+pub fn project_percentage(observed: f64, from: f64, to: f64) -> f64 {
+    if to <= 0.0 {
+        return round_hundredths(observed);
+    }
+    round_hundredths((observed * from / to).clamp(0.0, UTILIZATION_PERCENTAGE_CEILING))
+}
+
 /// The value `metric_name` is projected to take on the recommended DB instance class, given
 /// the `observed` value on the current one.
 ///
@@ -3352,13 +3367,10 @@ pub fn rds_projected_metric_value(
     let capacities = current_instance_class
         .and_then(instance_size_capacity)
         .zip(recommended_instance_class.and_then(instance_size_capacity));
-    let Some((current, recommended)) = capacities.filter(|(_, recommended)| *recommended > 0.0)
-    else {
+    let Some((current, recommended)) = capacities else {
         return observed;
     };
-    round_hundredths(
-        (observed * current / recommended).clamp(0.0, UTILIZATION_PERCENTAGE_CEILING),
-    )
+    project_percentage(observed, current, recommended)
 }
 
 /// Whether an `RDSDBMetricName` measures, as a percentage, a resource the DB instance class
@@ -3497,9 +3509,11 @@ pub const LAMBDA_METRIC_DURATION: &str = "Duration";
 /// See [`LAMBDA_METRIC_DURATION`].
 pub const LAMBDA_METRIC_MEMORY: &str = "Memory";
 
-/// The `LambdaFunctionMetricStatistic` value beside [`METRIC_STATISTIC_MAXIMUM`]
-/// (`crate::ops::types::LAMBDA_FUNCTION_METRIC_STATISTIC_VALUES` are `Average` |
-/// `Maximum`).
+/// The statistic value beside [`METRIC_STATISTIC_MAXIMUM`] that this API's metric-statistic
+/// vocabularies declare (`crate::ops::types::METRIC_STATISTIC_VALUES` and
+/// `crate::ops::types::LAMBDA_FUNCTION_METRIC_STATISTIC_VALUES` are both `Average` |
+/// `Maximum`): the other statistic an analysis records an observation under, and so the other
+/// one a reader of projected metrics can ask for.
 pub const METRIC_STATISTIC_AVERAGE: &str = "Average";
 
 /// The `LambdaFunctionMemoryMetricStatistic` values
@@ -5403,6 +5417,334 @@ pub fn export_job_matches_filters(job: &ExportJob, filters: &[JobFilter], now: f
     })
 }
 
+// ---------------------------------------------------------------------------
+// The Amazon EC2 instances Compute Optimizer observes
+//
+// Compute Optimizer analyses the workload it OBSERVES on an instance, so no operation of
+// this API creates an instance or an analysis of one: the observation below is part of the
+// store's INITIAL VALUE (`observed_instances`), exactly as the volume, group, function and
+// license observations are. Everything a reader reports about an instance — its finding,
+// what it costs, the instance types the analysis would move it to, and the utilization
+// projected onto each of them — is DERIVED from it, so no two readers of one instance can
+// disagree, and the `Ec2Instance` rows of the findings catalog are projected from it
+// (`ObservedInstance::to_analysed_resource`) rather than stated a second time.
+// ---------------------------------------------------------------------------
+
+/// One Amazon EC2 instance TYPE, as the configuration an instance runs today or as one the
+/// analysis found as a candidate for it. Both sides are the same shape because every figure
+/// derived from them — the cost, the saving, the utilization projected onto a candidate — is
+/// a comparison BETWEEN two of them, the same reason [`GroupConfiguration`] serves both
+/// sides of an Auto Scaling group's analysis.
+#[derive(Debug, Clone)]
+pub struct InstanceConfiguration {
+    /// The instance type, `<family>.<size>` — what
+    /// `RecommendedOptionProjectedMetric$recommendedInstanceType` names.
+    pub instance_type: String,
+    /// The vCPUs this instance type provides.
+    pub vcpus: f64,
+    /// The memory, in GiB, this instance type provides.
+    pub memory_gib: f64,
+    /// The public on-demand price of one instance-hour, in [`CURRENCY_USD`].
+    pub hourly_price: f64,
+    /// This type's `CpuVendorArchitecture`: [`CPU_ARCHITECTURE_CURRENT`] or
+    /// [`CPU_ARCHITECTURE_AWS_ARM64`].
+    pub architecture: String,
+}
+
+/// Whether a `MetricName` measures, as a percentage, a resource the instance TYPE sizes — the
+/// instance's vCPUs (`Cpu`) and its memory (`Memory`).
+///
+/// "`Cpu` — the projected percentage of allocated EC2 compute units … identifies the
+/// processing power required to run an application" and "`Memory` — the percentage of memory
+/// that would be in use … identifies the amount of memory required" (`ProjectedMetric$name`):
+/// both are percentages of what the instance type provides, so moving to another type changes
+/// what they are OF. Every other `MetricName` of that value set measures the workload's own
+/// traffic — its network packets and bytes, its disk and EBS operations — which changing the
+/// instance type does not resize.
+///
+/// They are also exactly the metrics a PROJECTION reports: "The `Cpu` and `Memory` metrics are
+/// the only projected utilization metrics returned when you run the
+/// `GetEC2RecommendationProjectedMetrics` action" (`RecommendedOptionProjectedMetric`).
+pub fn metric_sized_by_instance_type(metric_name: &str) -> bool {
+    metric_name == METRIC_CPU || metric_name == METRIC_MEMORY
+}
+
+impl InstanceConfiguration {
+    /// The estimated monthly on-demand cost of running one instance of this type: the price
+    /// of one instance-hour × [`HOURS_PER_MONTH`].
+    pub fn monthly_cost(&self) -> f64 {
+        round_hundredths(self.hourly_price * HOURS_PER_MONTH)
+    }
+
+    /// The capacity a metric named `metric_name` is measured as a percentage OF on this
+    /// instance type, or `None` for a metric the instance type does not size
+    /// ([`metric_sized_by_instance_type`]).
+    pub fn metric_capacity(&self, metric_name: &str) -> Option<f64> {
+        match metric_name {
+            METRIC_CPU => Some(self.vcpus),
+            METRIC_MEMORY => Some(self.memory_gib),
+            _ => None,
+        }
+    }
+}
+
+/// One utilization figure the analysis observed on an instance: the `MetricName` measured,
+/// the `MetricStatistic` it was observed under, and its value.
+#[derive(Debug, Clone)]
+pub struct ObservedInstanceMetric {
+    /// The `MetricName` measured (`crate::ops::types::METRIC_NAME_VALUES`).
+    pub name: String,
+    /// The `MetricStatistic` the figure was observed under ([`METRIC_STATISTIC_MAXIMUM`] or
+    /// [`METRIC_STATISTIC_AVERAGE`]), which is what a request's `stat` selects on.
+    pub statistic: String,
+    /// The figure itself: a percentage for a metric the instance type sizes
+    /// ([`InstanceConfiguration::metric_capacity`]), and the metric's own unit otherwise.
+    pub value: f64,
+}
+
+/// One Amazon EC2 instance Compute Optimizer has analysed: the instance type it runs, the
+/// utilization observed on it, and the instance types the analysis found as candidates for
+/// it. Every value a reader REPORTS about the instance is one of these stored observations
+/// or a figure computed from them, so two readers of the same instance cannot disagree.
+#[derive(Debug, Clone)]
+pub struct ObservedInstance {
+    /// The EC2 instance id, which is this inventory's key. The ARN a reader reports is built
+    /// from it and the region the request was signed for ([`Self::instance_arn`]), because
+    /// Compute Optimizer is a REGIONAL service.
+    pub instance_id: String,
+    /// The account that owns the instance.
+    pub account_id: String,
+    /// The instance type the instance runs today.
+    pub current: InstanceConfiguration,
+    /// The candidate instance types the analysis found, best first — so a reported `rank` is
+    /// a candidate's position in this list ("the top recommendation option is ranked as 1").
+    /// Empty for an instance the analysis would leave as it is.
+    pub candidates: Vec<InstanceConfiguration>,
+    /// The utilization the analysis observed over its look-back period, one figure per
+    /// metric and statistic.
+    pub utilization: Vec<ObservedInstanceMetric>,
+    /// The `FindingReasonCode`s behind the instance's finding; empty where it has none.
+    pub finding_reason_codes: Vec<String>,
+    /// `currentPerformanceRisk`: the `CurrentPerformanceRisk` the instance's current
+    /// configuration runs.
+    pub current_performance_risk: String,
+    /// The `InferredWorkloadType`s the analysis inferred for the instance; empty where it
+    /// inferred none.
+    pub inferred_workload_types: Vec<String>,
+}
+
+impl ObservedInstance {
+    /// This instance's identity WITHOUT the region — the resource part of its ARN.
+    pub fn arn_resource(&self) -> String {
+        format!("instance/{}", self.instance_id)
+    }
+
+    /// This instance's ARN as the endpoint in `region` reports it:
+    /// `arn:aws:ec2:<region>:<account>:instance/<id>`, the form
+    /// `GetEC2RecommendationProjectedMetrics$instanceArn` carries.
+    pub fn instance_arn(&self, region: &str) -> String {
+        resource_arn_in("ec2", region, &self.account_id, &self.arn_resource())
+    }
+
+    /// The top-ranked candidate the analysis found, or `None` for an instance it would leave
+    /// as it is — which is also the configuration a cost or a saving is computed against.
+    pub fn recommended_configuration(&self) -> Option<&InstanceConfiguration> {
+        self.candidates.first()
+    }
+
+    /// The instance's `Finding`.
+    ///
+    /// An instance is `Overprovisioned` "if at least one specification of your instance, such
+    /// as CPU, memory, or network, can be sized down while still meeting the performance
+    /// requirements of your workload", `Underprovisioned` "if at least one specification …
+    /// does not meet the performance requirements of your workload", and `Optimized` "when
+    /// all specifications … meet the performance requirements" — so the finding follows the
+    /// top-ranked candidate: one that GROWS a specification is one the workload needed more
+    /// of, one that only SHRINKS specifications is one the instance has more of than the
+    /// workload needs, and an instance with no candidate at all, or one at the same capacity
+    /// (a newer generation of the same size), is optimized.
+    pub fn finding(&self) -> &'static str {
+        let Some(option) = self.recommended_configuration() else {
+            return FINDING_OPTIMIZED;
+        };
+        let grows = option.vcpus > self.current.vcpus || option.memory_gib > self.current.memory_gib;
+        let shrinks =
+            option.vcpus < self.current.vcpus || option.memory_gib < self.current.memory_gib;
+        match (grows, shrinks) {
+            (true, _) => FINDING_UNDERPROVISIONED,
+            (false, true) => FINDING_OVERPROVISIONED,
+            (false, false) => FINDING_OPTIMIZED,
+        }
+    }
+
+    /// The value a metric is projected to take once the instance runs on `option`, given the
+    /// `observed` value on the type it runs today.
+    ///
+    /// "This represents the projected utilization of a recommendation option had you used
+    /// that resource during the analyzed period" (`ProjectedMetric`): a metric measured as a
+    /// percentage of a resource the instance type sizes
+    /// ([`InstanceConfiguration::metric_capacity`]) is projected by the one percentage
+    /// projection [`project_percentage`] states. Every other metric measures the workload
+    /// itself, which changing the instance type does not resize, so it is projected
+    /// unchanged.
+    ///
+    /// The ONE projection rule for an instance, so the series this projects over a window and
+    /// the projected utilization an instance recommendation option reports cannot disagree.
+    pub fn projected_metric_value(
+        &self,
+        metric_name: &str,
+        observed: f64,
+        option: &InstanceConfiguration,
+    ) -> f64 {
+        let capacities = self
+            .current
+            .metric_capacity(metric_name)
+            .zip(option.metric_capacity(metric_name));
+        let Some((from, to)) = capacities else {
+            return observed;
+        };
+        project_percentage(observed, from, to)
+    }
+
+    /// This instance as a row of the findings catalog, i.e. as `GetRecommendationSummaries`
+    /// aggregates it: the finding the analysis reached, what the instance costs today and
+    /// what the top-ranked candidate would cost — "the top recommendation option is ranked as
+    /// 1" — or its own cost where the analysis found no candidate.
+    ///
+    /// The projection is what keeps one instance's analysis in ONE place: the summary reader
+    /// and every reader of an instance recommendation answer from this observation, so they
+    /// cannot disagree about an instance's finding, its performance risk or what adopting its
+    /// recommendation saves.
+    pub fn to_analysed_resource(&self) -> AnalysedResource {
+        AnalysedResource {
+            account_id: self.account_id.clone(),
+            resource_type: SOURCE_TYPE_EC2_INSTANCE.to_string(),
+            // The catalog records a resource's REGION-FREE identity
+            // ([`AnalysedResource::arn_in`]), which for an instance is its EC2 instance id.
+            arn_service: "ec2".to_string(),
+            arn_resource: self.arn_resource(),
+            finding: self.finding().to_string(),
+            finding_reason_codes: self.finding_reason_codes.clone(),
+            current_performance_risk: self.current_performance_risk.clone(),
+            current_monthly_cost: self.current.monthly_cost(),
+            recommended_monthly_cost: self
+                .recommended_configuration()
+                .unwrap_or(&self.current)
+                .monthly_cost(),
+            inferred_workload_types: self.inferred_workload_types.clone(),
+            // An instance is not a database, so there is no database configuration to record.
+            rds_database: None,
+        }
+    }
+}
+
+/// The Amazon EC2 instance inventory this emulator observes, generated once when the store
+/// is created.
+///
+/// The emulator watches no real workload, so WHICH instances it holds and the utilization
+/// observed on them are a fixed observation rather than something derived from traffic.
+/// Everything a reader reports is nevertheless computed from what is stored here — each
+/// cost from the stored on-demand price, each finding from the candidate the analysis found,
+/// and every projected metric from the observed one — so a reader cannot report a figure the
+/// observation does not support.
+///
+/// The set spans the cases an instance recommendation distinguishes: an instance the
+/// analysis would size DOWN (so its recommendation saves, and one of its candidates is a
+/// Graviton type, which a request may ask for on its own), one it would size UP (whose
+/// recommendation therefore saves nothing) and one it would leave as it is (which has no
+/// candidate to project onto).
+///
+/// The prices and capacities are the public on-demand Linux prices of these instance types
+/// in the `us-east-1` Region, as the Amazon EC2 On-Demand pricing page lists them: `m5.large`
+/// $0.096 per hour with 2 vCPUs and 8 GiB, `m5.xlarge` $0.192 with 4 vCPUs and 16 GiB,
+/// `m5.2xlarge` $0.384 with 8 vCPUs and 32 GiB, and the Graviton `m6g.xlarge` $0.154 with
+/// 4 vCPUs and 16 GiB.
+fn observed_instances() -> Vec<ObservedInstance> {
+    let account_id = ::engine::emulator_account_id().to_string();
+    let configuration = |instance_type: &str,
+                         vcpus: f64,
+                         memory_gib: f64,
+                         hourly_price: f64,
+                         architecture: &str| InstanceConfiguration {
+        instance_type: instance_type.to_string(),
+        vcpus,
+        memory_gib,
+        hourly_price,
+        architecture: architecture.to_string(),
+    };
+    let m5_large = || configuration("m5.large", 2.0, 8.0, 0.096, CPU_ARCHITECTURE_CURRENT);
+    let m5_xlarge = || configuration("m5.xlarge", 4.0, 16.0, 0.192, CPU_ARCHITECTURE_CURRENT);
+    let m5_2xlarge = || configuration("m5.2xlarge", 8.0, 32.0, 0.384, CPU_ARCHITECTURE_CURRENT);
+    let m6g_xlarge = || configuration("m6g.xlarge", 4.0, 16.0, 0.154, CPU_ARCHITECTURE_AWS_ARM64);
+    let metric = |name: &str, statistic: &str, value: f64| ObservedInstanceMetric {
+        name: name.to_string(),
+        statistic: statistic.to_string(),
+        value,
+    };
+
+    vec![
+        // Half the workload's memory and processing power is idle: the analysis would move
+        // the instance to half the capacity, which costs half as much. It found a Graviton
+        // candidate of the same capacity too, which a request asking for `AWS_ARM64` gets on
+        // its own.
+        ObservedInstance {
+            instance_id: "i-0a1b2c3d4e5f60001".to_string(),
+            account_id: account_id.clone(),
+            current: m5_2xlarge(),
+            candidates: vec![m5_xlarge(), m6g_xlarge()],
+            utilization: vec![
+                metric(METRIC_CPU, METRIC_STATISTIC_MAXIMUM, 22.5),
+                metric(METRIC_MEMORY, METRIC_STATISTIC_MAXIMUM, 31.0),
+                metric(METRIC_CPU, METRIC_STATISTIC_AVERAGE, 12.0),
+                metric(METRIC_MEMORY, METRIC_STATISTIC_AVERAGE, 20.0),
+                // A metric the instance type does not size: the workload's own network
+                // traffic, in bytes per second.
+                metric(
+                    "NETWORK_IN_BYTES_PER_SECOND",
+                    METRIC_STATISTIC_MAXIMUM,
+                    1_250_000.0,
+                ),
+            ],
+            finding_reason_codes: vec![METRIC_REASON_MEMORY_OVERPROVISIONED.to_string()],
+            current_performance_risk: PERFORMANCE_RISK_VERY_LOW.to_string(),
+            inferred_workload_types: vec!["PostgreSql".to_string()],
+        },
+        // The workload outgrew the instance: the analysis would move it to twice the
+        // capacity, which costs MORE — a recommendation is not always a saving.
+        ObservedInstance {
+            instance_id: "i-0a1b2c3d4e5f60002".to_string(),
+            account_id: account_id.clone(),
+            current: m5_large(),
+            candidates: vec![m5_xlarge()],
+            utilization: vec![
+                metric(METRIC_CPU, METRIC_STATISTIC_MAXIMUM, 88.0),
+                metric(METRIC_MEMORY, METRIC_STATISTIC_MAXIMUM, 97.0),
+                metric(METRIC_CPU, METRIC_STATISTIC_AVERAGE, 64.0),
+                metric(METRIC_MEMORY, METRIC_STATISTIC_AVERAGE, 90.0),
+            ],
+            finding_reason_codes: vec![METRIC_REASON_MEMORY_UNDERPROVISIONED.to_string()],
+            current_performance_risk: PERFORMANCE_RISK_HIGH.to_string(),
+            inferred_workload_types: vec!["Redis".to_string()],
+        },
+        // Already the right size for its workload: no candidate, so nothing to project onto.
+        ObservedInstance {
+            instance_id: "i-0a1b2c3d4e5f60003".to_string(),
+            account_id,
+            current: m5_xlarge(),
+            candidates: Vec::new(),
+            utilization: vec![
+                metric(METRIC_CPU, METRIC_STATISTIC_MAXIMUM, 55.0),
+                metric(METRIC_MEMORY, METRIC_STATISTIC_MAXIMUM, 60.0),
+                metric(METRIC_CPU, METRIC_STATISTIC_AVERAGE, 41.0),
+                metric(METRIC_MEMORY, METRIC_STATISTIC_AVERAGE, 48.0),
+            ],
+            finding_reason_codes: Vec::new(),
+            current_performance_risk: PERFORMANCE_RISK_VERY_LOW.to_string(),
+            inferred_workload_types: Vec::new(),
+        },
+    ]
+}
+
 /// Per-service state for com-amazonaws-computeoptimizer-computeoptimizerservice. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
@@ -5424,6 +5766,14 @@ pub struct ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// SINGLE source for a volume: the EBS volume rows of [`Self::analysed_resources`]
     /// are projected from it.
     pub volumes: BTreeMap<String, ObservedVolume>,
+    /// The Amazon EC2 instances Compute Optimizer observes, by instance id, so the
+    /// iteration order is stable across calls. Part of the store's initial value rather than
+    /// something a reader writes on first use: a reader REPORTS this analysis and must not
+    /// mutate the store (see [`observed_instances`]). It is the SINGLE source for an
+    /// instance: the `Ec2Instance` rows of [`Self::analysed_resources`] are projected from
+    /// it, and `GetEC2RecommendationProjectedMetrics` projects its observed utilization onto
+    /// the instance types the analysis recommends.
+    pub instances: BTreeMap<String, ObservedInstance>,
     /// The Lambda function versions Compute Optimizer observes, by the resource part of
     /// their ARN, so a page boundary is stable across calls and the iteration order is the
     /// order a reader reports them in. Part of the store's initial value rather than
@@ -5443,7 +5793,8 @@ pub struct ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// store's initial value rather than something a reader writes on first use, so every
     /// findings reader serves the same rows and none of them mutates the store. The Auto
     /// Scaling group rows are PROJECTED from [`Self::auto_scaling_group_analyses`], the
-    /// EBS volume rows from [`Self::volumes`] and the Lambda function rows from
+    /// EBS volume rows from [`Self::volumes`], the Amazon EC2 instance rows from
+    /// [`Self::instances`] and the Lambda function rows from
     /// [`Self::functions`] ([`seed_analysed_resources`]), so the two readers of one resource
     /// cannot disagree about its finding, its risk or what it costs.
     pub analysed_resources: Vec<AnalysedResource>,
@@ -5482,6 +5833,10 @@ impl Default for ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             volumes: observed_volumes()
                 .into_iter()
                 .map(|volume| (volume.volume_id.clone(), volume))
+                .collect(),
+            instances: observed_instances()
+                .into_iter()
+                .map(|instance| (instance.instance_id.clone(), instance))
                 .collect(),
             functions: observed_functions()
                 .into_iter()
@@ -5548,43 +5903,6 @@ fn seed_analysed_resources() -> Vec<AnalysedResource> {
     };
 
     vec![
-        // An over-provisioned instance: the recommendation is smaller, so it saves.
-        row(
-            SOURCE_TYPE_EC2_INSTANCE,
-            "ec2",
-            "instance/i-0a1b2c3d4e5f60001",
-            FINDING_OVERPROVISIONED,
-            &[METRIC_REASON_MEMORY_OVERPROVISIONED],
-            PERFORMANCE_RISK_VERY_LOW,
-            280.32,
-            140.16,
-            &["PostgreSql"],
-        ),
-        // An under-provisioned instance: the recommendation is LARGER, so it saves
-        // nothing even though its configuration changes.
-        row(
-            SOURCE_TYPE_EC2_INSTANCE,
-            "ec2",
-            "instance/i-0a1b2c3d4e5f60002",
-            FINDING_UNDERPROVISIONED,
-            &[METRIC_REASON_MEMORY_UNDERPROVISIONED],
-            PERFORMANCE_RISK_HIGH,
-            70.08,
-            140.16,
-            &["Redis"],
-        ),
-        // An optimized instance: nothing to change, nothing to save.
-        row(
-            SOURCE_TYPE_EC2_INSTANCE,
-            "ec2",
-            "instance/i-0a1b2c3d4e5f60003",
-            FINDING_OPTIMIZED,
-            &[],
-            PERFORMANCE_RISK_VERY_LOW,
-            140.16,
-            140.16,
-            &[],
-        ),
         row(
             SOURCE_TYPE_ECS_SERVICE,
             "ecs",
@@ -5657,6 +5975,16 @@ fn seed_analysed_resources() -> Vec<AnalysedResource> {
         },
     ]
     .into_iter()
+    // The Amazon EC2 instance rows are the SAME observation an instance reader reports,
+    // projected onto the findings row ([`ObservedInstance::to_analysed_resource`]) rather
+    // than stated a second time here, so a summary of the account's instances counts
+    // exactly the instances that reader reports and agrees with it on each one's finding,
+    // risk and cost.
+    .chain(
+        observed_instances()
+            .iter()
+            .map(ObservedInstance::to_analysed_resource),
+    )
     // The Auto Scaling group rows are the SAME analysis
     // `GetAutoScalingGroupRecommendations` reports, projected onto the findings row
     // ([`AnalyzedAutoScalingGroup::to_analysed_resource`]) rather than stated a second
@@ -5853,6 +6181,20 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     pub fn visible_licenses(&self) -> impl Iterator<Item = &ObservedLicensedInstance> {
         let visible = self.enrollment.is_opted_in() && self.enrollment.analysis_due();
         self.licenses.values().filter(move |_| visible)
+    }
+
+    /// The Amazon EC2 instances whose analysis a caller can read, in instance-id order.
+    ///
+    /// The same gate [`visible_volumes`] applies: Compute Optimizer reports recommendations
+    /// for an ENROLLED account only, and only once the analysis that enrollment starts is
+    /// due ([`ANALYSIS_DELAY`]), so an account that never opted in, one that opted out, and
+    /// one that has just opted in all read the empty set rather than an analysis nothing has
+    /// produced yet.
+    ///
+    /// [`visible_volumes`]: Self::visible_volumes
+    pub fn visible_instances(&self) -> impl Iterator<Item = &ObservedInstance> {
+        let visible = self.enrollment.is_opted_in() && self.enrollment.analysis_due();
+        self.instances.values().filter(move |_| visible)
     }
 
     /// The idle resource analysis a caller can read, in record order.

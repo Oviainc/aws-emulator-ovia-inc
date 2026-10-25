@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBillingGroupCostReport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBillingGroupCostReport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBillingGroupCostReport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation reports the margin summary of ONE billing group over the
+//! billing periods the request's range covers — the actual Amazon Web Services charges of
+//! the group, the pro forma charges computed from the custom line items the store holds
+//! for it, and the margin between them — broken down by the attributes `GroupBy` names.
+//! It writes nothing. This file is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +87,73 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeMap;
+
+/// The largest page of margin summary rows this operation serves, and the page it
+/// serves a request that names no `MaxResults`: the maximum of the modelled
+/// `MaxBillingGroupCostReportResults` range (200..300,
+/// `smithy_query(query="operation",operation="GetBillingGroupCostReport")`).
+const MAX_PAGE_SIZE: i32 = 300;
+
+/// The actual Amazon Web Services charges this emulator has recorded for a billing
+/// group's accounts: NONE.
+///
+/// `AWSCost` is "the actual Amazon Web Services charges for the billing group" — the
+/// metered usage of its member accounts. Nothing in this service's surface reports usage
+/// into the store (its writes create billing groups, pricing plans, pricing rules and
+/// custom line items), and no other recorded state prices usage either, so a group's
+/// actual charges are zero. Zero is REPORTED as the amount it is rather than withheld or
+/// invented, and it is what the pro forma cost — the custom line items the caller really
+/// did create — is measured against.
+const AWS_COST: f64 = 0.0;
+
+/// `GroupByAttributeName.BILLING_PERIOD`: break the summary down by billing period.
+const GROUP_BY_BILLING_PERIOD: &str = "BILLING_PERIOD";
+
+/// `GroupByAttributeName.PRODUCT_NAME`: break the summary down by the product the
+/// charges are presented under.
+const GROUP_BY_PRODUCT_NAME: &str = "PRODUCT_NAME";
+
+/// How many decimal places a reported amount keeps.
+///
+/// The reported members are strings carrying a decimal amount, summed and multiplied out
+/// of the stored `double` charge values, so the sum carries binary floating-point residue
+/// that is not part of any amount. Rounding to this many places drops it while keeping
+/// far more precision than the minor unit of either currency this service bills in.
+const REPORTED_DECIMALS: i32 = 6;
+
+/// One row of the margin summary: the charges of one group of the requested breakdown.
+#[derive(Debug, Default)]
+struct ReportRow {
+    /// The attributes that identify this group, in the order the request listed them.
+    attributes: Vec<Attribute>,
+    /// The pro forma charges of the billing periods and products this row covers.
+    proforma_cost: f64,
+}
+
+/// An amount as the reported `AWSCost` / `ProformaCost` / `Margin` / `MarginPercentage`
+/// strings carry one: a decimal rounded to [`REPORTED_DECIMALS`] places.
+fn reported_amount(value: f64) -> String {
+    let scale = 10f64.powi(REPORTED_DECIMALS);
+    // Adding zero normalises a negative zero (a credit cancelling a fee) to the one
+    // amount it is, so no row reports `-0`.
+    let rounded = (value * scale).round() / scale + 0.0;
+    format!("{rounded}")
+}
+
+/// The cursor key of one row — what orders the rows and what a `NextToken` names.
+///
+/// It is built from the row's OWN attribute values, so the rows run by billing period
+/// (chronological, since a period is enumerated in the canonical zero-padded spelling)
+/// and then by product name, and resuming from a token lands on the row it named.
+fn row_key(billing_period: Option<&str>, product_name: Option<&str>) -> String {
+    format!(
+        "{}#{}",
+        billing_period.unwrap_or_default(),
+        product_name.unwrap_or_default()
+    )
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -162,18 +226,179 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBillingGroupCostReport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBillingGroupCostReportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBillingGroupCostReport"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetBillingGroupCostReportErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billingconductor store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // "The Amazon Resource Number (ARN) that uniquely identifies the billing group" —
+        // in either spelling the pattern admits, so it is normalised before the lookup. A
+        // report is of a group that exists.
+        let group_arn = crate::state::normalize_billing_group_arn(&input.arn);
+        let Some(group) = state.billing_groups.get(&group_arn) else {
+            return Err(GetBillingGroupCostReportErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: "the billing group does not exist".to_string(),
+                    resource_id: group_arn,
+                    resource_type: "billinggroup".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // "A time range for which the margin summary is effective. You can specify up to
+        // 12 months." The range is half-open, as its member names say, so the end has to
+        // be a LATER period than the start; a request that names no range is asking about
+        // the billing period the call is made in.
+        let billing_periods = match &input.billing_period_range {
+            None => vec![crate::state::current_billing_period()],
+            Some(range) => {
+                let start = range.inclusive_start_billing_period.as_str();
+                let end = range.exclusive_end_billing_period.as_str();
+                let covered =
+                    crate::state::billing_period_range_length(start, end).unwrap_or_default();
+                if covered <= 0 {
+                    return Err(validation(
+                        "ILLEGAL_BILLING_PERIOD_RANGE",
+                        "BillingPeriodRange.ExclusiveEndBillingPeriod",
+                        "the exclusive end billing period must be later than the inclusive \
+                         start billing period"
+                            .to_string(),
+                    ));
+                }
+                let at_most =
+                    i64::try_from(crate::state::MAX_BILLING_PERIODS_PER_RANGE).unwrap_or(i64::MAX);
+                if covered > at_most {
+                    return Err(validation(
+                        "ILLEGAL_BILLING_PERIOD_RANGE",
+                        "BillingPeriodRange",
+                        format!(
+                            "a billing period range covers at most {at_most} billing periods; \
+                             this one covers {covered}"
+                        ),
+                    ));
+                }
+                crate::state::billing_periods_in_range(start, end)
+            }
+        };
+
+        // "A list of strings that specify the attributes that are used to break down
+        // costs in the margin summary reports": each attribute named splits the summary
+        // further, and naming one twice splits it no further than naming it once.
+        let mut group_by: Vec<&str> = Vec::new();
+        for attribute in input.group_by.iter().flatten() {
+            let Some(attribute) = GROUP_BY_ATTRIBUTE_NAME_VALUES
+                .iter()
+                .find(|known| *known == attribute)
+            else {
+                return Err(validation(
+                    "FIELD_VALIDATION_FAILED",
+                    "GroupBy",
+                    format!(
+                        "Value at 'GroupBy' failed to satisfy constraint: each attribute must \
+                         be one of {}",
+                        GROUP_BY_ATTRIBUTE_NAME_VALUES.join(", ")
+                    ),
+                ));
+            };
+            if !group_by.contains(attribute) {
+                group_by.push(attribute);
+            }
+        }
+        let by_billing_period = group_by.contains(&GROUP_BY_BILLING_PERIOD);
+        let by_product_name = group_by.contains(&GROUP_BY_PRODUCT_NAME);
+
+        // One row per group of the requested breakdown, ordered by its cursor key. A
+        // request that asks for no breakdown is asking about the billing group itself over
+        // the whole range, which is ONE row — reported even when the group has no charge
+        // in any of those periods, because the group's own cost is what the report is of.
+        let mut rows: BTreeMap<String, ReportRow> = BTreeMap::new();
+        if group_by.is_empty() {
+            rows.insert(row_key(None, None), ReportRow::default());
+        }
+        for billing_period in &billing_periods {
+            for (product_name, charge) in
+                state.proforma_custom_line_item_charges(&group.arn, billing_period)
+            {
+                let key = row_key(
+                    by_billing_period.then_some(billing_period.as_str()),
+                    by_product_name.then_some(product_name.as_str()),
+                );
+                let row = rows.entry(key).or_insert_with(|| ReportRow {
+                    attributes: group_by
+                        .iter()
+                        .map(|attribute| Attribute {
+                            key: Some((*attribute).to_string()),
+                            value: Some(if *attribute == GROUP_BY_BILLING_PERIOD {
+                                billing_period.clone()
+                            } else {
+                                product_name.clone()
+                            }),
+                        })
+                        .collect(),
+                    proforma_cost: 0.0,
+                });
+                row.proforma_cost += charge;
+            }
+        }
+
+        // The margin a billing group earns on a group of charges is what it is charged for
+        // them (pro forma) less what they actually cost (AWS), and the margin percentage is
+        // that margin as a share of the pro forma amount — undefined, and so reported as
+        // zero, where there is no pro forma amount to take a share of.
+        let currency = crate::state::partition_currency_code(&group.arn).to_string();
+        let results: Vec<(String, BillingGroupCostReportResultElement)> = rows
+            .into_iter()
+            .map(|(key, row)| {
+                let margin = row.proforma_cost - AWS_COST;
+                let margin_percentage = if row.proforma_cost == 0.0 {
+                    0.0
+                } else {
+                    margin / row.proforma_cost * 100.0
+                };
+                (
+                    key,
+                    BillingGroupCostReportResultElement {
+                        arn: Some(group.arn.clone()),
+                        aws_cost: Some(reported_amount(AWS_COST)),
+                        proforma_cost: Some(reported_amount(row.proforma_cost)),
+                        margin: Some(reported_amount(margin)),
+                        margin_percentage: Some(reported_amount(margin_percentage)),
+                        currency: Some(currency.clone()),
+                        // A request that asked for no breakdown gets no attributes: an
+                        // empty list would claim a breakdown by nothing.
+                        attributes: (!row.attributes.is_empty()).then_some(row.attributes),
+                    },
+                )
+            })
+            .collect();
+
+        let (billing_group_cost_report_results, next_token) = crate::state::paginate_bounded(
+            results,
+            input.next_token.as_deref(),
+            input.max_results,
+            MAX_PAGE_SIZE,
+        );
+
+        Ok(GetBillingGroupCostReportOutput {
+            billing_group_cost_report_results: Some(billing_group_cost_report_results),
+            next_token,
+        })
     }
+}
+
+/// This operation's modelled `ValidationException` (HTTP 400), built the way every other
+/// operation of this service builds one ([`crate::state::validation_exception`]).
+fn validation(reason: &str, field: &str, message: String) -> GetBillingGroupCostReportError {
+    GetBillingGroupCostReportErrorModeled::ValidationException(
+        crate::state::validation_exception(reason, field, message),
+    )
+    .into()
 }

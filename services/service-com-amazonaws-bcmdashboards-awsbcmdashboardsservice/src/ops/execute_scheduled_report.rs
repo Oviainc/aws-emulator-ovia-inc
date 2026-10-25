@@ -29,9 +29,11 @@
 //! * A `clientToken` makes the call idempotent for
 //!   `crate::state::EXECUTION_IDEMPOTENCY_WINDOW` (the minute the model documents): a
 //!   retry presenting the same token for the same report answers the first call's
-//!   outcome and triggers nothing, and the same token presented for a DIFFERENT report
-//!   inside that window is a conflicting reuse, refused with the modelled
-//!   `ConflictException` (409) rather than answered with another report's outcome.
+//!   outcome and triggers nothing. The token is scoped to the request it was presented
+//!   with — the model's only documented effect is that "requests with the same client
+//!   token will not trigger a new execution within the same minute" — so the same token
+//!   presented for a DIFFERENT report is a different request: it triggers that report's
+//!   execution and answers that report's health.
 //!
 //! A triggered execution writes two members of the stored record — `lastExecutionAt`
 //! and `healthStatus` — which `GetScheduledReport` and `ListScheduledReports` then read
@@ -258,29 +260,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // of them can be read as a retry.
         state.expire_execution_tokens(now);
 
-        if let Some(token) = input.client_token.as_deref() {
-            if let Some(prior) = state.scheduled_report_executions.get(token) {
-                if prior.arn == input.arn {
-                    // A retry inside the documented window: the first call's outcome,
-                    // and no second execution. It triggers nothing and changes nothing
-                    // a later caller sees, so — like the dry run — it emits no audit
-                    // record; the execution it replays already emitted one.
-                    return Ok(ExecuteScheduledReportOutput {
-                        health_status: Some(prior.health_status.clone()),
-                        execution_triggered: Some(prior.execution_triggered),
-                    });
-                }
-                let conflicting_arn = prior.arn.clone();
-                crate::state::record_state_change(ctx, Self::NAME, &input.arn, "ConflictException");
-                return Err(ExecuteScheduledReportErrorModeled::ConflictException(
-                    ConflictException {
-                        message: format!(
-                            "Client token {token} was already used to execute scheduled report {conflicting_arn}"
-                        ),
-                    },
-                )
-                .into());
-            }
+        // The idempotency key of THIS request: the report it names together with the
+        // token it presented. A token suppresses a repeat of the request that carried it,
+        // so the same token on another report is looked up under another key and decided
+        // on its own merits rather than answered with — or refused because of — the first
+        // report's execution.
+        let idempotency_key = input
+            .client_token
+            .as_ref()
+            .map(|token| (input.arn.clone(), token.clone()));
+
+        if let Some(prior) = idempotency_key
+            .as_ref()
+            .and_then(|key| state.scheduled_report_executions.get(key))
+        {
+            // A retry inside the documented window: the first call's outcome, and no
+            // second execution. It triggers nothing and changes nothing a later caller
+            // sees, so — like the dry run — it emits no audit record; the execution it
+            // replays already emitted one.
+            return Ok(ExecuteScheduledReportOutput {
+                health_status: Some(prior.health_status.clone()),
+                execution_triggered: Some(prior.execution_triggered),
+            });
         }
 
         // The health the store establishes for this report right now, and with it
@@ -301,11 +302,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // report's configuration.
         }
 
-        if let Some(token) = input.client_token {
+        if let Some(key) = idempotency_key {
             state.scheduled_report_executions.insert(
-                token,
+                key,
                 crate::state::ScheduledReportExecution {
-                    arn: input.arn.clone(),
                     executed_at: now,
                     execution_triggered,
                     health_status: health_status.clone(),

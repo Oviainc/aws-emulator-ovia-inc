@@ -99,5 +99,7 @@ mod tag_resource;
 mod tenant_distribution_and_method_order;
 #[path = "all/tenant_invalidations.rs"]
 mod tenant_invalidations;
+#[path = "all/verify_dns_configuration.rs"]
+mod verify_dns_configuration;
 #[path = "all/web_acl_association.rs"]
 mod web_acl_association;

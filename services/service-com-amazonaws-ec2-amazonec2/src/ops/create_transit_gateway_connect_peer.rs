@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTransitGatewayConnectPeer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTransitGatewayConnectPeer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTransitGatewayConnectPeer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation does
+//!
+//! "Creates a Connect peer for a specified transit gateway Connect attachment between a
+//! transit gateway and an appliance": it resolves the Connect attachment the request names,
+//! works out the two GRE outer addresses and the interior BGP addresses of the peering, and
+//! stores the peer in the service's own state in the non-terminal `pending` state with the
+//! clock owing it `available`. `DescribeTransitGatewayConnectPeers` reads the very record
+//! this writes.
+//!
+//! Nothing about the answer is taken from a recording: the peer's id comes from the store's
+//! id mint, its interior BGP addresses from the inside CIDR block the request names ("The
+//! first address from the range must be configured on the appliance as the BGP IP address"),
+//! its transit gateway address from the gateway's own CIDR blocks, and its BGP status is
+//! `down` because no appliance has opened a session with this emulator.
+//!
+//! The peering is derived from the one inside range the documentation ties it to — the
+//! required IPv4 /29. An optional IPv6 /125 is validated, stored and reported among the
+//! peer's `InsideCidrBlocks`, but no BGP configuration is invented for it: see
+//! [`inside_cidr_blocks`].
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +96,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -152,18 +165,452 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTransitGatewayConnectPeer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTransitGatewayConnectPeerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTransitGatewayConnectPeer"))
+        // `ctx` carries request metadata only; this operation reads none of it — the
+        // attachment, the gateway and both addresses are named by the request or derived
+        // from the store, which is reached through the engine held on `self`.
+        let _ = ctx;
+        use std::time::SystemTime;
+
+        // The request's own form first, before anything is resolved: an id that is not a
+        // transit gateway attachment id at all is refused as malformed, so "not an id of
+        // this kind" never reads as "no such attachment" and is never answered by the
+        // DryRun arm below either.
+        state::require_well_formed_id(
+            state::TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX,
+            &input.transit_gateway_attachment_id,
+            state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MALFORMED,
+        )?;
+
+        // "The range of inside IP addresses that are used for BGP peering"
+        // (`InsideCidrBlocks`), held to the two published block sizes and ranges.
+        let inside = inside_cidr_blocks(&input.inside_cidr_blocks)?;
+
+        // "The peer IP address (GRE outer IP address) on the appliance side of the Connect
+        // peer" (`PeerAddress`): an address, of whichever family — which is the family the
+        // transit gateway address must then be of.
+        let peer_is_ipv6 = state::ip_address_is_ipv6(&input.peer_address).ok_or_else(|| {
+            state::invalid_parameter_value(format!(
+                "PeerAddress '{address}' is not an IP address",
+                address = input.peer_address,
+            ))
+        })?;
+
+        // "The peer Autonomous System Number (ASN)"
+        // (`TransitGatewayConnectRequestBgpOptions$PeerAsn`), defaulted and range-checked.
+        let peer_asn = peer_asn(input.bgp_options.as_ref())?;
+
+        // "The tags to apply to the Connect peer" (`TagSpecifications`) — "you must specify
+        // the resource type to tag, otherwise the request will fail" (`TagSpecification`),
+        // and the only type this action tags is the peer it creates. The tag payload's own
+        // bounds are applied by the one shared reader every create holds its tags to.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_TRANSIT_GATEWAY_CONNECT_PEER,
+            Self::NAME,
+        )?;
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // The clock first: whether the attachment admits this call is asked of the state it
+        // is ACTUALLY in rather than of the one its last writer left it in.
+        store.materialize_due_transitions();
+
+        // "The ID of the Connect attachment" (`TransitGatewayAttachmentId`). Every kind of
+        // attachment shares one id space, so an id naming an attachment of another kind
+        // names no Connect attachment and is as unknown as an id naming nothing at all.
+        let (attachment_state, transit_gateway_id) = {
+            let record = store
+                .transit_gateway_attachments
+                .get(&input.transit_gateway_attachment_id)
+                .filter(|record| {
+                    record.view.resource_type()
+                        == state::TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_CONNECT
+                })
+                .ok_or_else(|| {
+                    state::id_not_found(
+                        state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND,
+                        "transit gateway attachment ID",
+                        &input.transit_gateway_attachment_id,
+                    )
+                })?;
+            let state::TransitGatewayAttachmentView::Connect(attachment) = &record.view else {
+                return Err(state::unexpected_attachment_kind(
+                    &input.transit_gateway_attachment_id,
+                ));
+            };
+            (
+                record.view.state().unwrap_or_default().to_string(),
+                attachment.transit_gateway_id.clone().unwrap_or_default(),
+            )
+        };
+
+        // A Connect peer is a BGP peering inside the Connect attachment's GRE tunnel, and
+        // that tunnel carries traffic only once the attachment is in service, so an
+        // attachment in any other state is refused with `IncorrectState` and nothing is
+        // written.
+        if attachment_state != state::TRANSIT_GATEWAY_ATTACHMENT_STATE_AVAILABLE {
+            return Err(state::incorrect_state(format!(
+                "The transit gateway attachment '{attachment_id}' is in state \
+                 '{attachment_state}'; a Connect peer can only be created on an attachment \
+                 in state '{available}'",
+                attachment_id = input.transit_gateway_attachment_id,
+                available = state::TRANSIT_GATEWAY_ATTACHMENT_STATE_AVAILABLE,
+            )));
+        }
+
+        // The gateway behind that attachment: its `AmazonSideAsn` is the transit gateway ASN
+        // every BGP configuration of this peer reports, and its CIDR blocks are where the
+        // transit gateway address comes from.
+        let gateway_options = store
+            .transit_gateways
+            .get(&transit_gateway_id)
+            .and_then(|transit_gateway| transit_gateway.options.clone());
+        let transit_gateway_asn = gateway_options
+            .as_ref()
+            .and_then(|options| options.amazon_side_asn);
+        let gateway_cidr_blocks: Vec<String> = gateway_options
+            .and_then(|options| options.transit_gateway_cidr_blocks)
+            .unwrap_or_default();
+
+        // "The peer IP address (GRE outer IP address) on the transit gateway side of the
+        // Connect peer, which must be specified from a transit gateway CIDR block. If not
+        // specified, Amazon automatically assigns the first available IP address from the
+        // transit gateway CIDR block" (`TransitGatewayAddress`).
+        let transit_gateway_address = match input.transit_gateway_address.as_deref() {
+            Some(address) => {
+                let address_is_ipv6 = state::ip_address_is_ipv6(address).ok_or_else(|| {
+                    state::invalid_parameter_value(format!(
+                        "TransitGatewayAddress '{address}' is not an IP address"
+                    ))
+                })?;
+                // "The peer address and transit gateway address must be the same IP address
+                // family (IPv4 or IPv6)": two members each usable alone that cannot be used
+                // together.
+                if address_is_ipv6 != peer_is_ipv6 {
+                    return Err(state::invalid_parameter_combination(format!(
+                        "TransitGatewayAddress '{address}' and PeerAddress '{peer}' are not \
+                         of the same IP address family",
+                        peer = input.peer_address,
+                    )));
+                }
+                if !gateway_cidr_blocks
+                    .iter()
+                    .any(|block| state::cidr_block_contains_address(block, address))
+                {
+                    return Err(state::invalid_parameter_value(format!(
+                        "TransitGatewayAddress '{address}' is not an address of a CIDR block \
+                         of the transit gateway '{transit_gateway_id}'"
+                    )));
+                }
+                address.to_string()
+            }
+            None => store
+                .first_available_transit_gateway_connect_address(&transit_gateway_id, peer_is_ipv6)
+                .ok_or_else(|| {
+                    state::invalid_parameter_value(format!(
+                        "The transit gateway '{transit_gateway_id}' has no free address in a \
+                         CIDR block of the address family of PeerAddress '{peer}', so \
+                         TransitGatewayAddress must be specified",
+                        peer = input.peer_address,
+                    ))
+                })?,
+        };
+
+        // An interior peering and a GRE outer address on the transit gateway side are
+        // ALLOCATIONS of this gateway: the assignment arm above hands out an address no
+        // Connect peer of the gateway holds, so a request that names its own addresses — or
+        // an inside range another peer already peers over — is held to the same rule rather
+        // than being allowed to claim what is already taken. Each published inside block
+        // size is one size, so two ranges of a family are either the same range or share no
+        // address. (The peer address is on the APPLIANCE side of the tunnel, which this
+        // service allocates nothing in, so it is not held to this rule.)
+        if store
+            .transit_gateway_connect_addresses_in_use(&transit_gateway_id)
+            .contains(transit_gateway_address.as_str())
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "The transit gateway address '{transit_gateway_address}' is already used by a \
+                 Connect peer of the transit gateway '{transit_gateway_id}'"
+            )));
+        }
+        let inside_blocks_in_use =
+            store.transit_gateway_connect_inside_blocks_in_use(&transit_gateway_id);
+        if let Some(taken) = inside
+            .reported()
+            .into_iter()
+            .find(|block| inside_blocks_in_use.contains(block.as_str()))
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "The inside CIDR block '{taken}' is already used by a Connect peer of the \
+                 transit gateway '{transit_gateway_id}'"
+            )));
+        }
+
+        // "Information about the Connect peer" as it is about to be stored. The id and the
+        // state are left for the store to mint, so no path can report a peer in a state the
+        // store does not hold.
+        let view = TransitGatewayConnectPeer {
+            transit_gateway_attachment_id: Some(input.transit_gateway_attachment_id.clone()),
+            transit_gateway_connect_peer_id: None,
+            state: None,
+            creation_time: Some(state::system_time_to_date_time(SystemTime::now())),
+            connect_peer_configuration: Some(TransitGatewayConnectPeerConfiguration {
+                transit_gateway_address: Some(transit_gateway_address),
+                peer_address: Some(input.peer_address.clone()),
+                inside_cidr_blocks: Some(inside.reported()),
+                // `ProtocolValue` has one member: a Connect attachment is a GRE tunnel.
+                protocol: Some(state::PROTOCOL_VALUE_GRE.to_string()),
+                bgp_configurations: Some(bgp_configurations(
+                    &inside.ipv4,
+                    transit_gateway_asn,
+                    peer_asn,
+                )?),
+            }),
+            tags: (!tags.is_empty()).then_some(tags),
+        };
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of.
+        if !store.has_transit_gateway_connect_peer_capacity() {
+            return Err(state::resource_count_exceeded(
+                "This emulator holds as many transit gateway Connect peers as it will store",
+            ));
+        }
+        let payload_bytes = state::transit_gateway_connect_peer_payload_bytes(&view);
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let Some(peer_id) = store.insert_transit_gateway_connect_peer(view) else {
+            return Err(state::resource_count_exceeded(
+                "This emulator holds as many transit gateway Connect peers as it will store",
+            ));
+        };
+
+        // The answer is the record as it was STORED, so this operation and
+        // `DescribeTransitGatewayConnectPeers` cannot drift apart.
+        let Some(record) = store.transit_gateway_connect_peers.get(&peer_id) else {
+            return Err(state::internal_error(
+                "the transit gateway Connect peer just created could not be read back",
+            ));
+        };
+        Ok(CreateTransitGatewayConnectPeerOutput {
+            transit_gateway_connect_peer: Some(record.view.clone()),
+        })
     }
+}
+
+/// The range a Connect peer's IPv4 inside CIDR block must come from: "You must specify a size
+/// /29 IPv4 CIDR block from the 169.254.0.0/16 range"
+/// (`CreateTransitGatewayConnectPeerRequest$InsideCidrBlocks`).
+const INSIDE_CIDR_IPV4_RANGE: &str = "169.254.0.0/16";
+
+/// The one IPv4 block size an inside CIDR block may have (see [`INSIDE_CIDR_IPV4_RANGE`]).
+const INSIDE_CIDR_IPV4_PREFIX: u32 = 29;
+
+/// The range an optional IPv6 inside CIDR block must come from: "You can also optionally
+/// specify a size /125 IPv6 CIDR block from the fd00::/8 range" (same member).
+const INSIDE_CIDR_IPV6_RANGE: &str = "fd00::/8";
+
+/// The one IPv6 block size an inside CIDR block may have (see [`INSIDE_CIDR_IPV6_RANGE`]).
+const INSIDE_CIDR_IPV6_PREFIX: u32 = 125;
+
+/// The index, into the inside CIDR block, of the address the appliance peers from.
+///
+/// "The first address from the range must be configured on the appliance as the BGP IP
+/// address" (`CreateTransitGatewayConnectPeerRequest$InsideCidrBlocks`) — the first HOST
+/// address of the range, which the crate defines once as
+/// [`state::FIRST_HOST_ADDRESS_INDEX`]: the AWS CLI reference for
+/// `create-transit-gateway-connect-peer` shows an inside range of `169.254.6.0/29` peering
+/// from `169.254.6.1`, with the transit gateway on `169.254.6.2` and `169.254.6.3`.
+const APPLIANCE_BGP_ADDRESS_INDEX: u32 = state::FIRST_HOST_ADDRESS_INDEX;
+
+/// How many interior BGP peerings one Connect peer has, and so how many
+/// `TransitGatewayAttachmentBgpConfiguration`s it reports.
+///
+/// 2: the transit gateway peers with the appliance from the two addresses after the
+/// appliance's for redundancy, which is what a range that must be a /29 (eight addresses) is
+/// sized for and what the CLI reference example cited above reports. The model publishes no
+/// count, so this number is the emulator's; the ADDRESSES are derived from the block the
+/// request names.
+const BGP_PEERINGS_PER_CONNECT_PEER: u32 = 2;
+
+/// The peer ASN a request that names no `BgpOptions` gets.
+///
+/// CHOSEN: `TransitGatewayConnectRequestBgpOptions$PeerAsn` publishes no default, so this
+/// emulator uses the first ASN of the 16-bit private-use range (64512..=65534, RFC 6996) —
+/// the range an appliance peering over a link-local inside range is numbered from, and the
+/// one the CLI reference example reports. A request that names a `PeerAsn` gets that one.
+const DEFAULT_PEER_ASN: i64 = 64512;
+
+/// The smallest ASN a BGP speaker can be numbered with: ASN 0 is reserved (RFC 7607).
+const MIN_ASN: i64 = 1;
+
+/// The largest ASN a BGP speaker can be numbered with: an ASN is a 32-bit number, and
+/// 4294967295 is reserved (RFC 7300).
+const MAX_ASN: i64 = 4_294_967_294;
+
+/// The inside CIDR blocks one Connect peer's BGP peering runs over: the IPv4 block every
+/// request must name, and the IPv6 one it may add.
+struct InsideCidrBlocks {
+    /// The required IPv4 block.
+    ipv4: String,
+    /// The optional IPv6 block.
+    ipv6: Option<String>,
+}
+
+impl InsideCidrBlocks {
+    /// The blocks as the peer's configuration reports them — the required IPv4 block first,
+    /// so two requests naming the same two blocks in different orders report one peer the
+    /// same way.
+    fn reported(&self) -> Vec<String> {
+        let mut blocks = vec![self.ipv4.clone()];
+        blocks.extend(self.ipv6.clone());
+        blocks
+    }
+}
+
+/// Read the request's `InsideCidrBlocks`, or refuse it.
+///
+/// "You must specify a size /29 IPv4 CIDR block from the 169.254.0.0/16 range. The first
+/// address from the range must be configured on the appliance as the BGP IP address. You can
+/// also optionally specify a size /125 IPv6 CIDR block from the fd00::/8 range" — so at most
+/// one block of each published size and range, the IPv4 one required and the IPv6 one not,
+/// and each naming the range itself rather than an address inside it (whichever of a range's
+/// equivalent spellings the request uses), because the first host address of the range is
+/// what the peering is built on.
+///
+/// The peering itself is derived from the IPv4 block alone ([`bgp_configurations`]): the
+/// sentence that fixes which address the appliance peers from is the one about the required
+/// IPv4 range, the optional IPv6 range carries no such statement, and
+/// `TransitGatewayAttachmentBgpConfiguration` has no member that would say which family a
+/// configuration belongs to — so an IPv6 range is stored and reported as configured
+/// (`TransitGatewayConnectPeerConfiguration$InsideCidrBlocks`) without a second peering being
+/// invented for it.
+fn inside_cidr_blocks(
+    requested: &[String],
+) -> Result<InsideCidrBlocks, CreateTransitGatewayConnectPeerError> {
+    let mut ipv4: Option<String> = None;
+    let mut ipv6: Option<String> = None;
+    for block in requested {
+        let Some(canonical) = state::canonical_cidr_block(block) else {
+            return Err(state::invalid_parameter_value(format!(
+                "InsideCidrBlocks entry '{block}' is not a CIDR block"
+            )));
+        };
+        // The range itself, asked of the addresses the block holds rather than of how it is
+        // spelled: two spellings of one range are one range, and only a block whose host bits
+        // are set names an address inside a range instead of the range. The canonical spelling
+        // is what gets stored, so one range is reported one way however it was named.
+        if !state::cidr_block_names_its_range(block) {
+            return Err(state::invalid_parameter_value(format!(
+                "InsideCidrBlocks entry '{block}' names an address inside a range rather than \
+                 the range itself ('{canonical}')"
+            )));
+        }
+        let (family, range, prefix_length, slot) = if block.contains(':') {
+            (
+                "IPv6",
+                INSIDE_CIDR_IPV6_RANGE,
+                INSIDE_CIDR_IPV6_PREFIX,
+                &mut ipv6,
+            )
+        } else {
+            (
+                "IPv4",
+                INSIDE_CIDR_IPV4_RANGE,
+                INSIDE_CIDR_IPV4_PREFIX,
+                &mut ipv4,
+            )
+        };
+        if state::cidr_block_prefix_length(&canonical) != Some(prefix_length) {
+            return Err(state::invalid_parameter_value(format!(
+                "InsideCidrBlocks entry '{block}' is not a size /{prefix_length} {family} \
+                 CIDR block"
+            )));
+        }
+        if !state::cidr_block_contains_block(range, &canonical) {
+            return Err(state::invalid_parameter_value(format!(
+                "InsideCidrBlocks entry '{block}' is not from the {range} range"
+            )));
+        }
+        if slot.replace(canonical).is_some() {
+            return Err(state::invalid_parameter_value(format!(
+                "InsideCidrBlocks names more than one {family} CIDR block"
+            )));
+        }
+    }
+    let Some(ipv4) = ipv4 else {
+        return Err(state::missing_parameter(format!(
+            "InsideCidrBlocks must name a size /{INSIDE_CIDR_IPV4_PREFIX} IPv4 CIDR block \
+             from the {INSIDE_CIDR_IPV4_RANGE} range"
+        )));
+    };
+    Ok(InsideCidrBlocks { ipv4, ipv6 })
+}
+
+/// The peer ASN this Connect peer is created with: the one `BgpOptions` names, held to the
+/// ASNs a BGP speaker can be numbered with, or [`DEFAULT_PEER_ASN`] when the request names
+/// none.
+fn peer_asn(
+    bgp_options: Option<&TransitGatewayConnectRequestBgpOptions>,
+) -> Result<i64, CreateTransitGatewayConnectPeerError> {
+    let Some(peer_asn) = bgp_options.and_then(|options| options.peer_asn) else {
+        return Ok(DEFAULT_PEER_ASN);
+    };
+    if !(MIN_ASN..=MAX_ASN).contains(&peer_asn) {
+        return Err(state::invalid_parameter_value(format!(
+            "BgpOptions.PeerAsn '{peer_asn}' is outside the Autonomous System Numbers \
+             {MIN_ASN}..={MAX_ASN}"
+        )));
+    }
+    Ok(peer_asn)
+}
+
+/// "The BGP configuration details" of this peer, one per interior BGP peering.
+///
+/// Every address is derived from `inside_block`: the appliance's is its first address, and
+/// the transit gateway's are the ones after it, as many as the peer has peerings. A `None`
+/// from the block reader could only mean the block is smaller than the peering count, which
+/// the published /29 block size has already ruled out — so it is this module disagreeing with
+/// itself rather than a bad request, and it is answered as a server error.
+fn bgp_configurations(
+    inside_block: &str,
+    transit_gateway_asn: Option<i64>,
+    peer_asn: i64,
+) -> Result<Vec<TransitGatewayAttachmentBgpConfiguration>, CreateTransitGatewayConnectPeerError> {
+    let address_at = |index: u32| {
+        state::nth_address_in_cidr_block(inside_block, index).ok_or_else(|| {
+            state::internal_error(format!(
+                "the inside CIDR block '{inside_block}' holds no address at offset {index}"
+            ))
+        })
+    };
+    let peer_address = address_at(APPLIANCE_BGP_ADDRESS_INDEX)?;
+    let mut configurations =
+        Vec::with_capacity(usize::try_from(BGP_PEERINGS_PER_CONNECT_PEER).unwrap_or_default());
+    for peering in 1..=BGP_PEERINGS_PER_CONNECT_PEER {
+        configurations.push(TransitGatewayAttachmentBgpConfiguration {
+            transit_gateway_asn,
+            peer_asn: Some(peer_asn),
+            transit_gateway_address: Some(address_at(APPLIANCE_BGP_ADDRESS_INDEX + peering)?),
+            peer_address: Some(peer_address.clone()),
+            // Nothing in this emulator is the appliance on the other side of the tunnel, so
+            // no session has been established and none is claimed.
+            bgp_status: Some(state::BGP_STATUS_DOWN.to_string()),
+        });
+    }
+    Ok(configurations)
 }

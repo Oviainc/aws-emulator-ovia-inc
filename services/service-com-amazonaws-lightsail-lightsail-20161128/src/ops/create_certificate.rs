@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Requests one SSL/TLS certificate for the domain the request names, stores it
+//! pending validation, and answers the certificate it created together with the
+//! operation-log entry the request appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +167,151 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCertificate"))
+        // Lightsail serves the certificate APIs from the N. Virginia endpoint
+        // ALONE: the modelled `InvalidInputException` documentation covers
+        // "Domain and distribution APIs" together, and a certificate is one of
+        // those — "only certificates created in the us-east-1 Amazon Web Services
+        // Region can be attached to Lightsail distributions". Checked through the
+        // crate's one owner of that rule, BEFORE anything is written, so a refused
+        // request creates nothing.
+        if let Some(message) = crate::state::domain_region_refusal(ctx.parts()) {
+            return Err(invalid(message));
+        }
+
+        // `certificateName` and `domainName` are modelled `@required` members, so
+        // the centralized walk refused an absent one before this body ran.
+        // Neither the modelled `CertificateName` nor the modelled `DomainName`
+        // shape carries a pattern, so what is left is what the model cannot
+        // express: the name has to be one this record could be addressed by, the
+        // domains have to be domain names (which is also what refuses the
+        // "wildcard domain entries (*.example.com)" the documentation says are
+        // "not supported", because `*` is not a character a DNS label carries),
+        // the alternate domains have to be within the documented nine, the tags
+        // within their bound, and the name has to still be free. Every one of
+        // those is checked BEFORE the first write, so a refused request creates
+        // nothing.
+        let name = input.certificate_name;
+        if name.trim().is_empty() {
+            return Err(invalid(
+                "certificateName must carry a non-whitespace name: it is the name every \
+                 later certificate call addresses this certificate by"
+                    .to_string(),
+            ));
+        }
+        let domain_name = input.domain_name;
+        crate::state::validate_domain_name(&domain_name).map_err(invalid)?;
+        let subject_alternative_names = input.subject_alternative_names.unwrap_or_default();
+        if subject_alternative_names.len() > crate::state::MAX_SUBJECT_ALTERNATIVE_NAMES {
+            return Err(invalid(format!(
+                "subjectAlternativeNames carries {} entries, more than the {} alternate \
+                 domains a certificate may have",
+                subject_alternative_names.len(),
+                crate::state::MAX_SUBJECT_ALTERNATIVE_NAMES
+            )));
+        }
+        for alternative in &subject_alternative_names {
+            crate::state::validate_domain_name(alternative).map_err(|detail| {
+                invalid(format!(
+                    "subjectAlternativeNames entry '{alternative}' is not an alternate \
+                     domain of this certificate: {detail}"
+                ))
+            })?;
+        }
+        let tags = input.tags.unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS {
+            return Err(invalid(format!(
+                "tags carries {} entries, more than the {} this service accepts",
+                tags.len(),
+                crate::state::MAX_TAGS
+            )));
+        }
+
+        let location =
+            crate::state::StoredLocation::regional(crate::state::DISTRIBUTION_REGION_NAME);
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // A certificate name addresses one certificate, so requesting one
+            // this account already holds is refused rather than silently
+            // replacing the record a distribution may already have attached.
+            if store.certificate(&name).is_some() {
+                return Err(invalid(format!(
+                    "certificateName '{name}' already names a certificate of this account"
+                )));
+            }
+            if store.certificates.len() >= crate::state::MAX_CERTIFICATES {
+                return Err(invalid(format!(
+                    "creating a certificate would take this account past the {} this \
+                     emulator holds",
+                    crate::state::MAX_CERTIFICATES
+                )));
+            }
+
+            let id = store.mint_uuid();
+            // A certificate is not usable yet: Lightsail validates the domain
+            // first — "After the certificate is valid, use the
+            // AttachCertificateToDistribution action" — so the record is stored
+            // PENDING_VALIDATION and the clock owes it ISSUED, which is why a
+            // read straight after this call still reports the pending status and
+            // an attach made straight after it is refused.
+            let due =
+                crate::state::DueNamedState::after(now, crate::state::CERTIFICATE_STATUS_ISSUED);
+            store.insert_certificate(crate::state::StoredCertificate {
+                name: name.clone(),
+                arn: crate::state::certificate_arn(&id),
+                support_code: crate::state::support_code(&id),
+                created_at_ms: now,
+                location: location.clone(),
+                tags,
+                domain_name,
+                subject_alternative_names,
+                serial_number: crate::state::certificate_serial_number(&id),
+                status: crate::state::CERTIFICATE_STATUS_PENDING_VALIDATION,
+                due: Some(due),
+                issued_at_ms: due.at_ms,
+            });
+            // `operations` is a list because a Lightsail call can act on several
+            // resources at once; this one requests exactly one certificate, so it
+            // answers exactly one entry, left non-terminal until the validation
+            // the clock owes it is due.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_CREATE_CERTIFICATE,
+                crate::state::RESOURCE_TYPE_CERTIFICATE,
+                &name,
+                &location,
+                Some(due.at_ms),
+            );
+            Ok(CreateCertificateOutput {
+                // The record this call created, in full: the caller just asked
+                // for it, so the detail is answered rather than withheld the way
+                // a `GetCertificates` listing without `includeCertificateDetails`
+                // withholds it.
+                certificate: store.certificate_view(&name, true),
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> CreateCertificateError {
+    CreateCertificateErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> CreateCertificateError {
+    CreateCertificateErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail certificate store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

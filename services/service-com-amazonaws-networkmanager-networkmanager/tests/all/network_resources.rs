@@ -48,6 +48,10 @@ struct Resource {
     /// core network, its parent's for an attachment, and `None` for the kinds that hang off
     /// the global network itself.
     core_network_id: Option<String>,
+    /// The Region the answer must report in `AwsRegion`: the edge location the resource
+    /// sits at, and `None` for the kinds the store places at no single Region. Covered over
+    /// a kind-spanning table in `crate::network_resource_regions`.
+    aws_region: Option<&'static str>,
     /// The URI of the operation that describes this one resource.
     describe_uri: String,
     /// The response member that reader answers the resource in.
@@ -82,8 +86,9 @@ impl Resource {
     }
 }
 
-/// A `POST uri` that must succeed, answering the response.
-async fn create_ok(emulator: &Emulator, uri: &str, body: Value) -> Value {
+/// A `POST uri` that must succeed, answering the response. Shared with the suites that
+/// build an inventory through the creating operations.
+pub(crate) async fn create_ok(emulator: &Emulator, uri: &str, body: Value) -> Value {
     let (status, created) = emulator.post(uri, body.clone()).await;
     assert_eq!(
         status, 200,
@@ -92,8 +97,9 @@ async fn create_ok(emulator: &Emulator, uri: &str, body: Value) -> Value {
     created
 }
 
-/// The minted id at `body[outer][member]`.
-fn minted(body: &Value, outer: &str, member: &str) -> String {
+/// The minted id at `body[outer][member]`. Shared with the suites that create a resource
+/// through its own operation and then look for it in this inventory.
+pub(crate) fn minted(body: &Value, outer: &str, member: &str) -> String {
     body[outer][member]
         .as_str()
         .unwrap_or_else(|| panic!("expected a {outer}.{member} in {body}"))
@@ -171,6 +177,7 @@ async fn inventory(emulator: &Emulator) -> (String, Vec<Resource>) {
             id,
             tags,
             core_network_id: None,
+            aws_region: None,
             describe_member: "Sites",
             describe_is_list: true,
         });
@@ -202,6 +209,7 @@ async fn inventory(emulator: &Emulator) -> (String, Vec<Resource>) {
             id,
             tags,
             core_network_id: None,
+            aws_region: None,
             describe_member: "Links",
             describe_is_list: true,
         });
@@ -237,6 +245,7 @@ async fn inventory(emulator: &Emulator) -> (String, Vec<Resource>) {
             id,
             tags,
             core_network_id: None,
+            aws_region: None,
             describe_member: "Devices",
             describe_is_list: true,
         });
@@ -264,6 +273,7 @@ async fn inventory(emulator: &Emulator) -> (String, Vec<Resource>) {
         id: connection_id,
         tags: connection_tags,
         core_network_id: None,
+        aws_region: None,
         describe_member: "Connections",
         describe_is_list: true,
     });
@@ -290,6 +300,9 @@ async fn inventory(emulator: &Emulator) -> (String, Vec<Resource>) {
         id: core_id.clone(),
         tags: core_tags,
         core_network_id: Some(core_id.clone()),
+        // A core network spans every edge its policy configures and reports them as a
+        // LIST, so no single Region is its own.
+        aws_region: None,
         describe_member: "CoreNetwork",
         describe_is_list: false,
     });
@@ -321,6 +334,8 @@ async fn inventory(emulator: &Emulator) -> (String, Vec<Resource>) {
         id: attachment_id,
         tags: attachment_tags,
         core_network_id: Some(core_id),
+        // The attachment sits at the one edge location its VPC's Region names.
+        aws_region: Some(EDGE_REGION),
         describe_member: "VpcAttachment",
         describe_is_list: false,
     });
@@ -331,7 +346,7 @@ async fn inventory(emulator: &Emulator) -> (String, Vec<Resource>) {
 
 /// The `GetNetworkResources` URI of `network`, with `query` (already escaped) appended
 /// when it is not empty.
-fn resources_uri(network: &str, query: &str) -> String {
+pub(crate) fn resources_uri(network: &str, query: &str) -> String {
     let path = format!("/global-networks/{network}/network-resources");
     if query.is_empty() {
         path
@@ -349,7 +364,7 @@ fn entries_of(body: &Value) -> Vec<Value> {
 }
 
 /// The `<ResourceType>/<ResourceId>` key of one reported resource.
-fn key_of(entry: &Value) -> String {
+pub(crate) fn key_of(entry: &Value) -> String {
     let resource_type = entry["ResourceType"]
         .as_str()
         .unwrap_or_else(|| panic!("expected a ResourceType in {entry}"));
@@ -360,7 +375,11 @@ fn key_of(entry: &Value) -> String {
 }
 
 /// Every entry `query` selects, following `NextToken` to the end, with the page count.
-async fn listed(emulator: &Emulator, network: &str, query: &str) -> (Vec<Value>, usize) {
+pub(crate) async fn listed(
+    emulator: &Emulator,
+    network: &str,
+    query: &str,
+) -> (Vec<Value>, usize) {
     let mut collected: Vec<Value> = Vec::new();
     let mut token: Option<String> = None;
     let mut pages = 0;
@@ -392,7 +411,7 @@ async fn listed(emulator: &Emulator, network: &str, query: &str) -> (Vec<Value>,
 }
 
 /// The keys `query` selects, following `NextToken` to the end.
-async fn keys(emulator: &Emulator, network: &str, query: &str) -> Vec<String> {
+pub(crate) async fn keys(emulator: &Emulator, network: &str, query: &str) -> Vec<String> {
     let (entries, _) = listed(emulator, network, query).await;
     entries.iter().map(key_of).collect()
 }
@@ -438,9 +457,10 @@ async fn every_stored_resource_is_reported_with_its_identity_account_tags_and_de
         );
         // A core network belongs to itself and an attachment to the core network it joins
         // a resource to; the kinds that hang off the global network belong to no core
-        // network. No stored resource is reached through a registered gateway, sits in one
-        // Region, or carries metadata (the operations that would give it any are still
-        // scaffold stubs).
+        // network. The attachment is the one resource of this fixture that sits at a single
+        // edge location, which is the Region it reports. No stored resource is reached
+        // through a registered gateway or carries metadata (the operations that would give
+        // it either are still scaffold stubs).
         let expected_core_network = resource
             .core_network_id
             .as_ref()
@@ -449,7 +469,14 @@ async fn every_stored_resource_is_reported_with_its_identity_account_tags_and_de
             entry["CoreNetworkId"], expected_core_network,
             "case {case}: expected CoreNetworkId {expected_core_network}, got {entry}"
         );
-        for absent in ["AwsRegion", "RegisteredGatewayArn", "Metadata"] {
+        let expected_region = resource
+            .aws_region
+            .map_or(Value::Null, |region| json!(region));
+        assert_eq!(
+            entry["AwsRegion"], expected_region,
+            "case {case}: expected AwsRegion {expected_region}, got {entry}"
+        );
+        for absent in ["RegisteredGatewayArn", "Metadata"] {
             assert!(
                 entry[absent].is_null(),
                 "case {case}: {absent} is held nowhere, so it must be absent, got {entry}"
@@ -584,7 +611,7 @@ async fn each_filter_narrows_the_inventory_to_the_resources_that_carry_its_value
         ),
         (
             "two filters, one unsatisfied".to_string(),
-            "resourceType=site&awsRegion=us-west-2".to_string(),
+            format!("resourceType=site&awsRegion={EDGE_REGION}"),
             Vec::new(),
         ),
     ];
@@ -598,13 +625,18 @@ async fn each_filter_narrows_the_inventory_to_the_resources_that_carry_its_value
             of_type(resource_type),
         ));
     }
-    // Every Region is a row, because no kind this service stores sits in one: its ARNs
-    // carry an empty region segment, so an `awsRegion` filter selects none of them.
-    for region in ["us-west-2", "eu-west-1", "ap-southeast-1"] {
+    // Every Region is a row: the one the fixture's attachment sits at selects exactly that
+    // attachment, and a Region nothing of this global network sits at selects nothing.
+    for region in [EDGE_REGION, "eu-west-1", "ap-southeast-1"] {
+        let expected: Vec<String> = resources
+            .iter()
+            .filter(|resource| resource.aws_region == Some(region))
+            .map(Resource::key)
+            .collect();
         rows.push((
             format!("awsRegion={region}"),
             format!("awsRegion={region}"),
-            Vec::new(),
+            expected,
         ));
     }
 

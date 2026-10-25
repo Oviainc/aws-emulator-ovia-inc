@@ -33,6 +33,8 @@ mod instance_profile_roles;
 mod instance_profile_tags;
 #[path = "all/instance_profiles.rs"]
 mod instance_profiles;
+#[path = "all/login_profile_updates.rs"]
+mod login_profile_updates;
 #[path = "all/login_profiles.rs"]
 mod login_profiles;
 #[path = "all/managed_policies.rs"]

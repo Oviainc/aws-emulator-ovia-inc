@@ -289,6 +289,24 @@ pub const MAX_DISTRIBUTION_TENANTS: usize = 10_000;
 /// nothing here runs.
 pub const DOMAIN_STATUS_ACTIVE: &str = "active";
 
+/// `DnsConfiguration$Status` for a domain that "is correctly configured and points to the
+/// correct routing endpoint of the connection group".
+pub const DNS_CONFIGURATION_VALID: &str = "valid-configuration";
+
+/// `DnsConfiguration$Status` for a domain where "there is either a missing DNS record or
+/// the DNS record exists but it's using an incorrect routing endpoint": the status for a
+/// verification that was MADE and disagreed — a DNS record that resolves the domain to
+/// some other endpoint.
+pub const DNS_CONFIGURATION_INVALID: &str = "invalid-configuration";
+
+/// `DnsConfiguration$Status` for a domain CloudFront "can't validate": the status for a
+/// verification that could not be MADE — "CloudFront can't verify the DNS record, or the
+/// DNS lookup request failed or timed out" — as opposed to one that was made and
+/// disagreed. A name no DNS record this service can read resolves is in exactly that
+/// position: recorded behaviour, which answers this rather than
+/// [`DNS_CONFIGURATION_INVALID`] for a domain with no DNS record.
+pub const DNS_CONFIGURATION_UNKNOWN: &str = "unknown-configuration";
+
 /// The prefix every distribution tenant id this service mints carries.
 ///
 /// `GetDistributionTenant`'s `Identifier` is "the ARN, ID, or name of the distribution
@@ -2613,6 +2631,41 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
                     .iter()
                     .any(|alias| same_domain(alias, domain))
             })
+    }
+
+    /// The CloudFront endpoint the DNS name `name` resolves to, or `None` when this
+    /// service holds no record that resolves it.
+    ///
+    /// CloudFront answers for the names it MINTS — the `d<label>.cloudfront.net` endpoints
+    /// it allocates: a connection group's routing endpoint ("also known as the DNS name
+    /// ... such as `d111111abcdef8.cloudfront.net`") and a distribution's own
+    /// `DomainName`. Each of those names resolves to itself, and that is the whole of what
+    /// this emulator can resolve: a name in a CUSTOMER's zone (the domain of a
+    /// distribution tenant, an alias of a distribution) is published by the customer's own
+    /// DNS, which this emulator neither runs nor reaches — so it holds no record for one,
+    /// exactly as [`DOMAIN_STATUS_ACTIVE`] says of the association it does hold.
+    ///
+    /// [`MULTI_TENANT_DOMAIN_NAME`] is excluded: it is the fixed placeholder a
+    /// multi-tenant distribution reports in place of an edge domain, not a name that
+    /// resolves anywhere.
+    pub fn resolved_cloudfront_endpoint(&self, name: &str) -> Option<String> {
+        if let Some(group) = self
+            .connection_groups
+            .values()
+            .find(|group| same_domain(&group.routing_endpoint, name))
+        {
+            return Some(group.routing_endpoint.clone());
+        }
+        if let Some(distribution) = self.distributions.values().find(|distribution| {
+            let reported = distribution.reported_domain_name();
+            reported != MULTI_TENANT_DOMAIN_NAME && same_domain(&reported, name)
+        }) {
+            return Some(distribution.reported_domain_name());
+        }
+        self.streaming_distributions
+            .values()
+            .find(|distribution| same_domain(&distribution.domain_name, name))
+            .map(|distribution| distribution.domain_name.clone())
     }
 
     /// Whether `id` names a connection group this store holds — an id no connection group
@@ -5711,11 +5764,15 @@ pub fn distribution_not_found(id: &str) -> EntityNotFound {
 
 /// The modelled `EntityNotFound` (HTTP 404) for an identifier — an ARN, an id or a name —
 /// no stored distribution tenant answers to.
-pub fn distribution_tenant_not_found(identifier: &str) -> EntityNotFound {
+///
+/// CloudFront's wording states the CONDITION and echoes no part of the request, so it
+/// takes no identifier: the same sentence answers an unknown ARN, an unknown id and an
+/// unknown name, which is also why every operation that resolves a tenant shares it.
+/// Recorded behaviour — the model states only `EntityNotFound`'s own "The entity was not
+/// found."
+pub fn distribution_tenant_not_found() -> EntityNotFound {
     EntityNotFound {
-        message: Some(format!(
-            "The specified distribution tenant does not exist: {identifier}"
-        )),
+        message: Some("The specified distribution tenant doesn't exist.".to_string()),
     }
 }
 

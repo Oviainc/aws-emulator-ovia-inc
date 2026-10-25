@@ -221,18 +221,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The same bound store-wide: the per-catalog ceiling alone, multiplied by the
+        // number of catalogs, would still let a caller grow the store past what one
+        // process should hold.
+        if !store.can_store_database() {
+            return Err(
+                CreateDatabaseErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} databases",
+                            crate::state::MAX_STORED_DATABASES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let entry = crate::state::DatabaseEntry::from_input(
             &input.database_input,
             &catalog_id,
             input.tags.as_ref(),
             ::std::time::SystemTime::now(),
         );
-        store
-            .catalogs
-            .entry(catalog_id.clone())
-            .or_default()
-            .databases
-            .insert(folded.clone(), entry);
+        // The catalog container is created here if this store does not hold it yet, and
+        // only if there is room for another one: the number of containers is bounded too,
+        // not just what each one holds.
+        let Some(catalog) = store.catalog_mut_for_create(&catalog_id) else {
+            return Err(
+                CreateDatabaseErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} Data Catalogs",
+                            crate::state::MAX_CATALOGS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        catalog.databases.insert(folded.clone(), entry);
         ::tracing::info!(
             operation = "CreateDatabase",
             catalog_id = %catalog_id,

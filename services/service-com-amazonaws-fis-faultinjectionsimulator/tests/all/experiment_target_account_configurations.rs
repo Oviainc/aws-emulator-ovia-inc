@@ -118,7 +118,22 @@ async fn send(router: &MultiServiceRouter, method: &str, uri: &str, body: Option
 /// Create an experiment template to hang target account configurations off, and report
 /// its minted id. `label` only has to be unique within one test; whitespace in it is
 /// collapsed because `ClientToken` is modelled `pattern ^[\S]+$`.
+///
+/// The template targets MULTIPLE accounts, which is the targeting a target account
+/// configuration belongs to: `accountTargeting` and the configurations a template holds
+/// state the same thing between them. [`single_account_template`] is the one for a case
+/// that hangs no configuration off its template.
 async fn template(router: &MultiServiceRouter, label: &str) -> String {
+    create_template(router, label, "multi-account").await
+}
+
+/// Create an experiment template that targets a SINGLE account — the documented default —
+/// for a case whose experiment holds no target account configuration at all.
+async fn single_account_template(router: &MultiServiceRouter, label: &str) -> String {
+    create_template(router, label, "single-account").await
+}
+
+async fn create_template(router: &MultiServiceRouter, label: &str, targeting: &str) -> String {
     let token: String = label
         .chars()
         .map(|c| if c.is_whitespace() { '-' } else { c })
@@ -132,6 +147,7 @@ async fn template(router: &MultiServiceRouter, label: &str) -> String {
             "description": format!("experiment target account configuration suite: {label}"),
             "roleArn": "arn:aws:iam::000000000000:role/fis-experiment-target-accounts",
             "stopConditions": [{ "source": "none" }],
+            "experimentOptions": { "accountTargeting": targeting },
             // `aws:fis:wait` takes a required `duration`, an ISO 8601 duration within the
             // documented 1 to 720 minutes.
             "actions": {
@@ -588,7 +604,8 @@ async fn a_configuration_added_after_the_start_is_not_part_of_the_experiment() {
 async fn a_name_the_experiment_does_not_hold_answers_resource_not_found() {
     let router = emulator();
     let configured = template(&router, "configured").await;
-    let other = template(&router, "other").await;
+    // This one holds no configuration at all, so it targets a single account.
+    let other = single_account_template(&router, "other").await;
     let account_id = "999999999999";
     let created = create_configuration(
         &router,
@@ -662,7 +679,7 @@ async fn a_name_the_experiment_does_not_hold_answers_resource_not_found() {
 #[tokio::test]
 async fn a_read_outside_a_modelled_bound_is_refused() {
     let router = emulator();
-    let template_id = template(&router, "bounds").await;
+    let template_id = single_account_template(&router, "bounds").await;
     let (experiment_id, _) = start_experiment(&router, &template_id, "bounds").await;
 
     // `accountId` on each of its published bounds, and one past each. Inside the bounds
