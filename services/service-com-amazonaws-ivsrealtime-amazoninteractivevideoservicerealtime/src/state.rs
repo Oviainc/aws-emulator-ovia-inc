@@ -27,7 +27,8 @@ use crate::ops::types::{
     LayoutConfiguration, Participant, ParticipantRecordingHlsConfiguration, ParticipantReplica,
     ParticipantSummary, ParticipantThumbnailConfiguration, ParticipantToken, PipConfiguration,
     RedundantIngestCredential, ResourceNotFoundException, S3StorageConfiguration,
-    ServiceQuotaExceededException, Stage, StageEndpoints, StageSessionSummary, StageSummary,
+    ServiceQuotaExceededException, Stage, StageEndpoints, StageSession, StageSessionSummary,
+    StageSummary,
     StartParticipantReplicationOutput, StopParticipantReplicationOutput, StorageConfiguration,
     StorageConfigurationSummary, UpdateIngestConfigurationOutput, ValidationException, Video,
 };
@@ -1477,9 +1478,9 @@ impl CompositionRecord {
 // applied — over the session [`ensure_active_session`] opens, and by the one control-plane
 // call that does put a participant into a stage, a replication starting
 // ([`record_replicated_participant`], which goes through that same entry point); and the
-// reporting operations (`GetParticipant`, `ListParticipants` and `ListStageSessions`
-// today; `GetStageSession`, its own gap issue) answer from exactly what those recorded,
-// never from a value invented for a join that never happened.
+// reporting operations (`GetParticipant`, `ListParticipants`, `ListStageSessions` and
+// `GetStageSession`) answer from exactly what those recorded, never from a value
+// invented for a join that never happened.
 // ---------------------------------------------------------------------------
 
 /// `ParticipantState` of a participant that is in the stage right now.
@@ -2160,6 +2161,22 @@ impl StageSessionRecord {
             session_id: Some(self.session_id.clone()),
             start_time: Some(::aws_smithy_types::DateTime::from(self.start_time)),
             end_time: self.end_time.map(::aws_smithy_types::DateTime::from),
+        }
+    }
+
+    /// The modelled `StageSession` this record reports when `GetStageSession` names it.
+    ///
+    /// Every member of `StageSession` is the same member of `StageSessionSummary` with
+    /// the same doc, so the two are reported from one place and `GetStageSession` and
+    /// `ListStageSessions` cannot disagree about a session: `endTime` is reported only
+    /// once the session has ended ("This is null if the stage is active", as
+    /// `StageSession$endTime` states).
+    pub fn to_stage_session(&self) -> StageSession {
+        let summary = self.to_summary();
+        StageSession {
+            session_id: summary.session_id,
+            start_time: summary.start_time,
+            end_time: summary.end_time,
         }
     }
 
