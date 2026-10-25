@@ -15,6 +15,13 @@
 //! the accumulated map honours [`crate::state::TAGS_PER_SCAN_QUOTA`] as `TagResource`
 //! does.
 //!
+//! `clientToken` is `@idempotencyToken`, so a RETRY — the same request sent again — is
+//! answered with the run the first call started and starts no revision, while the same
+//! token carrying a different request is two requests sharing one token and is refused
+//! with the modelled `ConflictException` (HTTP 409). A token stands for its request only
+//! within [`crate::state::CLIENT_TOKEN_WINDOW_MILLIS`]; past that it names nothing and
+//! the next call carrying it is a fresh request.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -216,19 +223,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_due_runs(now);
         store.expire_due_artifacts(now);
+        // A client token stands for one request only while its window is open; once the
+        // clock has closed it the token names nothing, so this request is a fresh one.
+        store.expire_due_client_tokens(now);
+
+        // Documented defaults: "Defaults to Standard type if missing" (`scanType`) and
+        // "Defaults to Security type if missing" (`analysisType`). Resolved before the
+        // token is consulted, because what the token stands for is the request as the
+        // service resolves it: naming a default explicitly asks for the same work as
+        // leaving it out.
+        let scan_type = input
+            .scan_type
+            .clone()
+            .unwrap_or_else(|| crate::state::SCAN_TYPE_STANDARD.to_string());
+        let analysis_type = input
+            .analysis_type
+            .clone()
+            .unwrap_or_else(|| crate::state::ANALYSIS_TYPE_SECURITY.to_string());
+
+        let code_artifact_id = match &input.resource_id {
+            ResourceId::codeArtifactId(id) => id.clone(),
+        };
+
+        // Everything this request asks for, which is what its client token stands for.
+        let requested = crate::state::ScanRequestParameters {
+            scan_name: input.scan_name.clone(),
+            code_artifact_id: code_artifact_id.clone(),
+            scan_type: scan_type.clone(),
+            analysis_type: analysis_type.clone(),
+            tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
+        };
 
         // `clientToken` is `@idempotencyToken` and documented as preventing "the
-        // accidental creation of duplicate scans if there are failures and retries": a
-        // repeat answers with the run the first call created, and starts no revision.
-        // The ledger is keyed on the token AND the scan name, so a token reused for a
-        // different scan can never answer with the other scan's run.
+        // accidental creation of duplicate scans if there are failures and retries". A
+        // retry is the SAME request sent again, so a token answers from its record only
+        // where the request it carries is the one the token was first seen on: that
+        // replay starts no revision and answers with the run the first call created —
+        // decided before the artifact is resolved, since a retry of an accepted request
+        // answers what that request produced rather than changing its answer because the
+        // account's artifacts have moved on since. A token carrying a DIFFERENT request
+        // is not a retry of anything but two requests sharing one token, which is the
+        // conflict the token exists to detect.
         if let Some(token) = input.client_token.as_deref() {
-            let ledger_key = (token.to_string(), input.scan_name.clone());
-            if let Some(run_id) = store.idempotency.get(&ledger_key).cloned() {
-                let recorded = store.scans.get(&input.scan_name).and_then(|scan| {
+            if let Some(record) = store.idempotency.get(token).cloned() {
+                if record.request != requested {
+                    return Err(CreateScanErrorModeled::ConflictException(ConflictException {
+                        error_code: "ConflictException".to_string(),
+                        message: format!(
+                            "The requested operation would cause a conflict with the current \
+                             state of a service resource associated with the request: client \
+                             token {token} already identifies the request that started run \
+                             {run_id} of scan {recorded_scan}, and this request is not that \
+                             request. Resolve the conflict before retrying this request.",
+                            run_id = record.run_id,
+                            recorded_scan = record.request.scan_name,
+                        ),
+                        resource_id: record.request.scan_name.clone(),
+                        resource_type: "scan".to_string(),
+                    })
+                    .into());
+                }
+                let recorded = store.scans.get(&record.request.scan_name).and_then(|scan| {
                     scan.runs
                         .iter()
-                        .find(|run| run.run_id == run_id)
+                        .find(|run| run.run_id == record.run_id)
                         .map(|run| (scan.scan_name_arn.clone(), run.clone()))
                 });
                 let Some((scan_name_arn, run)) = recorded else {
@@ -238,7 +296,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             message: Some(format!(
                                 "client token {token} names run {run_id} of scan {scan_name}, \
                                  which is no longer recorded",
-                                scan_name = input.scan_name,
+                                run_id = record.run_id,
+                                scan_name = record.request.scan_name,
                             )),
                         },
                     )
@@ -253,10 +312,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 });
             }
         }
-
-        let code_artifact_id = match &input.resource_id {
-            ResourceId::codeArtifactId(id) => id.clone(),
-        };
 
         // `ResourceId$codeArtifactId` is documented as "Returned by `CreateUploadUrl`",
         // so an id this service never minted names no resource.
@@ -299,17 +354,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
-
-        // Documented defaults: "Defaults to Standard type if missing" (`scanType`) and
-        // "Defaults to Security type if missing" (`analysisType`).
-        let scan_type = input
-            .scan_type
-            .clone()
-            .unwrap_or_else(|| crate::state::SCAN_TYPE_STANDARD.to_string());
-        let analysis_type = input
-            .analysis_type
-            .clone()
-            .unwrap_or_else(|| crate::state::ANALYSIS_TYPE_SECURITY.to_string());
 
         // A scan name tracks revisions of one resource one run at a time: while its
         // latest run is still `InProgress` another revision cannot be started.
@@ -455,10 +499,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // had one keeps the key it configured.
         store.onboard_account(now);
 
+        // What this token now stands for: the request it was carried on and the run that
+        // request started, until its window closes.
         if let Some(token) = input.client_token.clone() {
-            store
-                .idempotency
-                .insert((token, input.scan_name.clone()), run_id.clone());
+            store.remember_client_token(crate::state::IdempotentCreateScan {
+                client_token: token,
+                request: requested,
+                run_id: run_id.clone(),
+                recorded_at_millis: now,
+                expires_at_millis: now.saturating_add(crate::state::CLIENT_TOKEN_WINDOW_MILLIS),
+            });
         }
 
         Ok(CreateScanOutput {

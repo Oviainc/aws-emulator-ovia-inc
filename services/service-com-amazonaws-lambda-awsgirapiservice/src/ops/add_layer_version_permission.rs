@@ -273,7 +273,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Only update the policy if the revision ID matches the ID specified." The id
         // to match is the policy's own, which is the one `GetLayerVersionPolicy`
         // reports; a version with no policy yet is at no revision, so any expectation
-        // fails against it.
+        // fails against it. `PreconditionFailedException` puts every operation but
+        // `AddPermission`/`RemovePermission` on its second branch, so the refusal is the
+        // sentence naming `GetFunction`/`GetAlias`.
         if let Some(expected) = input.revision_id.as_deref() {
             let current = resolved
                 .version
@@ -285,12 +287,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     AddLayerVersionPermissionErrorModeled::PreconditionFailedException(
                         PreconditionFailedException {
                             r#type: None,
-                            message: Some(format!(
-                                "The RevisionId ({expected}) provided does not match the latest \
-                                 RevisionId for the resource {resource}. Call \
-                                 GetLayerVersionPolicy to retrieve the latest RevisionId for \
-                                 your resource."
-                            )),
+                            message: Some(
+                                crate::state::CONFIGURATION_REVISION_PRECONDITION_MESSAGE
+                                    .to_string(),
+                            ),
                         },
                     )
                     .into(),

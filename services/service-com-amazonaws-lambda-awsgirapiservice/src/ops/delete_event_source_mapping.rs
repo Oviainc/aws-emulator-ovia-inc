@@ -265,7 +265,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        let region = crate::state::request_region(ctx);
+        // A mapping is addressed by its own `UUID` and reports the ARNs it was created
+        // with, so no request metadata takes part in this delete.
+        let _ = ctx;
         let mut store = state.lock();
         // The store is first brought up to whatever the clock already made due, so a
         // mapping whose own removal was already owed is gone before this call looks for
@@ -277,10 +279,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 DeleteEventSourceMappingErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         r#type: None,
-                        message: Some(format!(
-                            "Event source mapping not found: {}",
-                            crate::state::event_source_mapping_arn(&region, &input.uuid)
-                        )),
+                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                     },
                 )
                 .into(),
