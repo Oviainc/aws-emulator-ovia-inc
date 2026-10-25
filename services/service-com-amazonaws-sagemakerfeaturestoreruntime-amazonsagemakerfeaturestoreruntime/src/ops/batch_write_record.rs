@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchWriteRecord
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchWriteRecord`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation ingests each of its `Entries` into the OnlineStore held
+//! in [`crate::state`], independently of the others, through the same preparation and
+//! ingestion one `PutRecord` performs ([`crate::state::prepare_record`] and
+//! [`crate::state::FeatureGroupStore::ingest`]) — so a batched write and a single write
+//! of the same record cannot be judged differently.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchWriteRecord::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An entry this data plane cannot write — its `FeatureGroupName` resolves to no feature
+//! group, or its `Record` carries no value for the group's own record-identifier feature,
+//! or an unreadable event time — is reported in `Errors` as that ONE entry's failure and
+//! leaves every other entry of the batch written, rather than failing the whole call; an
+//! entry whose feature group cannot be found is named there by the ARN a group of that
+//! name would carry. An entry the emulator's bounded store has no room for is reported in
+//! `UnprocessedEntries`, which the model documents as the entries that "can be retried".
+//! The request-level `TtlDuration` applies to every entry that names none of its own, and
+//! an entry's own `TtlDuration` overrides it.
+//!
+//! Authorization is not emulated, so the modelled `AccessForbidden` is unreachable, and
+//! so is `ResourceNotFound`: a write names no record that has to exist already, and an
+//! entry whose feature group cannot be found is that entry's own error rather than a
+//! failure of the batch. The OfflineStore is not modelled at all: this file serves the
+//! OnlineStore side of the operation only.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +169,205 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchWriteRecord` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchWriteRecordErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchWriteRecord"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(BatchWriteRecordErrorModeled::InternalFailure(InternalFailure {
+                message: Some(
+                    "BatchWriteRecord: this service holds no state on the mounted engine".into(),
+                ),
+            })
+            .into());
+        };
+
+        // `Entries` is modelled `len 1..25` and refused at the boundary; read it
+        // fallibly all the same, so a handler reached with an empty list answers the
+        // modelled error rather than reporting a batch that wrote nothing as a success.
+        if input.entries.is_empty() {
+            return Err(validation(
+                "Entries must carry at least one BatchWriteRecordEntry",
+            ));
+        }
+
+        // The REQUEST-level `TtlDuration` "applies to all entries that do not specify
+        // their own TtlDuration", so a unit outside the modelled enum would misread every
+        // one of them: it is a defect of the request itself, not of one entry, and fails
+        // the call rather than being reported per entry.
+        if let Some(ttl) = input.ttl_duration.as_ref() {
+            if crate::state::ttl_seconds(ttl).is_none() {
+                return Err(validation(format!(
+                    "TtlDuration.Unit: '{}' is not a TtlDurationUnit; expected one of {}",
+                    ttl.unit,
+                    TTL_DURATION_UNIT_VALUES.join(", ")
+                )));
+            }
+        }
+
+        let mut errors: Vec<BatchWriteRecordError2> = Vec::new();
+        let mut unprocessed_entries: Vec<BatchWriteRecordEntry> = Vec::new();
+        // A feature group an entry names is reported by its ARN, which carries the region
+        // the request was signed for.
+        let region = crate::state::request_region(ctx);
+
+        // ONE critical section for the whole batch, so a batch is never half-visible to
+        // a concurrent reader. Nothing below can panic — each entry's failure is recorded
+        // and the loop goes on to the next entry — and nothing below awaits, so the guard
+        // is never held across a suspension point. LOCK ORDER: this service's own store
+        // first, the shared feature-group directory second (the order every other caller
+        // of the directory takes).
+        let mut store = state.lock();
+        // The fan-out is bounded by the request: `Entries` is modelled `len 1..25`,
+        // refused at the boundary before this handler runs, so no cardinality check is
+        // repeated here.
+        for entry in &input.entries {
+            // "Time to live duration for this entry … This overrides the request level
+            // TtlDuration."
+            let ttl_duration = entry.ttl_duration.as_ref().or(input.ttl_duration.as_ref());
+
+            if let Some(message) =
+                crate::state::undeclared_target_store(entry.target_stores.as_ref())
+            {
+                errors.push(entry_error(
+                    entry,
+                    crate::state::VALIDATION_ERROR_CODE,
+                    message,
+                ));
+                continue;
+            }
+
+            // The data plane's one feature-group resolution, per entry: this operation
+            // reports a failure that concerns ONE entry in `Errors` rather than failing
+            // the whole batch, so a name that denotes no feature group is that entry's
+            // own error, carrying the `ValidationError` code every single-record write of
+            // this data plane refuses the same name with. The MESSAGE is this operation's
+            // own: it states that the feature group could not be found and names it by
+            // its ARN, which is what tells a caller which of up to 25 entries the failure
+            // belongs to.
+            let definition =
+                match crate::state::resolve_group(&*self.engine, &entry.feature_group_name) {
+                    Ok(definition) => definition,
+                    Err(crate::state::Unresolved::Refused(_)) => {
+                        errors.push(entry_error(
+                            entry,
+                            crate::state::VALIDATION_ERROR_CODE,
+                            no_such_feature_group(&crate::state::feature_group_arn(
+                                &region,
+                                &entry.feature_group_name,
+                            )),
+                        ));
+                        continue;
+                    }
+                    Err(crate::state::Unresolved::NoDirectory) => {
+                        return Err(BatchWriteRecordErrorModeled::InternalFailure(
+                            InternalFailure {
+                                message: Some(
+                                    "BatchWriteRecord: this service holds no feature-group \
+                                     directory on the mounted engine"
+                                        .into(),
+                                ),
+                            },
+                        )
+                        .into())
+                    }
+                };
+
+            // The entry's record is read against the group's DEFINITION by the same
+            // preparation `PutRecord` uses, so a record written in a batch is read
+            // exactly as the same record written on its own.
+            let prepared =
+                match crate::state::prepare_record(&definition, &entry.record, ttl_duration) {
+                    Ok(prepared) => prepared,
+                    Err(message) => {
+                        errors.push(entry_error(
+                            entry,
+                            crate::state::VALIDATION_ERROR_CODE,
+                            message,
+                        ));
+                        continue;
+                    }
+                };
+
+            // This service is the OnlineStore data plane, so an entry naming only the
+            // OfflineStore leaves the online store alone — as does an entry written to a
+            // feature group that HAS no OnlineStore (AWS replicates that one to the
+            // OfflineStore, which this emulator does not model). Neither is a failure of
+            // the entry, so neither is reported in `Errors`.
+            if !crate::state::targets_online_store(entry.target_stores.as_ref())
+                || !definition.online_store_enabled
+            {
+                continue;
+            }
+
+            // A write the emulator's bounded store has no room for is not the caller's
+            // mistake, so it is not an entry error: it is an entry that was not
+            // processed, which the model documents as one that can be retried.
+            let Some(group) = store.group_or_create(&entry.feature_group_name) else {
+                unprocessed_entries.push(entry.clone());
+                continue;
+            };
+            match group.ingest(prepared) {
+                // A historic entry is written only to the OfflineStore, which this
+                // emulator does not model: nothing was stored online and nothing failed.
+                crate::state::Ingested::Stored | crate::state::Ingested::Historic => {}
+                crate::state::Ingested::AtCapacity => unprocessed_entries.push(entry.clone()),
+            }
+        }
+
+        Ok(BatchWriteRecordOutput {
+            errors,
+            unprocessed_entries,
+        })
     }
 }
+
+/// The modelled `ValidationError` (HTTP 400) for a REQUEST this operation refuses whole,
+/// as opposed to one entry of a batch whose other entries are written.
+fn validation(message: impl Into<String>) -> BatchWriteRecordError {
+    BatchWriteRecordErrorModeled::ValidationError(ValidationError {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// One entry's failure, as `Errors` reports it: "The entry that failed to be written",
+/// the error code for the failed record write, and its message.
+fn entry_error(
+    entry: &BatchWriteRecordEntry,
+    error_code: &str,
+    message: String,
+) -> BatchWriteRecordError2 {
+    BatchWriteRecordError2 {
+        entry: entry.clone(),
+        error_code: error_code.to_owned(),
+        error_message: bounded_message(message),
+    }
+}
+
+/// How this operation states an entry whose `FeatureGroupName` denotes no feature group.
+///
+/// The group is named by `arn`, the ARN a feature group of that name would carry
+/// ([`crate::state::feature_group_arn`]): a batch carries up to 25 entries, so the
+/// message has to say WHICH group could not be found for a caller to tell which entry it
+/// belongs to.
+fn no_such_feature_group(arn: &str) -> String {
+    format!("Resource Not Found: Amazon SageMaker can't find a FeatureGroup with name [{arn}].")
+}
+
+/// `message`, cut to the modelled maximum length of an `ErrorMessage`.
+///
+/// A refusal may quote a value the request supplied, and a `ValueAsString` is modelled
+/// `len 0..358400`, so the message is cut at the last character boundary within the bound
+/// rather than answered outside it.
+fn bounded_message(mut message: String) -> String {
+    if message.len() > MAX_ERROR_MESSAGE {
+        let cut = (0..=MAX_ERROR_MESSAGE)
+            .rev()
+            .find(|at| message.is_char_boundary(*at))
+            .unwrap_or_default();
+        message.truncate(cut);
+    }
+    message
+}
+
+/// The modelled maximum length of a `BatchWriteRecordError`'s `ErrorMessage`: its target
+/// `Message` is `len 0..2048`
+/// (`smithy_query(query="shape", shape="BatchWriteRecordError")`).
+const MAX_ERROR_MESSAGE: usize = 2048;

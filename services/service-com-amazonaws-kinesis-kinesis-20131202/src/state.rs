@@ -119,6 +119,25 @@ pub const DEFAULT_DESCRIBE_STREAM_SHARD_LIMIT: i32 = 100;
 /// than 100, at most 100 results are returned" (`DescribeStreamInput$Limit`).
 pub const MAX_DESCRIBE_STREAM_SHARD_LIMIT: i32 = 100;
 
+/// How many shards `ListShards` returns when the request names no `MaxResults`: "The
+/// maximum number of shards to return in a single call. The default value is 1000"
+/// (`ListShardsInput$MaxResults`).
+pub const DEFAULT_LIST_SHARDS_LIMIT: i32 = 1_000;
+
+/// The most shards `ListShards` returns in one call: "If you specify a value greater than
+/// 1000, at most 1000 results are returned" (`ListShardsInput$MaxResults`), which the
+/// modelled `range 1..10000` deliberately leaves room above.
+pub const MAX_LIST_SHARDS_LIMIT: i32 = 1_000;
+
+/// How long a `ListShards` pagination token stays usable: "Tokens expire after 300
+/// seconds. When you obtain a value for NextToken in the response to a call to ListShards,
+/// you have 300 seconds to use that value" (`ListShardsOutput$NextToken`).
+pub const LIST_SHARDS_TOKEN_TTL: Duration = Duration::from_secs(300);
+
+/// How many seconds an hour of a retention window holds, so the window a stream reports in
+/// hours can be measured against stored instants.
+const SECONDS_PER_HOUR: u64 = 3_600;
+
 /// How a stream is keyed: the region its creating request was signed for, and the name
 /// that request carried.
 ///
@@ -158,6 +177,12 @@ pub struct ShardRecord {
     /// OPEN state have an ending sequence number of null"
     /// (`SequenceNumberRange$EndingSequenceNumber`).
     pub ending_sequence_number: Option<String>,
+    /// When the shard was opened: the instant the create or the reshard that laid it down
+    /// ran. A shard filter selects by it, so it is stored rather than derived.
+    pub created_at: SystemTime,
+    /// When the shard was closed, `None` while it is open. A reshard is what closes a
+    /// shard, and it sets this instant and [`Self::ending_sequence_number`] together.
+    pub closed_at: Option<SystemTime>,
 }
 
 impl ShardRecord {
@@ -182,7 +207,24 @@ impl ShardRecord {
 
     /// Whether the shard is still open, so it counts towards `OpenShardCount`.
     pub fn is_open(&self) -> bool {
-        self.ending_sequence_number.is_none()
+        self.ending_sequence_number.is_none() && self.closed_at.is_none()
+    }
+
+    /// Whether the shard was open at `instant`: it had been laid down by then and nothing
+    /// had closed it yet.
+    pub fn was_open_at(&self, instant: SystemTime) -> bool {
+        self.created_at <= instant && self.closed_at.is_none_or(|closed| closed > instant)
+    }
+
+    /// Whether the shard still held data at `instant`: it was laid down no later than
+    /// `instant` and, if it has been closed, closed no earlier.
+    pub fn spans(&self, instant: SystemTime) -> bool {
+        self.created_at <= instant && self.closed_at.is_none_or(|closed| closed >= instant)
+    }
+
+    /// Whether the shard is open or was closed no earlier than `instant`.
+    pub fn open_or_closed_since(&self, instant: SystemTime) -> bool {
+        self.closed_at.is_none_or(|closed| closed >= instant)
     }
 }
 
@@ -237,6 +279,20 @@ impl Stream {
         } else {
             STREAM_ACTIVE
         }
+    }
+
+    /// The stream's trim horizon at `now`: the oldest instant data is still retained for.
+    ///
+    /// "A stream's data records are accessible for 24 hours from the time they are added to
+    /// the stream" by default, and for `RetentionPeriodHours` once that window is changed,
+    /// so the horizon trails `now` by the stream's own retention window — never reaching
+    /// back past the instant the stream was created, since nothing was retained before it.
+    pub fn trim_horizon(&self, now: SystemTime) -> SystemTime {
+        let hours = u64::try_from(self.retention_period_hours).unwrap_or_default();
+        let window = Duration::from_secs(hours.saturating_mul(SECONDS_PER_HOUR));
+        now.checked_sub(window)
+            .filter(|horizon| *horizon > self.created_at)
+            .unwrap_or(self.created_at)
     }
 
     /// How many of the stream's shards are open.
@@ -612,9 +668,143 @@ pub fn hash_key_ranges(shard_count: u32) -> Vec<(String, String)> {
 /// differ, two streams created at different instants differ, and the value a read reports
 /// never changes.
 pub fn starting_sequence_number(created_at: SystemTime, index: u32) -> String {
-    let millis = created_at
-        .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_millis())
-        .unwrap_or(0);
+    let millis = epoch_millis(created_at);
     format!("49{millis:013}{index:06}")
+}
+
+/// What a `ListShards` pagination token is tagged with, so a string the service never
+/// issued is refused rather than read as a shard id.
+const SHARD_PAGE_TOKEN_TAG: &str = "listShards";
+
+/// Milliseconds since the epoch at `at`, which is how an instant travels inside a
+/// pagination token.
+pub fn epoch_millis(at: SystemTime) -> u128 {
+    at.duration_since(UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or(0)
+}
+
+/// Where a truncated `ListShards` page continues, which stream's shards it continues, and
+/// when the page that handed the token out was served.
+///
+/// The token "unambiguously identifies the stream" (`ListShardsInput$NextToken`), so it
+/// carries the stream's ARN AND the instant that stream was created — a name a delete
+/// released and a later create took again is another stream, and the pair names only one of
+/// them — beside the shard the next page starts at; and it expires, so it carries the
+/// instant it was minted. All of it travels INSIDE the token: a read mints one without
+/// writing anything a later caller could see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardPageToken {
+    /// The ARN of the stream whose shards are being listed.
+    pub stream_arn: String,
+    /// When that stream was created, in milliseconds since the epoch.
+    pub stream_created_at_millis: u128,
+    /// The id of the first shard the page did NOT return, which the next page starts at.
+    pub next_shard_id: String,
+    /// When the page that handed this token out was served, in milliseconds since the
+    /// epoch.
+    pub issued_at_millis: u128,
+}
+
+impl ShardPageToken {
+    /// The token that resumes at `next_shard_id` for the stream `stream_arn` created at
+    /// `stream_created_at`, minted at `issued_at`.
+    pub fn new(
+        stream_arn: &str,
+        stream_created_at: SystemTime,
+        next_shard_id: &str,
+        issued_at: SystemTime,
+    ) -> Self {
+        Self {
+            stream_arn: stream_arn.to_string(),
+            stream_created_at_millis: epoch_millis(stream_created_at),
+            next_shard_id: next_shard_id.to_string(),
+            issued_at_millis: epoch_millis(issued_at),
+        }
+    }
+
+    /// This token as the opaque `NextToken` a client is handed.
+    ///
+    /// Opaque (hex of a tagged byte string) because the model gives `NextToken` no
+    /// structure: a client passes back what it was handed rather than constructing one. Two
+    /// hex characters per byte keeps it far inside the modelled length 1..1048576.
+    pub fn encode(&self) -> String {
+        hex::encode(format!(
+            "{SHARD_PAGE_TOKEN_TAG}:{}:{}:{}:{}",
+            self.issued_at_millis,
+            self.stream_created_at_millis,
+            self.next_shard_id,
+            self.stream_arn
+        ))
+    }
+
+    /// The token `token` carries, or `None` when it is not one this service issued.
+    pub fn decode(token: &str) -> Option<Self> {
+        let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+        // The ARN carries colons of its own, so it is the LAST field: the tag, the two
+        // instants and the shard id (whose `@pattern` admits no colon) are taken first.
+        let mut fields = decoded.splitn(5, ':');
+        if fields.next()? != SHARD_PAGE_TOKEN_TAG {
+            return None;
+        }
+        let issued_at_millis = fields.next()?.parse().ok()?;
+        let stream_created_at_millis = fields.next()?.parse().ok()?;
+        let next_shard_id = fields.next()?.to_string();
+        let stream_arn = fields.next()?.to_string();
+        if next_shard_id.is_empty() || stream_arn.is_empty() {
+            return None;
+        }
+        Some(Self {
+            stream_arn,
+            stream_created_at_millis,
+            next_shard_id,
+            issued_at_millis,
+        })
+    }
+
+    /// Whether the token names `stream`: the same ARN, created at the same instant.
+    pub fn names(&self, stream: &Stream) -> bool {
+        self.stream_arn == stream.arn
+            && self.stream_created_at_millis == epoch_millis(stream.created_at)
+    }
+
+    /// Whether the token is past its lifetime at `now` ([`LIST_SHARDS_TOKEN_TTL`]).
+    ///
+    /// A mint instant no clock of this emulator could have produced — one that cannot be
+    /// represented, or one still in the future — names no page either, so it counts as past
+    /// its lifetime rather than reaching the store.
+    pub fn is_expired(&self, now: SystemTime) -> bool {
+        let millis = u64::try_from(self.issued_at_millis).unwrap_or(u64::MAX);
+        let Some(issued_at) = UNIX_EPOCH.checked_add(Duration::from_millis(millis)) else {
+            return true;
+        };
+        match now.duration_since(issued_at) {
+            Ok(age) => age > LIST_SHARDS_TOKEN_TTL,
+            // Minted after the instant it is being used at, which no page of this emulator
+            // ever is.
+            Err(_) => true,
+        }
+    }
+}
+
+/// How a request that pairs `NextToken` with a member the token already determines is
+/// refused: "Don't specify StreamName or StreamCreationTimestamp if you specify NextToken
+/// because the latter unambiguously identifies the stream" (`ListShardsInput$NextToken`).
+/// Built FROM the request, so the member at fault names it.
+pub fn next_token_conflict_message(member: &str) -> String {
+    format!(
+        "{member} cannot be specified together with NextToken, which already identifies \
+         the stream and the shard to resume at"
+    )
+}
+
+/// How a read refuses a `NextToken` that is past its lifetime, or one this service never
+/// issued: the rule `ExpiredNextTokenException` publishes ("The pagination token passed to
+/// the operation is expired") together with the lifetime `ListShards` documents.
+pub fn next_token_expired_message() -> String {
+    format!(
+        "the pagination token is expired or was not issued by this service; a NextToken is \
+         usable for {} seconds after the page that returned it",
+        LIST_SHARDS_TOKEN_TTL.as_secs()
+    )
 }
