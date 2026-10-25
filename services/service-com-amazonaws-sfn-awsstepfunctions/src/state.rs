@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-sfn-awsstepfunctions service.
 //!
-//! Five resources live here, and every operation answers from them:
+//! Six resources live here, and every operation answers from them:
 //!
 //! * a **state machine**, keyed by its own ARN
 //!   (`arn:aws:states:<region>:<account>:stateMachine:<name>`). That ARN is a total
@@ -26,11 +26,15 @@
 //! * an **execution**, keyed by its own ARN
 //!   (`arn:aws:states:<region>:<account>:execution:<stateMachineName>:<executionName>`),
 //!   with `executions_by_sm` listing one state machine's executions in start order so
-//!   `ListExecutions` pages without walking the whole store.
+//!   `ListExecutions` pages without walking the whole store;
+//! * a **map run**, the resource a Distributed Map state starts, keyed by its own ARN
+//!   (`arn:aws:states:<region>:<account>:mapRun:<stateMachineName>/<label>:<id>`),
+//!   with `map_runs_by_execution` listing one execution's map runs in the order their
+//!   states were entered so `ListMapRuns` pages the same way.
 //!
 //! ## What the clock owes
 //!
-//! Three transitions here are owed to the clock rather than applied in the call that
+//! Four transitions here are owed to the clock rather than applied in the call that
 //! starts them, because that is what the service reports:
 //!
 //! * an execution starts `RUNNING` and reaches its terminal status later. The run is
@@ -46,6 +50,9 @@
 //! * `DeleteStateMachine` is documented as asynchronous: it "sets the state machine's
 //!   status to `DELETING` and begins the deletion process", so the record moves to
 //!   `DELETING` now and is removed once [`DELETE_SETTLE_DELAY`] has passed.
+//! * a map run a Distributed Map state started is `RUNNING` until the instant its
+//!   items were due, so a caller that lists or describes it straight after the start
+//!   sees it running, exactly as the execution around it is.
 //!
 //! Nothing sleeps: the due instant is stored and [`ComAmazonawsSfnAwsstepfunctionsState::settle`]
 //! materialises whatever the clock has already made due. That is the only write a
@@ -199,6 +206,20 @@ pub const EXECUTION_STATUS_ABORTED: &str = "ABORTED";
 /// An execution that ran for longer than the `TimeoutSeconds` its definition
 /// declares.
 pub const EXECUTION_STATUS_TIMED_OUT: &str = "TIMED_OUT";
+
+/// A Map Run whose items have not all finished yet, one of the values the modelled
+/// `MapRunStatus` carries.
+pub const MAP_RUN_STATUS_RUNNING: &str = "RUNNING";
+
+/// A Map Run every item of which its iteration produced a result for, or whose
+/// failures stayed inside what its `Map` state tolerates.
+pub const MAP_RUN_STATUS_SUCCEEDED: &str = "SUCCEEDED";
+
+/// A Map Run more of whose items failed than its `Map` state tolerates.
+pub const MAP_RUN_STATUS_FAILED: &str = "FAILED";
+
+/// A Map Run whose parent execution was stopped before its items finished.
+pub const MAP_RUN_STATUS_ABORTED: &str = "ABORTED";
 
 /// `ValidateStateMachineDefinitionResultCode`'s value for a definition that
 /// carries no error: "The result value will be OK when no syntax errors are
@@ -542,6 +563,12 @@ pub const STOP_RESERVE_BYTES: usize = asl::MAX_ERROR_BYTES
 /// "The default is 100 and the maximum allowed page size is 1000. A value of 0 uses
 /// the default."
 pub const DEFAULT_PAGE_SIZE: usize = 100;
+
+/// The most bytes one of this service's generated ARNs holds, which is the maximum
+/// the modelled `Arn` shape (len 1..256) carries: every ARN this emulator mints is
+/// built from a state machine name, an execution name and a Map state label, each of
+/// which the Amazon States Language and this API bound well inside it.
+pub const MAX_ARN_BYTES: usize = 256;
 
 // ---------------------------------------------------------------------------
 // Records
@@ -1281,6 +1308,85 @@ impl Execution {
     }
 }
 
+/// One stored Map Run: the resource a Distributed Map state starts, which
+/// `ListMapRuns` reports for the execution that started it.
+///
+/// A Map Run is NOT keyed by its `(execution, label)` pair in the store, because it
+/// is reached by its own ARN; `map_runs_by_execution` is what lists one execution's
+/// Map Runs in the order their states were entered.
+#[derive(Debug, Clone)]
+pub struct MapRun {
+    pub arn: String,
+    /// The execution whose Distributed Map state started it.
+    pub execution_arn: String,
+    /// The state machine that execution ran.
+    pub state_machine_arn: String,
+    /// The `Label` the Map state declares, else that state's own name: the field of
+    /// the ARN that tells two Map Runs of one execution apart.
+    pub label: String,
+    pub status: String,
+    pub start_date: SystemTime,
+    pub stop_date: Option<SystemTime>,
+    /// The terminal status the walk computed and the instant the clock owes it at;
+    /// `None` once it has been applied, or once a stop overtook it.
+    pub pending: Option<PendingMapRunOutcome>,
+    pub max_concurrency: i32,
+    pub tolerated_failure_count: i64,
+    pub tolerated_failure_percentage: f32,
+    pub total_items: i64,
+    pub succeeded_items: i64,
+    pub failed_items: i64,
+    /// How many times the parent execution has been redriven since this Map Run was
+    /// created, which re-ran the Map state this record belongs to.
+    pub redrive_count: i32,
+    pub redrive_date: Option<SystemTime>,
+    /// The bytes the store counts for this record against [`MAX_STORE_BYTES`], set by
+    /// [`ComAmazonawsSfnAwsstepfunctionsState::record_map_runs`] exactly as
+    /// [`Execution::retained_bytes`] is.
+    pub retained_bytes: usize,
+}
+
+/// The terminal status [`asl::run`] computed for a Map Run, owed to the clock: it
+/// becomes the Map Run's reported status at `due_at` and not before.
+#[derive(Debug, Clone)]
+pub struct PendingMapRunOutcome {
+    pub due_at: SystemTime,
+    pub status: String,
+}
+
+impl MapRun {
+    /// Whether this Map Run has reached a terminal status.
+    pub fn is_terminal(&self) -> bool {
+        self.status != MAP_RUN_STATUS_RUNNING
+    }
+
+    /// The bytes this record would retain.
+    pub fn measure(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.arn.len()
+            + self.execution_arn.len()
+            + self.state_machine_arn.len()
+            + self.label.len()
+            + self.status.len()
+            + self
+                .pending
+                .as_ref()
+                .map_or(0, |pending| pending.status.len())
+    }
+
+    /// Apply the terminal status the clock now owes.
+    ///
+    /// `stopDate` is the instant the transition was DUE, not the instant somebody
+    /// happened to look, so two callers reading at different times see one value.
+    fn apply_pending(&mut self) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        self.status = pending.status;
+        self.stop_date = Some(pending.due_at);
+    }
+}
+
 /// Per-service state for com-amazonaws-sfn-awsstepfunctions. A handler reaches it
 /// through [`service_state`].
 #[derive(Debug, Default)]
@@ -1321,6 +1427,12 @@ pub struct ComAmazonawsSfnAwsstepfunctionsState {
     pub executions: BTreeMap<String, Execution>,
     /// One state machine's execution ARNs in start order.
     pub executions_by_sm: HashMap<String, Vec<String>>,
+    /// Every Map Run a Distributed Map state started, keyed by its own ARN — the one
+    /// name `DescribeMapRun` and `UpdateMapRun` reach it by.
+    pub map_runs: BTreeMap<String, MapRun>,
+    /// One execution's Map Run ARNs in the order their `Map` states were entered, so
+    /// `ListMapRuns` pages one execution's Map Runs without walking the whole store.
+    pub map_runs_by_execution: HashMap<String, Vec<String>>,
     /// Every outstanding activity task, keyed by the `taskToken` that names it — the
     /// one name the worker holding it has, and what `SendTaskHeartbeat`,
     /// `SendTaskSuccess` and `SendTaskFailure` resolve it by.
@@ -1339,6 +1451,9 @@ pub struct ComAmazonawsSfnAwsstepfunctionsState {
     /// The execution ARNs that still carry a [`PendingOutcome`], so settling is
     /// proportional to what is actually owed rather than to the whole store.
     pending_executions: Vec<String>,
+    /// The Map Run ARNs that still carry a [`PendingMapRunOutcome`], for the same
+    /// reason.
+    pending_map_runs: Vec<String>,
     /// The state machine ARNs that are `DELETING`, for the same reason.
     deleting_state_machines: Vec<String>,
     /// The bytes every stored record holds together, so the bound on the store is a
@@ -1357,7 +1472,8 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     /// This is the ONE write a reporting operation performs, and it is owed whether
     /// or not anybody called: an execution whose outcome came due is reported
     /// terminal, an activity task that ran out of time is closed and the execution
-    /// waiting at it has failed, and a state machine whose deletion came due is gone.
+    /// waiting at it has failed, a map run whose items were due reports the status
+    /// they produced, and a state machine whose deletion came due is gone.
     /// Tasks settle before executions and executions before deletions, so an outcome
     /// owed before the machine disappeared is still recorded.
     pub fn settle(&mut self, now: SystemTime) {
@@ -1377,6 +1493,22 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             execution.apply_pending();
         }
         self.pending_executions = still_pending;
+
+        let mut still_running = Vec::with_capacity(self.pending_map_runs.len());
+        for arn in std::mem::take(&mut self.pending_map_runs) {
+            let Some(map_run) = self.map_runs.get_mut(&arn) else {
+                continue;
+            };
+            let Some(pending) = map_run.pending.as_ref() else {
+                continue;
+            };
+            if pending.due_at > now {
+                still_running.push(arn);
+                continue;
+            }
+            map_run.apply_pending();
+        }
+        self.pending_map_runs = still_running;
 
         let mut still_deleting = Vec::with_capacity(self.deleting_state_machines.len());
         for arn in std::mem::take(&mut self.deleting_state_machines) {
@@ -2383,7 +2515,9 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             // An outstanding activity task names the execution it belongs to, so it
             // goes with it: no token is left for a worker to answer against an
             // execution that no longer exists.
-            self.discard_tasks_of_executions(&[execution_arn]);
+            self.discard_tasks_of_executions(std::slice::from_ref(&execution_arn));
+            // A Map Run names the execution that started it, for the same reason.
+            self.discard_map_runs_of(&execution_arn);
         }
         Some(machine)
     }
@@ -2463,6 +2597,181 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         self.executions.insert(execution.arn.clone(), execution);
     }
 
+    // -----------------------------------------------------------------------
+    // Map runs
+    // -----------------------------------------------------------------------
+
+    /// Store the Map Runs one attempt of `execution_arn`'s definition started, and
+    /// index them under that execution.
+    ///
+    /// Called once the execution has been ADMITTED, against bytes that already
+    /// include these records' ([`PlannedMapRun::measure`]).
+    ///
+    /// One attempt's Map Runs are POSITIONAL: the walk reports them in the order it
+    /// entered their `Map` states, and a redrive re-runs the same definition over the
+    /// same input, so its walk enters the same states in the same order. The record
+    /// already at a position therefore belongs to the same `Map` state and MOVES —
+    /// keeping its ARN, which a client may be holding, and counting the redrive —
+    /// while a position no earlier attempt reached gets a Map Run of its own. The
+    /// position is what identifies it, not the label, because one walk can enter one
+    /// `Map` state many times (a Distributed Map nested inside another runs once per
+    /// outer item) and each of those entries is a Map Run in its own right.
+    ///
+    /// A record an earlier attempt left at a position this one did not reach, or at
+    /// one this one entered a DIFFERENT state at, is no longer a Map Run of this
+    /// execution and is dropped rather than left listed under it.
+    pub fn record_map_runs(
+        &mut self,
+        execution_arn: &str,
+        state_machine_arn: &str,
+        state_machine_name: &str,
+        region: &str,
+        planned: Vec<PlannedMapRun>,
+    ) {
+        // An attempt that entered no Distributed Map state reports nothing, and says
+        // nothing about the records an earlier attempt left.
+        if planned.is_empty() {
+            return;
+        }
+        let previous: Vec<String> = self
+            .map_runs_by_execution
+            .get(execution_arn)
+            .cloned()
+            .unwrap_or_default();
+        let mut recorded: Vec<String> = Vec::with_capacity(planned.len());
+        for (position, plan) in planned.into_iter().enumerate() {
+            let reused = previous
+                .get(position)
+                .filter(|arn| {
+                    self.map_runs
+                        .get(*arn)
+                        .is_some_and(|map_run| map_run.label == plan.label)
+                })
+                .cloned();
+            let arn = match reused {
+                Some(arn) => arn,
+                None => {
+                    let id = self.fresh_uuid();
+                    map_run_arn(region, state_machine_name, &plan.label, &id)
+                }
+            };
+            let (redrive_count, retained_before) = match self.map_runs.get(&arn) {
+                Some(map_run) => (
+                    map_run.redrive_count.saturating_add(1),
+                    map_run.retained_bytes,
+                ),
+                None => (0, 0),
+            };
+            let mut record = MapRun {
+                arn: arn.clone(),
+                execution_arn: execution_arn.to_string(),
+                state_machine_arn: state_machine_arn.to_string(),
+                label: plan.label,
+                // The items ran in the walk, but the Map Run reaches its terminal
+                // status when the clock says it did, exactly as its execution does:
+                // a caller reading straight after the start sees it RUNNING.
+                status: MAP_RUN_STATUS_RUNNING.to_string(),
+                start_date: plan.start_date,
+                stop_date: None,
+                pending: Some(PendingMapRunOutcome {
+                    due_at: plan.due_at,
+                    status: plan.status,
+                }),
+                max_concurrency: plan.max_concurrency,
+                tolerated_failure_count: plan.tolerated_failure_count,
+                tolerated_failure_percentage: plan.tolerated_failure_percentage,
+                total_items: plan.total_items,
+                succeeded_items: plan.succeeded_items,
+                failed_items: plan.failed_items,
+                redrive_count,
+                // "If you have not yet redriven [...] the redriveDate is null": the
+                // instant the re-run that produced this record began.
+                redrive_date: (redrive_count > 0).then_some(plan.start_date),
+                retained_bytes: 0,
+            };
+            record.retained_bytes = record.measure();
+            self.retained_bytes = self
+                .retained_bytes
+                .saturating_add(record.retained_bytes)
+                .saturating_sub(retained_before);
+            self.pending_map_runs.retain(|pending| pending != &arn);
+            self.pending_map_runs.push(arn.clone());
+            recorded.push(arn.clone());
+            self.map_runs.insert(arn, record);
+        }
+        for arn in previous {
+            if recorded.contains(&arn) {
+                continue;
+            }
+            if let Some(map_run) = self.map_runs.remove(&arn) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(map_run.retained_bytes);
+            }
+            self.pending_map_runs.retain(|pending| pending != &arn);
+        }
+        self.map_runs_by_execution
+            .insert(execution_arn.to_string(), recorded);
+    }
+
+    /// One execution's Map Runs, in the order their `Map` states were entered.
+    pub fn map_runs_of(&self, execution_arn: &str) -> Vec<&MapRun> {
+        self.map_runs_by_execution
+            .get(execution_arn)
+            .map(|arns| {
+                arns.iter()
+                    .filter_map(|arn| self.map_runs.get(arn))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Stop every Map Run of `execution_arn` that has not finished, at `now`.
+    ///
+    /// A Map Run runs INSIDE its execution, so an execution that was stopped before
+    /// its Map Run's items were due stopped them too: the terminal status the walk
+    /// had computed is discarded along with its place in the settle queue, exactly as
+    /// the execution's own is.
+    fn abort_map_runs_of(&mut self, execution_arn: &str, now: SystemTime) {
+        let arns = self
+            .map_runs_by_execution
+            .get(execution_arn)
+            .cloned()
+            .unwrap_or_default();
+        for arn in arns {
+            let Some(map_run) = self.map_runs.get_mut(&arn) else {
+                continue;
+            };
+            if map_run.is_terminal() {
+                continue;
+            }
+            let before = map_run.retained_bytes;
+            map_run.pending = None;
+            map_run.status = MAP_RUN_STATUS_ABORTED.to_string();
+            map_run.stop_date = Some(now);
+            map_run.retained_bytes = map_run.measure();
+            let after = map_run.retained_bytes;
+            self.retained_bytes = self
+                .retained_bytes
+                .saturating_add(after)
+                .saturating_sub(before);
+            self.pending_map_runs.retain(|pending| pending != &arn);
+        }
+    }
+
+    /// Drop every Map Run of `execution_arn`, so no Map Run ARN is left naming one
+    /// whose execution no longer exists.
+    fn discard_map_runs_of(&mut self, execution_arn: &str) {
+        for arn in self
+            .map_runs_by_execution
+            .remove(execution_arn)
+            .unwrap_or_default()
+        {
+            if let Some(map_run) = self.map_runs.remove(&arn) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(map_run.retained_bytes);
+            }
+            self.pending_map_runs.retain(|pending| pending != &arn);
+        }
+    }
+
     /// Stop the execution `arn` names, and report the `stopDate` it carries.
     ///
     /// The outcome the interpreter had computed is DISCARDED along with its place in
@@ -2500,6 +2809,8 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             .saturating_add(after)
             .saturating_sub(before);
         self.pending_executions.retain(|pending| pending != arn);
+        // A Map Run of this execution had not finished either, so it stopped here too.
+        self.abort_map_runs_of(arn, now);
         Some(now)
     }
 
@@ -2572,8 +2883,9 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     /// caller supplied one — is remembered so a repeat answers the same
     /// `redriveDate`. Answers the `redriveDate` the redrive carries.
     ///
-    /// `task_bytes` is what the activity task the re-run stopped at will retain, so a
-    /// redrive is admitted against the whole of what it adds.
+    /// `extra_bytes` is what the activity task the re-run stopped at and the Map Runs
+    /// it re-entered will retain, so a redrive is admitted against the whole of what
+    /// it adds.
     pub fn redrive_execution(
         &mut self,
         arn: &str,
@@ -2581,7 +2893,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         client_token: Option<&str>,
         opening: Vec<HistoryEvent>,
         pending: Option<PendingOutcome>,
-        task_bytes: usize,
+        extra_bytes: usize,
     ) -> Result<SystemTime, RedriveRejection> {
         let Some(execution) = self.executions.get(arn) else {
             return Err(RedriveRejection::NotFound);
@@ -2594,7 +2906,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         let mut candidate = execution.clone();
         candidate.apply_redrive(now, client_token, opening, pending);
         let after = candidate.measure();
-        if after + task_bytes > before && !self.has_room_for(after + task_bytes - before) {
+        if after + extra_bytes > before && !self.has_room_for(after + extra_bytes - before) {
             return Err(RedriveRejection::NoRoom);
         }
         candidate.retained_bytes = after;
@@ -3033,6 +3345,26 @@ pub const INVALID_STATE_MACHINE_EXECUTION_INPUT: &str = "Invalid State Machine E
 pub const STATE_MACHINE_TYPE_NOT_SUPPORTED: &str =
     "This operation is not supported by this type of state machine";
 
+/// `InvalidToken`'s own name, as its message spells it, for
+/// [`resource_error_message`]. RECORDED text.
+pub const INVALID_TOKEN: &str = "Invalid Token";
+
+/// The detail `InvalidToken`'s message quotes.
+///
+/// RECORDED text (`sfn.error-invalid-token-list-map-runs` records
+/// `Invalid Token: 'Invalid token'`): the service does NOT echo the token it
+/// refused, so the quoted value is the condition itself and no caller text reaches
+/// the message. A pagination token is opaque and may be long, which is the same
+/// reason the service has none to quote.
+pub const INVALID_TOKEN_DETAIL: &str = "Invalid token";
+
+/// What every operation of this API answers when it is given a pagination token it
+/// did not issue: ONE construction, so no two paged lists word the same refusal
+/// differently.
+pub fn invalid_token_message() -> String {
+    resource_error_message(INVALID_TOKEN, INVALID_TOKEN_DETAIL)
+}
+
 /// The members of this service's model whose target shape is a FRACTIONAL number
 /// (Smithy `float`/`double`), named by their wire (lowerCamel) member name.
 ///
@@ -3279,6 +3611,21 @@ pub fn execution_arn(region: &str, state_machine_name: &str, execution_name: &st
     )
 }
 
+/// The ARN of one Map Run a Distributed Map state of `state_machine_name` started.
+///
+/// A Map Run ARN is a LongArn naming the `mapRun` resource, whose fields are the
+/// state machine's name and the Map state's label joined by `/`, and a unique id
+/// (`mapRun:<stateMachineName>/<label>:<id>`) — the form
+/// [`read_map_run_arn`] reads back. The label is what tells two Map Runs of one
+/// execution apart and the id is what tells two executions' apart.
+pub fn map_run_arn(region: &str, state_machine_name: &str, label: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{MAP_RUN_RESOURCE}:{state_machine_name}/{label}:{id}"),
+    )
+}
+
 /// The ARN of one SYNCHRONOUS Express execution of a state machine.
 ///
 /// See [`EXPRESS_EXECUTION_RESOURCE`] for the form and for what the trailing
@@ -3427,9 +3774,9 @@ pub fn read_execution_arn(arn: &str, endpoint_region: &str) -> Result<(String, S
 /// Reads `arn` as a Map Run ARN of this service in `endpoint_region`, answering the
 /// message the modelled `InvalidArn` carries when it is not one.
 ///
-/// A Map Run ARN is `mapRun:<stateMachineName>/<label>:<id>`, so only its resource
-/// type and a non-empty remainder are read here: no map run can exist in this
-/// emulator, so nothing is resolved from it.
+/// A Map Run ARN is `mapRun:<stateMachineName>/<label>:<id>` ([`map_run_arn`]), so
+/// only its resource type and a non-empty remainder are judged here: the ARN names
+/// one record in the store, which the caller looks up by the whole ARN.
 pub fn read_map_run_arn(arn: &str, endpoint_region: &str) -> Result<(), String> {
     let resource = states_arn_resource(arn, endpoint_region)?;
     let mut parts = resource.splitn(2, ':');
@@ -4140,6 +4487,49 @@ pub struct Planned {
     pub pending: Option<PendingOutcome>,
     /// The activity task the walk suspended on.
     pub waiting: Option<PlannedActivityTask>,
+    /// The Map Run every Distributed Map state the walk entered started, with the
+    /// offsets the walk reported turned into instants.
+    pub map_runs: Vec<PlannedMapRun>,
+}
+
+/// One Map Run a planned run started, ready for the store to record.
+///
+/// This is [`asl::StartedMapRun`] with the run's offsets turned into instants: the
+/// Map Run started when its `Map` state was entered and reaches the status the walk
+/// computed when the clock makes it due, which is the same delay the execution's own
+/// outcome is owed after.
+#[derive(Debug, Clone)]
+pub struct PlannedMapRun {
+    pub label: String,
+    pub status: String,
+    pub start_date: SystemTime,
+    pub due_at: SystemTime,
+    pub max_concurrency: i32,
+    pub tolerated_failure_count: i64,
+    pub tolerated_failure_percentage: f32,
+    pub total_items: i64,
+    pub succeeded_items: i64,
+    pub failed_items: i64,
+}
+
+impl PlannedMapRun {
+    /// The bytes the record this will become retains, so an execution is admitted
+    /// against the whole of what its start adds to the store.
+    pub fn measure(&self) -> usize {
+        std::mem::size_of::<MapRun>()
+            + self.label.len()
+            // `status` is held twice while the terminal one is still owed to the clock.
+            + 2 * self.status.len()
+            // The three ARNs the stored record carries. Each is built from a state
+            // machine name, an execution name and a state label, all of which the
+            // model bounds well inside the `Arn` maximum.
+            + 3 * MAX_ARN_BYTES
+    }
+}
+
+/// The bytes a run of planned Map Runs retains together.
+pub fn planned_map_run_bytes(planned: &[PlannedMapRun]) -> usize {
+    planned.iter().map(PlannedMapRun::measure).sum()
 }
 
 /// As [`plan_run`], with the delay after which the outcome settles stated by the
@@ -4192,6 +4582,27 @@ pub fn plan_run_settling_after(
             state_name: step.state_name,
         })
         .collect();
+    // Every Map Run the walk started, with its offsets turned into instants against
+    // the execution's own start: it started when its `Map` state was entered, and
+    // reaches the status the walk computed one `settle` after its items finished —
+    // the same delay the execution's own outcome is owed after, so a Map Run never
+    // reports a terminal status before the execution around it could.
+    let map_runs: Vec<PlannedMapRun> = run
+        .map_runs
+        .into_iter()
+        .map(|map_run| PlannedMapRun {
+            label: map_run.label,
+            status: map_run.status.to_string(),
+            start_date: after(start, map_run.started_at),
+            due_at: after(start, settle.saturating_add(map_run.stopped_at)),
+            max_concurrency: map_run.max_concurrency,
+            tolerated_failure_count: map_run.tolerated_failure_count,
+            tolerated_failure_percentage: map_run.tolerated_failure_percentage,
+            total_items: map_run.total_items,
+            succeeded_items: map_run.succeeded_items,
+            failed_items: map_run.failed_items,
+        })
+        .collect();
     // A walk that SUSPENDED computed no outcome: what it produced is the task it is
     // waiting at, available to a worker once the clock reaches the offset the walk
     // got to — every `Wait` before the state is still owed, and nothing slept for
@@ -4211,6 +4622,7 @@ pub fn plan_run_settling_after(
                 timeout_seconds: waiting.timeout_seconds,
                 heartbeat_seconds: waiting.heartbeat_seconds,
             }),
+            map_runs,
         };
     }
     Planned {
@@ -4224,6 +4636,7 @@ pub fn plan_run_settling_after(
             events,
         }),
         waiting: None,
+        map_runs,
     }
 }
 

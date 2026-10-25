@@ -55,6 +55,20 @@ pub const DEFAULT_FUNCTION_STAGE: &str = FUNCTION_STAGE_DEVELOPMENT;
 /// this status stands until such a call.
 pub const FUNCTION_STATUS_UNPUBLISHED: &str = "UNPUBLISHED";
 
+/// `FunctionSummary$Status` for a published stage that nothing serving traffic names.
+///
+/// A publish COPIES one stage into the other, and what a published stage reports from then
+/// on is whether anything uses it: CloudFront distinguishes a function that is live but
+/// attached to nothing from one a distribution runs. The model targets `Status` at plain
+/// `string` and states no value list, so the two words are spelled out here once, beside
+/// [`FUNCTION_STATUS_UNPUBLISHED`], and every publish reports one of them computed from the
+/// stored distributions rather than from the request being served.
+pub const FUNCTION_STATUS_UNASSOCIATED: &str = "UNASSOCIATED";
+
+/// `FunctionSummary$Status` for a published stage a stored distribution names — the other
+/// value of the pair [`FUNCTION_STATUS_UNASSOCIATED`] documents.
+pub const FUNCTION_STATUS_ASSOCIATED: &str = "ASSOCIATED";
+
 /// The most CloudFront functions this emulator holds, refused at with the modelled
 /// `TooManyFunctions` ("You have reached the maximum number of CloudFront functions for
 /// this Amazon Web Services account").

@@ -81,6 +81,8 @@ mod route_analysis;
 mod site_to_site_vpn_attachment_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/transit_gateway_peering.rs"]
+mod transit_gateway_peering;
 #[path = "all/transit_gateway_route_table_attachment.rs"]
 mod transit_gateway_route_table_attachment;
 #[path = "all/transit_gateway_route_table_attachment_lifecycle.rs"]

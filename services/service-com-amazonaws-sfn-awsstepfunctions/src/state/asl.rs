@@ -90,9 +90,10 @@
 //!
 //! A Distributed Map's items are interpreted in this process, by the same walk that
 //! runs an inline Map: the state's output is therefore computed from the items the
-//! definition selected. The child EXECUTION records and the Map Run a real
-//! Distributed Map also creates are not stored yet — `DescribeMapRun` and
-//! `ListMapRuns` are still scaffolded, and their own stub issues own that.
+//! definition selected. Each Distributed Map state the walk entered is reported as a
+//! [`StartedMapRun`], which the call that started the execution stores as a Map Run
+//! of its own. The child EXECUTION records a real Distributed Map also creates are
+//! not stored yet, and their own stub issues own that.
 //!
 //! ## Time
 //!
@@ -467,6 +468,40 @@ pub struct Step {
     pub terminal: bool,
 }
 
+/// One Distributed Map state the walk ran, as the Map Run it started.
+///
+/// A Distributed Map "starts a Map Run", a resource of its own that reports the
+/// state's configuration and what its items produced. The offsets are into the RUN
+/// (the total of every `Wait` the walk passed), so the caller that stores this turns
+/// them into instants against the execution's own start — the walk never sleeps.
+#[derive(Debug, Clone)]
+pub struct StartedMapRun {
+    /// The state's `Label` when it declares one, else the state's own name: "a
+    /// user-defined or an auto-generated string that identifies a Map state".
+    pub label: String,
+    /// The status the state's items left the Map Run in: `SUCCEEDED` when the
+    /// iterations produced a result, `FAILED` when more of them failed than the
+    /// state tolerates.
+    pub status: &'static str,
+    /// How far into the run the state was entered.
+    pub started_at: Duration,
+    /// How far into the run its last item finished.
+    pub stopped_at: Duration,
+    /// `MaxConcurrency` as the state resolved it; `0` is "no limit", which is the
+    /// member's own default.
+    pub max_concurrency: i32,
+    /// `ToleratedFailureCount` as the state resolved it.
+    pub tolerated_failure_count: i64,
+    /// `ToleratedFailurePercentage` as the state resolved it.
+    pub tolerated_failure_percentage: f32,
+    /// How many items the state iterated.
+    pub total_items: i64,
+    /// How many of them their iteration produced a result for.
+    pub succeeded_items: i64,
+    /// How many of them their iteration failed on.
+    pub failed_items: i64,
+}
+
 /// What one walk of a definition produced.
 #[derive(Debug, Clone)]
 pub struct Run {
@@ -485,6 +520,17 @@ pub struct Run {
     /// carries this reached no terminal status: the task is what the execution is
     /// waiting for.
     pub waiting: Option<ScheduledActivity>,
+    /// The Map Run each Distributed Map state the walk entered started, in the order
+    /// they were entered.
+    pub map_runs: Vec<StartedMapRun>,
+}
+
+impl Run {
+    /// This run, with the Map Runs its Distributed Map states started.
+    fn with_map_runs(mut self, map_runs: Vec<StartedMapRun>) -> Self {
+        self.map_runs = map_runs;
+        self
+    }
 }
 
 /// The activity task a `Task` state scheduled, as the walk computed it.
@@ -1877,6 +1923,7 @@ pub fn run(definition: &str, input: &str, start: SystemTime, context: &Context) 
         start,
         base_context: context.value(&input_value, start),
         waiting: None,
+        map_runs: Vec::new(),
     };
     let branch = interpreter.walk(
         states,
@@ -1887,6 +1934,7 @@ pub fn run(definition: &str, input: &str, start: SystemTime, context: &Context) 
     );
     let waiting = interpreter.waiting.take();
     let steps = interpreter.steps;
+    let map_runs = interpreter.map_runs;
 
     // A definition-level `TimeoutSeconds` bounds the whole execution: a run that got
     // past it ended TIMED_OUT at the timeout, whatever it went on to compute.
@@ -1894,6 +1942,17 @@ pub fn run(definition: &str, input: &str, start: SystemTime, context: &Context) 
         let timeout = Duration::from_secs(seconds);
         if branch.end > timeout {
             let kept = steps.into_iter().filter(|step| step.after <= timeout).collect();
+            // A Map Run the walk only reached past the timeout never started, exactly
+            // as the events past it never happened; one that had started stopped WHEN
+            // THE EXECUTION DID, so its own stop cannot be later than the timeout.
+            let kept_map_runs = map_runs
+                .into_iter()
+                .filter(|map_run| map_run.started_at <= timeout)
+                .map(|mut map_run| {
+                    map_run.stopped_at = map_run.stopped_at.min(timeout);
+                    map_run
+                })
+                .collect();
             return terminal(
                 kept,
                 timeout,
@@ -1905,7 +1964,8 @@ pub fn run(definition: &str, input: &str, start: SystemTime, context: &Context) 
                     "the execution ran for longer than the {seconds} seconds its definition's \
                      'TimeoutSeconds' allows"
                 )),
-            );
+            )
+            .with_map_runs(kept_map_runs);
         }
     }
 
@@ -1925,6 +1985,7 @@ pub fn run(definition: &str, input: &str, start: SystemTime, context: &Context) 
             steps,
             elapsed: branch.end,
             waiting: Some(waiting),
+            map_runs,
         };
     }
 
@@ -1934,9 +1995,11 @@ pub fn run(definition: &str, input: &str, start: SystemTime, context: &Context) 
         // caller's own BYTES are what the execution reports, rather than a
         // re-encoding of a parsed copy. A document the definition built is reported
         // in the encoding the walk produced it in.
-        Ok(value) if value == input_value => succeeded(steps, branch.end, input.to_string()),
-        Ok(value) => succeeded(steps, branch.end, value.to_string()),
-        Err(failure) => failed(steps, branch.end, failure),
+        Ok(value) if value == input_value => {
+            succeeded(steps, branch.end, input.to_string()).with_map_runs(map_runs)
+        }
+        Ok(value) => succeeded(steps, branch.end, value.to_string()).with_map_runs(map_runs),
+        Err(failure) => failed(steps, branch.end, failure).with_map_runs(map_runs),
     }
 }
 
@@ -2044,6 +2107,8 @@ fn terminal(
         elapsed,
         // A run that reached a terminal event is waiting for nothing.
         waiting: None,
+        // Set by `run`, which is where the walk's Map Runs are in scope.
+        map_runs: Vec::new(),
     }
 }
 
@@ -2142,6 +2207,22 @@ struct Interpreter {
     /// execution waits at that state until a worker answers it. Set at most once,
     /// because the walk stops at the state that set it.
     waiting: Option<ScheduledActivity>,
+    /// The Map Run every Distributed Map state this walk entered started, in the
+    /// order they were entered. Bounded by [`MAX_STATE_TRANSITIONS`], which every
+    /// `Map` state spends from.
+    map_runs: Vec<StartedMapRun>,
+}
+
+/// How the items of ONE `Map` attempt turned out, counted as they are run.
+///
+/// A `Map` attempt can end at any item (a budget, a deadline, a document past what a
+/// state may carry), so the counts are kept here rather than derived from the
+/// attempt's result: however the attempt ended, what its items did is what this
+/// holds.
+#[derive(Debug, Default)]
+struct MapTally {
+    succeeded: i64,
+    failed: i64,
 }
 
 impl Interpreter {
@@ -2790,6 +2871,10 @@ impl Interpreter {
         at: Duration,
     ) -> Result<StateStep, Fault> {
         self.push("MapStateEntered", name, at);
+        // Where this state's Map Run belongs in the walk's list: the state is ENTERED
+        // here, and a nested Distributed Map inside its items finishes first, so the
+        // record is placed at this slot rather than appended once the items are done.
+        let slot = self.map_runs.len();
         let items = self
             .map_items(name, state, &effective, context)
             .map_err(|failure| failure.at(at))?;
@@ -2818,12 +2903,55 @@ impl Interpreter {
                 .any(|member| state.contains_key(*member)),
         };
 
+        // The tally belongs to the LAST attempt: a retried `Map` state resets it, so
+        // what is reported is what the attempt the state ended on did.
+        let mut tally = MapTally::default();
         let (outcome, end) = self.with_retries(state, at, &mut |me, at| {
             // This attempt's own members read `$$.State.RetryCount`, so they are
             // evaluated with the context of the attempt they are on.
             let context = with_retry_count(context, me.retry_count);
-            me.run_map_items(&plan, &effective, &context, at)
+            me.run_map_items(&plan, &effective, &context, at, &mut tally)
         });
+        // A Distributed Map "starts a Map Run", a resource of its own; an INLINE Map
+        // starts none, so only the distributed mode records one.
+        if distributed {
+            self.map_runs.insert(
+                slot,
+                StartedMapRun {
+                    label: state
+                        .get("Label")
+                        .and_then(Value::as_str)
+                        .unwrap_or(name)
+                        .to_string(),
+                    status: if outcome.is_ok() {
+                        super::MAP_RUN_STATUS_SUCCEEDED
+                    } else {
+                        super::MAP_RUN_STATUS_FAILED
+                    },
+                    started_at: at,
+                    stopped_at: end,
+                    max_concurrency: if plan.concurrency == 0 {
+                        // `MaxConcurrency`'s own default is `0`, which the Amazon
+                        // States Language defines as NO limit, and a Map Run reports
+                        // its limit through a modelled integer: an unlimited Map Run
+                        // therefore reports the largest value that integer carries,
+                        // rather than a `0` a client would read as "none at a time".
+                        // RECORDED: `DescribeMapRun` on a `Map` state that declares
+                        // no `MaxConcurrency` answers `2147483647`
+                        // (`sfn.describe-map-run-default-fields-and-execution-counts`).
+                        i32::MAX
+                    } else {
+                        i32::try_from(plan.concurrency).unwrap_or(i32::MAX)
+                    },
+                    tolerated_failure_count: i64::try_from(plan.tolerated_count)
+                        .unwrap_or(i64::MAX),
+                    tolerated_failure_percentage: plan.tolerated_percentage as f32,
+                    total_items: i64::try_from(plan.items.len()).unwrap_or(i64::MAX),
+                    succeeded_items: tally.succeeded,
+                    failed_items: tally.failed,
+                },
+            );
+        }
         match outcome {
             Ok(results) => {
                 let value = self
@@ -2888,13 +3016,18 @@ impl Interpreter {
     /// returned offset reports. The ITEMS themselves are interpreted one after the
     /// other, because the interpreter is a single walk — the result is the same, and
     /// no iteration can observe another's.
+    ///
+    /// `tally` is counted up as the items are run, so it holds what this attempt's
+    /// items did however the attempt ended.
     fn run_map_items(
         &mut self,
         plan: &MapPlan<'_>,
         effective: &Value,
         context: &Value,
         at: Duration,
+        tally: &mut MapTally,
     ) -> Attempt {
+        *tally = MapTally::default();
         let batch = if plan.concurrency == 0 {
             plan.items.len().max(1)
         } else {
@@ -2972,9 +3105,11 @@ impl Interpreter {
                             );
                         }
                         results.push(value);
+                        tally.succeeded += 1;
                     }
                     Err(failure) => {
                         failures += 1;
+                        tally.failed += 1;
                         if first_failure.is_none() {
                             first_failure = Some(failure);
                         }
@@ -4790,6 +4925,9 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         // `TestState` tests ONE state, with no execution around it to wait: a state
         // whose work is an invocation is tested through its `mock`.
         waiting: None,
+        // `TestState` starts nothing: it reports what one state computes, and the
+        // Map Runs a Distributed Map starts belong to an execution.
+        map_runs: Vec::new(),
     };
     interpreter.trial(test, &raw, inspection)
 }

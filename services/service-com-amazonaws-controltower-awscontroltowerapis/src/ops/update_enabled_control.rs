@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEnabledControl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEnabledControl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEnabledControl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the configuration of an already enabled control in [`crate::state`], and starts
+//! the asynchronous `UPDATE_ENABLED_CONTROL` operation that deploys it: the requested
+//! `parameters` are parked on the stored control, which reads as `UNDER_CHANGE` until
+//! [`crate::state::OPERATION_SETTLE_AFTER`] has elapsed, and are the configured ones
+//! `GetEnabledControl` and `ListEnabledControls` report once the clock makes that
+//! operation due.
+//!
+//! Implemented: this operation no longer answers HTTP 501.
 //!
 //! ## Shape of an operation
 //!
@@ -164,20 +164,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEnabledControl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEnabledControlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEnabledControl"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateEnabledControlErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AWS Control Tower emulator is mounted on an engine that \
+                              holds no state"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The configuration the request asks for, as the store keeps one. Checked by the
+        // rule both this operation and `EnableControl` apply to a control's parameter
+        // list, so the same lists are refused in the same words from either call.
+        let requested: Vec<(String, ::aws_smithy_types::Document)> = input
+            .parameters
+            .into_iter()
+            .map(|parameter| (parameter.key, parameter.value))
+            .collect();
+
+        if let Some(message) = crate::state::unacceptable_control_parameters_message(&requested) {
+            return Err(UpdateEnabledControlErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // `enabledControlIdentifier` is modelled as an `Arn`, so the only identifier the
+        // front door lets through is the ARN `EnableControl` minted — which is this map's
+        // key, the same resolution `GetEnabledControl` does.
+        let Some(control) = store
+            .enabled_controls
+            .get(&input.enabled_control_identifier)
+            .cloned()
+        else {
+            return Err(UpdateEnabledControlErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no enabled control matches enabledControlIdentifier {}",
+                        input.enabled_control_identifier
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // A drifted control cannot be updated through this call — its configuration has
+        // diverged from the one the service deployed, so applying a new one on top would
+        // leave it in the inconsistent state `ConflictException` reports. The caller
+        // repairs drift with `ResetEnabledControl` instead. Nothing in this crate assesses
+        // a control as `DRIFTED` yet, so this branch is unreachable from the wire today;
+        // it is here so the refusal is already in place for the slice that can set it,
+        // rather than being forgotten there.
+        if control.drift_status == crate::state::DriftStatus::Drifted {
+            return Err(UpdateEnabledControlErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "enabled control {} has drifted; reset it rather than updating its \
+                         configuration",
+                        control.arn
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // An operation still changing this control owns it: a change starting now would
+        // apply on top of one half applied, which is the inconsistent state
+        // `ConflictException` reports.
+        if control.status == crate::state::EnablementStatus::UnderChange {
+            return Err(UpdateEnabledControlErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "control operation {} is still in progress against {}; updating its \
+                         configuration now would leave this control in an inconsistent state",
+                        control.last_operation_identifier, control.arn
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // A control whose configuration is deployed must be given a configuration that
+        // differs from the deployed one — an update to the same configuration changes
+        // nothing, so the service does not accept it. A control whose enablement FAILED is
+        // updated to match any valid configuration supplied, the one already recorded
+        // included, because nothing of it is deployed to differ from.
+        if control.status == crate::state::EnablementStatus::Succeeded
+            && crate::state::same_control_configuration(&control.parameters, &requested)
+        {
+            return Err(UpdateEnabledControlErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "parameters is the configuration enabled control {} already carries; \
+                         supply parameters that differ from the configured ones",
+                        control.arn
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // `UpdateEnabledControl` starts an asynchronous operation, so the identifier it
+        // returns names a record in the control operation log and the configuration is
+        // parked until the clock makes that operation due.
+        let Some(operation_identifier) =
+            store.record_enabled_control_update(&control.arn, requested, now)
+        else {
+            // The ARN was read out of this same locked store above, so nothing can have
+            // removed the control in between; the modelled 404 is the answer if it ever
+            // did.
+            return Err(UpdateEnabledControlErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no enabled control matches enabledControlIdentifier {}",
+                        control.arn
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(UpdateEnabledControlOutput {
+            operation_identifier,
+        })
     }
 }

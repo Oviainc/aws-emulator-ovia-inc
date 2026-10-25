@@ -21,6 +21,8 @@ mod cache_policy_list;
 mod cache_policy_update;
 #[path = "all/connection_function_lifecycle.rs"]
 mod connection_function_lifecycle;
+#[path = "all/connection_function_publish.rs"]
+mod connection_function_publish;
 #[path = "all/connection_groups.rs"]
 mod connection_groups;
 #[path = "all/continuous_deployment_policies.rs"]

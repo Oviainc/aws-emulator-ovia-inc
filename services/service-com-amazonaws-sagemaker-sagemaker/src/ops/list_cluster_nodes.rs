@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListClusterNodes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListClusterNodes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListClusterNodes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the nodes of the cluster `ClusterName` names (by name or ARN) —
+//! the instances its groups were created asking for plus the ones
+//! `BatchAddClusterNodes` added, as `crate::state::Cluster::nodes` holds them — filtered
+//! by instance-group name and the creation window, sorted by the requested key and
+//! order, and paged by `MaxResults`/`NextToken`. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,6 +150,24 @@ impl<Eng> ListClusterNodes<Eng> {
     }
 }
 
+/// `SortBy`'s documented default on this listing ("The field by which to sort results.
+/// The default value is CREATION_TIME."), as `crate::state` names it. Named
+/// `NODE_`-first so it cannot be read as `crate::state::DEFAULT_SORT_BY`, which is a
+/// different listing's different default.
+const NODE_DEFAULT_SORT_BY: &str = crate::state::CLUSTER_SORT_BY_CREATION_TIME;
+
+/// One node of the cluster, projected into the summary this listing reports, beside the
+/// keys it is filtered, sorted and paged by.
+struct Listed {
+    /// The node's `NodeLogicalId`: its one identifier that exists for its whole
+    /// lifecycle, so it is the sort tie-break and the page boundary even for a node that
+    /// has no `InstanceId` yet.
+    logical_id: String,
+    /// `LaunchTime` as a comparable key, which is the node's creation time.
+    created: (i64, u32),
+    summary: ClusterNodeSummary,
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListClusterNodes<Eng>
 {
@@ -170,18 +185,186 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListClusterNodes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListClusterNodesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListClusterNodes"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let sort_by = input.sort_by.as_deref().unwrap_or(NODE_DEFAULT_SORT_BY);
+        if !matches!(
+            sort_by,
+            crate::state::CLUSTER_SORT_BY_CREATION_TIME | crate::state::CLUSTER_SORT_BY_NAME
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortBy must be one of {}, {}; got \"{sort_by}\".",
+                crate::state::CLUSTER_SORT_BY_CREATION_TIME,
+                crate::state::CLUSTER_SORT_BY_NAME
+            )));
+        }
+        let sort_order = input
+            .sort_order
+            .as_deref()
+            .unwrap_or(crate::state::CLUSTER_DEFAULT_SORT_ORDER);
+        let descending = if sort_order == crate::state::ORDER_DESCENDING {
+            true
+        } else if sort_order == crate::state::CLUSTER_DEFAULT_SORT_ORDER {
+            false
+        } else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortOrder must be one of {}, {}; got \"{sort_order}\".",
+                crate::state::CLUSTER_DEFAULT_SORT_ORDER,
+                crate::state::ORDER_DESCENDING
+            )));
+        };
+
+        let after = input.creation_time_after.map(crate::state::timestamp_key);
+        let before = input.creation_time_before.map(crate::state::timestamp_key);
+        // `IncludeNodeLogicalIds`: "When set to true, the response includes all nodes
+        // regardless of their provisioning status. When set to False (default), only
+        // nodes with assigned InstanceIds are returned." The same flag decides whether a
+        // summary carries `NodeLogicalId`, which "is only included when
+        // IncludeNodeLogicalIds is set to True".
+        let include_logical_ids = input.include_node_logical_ids.unwrap_or(false);
+
+        let mut store = state.lock();
+        // The cluster is this call's subject, so a name or ARN this account holds no
+        // cluster for is the modelled `ResourceNotFound`.
+        let Some(cluster) = store.cluster_by_name_or_arn_mut(&input.cluster_name) else {
+            return Err(ListClusterNodesErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!("Cluster {} does not exist.", input.cluster_name)),
+            })
+            .into());
+        };
+        let cluster_arn = cluster.arn.clone();
+
+        // The only write this reporting call makes: the transitions the clock already
+        // owed the cluster and its nodes — the cluster's own `Creating` -> `InService`,
+        // which is when its groups' instances come up, and each node's
+        // `Pending` -> `Running`. Both were due at their stored instants whether or not
+        // anybody listed the nodes.
+        let now = ::std::time::SystemTime::now();
+        let mut settled = cluster.settle_status(now);
+        // Every node is settled, not just until the first one that moved, so the
+        // statuses this call reports are the ones a describe would report at the same
+        // instant.
+        for node in cluster.nodes.values_mut() {
+            settled |= node.settle_status(now);
+        }
+
+        let mut matching: Vec<Listed> = cluster
+            .nodes
+            .values()
+            // A node without an `InstanceId` is still being provisioned, so it is
+            // reported only when the request asked for those too.
+            .filter(|node| include_logical_ids || node.instance_id.is_some())
+            .filter(|node| {
+                input
+                    .instance_group_name_contains
+                    .as_deref()
+                    .is_none_or(|needle| node.instance_group_name.contains(needle))
+            })
+            .map(|node| Listed {
+                logical_id: node.logical_id.clone(),
+                created: crate::state::timestamp_key(crate::state::timestamp(node.launch_time)),
+                summary: ClusterNodeSummary {
+                    instance_group_name: node.instance_group_name.clone(),
+                    // The id the `Pending` -> `Running` transition mints. A node that has
+                    // not reached `Running` has none yet, and is reported only under
+                    // `IncludeNodeLogicalIds`, which is what identifies it instead.
+                    instance_id: node.instance_id.clone().unwrap_or_default(),
+                    node_logical_id: include_logical_ids.then(|| node.logical_id.clone()),
+                    // The type its instance group runs; a group that names
+                    // `InstanceRequirements` with no type at all leaves the node none.
+                    instance_type: node.instance_type.clone().unwrap_or_default(),
+                    launch_time: crate::state::timestamp(node.launch_time),
+                    // No software update has been applied to a node this emulator added.
+                    last_software_update_time: None,
+                    instance_status: ClusterInstanceStatusDetails {
+                        status: node.status.clone(),
+                        message: None,
+                    },
+                    ultra_server_info: None,
+                    // This emulator resolves no VPC, so a node has no private address
+                    // and therefore no hostname derived from one.
+                    private_dns_hostname: None,
+                    // Nothing here publishes a HyperPod-managed AMI to a node, so there
+                    // is no running version and no version comparison to report.
+                    current_image_release_version: None,
+                    image_version_status: None,
+                },
+            })
+            // Both bounds are inclusive: a node launched exactly at either bound is
+            // inside the window the request asked for.
+            .filter(|listed| {
+                after.is_none_or(|bound| listed.created >= bound)
+                    && before.is_none_or(|bound| listed.created <= bound)
+            })
+            .collect();
+        // `SortOrder` reverses the SORT KEY only. The tie-break stays `NodeLogicalId`
+        // ascending in both directions, so two nodes launched in the same instant keep
+        // one order whichever way the page is sorted — and a `NextToken` resolved against
+        // a freshly computed result set lands on the same boundary.
+        matching.sort_by(|left, right| {
+            let by_key = if sort_by == crate::state::CLUSTER_SORT_BY_NAME {
+                // A node carries no name of its own; `NodeLogicalId` is "a unique
+                // identifier for the node that persists throughout its lifecycle", so it
+                // is the identifier a node is ordered by, and one every node has whether
+                // or not it has been assigned an `InstanceId`.
+                left.logical_id.cmp(&right.logical_id)
+            } else {
+                left.created.cmp(&right.created)
+            };
+            let by_key = if descending { by_key.reverse() } else { by_key };
+            by_key.then_with(|| left.logical_id.cmp(&right.logical_id))
+        });
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resumed_after = crate::state::decode_page_token(token)
+                    .and_then(|logical_id| {
+                        matching
+                            .iter()
+                            .position(|listed| listed.logical_id == logical_id)
+                    })
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::validation(crate::state::STALE_PAGE_TOKEN)
+                    })?;
+                resumed_after + 1
+            }
+        };
+
+        // `MaxResults` caps the page, and so does the service's own ceiling: an absent or
+        // larger `MaxResults` still cannot make one call serialise every node. The token
+        // below is emitted whenever anything is left, so a paginating client walks the
+        // full result set exactly once either way.
+        let start = start.min(matching.len());
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_PAGE_SIZE, |max| {
+                max.clamp(1, crate::state::MAX_PAGE_SIZE)
+            })
+            .unsigned_abs() as usize;
+        let end = start.saturating_add(page_size).min(matching.len());
+        let page = &matching[start..end];
+
+        let next_token = match page.last() {
+            // A token only where a further page exists, so a paginating client stops.
+            Some(last) if end < matching.len() => {
+                Some(crate::state::encode_page_token(&last.logical_id))
+            }
+            _ => None,
+        };
+
+        let answer = ListClusterNodesOutput {
+            cluster_node_summaries: page.iter().map(|listed| listed.summary.clone()).collect(),
+            next_token,
+        };
+        drop(store);
+
+        // A transition is a state change, so it leaves the same record an add does
+        // rather than happening unobservably on a read path.
+        if settled {
+            crate::state::record_state_change(Self::NAME, &cluster_arn, ctx);
+        }
+        Ok(answer)
     }
 }

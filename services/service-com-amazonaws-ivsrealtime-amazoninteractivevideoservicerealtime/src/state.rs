@@ -1106,6 +1106,29 @@ pub struct DestinationRecord {
 }
 
 impl DestinationRecord {
+    /// Whether this destination refers to the resource `arn` of THIS endpoint's store.
+    ///
+    /// The members a destination configuration names such a resource with: the encoder
+    /// configuration of a channel destination (`ChannelDestinationConfiguration$encoderConfigurationArn`),
+    /// and the storage configuration and encoder configurations of an S3 one
+    /// (`S3DestinationConfiguration$storageConfigurationArn` and `$encoderConfigurationArns`).
+    /// `channelArn` is deliberately not one of them: it names a low-latency channel of
+    /// the sibling endpoint, which this store does not hold — the same boundary
+    /// `StartComposition` draws when it resolves these references.
+    pub fn references(&self, arn: &str) -> bool {
+        let channel_reference = self.configuration.channel.as_ref().is_some_and(|channel| {
+            channel.encoder_configuration_arn.as_deref() == Some(arn)
+        });
+        let s3_reference = self.configuration.s3.as_ref().is_some_and(|s3| {
+            s3.storage_configuration_arn == arn
+                || s3
+                    .encoder_configuration_arns
+                    .iter()
+                    .any(|encoder_configuration_arn| encoder_configuration_arn == arn)
+        });
+        channel_reference || s3_reference
+    }
+
     /// The modelled `Destination` this record reports.
     pub fn to_destination(&self) -> Destination {
         Destination {
@@ -1182,25 +1205,49 @@ impl CompositionRecord {
     /// `ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState::materialize_due_compositions`'s
     /// to act on.
     pub fn materialize_due(&mut self, now: SystemTime) {
-        if self.state == COMPOSITION_STATE_STARTING && now >= self.active_at {
-            self.state = COMPOSITION_STATE_ACTIVE.to_string();
+        let due = self.state_at(now);
+        if due == self.state {
+            return;
+        }
+        let due = due.to_string();
+        if due == COMPOSITION_STATE_ACTIVE {
             for destination in &mut self.destinations {
                 if destination.state == DESTINATION_STATE_STARTING {
                     destination.state = DESTINATION_STATE_ACTIVE.to_string();
                 }
             }
-            return;
-        }
-        let stopped_at = self.ended_at.map(|ended_at| ended_at + COMPOSITION_STOP_SPAN);
-        if self.state == COMPOSITION_STATE_STOPPING
-            && stopped_at.is_some_and(|stopped_at| now >= stopped_at)
-        {
-            self.state = COMPOSITION_STATE_STOPPED.to_string();
+        } else if due == COMPOSITION_STATE_STOPPED {
             for destination in &mut self.destinations {
                 if destination.state == DESTINATION_STATE_STOPPING {
                     destination.state = DESTINATION_STATE_STOPPED.to_string();
                 }
             }
+        }
+        self.state = due;
+    }
+
+    /// The `CompositionState` this composition is in at `now`, whether or not anybody has
+    /// called since the clock made it due.
+    ///
+    /// A composition's position in its lifecycle is a function of the instants the start
+    /// and the stop recorded — [`Self::active_at`] for `STARTING` -> `ACTIVE`, one
+    /// [`COMPOSITION_STOP_SPAN`] after [`Self::ended_at`] for `STOPPING` -> `STOPPED` —
+    /// so this is what every reader asks, and the stored `state` is only where
+    /// [`Self::materialize_due`] writes the answer down. A reader holding the store
+    /// immutably therefore reaches the same answer as one that can write, instead of
+    /// seeing a transition that is due but not yet recorded. A state the clock owes
+    /// nothing from is reported as stored.
+    pub fn state_at(&self, now: SystemTime) -> &str {
+        match self.state.as_str() {
+            COMPOSITION_STATE_STARTING if now >= self.active_at => COMPOSITION_STATE_ACTIVE,
+            COMPOSITION_STATE_STOPPING
+                if self
+                    .ended_at
+                    .is_some_and(|ended_at| now >= ended_at + COMPOSITION_STOP_SPAN) =>
+            {
+                COMPOSITION_STATE_STOPPED
+            }
+            state => state,
         }
     }
 
@@ -1273,8 +1320,32 @@ impl CompositionRecord {
     /// The two states a composition reaches on its way up ([`COMPOSITION_STATE_STARTING`]
     /// and [`COMPOSITION_STATE_ACTIVE`]); from any other one the broadcast is already
     /// ending or has ended, which is what makes a second stop the modelled conflict.
+    ///
+    /// Asked of the stored state, because the only transitions the clock owes are between
+    /// two states this answers the same for ([`Self::state_at`] moves `STARTING` to
+    /// `ACTIVE` and `STOPPING` to `STOPPED`): whether the due transition has been written
+    /// down yet cannot change the answer.
     pub fn is_running(&self) -> bool {
         self.state == COMPOSITION_STATE_STARTING || self.state == COMPOSITION_STATE_ACTIVE
+    }
+
+    /// Whether this composition is still using the resources its destinations name, so a
+    /// delete of one of them would leave it composing against a resource that is gone.
+    ///
+    /// Every state on this side of a FINISHED stop: the model tells a caller that wants
+    /// to delete such a resource to "first use StopComposition and wait for it to
+    /// complete", so a composition that is starting, composing or still stopping is using
+    /// them, and one whose stop has completed is not.
+    pub fn is_using_resources(&self) -> bool {
+        self.is_running() || self.state == COMPOSITION_STATE_STOPPING
+    }
+
+    /// Whether any destination of this composition refers to the resource `arn` — see
+    /// [`DestinationRecord::references`].
+    pub fn references(&self, arn: &str) -> bool {
+        self.destinations
+            .iter()
+            .any(|destination| destination.references(arn))
     }
 
     /// Begin the stop of this composition at `now`: the composition and every destination
@@ -1296,11 +1367,11 @@ impl CompositionRecord {
     /// nothing may report it any more.
     ///
     /// Due one [`COMPOSITION_STOP_SPAN`] after the stop finished, which is two spans after
-    /// the stop began — computed from the recorded end time rather than stored, so a
-    /// reader that holds the record immutably reaches the same answer as one that can
-    /// write ([`Self::materialize_due`] is what removes it).
+    /// the stop began — computed from the recorded end time and [`Self::state_at`] rather
+    /// than from the stored state, so a reader that holds the record immutably reaches the
+    /// same answer as one that can write ([`Self::materialize_due`] is what removes it).
     pub fn is_reclaimed(&self, now: SystemTime) -> bool {
-        self.state == COMPOSITION_STATE_STOPPED
+        self.state_at(now) == COMPOSITION_STATE_STOPPED
             && self
                 .ended_at
                 .is_some_and(|ended_at| now >= ended_at + COMPOSITION_STOP_SPAN * 2)
@@ -2125,6 +2196,23 @@ impl ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
         self.compositions
             .values()
             .find(|composition| composition.idempotency_token.as_deref() == Some(token))
+    }
+
+    /// The composition using the resource `arn` right now, if this store holds one: the
+    /// first one started among those whose destinations refer to it
+    /// ([`CompositionRecord::references`]) and whose stop has not completed
+    /// ([`CompositionRecord::is_using_resources`]).
+    ///
+    /// The ONE lookup for "is a composition using this resource", so what a delete of an
+    /// encoder or storage configuration refuses over is exactly what the compositions
+    /// `GetComposition` reports say. Call it after
+    /// [`Self::materialize_due_compositions`], so a composition whose stop the clock has
+    /// already finished holds nothing back.
+    pub fn composition_using(&self, arn: &str) -> Option<&CompositionRecord> {
+        self.compositions
+            .values()
+            .filter(|composition| composition.is_using_resources() && composition.references(arn))
+            .min_by_key(|composition| composition.sequence)
     }
 }
 
@@ -2998,6 +3086,21 @@ pub fn replication_already_active_message(
     )
 }
 
+/// How this service states a delete of a resource a composition is still using: it names
+/// the resource, the composition using it and the state that composition is in, so the
+/// caller can see what has to stop before the delete can succeed.
+///
+/// AWS documents no text for `ConflictException` beyond what it means ("Updating or
+/// deleting a resource can cause an inconsistent state"), so the sentence is built from
+/// the request and the store, the way every other refusal of this service is.
+pub fn resource_in_use_by_composition_message(
+    arn: &str,
+    composition_arn: &str,
+    composition_state: &str,
+) -> String {
+    format!("Resource: {arn} is in use: composition {composition_arn} is {composition_state}")
+}
+
 /// How this service states a request to delete an ingest configuration a publisher is
 /// broadcasting with: it names the configuration, the participant publishing with it
 /// and the stage it publishes to, so the caller can see what is in use.
@@ -3368,9 +3471,10 @@ pub fn resource_tags(
             .compositions
             .get(arn)
             // This reader holds the store immutably, so a composition the clock has
-            // already reclaimed is skipped rather than dropped: a tag listing answers for
-            // exactly the compositions `GetComposition` answers for, and the next call
-            // that can write clears the record.
+            // already reclaimed is skipped rather than dropped: the reclaim deadline is
+            // computed from the instant the stop recorded, so a tag listing answers for
+            // exactly the compositions `GetComposition` answers for at the same instant,
+            // and the next call that can write clears the record.
             .filter(|composition| !composition.is_reclaimed(SystemTime::now()))
             .map(|composition| composition.tags.clone()),
         "ingest-configuration" => state

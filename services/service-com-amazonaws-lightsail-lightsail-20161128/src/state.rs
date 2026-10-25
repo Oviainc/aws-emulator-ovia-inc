@@ -3182,7 +3182,7 @@ pub const RELATIONAL_DATABASE_PARAMETER_PAGE_SIZE: usize = 50;
 pub fn relational_database_parameter_specs(
     engine: &str,
 ) -> &'static [RelationalDatabaseParameterSpec] {
-    if engine.to_ascii_lowercase().contains("postgres") {
+    if is_postgres_engine(engine) {
         POSTGRES_RELATIONAL_DATABASE_PARAMETERS
     } else {
         MYSQL_RELATIONAL_DATABASE_PARAMETERS
@@ -5374,6 +5374,27 @@ const RELATIONAL_DATABASE_HOST_LABEL_LEN: usize = 12;
 /// case-insensitive and RDS renders this one in lowercase.
 const RELATIONAL_DATABASE_HOST_LABEL_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 
+/// Whether `engine` is the PostgreSQL engine FAMILY.
+///
+/// The ONE engine classification every per-engine helper here shares (the port,
+/// the parameter catalog, the log streams and the master-credential limits), so
+/// they cannot drift apart.
+///
+/// It answers true when any SEPARATOR-DELIMITED token of the value is
+/// `postgres` or `postgresql`, case-insensitively — which covers the catalog's
+/// own [`RelationalDatabaseBlueprintSpec::engine`] value (`postgres`) and a
+/// blueprint id that carries the version beside it (`postgres_17`), the two
+/// forms this crate passes. An unseparated spelling (`postgres17`) is NOT
+/// PostgreSQL to this predicate; everything that is not PostgreSQL is MySQL, the
+/// engine the modelled `RelationalDatabaseEngine` enum names.
+pub fn is_postgres_engine(engine: &str) -> bool {
+    engine
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|token| {
+            token.eq_ignore_ascii_case("postgres") || token.eq_ignore_ascii_case("postgresql")
+        })
+}
+
 /// The port a database of `engine` listens on: the engine's own default
 /// (MySQL `3306`, PostgreSQL `5432`), the ports RDS documents as the default for
 /// each engine under `CreateDBInstance$Port`.
@@ -5381,10 +5402,57 @@ const RELATIONAL_DATABASE_HOST_LABEL_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvw
 /// Lightsail exposes no port parameter at all, so a database always listens on
 /// its engine's default.
 pub fn relational_database_port(engine: &str) -> i32 {
-    if engine.to_ascii_lowercase().contains("postgres") {
+    if is_postgres_engine(engine) {
         5432
     } else {
         3306
+    }
+}
+
+/// The log streams a MySQL managed database publishes, in the order
+/// [`relational_database_log_streams`] reports them.
+///
+/// A Lightsail managed database is an Amazon RDS DB instance, and a log stream is
+/// one of the log FILES that instance's engine writes: the RDS MySQL log-file
+/// names (Amazon RDS User Guide, "MySQL database log files" — the error log
+/// `error/mysql-error.log` with its hourly-rotated running copy
+/// `error/mysql-error-running.log`, the general query log
+/// `general/mysql-general.log` and the slow query log
+/// `slowquery/mysql-slowquery.log`).
+///
+/// CHOSEN where AWS publishes no list: Lightsail's own API documents only that
+/// `GetRelationalDatabaseLogStreams` answers "a list of available log streams"
+/// and names none of them, so this is the engine's documented log-file set. The
+/// hourly `error/mysql-error-running.log.<hour>` copies and the audit log are
+/// left out: the first is a rotation artefact of a server that has been running
+/// for hours, and the second needs an option group Lightsail does not offer.
+pub const MYSQL_LOG_STREAMS: &[&str] = &[
+    "error/mysql-error-running.log",
+    "error/mysql-error.log",
+    "general/mysql-general.log",
+    "slowquery/mysql-slowquery.log",
+];
+
+/// The log streams a PostgreSQL managed database publishes. See
+/// [`MYSQL_LOG_STREAMS`] for where the names come from: PostgreSQL writes ONE
+/// log, `error/postgresql.log` (Amazon RDS User Guide, "PostgreSQL database log
+/// files"), whose hourly-stamped copies are left out for the same reason the
+/// MySQL rotations are — and because a stream name has to be stable across
+/// reads.
+pub const POSTGRES_LOG_STREAMS: &[&str] = &["error/postgresql.log"];
+
+/// The log streams a database of `engine` publishes.
+///
+/// The set is the ENGINE's, like the port and the master-credential limits, so a
+/// MySQL database and a PostgreSQL one answer different streams. The engine of a
+/// blueprint is the catalog's own [`RelationalDatabaseBlueprintSpec::engine`]
+/// value, so the PostgreSQL set is selected on that engine and every other engine
+/// the catalog serves answers the MySQL set.
+pub fn relational_database_log_streams(engine: &str) -> &'static [&'static str] {
+    if is_postgres_engine(engine) {
+        POSTGRES_LOG_STREAMS
+    } else {
+        MYSQL_LOG_STREAMS
     }
 }
 
@@ -5456,7 +5524,7 @@ pub struct MasterCredentialLimits {
 /// selected on that engine and every other engine the catalog serves is held to
 /// the MySQL set the modelled documentation gives first.
 pub fn master_credential_limits(engine: &str) -> MasterCredentialLimits {
-    if engine.to_ascii_lowercase().contains("postgres") {
+    if is_postgres_engine(engine) {
         MasterCredentialLimits {
             database_name_chars: 63,
             username_chars: 63,
@@ -6247,6 +6315,28 @@ impl StoredRelationalDatabase {
             pending_maintenance_actions: Some(Vec::new()),
             ca_certificate_identifier: Some(self.ca_certificate_identifier.clone()),
         }
+    }
+
+    /// The log streams this database publishes right now, as
+    /// `GetRelationalDatabaseLogStreams` answers them.
+    ///
+    /// A log stream is a log file the database's ENGINE writes, so the set is the
+    /// engine's own ([`relational_database_log_streams`]) — and it exists only
+    /// once that engine has run: a database still in
+    /// [`RELATIONAL_DATABASE_STATE_CREATING`] has started no engine and written
+    /// no log, so it publishes no stream, exactly as it announces no master
+    /// endpoint. Every later state keeps the files — a database in
+    /// [`RELATIONAL_DATABASE_STATE_REBOOTING`] has already written its error log
+    /// and the restart is itself logged — so the gate is on `creating` alone,
+    /// the same one `master_endpoint` uses.
+    pub fn log_streams(&self) -> Vec<String> {
+        if self.state == RELATIONAL_DATABASE_STATE_CREATING {
+            return Vec::new();
+        }
+        relational_database_log_streams(self.blueprint.engine)
+            .iter()
+            .map(|stream| (*stream).to_string())
+            .collect()
     }
 }
 

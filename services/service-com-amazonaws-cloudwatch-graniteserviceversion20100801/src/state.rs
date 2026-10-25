@@ -20,6 +20,9 @@
 //!   configuration of the CloudWatch Logs scheduled query it evaluates.
 //! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::metric_streams`] — the
 //!   metric streams written by `PutMetricStream` and read back by `GetMetricStream`.
+//! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::insight_rules`] — the
+//!   Contributor Insights rules written by `PutInsightRule` and read back by
+//!   `DescribeInsightRules`.
 //!
 //! An alarm is stored as the modelled [`MetricAlarm`] shape itself rather than a parallel
 //! record, so every member `PutMetricAlarm` accepts round-trips through `DescribeAlarms`
@@ -33,7 +36,7 @@ use ::serde_json::{Map, Value};
 
 use crate::ops::types::{
     ActionConfiguration, AlarmHistoryItem, CompositeAlarm, Dimension, EvaluationCriteria,
-    EvaluationWindow, GetMetricStreamOutput, LogAlarm, MetricAlarm, MetricDataQuery,
+    EvaluationWindow, GetMetricStreamOutput, InsightRule, LogAlarm, MetricAlarm, MetricDataQuery,
     ScheduledQueryConfiguration, Tag, WarmUpConfiguration,
 };
 
@@ -520,6 +523,16 @@ pub struct StoredMetricStream {
     pub tags: Vec<Tag>,
 }
 
+/// A stored Contributor Insights rule: the modelled shape `DescribeInsightRules` reports,
+/// plus the tags `PutInsightRule` accepted (no [`InsightRule`] member carries them).
+#[derive(Debug, Clone, Default)]
+pub struct StoredInsightRule {
+    /// The rule as `DescribeInsightRules` reports it.
+    pub rule: InsightRule,
+    /// The tags the rule was created with.
+    pub tags: Vec<Tag>,
+}
+
 /// Per-service state for com-amazonaws-cloudwatch-graniteserviceversion20100801. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudwatchGraniteserviceversion20100801State {
@@ -538,6 +551,8 @@ pub struct ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     pub next_history_sequence: u64,
     /// Metric streams by stream name.
     pub metric_streams: HashMap<String, StoredMetricStream>,
+    /// Contributor Insights rules by rule name.
+    pub insight_rules: HashMap<String, StoredInsightRule>,
     /// The action notifications the alarm state transitions this store has materialised owe
     /// but nothing has delivered yet, oldest first. Bounded by
     /// [`alarm_evaluation::MAX_PENDING_NOTIFICATIONS`]; drained by
@@ -741,6 +756,45 @@ pub const MAX_HISTORY_ITEMS_PER_ALARM: usize = 1_000;
 /// their number has to be finite. Reaching it evicts the history whose NEWEST item is the
 /// oldest, the same direction retention ages history out in, so recent reads stay exact.
 pub const MAX_ALARM_HISTORIES: usize = 10_000;
+
+/// The `Schema` every Contributor Insights rule a caller creates carries: "For rules that
+/// you create, this is always `{"Name": "CloudWatchLogRule", "Version": 1}`. For managed
+/// rules, this is `{"Name": "ServiceLogRule", "Version": 1}`" (`InsightRule$Schema`).
+pub const INSIGHT_RULE_SCHEMA: &str = "{\"Name\": \"CloudWatchLogRule\", \"Version\": 1}";
+
+/// A Contributor Insights rule that is evaluating log events: "The state of the rule. Valid
+/// values are ENABLED and DISABLED." (`PutInsightRuleInput$RuleState`)
+pub const INSIGHT_RULE_ENABLED: &str = "ENABLED";
+
+/// A Contributor Insights rule that is not evaluating log events
+/// (`PutInsightRuleInput$RuleState`).
+pub const INSIGHT_RULE_DISABLED: &str = "DISABLED";
+
+/// The largest number of Contributor Insights rules this in-memory store holds.
+///
+/// A capacity bound, not an AWS quota: the rule records live in this process's memory, so
+/// their number has to be finite. `PutInsightRule` answers its modelled `LimitExceededException`
+/// ("The operation exceeded one or more limits.") rather than growing without limit once it is
+/// reached; updating a rule that already exists adds none, so it is unaffected.
+pub const MAX_INSIGHT_RULES: usize = 10_000;
+
+/// How many tags one CloudWatch resource may carry: "You can associate as many as 50 tags
+/// with a rule." (`PutInsightRuleInput$Tags`) — the same 50 every taggable resource of this
+/// service takes ("You can associate as many as 50 tags with a metric stream.",
+/// `PutMetricStreamInput$Tags`), which is why the bound lives here rather than per operation.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// Why `tags` is more tags than one `resource` may carry, or `None` when it is not. The
+/// caller renders the sentence through whichever parameter fault its own model declares.
+pub fn tag_count_error(resource: &str, tags: Option<&[Tag]>) -> Option<String> {
+    let count = tags.map_or(0, <[Tag]>::len);
+    (count > MAX_TAGS_PER_RESOURCE).then(|| {
+        format!(
+            "a {resource} can be associated with at most {MAX_TAGS_PER_RESOURCE} tags; \
+             got {count}"
+        )
+    })
+}
 
 /// The largest number of metric streams this in-memory store holds.
 ///

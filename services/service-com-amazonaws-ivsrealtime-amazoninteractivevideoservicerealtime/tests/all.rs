@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/composition_stop.rs"]
 mod composition_stop;
+#[path = "all/composition_tag_lifetime.rs"]
+mod composition_tag_lifetime;
 #[path = "all/compositions.rs"]
 mod compositions;
 #[path = "all/create_ingest_configuration_inputs.rs"]
@@ -23,6 +25,8 @@ mod delete_ingest_configuration;
 mod disconnect_participant;
 #[path = "all/empty_response_framing.rs"]
 mod empty_response_framing;
+#[path = "all/encoder_configuration_in_use.rs"]
+mod encoder_configuration_in_use;
 #[path = "all/encoder_configurations.rs"]
 mod encoder_configurations;
 #[path = "all/error_envelope.rs"]

@@ -123,3 +123,5 @@ mod update_router_output;
 // every mediaconnect change at once, and the middle of it is where those insertions land.
 #[path = "all/describe_gateway_instance.rs"]
 mod describe_gateway_instance;
+#[path = "all/gateway_instance_listing.rs"]
+mod gateway_instance_listing;

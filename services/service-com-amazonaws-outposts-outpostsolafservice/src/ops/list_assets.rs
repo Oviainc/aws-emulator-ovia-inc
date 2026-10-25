@@ -12,8 +12,8 @@
 //! sees exactly what the next caller does. An asset is a physical unit of hardware
 //! Amazon Web Services installs once an order is fulfilled, so no call in this API
 //! creates one and this operation invents none: an Outpost with no installed hardware
-//! is answered with no asset, exactly as `GetRenewalPricing` answers an Outpost with no
-//! recorded price. See [`crate::state::OutpostRecord::assets`] for the operations an
+//! is answered with no asset. See [`crate::state::OutpostRecord::assets`] for the
+//! operations an
 //! Outpost's hardware would arrive with — all still scaffold stubs with issues of
 //! their own.
 //!

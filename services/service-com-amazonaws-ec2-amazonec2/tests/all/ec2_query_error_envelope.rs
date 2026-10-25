@@ -34,7 +34,9 @@
 //! element a 200 carries instead. The scaffold's 501 is rendered by the same
 //! `serialize_error`, so it carries the element by construction; no row names a scaffolded
 //! operation, because the operation this suite would have to name is one some other issue
-//! implements next.
+//! implements next — the `CreateVpnConnectionRoute` rows below are an operation that WAS a
+//! scaffold and is one no longer, which is what pins that an operation added to this
+//! service answers this envelope rather than a body of its own.
 
 use std::collections::BTreeSet;
 
@@ -48,17 +50,21 @@ use super::wire::{child, child_text, document, param, Param};
 const REGION: &str = "us-east-1";
 
 /// The root element of the ec2Query ERROR envelope.
-const ERROR_ENVELOPE_ROOT: &str = "Response";
+pub(crate) const ERROR_ENVELOPE_ROOT: &str = "Response";
 
 /// The element a refusal reports the answered request in (`RequestID`), and the one a
 /// success reports it in (`requestId`). XML is case-sensitive, so these are two distinct
 /// elements and a response carries exactly one of them.
-const ERROR_REQUEST_ID: &str = "RequestID";
-const SUCCESS_REQUEST_ID: &str = "requestId";
+pub(crate) const ERROR_REQUEST_ID: &str = "RequestID";
+pub(crate) const SUCCESS_REQUEST_ID: &str = "requestId";
 
 /// A well-formed VPC id in the long (17 hexadecimal digit) form that the account holds no
 /// VPC for.
 const UNKNOWN_VPC_ID: &str = "vpc-0ffffffffffffffff";
+
+/// A well-formed VPN connection id the account holds no connection for — enough for the
+/// `CreateVpnConnectionRoute` rows, each of which is refused before anything is written.
+const UNKNOWN_VPN_CONNECTION_ID: &str = "vpn-00000000000000001";
 
 /// A well-formed transit gateway route table id that names no route table — enough for the
 /// rows refused before any route table is resolved.
@@ -142,6 +148,39 @@ fn refusal_rows() -> Vec<Row> {
             status: 400,
             code: ec2::state::INVALID_PARAMETER_VALUE,
         },
+        Row {
+            case: "a static route named for a VPN connection the account does not hold",
+            action: "CreateVpnConnectionRoute",
+            params: vec![
+                param("VpnConnectionId", UNKNOWN_VPN_CONNECTION_ID),
+                param("DestinationCidrBlock", "192.168.0.0/24"),
+            ],
+            status: 400,
+            code: ec2::state::INVALID_VPN_CONNECTION_ID,
+        },
+        Row {
+            case: "a static route whose destination is not a CIDR block",
+            action: "CreateVpnConnectionRoute",
+            params: vec![
+                param("VpnConnectionId", UNKNOWN_VPN_CONNECTION_ID),
+                param("DestinationCidrBlock", "not-a-cidr"),
+            ],
+            status: 400,
+            code: ec2::state::INVALID_PARAMETER_VALUE,
+        },
+        Row {
+            // Both members are `@required` AND `@clientOptional`, so an empty value reaches
+            // the handler rather than the framework's refusal tail: this row is the
+            // SERVICE's own `MissingParameter`, rendered by the same `serialize_error`.
+            case: "a static route that names no VPN connection at all",
+            action: "CreateVpnConnectionRoute",
+            params: vec![
+                param("VpnConnectionId", ""),
+                param("DestinationCidrBlock", "192.168.0.0/24"),
+            ],
+            status: 400,
+            code: ec2::state::MISSING_PARAMETER,
+        },
     ]
 }
 
@@ -173,7 +212,10 @@ fn is_request_id_form(value: &str) -> bool {
 }
 
 /// The text of every direct child of `body`'s root element named `name`, in document order.
-fn root_children(case: &str, body: &str, root_name: &str, name: &str) -> Vec<String> {
+///
+/// `pub(crate)` so a suite that brings ONE operation under this rule reads the envelope
+/// through this reader rather than declaring a second one.
+pub(crate) fn root_children(case: &str, body: &str, root_name: &str, name: &str) -> Vec<String> {
     let parsed = document(case, body);
     let root = parsed.root_element();
     assert_eq!(

@@ -41,16 +41,16 @@ use crate::certificate_lifecycle::{call_in_region, router_with_engine, ACCOUNT};
 /// host FORM: the recorded behaviour grades `AcmeEndpoint$EndpointUrl` as having to be
 /// on `acm-acme-enroll.<region>.<domain>`, and an ACME client is configured with that
 /// URL as its ACME server.
-const ENROLLMENT_LABEL: &str = "acm-acme-enroll";
+pub(crate) const ENROLLMENT_LABEL: &str = "acm-acme-enroll";
 
 /// The DNS suffix of the AWS endpoint hosts this emulator publishes.
-const DNS_SUFFIX: &str = "amazonaws.com";
+pub(crate) const DNS_SUFFIX: &str = "amazonaws.com";
 
 /// The Regions the table spans: the recorded one, one in each of three other
 /// geographies, and one whose name carries three hyphen-separated parts — so the host
 /// assertion holds for every Region-name shape an ACM ARN may carry
 /// (`AcmeEndpointArn`'s `@pattern` spells the Region `[a-z0-9-]+`).
-const REGIONS: &[&str] = &[
+pub(crate) const REGIONS: &[&str] = &[
     "us-west-2",
     "eu-west-1",
     "ap-southeast-2",
@@ -60,7 +60,7 @@ const REGIONS: &[&str] = &[
 
 /// Every member RFC 8555 §7.1.1 requires of the directory object, beside the resource
 /// path this service mints its URL from.
-const DIRECTORY_MEMBERS: &[(&str, &str)] = &[
+pub(crate) const DIRECTORY_MEMBERS: &[(&str, &str)] = &[
     ("newNonce", "new-nonce"),
     ("newAccount", "new-account"),
     ("newOrder", "new-order"),
@@ -81,7 +81,7 @@ fn create_body(marker: &str) -> Value {
 }
 
 /// Create one ACME endpoint in `region` and return its ARN.
-async fn create_endpoint(
+pub(crate) async fn create_endpoint(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,
@@ -121,7 +121,7 @@ async fn describe_endpoint(
 }
 
 /// The `EndpointUrl` `DescribeAcmeEndpoint` reports for `arn`.
-async fn endpoint_url(
+pub(crate) async fn endpoint_url(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,
@@ -135,14 +135,14 @@ async fn endpoint_url(
 }
 
 /// The endpoint id of an ACME endpoint ARN: the part after `acme-endpoint/`.
-fn endpoint_id(arn: &str) -> &str {
+pub(crate) fn endpoint_id(arn: &str) -> &str {
     arn.rsplit_once("acme-endpoint/")
         .unwrap_or_else(|| panic!("{arn} is not an ACME endpoint ARN"))
         .1
 }
 
 /// The `(host, path)` an `https://` URL addresses.
-fn split_url(case: &str, url: &str) -> (String, String) {
+pub(crate) fn split_url(case: &str, url: &str) -> (String, String) {
     let rest = url
         .strip_prefix("https://")
         .unwrap_or_else(|| panic!("case {case:?}: expected an https URL, got {url:?}"));
@@ -158,7 +158,7 @@ fn split_url(case: &str, url: &str) -> (String, String) {
 /// Fetch `url` from the emulator with `method`, exactly as a client holding that URL
 /// would: the URL's own host in the `Host` header, its path as the request target, and
 /// NO credential of any kind — an ACME client has none.
-async fn fetch(
+pub(crate) async fn fetch(
     router: &MultiServiceRouter,
     case: &str,
     method: &str,
@@ -175,7 +175,7 @@ async fn fetch(
 }
 
 /// The response body as JSON, or `Value::Null` when it is empty.
-fn body_json(case: &str, response: &::http::Response<Bytes>) -> Value {
+pub(crate) fn body_json(case: &str, response: &::http::Response<Bytes>) -> Value {
     let bytes = response.body();
     if bytes.is_empty() {
         return Value::Null;
@@ -204,7 +204,7 @@ fn header(response: &::http::Response<Bytes>, name: &str) -> String {
 ///
 /// Writes only the due instant the emulator itself stores: the transition is still
 /// applied by `materialize_due` on the next request, exactly as in production.
-fn activate_endpoints_now(engine: &Arc<engine::InMemoryEngine>) {
+pub(crate) fn activate_endpoints_now(engine: &Arc<engine::InMemoryEngine>) {
     let store = engine.state::<state::ComAmazonawsAcmCertificatemanagerState>();
     let mut store = store.lock();
     let past = SystemTime::now() - Duration::from_millis(1);
@@ -516,11 +516,11 @@ async fn no_acme_resource_is_served_without_an_active_endpoint_behind_it() {
     let cases: Vec<(&str, String)> = vec![
         (
             "an endpoint id no record answers to",
-            format!("https://{host}/acme/00000000-0000-4000-8000-000000000000/directory"),
+            format!("https://{host}/00000000-0000-4000-8000-000000000000/directory"),
         ),
         (
             "another Region's endpoint on this Region's host",
-            format!("https://{host}/acme/{}/directory", endpoint_id(&elsewhere)),
+            format!("https://{host}/{}/directory", endpoint_id(&elsewhere)),
         ),
         (
             "a resource no endpoint publishes",
@@ -529,7 +529,7 @@ async fn no_acme_resource_is_served_without_an_active_endpoint_behind_it() {
         ("a path that is not an ACME path", format!("https://{host}/")),
         (
             "an endpoint id with no resource under it",
-            format!("https://{host}/acme/{}", endpoint_id(&active)),
+            format!("https://{host}/{}", endpoint_id(&active)),
         ),
     ];
     for (case, url) in &cases {

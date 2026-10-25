@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`ModifyUser::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -167,18 +163,257 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyUser"))
+        // A mutation: "Changes user password(s) and/or access string." The
+        // request names the change; the stored user is the ONE copy it is made
+        // to, and the answer is read back out of that copy.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // Same identity rule as `CreateUser`: `UserId` "is stored as a lowercase
+        // string", so that is the key this lookup resolves against.
+        let user_id = input.user_id.to_ascii_lowercase();
+        // The upper bound on a user id the model does not express; see
+        // `crate::state::user_id_rejection`. Checked BEFORE the lookup: an id
+        // the service would never have stored names no user to look up.
+        if let Some(message) = crate::state::user_id_rejection(&user_id) {
+            return Err(ModifyUserErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // The two access-string members ask for opposite things about the same
+        // rule list: `AccessString` is "Access permissions string used for this
+        // user" — the whole list — while `AppendAccessString` "adds additional
+        // user permissions to the access string" it already has. One call
+        // cannot both state the list and add to it.
+        if input.access_string.is_some() && input.append_access_string.is_some() {
+            return Err(
+                ModifyUserErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(
+                            "AccessString cannot be combined with AppendAccessString: one states \
+                             the whole access string, the other adds to it."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // Whichever member carries a rule list, it is the engine's own ACL
+        // syntax: one that names something that is not a rule is refused rather
+        // than stored as a permission set no engine could apply. The same test
+        // `CreateUser` applies (`crate::state::access_string_rejection`), so the
+        // two cannot drift about which rule lists the service accepts.
+        for (member, value) in [
+            ("AccessString", input.access_string.as_deref()),
+            ("AppendAccessString", input.append_access_string.as_deref()),
+        ] {
+            if let Some(value) = value {
+                if let Some(message) = crate::state::access_string_rejection(member, value) {
+                    return Err(ModifyUserErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(message),
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+
+        // "Modifies the engine listed for a user. The options are valkey or
+        // redis" — the same set a user is created for, so one implementation
+        // decides it.
+        let engine = match input.engine.as_deref() {
+            Some(requested) => match crate::state::normalize_user_engine(requested) {
+                Ok(engine) => Some(engine),
+                Err(message) => {
+                    return Err(ModifyUserErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(message),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => None,
+        };
+
+        // How the user authenticates, from the three mutually exclusive members
+        // that can say so — resolved by the helper `CreateUser` uses, so both
+        // take the same password rules and refuse the same combinations. Unlike
+        // a create, a modify need not say anything about authentication: a
+        // request that names none of the three leaves the user authenticating
+        // the way it already does.
+        let names_authentication = input.passwords.as_deref().is_some_and(|p| !p.is_empty())
+            || input.no_password_required.is_some()
+            || input.authentication_mode.is_some();
+        let authentication = if names_authentication {
+            match crate::state::authentication_from_request(
+                input.passwords.as_deref(),
+                input.no_password_required,
+                input.authentication_mode.as_ref(),
+            ) {
+                Ok(authentication) => Some(authentication),
+                Err(crate::state::AuthRefusal::Value(message)) => {
+                    return Err(ModifyUserErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(message),
+                        },
+                    )
+                    .into())
+                }
+                Err(crate::state::AuthRefusal::Combination(message)) => {
+                    return Err(
+                        ModifyUserErrorModeled::InvalidParameterCombinationException(
+                            InvalidParameterCombinationException {
+                                message: Some(message),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            }
+        } else {
+            None
+        };
+
+        // A modify has to ask for something: with no member named there is no
+        // change to make, and a 200 would report a modification that never
+        // happened — the rule `ModifyUserGroup` applies to its own members.
+        if engine.is_none()
+            && authentication.is_none()
+            && input.access_string.is_none()
+            && input.append_access_string.is_none()
+        {
+            return Err(
+                ModifyUserErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(
+                            "No modifications were requested: name AccessString, \
+                             AppendAccessString, Engine, Passwords, NoPasswordRequired or an \
+                             AuthenticationMode."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // One instant for the whole request: the event is dated at it, and the
+        // status the clock owes is due a span after it.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A user whose removal has fallen due is gone, so a modify naming it
+        // answers not-found; a user whose last change has fallen due is `active`
+        // again and can take another one. Both were owed at this instant whether
+        // or not anybody called.
+        store.settle_users(now);
+
+        // "The user does not exist or could not be found": the modelled 404.
+        if !store.users.contains_key(&user_id) {
+            return Err(ModifyUserErrorModeled::UserNotFoundFault(UserNotFoundFault {
+                message: Some(format!("User {} not found.", input.user_id)),
+            })
+            .into());
+        }
+        // "Returns a list of the user group IDs the user belongs to": held by
+        // the groups that list the user, so it is read before the record is
+        // borrowed mutably below. This call changes no membership.
+        let user_group_ids = store.user_group_ids_of(&user_id);
+        let Some(user) = store.users.get_mut(&user_id) else {
+            // Unreachable: the containment check above holds the same lock.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+        // `InvalidUserStateFault`: "The user is not in active state." A user
+        // still carrying the previous change, or on its way out, takes no
+        // further one; the accepted statuses are stated once in
+        // `crate::state::user_state_refusal`.
+        if let Some(message) = crate::state::user_state_refusal(user) {
+            return Err(ModifyUserErrorModeled::InvalidUserStateFault(
+                InvalidUserStateFault {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // The change itself. Each member is applied only where the request named
+        // it, so a modify that states one thing about the user leaves the rest
+        // of it exactly as it was.
+        if let Some(access_string) = input.access_string.as_deref() {
+            user.access_string = crate::state::canonical_access_string(access_string);
+        } else if let Some(appended) = input.append_access_string.as_deref() {
+            // "Adds additional user permissions to the access string": the
+            // rules asked for follow the ones the user already has, and the
+            // result is stored in the expanded form the service reports — the
+            // same form `CreateUser` stores, so a user's rule list reads the
+            // same however it got there.
+            let next =
+                crate::state::canonical_access_string(&format!("{} {appended}", user.access_string));
+            // An append makes the stored list the one thing a caller can grow
+            // from call to call, so the bound is checked on the RESULT rather
+            // than on the rules the request added; it is the same bound a whole
+            // access string is accepted under (`crate::state::access_string_rejection`).
+            if let Some(message) =
+                crate::state::access_string_rejection("AppendAccessString", &next)
+            {
+                return Err(ModifyUserErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+            user.access_string = next;
+        }
+        if let Some(engine) = engine {
+            user.engine = engine;
+        }
+        if let Some(authentication) = authentication {
+            user.authentication = authentication;
+        }
+        // `User$Status` "can be \"active\", \"modifying\" or \"deleting\"": the
+        // user is modifying from here, and the clock owes it `active` a span
+        // later — so a caller acting straight after this call still observes the
+        // transient status and the state error that goes with it.
+        user.status = crate::state::STATUS_MODIFYING.to_string();
+        user.pending_status = crate::state::user_transition(now);
+
+        // Read back out of the store, so the answer is the persisted user rather
+        // than the request echoed. `User` is generated once per operation, so
+        // the stored user's ONE modelled view is remapped onto this operation's
+        // copy of that shape rather than built a second time.
+        let modified = user.to_modeled_in(user_group_ids);
+        // Modifying a user is one of the events this service records; see
+        // `crate::state::EventRecord`.
+        store.record_event(
+            crate::state::SOURCE_TYPE_USER,
+            &user_id,
+            "User modified",
+            now,
+        );
+
+        Ok(ModifyUserOutput {
+            user_id: modified.user_id,
+            user_name: modified.user_name,
+            status: modified.status,
+            engine: modified.engine,
+            minimum_engine_version: modified.minimum_engine_version,
+            access_string: modified.access_string,
+            user_group_ids: modified.user_group_ids,
+            authentication: modified.authentication,
+            arn: modified.arn,
+        })
     }
 }

@@ -59,7 +59,7 @@ use crate::response_headers_policy_lifecycle::escape;
 // ---------------------------------------------------------------------------
 
 /// `POST /2020-05-31/connection-function` with the request document `body`.
-async fn create_connection_function(router: &MultiServiceRouter, body: &str) -> Answer {
+pub(crate) async fn create_connection_function(router: &MultiServiceRouter, body: &str) -> Answer {
     call(
         router,
         "POST",
@@ -72,7 +72,7 @@ async fn create_connection_function(router: &MultiServiceRouter, body: &str) -> 
 
 /// `GET /2020-05-31/connection-function/{Identifier}/describe`, naming `stage` when it is
 /// `Some` and leaving the optional query parameter out entirely when it is `None`.
-async fn describe_connection_function(
+pub(crate) async fn describe_connection_function(
     router: &MultiServiceRouter,
     identifier: &str,
     stage: Option<&str>,
@@ -88,7 +88,7 @@ async fn describe_connection_function(
 
 /// Create a key value store and answer the ARN its create minted, so a connection function
 /// configuration can name a store this service actually holds.
-async fn key_value_store_arn(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn key_value_store_arn(router: &MultiServiceRouter, name: &str) -> String {
     let body = format!(
         "<CreateKeyValueStoreRequest \
          xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
@@ -113,24 +113,24 @@ async fn key_value_store_arn(router: &MultiServiceRouter, name: &str) -> String 
 
 /// One `CreateConnectionFunction` request a client submits.
 #[derive(Debug, Clone)]
-struct Create {
-    case: &'static str,
-    name: String,
+pub(crate) struct Create {
+    pub(crate) case: &'static str,
+    pub(crate) name: String,
     /// `FunctionConfig.Comment`, which is required on the wire.
-    comment: String,
+    pub(crate) comment: String,
     /// `FunctionConfig.Runtime`.
-    runtime: &'static str,
+    pub(crate) runtime: &'static str,
     /// `ConnectionFunctionCode`, as the bytes a client submits.
-    code: Vec<u8>,
+    pub(crate) code: Vec<u8>,
     /// The `KeyValueStoreARN` of each association the configuration names.
-    associations: Vec<String>,
+    pub(crate) associations: Vec<String>,
     /// `Tags.Items`.
-    tags: Vec<SubmittedTag>,
+    pub(crate) tags: Vec<SubmittedTag>,
 }
 
 impl Create {
     /// The `CreateConnectionFunctionRequest` XML a client sends for this create.
-    fn xml(&self) -> String {
+    pub(crate) fn xml(&self) -> String {
         let mut out = format!(
             "<CreateConnectionFunctionRequest \
              xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">"
@@ -199,7 +199,7 @@ const CONNECTION_CODE: &str = "function handler(event) {\n\
 ///
 /// `kvs_arn` is the ARN of a key value store this service holds, so the row that associates
 /// one names a store that really exists.
-fn create_table(kvs_arn: &str) -> Vec<Create> {
+pub(crate) fn create_table(kvs_arn: &str) -> Vec<Create> {
     vec![
         Create {
             case: "the shortest admissible name, the smallest admissible code",
@@ -274,7 +274,7 @@ fn is_connection_function_id(value: &str) -> bool {
 
 /// The text of one member of the `ConnectionFunctionSummary` document, or a panic naming
 /// the case.
-fn member(summary: &Node, path: &str, case: &str, raw: &str) -> String {
+pub(crate) fn member(summary: &Node, path: &str, case: &str, raw: &str) -> String {
     summary
         .text_at(path)
         .unwrap_or_else(|| panic!("case {case}: the answer carries no {path}: {raw}"))

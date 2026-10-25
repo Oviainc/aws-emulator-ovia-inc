@@ -488,15 +488,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `input` (caller-sized up to the modelled 256 KiB), the outcome the walk
         // computed and that run's history, so a record count alone would not bound
         // the memory. A run that stopped at an activity task retains that task too,
-        // so it is admitted against both records together and the schedule below
-        // cannot grow the store past what was admitted.
+        // and a run whose Distributed Map states started Map Runs retains those, so
+        // it is admitted against every record together and the writes below cannot
+        // grow the store past what was admitted.
         let waiting = planned.waiting;
         let task_bytes = waiting
             .as_ref()
             .map_or(0, crate::state::PlannedActivityTask::measure);
-        if let Some(why) =
-            store.execution_rejection(&machine_arn, candidate.measure() + task_bytes)
-        {
+        let map_run_bytes = crate::state::planned_map_run_bytes(&planned.map_runs);
+        if let Some(why) = store.execution_rejection(
+            &machine_arn,
+            candidate.measure() + task_bytes + map_run_bytes,
+        ) {
             return Err(
                 StartExecutionErrorModeled::ExecutionLimitExceeded(ExecutionLimitExceeded {
                     message: Some(why),
@@ -506,6 +509,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         store.insert_execution(candidate);
+        // Every Distributed Map state the walk entered started a Map Run, which
+        // `ListMapRuns` reports for this execution and `DescribeMapRun` by its own ARN.
+        store.record_map_runs(
+            &arn,
+            &machine_arn,
+            &machine_name,
+            &region,
+            planned.map_runs,
+        );
         // The walk reached an activity task: it is queued under its activity's ARN
         // for a worker to claim with `GetActivityTask`, and the execution waits at
         // that state until one answers it.

@@ -4,8 +4,9 @@
 //! IMPLEMENTED: one `WorkflowRunSummary` per run the named workflow holds in this
 //! service's store (`crate::state`), oldest first by the instant each run was created,
 //! at most `MaxResults` per page, optionally narrowed to one `WorkflowVersion`. A
-//! workflow the store does not hold is
-//! the service's lookup miss, not an empty page. The only writes are the changes the
+//! workflow this endpoint does not hold contributes no run, so the page it answers is
+//! empty: the operation's modelled error set declares no not-found error, and an
+//! operation answers only the errors it declares. The only writes are the changes the
 //! clock already owed — the teardown of a workflow past its `DELETING` span and each
 //! run's own status schedule — so a read never changes what a later caller sees. The
 //! `NextToken` this operation returns is the only one it accepts back; anything else is
@@ -115,26 +116,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mwaaserverless-amazonmw
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
 //
-// Widened with `ResourceNotFoundException`: `WorkflowArn` is this operation's
-// `@httpLabel` — the parent resource the listing walks, `GET
-// /workflows/{WorkflowArn}/runs` — and every sibling operation that resolves that
-// same ARN (`GetWorkflow`, `DeleteWorkflow`, `StartWorkflowRun`, `GetWorkflowRun`,
-// `ListTagsForResource`) declares `ResourceNotFoundException` for a workflow the
-// store does not hold. This operation's own `errors` list omits it, so it is widened
-// in here through `extra_errors` rather than answered as an empty page, which would
-// report "this workflow has no runs" for a workflow that does not exist. The shape is
-// this service's own (`com.amazonaws.mwaaserverless#ResourceNotFoundException`),
-// served at `crate::state::LOOKUP_MISS_STATUS` like every other lookup miss here.
-#[smithy_macros::operation_error(
-    "com.amazonaws.mwaaserverless#ListWorkflowRuns",
-    extra_errors = ["ResourceNotFoundException"]
-)]
+// This set is EXACTLY what the model declares for this operation
+// (`smithy_query(query="operation", operation="ListWorkflowRuns")`): no
+// `ResourceNotFoundException`, unlike every single-resource operation that resolves
+// the same `WorkflowArn` (`GetWorkflow`, `DeleteWorkflow`, `StartWorkflowRun`,
+// `GetWorkflowRun`, `ListTagsForResource`), which all declare it. A child-resource
+// listing therefore cannot answer a workflow it does not hold with that shape — an
+// SDK client has no modelled type to map it onto — so the absent parent is an empty
+// page instead.
+#[smithy_macros::operation_error("com.amazonaws.mwaaserverless#ListWorkflowRuns")]
 #[derive(Debug)]
 pub enum ListWorkflowRunsErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
     OperationTimeoutException(OperationTimeoutException),
-    ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
 }
@@ -237,22 +232,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         };
 
-        // The entity this listing walks is the workflow its `@httpLabel` names: one the
-        // store does not hold has no runs to page over, and an empty page for it would
-        // claim the workflow exists. A workflow of ANOTHER region is not one this
+        // The entity this listing walks is the workflow its `@httpLabel` names: one this
+        // endpoint does not hold contributes no run, so the walk is over an empty set.
+        // The listing reports that as the empty page its output models, because the only
+        // failures it may answer are the ones its own error set declares, and a
+        // not-found error is not among them. A workflow of ANOTHER region is not one this
         // endpoint holds either.
-        let workflow = store
-            .workflow_in_mut(&region, &input.workflow_arn)
-            .ok_or_else(|| {
-                crate::state::lookup_miss(
-                    ListWorkflowRunsErrorModeled::ResourceNotFoundException(
-                        crate::state::unresolved(
-                            crate::state::UnresolvedEntity::Workflow,
-                            &input.workflow_arn,
-                        ),
-                    ),
-                )
-            })?;
+        let Some(workflow) = store.workflow_in_mut(&region, &input.workflow_arn) else {
+            return Ok(ListWorkflowRunsOutput {
+                workflow_runs: Some(Vec::new()),
+                next_token: None,
+            });
+        };
 
         // The ONE further write a read may make: every status change the clock already
         // owed, applied to each run so this listing reports what `GetWorkflowRun` would.
