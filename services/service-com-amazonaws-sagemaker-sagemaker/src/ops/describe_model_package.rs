@@ -289,10 +289,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(package) = store.model_packages.get_mut(key) else {
             // The message quotes the identifier the caller passed, not an ARN this
             // emulator synthesized.
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Could not find model package \"{}\".",
-                input.model_package_name
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::could_not_find(
+                    crate::state::MODEL_PACKAGE_KIND_LABEL,
+                    &input.model_package_name,
+                ),
+            ));
         };
 
         // The only write a reporting call makes: the registration the clock already

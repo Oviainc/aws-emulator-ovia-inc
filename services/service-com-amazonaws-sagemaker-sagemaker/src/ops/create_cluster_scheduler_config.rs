@@ -140,14 +140,6 @@ impl<Eng> CreateClusterSchedulerConfig<Eng> {
     }
 }
 
-/// The message this operation answers when `ClusterArn` names no cluster the service
-/// holds.
-///
-/// A FIXED text carrying nothing from the request: it is the wording the real service
-/// answers for this condition (as the behavioural corpus records), so a client that
-/// matches on it reads the same thing here.
-const CLUSTER_NOT_FOUND: &str = "Specified cluster not found";
-
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for CreateClusterSchedulerConfig<Eng>
 {
@@ -179,7 +171,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // writes and `ListClusters` reports. The refusal is a 400 `ValidationException`,
         // this operation modelling no not-found error.
         if store.cluster_by_arn(&input.cluster_arn).is_none() {
-            return Err(crate::scaffolded::Scaffolded::validation(CLUSTER_NOT_FOUND));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::CLUSTER_NOT_FOUND,
+            ));
         }
         let policies = &mut store.cluster_policies;
         // The store is bounded, so a caller varying `Name` cannot grow it without end.

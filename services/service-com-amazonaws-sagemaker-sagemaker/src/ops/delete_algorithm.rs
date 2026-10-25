@@ -164,9 +164,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "algorithm",
                 &input.algorithm_name,
             );
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Could not find algorithm \"{arn}\"."
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::entity_does_not_exist(crate::state::ALGORITHM_ENTITY, &arn),
+            ));
         };
         let arn = algorithm.arn;
         drop(store);

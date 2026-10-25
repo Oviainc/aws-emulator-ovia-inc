@@ -154,9 +154,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "model-package-group",
                 name,
             );
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Model Package Group \"{arn}\" does not exist."
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::entity_does_not_exist(
+                    crate::state::MODEL_PACKAGE_GROUP_ENTITY,
+                    &arn,
+                ),
+            ));
         };
 
         Ok(DescribeModelPackageGroupOutput {
