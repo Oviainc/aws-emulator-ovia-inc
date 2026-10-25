@@ -36,14 +36,18 @@ use crate::workspace_instance_lifecycle::{call, error_code, harness, ok, DEFAULT
 
 /// The HTTP status the model gives `ConflictException`
 /// (`smithy_query(query="shape",shape="ConflictException")` → `httpError 409`).
-const CONFLICT_STATUS: u16 = 409;
+pub(crate) const CONFLICT_STATUS: u16 = 409;
 
 /// One pair of create calls that share a token: `first` is the call that spends it,
 /// `second` the call that reuses it. `case` names the dimension they differ along.
-struct TokenRow {
-    case: &'static str,
-    first: Value,
-    second: Value,
+///
+/// `pub(crate)` with [`assert_conflict`]: the sibling `instance_token_parameter_mismatch`
+/// suite drives the same rule over retries that differ in SEVERAL members at once, and
+/// states a row and checks a refusal the same way rather than restating either.
+pub(crate) struct TokenRow {
+    pub(crate) case: &'static str,
+    pub(crate) first: Value,
+    pub(crate) second: Value,
 }
 
 /// The volumes the store holds, keyed by id.
@@ -83,7 +87,7 @@ async fn create_volume(router: &MultiServiceRouter, body: Value) -> String {
 
 /// The `ConflictException` a reused token must be refused with: the modelled status
 /// and code, the id the token DID create, and that resource's kind.
-fn assert_conflict(
+pub(crate) fn assert_conflict(
     case: &str,
     status: u16,
     payload: &Value,
