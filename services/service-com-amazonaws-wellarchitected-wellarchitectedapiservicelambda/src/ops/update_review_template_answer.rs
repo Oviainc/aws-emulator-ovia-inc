@@ -317,7 +317,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Answering a question changes the template and the lens review that asks it, so
         // both report this write as the instant they were last updated.
         template
-            .lens_review_notes_mut(&input.lens_alias, now)
+            .lens_review_record_mut(&input.lens_alias, now)
             .updated_at = now;
         template.updated_at = now;
 
