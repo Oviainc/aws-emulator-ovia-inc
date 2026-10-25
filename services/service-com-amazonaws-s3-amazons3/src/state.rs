@@ -82,6 +82,24 @@ pub enum BucketCreation {
 /// the STANDARD Storage Class to store newly created objects."
 pub const DEFAULT_STORAGE_CLASS: &str = "STANDARD";
 
+/// The `StorageClass` values whose objects are ARCHIVED: not readable, not copyable and
+/// not usable until a temporary copy of them has been restored.
+///
+/// "Before using an object as a source object for the copy operation, you must restore a
+/// copy of it if … the storage class of the source object is `GLACIER` or `DEEP_ARCHIVE`"
+/// (`smithy_query(query="doc",shape="CopyObjectRequest",member="StorageClass")`), and the
+/// same two are the storage classes `InvalidObjectState` names — "the S3 Glacier Flexible
+/// Retrieval storage class, the S3 Glacier Deep Archive storage class, the S3
+/// Intelligent-Tiering Archive Access tier, or the S3 Intelligent-Tiering Deep Archive
+/// Access tier" (`smithy_query(query="shape",shape="InvalidObjectState")`), whose other two
+/// entries are TIERS of `INTELLIGENT_TIERING` rather than storage classes and are not
+/// recorded here. Both are values of the `StorageClass` enum
+/// (`smithy_query(query="shape",shape="StorageClass")`).
+///
+/// ONE list, because the operations that judge an object by it — `CopyObject`'s source and
+/// `RestoreObject`'s target — must not disagree about which objects are archived.
+pub const ARCHIVED_STORAGE_CLASSES: [&str; 2] = ["GLACIER", "DEEP_ARCHIVE"];
+
 /// The longest object key this emulator records, in UTF-8 bytes.
 ///
 /// The published S3 limit: "The name for a key is a sequence of Unicode characters whose
@@ -261,6 +279,25 @@ pub enum ObjectRetentionWrite {
     /// retained bytes; nothing was written.
     ByteBudgetReached { would_hold: usize },
     /// Keeping the retention would take the whole store past [`MAX_OBJECT_BYTES_TOTAL`]
+    /// retained bytes; nothing was written.
+    TotalByteBudgetReached { would_hold: usize },
+}
+
+/// What [`ComAmazonawsS3Amazons3State::restore_object_version`] did, so the caller answers
+/// each outcome without re-deriving it — and cannot record a restore without having gone
+/// through the byte budgets a stored object's members count against, per bucket AND
+/// service-wide. The shape [`ObjectRetentionWrite`] has, for the same reason: a restore is
+/// one more record kept beside an object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectRestoreWrite {
+    /// The addressed object version now carries the restore that was handed in.
+    Applied,
+    /// The bucket exists but holds no such object version; nothing was written.
+    NoSuchObject,
+    /// Keeping the restore would take the bucket past [`MAX_OBJECT_BYTES_PER_BUCKET`]
+    /// retained bytes; nothing was written.
+    ByteBudgetReached { would_hold: usize },
+    /// Keeping the restore would take the whole store past [`MAX_OBJECT_BYTES_TOTAL`]
     /// retained bytes; nothing was written.
     TotalByteBudgetReached { would_hold: usize },
 }
@@ -4566,8 +4603,9 @@ impl Bucket {
     /// mutable twin of [`Self::addressed_object`].
     ///
     /// PRIVATE, and reached only through
-    /// [`ComAmazonawsS3Amazons3State::replace_object_retention`], for the reason
-    /// [`Self::object_mut`] is private: that is the one place that sees the byte budgets a
+    /// [`ComAmazonawsS3Amazons3State::replace_object_retention`] and
+    /// [`ComAmazonawsS3Amazons3State::restore_object_version`], for the reason
+    /// [`Self::object_mut`] is private: those are the places that see the byte budgets a
     /// subresource write also has to stay inside.
     fn addressed_object_mut(&mut self, key: &str, version_id: Option<&str>) -> Option<&mut Object> {
         match version_id {
@@ -4934,6 +4972,17 @@ pub struct Object {
     /// [`ComAmazonawsS3Amazons3State::replace_object_retention`], which is the one place
     /// that sees the byte budgets it has to stay inside.
     pub retention: Option<ObjectRetention>,
+    /// The restore `RestoreObject` last initiated on this stored version — see
+    /// [`ObjectRestore`] — or `None` while no restore has been asked for, which is the
+    /// state a write leaves a version in.
+    ///
+    /// Set AFTER the write, like [`Self::retention`]: a restore is initiated on an
+    /// already-archived object ("you must first initiate a restore request, and then wait
+    /// until a temporary copy of the object is available", `RestoreObject`'s own
+    /// documentation), through
+    /// [`ComAmazonawsS3Amazons3State::restore_object_version`], which is the one place that
+    /// sees the byte budgets it has to stay inside.
+    pub restore: Option<ObjectRestore>,
 }
 
 /// The server-side encryption in force on one stored object: the configuration the write
@@ -5089,6 +5138,114 @@ impl ObjectRetention {
     }
 }
 
+/// How long after the `RestoreObject` that initiated it a temporary copy of an archived
+/// object becomes available in this emulator.
+///
+/// NOT a fidelity claim about retrieval time: a real Glacier retrieval takes minutes to
+/// hours depending on the tier, which no emulated workflow could wait for. What IS faithful
+/// is that the copy is NOT there when the call returns — "you must first initiate a restore
+/// request, and then wait until a temporary copy of the object is available"
+/// (`RestoreObject`'s own documentation) — so the restore is reported as ongoing for a
+/// span, and a caller reading the object's state straight afterwards sees
+/// `ongoing-request="true"` exactly as it would against AWS. The instant it falls due is
+/// stored ([`ObjectRestore::available_at`]) and nothing sleeps for it.
+pub const RESTORE_COMPLETION_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+/// The restore in force on one stored object version: what the last `RestoreObject` on it
+/// asked for, and when the temporary copy it initiated falls due.
+///
+/// The members are `RestoreRequest`'s own
+/// (`smithy_query(query="shape",shape="RestoreRequest")`): the `Days` the active copy lives
+/// for and the `Tier` the retrieval is processed at. A restore is one job on one version —
+/// "To restore a specific object version, you can provide a version ID. If you don't
+/// provide a version ID, Amazon S3 restores the current version" — so a version either
+/// carries one or carries none, which is why this lives behind an `Option` on [`Object`].
+///
+/// Nothing here is a copy of the object: the archived bytes are the ones the store already
+/// holds. What it records is the STATE of the restore, which is what every reader of the
+/// object reports through its `x-amz-restore` header ([`Self::header_value`]): ongoing
+/// until the copy falls due, then available until it expires.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectRestore {
+    /// A `Tier` value — the retrieval tier the restore is processed at
+    /// ([`DEFAULT_RESTORE_TIER`] when the request named none).
+    pub tier: String,
+    /// "Lifetime of the active copy in days" (`RestoreRequest$Days`): how long the
+    /// temporary copy lives once it is available.
+    pub days: i32,
+    /// When the temporary copy falls due — the instant the restore stops being reported as
+    /// ongoing, [`RESTORE_COMPLETION_DELAY`] after the call that initiated it.
+    pub available_at: SystemTime,
+}
+
+impl ObjectRestore {
+    /// Whether the retrieval is still running at `instant`: "If the object restoration is
+    /// in progress, the header returns the value `ongoing-request="true"`"
+    /// (`HeadObjectOutput$Restore`).
+    pub fn in_progress_at(&self, instant: SystemTime) -> bool {
+        instant < self.available_at
+    }
+
+    /// When Amazon S3 is scheduled to delete the temporary copy: [`Self::days`] days after
+    /// it became available, rounded up to midnight UTC the way every S3 lifetime date is
+    /// ([`midnight_after_days`]), or `None` when that instant is outside the range this
+    /// platform can hold.
+    pub fn expires_at(&self) -> Option<SystemTime> {
+        midnight_after_days(self.available_at, self.days)
+    }
+
+    /// That expiry as the HTTP date the `Restore` member reports it as, or `None` when the
+    /// lifetime names an instant no date this store can render falls on.
+    ///
+    /// The one place the date is rendered, so what a reader reports and what
+    /// `RestoreObject` checks a lifetime against cannot drift: a restore whose expiry
+    /// cannot be rendered is refused rather than recorded, which is what keeps every
+    /// recorded restore reportable.
+    pub fn expiry_date(&self) -> Option<String> {
+        ::aws_smithy_types::DateTime::from(self.expires_at()?)
+            .fmt(::aws_smithy_types::date_time::Format::HttpDate)
+            .ok()
+    }
+
+    /// This restore as the `Restore` response member carries it at `instant`, or `None`
+    /// once the temporary copy has expired (the version is archived again, and the header
+    /// is reported only "if either the archive restoration is in progress … or an archive
+    /// copy is already restored").
+    ///
+    /// The two documented renderings, verbatim from `HeadObjectOutput$Restore`:
+    /// `ongoing-request="true"` while the retrieval runs, and
+    /// `ongoing-request="false", expiry-date="Fri, 21 Dec 2012 00:00:00 GMT"` once the copy
+    /// is there — the expiry date as an HTTP date, the way [`ObjectExpiration::header_value`]
+    /// renders its own.
+    pub fn header_value(&self, instant: SystemTime) -> Option<String> {
+        if self.in_progress_at(instant) {
+            return Some(String::from("ongoing-request=\"true\""));
+        }
+        let expires_at = self.expires_at()?;
+        if instant >= expires_at {
+            return None;
+        }
+        let expiry_date = self.expiry_date()?;
+        Some(format!(
+            "ongoing-request=\"false\", expiry-date=\"{expiry_date}\""
+        ))
+    }
+
+    /// How many bytes this record retains — the caller-supplied string it holds, which the
+    /// per-bucket and service-wide budgets must count like every other string kept beside
+    /// an object ([`ObjectRetention::retained_bytes`] counts its own the same way).
+    pub fn retained_bytes(&self) -> usize {
+        self.tier.len()
+    }
+}
+
+/// The `Tier` a restore is processed at when the request names none.
+///
+/// From `RestoreObject`'s own documentation: "Standard - Standard retrievals allow you to
+/// access any of your archived objects within several hours. This is the default option for
+/// retrieval requests that do not specify the retrieval option." `Standard` is one of the
+/// `Tier` enum's values (`smithy_query(query="shape",shape="Tier")`).
+pub const DEFAULT_RESTORE_TIER: &str = "Standard";
+
 
 impl Object {
     /// How many bytes this stored object retains: its payload AND every string kept
@@ -5111,6 +5268,10 @@ impl Object {
                 .retention
                 .as_ref()
                 .map_or(0, ObjectRetention::retained_bytes)
+            + self
+                .restore
+                .as_ref()
+                .map_or(0, ObjectRestore::retained_bytes)
             + [
                 &self.content_type,
                 &self.cache_control,
@@ -5944,6 +6105,74 @@ impl ComAmazonawsS3Amazons3State {
             })
     }
 
+    /// Record `restore` on the object version `version_id` names in `bucket` — the key's
+    /// current object when it names none. Reports what the write did, or `None` when this
+    /// emulator holds no such bucket (so a restore refuses a name that is not a bucket
+    /// instead of creating one).
+    ///
+    /// A REPLACEMENT of the whole record, the way [`Self::replace_object_retention`]
+    /// replaces a retention: a second `RestoreObject` on a version states the lifetime and
+    /// the tier of the copy afresh, so what the version carries afterwards is exactly what
+    /// this call carried.
+    ///
+    /// It decides NOTHING about whether the restore is ALLOWED: whether the version is
+    /// archived at all, and whether a retrieval is already running on it, is the handler's
+    /// judgement over [`ARCHIVED_STORAGE_CLASSES`] and [`ObjectRestore::in_progress_at`] —
+    /// this is the storage seam those answers end at. It restores no BYTES either: an
+    /// archived version's bytes are the ones this store already holds, and what a restore
+    /// changes is the state every reader reports through `x-amz-restore`.
+    ///
+    /// It is the ONLY way a restore is recorded, because it is the only place that can see
+    /// BOTH the per-bucket byte budget and the service-wide one: the record is retained
+    /// with the object ([`Object::retained_bytes`]) and is not bounded by anything
+    /// [`Self::put_object`] checked. Nothing is written unless the answer is
+    /// [`ObjectRestoreWrite::Applied`].
+    pub fn restore_object_version(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        restore: ObjectRestore,
+    ) -> Option<ObjectRestoreWrite> {
+        let held = self.buckets.get(bucket)?;
+        let Some(object) = held.addressed_object(key, version_id) else {
+            return Some(ObjectRestoreWrite::NoSuchObject);
+        };
+
+        // What the bucket and the whole store would retain with this record in place of the
+        // version's current one: everything they retain now, less the bytes the record
+        // being replaced holds, plus the bytes of the replacement.
+        let released = object
+            .restore
+            .as_ref()
+            .map_or(0, ObjectRestore::retained_bytes);
+        let taken = restore.retained_bytes();
+        let would_hold = held.retained_bytes().saturating_sub(released) + taken;
+        if would_hold > MAX_OBJECT_BYTES_PER_BUCKET {
+            return Some(ObjectRestoreWrite::ByteBudgetReached { would_hold });
+        }
+        let total_would_hold = self
+            .buckets
+            .values()
+            .map(Bucket::retained_bytes)
+            .sum::<usize>()
+            .saturating_sub(released)
+            + taken;
+        if total_would_hold > MAX_OBJECT_BYTES_TOTAL {
+            return Some(ObjectRestoreWrite::TotalByteBudgetReached {
+                would_hold: total_would_hold,
+            });
+        }
+
+        self.buckets
+            .get_mut(bucket)
+            .and_then(|held| held.addressed_object_mut(key, version_id))
+            .map(|object| {
+                object.restore = Some(restore);
+                ObjectRestoreWrite::Applied
+            })
+    }
+
     /// Record a bucket named `name` in `region`, reporting what happened.
     ///
     /// Nothing is written unless the answer is [`BucketCreation::Created`]: a taken name
@@ -6343,11 +6572,49 @@ pub const NO_SUCH_OBJECT_LOCK_CONFIGURATION_MESSAGE: &str =
 pub const OBJECT_LOCK_ACCESS_DENIED_MESSAGE: &str =
     "Access Denied because object protected by object lock.";
 
+/// The code S3 answers a call that cannot be served because of the state the object is in:
+/// `InvalidObjectState`, HTTP 403 — the status the shape itself carries
+/// (`smithy_query(query="shape",shape="InvalidObjectState")`).
+///
+/// The shape is in this model, but only `GetObject` lists it, and the `<Message>` depends
+/// on WHICH state barred the call: a read of an archived object is told the object is
+/// archived ([`crate::scaffolded::DOCUMENTED_ERROR_MESSAGES`] carries that one), while a
+/// restore of an object that is not archived is told the storage class does not allow one
+/// ([`RESTORE_NOT_ALLOWED_MESSAGE`]). So a handler that must word its own message answers
+/// this code through the unmodelled channel, where the message travels with it.
+pub const INVALID_OBJECT_STATE_CODE: &str = "InvalidObjectState";
+
+/// The HTTP status [`INVALID_OBJECT_STATE_CODE`] is rendered with: 403, from the shape's
+/// own `@httpError`.
+pub const INVALID_OBJECT_STATE_STATUS: u16 = 403;
+
+/// The `<Message>` S3 sends beside [`INVALID_OBJECT_STATE_CODE`] when a restore is asked
+/// for an object whose storage class has nothing to restore: "Restore is not allowed for
+/// the object's current storage class."
+///
+/// A fixed sentence for that one condition — it names neither the object nor its class, so
+/// nothing in it is derived from the request — which is why it lives here beside the other
+/// code/message pairs rather than being built in the handler.
+pub const RESTORE_NOT_ALLOWED_MESSAGE: &str =
+    "Restore is not allowed for the object's current storage class";
+
+/// The code `RestoreObject` answers when a retrieval is already running on the version it
+/// names: `RestoreAlreadyInProgress`, with HTTP 409 Conflict — the special error that
+/// operation publishes for the cause "Object restore is already in progress". Not a shape
+/// in this model, so it goes out through the unmodelled channel.
+pub const RESTORE_ALREADY_IN_PROGRESS_CODE: &str = "RestoreAlreadyInProgress";
+
+/// The HTTP status [`RESTORE_ALREADY_IN_PROGRESS_CODE`] is rendered with: 409, from the
+/// same list of special errors.
+pub const RESTORE_ALREADY_IN_PROGRESS_STATUS: u16 = 409;
+
+/// See [`RESTORE_ALREADY_IN_PROGRESS_CODE`] — the cause that list publishes for it.
+pub const RESTORE_ALREADY_IN_PROGRESS_MESSAGE: &str = "Object restore is already in progress";
+
 /// The code S3 answers a request whose value is not valid for the parameter carrying it:
 /// "InvalidArgument - Invalid Argument", HTTP 400 (Amazon S3 "Error responses", list of
 /// error codes).
 pub const INVALID_ARGUMENT_CODE: &str = "InvalidArgument";
-
 /// The HTTP status [`INVALID_ARGUMENT_CODE`] is rendered with: 400, from the same list.
 pub const INVALID_ARGUMENT_STATUS: u16 = 400;
 
@@ -6930,6 +7197,8 @@ mod tests {
             version_id: None,
             // A write places no retention; `replace_object_retention` is what does.
             retention: None,
+            // A write initiates no restore; `restore_object_version` is what does.
+            restore: None,
         }
     }
 

@@ -599,8 +599,16 @@ pub fn new_activation_key() -> String {
         .to_ascii_uppercase()
 }
 
+/// The bounds the model puts on `BillingTier` (`@range(min: 0, max: 8)`), which is
+/// every value the member may ever carry.
+pub const BILLING_TIER_RANGE: (i32, i32) = (0, 8);
+
 /// Project a stored `Connection` into the `ConnectionSummary` the list operation
 /// returns, so both views report one record rather than two.
+///
+/// `billingTier` is carried across like any other stored member: the tier a
+/// connection is assigned belongs to the record, so the summary view reports the
+/// same value the full view does rather than deciding one of its own.
 pub fn summary_of(connection: &Connection) -> ConnectionSummary {
     ConnectionSummary {
         id: connection.id.clone(),

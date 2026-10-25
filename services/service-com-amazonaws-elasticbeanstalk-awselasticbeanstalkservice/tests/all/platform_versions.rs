@@ -503,7 +503,9 @@ async fn a_filter_term_selects_by_the_attribute_its_type_names() {
         // model documents the filter VALUE for this attribute in lower case
         // (`PlatformFilter$Values`: "PlatformLifecycleState: recommended") while
         // the state is REPORTED capitalized, so both spellings name the one
-        // state.
+        // state. The term NARROWS the catalogue: a branch publishes the release
+        // its current version superseded beside it, and only the current one is
+        // the branch's recommended version.
         FilterCase {
             case: "PlatformLifecycleState Recommended, operator defaulted",
             params: &[
@@ -511,7 +513,7 @@ async fn a_filter_term_selects_by_the_attribute_its_type_names() {
                 ("Filters.member.1.Values.member.1", "Recommended"),
             ],
             holds: |summary| summary.lifecycle_state == "Recommended",
-            narrows: false,
+            narrows: true,
         },
         FilterCase {
             case: "PlatformLifecycleState recommended, the documented filter spelling",
@@ -521,7 +523,7 @@ async fn a_filter_term_selects_by_the_attribute_its_type_names() {
                 ("Filters.member.1.Values.member.1", "recommended"),
             ],
             holds: |summary| summary.lifecycle_state == "Recommended",
-            narrows: false,
+            narrows: true,
         },
         FilterCase {
             case: "PlatformLifecycleState != recommended",

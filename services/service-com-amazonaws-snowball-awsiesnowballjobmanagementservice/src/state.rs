@@ -7,15 +7,15 @@
 //! record-to-modelled-shape conversions and the list cursor codec — so the handlers agree
 //! on one implementation of each instead of carrying a copy apiece that can drift apart.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Address, ClusterListEntry, ClusterMetadata, DeviceConfiguration, JobListEntry, JobMetadata,
-    JobResource, LongTermPricingListEntry, Notification, OnDeviceServiceConfiguration,
-    PickupDetails, ServiceVersion, ShippingDetails, TaxDocuments,
+    Address, ClusterListEntry, ClusterMetadata, CompatibleImage, DeviceConfiguration, JobListEntry,
+    JobMetadata, JobResource, LongTermPricingListEntry, Notification,
+    OnDeviceServiceConfiguration, PickupDetails, ServiceVersion, ShippingDetails, TaxDocuments,
 };
 
 /// What a handler says when the engine it was constructed with does not carry this
@@ -1300,8 +1300,31 @@ fn seed_service_versions() -> BTreeMap<String, Vec<StoredServiceVersion>> {
     ])
 }
 
+/// One Amazon EC2-compatible image this store holds for the account.
+///
+/// The record behind `CompatibleImage`: the image's `AmiId`, and the `Name` the store
+/// holds for it when it holds one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredCompatibleImage {
+    /// The image's identifier, as `CompatibleImage$AmiId` reports it.
+    pub ami_id: String,
+    /// The image's name, as `CompatibleImage$Name` — "the optional name of a compatible
+    /// image" — reports it, or `None` when the store holds no name for the image.
+    pub name: Option<String>,
+}
+
+impl StoredCompatibleImage {
+    /// This record as the modelled `CompatibleImage`.
+    pub fn to_modeled(&self) -> CompatibleImage {
+        CompatibleImage {
+            ami_id: Some(self.ami_id.clone()),
+            name: self.name.clone(),
+        }
+    }
+}
+
 /// A list operation's cursor for a page that starts at `key` — a job id for `ListJobs`,
-/// a version for `ListServiceVersions`.
+/// a version for `ListServiceVersions`, an AMI id for `ListCompatibleImages`.
 ///
 /// Hex of the key: the token carries nothing but the key the next page resumes at, and a
 /// cursor is only ever handed back unchanged. It is not a capability — a list operation
@@ -1431,6 +1454,26 @@ pub fn page_of_clusters(
     )
 }
 
+/// One page of `images`, as [`page_of`] pages any listing: the `CompatibleImage` list
+/// `ListCompatibleImages` reports, with the cursor its next page resumes at.
+#[allow(clippy::type_complexity)]
+pub fn page_of_compatible_images(
+    images: &[StoredCompatibleImage],
+    next_token: Option<&str>,
+    page_size: usize,
+) -> Option<(Vec<CompatibleImage>, Option<String>)> {
+    // The images are read off the store's own records rather than held as a collection of
+    // their own, so this is where the borrowed view `page_of` walks is taken.
+    let records: Vec<&StoredCompatibleImage> = images.iter().collect();
+    page_of(
+        &records,
+        next_token,
+        page_size,
+        |image| image.ami_id.as_str(),
+        StoredCompatibleImage::to_modeled,
+    )
+}
+
 /// What a list operation says when the `NextToken` it was handed is not one it minted for
 /// the listing being walked, as `InvalidNextTokenException` documents the condition.
 pub const INVALID_NEXT_TOKEN_MESSAGE: &str =
@@ -1530,6 +1573,50 @@ impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     /// `None` when this store holds no such service.
     pub fn service_versions(&self, service_name: &str) -> Option<&[StoredServiceVersion]> {
         self.service_versions.get(service_name).map(Vec::as_slice)
+    }
+
+    /// The Amazon EC2-compatible images this store holds for the account: every distinct
+    /// `AmiId` a stored job names as an `Ec2AmiResource`, each once, in the order the
+    /// store first recorded it.
+    ///
+    /// `ListCompatibleImages` reports "the different Amazon EC2-compatible Amazon Machine
+    /// Images (AMIs) that are owned by your Amazon Web Services account that would be
+    /// supported for use on a Snow device"
+    /// (`smithy_query(query="operation", operation="ListCompatibleImages")`), so this is a
+    /// collection of the ACCOUNT's images, not a catalog of the service's own: a store no
+    /// order has named an AMI in holds none, the way one in which no address has been
+    /// created holds no address. An `Ec2AmiResource` is how an order puts one of the
+    /// account's AMIs on a device — `CompatibleImage` is "compatible with the device's
+    /// physical hardware requirements" and `Ec2AmiResource$AmiId` is "the ID of the AMI in
+    /// Amazon EC2" — so the AMIs this emulator holds for the account are exactly the ones
+    /// its stored orders name, which also makes this listing agree with what `CreateJob`
+    /// accepted.
+    ///
+    /// Every stored job is read, cluster node jobs included: a node job carries its
+    /// cluster's resources, and `job_order` holds every job this store has ever stored
+    /// ([`Self::insert_job_order`]). An id named by more than one order is one image of the
+    /// account, so it is reported once.
+    pub fn compatible_images(&self) -> Vec<StoredCompatibleImage> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut images: Vec<StoredCompatibleImage> = Vec::new();
+        for job in self.jobs_in_creation_order() {
+            let named = job
+                .resources
+                .as_ref()
+                .and_then(|resources| resources.ec2_ami_resources.as_deref())
+                .unwrap_or_default();
+            for image in named {
+                if seen.insert(image.ami_id.as_str()) {
+                    images.push(StoredCompatibleImage {
+                        ami_id: image.ami_id.clone(),
+                        // An order identifies an AMI by its id alone, so the store holds
+                        // no name for the image and the optional member reports none.
+                        name: None,
+                    });
+                }
+            }
+        }
+        images
     }
 
     /// Whether this store holds the long-term pricing contract `long_term_pricing_id`

@@ -389,3 +389,7 @@ mod copy_fpga_image;
 mod network_interface_dependencies;
 #[path = "all/launch_template_ssm_alias_catalog.rs"]
 mod launch_template_ssm_alias_catalog;
+// Declared LAST for the reason the header gives: what `DescribeIpamByoasn` reports out of
+// the store of ASNs brought to IPAM, and how the page size and the token narrow it.
+#[path = "all/ipam_byoasns.rs"]
+mod ipam_byoasns;

@@ -58,6 +58,13 @@
 //! the two `@httpLabel`s of `/packages/{packageName}/versions/{versionName}` — so a
 //! version lives inside the package it belongs to and disappears with it.
 //!
+//! It also holds the account's OTA UPDATES, keyed by `otaUpdateId` for the same
+//! reason: the id is the update's identity and the `@httpLabel` of
+//! `/otaUpdates/{otaUpdateId}`. An OTA update DEPLOYS through an AWS IoT job, so
+//! creating one also records that job in [`ComAmazonawsIotAwsiotserviceState::jobs`]
+//! and its per-thing executions in the shared store — one OTA update, one job, one
+//! execution per targeted device.
+//!
 //! Finally it holds the account's COMMANDS, keyed by `commandId` ("A unique
 //! identifier for the command", and the `@httpLabel` of `/commands/{commandId}`),
 //! whose EXISTENCE the IoT Jobs data plane also needs — `StartCommandExecution`
@@ -65,7 +72,7 @@
 //! ARN is registered in the shared index as well (see [`command_registry`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use service_common::iot_job_executions::{
     is_modeled_thing_name, JobExecutionRecord, JobExecutionStore, MAX_THING_NAME_LEN,
@@ -73,9 +80,10 @@ use service_common::iot_job_executions::{
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Action, AuthorizerDescription, CommandParameter, CommandParameterValue, CommandPayload,
-    CommandPreprocessor, GetCommandExecutionOutput, GetCommandOutput, JobExecution,
-    JobExecutionStatusDetails, PackageVersionArtifact, Sbom, ThingGroupIndexingConfiguration,
+    Action, AuthorizerDescription, AwsJobExecutionsRolloutConfig, AwsJobPresignedUrlConfig,
+    CommandParameter, CommandParameterValue, CommandPayload, CommandPreprocessor,
+    GetCommandExecutionOutput, GetCommandOutput, JobExecution, JobExecutionStatusDetails,
+    OTAUpdateFile, OTAUpdateInfo, PackageVersionArtifact, Sbom, ThingGroupIndexingConfiguration,
     ThingIndexingConfiguration, TopicRule, TopicRulePayload,
 };
 
@@ -425,6 +433,20 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// A caller grows this store, so it is bounded: [`MAX_PACKAGES`] is the ceiling
     /// `CreatePackage` refuses past.
     pub packages: BTreeMap<String, RegisteredPackage>,
+    /// Every OTA update that exists, keyed by `otaUpdateId`.
+    ///
+    /// The id is the update's identity — `CreateOTAUpdate$otaUpdateId` is "The ID of
+    /// the OTA update to be created" and the model binds it as the `@httpLabel` of
+    /// `/otaUpdates/{otaUpdateId}` on every single-update operation — so a `BTreeMap`
+    /// keyed by id is the OTA update store itself. `BTreeMap` (not `HashMap`) because
+    /// `ListOTAUpdates` is `@paginated` and a page boundary is only meaningful over a
+    /// stable order.
+    ///
+    /// Every record here owns the AWS IoT job it deploys through
+    /// ([`ota_update_job_id`]), which lives in
+    /// [`ComAmazonawsIotAwsiotserviceState::jobs`], so this store is bounded by the
+    /// same [`MAX_JOBS`] ceiling: an OTA update cannot be created without its job.
+    pub ota_updates: BTreeMap<String, RegisteredOtaUpdate>,
     /// The account's FLEET INDEXING configuration — one record, read by
     /// `GetIndexingConfiguration` and replaced by `UpdateIndexingConfiguration`.
     ///
@@ -498,6 +520,25 @@ impl ComAmazonawsIotAwsiotserviceState {
         }
         chain.reverse();
         chain
+    }
+
+    /// How a THING GROUP target is refused.
+    ///
+    /// A group's executions are its MEMBERS' executions. The group registry holds no
+    /// membership (`AddThingToThingGroup` is still a scaffold, its own issue), so a
+    /// group target cannot be expanded into the devices it names: a group the registry
+    /// does not hold is the modelled 404, and one it DOES hold is the modelled 400 —
+    /// never a 200 that reports a group-targeted job as dispatched while queueing
+    /// nothing.
+    pub fn thing_group_target_refusal(&self, group_name: &str) -> JobTargetsRefusal {
+        if self.thing_groups.contains_key(group_name) {
+            return JobTargetsRefusal::Invalid(format!(
+                "a thing group target cannot be expanded: this emulator records no \
+                 membership for thing group {group_name}, so the devices it names are \
+                 not known"
+            ));
+        }
+        JobTargetsRefusal::NotFound(format!("Thing group {group_name} does not exist"))
     }
 
     /// The endpoint identifier recorded for `region`, if an endpoint has been created
@@ -633,15 +674,138 @@ pub fn parse_job_target(target_arn: &str) -> Result<JobTarget, JobTargetRejectio
 /// growing without bound.
 pub const MAX_JOBS: usize = 10_000;
 
-/// How many `targets` ONE `CreateJob` may name.
+/// How many `targets` ONE request that creates a job may name.
 ///
-/// `JobTargets` is modelled `len 1..` — a minimum and NO maximum — so without a
-/// ceiling the request chooses how much work the handler does and how many execution
-/// records (each carrying a copy of the job document, up to 32 KiB) it creates. The
-/// figure is the emulator's own; what matters is that the fan-out of one request is
-/// bounded BEFORE any work proportional to it, and `CreateJob` past it answers the
-/// modelled `LimitExceededException`.
+/// `JobTargets` / `Targets` are modelled `len 1..` — a minimum and NO maximum — so
+/// without a ceiling the request chooses how much work the handler does and how many
+/// execution records (each carrying a copy of the job document, up to 32 KiB) it
+/// creates. The figure is the emulator's own; what matters is that the fan-out of one
+/// request is bounded BEFORE any work proportional to it, and a request past it
+/// answers the modelled `LimitExceededException`.
 pub const MAX_JOB_TARGETS: usize = 100;
+
+/// Why a request's `targets` cannot be turned into job executions.
+///
+/// Each variant carries the message the refusal states and names the modelled error
+/// class the handler answers with, so every operation that targets devices with a job
+/// — `CreateJob`, `CreateOTAUpdate` — refuses one request for one reason in one
+/// wording and with one status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobTargetsRefusal {
+    /// The targets violate a constraint: `InvalidRequestException` (HTTP 400).
+    Invalid(String),
+    /// A target names a thing group that does not exist: `ResourceNotFoundException`
+    /// (HTTP 404).
+    NotFound(String),
+    /// More targets than one request may name: `LimitExceededException`.
+    OverLimit(String),
+}
+
+impl JobTargetsRefusal {
+    /// The message the refusal states, whichever class it names.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Invalid(message) | Self::NotFound(message) | Self::OverLimit(message) => message,
+        }
+    }
+}
+
+/// Which DEVICES and thing GROUPS one request's `targets` name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobTargetFanout {
+    /// Every DISTINCT thing targeted, in the order the request named it: one device
+    /// targeted twice is one device, so it gets one execution.
+    pub things: Vec<String>,
+    /// Every thing-group target, in the order the request named it.
+    pub groups: Vec<String>,
+}
+
+/// Resolve a request's `targets` into the devices and groups they name, or the reason
+/// they are no targets at all.
+///
+/// A thing target is NOT resolved against the thing registry: an execution is keyed by
+/// the thing NAME, and this surface accepts a target that is not registered — the data
+/// plane then answers that name's queue reads from the execution the request creates.
+/// The fan-out is bounded by [`MAX_JOB_TARGETS`] FIRST, before the parse walks the
+/// list, so the request cannot choose how much work the handler does.
+pub fn resolve_job_targets(targets: &[String]) -> Result<JobTargetFanout, JobTargetsRefusal> {
+    let target_count = targets.len();
+    if target_count > MAX_JOB_TARGETS {
+        return Err(JobTargetsRefusal::OverLimit(format!(
+            "a job may name at most {MAX_JOB_TARGETS} targets, got {target_count}"
+        )));
+    }
+
+    let mut fanout = JobTargetFanout::default();
+    let mut seen_things: BTreeSet<String> = BTreeSet::new();
+    for target_arn in targets {
+        match parse_job_target(target_arn) {
+            Ok(JobTarget::Thing(thing_name)) => {
+                if seen_things.insert(thing_name.clone()) {
+                    fanout.things.push(thing_name);
+                }
+            }
+            Ok(JobTarget::ThingGroup(group_name)) => fanout.groups.push(group_name),
+            Err(JobTargetRejection::UnsupportedResourceType(resource_type)) => {
+                return Err(JobTargetsRefusal::Invalid(format!(
+                    "Resource type {resource_type} not supported as a target"
+                )));
+            }
+            Err(JobTargetRejection::UnaddressableName(name)) => {
+                return Err(JobTargetsRefusal::Invalid(format!(
+                    "{name} is not a thing name a job may target: a thing name is \
+                     1..{MAX_THING_NAME_LEN} characters matching ^[a-zA-Z0-9:_-]+$"
+                )));
+            }
+            Err(JobTargetRejection::NotAnIotResourceArn) => {
+                return Err(JobTargetsRefusal::Invalid(format!(
+                    "{target_arn} is not an IoT thing or thing group ARN"
+                )));
+            }
+        }
+    }
+    Ok(fanout)
+}
+
+/// Queue ONE `QUEUED` execution of `job_id` per thing in `things`, all-or-nothing.
+///
+/// Targeting a thing with a job IS creating that thing's job execution: it is
+/// `QUEUED`, at version 1, and carries the job's document and in-progress timeout,
+/// which is what the device then polls for, starts and reports on.
+///
+/// The execution numbers are read first (one `i64` per target), then the records are
+/// built LAZILY, one at a time, so the store's own ceilings bound what one request
+/// allocates instead of being consulted after a whole `Vec` of records — each with a
+/// copy of the document — was already materialised. `Err` carries the quota message
+/// the store refused with.
+pub fn queue_job_executions(
+    pending: &mut JobExecutionStore,
+    job_id: &str,
+    document: Option<&str>,
+    in_progress_timeout_minutes: Option<i64>,
+    things: &[String],
+    now: i64,
+) -> Result<(), String> {
+    let numbers: Vec<i64> = things
+        .iter()
+        .map(|thing_name| pending.next_execution_number(thing_name, job_id))
+        .collect();
+    let records = things
+        .iter()
+        .zip(numbers)
+        .map(|(thing_name, execution_number)| {
+            let mut record = JobExecutionRecord::queued(
+                job_id.to_string(),
+                thing_name.clone(),
+                document.map(str::to_string),
+                now,
+            );
+            record.execution_number = execution_number;
+            record.in_progress_timeout_minutes = in_progress_timeout_minutes;
+            record
+        });
+    pending.try_insert_executions(records)
+}
 
 /// One job in the control plane, as this service persists it.
 ///
@@ -2264,6 +2428,228 @@ impl RegisteredPackageVersion {
             sbom_validation_status: None,
             creation_date: created_at,
             last_modified_date: created_at,
+        }
+    }
+}
+
+/// The ARN of an OTA update:
+/// `arn:aws:iot:<region>:<account>:otaupdate/<otaUpdateId>`.
+///
+/// `otaupdate` (one word, lowercase) is the resource type AWS IoT's OTA-update ARNs
+/// use — the resource an `iot:GetOTAUpdate` policy statement names — beside `thing/`
+/// for a thing (`OTAUpdateArn` is an opaque string in the model,
+/// `smithy_query(query="shape",shape="OTAUpdateArn")`, so the form comes from the
+/// service's documented ARN layout); the namespace and account segments are the ones
+/// [`thing_arn`] documents.
+pub fn ota_update_arn(region: &str, ota_update_id: &str) -> String {
+    ::emulator_server::emulator_arn("iot", region, &format!("otaupdate/{ota_update_id}"))
+}
+
+/// The prefix of the AWS IoT job id an OTA update deploys through.
+///
+/// AWS documents that the OTA Update Manager creates the update's job under
+/// `AFR_OTA-<otaUpdateId>`, which is the id a targeted device sees on the job it is
+/// handed; `CreateOTAUpdate` reports it as `awsIotJobId`.
+pub const OTA_UPDATE_JOB_ID_PREFIX: &str = "AFR_OTA-";
+
+/// The id of the AWS IoT job the OTA update `ota_update_id` deploys through.
+///
+/// It is DERIVED from the update's own id, so the job an update owns is found from the
+/// update and never recorded twice. `OTAUpdateId` is `len 1..128, ^[a-zA-Z0-9_-]+$`
+/// and `JobId` is `len 1..64, ^[a-zA-Z0-9_-]+$`, so the prefix keeps the character
+/// class; an id long enough to overflow `JobId` is refused before this is called (see
+/// [`MAX_OTA_UPDATE_ID_LEN`]).
+pub fn ota_update_job_id(ota_update_id: &str) -> String {
+    format!("{OTA_UPDATE_JOB_ID_PREFIX}{ota_update_id}")
+}
+
+/// The longest `otaUpdateId` whose derived job id still fits the model's `JobId`.
+///
+/// `OTAUpdateId` is modelled `len 1..128` while `JobId` — the shape the derived
+/// `awsIotJobId` has to satisfy — is `len 1..64`, so an id past this length could not
+/// be deployed by a job that any `/jobs/{jobId}` request can address, and
+/// `CreateOTAUpdate` refuses it with the modelled `InvalidRequestException` instead of
+/// recording an update whose job is unreachable.
+pub const MAX_OTA_UPDATE_ID_LEN: usize = 64 - OTA_UPDATE_JOB_ID_PREFIX.len();
+
+/// How many `files` ONE `CreateOTAUpdate` may carry.
+///
+/// `OTAUpdateFiles` is modelled `len 1..` — a minimum and NO maximum — so without a
+/// ceiling the request chooses how much the stored record costs (each file carries its
+/// own location, code-signing material and attribute map). The figure is the
+/// emulator's own, for the same reason [`MAX_JOB_TARGETS`] exists, and a request past
+/// it answers the modelled `LimitExceededException`.
+pub const MAX_OTA_UPDATE_FILES: usize = 50;
+
+/// The status an OTA update is created in.
+///
+/// `OTAUpdateStatus` is `CREATE_PENDING | CREATE_IN_PROGRESS | CREATE_COMPLETE |
+/// CREATE_FAILED | DELETE_IN_PROGRESS | DELETE_FAILED`
+/// ([`crate::ops::types::O_T_A_UPDATE_STATUS_VALUES`]) and the creation lifecycle is
+/// entered at `CREATE_PENDING`: that is what `CreateOTAUpdate` answers with, and the
+/// clock is what moves it on.
+pub const NEW_OTA_UPDATE_STATUS: &str = "CREATE_PENDING";
+
+/// The status an OTA update holds once its creation has completed.
+pub const CREATED_OTA_UPDATE_STATUS: &str = "CREATE_COMPLETE";
+
+/// How long after `CreateOTAUpdate` the update's creation completes.
+///
+/// The update is answered in a NON-TERMINAL status ([`NEW_OTA_UPDATE_STATUS`]), so the
+/// clock owes its move to [`CREATED_OTA_UPDATE_STATUS`]; the span is the emulator's
+/// own, chosen so a caller reading straight back still observes the transient status,
+/// and the due instant is recorded rather than slept for.
+pub const OTA_UPDATE_CREATION_SPAN: Duration = Duration::from_millis(500);
+
+/// One OTA update in the control plane, as this service persists it.
+///
+/// It holds what `GetOTAUpdate` reports member for member — the id and ARN are its
+/// identity, and the targets, protocols, files, configs and parameters are what the
+/// create supplied — so a reader clones this record and the writer and the reader
+/// cannot drift.
+///
+/// `role_arn`, `aws_job_abort_config`, `aws_job_timeout_config` and `tags` are NOT
+/// kept: no reader of an OTA update reports them (`OTAUpdateInfo` declares none of
+/// them), so storing them would promise a reader data this record does not hand back.
+/// The timeout the request named IS carried — onto the executions of the job the
+/// update deploys through, where a device reads it.
+#[derive(Debug, Clone)]
+pub struct RegisteredOtaUpdate {
+    /// The id the update was created under; also its key in the store.
+    pub ota_update_id: String,
+    /// `arn:aws:iot:<region>:<account>:otaupdate/<otaUpdateId>`, minted on create.
+    pub ota_update_arn: String,
+    /// "The description of the OTA update", when the create carried one.
+    pub description: Option<String>,
+    /// "The devices targeted to receive OTA updates", verbatim.
+    pub targets: Vec<String>,
+    /// "The protocol used to transfer the OTA update image", when the create named
+    /// one. Absent is distinguishable from a value, so a create that named no
+    /// protocol reports none rather than an invented default.
+    pub protocols: Option<Vec<String>>,
+    /// `targetSelection` as supplied (`CONTINUOUS` / `SNAPSHOT`), or `None` when the
+    /// request left it out.
+    pub target_selection: Option<String>,
+    /// "Configuration for the rollout of OTA updates", when the create carried one.
+    pub aws_job_executions_rollout_config: Option<AwsJobExecutionsRolloutConfig>,
+    /// "Configuration information for pre-signed URLs", when the create carried one.
+    pub aws_job_presigned_url_config: Option<AwsJobPresignedUrlConfig>,
+    /// "The files to be streamed by the OTA update", verbatim. Bounded by
+    /// [`MAX_OTA_UPDATE_FILES`].
+    pub files: Vec<OTAUpdateFile>,
+    /// "A list of additional OTA update parameters, which are name-value pairs",
+    /// keyed by name — `AdditionalParameterMap` is a map, so the key is the identity
+    /// and a `BTreeMap` keeps one stable order for every reader.
+    pub additional_parameters: BTreeMap<String, String>,
+    /// The id of the AWS IoT job this update deploys through
+    /// ([`ota_update_job_id`]), reported as `awsIotJobId`.
+    pub aws_iot_job_id: String,
+    /// That job's ARN ([`job_arn`]), reported as `awsIotJobArn`.
+    pub aws_iot_job_arn: String,
+    /// Where the update stands in its creation lifecycle: one of
+    /// [`crate::ops::types::O_T_A_UPDATE_STATUS_VALUES`].
+    pub status: String,
+    /// When the creation this update was answered in the middle of completes — the
+    /// transition the clock already owes, whether or not anybody calls. `None` once it
+    /// has been materialised.
+    pub create_complete_due_at: Option<SystemTime>,
+    /// "The date when the OTA update was created" (`OTAUpdateInfo$creationDate`).
+    pub creation_date: SystemTime,
+    /// "The date when the OTA update was last updated"
+    /// (`OTAUpdateInfo$lastModifiedDate`) — the instant of the last transition it
+    /// made, which on a freshly created update is the create itself.
+    pub last_modified_date: SystemTime,
+}
+
+impl RegisteredOtaUpdate {
+    /// Record an OTA update created now: the id, ARN and the job it deploys through
+    /// are its identity, the rest is what the create supplied, it enters the lifecycle
+    /// at [`NEW_OTA_UPDATE_STATUS`] with its completion due
+    /// [`OTA_UPDATE_CREATION_SPAN`] later, and both dates are the instant of the
+    /// create.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        ota_update_id: String,
+        ota_update_arn: String,
+        aws_iot_job_id: String,
+        aws_iot_job_arn: String,
+        description: Option<String>,
+        targets: Vec<String>,
+        protocols: Option<Vec<String>>,
+        target_selection: Option<String>,
+        aws_job_executions_rollout_config: Option<AwsJobExecutionsRolloutConfig>,
+        aws_job_presigned_url_config: Option<AwsJobPresignedUrlConfig>,
+        files: Vec<OTAUpdateFile>,
+        additional_parameters: BTreeMap<String, String>,
+        created_at: SystemTime,
+    ) -> Self {
+        Self {
+            ota_update_id,
+            ota_update_arn,
+            description,
+            targets,
+            protocols,
+            target_selection,
+            aws_job_executions_rollout_config,
+            aws_job_presigned_url_config,
+            files,
+            additional_parameters,
+            aws_iot_job_id,
+            aws_iot_job_arn,
+            status: NEW_OTA_UPDATE_STATUS.to_string(),
+            create_complete_due_at: Some(created_at + OTA_UPDATE_CREATION_SPAN),
+            creation_date: created_at,
+            last_modified_date: created_at,
+        }
+    }
+
+    /// Materialise the completion the clock already owes at `now`, and answer whether
+    /// anything changed.
+    ///
+    /// The update was answered `CREATE_PENDING` with its completion due at a recorded
+    /// instant, so by `now` it is `CREATE_COMPLETE` whether or not anybody called: a
+    /// reader states that, and stamps the transition's own instant as the update's
+    /// `lastModifiedDate` rather than the moment of the read.
+    pub fn settle(&mut self, now: SystemTime) -> bool {
+        let Some(due) = self.create_complete_due_at.filter(|due| now >= *due) else {
+            return false;
+        };
+        self.status = CREATED_OTA_UPDATE_STATUS.to_string();
+        self.create_complete_due_at = None;
+        self.last_modified_date = due;
+        true
+    }
+
+    /// This update as the modeled `OTAUpdateInfo` a reader hands back.
+    ///
+    /// `errorInfo` is "A collection of error information on this OTA update" and
+    /// nothing here fails a creation, so there is no stored error to report and the
+    /// member is left out rather than reported empty. `additionalParameters` is
+    /// reported only while the update carries some, so a create that named none is not
+    /// answered with an empty map.
+    pub fn info(&self) -> OTAUpdateInfo {
+        OTAUpdateInfo {
+            ota_update_id: Some(self.ota_update_id.clone()),
+            ota_update_arn: Some(self.ota_update_arn.clone()),
+            creation_date: Some(::aws_smithy_types::DateTime::from(self.creation_date)),
+            last_modified_date: Some(::aws_smithy_types::DateTime::from(self.last_modified_date)),
+            description: self.description.clone(),
+            targets: Some(self.targets.clone()),
+            protocols: self.protocols.clone(),
+            aws_job_executions_rollout_config: self.aws_job_executions_rollout_config.clone(),
+            aws_job_presigned_url_config: self.aws_job_presigned_url_config.clone(),
+            target_selection: self.target_selection.clone(),
+            ota_update_files: Some(self.files.clone()),
+            ota_update_status: Some(self.status.clone()),
+            aws_iot_job_id: Some(self.aws_iot_job_id.clone()),
+            aws_iot_job_arn: Some(self.aws_iot_job_arn.clone()),
+            error_info: None,
+            additional_parameters: (!self.additional_parameters.is_empty()).then(|| {
+                self.additional_parameters
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect()
+            }),
         }
     }
 }

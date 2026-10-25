@@ -57,8 +57,9 @@ const ALL_OPERATIONS: &str = "ALL_OPERATIONS";
 /// and the member's declared default.
 const LATEST_PER_CHECK: &str = "LATEST_PER_CHECK";
 
-/// `OperationStatus$ERROR`, the terminal status a settled check carries.
-const ERROR: &str = "ERROR";
+/// `OperationStatus$SUCCESS`, the terminal status a settled check carries once its rules
+/// have been evaluated.
+const SUCCESS: &str = "SUCCESS";
 
 /// `OperationStatus$INPROGRESS`, as the model spells it.
 const INPROGRESS: &str = "INPROGRESS";
@@ -306,7 +307,7 @@ async fn filters_narrow_the_listing_by_the_members_it_reports() {
         FilterCase {
             name: "Status",
             operator: "Equals",
-            value: ERROR.to_string(),
+            value: SUCCESS.to_string(),
         },
         FilterCase {
             name: "Status",
@@ -316,7 +317,7 @@ async fn filters_narrow_the_listing_by_the_members_it_reports() {
         FilterCase {
             name: "Status",
             operator: "Equals",
-            value: format!("{INPROGRESS},{ERROR}"),
+            value: format!("{INPROGRESS},{SUCCESS}"),
         },
         // The listing is already scoped to one application, so this filter keeps every
         // row or none.
@@ -381,7 +382,7 @@ async fn filters_narrow_the_listing_by_the_members_it_reports() {
             FilterCase {
                 name: "Status",
                 operator: "Equals",
-                value: ERROR.to_string(),
+                value: SUCCESS.to_string(),
             },
             FilterCase {
                 name: "ConfigurationCheckId",
@@ -480,7 +481,7 @@ async fn a_filter_the_listing_does_not_filter_by_is_refused() {
         let reply = emulator
             .list_checks(json!({
                 "ApplicationId": APPLICATION,
-                "Filters": [{"Name": name, "Value": ERROR, "Operator": "Equals"}],
+                "Filters": [{"Name": name, "Value": SUCCESS, "Operator": "Equals"}],
             }))
             .await;
         assert_eq!(
@@ -505,7 +506,7 @@ async fn a_filter_the_listing_does_not_filter_by_is_refused() {
         let reply = emulator
             .list_checks(json!({
                 "ApplicationId": APPLICATION,
-                "Filters": [{"Name": "Status", "Value": ERROR, "Operator": operator}],
+                "Filters": [{"Name": "Status", "Value": SUCCESS, "Operator": operator}],
             }))
             .await;
         assert_eq!(

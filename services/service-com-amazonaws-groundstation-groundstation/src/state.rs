@@ -2367,6 +2367,16 @@ pub const EPHEMERIS_TIME_RANGE_INVALID: &str = "TIME_RANGE_INVALID";
 /// trait, so the documented default is applied here instead.
 pub const DEFAULT_EPHEMERIS_PRIORITY: i32 = 1;
 
+/// The smallest priority a customer ephemeris may carry, from the same documented sentence
+/// as [`DEFAULT_EPHEMERIS_PRIORITY`]: "Must be 1 or greater."
+///
+/// `CreateEphemeris` takes a `CustomerEphemerisPriority` (range 1..99999), so the model
+/// itself refuses anything below this there; `UpdateEphemeris` takes an
+/// `EphemerisPriority` (range 0..99999 — `smithy_query(query="shape",
+/// shape="EphemerisPriority")`), whose range admits a value the member's own documentation
+/// rules out, so the bound lives here for the handler that has to apply it.
+pub const MIN_EPHEMERIS_PRIORITY: i32 = 1;
+
 /// Whether an ephemeris created without an `enabled` member is enabled.
 ///
 /// FALSE: the member exists to ask for enabling — "Set to `true` to enable the ephemeris

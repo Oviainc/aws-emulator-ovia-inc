@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEphemeris
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEphemeris`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEphemeris::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation changes
+//!
+//! The ephemeris this account holds under `{ephemerisId}`, in place: the request's
+//! `enabled` replaces the stored flag, and `name` and `priority` replace the stored values
+//! when the request carries them. Nothing else about the ephemeris moves — its id, ARN,
+//! satellite, supplied data, creation time and expiration are not members of this request.
+//!
+//! Enabling or disabling "doesn't require re-validation" (`smithy_query(query="doc",
+//! shape="UpdateEphemerisRequest", member="enabled")`), so an ephemeris whose data has
+//! already validated takes the `EphemerisStatus` its new flag selects straight away, with
+//! no return to `VALIDATING`: `ENABLED` and `DISABLED` are exactly the two statuses that
+//! flag selects (`state::settle_due_ephemerides`). One still validating keeps the move it
+//! is owed and lands on the flag as it stands when that move falls due; one that did not
+//! validate, or whose expiration has passed, keeps the status its data earned — a flag
+//! does not revalidate or un-expire a trajectory.
 //!
 //! ## Shape of an operation
 //!
@@ -147,20 +154,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEphemeris` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEphemerisErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEphemeris"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateEphemerisErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        // A priority of 0 satisfies the modelled `EphemerisPriority` range but not the
+        // member's own rule — "Higher numbers take precedence. The default is 1. Must be 1
+        // or greater." — so it is refused here rather than stored (see
+        // `state::MIN_EPHEMERIS_PRIORITY`). Nothing is read or written before this.
+        if input
+            .priority
+            .is_some_and(|priority| priority < crate::state::MIN_EPHEMERIS_PRIORITY)
+        {
+            return Err(UpdateEphemerisErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(PRIORITY_BELOW_MINIMUM.to_string()),
+                    parameter_name: Some(PRIORITY_PARAMETER.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let mut guard = state.lock();
+        // An ephemeris leaves `VALIDATING` at an instant its create recorded, and becomes
+        // `EXPIRED` once its expiration time passes: both moves were owed at this instant
+        // whether or not anybody called, so materialising them before this update reads
+        // the status it is about to act on changes nothing a later caller could otherwise
+        // have seen.
+        guard.settle_due_ephemerides();
+
+        let stored = guard
+            .ephemerides
+            .get_mut(&input.ephemeris_id)
+            .ok_or_else(|| {
+                UpdateEphemerisErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    // This service's ephemeris literal: it discloses neither the id that
+                    // was asked for nor the account it was looked for in, exactly as the
+                    // sibling read and delete of the same dead id answer.
+                    message: Some(crate::state::EPHEMERIS_NOT_FOUND.to_string()),
+                })
+            })?;
+
+        // `enabled` is required, so every update states whether the ephemeris is to be
+        // used; `name` and `priority` are optional, and one the request omits leaves the
+        // stored value alone.
+        stored.enabled = input.enabled;
+        if let Some(name) = input.name {
+            stored.name = name;
+        }
+        if let Some(priority) = input.priority {
+            stored.priority = priority;
+        }
+
+        // Changing the flag needs no re-validation, so an ephemeris whose data already
+        // validated moves between the two statuses the flag selects at once. One still
+        // `VALIDATING` is left the move it is owed, which lands on the flag as it now
+        // stands; one `INVALID` or `EXPIRED` keeps the status its data earned.
+        if matches!(
+            stored.status.as_str(),
+            crate::state::EPHEMERIS_ENABLED | crate::state::EPHEMERIS_DISABLED
+        ) {
+            stored.status = if stored.enabled {
+                crate::state::EPHEMERIS_ENABLED.to_string()
+            } else {
+                crate::state::EPHEMERIS_DISABLED.to_string()
+            };
+        }
+
+        Ok(UpdateEphemerisOutput {
+            ephemeris_id: Some(stored.ephemeris_id.clone()),
+        })
     }
 }
+
+/// The request member a refused priority names.
+pub const PRIORITY_PARAMETER: &str = "priority";
+
+/// Why a priority below [`crate::state::MIN_EPHEMERIS_PRIORITY`] is refused, in the words
+/// the member's own documentation states the rule in.
+pub const PRIORITY_BELOW_MINIMUM: &str = "priority must be 1 or greater";

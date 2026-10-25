@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEventActions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEventActions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEventActions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages through the stored event actions, newest first, optionally
+//! narrowed to the ones whose event watches one source. A read: it changes nothing. This
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +142,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEventActions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEventActionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEventActions"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListEventActionsErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        // The page size the request asked for; `MaxResults` carries
+        // `skip_validation` on this input, so its modelled `@range` is checked here
+        // against the value the request actually carried. See
+        // `crate::state::requested_max_results`.
+        let max_results = match crate::state::requested_max_results(ctx, input.max_results) {
+            Ok(max_results) => max_results,
+            Err(refusal) => {
+                return Err(ListEventActionsErrorModeled::ValidationException(refusal).into())
+            }
+        };
+
+        let store = state.lock();
+
+        // Newest first: the stored order is creation order, so the page walks it
+        // backwards. `EventSourceId` narrows the listing to the event actions whose
+        // event watches that source — it is a filter over the collection, not a
+        // resource this call addresses, so one naming nothing selects nothing and the
+        // page is empty rather than a 404.
+        let ordered: Vec<String> = store
+            .event_action_order
+            .iter()
+            .rev()
+            .filter(|id| {
+                store.event_actions.get(*id).is_some_and(|record| {
+                    input
+                        .event_source_id
+                        .as_deref()
+                        .is_none_or(|source| record.event_source_id == source)
+                })
+            })
+            .cloned()
+            .collect();
+
+        let Some((start, end)) =
+            crate::state::page_window(&ordered, input.next_token.as_deref(), max_results)
+        else {
+            return Err(ListEventActionsErrorModeled::ValidationException(
+                crate::state::invalid_next_token(),
+            )
+            .into());
+        };
+
+        // `EventActionEntry` models no `Tags` member; `ListTagsForResource` is the tag
+        // reader.
+        let event_actions: Vec<EventActionEntry> = ordered
+            .get(start..end)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|id| store.event_actions.get(id))
+            .map(|record| EventActionEntry {
+                action: record.action.clone(),
+                arn: record.arn.clone(),
+                created_at: record.created_at,
+                event: record.event.clone(),
+                id: record.id.clone(),
+                updated_at: record.updated_at,
+            })
+            .collect();
+
+        Ok(ListEventActionsOutput {
+            next_token: crate::state::next_token(&ordered, start, end),
+            event_actions: Some(event_actions),
+        })
     }
 }

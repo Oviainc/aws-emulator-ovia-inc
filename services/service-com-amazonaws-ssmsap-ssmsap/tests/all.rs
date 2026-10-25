@@ -25,6 +25,8 @@ mod component_listing;
 mod component_reads;
 #[path = "all/configuration_check_reads.rs"]
 mod configuration_check_reads;
+#[path = "all/configuration_check_rules.rs"]
+mod configuration_check_rules;
 #[path = "all/configuration_checks.rs"]
 mod configuration_checks;
 #[path = "all/deregistration_window.rs"]

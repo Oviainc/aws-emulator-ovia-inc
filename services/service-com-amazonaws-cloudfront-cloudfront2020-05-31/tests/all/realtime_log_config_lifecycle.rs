@@ -73,7 +73,9 @@ async fn create_config(router: &MultiServiceRouter, body: &str) -> Answer {
 /// `POST /2020-05-31/get-realtime-log-config` naming the configuration by `name`, by
 /// `arn`, by both or by neither — each `None` leaves that element out of the document
 /// entirely.
-async fn get_config(router: &MultiServiceRouter, name: Option<&str>, arn: Option<&str>) -> Answer {
+///
+/// `pub(crate)` so a sibling suite reads a configuration back over the same wire path.
+pub(crate) async fn get_config(router: &MultiServiceRouter, name: Option<&str>, arn: Option<&str>) -> Answer {
     let mut body = format!(
         "<GetRealtimeLogConfigRequest \
          xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">"
@@ -97,7 +99,9 @@ async fn get_config(router: &MultiServiceRouter, name: Option<&str>, arn: Option
 
 /// `POST /2020-05-31/delete-realtime-log-config`, addressing the configuration the same
 /// way a read does.
-async fn delete_config(
+///
+/// `pub(crate)` so a sibling suite removes a configuration over the same wire path.
+pub(crate) async fn delete_config(
     router: &MultiServiceRouter,
     name: Option<&str>,
     arn: Option<&str>,
@@ -263,7 +267,10 @@ pub(crate) fn strings(values: &[&str]) -> Vec<String> {
 /// `SamplingRate` and a value between them, one endpoint and several, one field and many,
 /// a field order that is not the sorted one, and names and field names that are plain
 /// ASCII, carry punctuation, are non-ASCII or carry XML metacharacters.
-fn config_table() -> Vec<Submitted> {
+///
+/// `pub(crate)` so a sibling suite asserts its own rules over these same rows rather than
+/// carrying a second table.
+pub(crate) fn config_table() -> Vec<Submitted> {
     vec![
         Submitted {
             case: "one endpoint, one field, the smallest sampling rate",
@@ -321,7 +328,10 @@ pub(crate) fn config_node<'a>(answer: &'a Answer, case: &str, context: &str) -> 
 
 /// Assert the `RealtimeLogConfig` document `node` is the configuration `row` submitted,
 /// under the ARN the service mints for its name.
-fn assert_reports(node: &Node, row: &Submitted, context: &str, raw: &str) {
+///
+/// `pub(crate)` so a sibling suite asserts a configuration it reads another way is the same
+/// record, by this one rule.
+pub(crate) fn assert_reports(node: &Node, row: &Submitted, context: &str, raw: &str) {
     let case = row.case;
     let expected_arn = format!("arn:aws:cloudfront::{ACCOUNT_ID}:realtime-log-config/{}", row.name);
     let arn = node.text_at("ARN").unwrap_or_default();

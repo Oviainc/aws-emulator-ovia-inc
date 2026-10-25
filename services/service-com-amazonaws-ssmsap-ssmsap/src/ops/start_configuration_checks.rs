@@ -7,9 +7,9 @@
 //! its terminal status one [`crate::state::TRANSITION_SPAN`] later, and each `Id` names
 //! a persisted record `GetConfigurationCheckOperation` reads back. A request naming no
 //! check runs the service's whole catalogue (see
-//! [`crate::state::configuration_checks_to_run`]), and the terminal status is the
-//! model's failure status for the reason
-//! [`crate::state::CONFIGURATION_CHECK_NOT_EVALUATED_MESSAGE`] states.
+//! [`crate::state::configuration_checks_to_run`]), and a run reaches `SUCCESS` with the
+//! results of the rules its catalogue entry names
+//! ([`crate::state::ConfigurationCheckEntry::evaluate`]).
 //!
 //! ## Shape of an operation
 //!

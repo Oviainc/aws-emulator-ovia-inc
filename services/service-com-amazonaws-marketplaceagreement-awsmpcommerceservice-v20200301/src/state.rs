@@ -1115,6 +1115,12 @@ pub const CANCELLATION_STATUS_PENDING_APPROVAL: &str = "PENDING_APPROVAL";
 /// (`AcceptAgreementCancellationRequest`).
 pub const CANCELLATION_STATUS_APPROVED: &str = "APPROVED";
 
+/// The `AgreementCancellationRequestStatus` a rejected cancellation request
+/// carries: "Once rejected, the cancellation request transitions to REJECTED
+/// status and the agreement remains active"
+/// (`RejectAgreementCancellationRequest`).
+pub const CANCELLATION_STATUS_REJECTED: &str = "REJECTED";
+
 /// `ResourceType` for a cancellation request, reported on a
 /// `ResourceNotFoundException` or a `ConflictException` about one.
 pub const RESOURCE_TYPE_AGREEMENT_CANCELLATION_REQUEST: &str = "AgreementCancellationRequest";
@@ -2441,6 +2447,13 @@ pub struct AgreementCancellationRequest {
     /// One of `AgreementCancellationRequestStatus`'s values; see
     /// [`CANCELLATION_STATUS_PENDING_APPROVAL`].
     pub status: String,
+    /// "A message providing additional context about the cancellation request
+    /// status": the value of whichever call that moved the request supplied one,
+    /// which is the buyer's `rejectionReason`
+    /// (`RejectAgreementCancellationRequest`). A status no call carries a
+    /// message member for leaves it absent rather than inventing one, exactly as
+    /// the sibling [`PaymentRequest::status_message`] does.
+    pub status_message: Option<String>,
     /// One of `AgreementCancellationRequestReasonCode`'s values, as the modelled
     /// enum member the create call carried.
     pub reason_code: String,
@@ -2470,6 +2483,38 @@ impl AgreementCancellationRequest {
         self.agreement_id == input.agreement_id
             && self.reason_code == input.reason_code
             && self.description == input.description
+    }
+
+    /// Whether a decision on this cancellation request is still open — the one
+    /// precondition every operation that moves it shares.
+    ///
+    /// A request is decidable only in
+    /// [`CANCELLATION_STATUS_PENDING_APPROVAL`]: "Only cancellation requests in
+    /// PENDING_APPROVAL status can be accepted"
+    /// (`AcceptAgreementCancellationRequest`), and the buyer's reject states the
+    /// same bound. Every other `AgreementCancellationRequestStatus` value is one
+    /// a decision has already moved it to, or one the validation of the send
+    /// left it in, so deciding now would move it a second time.
+    pub fn is_pending_approval(&self) -> bool {
+        self.status == CANCELLATION_STATUS_PENDING_APPROVAL
+    }
+
+    /// Reject this cancellation request at `now`: the one transition to
+    /// [`CANCELLATION_STATUS_REJECTED`], so the status, the status message and
+    /// the `updated_at` that go with it have exactly one writer.
+    ///
+    /// `updatedAt` is "the date and time when the cancellation request was
+    /// rejected", so it becomes this instant while `created_at` keeps the one
+    /// the send recorded. `reason` is the buyer's required rejection reason —
+    /// "this message is visible to the seller" — and it becomes the request's
+    /// `statusMessage`. Callers check
+    /// [`AgreementCancellationRequest::is_pending_approval`] first and refuse
+    /// anything else as a conflict, the way the sibling
+    /// [`PaymentRequest::reject`] is used.
+    pub fn reject(&mut self, now: SystemTime, reason: String) {
+        self.status = CANCELLATION_STATUS_REJECTED.to_string();
+        self.status_message = Some(reason);
+        self.updated_at = now;
     }
 
     /// The `ListAgreementCancellationRequests` projection of this request.

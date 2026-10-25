@@ -207,7 +207,9 @@ use super::template::{
     ACM_ACME_ENDPOINT, AOSS_COLLECTION, AOSS_SECURITY_POLICY, CLOUDWATCH_METRIC_STREAM,
     COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, ECR_PUBLIC_REPOSITORY, ECS_CLUSTER,
     EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
-    GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, MSK_CLUSTER, MSK_SERVERLESS_CLUSTER,
+    ELASTIC_BEANSTALK_APPLICATION, ELASTIC_BEANSTALK_APPLICATION_VERSION,
+    ELASTIC_BEANSTALK_ENVIRONMENT, GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, MSK_CLUSTER,
+    MSK_SERVERLESS_CLUSTER,
     S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX,
     S3VECTORS_VECTOR_BUCKET, SAGEMAKER_MODEL_PACKAGE_GROUP, SCHEDULER_SCHEDULE,
     SCHEDULER_SCHEDULE_GROUP, SNS_TOPIC, SQS_QUEUE, SSM_PARAMETER, STEP_FUNCTIONS_ACTIVITY,
@@ -285,6 +287,9 @@ pub(super) enum Provisioner {
     SchedulerSchedule,
     CognitoUserPoolGroup,
     AcmAcmeEndpoint,
+    ElasticBeanstalkApplication,
+    ElasticBeanstalkApplicationVersion,
+    ElasticBeanstalkEnvironment,
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -323,6 +328,11 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         SCHEDULER_SCHEDULE => Some(Provisioner::SchedulerSchedule),
         COGNITO_USER_POOL_GROUP => Some(Provisioner::CognitoUserPoolGroup),
         ACM_ACME_ENDPOINT => Some(Provisioner::AcmAcmeEndpoint),
+        ELASTIC_BEANSTALK_APPLICATION => Some(Provisioner::ElasticBeanstalkApplication),
+        ELASTIC_BEANSTALK_APPLICATION_VERSION => {
+            Some(Provisioner::ElasticBeanstalkApplicationVersion)
+        }
+        ELASTIC_BEANSTALK_ENVIRONMENT => Some(Provisioner::ElasticBeanstalkEnvironment),
         _ => None,
     }
 }
@@ -447,6 +457,18 @@ impl Provisioner {
             // taggable, so no tags are propagated to a group.
             Self::CognitoUserPoolGroup => create_group(ctx, region, resource).await,
             Self::AcmAcmeEndpoint => create_acme_endpoint(ctx, region, resource, propagated).await,
+            // `AWS::ElasticBeanstalk::Application` publishes `ApplicationName`,
+            // `Description` and `ResourceLifecycleConfig` and no `Tags`: the type is not
+            // taggable, so no tags are propagated to it. The same goes for
+            // `AWS::ElasticBeanstalk::ApplicationVersion`, whose properties are the
+            // application it belongs to, its description and its source bundle.
+            Self::ElasticBeanstalkApplication => create_eb_application(ctx, region, resource).await,
+            Self::ElasticBeanstalkApplicationVersion => {
+                create_eb_application_version(ctx, region, resource).await
+            }
+            Self::ElasticBeanstalkEnvironment => {
+                create_eb_environment(ctx, region, resource, propagated).await
+            }
         }
     }
 
@@ -650,6 +672,17 @@ impl Provisioner {
             // half of that pair is on the resource's own declaration.
             Self::CognitoUserPoolGroup => delete_group(ctx, region, resource).await,
             Self::AcmAcmeEndpoint => delete_acme_endpoint(ctx, region, physical_resource_id).await,
+            Self::ElasticBeanstalkApplication => {
+                delete_eb_application(ctx, region, physical_resource_id).await
+            }
+            // An application version is keyed by the PAIR that identifies it, and the
+            // application half of that pair is on the resource's own declaration.
+            Self::ElasticBeanstalkApplicationVersion => {
+                delete_eb_application_version(ctx, region, resource).await
+            }
+            Self::ElasticBeanstalkEnvironment => {
+                terminate_eb_environment(ctx, region, physical_resource_id).await
+            }
         }
     }
 
@@ -756,6 +789,17 @@ impl Provisioner {
             Self::CognitoUserPoolGroup => describe_group(ctx, region, resource).await,
             Self::AcmAcmeEndpoint => {
                 describe_acme_endpoint(ctx, region, physical_resource_id).await
+            }
+            Self::ElasticBeanstalkApplication => {
+                describe_eb_application(ctx, region, physical_resource_id).await
+            }
+            // The read is addressed by the version's label AND the application that
+            // holds it, which only the resource's own record carries.
+            Self::ElasticBeanstalkApplicationVersion => {
+                describe_eb_application_version(ctx, region, resource).await
+            }
+            Self::ElasticBeanstalkEnvironment => {
+                describe_eb_environment(ctx, region, physical_resource_id).await
             }
         }
     }
@@ -4993,6 +5037,9 @@ enum QueryMember {
     /// list member that carries none is `member`. A STRUCTURED entry's own members follow
     /// the index (`Tags.Tag.1.Key`).
     List(&'static str),
+    /// A STRUCTURE, whose own members follow the member's name (`Tier.Name=WebServer`,
+    /// `SourceBundle.S3Bucket=…`), nested the same way however deep the structure goes.
+    Structure,
 }
 
 /// The members `CreateDBInstance` takes, from Amazon RDS's own model
@@ -5784,6 +5831,7 @@ fn query_members(
                 parameters.push((member.to_string(), attribute_text(value)));
             }
             QueryMember::List(element) => push_list(&mut parameters, member, element, value),
+            QueryMember::Structure => push_structure(&mut parameters, member, value, 0)?,
         }
     }
     Ok(parameters)
@@ -5821,6 +5869,35 @@ fn push_list(
             )),
         }
     }
+}
+
+/// Write one STRUCTURE member into an awsQuery form body: each of its declared members
+/// under `<prefix>.<Member>`, nested structures the same way, and a nested LIST indexed
+/// from 1 under `member` — the Smithy default element name for a list member that fixes
+/// none, which is what every list inside these structures carries.
+///
+/// The walk is bounded by [`MAX_PROPERTY_NESTING`] for the reason that constant records:
+/// the document comes from a caller-supplied template, so a document nested past the
+/// bound is REFUSED rather than walked or quietly truncated.
+fn push_structure(
+    parameters: &mut Vec<(String, String)>,
+    prefix: &str,
+    declared: &Value,
+    depth: usize,
+) -> Result<(), Refusal> {
+    if depth >= MAX_PROPERTY_NESTING {
+        return Err(too_deeply_nested());
+    }
+    match declared {
+        Value::Object(members) => {
+            for (name, value) in members {
+                push_structure(parameters, &format!("{prefix}.{name}"), value, depth + 1)?;
+            }
+        }
+        Value::Array(_) => push_list(parameters, prefix, "member", declared),
+        scalar => parameters.push((prefix.to_string(), attribute_text(scalar))),
+    }
+    Ok(())
 }
 
 /// Write a tag set as the `Tag` structure list an awsQuery create takes, with the
@@ -7531,6 +7608,441 @@ async fn describe_acme_endpoint(
             ("CertificateAuthority", "CertificateAuthority"),
         ],
     )))
+}
+
+// ---------------------------------------------------------------------------
+// AWS Elastic Beanstalk: AWS::ElasticBeanstalk::Application,
+// AWS::ElasticBeanstalk::ApplicationVersion, AWS::ElasticBeanstalk::Environment
+// ---------------------------------------------------------------------------
+
+/// Elastic Beanstalk's signing name and API version, from its model
+/// (`sigv4Name: elasticbeanstalk`, service shape `AWSElasticBeanstalkService`,
+/// `version: 2010-12-01`), which speaks `awsQuery` — so its calls ride on [`call_query`]
+/// rather than on [`call_json_rpc`].
+const ELASTIC_BEANSTALK_SIGNING_NAME: &str = "elasticbeanstalk";
+const ELASTIC_BEANSTALK_API_VERSION: &str = "2010-12-01";
+
+/// The members `CreateApplication` takes, from Elastic Beanstalk's own model
+/// (`smithy_query(query="operation", operation="CreateApplication")`).
+///
+/// `AWS::ElasticBeanstalk::Application` publishes `ApplicationName`, `Description` and
+/// `ResourceLifecycleConfig`, which are three of those members spelled identically; the
+/// name is the one value CloudFormation decides, so the arm pushes it and
+/// [`APPLICATION_PROPERTIES_NOT_SENT`] keeps the walk from sending it twice. The type
+/// publishes no `Tags` property, so it is not taggable and no stack tag is propagated to
+/// it.
+const CREATE_APPLICATION_MEMBERS: &[(&str, QueryMember)] = &[
+    ("ApplicationName", QueryMember::Scalar),
+    ("Description", QueryMember::Scalar),
+    ("ResourceLifecycleConfig", QueryMember::Structure),
+];
+
+/// The `AWS::ElasticBeanstalk::Application` property the arm pushes itself: the
+/// application's name is this resource's physical id.
+const APPLICATION_PROPERTIES_NOT_SENT: &[&str] = &["ApplicationName"];
+
+/// The members `CreateApplicationVersion` takes, from Elastic Beanstalk's own model.
+///
+/// `AWS::ElasticBeanstalk::ApplicationVersion` publishes `ApplicationName`, `Description`
+/// and `SourceBundle` — the application the version belongs to, and the Amazon S3 archive
+/// it is built from, each spelled as the create spells it. The `VersionLabel` is not a
+/// property of the type at all: "Ref returns the auto-generated version label", so it is
+/// the physical id CloudFormation's naming rules computed and the arm pushes it.
+const CREATE_APPLICATION_VERSION_MEMBERS: &[(&str, QueryMember)] = &[
+    ("ApplicationName", QueryMember::Scalar),
+    ("Description", QueryMember::Scalar),
+    ("SourceBundle", QueryMember::Structure),
+];
+
+/// The members `CreateEnvironment` takes, from Elastic Beanstalk's own model, with each
+/// list's element name the Smithy default for a list member that fixes none (`member`).
+///
+/// `AWS::ElasticBeanstalk::Environment` publishes `ApplicationName`, `CNAMEPrefix`,
+/// `Description`, `EnvironmentName`, `OperationsRole`, `OptionSettings`, `PlatformArn`,
+/// `SolutionStackName`, `Tags`, `TemplateName`, `Tier` and `VersionLabel` — every one of
+/// them a member of the create under the same name. The two the arm pushes itself are in
+/// [`ENVIRONMENT_PROPERTIES_NOT_SENT`].
+const CREATE_ENVIRONMENT_MEMBERS: &[(&str, QueryMember)] = &[
+    ("ApplicationName", QueryMember::Scalar),
+    ("CNAMEPrefix", QueryMember::Scalar),
+    ("Description", QueryMember::Scalar),
+    ("EnvironmentName", QueryMember::Scalar),
+    ("OperationsRole", QueryMember::Scalar),
+    ("OptionSettings", QueryMember::List("member")),
+    ("PlatformArn", QueryMember::Scalar),
+    ("SolutionStackName", QueryMember::Scalar),
+    ("Tags", QueryMember::List("member")),
+    ("TemplateName", QueryMember::Scalar),
+    ("Tier", QueryMember::Structure),
+    ("VersionLabel", QueryMember::Scalar),
+];
+
+/// The `AWS::ElasticBeanstalk::Environment` properties the arm pushes itself: the
+/// environment's name, which is this resource's physical id, and its tags, which reach
+/// the create merged with the ones CloudFormation gives the resource ([`tags_of`]).
+const ENVIRONMENT_PROPERTIES_NOT_SENT: &[&str] = &["EnvironmentName", "Tags"];
+
+/// Create the application an `AWS::ElasticBeanstalk::Application` declares.
+async fn create_eb_application(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let mut parameters = query_members(
+        &resource.properties,
+        CREATE_APPLICATION_MEMBERS,
+        &[],
+        APPLICATION_PROPERTIES_NOT_SENT,
+        ELASTIC_BEANSTALK_APPLICATION,
+    )?;
+    parameters.push((
+        "ApplicationName".to_string(),
+        resource.physical_resource_id.clone(),
+    ));
+    call_query(
+        ctx,
+        ELASTIC_BEANSTALK_SIGNING_NAME,
+        region,
+        ELASTIC_BEANSTALK_API_VERSION,
+        "CreateApplication",
+        &parameters,
+    )
+    .await?;
+    // "Ref returns the Elastic Beanstalk application name", which is the physical id the
+    // application was created under, and the type publishes no `Fn::GetAtt` attribute.
+    Ok(Created::default())
+}
+
+/// Create the application version an `AWS::ElasticBeanstalk::ApplicationVersion`
+/// declares, under the version label CloudFormation decided for it.
+async fn create_eb_application_version(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let mut parameters = query_members(
+        &resource.properties,
+        CREATE_APPLICATION_VERSION_MEMBERS,
+        &[],
+        &[],
+        ELASTIC_BEANSTALK_APPLICATION_VERSION,
+    )?;
+    parameters.push((
+        "VersionLabel".to_string(),
+        resource.physical_resource_id.clone(),
+    ));
+    call_query(
+        ctx,
+        ELASTIC_BEANSTALK_SIGNING_NAME,
+        region,
+        ELASTIC_BEANSTALK_API_VERSION,
+        "CreateApplicationVersion",
+        &parameters,
+    )
+    .await?;
+    Ok(Created::default())
+}
+
+/// Create the environment an `AWS::ElasticBeanstalk::Environment` declares, through
+/// Elastic Beanstalk's own `CreateEnvironment`.
+///
+/// The environment is created with the tags CloudFormation gives it beside the declared
+/// ones, as the `Tags` structure list the create takes (`Tag` spells `Key`/`Value`), and
+/// under the name CloudFormation decided — this resource's physical id, which is what
+/// "Ref returns the Elastic Beanstalk environment name" resolves to. `EndpointURL` is the
+/// one attribute the type publishes, so it is recorded from what Elastic Beanstalk
+/// answered rather than computed; an environment that reports none carries no such
+/// attribute.
+async fn create_eb_environment(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut parameters = query_members(
+        &resource.properties,
+        CREATE_ENVIRONMENT_MEMBERS,
+        &[],
+        ENVIRONMENT_PROPERTIES_NOT_SENT,
+        ELASTIC_BEANSTALK_ENVIRONMENT,
+    )?;
+    parameters.push((
+        "EnvironmentName".to_string(),
+        resource.physical_resource_id.clone(),
+    ));
+    push_tag_list(
+        &mut parameters,
+        "Tags",
+        "member",
+        &tags_of(&resource.properties, propagated),
+    );
+    let answered = call_query(
+        ctx,
+        ELASTIC_BEANSTALK_SIGNING_NAME,
+        region,
+        ELASTIC_BEANSTALK_API_VERSION,
+        "CreateEnvironment",
+        &parameters,
+    )
+    .await?;
+    let mut attributes = BTreeMap::new();
+    if let Some(endpoint) =
+        xml_element(&answered, "EndpointURL").filter(|endpoint| !endpoint.is_empty())
+    {
+        attributes.insert("EndpointURL".to_string(), endpoint);
+    }
+    Ok(Created::attributes(attributes))
+}
+
+/// Delete the application a stack created, addressed by its name — this resource's
+/// physical id.
+///
+/// `DeleteApplication` models no not-found error (its one modelled error is
+/// `OperationInProgressException`), so "already gone" is decided by READING the
+/// application back rather than off a code that is also what another refusal carries.
+async fn delete_eb_application(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let parameters = vec![(
+        "ApplicationName".to_string(),
+        physical_resource_id.to_string(),
+    )];
+    let refusal = match call_query(
+        ctx,
+        ELASTIC_BEANSTALK_SIGNING_NAME,
+        region,
+        ELASTIC_BEANSTALK_API_VERSION,
+        "DeleteApplication",
+        &parameters,
+    )
+    .await
+    {
+        Ok(_) => return Ok(()),
+        Err(refusal) => refusal,
+    };
+    match describe_eb_application(ctx, region, physical_resource_id).await {
+        // Elastic Beanstalk does not have the application, which is the state the delete
+        // asked for.
+        Ok(None) => Ok(()),
+        // It still has it, or the read said nothing about it: the refusal stands rather
+        // than being reported as a deletion nothing carried out.
+        _ => Err(refusal),
+    }
+}
+
+/// Delete the application version a stack created: its label is this resource's physical
+/// id, and the application it belongs to is on the resource's own declaration.
+///
+/// The source bundle is NOT deleted with it — `DeleteSourceBundle` is not a property of
+/// the type, so the archive the template pointed at is left where the client put it.
+async fn delete_eb_application_version(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let application = eb_application_of(resource);
+    let parameters = vec![
+        ("ApplicationName".to_string(), application.clone()),
+        (
+            "VersionLabel".to_string(),
+            resource.physical_resource_id.clone(),
+        ),
+    ];
+    let refusal = match call_query(
+        ctx,
+        ELASTIC_BEANSTALK_SIGNING_NAME,
+        region,
+        ELASTIC_BEANSTALK_API_VERSION,
+        "DeleteApplicationVersion",
+        &parameters,
+    )
+    .await
+    {
+        Ok(_) => return Ok(()),
+        Err(refusal) => refusal,
+    };
+    match describe_eb_application_version(ctx, region, resource).await {
+        Ok(None) => Ok(()),
+        _ => Err(refusal),
+    }
+}
+
+/// How often this module checks whether an accepted environment termination has finished,
+/// and how many times.
+///
+/// The product is the longest a stack's deletion waits for ONE environment to go: an
+/// upper bound on the wait, not a duration anything is owed. Elastic Beanstalk reports a
+/// terminated environment as `Terminating` and removes it from the live set a moment
+/// later (its own transition span), so the check is far shorter than that moment and the
+/// whole wait is a small multiple of it — enough that a loaded machine still gets there,
+/// and bounded so a `DeleteStack` of several environments cannot hold its request open.
+/// The wait matters because the application the environment belongs to cannot be deleted
+/// while it still has a running environment, and that application is the next resource
+/// the same stack deletes.
+const ENVIRONMENT_TERMINATION_CHECK_INTERVAL: ::std::time::Duration =
+    ::std::time::Duration::from_millis(25);
+const ENVIRONMENT_TERMINATION_CHECKS: usize = 40;
+
+/// The code a refusal carries where a resource the owning service ACCEPTED the delete of
+/// had not reached the deleted state by the time the bounded wait ran out:
+/// CloudFormation's own resource-provider handler code for a resource that did not
+/// stabilize. It is not a code any AWS service answers, so it is never mistaken for one
+/// of theirs.
+const NOT_STABILIZED: &str = "NotStabilized";
+
+/// Terminate the environment a stack created, addressed by its name — this resource's
+/// physical id — and wait until Elastic Beanstalk no longer holds it among the live
+/// environments.
+///
+/// `TerminateEnvironment` models no not-found error, so "already gone" is decided by
+/// READING the environment back, exactly as the application's delete does.
+///
+/// The wait is what makes this delete USABLE by the rest of the stack's deletion: the
+/// application this environment belongs to is the next resource deleted, and Elastic
+/// Beanstalk refuses to delete an application that still has a running environment. So a
+/// wait that runs out while the environment is still live is reported HERE, naming this
+/// resource and the termination that did not finish, rather than left to surface as a
+/// confusing refusal of the application's delete. Only the read that says the environment
+/// is GONE ends the wait successfully: a read that answers nothing about it is not
+/// evidence the termination finished.
+async fn terminate_eb_environment(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let parameters = vec![(
+        "EnvironmentName".to_string(),
+        physical_resource_id.to_string(),
+    )];
+    let terminated = call_query(
+        ctx,
+        ELASTIC_BEANSTALK_SIGNING_NAME,
+        region,
+        ELASTIC_BEANSTALK_API_VERSION,
+        "TerminateEnvironment",
+        &parameters,
+    )
+    .await;
+    if let Err(refusal) = terminated {
+        return match describe_eb_environment(ctx, region, physical_resource_id).await {
+            Ok(None) => Ok(()),
+            _ => Err(refusal),
+        };
+    }
+    // The termination was ACCEPTED; it finishes a moment later.
+    for _ in 0..ENVIRONMENT_TERMINATION_CHECKS {
+        if matches!(
+            describe_eb_environment(ctx, region, physical_resource_id).await,
+            Ok(None)
+        ) {
+            return Ok(());
+        }
+        ::tokio::time::sleep(ENVIRONMENT_TERMINATION_CHECK_INTERVAL).await;
+    }
+    Err(Refusal {
+        code: NOT_STABILIZED.to_string(),
+        message: format!(
+            "the termination of environment {physical_resource_id} had not finished within the \
+             wait this deletion gives it, so the environment is still running"
+        ),
+    })
+}
+
+/// The application an `AWS::ElasticBeanstalk::ApplicationVersion` belongs to: the
+/// `ApplicationName` its declaration names, which is the other half of the pair Elastic
+/// Beanstalk keys an application version by.
+fn eb_application_of(resource: &StoredResource) -> String {
+    resource
+        .properties
+        .get("ApplicationName")
+        .map(attribute_text)
+        .unwrap_or_default()
+}
+
+/// The application's configuration as Elastic Beanstalk reports it, for drift detection.
+/// An application it no longer has is reported as no application at all — the describe
+/// answers an empty list rather than refusing — which is the `DELETED` drift status.
+async fn describe_eb_application(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let parameters = vec![(
+        "ApplicationNames.member.1".to_string(),
+        physical_resource_id.to_string(),
+    )];
+    eb_reported_entry(ctx, region, "DescribeApplications", &parameters).await
+}
+
+/// The application version's configuration as Elastic Beanstalk reports it, for drift
+/// detection. Addressed by the PAIR that identifies it: the version label (this
+/// resource's physical id) and the application its declaration names.
+async fn describe_eb_application_version(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let parameters = vec![
+        ("ApplicationName".to_string(), eb_application_of(resource)),
+        (
+            "VersionLabels.member.1".to_string(),
+            resource.physical_resource_id.clone(),
+        ),
+    ];
+    eb_reported_entry(ctx, region, "DescribeApplicationVersions", &parameters).await
+}
+
+/// The environment's configuration as Elastic Beanstalk reports it, for drift detection —
+/// and the read that says whether a termination has finished.
+///
+/// A terminated environment is not one of the live environments the describe reports (it
+/// is included only for `IncludeDeleted`, which this read does not ask for), so it reads
+/// as absent: the `DELETED` drift status, and the state a stack's deletion asked for.
+async fn describe_eb_environment(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let parameters = vec![(
+        "EnvironmentNames.member.1".to_string(),
+        physical_resource_id.to_string(),
+    )];
+    eb_reported_entry(ctx, region, "DescribeEnvironments", &parameters).await
+}
+
+/// The ONE resource an Elastic Beanstalk `Describe…` answered with: the scalar members of
+/// the first entry of the list it reports, or `None` when that list is empty.
+///
+/// Every `Describe…` of this service answers a LIST — `<Environments><member>…` — and
+/// each request above narrows it to the one resource by name, so the first entry is that
+/// resource and an empty list is the service saying it does not hold it. The entry's
+/// scalar members are named exactly as the declaring type's properties are
+/// (`ApplicationName`, `Description`, `SolutionStackName`, `PlatformArn`, `VersionLabel`,
+/// `TemplateName`), which is what makes them the actual configuration a declaration is
+/// compared against; a member reported as a STRUCTURE or a list is not a scalar and is
+/// left out, and a property the actual document does not carry is not evidence of
+/// anything (see [`super::drift`]).
+async fn eb_reported_entry(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    action: &str,
+    parameters: &[(String, String)],
+) -> Result<Option<Value>, Refusal> {
+    let answered = call_query(
+        ctx,
+        ELASTIC_BEANSTALK_SIGNING_NAME,
+        region,
+        ELASTIC_BEANSTALK_API_VERSION,
+        action,
+        parameters,
+    )
+    .await?;
+    if xml_element(&answered, "member").is_none() {
+        return Ok(None);
+    }
+    Ok(Some(Value::Object(xml_scalar_children(&answered, "member"))))
 }
 
 #[cfg(test)]

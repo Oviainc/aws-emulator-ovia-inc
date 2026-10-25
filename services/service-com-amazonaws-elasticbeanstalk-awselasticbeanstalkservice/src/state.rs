@@ -563,43 +563,101 @@ pub struct SolutionStack {
     pub frameworks: &'static [(&'static str, &'static str)],
 }
 
+/// The `SolutionStackName` the version `platform_version` of the platform branch
+/// `branch_name` is reported under.
+///
+/// AWS publishes a branch as `<runtime> running on <os>` and a solution stack
+/// within it as `<os> v<version> running <runtime>` — the Python 3.13 branch's
+/// current version is `64bit Amazon Linux 2023 v4.6.0 running Python 3.13` — so
+/// the name is DERIVED from the branch rather than written out a second time and
+/// left to drift from it.
+pub fn solution_stack_name_of(branch_name: &str, platform_version: &str) -> String {
+    match branch_name.split_once(" running on ") {
+        Some((runtime, os)) => format!("{os} v{platform_version} running {runtime}"),
+        // A branch name not in the published form is reported as it stands
+        // rather than rewritten into a shape it does not have.
+        None => branch_name.to_string(),
+    }
+}
+
+/// The `PlatformArn` the version `platform_version` of the platform branch
+/// `branch_name` is named by in `region`:
+/// `arn:aws:elasticbeanstalk:<region>::platform/<branch name>/<version>`.
+///
+/// A managed platform version belongs to the SERVICE, not to an account, so its
+/// ARN carries no account id — which is why it is not built with
+/// [`::engine::emulator_arn`], the form every account-owned resource of this
+/// service uses.
+pub fn platform_arn_of(region: &str, branch_name: &str, platform_version: &str) -> String {
+    format!("arn:aws:{ARN_NAMESPACE}:{region}::platform/{branch_name}/{platform_version}")
+}
+
+/// How one managed platform version is keyed in the catalog's per-version tables
+/// (its published machine images): the resource part of its `PlatformArn`, which
+/// is `<branch name>/<version>` and so names one catalog row in every region.
+pub fn platform_catalog_key(branch_name: &str, platform_version: &str) -> String {
+    format!("{branch_name}/{platform_version}")
+}
+
 impl SolutionStack {
-    /// The `SolutionStackName` this stack is reported under.
-    ///
-    /// AWS publishes a branch as `<runtime> running on <os>` and a solution
-    /// stack within it as `<os> v<version> running <runtime>` — the Python 3.13
-    /// branch's current version is `64bit Amazon Linux 2023 v4.6.0 running
-    /// Python 3.13` — so the name is DERIVED from the branch rather than
-    /// written out a second time and left to drift from it.
+    /// The `SolutionStackName` this stack's CURRENT version is reported under.
+    /// See [`solution_stack_name_of`].
     pub fn name(&self) -> String {
-        match self.branch_name.split_once(" running on ") {
-            Some((runtime, os)) => format!("{os} v{} running {runtime}", self.platform_version),
-            // A branch name not in the published form is reported as it stands
-            // rather than rewritten into a shape it does not have.
-            None => self.branch_name.to_string(),
+        solution_stack_name_of(self.branch_name, self.platform_version)
+    }
+
+    /// The `PlatformArn` this stack's CURRENT version is named by in `region`.
+    /// See [`platform_arn_of`].
+    pub fn platform_arn(&self, region: &str) -> String {
+        platform_arn_of(region, self.branch_name, self.platform_version)
+    }
+
+    /// How this stack's CURRENT version is keyed in the catalog's per-version
+    /// tables. See [`platform_catalog_key`].
+    pub fn catalog_key(&self) -> String {
+        platform_catalog_key(self.branch_name, self.platform_version)
+    }
+
+    /// The version of this branch that [`Self::platform_version`] SUPERSEDED, or
+    /// `None` when it is the first release of its line.
+    ///
+    /// Elastic Beanstalk publishes every platform version of a branch it has
+    /// released, not only the newest: a release the next one superseded stays
+    /// `Ready` and launchable — which is what makes a MINOR PLATFORM UPDATE
+    /// available to an environment running it, and so what lets the service
+    /// schedule a managed update for that environment — while only the newest
+    /// release of the branch is the branch's `Recommended` one.
+    ///
+    /// Which version that is comes out of the catalog's own numbering, the way
+    /// the solution stack name and the ARN do, rather than being written out per
+    /// row: a release is numbered `<major>.<minor>.<patch>` and the release
+    /// before it is the one with the lowest-order component a step lower — the
+    /// patch below it where this version carries one, and the preceding minor
+    /// release otherwise. (The version components themselves are this emulator's
+    /// own; see [`SOLUTION_STACKS`].)
+    pub fn superseded_version(&self) -> Option<String> {
+        let mut components = self.platform_version.split('.');
+        let major: u32 = components.next()?.parse().ok()?;
+        let minor: u32 = components.next()?.parse().ok()?;
+        let patch: u32 = components.next()?.parse().ok()?;
+        if components.next().is_some() {
+            return None;
+        }
+        match (minor, patch) {
+            (_, 1..) => Some(format!("{major}.{minor}.{}", patch - 1)),
+            (1.., 0) => Some(format!("{major}.{}.0", minor - 1)),
+            // The first release of the major line superseded nothing.
+            (0, 0) => None,
         }
     }
 
-    /// The `PlatformArn` this managed platform version is named by:
-    /// `arn:aws:elasticbeanstalk:<region>::platform/<branch name>/<version>`.
-    ///
-    /// A managed platform version belongs to the SERVICE, not to an account, so
-    /// its ARN carries no account id — which is why it is not built with
-    /// [`::engine::emulator_arn`], the form every account-owned resource of this
-    /// service uses.
-    pub fn platform_arn(&self, region: &str) -> String {
-        format!(
-            "arn:aws:{ARN_NAMESPACE}:{region}::platform/{}/{}",
-            self.branch_name, self.platform_version
-        )
-    }
-
-    /// How this version is keyed in the catalog's per-version tables (its
-    /// published machine images): the resource part of its `PlatformArn`, which
-    /// is `<branch name>/<version>` and so names one catalog row in every
-    /// region.
-    pub fn catalog_key(&self) -> String {
-        format!("{}/{}", self.branch_name, self.platform_version)
+    /// Every version of this branch the catalog publishes, NEWEST FIRST: the
+    /// branch's current version and the one it superseded
+    /// ([`Self::superseded_version`]).
+    pub fn published_versions(&self) -> Vec<String> {
+        let mut versions = vec![self.platform_version.to_string()];
+        versions.extend(self.superseded_version());
+        versions
     }
 
     /// The runtime and the operating system this stack's branch name is built
@@ -683,7 +741,9 @@ impl SolutionStack {
             .collect()
     }
 
-    /// The modelled `PlatformDescription` for this published version.
+    /// The modelled `PlatformDescription` for the version `platform_version` of
+    /// this branch — one of the versions the catalog publishes for it
+    /// ([`Self::published_versions`]).
     ///
     /// Everything the catalog states about the version is projected here, and
     /// everything the STORE holds about it comes from `store`: the
@@ -697,16 +757,17 @@ impl SolutionStack {
         &self,
         region: &str,
         store: &ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState,
+        platform_version: &str,
     ) -> PlatformDescription {
         let operating_system = self.operating_system();
         let branch = store.platform_branch_named(self.branch_name);
         PlatformDescription {
-            platform_arn: Some(self.platform_arn(region)),
+            platform_arn: Some(platform_arn_of(region, self.branch_name, platform_version)),
             platform_owner: Some(MANAGED_PLATFORM_OWNER.to_string()),
             platform_name: Some(self.branch_name.to_string()),
-            platform_version: Some(self.platform_version.to_string()),
+            platform_version: Some(platform_version.to_string()),
             platform_branch_name: Some(self.branch_name.to_string()),
-            solution_stack_name: Some(self.name()),
+            solution_stack_name: Some(solution_stack_name_of(self.branch_name, platform_version)),
             // A published version is usable as it stands; nothing is building it.
             platform_status: Some(PLATFORM_STATUS_READY.to_string()),
             // The catalog is service-owned reference data: it was published when
@@ -725,7 +786,7 @@ impl SolutionStack {
             custom_ami_list: Some(
                 store
                     .platform_custom_amis
-                    .get(&self.catalog_key())
+                    .get(&platform_catalog_key(self.branch_name, platform_version))
                     .cloned()
                     .unwrap_or_default(),
             ),
@@ -734,9 +795,11 @@ impl SolutionStack {
             // does not hold reports neither rather than one of the two.
             supported_addon_list: branch
                 .map(|branch| managed_supported_addons(&branch.supported_tiers)),
-            // The catalog publishes exactly one version per branch, so every
-            // published version IS its branch's recommended one.
-            platform_lifecycle_state: Some(PLATFORM_LIFECYCLE_RECOMMENDED.to_string()),
+            // Only the NEWEST version of a branch is its recommended one; the
+            // release it superseded is still `Ready` but carries no life-cycle
+            // state at all ("Possible values: `Recommended` | `null`").
+            platform_lifecycle_state: (platform_version == self.platform_version)
+                .then(|| PLATFORM_LIFECYCLE_RECOMMENDED.to_string()),
             platform_branch_lifecycle_state: branch
                 .map(|branch| reported_branch_lifecycle_state(&branch.lifecycle_state)),
         }
@@ -750,10 +813,14 @@ fn stated(value: &str) -> Option<String> {
 }
 
 /// The `CustomAmiList` the catalog publishes for every managed platform
-/// version, by [`SolutionStack::catalog_key`]: one machine image per
+/// version, by [`platform_catalog_key`]: one machine image per
 /// [`PLATFORM_VIRTUALIZATION_TYPES`] value, which is what
 /// `DescribePlatformVersion` reports as "the custom AMIs supported by the
 /// platform version".
+///
+/// Every version the catalog publishes has its own entry — a branch's current
+/// release and the one it superseded ([`SolutionStack::published_versions`])
+/// are two platform versions, each with its own images.
 ///
 /// The image IDS are SERVER-GENERATED, exactly like an `EnvironmentId`: an
 /// `ImageId` is opaque ("THe ID of the image used to create the custom AMI" and
@@ -765,15 +832,26 @@ fn stated(value: &str) -> Option<String> {
 fn managed_custom_ami_catalog() -> BTreeMap<String, Vec<CustomAmi>> {
     SOLUTION_STACKS
         .iter()
-        .map(|stack| {
-            let images = PLATFORM_VIRTUALIZATION_TYPES
-                .iter()
-                .map(|virtualization_type| CustomAmi {
-                    virtualization_type: Some((*virtualization_type).to_string()),
-                    image_id: Some(format!("ami-{}", random_id_body(CUSTOM_AMI_ID_BODY_LENGTH))),
+        .flat_map(|stack| {
+            stack
+                .published_versions()
+                .into_iter()
+                .map(move |platform_version| {
+                    let images = PLATFORM_VIRTUALIZATION_TYPES
+                        .iter()
+                        .map(|virtualization_type| CustomAmi {
+                            virtualization_type: Some((*virtualization_type).to_string()),
+                            image_id: Some(format!(
+                                "ami-{}",
+                                random_id_body(CUSTOM_AMI_ID_BODY_LENGTH)
+                            )),
+                        })
+                        .collect();
+                    (
+                        platform_catalog_key(stack.branch_name, &platform_version),
+                        images,
+                    )
                 })
-                .collect();
-            (stack.catalog_key(), images)
         })
         .collect()
 }
@@ -823,17 +901,72 @@ pub fn reported_branch_lifecycle_state(state: &str) -> String {
     }
 }
 
+/// One version of the AWS-managed platform catalog: the branch's catalog entry
+/// and WHICH of the versions that branch publishes
+/// ([`SolutionStack::published_versions`]) this is.
+///
+/// A branch's current release and the release it superseded are two distinct
+/// platform versions of one catalog row — same languages, same category, same
+/// branch, different `PlatformArn`, `SolutionStackName` and
+/// `PlatformLifecycleState` — so a resolved ARN carries both halves.
+#[derive(Debug, Clone)]
+pub struct ManagedPlatformVersion {
+    /// The catalog row this is a version of.
+    pub stack: &'static SolutionStack,
+    /// The version itself, one of [`SolutionStack::published_versions`].
+    pub platform_version: String,
+}
+
+impl ManagedPlatformVersion {
+    /// Whether this is its branch's newest, `Recommended`, release.
+    pub fn is_recommended(&self) -> bool {
+        self.platform_version == self.stack.platform_version
+    }
+
+    /// The `SolutionStackName` this version is reported under.
+    pub fn name(&self) -> String {
+        solution_stack_name_of(self.stack.branch_name, &self.platform_version)
+    }
+
+    /// The `PlatformArn` this version is named by in `region`.
+    pub fn platform_arn(&self, region: &str) -> String {
+        platform_arn_of(region, self.stack.branch_name, &self.platform_version)
+    }
+
+    /// The modelled `PlatformDescription` for this version.
+    pub fn to_description(
+        &self,
+        region: &str,
+        store: &ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState,
+    ) -> PlatformDescription {
+        self.stack
+            .to_description(region, store, &self.platform_version)
+    }
+}
+
 /// The published managed platform version `platform_arn` names in `region`, if
 /// the catalog publishes one.
 ///
 /// This is the other half of resolving a `PlatformArn`: a CUSTOM version lives in
 /// [`ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState::platform_versions`],
 /// a MANAGED one in [`SOLUTION_STACKS`], and an ARN that answers to neither names
-/// no platform version this service can launch.
-pub fn managed_platform_version(region: &str, platform_arn: &str) -> Option<&'static SolutionStack> {
-    SOLUTION_STACKS
-        .iter()
-        .find(|stack| stack.platform_arn(region) == platform_arn)
+/// no platform version this service can launch. Every version the catalog
+/// publishes resolves here, not only each branch's newest one, so an environment
+/// can be launched on the release a branch's current version superseded — which
+/// is what having a platform update available means.
+pub fn managed_platform_version(region: &str, platform_arn: &str) -> Option<ManagedPlatformVersion> {
+    SOLUTION_STACKS.iter().find_map(|stack| {
+        stack
+            .published_versions()
+            .into_iter()
+            .find(|platform_version| {
+                platform_arn_of(region, stack.branch_name, platform_version) == platform_arn
+            })
+            .map(|platform_version| ManagedPlatformVersion {
+                stack,
+                platform_version,
+            })
+    })
 }
 
 /// The published managed platform version reported under the
@@ -842,7 +975,10 @@ pub fn managed_platform_version(region: &str, platform_arn: &str) -> Option<&'st
 /// A solution stack name and a platform version ARN name the SAME platform
 /// version from the one catalog ([`SOLUTION_STACKS`]), so an operation handed
 /// either one resolves the other through here rather than reporting only the
-/// form the caller happened to use.
+/// form the caller happened to use. The names this resolves are the ones
+/// `ListAvailableSolutionStacks` offers — each branch's current version — so a
+/// superseded release is named by its ARN, the form `ListPlatformVersions`
+/// reports it under.
 pub fn solution_stack_named(name: &str) -> Option<&'static SolutionStack> {
     SOLUTION_STACKS.iter().find(|stack| stack.name() == name)
 }
@@ -2181,8 +2317,33 @@ pub fn configuration_platform(
     solution_stack_name: Option<&str>,
     platform_arn: Option<&str>,
 ) -> Option<&'static SolutionStack> {
+    // The option catalog is the BRANCH's: every version of a branch publishes
+    // the same configuration options, so the branch's catalog row answers for
+    // whichever of its versions the request named.
+    named_platform_version(region, solution_stack_name, platform_arn).map(|version| version.stack)
+}
+
+/// The managed platform version a request names, by either of the two names a
+/// platform version has: its `SolutionStackName` or its `PlatformArn`.
+///
+/// The ONE place that resolution is written, so every operation that reports
+/// BOTH names for the version an environment or a configuration runs reports two
+/// names of the SAME version — a request naming the release a branch's current
+/// version superseded gets that release's solution stack name back, not the
+/// newer one's. A `SolutionStackName` names the version
+/// `ListAvailableSolutionStacks` offers under it; an ARN names whichever of the
+/// branch's published versions it belongs to.
+pub fn named_platform_version(
+    region: &str,
+    solution_stack_name: Option<&str>,
+    platform_arn: Option<&str>,
+) -> Option<ManagedPlatformVersion> {
     solution_stack_name
         .and_then(solution_stack_named)
+        .map(|stack| ManagedPlatformVersion {
+            stack,
+            platform_version: stack.platform_version.to_string(),
+        })
         .or_else(|| platform_arn.and_then(|arn| managed_platform_version(region, arn)))
 }
 
@@ -5555,32 +5716,44 @@ pub fn platform_branch_named<'a>(
 /// operating system it runs on, the add-ons it supports, its branch and the
 /// life-cycle state of version and branch — so a client filtering or displaying
 /// on one of them reads the same value `DescribePlatformVersion` reports.
-/// `PlatformLifecycleState` is [`PLATFORM_LIFECYCLE_RECOMMENDED`] for every
-/// entry because the catalog publishes exactly one version per branch, so each
-/// published version IS its branch's recommended one. A stack whose branch the
-/// store does not hold is not published: a version of a branch nobody can see is
-/// not available to the account either.
+/// `PlatformLifecycleState` is [`PLATFORM_LIFECYCLE_RECOMMENDED`] on each
+/// branch's NEWEST release and absent on the release it superseded, which the
+/// catalog publishes beside it ([`SolutionStack::published_versions`]). A stack
+/// whose branch the store does not hold is not published: a version of a branch
+/// nobody can see is not available to the account either.
 pub fn managed_platform_listings(
     region: &str,
     branches: &BTreeMap<String, PlatformBranch>,
 ) -> Vec<ListedPlatformVersion> {
     SOLUTION_STACKS
         .iter()
-        .filter_map(|stack| {
+        .flat_map(|stack| {
+            stack
+                .published_versions()
+                .into_iter()
+                .map(move |platform_version| ManagedPlatformVersion {
+                    stack,
+                    platform_version,
+                })
+        })
+        .filter_map(|version| {
+            let stack = version.stack;
             let branch = platform_branch_named(branches, stack.branch_name)?;
             let operating_system = stack.operating_system();
             Some(ListedPlatformVersion {
                 summary: PlatformSummary {
-                    platform_arn: Some(stack.platform_arn(region)),
+                    platform_arn: Some(version.platform_arn(region)),
                     platform_owner: Some(MANAGED_PLATFORM_OWNER.to_string()),
                     platform_status: Some(PLATFORM_STATUS_READY.to_string()),
-                    platform_version: Some(stack.platform_version.to_string()),
+                    platform_version: Some(version.platform_version.clone()),
                     platform_branch_name: Some(branch.branch_name.clone()),
                     platform_branch_lifecycle_state: Some(reported_branch_lifecycle_state(
                         &branch.lifecycle_state,
                     )),
                     supported_tier_list: Some(branch.supported_tiers.clone()),
-                    platform_lifecycle_state: Some(PLATFORM_LIFECYCLE_RECOMMENDED.to_string()),
+                    platform_lifecycle_state: version
+                        .is_recommended()
+                        .then(|| PLATFORM_LIFECYCLE_RECOMMENDED.to_string()),
                     platform_category: Some(stack.platform_category.to_string()),
                     operating_system_name: operating_system.map(|(name, _)| name.to_string()),
                     operating_system_version: operating_system

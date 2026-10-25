@@ -60,6 +60,7 @@ pub mod get_resource_policy_types;
 pub mod get_runtime_management_config_types;
 pub mod invoke_async_types;
 pub mod invoke_types;
+pub mod invoke_with_response_stream_types;
 pub mod list_aliases_types;
 pub mod list_capacity_providers_types;
 pub mod list_code_signing_configs_types;
@@ -195,6 +196,8 @@ pub use get_runtime_management_config_types::*;
 pub use invoke_async_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use invoke_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use invoke_with_response_stream_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use list_aliases_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

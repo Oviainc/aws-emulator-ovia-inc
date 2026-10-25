@@ -23,6 +23,8 @@ mod app_bundle_refusal_wording;
 mod app_bundle_region_quota;
 #[path = "all/chain_read_not_found_attribution.rs"]
 mod chain_read_not_found_attribution;
+#[path = "all/client_token_region_scope.rs"]
+mod client_token_region_scope;
 #[path = "all/create_app_authorization_contract.rs"]
 mod create_app_authorization_contract;
 #[path = "all/ingestion_deletion.rs"]
