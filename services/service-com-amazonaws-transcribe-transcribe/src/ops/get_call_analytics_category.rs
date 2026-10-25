@@ -144,7 +144,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetCallAnalyticsCategoryErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -157,11 +156,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The Region this request is served in: a regional endpoint reports only the
+        // categories created through it.
+        let region = crate::state::request_region(ctx.parts());
         // REPORTING ONLY, and it writes nothing at all: a category has no status in
         // the model, so nothing about it is ever owed by the clock.
         let store = state.lock();
-        let Some(record) = store.call_analytics_categories.get(&input.category_name) else {
-            // A category this account does not hold is this service's
+        let Some(record) = store
+            .call_analytics_categories
+            .get(&region, &input.category_name)
+        else {
+            // A category this Region does not hold is this service's
             // `BadRequestException` — the shape whose own documentation covers an entity
             // that "doesn't exist", and the one this service's recorded not-found
             // responses carry — not the modelled `NotFoundException`.

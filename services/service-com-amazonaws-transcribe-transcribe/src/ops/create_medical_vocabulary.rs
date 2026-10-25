@@ -225,9 +225,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a new custom medical vocabulary with the same name as an existing custom
         // medical vocabulary, you get a ConflictException error." Checked and
         // inserted under one lock, so N concurrent creates of one name have exactly
-        // one winner. The name is unique within THIS family: a medical vocabulary and
-        // a custom vocabulary are two resource types, each with its own ARN.
-        if store.medical_vocabularies.contains_key(&input.vocabulary_name) {
+        // one winner. The name is unique within THIS family and within ONE Region: a
+        // medical vocabulary and a custom vocabulary are two resource types, each with
+        // its own ARN, and a regional endpoint serves only its own Region's resources.
+        if store
+            .medical_vocabularies
+            .contains(&region, &input.vocabulary_name)
+        {
             return Err(CreateMedicalVocabularyErrorModeled::ConflictException(
                 ConflictException {
                     // As `CreateVocabulary`: the kind, not the caller's name.
@@ -239,7 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if store.medical_vocabularies.len() >= crate::state::MAX_VOCABULARIES {
+        if store.medical_vocabularies.len_in(&region) >= crate::state::MAX_VOCABULARIES {
             return Err(CreateMedicalVocabularyErrorModeled::LimitExceededException(
                 LimitExceededException {
                     message: Some(format!(
@@ -253,13 +257,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The Region comes from the request's own (unauthenticated) credential scope,
+        // so the per-Region quota above bounds the store only together with a cap on how
+        // many Regions it keeps medical vocabularies for (see
+        // [`crate::state::MAX_REGIONS`]).
+        if store.medical_vocabularies.region_bucket_exhausted(&region) {
+            return Err(CreateMedicalVocabularyErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(crate::state::region_capacity_message(
+                        crate::state::FAMILY_MEDICAL_VOCABULARIES,
+                        &region,
+                    )),
+                },
+            )
+            .into());
+        }
+
         let sequence = store.next_sequence();
         let record = crate::state::MedicalVocabularyRecord::pending(
             input.vocabulary_name.clone(),
             sequence,
             input.language_code,
             input.vocabulary_file_uri,
-            region,
+            region.clone(),
             input.tags.unwrap_or_default(),
             now,
         );
@@ -278,7 +298,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state = %record.state,
             "custom medical vocabulary recorded; its file is not read"
         );
-        store.medical_vocabularies.insert(record.name.clone(), record);
+        let name = record.name.clone();
+        store.medical_vocabularies.insert(&region, &name, record);
 
         Ok(output)
     }

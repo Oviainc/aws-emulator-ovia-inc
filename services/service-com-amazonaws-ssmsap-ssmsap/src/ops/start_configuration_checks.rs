@@ -173,6 +173,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // How many checks one request may name, re-stated in this crate before the
+        // checks are resolved or any record is filed, so the work this request causes is
+        // bounded by a check here rather than by the request body's size.
+        crate::state::configuration_checks_within_bounds(input.configuration_check_ids.as_deref())
+            .map_err(StartConfigurationChecksErrorModeled::ValidationException)?;
+
         let checks =
             crate::state::configuration_checks_to_run(input.configuration_check_ids.as_deref());
 

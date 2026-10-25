@@ -40,7 +40,7 @@ use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
     SYNC_JOB_STATE_ERROR, SYNC_SOURCE_SITEWISE, MAX_PAGE_SIZE,
 };
 
-use crate::harness::{seed_sync_job, sync_job_arn, workspace_arn, Emulator, Resp};
+use crate::harness::{seed_sync_job, sync_job_arn, workspace_arn, Emulator, Resp, REGION};
 
 /// The role every seeded job carries; the listing does not report it, but a
 /// stored job always has one.
@@ -674,6 +674,7 @@ async fn a_listing_reports_the_state_the_clock_owes_and_changes_nothing_else() {
         emulator
             .state()
             .lock()
+            .region(REGION)
             .workspaces
             .values()
             .map(|workspace| workspace.sync_jobs.len())

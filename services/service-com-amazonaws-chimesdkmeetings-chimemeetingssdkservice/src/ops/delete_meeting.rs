@@ -3,7 +3,10 @@
 //! @op DeleteMeeting
 //! Removes a PERSISTED meeting with every attendee recorded under it and answers 204 with
 //! an empty body, so `GetMeeting`, `ListAttendees` and `CreateAttendee` on that meeting
-//! are all 404 afterwards.
+//! are all 404 afterwards. IDEMPOTENT: the call states an outcome — the meeting named is
+//! gone when it returns — so a delete whose target is already absent removes nothing and
+//! answers the same modelled 204, while every READER of an absent meeting still answers
+//! the modelled `NotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -175,13 +178,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // `forget_meeting` drops the meeting, the attendees nested in it and its
         // `ClientRequestToken` record together, so nothing outlives the meeting it
-        // belongs to and a reused token after a delete creates a fresh meeting.
-        if store.forget_meeting(&input.meeting_id).is_none() {
-            return Err(DeleteMeetingErrorModeled::NotFoundException(
-                crate::state::meeting_not_found(&input.meeting_id),
-            )
-            .into());
-        }
+        // belongs to and a reused token after a delete creates a fresh meeting. It
+        // answers `None` when the id names no meeting, which is the NO-OP case below.
+        //
+        // IDEMPOTENT, and deliberately not a `NotFoundException`: this operation states
+        // an outcome rather than a transition — "the meeting named is gone" — so a caller
+        // asking for an outcome that already holds has asked for nothing, gets the
+        // operation's modelled 204 with an empty body, and leaves the store exactly as it
+        // was. That is the behaviour recorded for a DELETE on a well-formed `GuidString`
+        // that was never created, and it is what makes delete-if-exists teardown and a
+        // retried delete work without a client branching on an error.
+        //
+        // A READER is the other half of the rule and keeps its refusal: `GetMeeting`,
+        // `ListAttendees` and `CreateAttendee` on an absent meeting all answer the
+        // modelled `NotFoundException`, because each of those has a value to report or a
+        // record to attach and there is no meeting to take it from.
+        store.forget_meeting(&input.meeting_id);
         Ok(DeleteMeetingOutput)
     }
 }

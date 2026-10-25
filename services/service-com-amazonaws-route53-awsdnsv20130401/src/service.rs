@@ -24,8 +24,10 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. Route 53 states every such refusal under the
-//!   `InvalidInput` code its model declares; see the inline note on that method.
+//!   before any handler ran. Route 53 states such a refusal under the
+//!   `InvalidInput` code its model declares, except where the value refused is
+//!   one the service RESOLVES rather than one the request has to have; see the
+//!   inline note on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -57,10 +59,47 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+use aws_smithy_schema_server::{Violation, ViolationKind};
+
 /// The wire error code Route 53 refuses an input it cannot use with — the
 /// `InvalidInput` (HTTP 400) its model declares, which is the code a client
 /// branches on for every input-level refusal this service answers.
 const INVALID_INPUT: &str = "InvalidInput";
+
+/// The wire error code Route 53 refuses a change batch with once the request
+/// itself has been read — `InvalidChangeBatch` (HTTP 400), whose own
+/// documentation is a LIST of "error messages. Each error message indicates one
+/// error in the change batch".
+const INVALID_CHANGE_BATCH: &str = "InvalidChangeBatch";
+
+/// The validation path of a record set's `Region`, as the framework spells a
+/// member path (lowerCamel, dotted, with `member` for a step out of a
+/// collection): `changeBatch.changes.<n>.member.resourceRecordSet.region`.
+const RECORD_SET_REGION_PATH: &str = "resourceRecordSet.region";
+
+/// The regions a change batch was refused over, when THAT is what it was
+/// refused over, in the order the batch named them.
+///
+/// `ResourceRecordSet$Region` is a modelled enum of Amazon EC2 Regions, so the
+/// framework's constraint walk refuses a value outside that set before any
+/// handler runs — but a region is something Route 53 RESOLVES while it
+/// evaluates the batch, not a shape the request has to have: the region a
+/// latency record set routes from is looked up, and a value that resolves to no
+/// region fails that lookup rather than the request's shape. It is therefore
+/// stated as a change-batch problem naming the region that could not be found,
+/// and only when every refused value is one of those: a batch that also broke a
+/// rule of its own shape is still a request fault.
+fn unresolvable_regions(violations: &[Violation]) -> Option<Vec<String>> {
+    let regions: Vec<String> = violations
+        .iter()
+        .filter(|violation| {
+            matches!(violation.kind, ViolationKind::EnumValue(_))
+                && violation.path.ends_with(RECORD_SET_REGION_PATH)
+        })
+        .filter_map(|violation| violation.value.clone())
+        .collect();
+    (!regions.is_empty() && regions.len() == violations.len()).then_some(regions)
+}
 
 /// The `com-amazonaws-route53-awsdnsv20130401` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -142,13 +181,34 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // constraint: <requirement>`, built from the request. Only the code a
         // client branches on is this service's to choose, so the envelope is
         // taken from the framework rather than restated here.
+        //
+        // The ONE exception is a value this service RESOLVES rather than one the
+        // request has to have — see [`unresolvable_regions`].
         match refusal {
-            Refusal::Invalid(violations) => Some(Refused {
-                code: INVALID_INPUT.to_string(),
-                // `None` when there are no violations to state, which keeps the
-                // framework's own wording rather than answering an empty message.
-                message: aws_smithy_schema_server::envelope(violations)?,
-            }),
+            Refusal::Invalid(violations) => {
+                // A region that resolves to no Amazon EC2 Region is refused by
+                // the region LOOKUP a change batch does, not by the request's
+                // shape, so it is stated as the change-batch problem it is —
+                // rendered as a list, in brackets, the way this service states
+                // the problems of one batch.
+                if let Some(regions) = unresolvable_regions(violations) {
+                    let problems: Vec<String> = regions
+                        .iter()
+                        .map(|region| format!("Cannot find region '{region}'. No changes made."))
+                        .collect();
+                    return Some(Refused {
+                        code: INVALID_CHANGE_BATCH.to_string(),
+                        message: format!("[{}]", problems.join(", ")),
+                    });
+                }
+                Some(Refused {
+                    code: INVALID_INPUT.to_string(),
+                    // `None` when there are no violations to state, which keeps
+                    // the framework's own wording rather than answering an empty
+                    // message.
+                    message: aws_smithy_schema_server::envelope(violations)?,
+                })
+            }
             // An unauthenticated caller is not an input problem at all: keep the
             // framework's 403 code and wording.
             Refusal::Unauthenticated => None,

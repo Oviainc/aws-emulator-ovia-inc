@@ -411,6 +411,27 @@ impl ComAmazonawsPcaconnectorscepPcaconnectorscepState {
         }
     }
 
+    /// The tags of the connector or challenge `resource_arn` names, to WRITE, or `None` when
+    /// this service holds no resource under that ARN.
+    ///
+    /// The mutable twin of [`tags_of`], reaching the same single map on the same record, so a
+    /// tag written through here is the one a listing reads back and is dropped with the
+    /// resource rather than lingering in a second table.
+    pub fn tags_of_mut(&mut self, resource_arn: &str) -> Option<&mut BTreeMap<String, String>> {
+        match connector_arn_of_challenge(resource_arn) {
+            Some(connector_arn) => self
+                .connectors
+                .get_mut(connector_arn)?
+                .challenges
+                .get_mut(resource_arn)
+                .map(|challenge| &mut challenge.tags),
+            None => self
+                .connectors
+                .get_mut(resource_arn)
+                .map(|connector| &mut connector.tags),
+        }
+    }
+
     /// The record a still-live `ClientToken` of `CreateConnector` is bound to.
     pub fn connector_for_token(&self, client_token: Option<&str>) -> Option<IdempotencyRecord> {
         client_token

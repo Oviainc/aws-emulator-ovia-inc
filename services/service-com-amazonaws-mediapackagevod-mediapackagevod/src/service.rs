@@ -39,11 +39,47 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## How an answer that carries no content is framed
+//!
+//! Several operations here answer `204 No Content`: each of the three deletes serves that
+//! recorded status (`DeleteAsset`, `DeletePackagingConfiguration`,
+//! `DeletePackagingGroup` — see each operation's `SUCCESS_STATUS`), and `TagResource` and
+//! `UntagResource` are modelled with it (`smithy_query(query="digest")`). Such an answer
+//! carries no content at all, and the length it does have is stated:
+//! `content-length: 0`.
+//!
+//! Two things stand between the protocol's serializer and that answer. The three deletes
+//! declare an output STRUCTURE with no members rather than `smithy.api#Unit`, and the
+//! serializer renders that structure as the empty JSON object `{}` — a body on a response
+//! that has none, which RFC 9110 §15.3.5 gives a 204 no room for. And a response the
+//! serializer leaves with an empty body carries no framing header, which leaves the length
+//! to the transport — so a client, proxy or SDK transport that keys on a framing header
+//! being present on a bodyless response reads the emulator's reply differently from the
+//! service's.
+//!
+//! `override_protocol` below therefore serves a protocol that is the model's own in every
+//! respect except one: a `204` this service answers carries no body, whatever the
+//! serializer rendered for it, and a response this service serializes with an EMPTY body
+//! states `content-length: 0`. A response that carries content is left exactly as the
+//! model's protocol renders it, framed from the body it carries. It is done here, at the
+//! one place every response of this service passes through, rather than per operation.
+//!
+//! That framing is what this service answers, and it is what the in-process front door
+//! delivers (the inter-service callback path and the SDK connector both serve the router's
+//! response unchanged). An answer served over HTTP/1.1 reaches the client without the
+//! header: the HTTP writer the vendored transport uses removes `content-length` from a
+//! `204`, which that same section forbids there, and that writer is below anything this
+//! crate decides. `tests/all/empty_response_framing.rs` pins what this service states.
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+use aws_smithy_runtime_api::http::{Request as WireRequest, Response as WireResponse};
+use aws_smithy_schema::Schema;
+use aws_smithy_schema_server::{ProtocolError, ServerProtocol};
 
 /// The `com-amazonaws-mediapackagevod-mediapackagevod` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -62,6 +98,120 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(engine),
         }
+    }
+}
+
+/// The status whose answer carries NO content, whatever a renderer wrote for it, and the
+/// length such an answer states. See the module docs.
+const NO_CONTENT_STATUS: u16 = 204;
+const NO_CONTENT_LENGTH: &str = "0";
+
+/// How an answer that carries no content is framed: with no body at all, and with the
+/// `content-length: 0` that states the length it has, rather than with no framing header.
+/// See the module docs.
+///
+/// A response that carries content is untouched: it keeps the body the protocol rendered
+/// and the framing that body already has.
+fn frame_empty_body(response: &mut WireResponse) {
+    if response.status().as_u16() == NO_CONTENT_STATUS {
+        // The empty JSON object the serializer renders for an output structure with no
+        // members goes no further: this status has no content to carry it.
+        *response.body_mut() = aws_smithy_types::body::SdkBody::empty();
+    }
+    if response.body().bytes().is_some_and(<[u8]>::is_empty) {
+        response
+            .headers_mut()
+            .insert("content-length", NO_CONTENT_LENGTH);
+    }
+}
+
+/// The protocol this service answers modelled requests in: the model's own, with the one
+/// framing correction the module docs state.
+///
+/// Implemented on the service itself because the model-derived protocol it delegates to is
+/// owned by the generated entry and reached by reference (`self.entry.protocol()`), and
+/// [`Service::override_protocol`] hands back a borrow of `&self` — so there is one protocol
+/// instance, the generated one, and no second routing table to drift from the model.
+impl<Eng: Send + Sync + 'static> ServerProtocol for EmulatedService<Eng> {
+    type Request = WireRequest;
+    type Response = WireResponse;
+
+    fn protocol_id(&self) -> &aws_smithy_schema::ShapeId {
+        self.entry.protocol().protocol_id()
+    }
+
+    fn routing_key<'a>(&self, request: &'a WireRequest) -> Result<&'a str, ProtocolError> {
+        self.entry.protocol().routing_key(request)
+    }
+
+    fn deserialize_input<'a>(
+        &self,
+        request: &'a WireRequest,
+        input_schema: &Schema,
+    ) -> Result<Box<dyn aws_smithy_schema::serde::ShapeDeserializer + 'a>, ProtocolError> {
+        self.entry.protocol().deserialize_input(request, input_schema)
+    }
+
+    fn serialize_output(
+        &self,
+        output: &dyn aws_smithy_schema::serde::SerializableStruct,
+        output_schema: &Schema,
+        operation_name: &str,
+        success_status: u16,
+    ) -> Result<WireResponse, ProtocolError> {
+        let mut response = self.entry.protocol().serialize_output(
+            output,
+            output_schema,
+            operation_name,
+            success_status,
+        )?;
+        // The status and every other header are the protocol's: only an answer that
+        // carries no content is emptied of the body rendered for it and framed.
+        frame_empty_body(&mut response);
+        Ok(response)
+    }
+
+    fn serialize_error(
+        &self,
+        error: &dyn aws_smithy_schema::serde::SerializableStruct,
+        error_schema: &Schema,
+        error_code: &str,
+        http_status: u16,
+    ) -> Result<WireResponse, ProtocolError> {
+        let mut response = self
+            .entry
+            .protocol()
+            .serialize_error(error, error_schema, error_code, http_status)?;
+        // Every modelled failure of this service carries a JSON error envelope at a 4xx or
+        // 5xx, so nothing here is emptied or reframed; the same call is made on both paths
+        // rather than leaving one of them to answer differently.
+        frame_empty_body(&mut response);
+        Ok(response)
+    }
+
+    fn serialize_event_stream_message(
+        &self,
+        event_type: &str,
+        is_exception: bool,
+        event: &dyn aws_smithy_schema::serde::SerializableStruct,
+        event_schema: &Schema,
+    ) -> Result<WireResponse, ProtocolError> {
+        self.entry.protocol().serialize_event_stream_message(
+            event_type,
+            is_exception,
+            event,
+            event_schema,
+        )
+    }
+}
+
+/// `ServerProtocol` requires `Debug`; the generated entry is not `Debug`, so this names the
+/// protocol being served rather than the service's internals.
+impl<Eng: Send + Sync + 'static> std::fmt::Debug for EmulatedService<Eng> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmulatedService")
+            .field("protocol", &self.entry.protocol().protocol_id())
+            .finish()
     }
 }
 
@@ -107,6 +257,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // leaving both alone.
         let _ = refusal;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // Every response a modelled operation of this service produces is serialized by
+        // the protocol returned here. See the module docs: it is the model's own protocol,
+        // with one correction — an answer that carries no content carries no body and
+        // states `content-length: 0`, instead of an empty JSON object and no framing
+        // header at all.
+        Some(self)
     }
 
     fn override_routing_error(

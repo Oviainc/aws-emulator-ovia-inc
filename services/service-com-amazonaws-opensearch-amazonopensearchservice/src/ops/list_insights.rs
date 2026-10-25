@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInsights
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInsights`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInsights::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the insights the entity a request names holds ([`crate::state::InsightRecord`])
+//! — a page of them per call, ordered by the instant each insight was raised and
+//! narrowed to the time range the request asks for, resumed by the token the previous
+//! page handed out. It only REPORTS: an insight is raised by the service observing a
+//! domain, never by a read of the set.
 //!
 //! ## Shape of an operation
 //!
@@ -93,6 +90,29 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{epoch_millis, invalid_next_token, InsightEntityRefusal, InsightRecord};
+
+/// The largest page this operation answers with, and the page size a request that
+/// names none gets: `MaxResults` is `@range(min: 1, max: 500)` — "valid values are 1
+/// to 500" — so 500 insights is the most any request can ask for.
+const MAX_PAGE: usize = 500;
+
+/// The page sizes `MaxResults` admits, as the modelled member's own type, for the
+/// bound check below.
+const PAGE_SIZE_RANGE: ::std::ops::RangeInclusive<i32> = 1..=500;
+
+/// `InsightSortOrder`'s values: "`ASC` (ascending) and `DESC` (descending)".
+const SORT_ASCENDING: &str = "ASC";
+/// See [`SORT_ASCENDING`].
+const SORT_DESCENDING: &str = "DESC";
+
+/// The order a listing reports its insights in when the request names none.
+///
+/// The model gives `SortOrder` no default, so this is the emulator's own: the newest
+/// insight is the one a caller polling for insights has not seen yet, so a request
+/// that expresses no preference gets the most recent first.
+const DEFAULT_SORT_ORDER: &str = SORT_DESCENDING;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -166,18 +186,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInsights` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInsightsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInsights"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        // `MaxResults` is `@range(min: 1, max: 500)`, so a page size outside that is a
+        // malformed request; the boundary validator refuses it before this handler
+        // runs, and the check is repeated here so the rule holds however the request
+        // reached us. A request that names NO page size asks for no particular bound
+        // and gets the largest page the model allows.
+        if let Some(max_results) = input.max_results {
+            if !PAGE_SIZE_RANGE.contains(&max_results) {
+                return Err(ListInsightsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "MaxResults must be between {} and {}: {max_results}",
+                            PAGE_SIZE_RANGE.start(),
+                            PAGE_SIZE_RANGE.end()
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "The sort order for the results": the listing is ordered by the instant each
+        // insight was raised — the only instant every insight carries — so this says
+        // whether the oldest or the newest comes first. A value outside
+        // `InsightSortOrder` is no sort order at all, so it is refused rather than
+        // reinterpreted.
+        let sort_order = input.sort_order.as_deref().unwrap_or(DEFAULT_SORT_ORDER);
+        let newest_first = if sort_order == SORT_DESCENDING {
+            true
+        } else if sort_order == SORT_ASCENDING {
+            false
+        } else {
+            return Err(ListInsightsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "SortOrder {sort_order} is not supported. Supported values are \
+                         {SORT_ASCENDING} and {SORT_DESCENDING}."
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "The time range for filtering insights, specified as epoch millisecond
+        // timestamps": the window an insight's creation instant must fall in to be
+        // reported, both ends included. A window that ends before it starts holds no
+        // instant at all, so it is a malformed request rather than an empty page.
+        if let Some(time_range) = &input.time_range {
+            if time_range.from > time_range.to {
+                return Err(ListInsightsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "TimeRange From {} must not be after TimeRange To {}.",
+                            time_range.from, time_range.to
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let store = state.lock();
+
+        // The listing belongs to the entity the request names, and resolving that
+        // entity is the store's one decision ([`crate::state::ComAmazonawsOpensearchAmazonopensearchserviceState::insights_of_entity`]),
+        // so a domain this account does not hold has no listing rather than an empty
+        // one.
+        let held = store
+            .insights_of_entity(&input.entity)
+            .map_err(|refusal| match refusal {
+                InsightEntityRefusal::NotFound(payload) => {
+                    ListInsightsErrorModeled::ResourceNotFoundException(payload)
+                }
+                InsightEntityRefusal::Validation(payload) => {
+                    ListInsightsErrorModeled::ValidationException(payload)
+                }
+            })?;
+
+        let mut insights: Vec<&InsightRecord> = held
+            .into_iter()
+            .filter(|record| {
+                input.time_range.as_ref().is_none_or(|time_range| {
+                    let raised = epoch_millis(record.created_at);
+                    (time_range.from..=time_range.to).contains(&raised)
+                })
+            })
+            .collect();
+
+        // "The timestamp when the insight was created" is what orders the listing, the
+        // insight id breaking a tie, so two reads of the same records report the same
+        // order — which is what lets a token name a place in the set.
+        insights.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.insight_id.cmp(&right.insight_id))
+        });
+        if newest_first {
+            insights.reverse();
+        }
+
+        // The token names the insight the next page starts AT, so a caller resumes
+        // exactly where the previous page stopped rather than at an offset a newly
+        // raised or resolved insight would have shifted. It is only ever a value this
+        // operation handed out for the same entity, time range and sort order, so one
+        // that names no insight of this listing — one this service never minted, one
+        // whose insight has since been released, or one carried over from another
+        // entity's listing — is the modelled refusal.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => insights
+                .iter()
+                .position(|record| record.insight_id == token)
+                .ok_or_else(|| {
+                    ListInsightsErrorModeled::ValidationException(invalid_next_token())
+                })?,
+        };
+
+        // "An optional parameter that specifies the maximum number of results to
+        // return": a request that asks for no particular page size gets the largest
+        // page this operation answers with rather than an empty one.
+        let page_size = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .map_or(MAX_PAGE, |size| size.min(MAX_PAGE));
+        let end = start.saturating_add(page_size).min(insights.len());
+
+        Ok(ListInsightsOutput {
+            insights: Some(
+                insights
+                    .iter()
+                    .skip(start)
+                    .take(page_size)
+                    .map(|record| record.to_insight())
+                    .collect(),
+            ),
+            // "When NextToken is returned, there are more results available": the token
+            // is the next insight in the listing, and there is none once this page
+            // ended it.
+            next_token: insights
+                .get(end)
+                .map(|record| record.insight_id.clone()),
+        })
     }
 }

@@ -289,6 +289,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         if let Some(stack) = store.resolve_mut(&request_region, &stack_id) {
+            // The resources' own transitions come BEFORE the stack's terminal event: the
+            // event stream is what the deletion did, in the order it did it.
+            stack.record_resource_events(&deleted.transitions);
             // What is left: a resource whose deletion the owning service carried out no
             // longer carries `materialised`, so a retried delete does not ask for it
             // again.

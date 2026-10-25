@@ -197,12 +197,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|application| (application.id.clone(), application.id.clone()))
             .collect();
 
-        let page = crate::state::page(matching, input.max_results, input.next_token.as_deref())
-            .map_err(|error| {
-                ListApplicationsErrorModeled::ValidationException(
-                    crate::state::page_validation_exception(&error),
-                )
-            })?;
+        let page = crate::state::page(
+            matching,
+            input.max_results,
+            input.next_token.as_deref(),
+            crate::state::Listing::Applications,
+        )
+        .map_err(|error| {
+            ListApplicationsErrorModeled::ValidationException(
+                crate::state::page_validation_exception(&error),
+            )
+        })?;
 
         let applications: Vec<ApplicationSummary> = page
             .items

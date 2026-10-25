@@ -18,7 +18,10 @@
 
 use serde_json::{json, Value};
 
-use crate::chain_query_slice::{error_code, refusal_explanation, token_json, Emulator, NetworkFixture};
+use crate::chain_query_slice::{
+    error_code, other_chain_address, refusal_explanation, token_json, unseeded_address,
+    unseeded_addresses, Emulator, NetworkFixture,
+};
 use crate::native_token_denomination::{amount_units, holding_decimals};
 
 /// The largest batch the model admits: `GetTokenBalanceInputList` carries
@@ -29,16 +32,14 @@ const MAX_BATCH: usize = 10;
 /// The smallest batch the model admits; see [`MAX_BATCH`].
 const MIN_BATCH: usize = 1;
 
-/// Addresses that satisfy `ChainAddress`'s `^[-A-Za-z0-9]{13,74}$` and that the fixture
-/// ledger holds nothing for. The forms differ: an Ethereum-shaped address, a
-/// base58-shaped one, a hyphenated label and the longest the pattern admits.
-fn strangers() -> Vec<String> {
-    vec![
-        "0x0000000000000000000000000000000000000000".to_string(),
-        "1NotASeededBitcoinAddressAtAll".to_string(),
-        "not-a-seeded-owner".to_string(),
-        "z".repeat(74),
-    ]
+/// Owners the fixture ledger holds no balance for: every well-formed address of
+/// `network`'s own chain that no fixture produced, plus an address of ANOTHER chain —
+/// which is not an address of this network at all, so the two kinds of per-item failure
+/// this operation can report (a missing holding and a refused member) are both rows.
+fn strangers(network: &str) -> Vec<String> {
+    let mut rows = unseeded_addresses(network);
+    rows.push(other_chain_address(network));
+    rows
 }
 
 /// One row of a table: the request item, and a label naming what makes it different.
@@ -166,7 +167,7 @@ fn rows(network: &NetworkFixture) -> Vec<Row> {
         .map(|(key, _)| token_json(name, key))
         .unwrap_or_else(|| panic!("case {name}: the seeded ledger holds no balance"));
 
-    for stranger in strangers() {
+    for stranger in strangers(name) {
         rows.push(Row {
             label: format!("{name}/stranger/{stranger}"),
             item: request_item(first_token.clone(), &stranger, None),
@@ -493,7 +494,10 @@ async fn a_batch_answers_a_repeated_item_once_per_request_item() {
             label: format!("{}/stranger", network.network),
             item: request_item(
                 token_json(&network.network, key),
-                &strangers()[0],
+                // A well-formed address of this network's own chain that the ledger
+                // holds no balance for, so every copy of the row is the SAME missing
+                // holding.
+                &unseeded_address(&network.network),
                 Some(holding.history.last().expect("a balance record").time),
             ),
         };

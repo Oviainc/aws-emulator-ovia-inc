@@ -25,6 +25,8 @@ mod capacity_task_dry_run;
 mod capacity_task_lifecycle;
 #[path = "all/catalog_items.rs"]
 mod catalog_items;
+#[path = "all/delete_conflicts.rs"]
+mod delete_conflicts;
 #[path = "all/dependent_resource_conflict.rs"]
 mod dependent_resource_conflict;
 #[path = "all/error_classification.rs"]

@@ -872,6 +872,15 @@ pub const DISK_SNAPSHOT_PAGE_SIZE: usize = 10;
 /// token is not returned if there are no more results to display."
 pub const EXPORT_SNAPSHOT_RECORD_PAGE_SIZE: usize = 10;
 
+/// How many log entries one `GetOperationsForResource` page carries.
+///
+/// CHOSEN: Lightsail publishes a page size for `GetOperations` only ("Results
+/// are returned from oldest to newest, up to a maximum of 200") and none for
+/// `GetOperationsForResource`, which documents only that "a next page token is
+/// not returned if there are no more results to display". Matches
+/// [`INSTANCE_PAGE_SIZE`], so every listing in this slice pages the same way.
+pub const OPERATIONS_FOR_RESOURCE_PAGE_SIZE: usize = 10;
+
 // ---------------------------------------------------------------------------
 // Catalog paging
 // ---------------------------------------------------------------------------
@@ -10778,6 +10787,54 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// [`MAX_OPERATION_HISTORY`] entries.
     pub fn operation(&self, id: &str) -> Option<&StoredOperation> {
         self.operations.iter().find(|entry| entry.id == id)
+    }
+
+    /// One page of the log entries recorded against `resource_name`, oldest
+    /// first, together with the id of the first entry of the page after it —
+    /// present only while entries remain.
+    ///
+    /// The log is append-only, so an entry outlives the resource it was
+    /// recorded against: a `DeleteInstance` entry is still reported under the
+    /// name of the instance it deleted. Reporting is therefore by NAME over the
+    /// log, never conditional on the resource still existing, and a name the log
+    /// holds nothing for reports an empty page.
+    ///
+    /// A page token NAMES the entry a page starts at (an operation id) rather
+    /// than carrying an index, so an entry appended between two pages cannot
+    /// make the walk skip or repeat another one. `None` is the answer when the
+    /// token names no entry of this resource's slice of the log — there is no
+    /// page to report, which the caller turns into a refusal.
+    ///
+    /// The walk is bounded by [`MAX_OPERATION_HISTORY`].
+    ///
+    /// The page is located over the STORED entries and the modelled view is
+    /// built only for the entries the page actually carries, so a resource with
+    /// a long slice of the log is not viewed in full to answer ten entries.
+    pub fn operations_for_resource_page(
+        &self,
+        resource_name: &str,
+        page_token: Option<&str>,
+    ) -> Option<(Vec<Operation>, Option<String>)> {
+        let reported: Vec<&StoredOperation> = self
+            .operations
+            .iter()
+            .filter(|entry| entry.resource_name == resource_name)
+            .collect();
+        let (page, next_page_token) =
+            catalog_page(
+                &reported,
+                OPERATIONS_FOR_RESOURCE_PAGE_SIZE,
+                page_token,
+                |entry| {
+                    // An entry's token is its own `id`, a member it already holds,
+                    // so the walk LENDS it rather than cloning it.
+                    Some(std::borrow::Cow::Borrowed(entry.id.as_str()))
+                },
+            )?;
+        Some((
+            page.into_iter().map(StoredOperation::view).collect(),
+            next_page_token,
+        ))
     }
 
     /// Append `operation` to the log, dropping the oldest entries past

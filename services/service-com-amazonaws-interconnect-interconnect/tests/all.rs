@@ -23,6 +23,8 @@ mod connection_lifecycle;
 mod connection_proposal;
 #[path = "all/connection_state_progression.rs"]
 mod connection_state_progression;
+#[path = "all/create_connection_attach_point_validation.rs"]
+mod create_connection_attach_point_validation;
 #[path = "all/emulator.rs"]
 mod emulator;
 #[path = "all/list_tags_for_resource.rs"]

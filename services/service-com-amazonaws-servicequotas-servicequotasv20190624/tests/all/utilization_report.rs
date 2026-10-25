@@ -13,6 +13,9 @@
 //! * a started report is `PENDING`, publishes nothing until the clock has made its
 //!   generation due, and then reports `COMPLETED` with the same records however often
 //!   it is read;
+//! * a start while the region's report is still live hands THAT report back — its id
+//!   and the status it carries now — and says so in `Message`, so a caller that
+//!   re-starts converges on one report instead of accumulating them;
 //! * every record in a report agrees, field for field, with what the quota reads
 //!   report for the same `(ServiceCode, QuotaCode)` pair — for EVERY pair in the
 //!   catalog — and carries a `Utilization` exactly when that quota publishes a usage
@@ -20,7 +23,7 @@
 //! * the report is ordered by utilization descending and is walked to the same
 //!   records whatever page size is used, with page boundaries that do not move;
 //! * a report is a SNAPSHOT: an increase approved after it was started does not change
-//!   what it publishes, while the next report picks the new value up;
+//!   what it publishes, while a report started after it picks the new value up;
 //! * a `ReportId` nothing minted, one from another region, and a token from another
 //!   report are each refused with the error the model declares.
 
@@ -161,14 +164,61 @@ async fn catalog(client: &Client) -> BTreeMap<(String, String), (Value, Value)> 
     quotas
 }
 
+/// How many utilization reports the service has stored for `region`, read out of the
+/// one shared engine these callers serve from.
+fn stored_reports(engine: &std::sync::Arc<engine::InMemoryEngine>, region: &str) -> usize {
+    use service_com_amazonaws_servicequotas_servicequotasv20190624::state;
+
+    state::service_state(&**engine)
+        .expect("the service keeps its state in the engine")
+        .lock()
+        .stored_report_count(region)
+}
+
+/// How far through its generation a `ReportStatus` is, so two observations of one
+/// report can be compared without pinning the instant each was made at.
+fn status_rank(status: &str) -> usize {
+    match status {
+        "PENDING" => 0,
+        "IN_PROGRESS" => 1,
+        "COMPLETED" => 2,
+        other => panic!("a report must carry a modelled ReportStatus, got {other:?}"),
+    }
+}
+
+/// A start's `Message` must say whether an existing recent report is being reused —
+/// the one thing the modelled `ReportMessage` is documented to carry — and stay inside
+/// the length the model declares for it (`ReportMessage`, len 0..350).
+fn assert_report_message(started: &Value, reused: bool, case: &str) {
+    let message = started["Message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case}: a start must report a Message, got {started}"));
+    assert!(
+        message.chars().count() <= 350,
+        "case {case}: the Message must stay inside the modelled 0..350 length, got {} \
+         characters",
+        message.chars().count()
+    );
+    assert_eq!(
+        message.to_lowercase().contains("reus"),
+        reused,
+        "case {case}: expected a Message that {} an existing recent report is being \
+         reused, got {message:?}",
+        if reused { "says" } else { "does not say" }
+    );
+}
+
 #[tokio::test]
 async fn a_report_is_pending_when_started_and_completes_on_its_own_clock() {
     let engine = emulator();
-    let client = client(&engine, "us-east-1");
 
-    // Rows: the report is started twice, so the rule is asserted on a report that is
-    // the account's first and on one started while another already exists.
-    for case in ["the first report", "a second report"] {
+    // Rows: two regional endpoints, each holding no report of its own yet, so each
+    // start MINTS one. (A start made where a live report already exists reuses it
+    // instead, which `a_start_reuses_the_live_report_and_mints_only_where_none_exists`
+    // covers.)
+    for region in ["us-east-1", "eu-west-1"] {
+        let client = client(&engine, region);
+        let case = format!("the first report in {region}");
         let started = client.ok("StartQuotaUtilizationReport", json!({})).await;
         let report_id = started["ReportId"]
             .as_str()
@@ -180,6 +230,7 @@ async fn a_report_is_pending_when_started_and_completes_on_its_own_clock() {
             json!("PENDING"),
             "case {case}: a just-initiated report must be PENDING, got {started}"
         );
+        assert_report_message(&started, false, &case);
         // The modelled `ReportId` pattern `^[0-9a-zA-Z][a-zA-Z0-9-]{1,128}$` and its
         // 1..128 length.
         assert!(
@@ -240,34 +291,132 @@ async fn a_report_is_pending_when_started_and_completes_on_its_own_clock() {
     }
 }
 
+/// A start hands back the region's live report instead of minting a second one,
+/// whatever status the clock has brought it to, and says so in `Message`; only a
+/// region holding no live report mints one.
 #[tokio::test]
-async fn two_reports_are_two_resources() {
+async fn a_start_reuses_the_live_report_and_mints_only_where_none_exists() {
     let engine = emulator();
-    let client = client(&engine, "us-east-1");
+    let home = client(&engine, "us-east-1");
+    let elsewhere = client(&engine, "ap-south-1");
 
-    let first = start_report(&client).await;
-    let second = start_report(&client).await;
-    assert_ne!(
-        first, second,
-        "case two starts: each start must mint its own report, got {first} twice"
+    // Nothing to reuse yet, so this start mints a report.
+    let minted = home.ok("StartQuotaUtilizationReport", json!({})).await;
+    let report_id = minted["ReportId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case the first start: expected a ReportId, got {minted}"))
+        .to_string();
+    assert_eq!(
+        minted["Status"],
+        json!("PENDING"),
+        "case the first start: a minted report must be PENDING, got {minted}"
     );
+    assert_report_message(&minted, false, "the first start");
 
-    tokio::time::sleep(PAST_COMPLETION).await;
-
-    // Rows: both reports, each read on its own id.
-    for (case, report_id) in [("the first report", &first), ("the second report", &second)] {
-        let read = client
+    // Rows: a re-start while the report is still generating and one after the clock
+    // has completed it — the statuses a live report can carry.
+    let rows: Vec<(&str, Option<Duration>, Vec<&str>)> = vec![
+        (
+            "a re-start while the report is still generating",
+            None,
+            vec!["PENDING", "IN_PROGRESS"],
+        ),
+        (
+            "a re-start after the report has completed",
+            Some(PAST_COMPLETION),
+            vec!["COMPLETED"],
+        ),
+    ];
+    for (case, wait, expected) in rows {
+        if let Some(wait) = wait {
+            tokio::time::sleep(wait).await;
+        }
+        let restarted = home.ok("StartQuotaUtilizationReport", json!({})).await;
+        assert_eq!(
+            restarted["ReportId"],
+            json!(report_id),
+            "case {case}: expected the live report {report_id}, got {restarted}"
+        );
+        let status = restarted["Status"].as_str().unwrap_or_default().to_string();
+        assert!(
+            expected.contains(&status.as_str()),
+            "case {case}: expected one of {expected:?}, got {status:?}"
+        );
+        // The start answers with the status a read of the same report answers with at
+        // the same moment: it is ONE resource, reached two ways.
+        let read = home
             .ok("GetQuotaUtilizationReport", json!({"ReportId": report_id}))
             .await;
+        // The start and the read are two observations of ONE resource, so the read
+        // (made after the start) is at the same point of its generation or further
+        // along it — never behind, and never a different report.
+        let read_status = read["Status"].as_str().unwrap_or_default();
+        assert!(
+            status_rank(read_status) >= status_rank(&status),
+            "case {case}: a read after the start must not be behind it, got {read_status:?} \
+             after {status:?}"
+        );
         assert_eq!(
             read["ReportId"],
             json!(report_id),
-            "case {case}: a read must answer for the id it was given, got {read}"
+            "case {case}: the start and the read must name one report, got {read}"
         );
+        assert_report_message(&restarted, true, case);
+    }
+
+    // Re-starting over and over converges on the one report rather than accumulating
+    // reports in state.
+    for round in 1..=8 {
+        let again = home.ok("StartQuotaUtilizationReport", json!({})).await;
         assert_eq!(
-            read["Status"],
-            json!("COMPLETED"),
-            "case {case}: expected a completed report, got {read}"
+            again["ReportId"],
+            json!(report_id),
+            "case re-start {round}: expected the live report {report_id}, got {again}"
+        );
+        assert_report_message(&again, true, &format!("re-start {round}"));
+    }
+    let stored = stored_reports(&engine, "us-east-1");
+    assert_eq!(
+        stored, 1,
+        "case eleven starts in one region: expected one stored report, got {stored}"
+    );
+
+    // Reuse is per region, like the rest of this service's mutable state: a region
+    // holding no live report mints its own.
+    let other_region = elsewhere.ok("StartQuotaUtilizationReport", json!({})).await;
+    assert_eq!(
+        other_region["Status"],
+        json!("PENDING"),
+        "case another region's first start: it must mint its own report, got {other_region}"
+    );
+    assert_ne!(
+        other_region["ReportId"],
+        json!(report_id),
+        "case another region's first start: it must not reuse another region's report, \
+         got {other_region}"
+    );
+    assert_report_message(&other_region, false, "another region's first start");
+
+    // Both reports are readable, each at its own endpoint.
+    tokio::time::sleep(PAST_COMPLETION).await;
+    for (case, caller, id) in [
+        ("the first region's report", &home, report_id.clone()),
+        (
+            "the other region's report",
+            &elsewhere,
+            other_region["ReportId"]
+                .as_str()
+                .expect("a minted report reports a ReportId")
+                .to_string(),
+        ),
+    ] {
+        let read = caller
+            .ok("GetQuotaUtilizationReport", json!({"ReportId": id}))
+            .await;
+        assert_eq!(
+            (read["ReportId"].clone(), read["Status"].clone()),
+            (json!(id), json!("COMPLETED")),
+            "case {case}: expected a completed report for the id asked for, got {read}"
         );
     }
 }
@@ -414,40 +563,89 @@ async fn a_report_is_ordered_by_utilization_descending_and_pages_consistently() 
 #[tokio::test]
 async fn a_report_is_a_snapshot_of_the_quotas_when_it_was_started() {
     let engine = emulator();
-    let client = client(&engine, "us-east-1");
-    let pair = json!({"ServiceCode": "vpc", "QuotaCode": "L-F678F1CE"});
-    let key = ("vpc".to_string(), "L-F678F1CE".to_string());
+    let home = client(&engine, "us-east-1");
+    // A second regional endpoint, because two reports take two regions: a start made
+    // where a live report exists reuses it. An increase approved on a quota AWS counts
+    // ACCOUNT-WIDE is in force at every endpoint, so one increase is visible to both
+    // reports' endpoints and the only difference left between them is WHEN each was
+    // started.
+    let elsewhere = client(&engine, "eu-west-1");
 
-    let before_value = client.ok("GetServiceQuota", pair.clone()).await["Quota"]["Value"]
+    // The quota comes out of the catalog rather than being named here: every listed
+    // quota reports `GlobalQuota` and `Adjustable`, which is what this row needs.
+    let listed = walk_pages(
+        &home,
+        "ListServiceQuotas",
+        &json!({"ServiceCode": "iam"}),
+        "Quotas",
+        None,
+    )
+    .await;
+    let quota = listed
+        .iter()
+        .find(|quota| quota["GlobalQuota"] == json!(true) && quota["Adjustable"] == json!(true))
+        .expect("the seeded catalog holds an adjustable account-wide quota");
+    let service_code = quota["ServiceCode"]
+        .as_str()
+        .expect("a listed quota reports its ServiceCode")
+        .to_string();
+    let quota_code = quota["QuotaCode"]
+        .as_str()
+        .expect("a listed quota reports its QuotaCode")
+        .to_string();
+    let pair = json!({"ServiceCode": service_code, "QuotaCode": quota_code});
+    let key = (service_code.clone(), quota_code.clone());
+    let before_value = quota["Value"]
         .as_f64()
-        .expect("the quota reports a Value");
+        .expect("a listed quota reports its Value");
 
-    let before = start_report(&client).await;
+    // Started BEFORE the increase, at the endpoint that does not request it.
+    let before = start_report(&elsewhere).await;
 
-    // An increase approved AFTER the report was started.
     let desired = before_value + 15.0;
-    client
-        .ok(
-            "RequestServiceQuotaIncrease",
-            json!({"ServiceCode": "vpc", "QuotaCode": "L-F678F1CE", "DesiredValue": desired}),
-        )
-        .await;
+    home.ok(
+        "RequestServiceQuotaIncrease",
+        json!({
+            "ServiceCode": service_code,
+            "QuotaCode": quota_code,
+            "DesiredValue": desired,
+        }),
+    )
+    .await;
     tokio::time::sleep(PAST_DECISION).await;
-    assert_eq!(
-        client.ok("GetServiceQuota", pair.clone()).await["Quota"]["Value"].as_f64(),
-        Some(desired),
-        "case the increase: the approved value must be in force before the next report"
-    );
+    // An account-wide quota's approved value is in force at every endpoint, so both
+    // report endpoints see the increase before the next report is started.
+    for (case, caller) in [
+        ("the requesting region", &home),
+        ("another region", &elsewhere),
+    ] {
+        assert_eq!(
+            caller.ok("GetServiceQuota", pair.clone()).await["Quota"]["Value"].as_f64(),
+            Some(desired),
+            "case {case}: the approved value of an account-wide quota must be in force \
+             before the next report"
+        );
+    }
 
-    let after = start_report(&client).await;
+    let after = start_report(&home).await;
+    assert_ne!(
+        before, after,
+        "case two endpoints: each region's first start mints its own report, got \
+         {before} twice"
+    );
     tokio::time::sleep(PAST_COMPLETION).await;
 
     // Rows: the report started before the increase, and the one started after it.
-    for (case, report_id, expected) in [
-        ("started before the increase", &before, before_value),
-        ("started after the increase", &after, desired),
+    for (case, caller, report_id, expected) in [
+        (
+            "started before the increase",
+            &elsewhere,
+            &before,
+            before_value,
+        ),
+        ("started after the increase", &home, &after, desired),
     ] {
-        let records = walk_report(&client, report_id, Some(4)).await;
+        let records = walk_report(caller, report_id, Some(4)).await;
         let record = records
             .iter()
             .find(|record| key_of(record) == key)
@@ -472,9 +670,11 @@ async fn a_report_this_emulator_did_not_mint_is_refused() {
     let home = client(&engine, "us-east-1");
 
     let mine = start_report(&home).await;
-    let other = start_report(&home).await;
+    // Two DIFFERENT reports take two regional endpoints: a second start at one
+    // endpoint reuses that region's live report rather than minting another.
+    let other = start_report(&elsewhere).await;
     tokio::time::sleep(PAST_COMPLETION).await;
-    let token = home
+    let token = elsewhere
         .ok(
             "GetQuotaUtilizationReport",
             json!({"ReportId": other, "MaxResults": 1}),
@@ -552,51 +752,41 @@ async fn a_report_this_emulator_did_not_mint_is_refused() {
     );
 }
 
-/// The report store has a ceiling, and a start past it is refused with the
-/// `TooManyRequestsException` the model declares — per region.
+/// Starting reports in a loop does not inflate the store: each region holds the one
+/// live report a start reuses, so no start is ever refused for a ceiling.
 #[tokio::test]
-async fn the_report_store_is_bounded_and_refuses_past_its_ceiling() {
-    use service_com_amazonaws_servicequotas_servicequotasv20190624::state;
-
+async fn starting_reports_in_a_loop_neither_inflates_the_store_nor_is_refused() {
     let engine = emulator();
-    let elsewhere = client(&engine, "eu-west-1");
-    let home = client(&engine, "us-east-1");
+    // Rows: several regional endpoints, each started on many times over.
+    let regions = ["us-east-1", "eu-west-1", "ap-southeast-2"];
+    let starts_per_region = 60;
 
-    // Fill one region to its ceiling over the wire.
-    let first = start_report(&home).await;
-    for index in 1..state::MAX_LIVE_REPORTS_PER_REGION {
-        let started = home.ok("StartQuotaUtilizationReport", json!({})).await;
+    for region in regions {
+        let caller = client(&engine, region);
+        let first = start_report(&caller).await;
+        for round in 2..=starts_per_region {
+            let started = caller.ok("StartQuotaUtilizationReport", json!({})).await;
+            assert_eq!(
+                started["ReportId"],
+                json!(first),
+                "case start {round} in {region}: expected the live report {first}, got \
+                 {started}"
+            );
+        }
+        let stored = stored_reports(&engine, region);
         assert_eq!(
-            started["Status"],
-            json!("PENDING"),
-            "case start {index}: a start below the ceiling must be accepted, got {started}"
+            stored, 1,
+            "case {starts_per_region} starts in {region}: expected one stored report, got \
+             {stored}"
+        );
+        let read = caller
+            .ok("GetQuotaUtilizationReport", json!({"ReportId": first}))
+            .await;
+        assert_eq!(
+            read["ReportId"],
+            json!(first),
+            "case {region}: the live report must stay readable, got {read}"
         );
     }
-
-    let (status, code) = home.refused("StartQuotaUtilizationReport", json!({})).await;
-    assert_eq!(
-        (status, code.contains("TooManyRequestsException")),
-        (400, true),
-        "case a start past the ceiling: expected HTTP 400 TooManyRequestsException, got \
-         {status} {code}"
-    );
-
-    // A refused start leaves the reports already in the store readable.
-    let read = home
-        .ok("GetQuotaUtilizationReport", json!({"ReportId": first}))
-        .await;
-    assert_eq!(
-        read["ReportId"],
-        json!(first),
-        "case the first report: a refused start must not disturb it, got {read}"
-    );
-
-    // The ceiling is per region, like the rest of this service's mutable state.
-    let accepted = elsewhere.ok("StartQuotaUtilizationReport", json!({})).await;
-    assert_eq!(
-        accepted["Status"],
-        json!("PENDING"),
-        "case another region: its own allowance must be untouched, got {accepted}"
-    );
 }
 

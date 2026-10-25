@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteHsmConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteHsmConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteHsmConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes an HSM configuration from this service's store, so a later
+//! `DescribeHsmConfigurations` naming it answers `HsmConfigurationNotFoundFault`
+//! — the deletion being observable is the whole of what this operation does.
+//! The record's two secret-bearing values (see
+//! [`crate::state::StoredHsmConfiguration`]) leave the store with it.
+//!
+//! A configuration the account cannot drop is refused instead: a configuration a
+//! cluster's `HsmStatus` names is still where that cluster stores its database
+//! encryption keys, so it answers the modelled
+//! `InvalidHsmConfigurationStateFault` and stays in the store.
 //!
 //! ## Shape of an operation
 //!
@@ -96,11 +98,18 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteHsmConfigurationOu
 // here — hence the `DeleteHsmConfigurationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DeleteHsmConfiguration")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DeleteHsmConfiguration",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DeleteHsmConfigurationErrorModeled {
     HsmConfigurationNotFoundFault(HsmConfigurationNotFoundFault),
     InvalidHsmConfigurationStateFault(InvalidHsmConfigurationStateFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -152,20 +161,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteHsmConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteHsmConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteHsmConfiguration"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DeleteHsmConfigurationErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+
+        // The identifier is resolved exactly as the create stored it and as the
+        // read resolves it, so the two can never disagree on which identifiers
+        // name a configuration. One that names none is a refusal, worded as this
+        // service words a delete's not-found fault: the resource, then the
+        // identifier the request carried.
+        let Some(position) = store.hsm_configuration_position(&input.hsm_configuration_identifier)
+        else {
+            return Err(
+                DeleteHsmConfigurationErrorModeled::HsmConfigurationNotFoundFault(
+                    HsmConfigurationNotFoundFault {
+                        message: Some(format!(
+                            "HSM configuration not found: {}",
+                            input.hsm_configuration_identifier
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "still in use by one or more Amazon Redshift clusters": a cluster
+        // configured from this HSM stores its database encryption keys there, so
+        // dropping the configuration under it is refused and nothing is removed.
+        let in_use_by = store.clusters_using_hsm_configuration(&input.hsm_configuration_identifier);
+        if !in_use_by.is_empty() {
+            return Err(
+                DeleteHsmConfigurationErrorModeled::InvalidHsmConfigurationStateFault(
+                    InvalidHsmConfigurationStateFault {
+                        message: Some(format!(
+                            "HSM configuration {} is in use by cluster(s) {}.",
+                            input.hsm_configuration_identifier,
+                            in_use_by.join(", ")
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The record leaves the store, which is what makes the deletion
+        // observable: every later read of this identifier reports it absent, and
+        // the certificate and partition password it held are gone with it.
+        // `remove` keeps the insertion order the `Marker` cursor pages over.
+        store.hsm_configurations.remove(position);
+
+        Ok(DeleteHsmConfigurationOutput)
     }
 }

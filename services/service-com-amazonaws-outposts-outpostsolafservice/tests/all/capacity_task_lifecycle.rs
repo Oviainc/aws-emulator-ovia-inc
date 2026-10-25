@@ -152,7 +152,7 @@ fn progression() -> [&'static str; 3] {
 /// Blocking with `std::thread::sleep` for the same reason
 /// [`crate::site_and_outpost_lifecycle::settle`] does: the workspace's `tokio`
 /// carries no timer driver.
-fn settle_capacity_task() {
+pub(crate) fn settle_capacity_task() {
     std::thread::sleep(2 * CAPACITY_TASK_STEP + std::time::Duration::from_millis(500));
 }
 
@@ -1082,6 +1082,10 @@ fn seed_completed_tasks(outposts: &Outposts, count: usize) {
 
 /// Rule 4, last clause: a capacity task exists only as a task of its Outpost, so
 /// deleting the Outpost takes it with it — and leaves other Outposts' tasks alone.
+///
+/// The tasks are let FINISH first: an Outpost whose task is still outstanding cannot
+/// be deleted at all (`crate::delete_conflicts`), so what this states is what
+/// becomes of a finished task's record.
 #[tokio::test]
 async fn deleting_an_outpost_takes_its_capacity_tasks_with_it() {
     let outposts = Outposts::new();
@@ -1090,6 +1094,7 @@ async fn deleting_an_outpost_takes_its_capacity_tasks_with_it() {
     let request = json!({ "InstancePools": [pool("m5.4xlarge", 1)] });
     let doomed_task = text(&start_ok(&outposts, &doomed, &request).await, "CapacityTaskId");
     let kept_task = text(&start_ok(&outposts, &keeper, &request).await, "CapacityTaskId");
+    settle_capacity_task();
 
     let _ = outposts
         .ok("DELETE", &format!("/outposts/{doomed}"), None)

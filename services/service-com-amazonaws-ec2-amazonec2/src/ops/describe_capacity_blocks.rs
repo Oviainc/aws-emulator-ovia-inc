@@ -356,18 +356,6 @@ fn canonical_filter_name(name: &str) -> Option<&str> {
     CAPACITY_BLOCK_FILTERS.contains(&name).then_some(name)
 }
 
-/// A modelled timestamp as a filter value compares against it: the ISO 8601 UTC rendering
-/// the wire carries it as. A member that is not set carries no value for the filter to
-/// match, like any other absent attribute.
-fn timestamp_values(
-    at: Option<::aws_smithy_types::DateTime>,
-) -> Vec<::std::borrow::Cow<'static, str>> {
-    at.and_then(|at| at.fmt(::aws_smithy_types::date_time::Format::DateTime).ok())
-        .map(::std::borrow::Cow::Owned)
-        .into_iter()
-        .collect()
-}
-
 /// The values the EC2 filter `name` compares against this Capacity Block.
 ///
 /// A filter naming an attribute this block does not carry compares against NO values, so it
@@ -393,9 +381,9 @@ fn filter_values<'a>(block: &'a CapacityBlock, name: &str) -> Vec<::std::borrow:
     match name {
         "availability-zone" => text(block.availability_zone.as_deref()),
         "capacity-block-id" => text(block.capacity_block_id.as_deref()),
-        "create-date" => timestamp_values(block.create_date),
-        "end-date" => timestamp_values(block.end_date),
-        "start-date" => timestamp_values(block.start_date),
+        "create-date" => crate::state::filter_timestamp_values(block.create_date),
+        "end-date" => crate::state::filter_timestamp_values(block.end_date),
+        "start-date" => crate::state::filter_timestamp_values(block.start_date),
         "state" => text(block.state.as_deref()),
         "tag-key" => block
             .tags

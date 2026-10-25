@@ -25,6 +25,11 @@
 //!    request outside a modelled constraint — including one that omits a member the
 //!    model marks `@required` — is 400 `ValidationException`. Neither persists
 //!    anything.
+//! 5. Starting a connection is neither idempotent nor exclusive: nothing in this API
+//!    models a second start as a conflict, so EVERY accepted `StartConnection` adds
+//!    one connection of its own to the store — whatever the request repeats, and
+//!    however many times — and every connection already started stays readable
+//!    exactly as it was, under the id it was given.
 //!
 //! Where the hardware comes from: an asset is a PHYSICAL unit of hardware that
 //! arrives with a fulfilled order, and no order this emulator accepts is ever carried
@@ -196,13 +201,18 @@ fn body(case: &Case) -> Value {
 /// A fresh Outpost on a fresh site with `asset_id` recorded as its hardware,
 /// returning the Outpost's id. See this module's header.
 async fn outpost_holding(outposts: &Outposts, name: &str, asset_id: &str) -> String {
+    outpost_holding_all(outposts, name, &[asset_id]).await
+}
+
+/// The same, for an Outpost holding every asset in `asset_ids` — a rack carries more
+/// than one unit of hardware, and each unit is its own installation.
+async fn outpost_holding_all(outposts: &Outposts, name: &str, asset_ids: &[&str]) -> String {
     let (outpost_id, _) = outposts.site_and_outpost(name).await;
-    record(
-        outposts,
-        &outpost_id,
-        &[asset(asset_id, "rack-1", None, None, None)],
-        name,
-    );
+    let hardware: Vec<_> = asset_ids
+        .iter()
+        .map(|asset_id| asset(asset_id, "rack-1", None, None, None))
+        .collect();
+    record(outposts, &outpost_id, &hardware, name);
     outpost_id
 }
 
@@ -681,5 +691,197 @@ async fn refusals_are_classified_and_persist_nothing() {
     assert_eq!(
         after, before,
         "a refused call must leave the stored connection as it was, got {after}"
+    );
+}
+
+/// One row of rule 5: the hardware the row's Outpost holds, and the sequence of
+/// `StartConnection` payloads it sends against that hardware, in the order it sends
+/// them.
+struct Repeat {
+    case: &'static str,
+    /// Every `AssetId` the row's Outpost holds, in installation order.
+    assets: &'static [&'static str],
+    /// The starts the row sends, each naming one of `assets`.
+    starts: Vec<Value>,
+}
+
+/// The rows of rule 5, differing along everything a repeat can repeat: how many
+/// starts a row sends, whether the payload is byte-for-byte the one before it, which
+/// member changes between them (the client key, the device index, the dongle serial)
+/// and whether two starts name one asset or two assets of one Outpost.
+fn repeats() -> Vec<Repeat> {
+    let key = client_key("E");
+    let other_key = client_key("F");
+    vec![
+        Repeat {
+            case: "the same payload sent twice",
+            assets: &["asset_repeat_same"],
+            starts: vec![
+                start_request("asset_repeat_same", &key, Some("DNG0000010"), Some(0)),
+                start_request("asset_repeat_same", &key, Some("DNG0000010"), Some(0)),
+            ],
+        },
+        Repeat {
+            case: "one asset started three times, a new client key each time",
+            assets: &["asset_repeat_rekeyed"],
+            starts: vec![
+                start_request("asset_repeat_rekeyed", &client_key("0"), None, Some(0)),
+                start_request("asset_repeat_rekeyed", &client_key("1"), None, Some(0)),
+                start_request("asset_repeat_rekeyed", &client_key("2"), None, Some(0)),
+            ],
+        },
+        Repeat {
+            case: "one asset started on each of the two modelled device indices",
+            assets: &["asset_repeat_indices"],
+            starts: vec![
+                start_request("asset_repeat_indices", &other_key, None, Some(0)),
+                start_request(
+                    "asset_repeat_indices",
+                    &other_key,
+                    None,
+                    Some(MAX_DEVICE_INDEX),
+                ),
+            ],
+        },
+        Repeat {
+            case: "one asset started with and then without a dongle serial",
+            assets: &["asset_repeat_serial"],
+            starts: vec![
+                start_request("asset_repeat_serial", &key, Some("DNG0000011"), Some(0)),
+                start_request("asset_repeat_serial", &key, None, Some(0)),
+            ],
+        },
+        Repeat {
+            case: "each of the two assets one Outpost holds, started once",
+            assets: &["asset_repeat_first", "asset_repeat_second"],
+            starts: vec![
+                start_request("asset_repeat_first", &key, None, Some(0)),
+                start_request("asset_repeat_second", &key, None, Some(MAX_DEVICE_INDEX)),
+            ],
+        },
+    ]
+}
+
+/// The `NetworkInterfaceDeviceIndex` a row's payload names. Every row carries one:
+/// the model marks the member `@required`.
+fn requested_index(payload: &Value, case: &str) -> i32 {
+    let index = payload
+        .get("NetworkInterfaceDeviceIndex")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| panic!("case {case:?}: every row names a device index, got {payload}"));
+    i32::try_from(index)
+        .unwrap_or_else(|_| panic!("case {case:?}: the device index is a modelled integer"))
+}
+
+/// Rule 5: every accepted start mints its own connection, and leaves the ones
+/// already started exactly as they were.
+#[tokio::test]
+async fn every_accepted_start_mints_a_connection_of_its_own() {
+    let outposts = Outposts::new();
+    // Every connection id the whole table started, so no two rows may collide
+    // either.
+    let mut minted: Vec<(&str, String)> = Vec::new();
+
+    for (row, repeat) in repeats().iter().enumerate() {
+        outpost_holding_all(&outposts, &format!("repeat-{row}"), repeat.assets).await;
+        // The id of each start of THIS row and the body `GetConnection` answered it
+        // with, so every later start of the row can be checked against them.
+        let mut answered: Vec<(String, Value)> = Vec::new();
+
+        for (nth, payload) in repeat.starts.iter().enumerate() {
+            let before = minted.len();
+            let start = outposts.ok("POST", START_ROUTE, Some(payload)).await;
+            let connection_id = text(&start, "ConnectionId");
+            assert!(
+                is_connection_id(&connection_id),
+                "case {:?} start {nth}: expected a ConnectionId of the modelled form, got \
+                 {connection_id:?}",
+                repeat.case
+            );
+            let held = outposts.store().lock().connections.len();
+            assert_eq!(
+                held,
+                before + 1,
+                "case {:?} start {nth}: an accepted start must add exactly one connection, \
+                 expected {} held, got {held}",
+                repeat.case,
+                before + 1
+            );
+
+            // The new connection reports THIS start's request, not the one before it.
+            let read = outposts.ok("GET", &route(&connection_id), None).await;
+            let details = details_of(&read, repeat.case);
+            assert_eq!(
+                text(&details, "ClientPublicKey"),
+                text(payload, "ClientPublicKey"),
+                "case {:?} start {nth}: the connection must report the client key this start \
+                 sent, got {details}",
+                repeat.case
+            );
+            {
+                let store = outposts.store();
+                let store = store.lock();
+                let persisted = store
+                    .connections
+                    .get(&connection_id)
+                    .unwrap_or_else(|| panic!("case {:?} start {nth}: it persisted", repeat.case));
+                assert_eq!(
+                    persisted.asset_id,
+                    text(payload, "AssetId"),
+                    "case {:?} start {nth}: the record must name the asset this start installs",
+                    repeat.case
+                );
+                assert_eq!(
+                    persisted.device_serial_number.as_deref(),
+                    payload.get("DeviceSerialNumber").and_then(Value::as_str),
+                    "case {:?} start {nth}: the record must keep the dongle serial this start \
+                     named, and none where it named none",
+                    repeat.case
+                );
+                assert_eq!(
+                    persisted.network_interface_device_index,
+                    requested_index(payload, repeat.case),
+                    "case {:?} start {nth}: the record must keep the device index this start \
+                     named",
+                    repeat.case
+                );
+            }
+
+            // Every connection already started is its own, and unchanged.
+            for (earlier, answer) in &answered {
+                assert_ne!(
+                    *earlier, connection_id,
+                    "case {:?} start {nth}: a repeated start must mint a new ConnectionId, got \
+                     the earlier one",
+                    repeat.case
+                );
+                let again = outposts.ok("GET", &route(earlier), None).await;
+                assert_eq!(
+                    &again, answer,
+                    "case {:?} start {nth}: a later start must leave the earlier connection as \
+                     it was, got {again}",
+                    repeat.case
+                );
+            }
+
+            answered.push((connection_id.clone(), read));
+            minted.push((repeat.case, connection_id));
+        }
+    }
+
+    // One connection per accepted start, each under an id of its own, and nothing
+    // else in the store.
+    let distinct: BTreeSet<&String> = minted.iter().map(|(_, id)| id).collect();
+    assert_eq!(
+        distinct.len(),
+        minted.len(),
+        "no two accepted starts may share a ConnectionId, got {minted:?}"
+    );
+    let held = outposts.store().lock().connections.len();
+    assert_eq!(
+        held,
+        minted.len(),
+        "the store must hold one connection per accepted start: expected {} held, got {held}",
+        minted.len()
     );
 }

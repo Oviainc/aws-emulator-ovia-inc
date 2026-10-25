@@ -314,7 +314,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // A Call Analytics job may only apply a custom vocabulary, custom vocabulary
-        // filter or custom language model this account HOLDS — the rule every job
+        // filter or custom language model this REGION holds — the rule every job
         // family's settings follow, see [`crate::state::unheld_reference_error`]. The
         // per-language `LanguageIdSettings` name resources of the same families, so
         // every entry of it is checked too.
@@ -327,16 +327,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &mut references,
             settings.and_then(|settings| settings.language_id_settings.as_ref()),
         );
-        if let Some(message) = store.unheld_reference_error(&references) {
+        if let Some(message) = store.unheld_reference_error(&region, &references) {
             return Err(bad_request(&message));
         }
 
         // "This name is case sensitive, cannot contain spaces, and must be unique
         // within an Amazon Web Services account. If you try to create a new job with
-        // the same name as an existing job, you get a ConflictException error."
+        // the same name as an existing job, you get a ConflictException error." Unique
+        // within ONE Region of that account: a regional endpoint holds only the jobs
+        // started through it.
         if store
             .call_analytics_jobs
-            .contains_key(&input.call_analytics_job_name)
+            .contains(&region, &input.call_analytics_job_name)
         {
             return Err(StartCallAnalyticsJobErrorModeled::ConflictException(
                 ConflictException {
@@ -350,12 +352,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The account's job quota is a CONCURRENCY one, as it is for every job family
-        // here: only the jobs the service is still working on count against
+        // The job quota is a CONCURRENCY one, per account per Region as it is for every
+        // job family here: only the jobs this REGION is still working on count against
         // `crate::state::MAX_CONCURRENT_CALL_ANALYTICS_JOBS`, and a job that has
         // reached a terminal status has released its slot (see
         // [`crate::state::jobs_in_flight`]).
-        if crate::state::jobs_in_flight(&mut store.call_analytics_jobs, now)
+        if crate::state::jobs_in_flight(&mut store.call_analytics_jobs, &region, now)
             >= crate::state::MAX_CONCURRENT_CALL_ANALYTICS_JOBS
         {
             return Err(StartCallAnalyticsJobErrorModeled::LimitExceededException(
@@ -363,6 +365,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(crate::state::concurrency_limit_message(
                         crate::state::MAX_CONCURRENT_CALL_ANALYTICS_JOBS,
                         crate::state::FAMILY_CALL_ANALYTICS_JOBS,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The Region comes from the request's own (unauthenticated) credential scope, so
+        // the concurrency quota above and the retention bound below bound this family's
+        // store only together with a cap on how many Regions it keeps job records for
+        // (see [`crate::state::MAX_REGIONS`]).
+        if store.call_analytics_jobs.region_bucket_exhausted(&region) {
+            return Err(StartCallAnalyticsJobErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(crate::state::region_capacity_message(
+                        crate::state::FAMILY_CALL_ANALYTICS_JOBS,
+                        &region,
                     )),
                 },
             )
@@ -378,7 +396,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             output_location: input.output_location,
             output_encryption_kms_key_id: input.output_encryption_kms_key_id,
             data_access_role_arn: input.data_access_role_arn,
-            region,
+            region: region.clone(),
             settings: input.settings,
             channel_definitions: input.channel_definitions,
             // What the service determines about the call it is given is determined
@@ -405,10 +423,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             region = %record.region,
             "Call Analytics job started"
         );
-        store.call_analytics_jobs.insert(record.name.clone(), record);
+        let name = record.name.clone();
+        store.call_analytics_jobs.insert(&region, &name, record);
         // What keeps the store bounded, since the quota above counts only the jobs in
         // flight (see [`crate::state::evict_oldest_finished_jobs`]).
-        crate::state::evict_oldest_finished_jobs(&mut store.call_analytics_jobs);
+        crate::state::evict_oldest_finished_jobs(&mut store.call_analytics_jobs, &region);
 
         Ok(StartCallAnalyticsJobOutput {
             call_analytics_job: Some(job),

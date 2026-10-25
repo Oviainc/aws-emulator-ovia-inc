@@ -5112,6 +5112,13 @@ pub const JOB_FILTER_JOB_STATUS: &str = "JobStatus";
 /// (`crate::ops::types::RESOURCE_TYPE_VALUES`).
 pub const RESOURCE_TYPE_IDLE: &str = "Idle";
 
+/// The `ResourceType` a commercial software license export job carries, which
+/// `ExportLicenseRecommendations` exports recommendations for
+/// (`crate::ops::types::RESOURCE_TYPE_VALUES`). The `ResourceType` domain, not the
+/// `RecommendationSourceType` one of the same spelling ([`SOURCE_TYPE_LICENSE`]) a findings
+/// catalog row carries.
+pub const RESOURCE_TYPE_LICENSE: &str = "License";
+
 /// How long each step of an export job's lifecycle takes: a created job stays `Queued` for
 /// this long, then runs `InProgress` for this long, then is `Complete`.
 ///

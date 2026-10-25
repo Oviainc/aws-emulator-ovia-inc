@@ -192,6 +192,11 @@ fn source_spec(
         end_date,
         instance_match_criteria: "open".to_string(),
         created_at: SystemTime::now(),
+        // Capacity for immediate use: no requested delivery date, nothing committed to and
+        // no delivery method — the members only a future-dated request names.
+        start_date: None,
+        commitment: None,
+        delivery_preference: None,
         state,
         tags: Vec::new(),
         interruption_info: None,
@@ -1140,15 +1145,16 @@ async fn a_created_reservation_reserves_what_the_request_asked_for() {
 }
 
 /// A request `CreateCapacityReservation` cannot honour is refused with the code that says
-/// why, and a request for a shape this emulator holds no state for answers 501 rather than
-/// blaming the caller.
+/// why, and nothing is written for it. The request shapes this emulator holds no state for
+/// (an Outpost, a cluster placement group) and the rules only a future-dated reservation is
+/// held to are covered in `capacity_reservations.rs`.
 #[tokio::test]
 async fn a_reservation_request_outside_the_published_rules_is_refused() {
     let (router, engine) = super::ec2_query::emulator();
     let before = stored_count(&engine);
 
     // Each row names one published rule.
-    let cases: [RefusalCase; 11] = [
+    let cases: [RefusalCase; 10] = [
         RefusalCase {
             case: "an instance type the model does not carry",
             changes: &[("InstanceType", "c5.enormous")],
@@ -1212,14 +1218,12 @@ async fn a_reservation_request_outside_the_published_rules_is_refused() {
             status: 400,
             code: "InvalidParameterValue",
         },
-        // A future-dated reservation is a delivery schedule and a commitment this emulator
-        // holds no state for, so it answers "nobody has written this yet".
-        RefusalCase {
-            case: "a future-dated reservation",
-            changes: &[("StartDate", "2035-06-01T12:00:00Z")],
-            status: 501,
-            code: "NotImplemented",
-        },
+        // A FUTURE-DATED request is reserved rather than refused now, and the rules only it
+        // is held to — the lead-time window its start date must fall in, the commitment it
+        // must carry, the delivery method AWS supports, the match criteria and the instance
+        // families it may reserve — are asserted in `capacity_reservations.rs`, whose rows
+        // date their start dates off the clock rather than naming an absolute one that
+        // would drift into the window as time passes.
     ];
     for row in cases {
         let RefusalCase {

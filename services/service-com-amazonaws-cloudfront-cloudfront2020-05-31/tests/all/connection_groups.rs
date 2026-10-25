@@ -76,7 +76,10 @@ pub(crate) async fn create_connection_group(router: &MultiServiceRouter, body: &
 }
 
 /// `GET /2020-05-31/connection-group/{Identifier}`.
-async fn get_connection_group(router: &MultiServiceRouter, identifier: &str) -> Answer {
+///
+/// `pub(crate)` for the same reason the create above is: a sibling suite that reads a
+/// group it created back goes through this one wire path rather than growing a copy of it.
+pub(crate) async fn get_connection_group(router: &MultiServiceRouter, identifier: &str) -> Answer {
     call(
         router,
         "GET",
