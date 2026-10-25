@@ -31,9 +31,11 @@
 //!   beside them, so a reported balance can never disagree with the transfers that
 //!   produced it;
 //! * an amount is held in the token's smallest unit and QUOTED in the unit that token is
-//!   denominated in ([`amount_string`]), in one place for every operation that reports
-//!   one, so an event's `value` and the balance it moves agree about the unit as well as
-//!   the quantity;
+//!   denominated in ([`NetworkLedger::amount_string`]) — the currency's own precision for
+//!   a native token, the `decimals` its own contract publishes for a token a contract
+//!   issues — in one place for every operation that reports one, so an event's `value`,
+//!   the balance it moves and the `decimals` the contract itself reports agree about the
+//!   unit as well as the quantity;
 //! * every contract `GetAssetContract` reports is one the network's ledger holds, so an
 //!   address no contract is deployed at is a not-found rather than an invented answer.
 //!
@@ -126,38 +128,36 @@ pub const NATIVE_TOKEN_ETH_DECIMALS: u32 = 18;
 /// native amount in satoshi, 10^8 of which make one bitcoin ([`BTC`]).
 pub const NATIVE_TOKEN_BTC_DECIMALS: u32 = 8;
 
-/// How many decimal places an amount of the token that `(contract_address, token_id)`
-/// names is REPORTED with, the ledger holding every amount in that token's smallest
-/// unit.
+/// How many decimal places an amount of the NATIVE token `token_id` names is reported
+/// with: the precision the currency itself fixes, 10^8 satoshi to the bitcoin and 10^18
+/// wei to the ether.
 ///
-/// A NATIVE token — no contract, and the documented 3-character abbreviation of the
-/// network's own currency as its `tokenId` — has a precision the currency itself fixes,
-/// so an amount of it is quoted in the currency: satoshi as bitcoin, wei as ether. A
-/// token a CONTRACT issues carries its precision in that contract's own metadata, which
-/// is no part of the token's identity here, so such an amount is reported in the
-/// contract's own units exactly as the ledger holds it.
-pub fn amount_decimals(contract_address: Option<&str>, token_id: Option<&str>) -> u32 {
-    match (contract_address, token_id) {
-        (None, Some(NATIVE_TOKEN_BTC)) => NATIVE_TOKEN_BTC_DECIMALS,
-        (None, Some(NATIVE_TOKEN_ETH)) => NATIVE_TOKEN_ETH_DECIMALS,
+/// A native token is named by "the 3 character abbreviation that best matches your token"
+/// (`TokenIdentifier$tokenId`), so anything else is no currency this emulator knows a
+/// subdivision of and its amounts are quoted as held.
+pub fn native_token_decimals(token_id: Option<&str>) -> u32 {
+    match token_id {
+        Some(NATIVE_TOKEN_BTC) => NATIVE_TOKEN_BTC_DECIMALS,
+        Some(NATIVE_TOKEN_ETH) => NATIVE_TOKEN_ETH_DECIMALS,
         _ => 0,
     }
 }
 
-/// Render `amount` — held in the smallest unit of the token `(contract_address,
-/// token_id)` names — as this API denominates it: a fixed-point decimal with
-/// [`amount_decimals`] places, with the fraction's trailing zeros dropped and the point
-/// itself dropped where nothing is left of it, so a whole amount reads as an integer.
+/// The widest subdivision an amount can be quoted at: an amount is held in an `i128`, so
+/// a scale past 10^38 is a factor no amount could be divided by.
+const MAX_AMOUNT_DECIMALS: i32 = 38;
+
+/// Render `amount` — held in the token's smallest unit — as this API denominates it: a
+/// fixed-point decimal with `decimals` places, with the fraction's trailing zeros dropped
+/// and the point itself dropped where nothing is left of it, so a whole amount reads as an
+/// integer.
 ///
 /// The ONE place a token amount becomes a response string, so `TransactionEvent$value`
 /// and the `TokenBalance$balance` that is derived from those same amounts
-/// ([`derive_holdings`]) can never disagree about the unit they are quoted in.
-pub fn amount_string(
-    amount: i128,
-    contract_address: Option<&str>,
-    token_id: Option<&str>,
-) -> String {
-    let decimals = amount_decimals(contract_address, token_id);
+/// ([`derive_holdings`]) can never disagree about the unit they are quoted in. Which
+/// subdivision a given token's amounts are quoted at is
+/// [`NetworkLedger::amount_decimals`].
+pub fn amount_string(amount: i128, decimals: u32) -> String {
     if decimals == 0 {
         return amount.to_string();
     }
@@ -344,8 +344,10 @@ impl StoredTransaction {
     ///
     /// The token the event moves ([`StoredEvent::token`]) settles both `tokenId` — "the
     /// unique identifier for the token involved in the transaction" — and the unit
-    /// `value` is quoted in ([`amount_string`]).
-    pub fn events(&self) -> Vec<TransactionEvent> {
+    /// `value` is quoted in ([`NetworkLedger::amount_decimals`]), which is why the
+    /// ledger holding this transaction is handed in: a contract-issued token's precision
+    /// is published by that contract, which the ledger holds.
+    pub fn events(&self, ledger: &NetworkLedger) -> Vec<TransactionEvent> {
         self.events
             .iter()
             .map(|event| {
@@ -357,7 +359,11 @@ impl StoredTransaction {
                     from: event.from.as_deref().map(derived::normalize_address),
                     to: event.to.as_deref().map(derived::normalize_address),
                     value: event.value.map(|amount| {
-                        amount_string(amount, contract_address.as_deref(), token_id.as_deref())
+                        ledger.amount_string(
+                            amount,
+                            contract_address.as_deref(),
+                            token_id.as_deref(),
+                        )
                     }),
                     contract_address: contract_address
                         .as_deref()
@@ -608,6 +614,9 @@ impl StoredHolding {
 
     /// Project this holding onto the modelled `TokenBalance`.
     ///
+    /// The ledger this holding belongs to settles the network the balance is reported
+    /// under and the unit it is quoted in ([`NetworkLedger::amount_decimals`]).
+    ///
     /// `atBlockchainInstant` is the instant the balance was ASKED for —
     /// `TokenBalance$atBlockchainInstant` is "the time for when the TokenBalance is
     /// requested or the current time if a time is not provided in the request" — while
@@ -616,15 +625,15 @@ impl StoredHolding {
     /// record the balance was read from.
     pub fn token_balance(
         &self,
-        network: &str,
+        ledger: &NetworkLedger,
         key: &HoldingKey,
         asked_at: i64,
         record: BalanceAt,
     ) -> TokenBalance {
         TokenBalance {
             owner_identifier: Some(key.owner_identifier()),
-            token_identifier: Some(key.token_identifier(network)),
-            balance: amount_string(
+            token_identifier: Some(key.token_identifier(&ledger.network)),
+            balance: ledger.amount_string(
                 record.balance,
                 key.contract_address.as_deref(),
                 key.token_id.as_deref(),
@@ -780,6 +789,42 @@ impl NetworkLedger {
         self.contracts.get(&normalize_contract_address(address))
     }
 
+    /// How many decimal places an amount of the token `(contract_address, token_id)`
+    /// names is REPORTED with, this ledger holding every amount in that token's smallest
+    /// unit.
+    ///
+    /// A NATIVE token — no contract, and the documented 3-character abbreviation of the
+    /// network's own currency as its `tokenId` — has a precision the currency itself
+    /// fixes ([`native_token_decimals`]): satoshi are quoted as bitcoin, wei as ether. A
+    /// token a CONTRACT issues subdivides by the `decimals` that contract publishes —
+    /// `ContractMetadata$decimals`, "the decimals used by the token contract", the same
+    /// number `GetAssetContract` reports for it — so its amounts are quoted that many
+    /// places down. A contract this index holds no metadata for publishes no
+    /// subdivision, and a token of such a contract is quoted as held.
+    pub fn amount_decimals(&self, contract_address: Option<&str>, token_id: Option<&str>) -> u32 {
+        match contract_address {
+            None => native_token_decimals(token_id),
+            Some(address) => self
+                .contract(address)
+                .and_then(|contract| contract.metadata.as_ref())
+                .and_then(|metadata| metadata.decimals)
+                .unwrap_or(0)
+                .clamp(0, MAX_AMOUNT_DECIMALS) as u32,
+        }
+    }
+
+    /// `amount` of the token `(contract_address, token_id)` names, as this API quotes it:
+    /// the smallest-unit integer this ledger holds, rendered at the subdivision that
+    /// token publishes ([`NetworkLedger::amount_decimals`], [`amount_string`]).
+    pub fn amount_string(
+        &self,
+        amount: i128,
+        contract_address: Option<&str>,
+        token_id: Option<&str>,
+    ) -> String {
+        amount_string(amount, self.amount_decimals(contract_address, token_id))
+    }
+
     /// Every transaction `address` took part in, in chain order — however the caller
     /// spelled the address ([`derived::normalize_address`]).
     pub fn for_address(&self, address: &str) -> Vec<&StoredTransaction> {
@@ -875,9 +920,9 @@ impl ComAmazonawsManagedblockchainqueryTietonchainqueryserviceState {
 
         let holding = self
             .ledger(&token.network)
-            .and_then(|ledger| ledger.holdings.get(&key));
-        let record = holding.and_then(|holding| holding.balance_at(at));
-        let (holding, record) = match (holding, record) {
+            .and_then(|ledger| ledger.holdings.get(&key).map(|holding| (ledger, holding)));
+        let record = holding.and_then(|(_, holding)| holding.balance_at(at));
+        let ((ledger, holding), record) = match (holding, record) {
             (Some(holding), Some(record)) => (holding, record),
             _ => {
                 return Err(BalanceFailure::NotFound(not_found(key.resource_id())));
@@ -887,7 +932,7 @@ impl ComAmazonawsManagedblockchainqueryTietonchainqueryserviceState {
         // `TokenBalance$atBlockchainInstant`: "the time for when the TokenBalance is
         // requested or the current time if a time is not provided in the request".
         let asked_at = at.unwrap_or_else(now_secs);
-        Ok(holding.token_balance(&token.network, &key, asked_at, record))
+        Ok(holding.token_balance(ledger, &key, asked_at, record))
     }
 }
 

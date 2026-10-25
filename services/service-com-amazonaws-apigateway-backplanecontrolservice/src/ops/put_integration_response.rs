@@ -171,6 +171,21 @@ pub fn is_integration_response_mapping_value(value: &str) -> bool {
     false
 }
 
+/// The `BadRequestException` message for a `responseParameters` value that is none of the
+/// forms the member publishes; see [`is_integration_response_mapping_value`].
+///
+/// `pub` because `UpdateIntegrationResponse` writes the same member under the same rule, so
+/// the two operations cannot disagree on how a value outside the documented forms is
+/// stated.
+pub fn invalid_integration_response_mapping(value: &str) -> String {
+    format!(
+        "Invalid mapping expression specified: {value}; an integration response parameter \
+         value must be a static value enclosed in single quotes, \
+         {INTEGRATION_RESPONSE_HEADER_PREFIX}{{name}} or \
+         {INTEGRATION_RESPONSE_BODY_PREFIX}{{JSON-expression}}"
+    )
+}
+
 /// Refuse a request whose caller-sized members would grow the store past a bound.
 ///
 /// Called BEFORE the store lock is taken, so an over-sized request never reaches the
@@ -232,12 +247,7 @@ fn integration_response_of(
             return Err(invalid_response_parameter(key));
         }
         if !is_integration_response_mapping_value(value) {
-            return Err(format!(
-                "Invalid mapping expression specified: {value}; an integration response parameter \
-                 value must be a static value enclosed in single quotes, \
-                 {INTEGRATION_RESPONSE_HEADER_PREFIX}{{name}} or \
-                 {INTEGRATION_RESPONSE_BODY_PREFIX}{{JSON-expression}}"
-            ));
+            return Err(invalid_integration_response_mapping(value));
         }
     }
     Ok(GetIntegrationResponseOutput {

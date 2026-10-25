@@ -17,8 +17,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     Filter, IdentityProvider, IdentityProviderSummary, InstanceSummary, InstanceUserSummary,
-    LicenseServerEndpoint, LicenseServerSettings, ProductUserSummary, ServerEndpoint, Settings,
-    SERVER_TYPE_VALUES,
+    LicenseServer, LicenseServerEndpoint, LicenseServerSettings, ProductUserSummary, ServerEndpoint,
+    Settings, SERVER_TYPE_VALUES,
 };
 
 /// The status a registration carries while its VPC endpoints are being provisioned.
@@ -64,6 +64,17 @@ pub const PROVISIONING_STATUS_DELETING: &str = "DELETING";
 /// The terminal `LicenseServerEndpointProvisioningStatus` an endpoint reaches once the
 /// deletion that put it in [`PROVISIONING_STATUS_DELETING`] has completed.
 pub const PROVISIONING_STATUS_DELETED: &str = "DELETED";
+/// The `LicenseServerHealthStatus` a license server carries once it is provisioned and
+/// serving.
+pub const HEALTH_STATUS_HEALTHY: &str = "HEALTHY";
+/// The `LicenseServerHealthStatus` a license server carries while there is no serving
+/// host to report a verdict about — before its provisioning completed, and once its
+/// teardown has begun.
+///
+/// The third value the model publishes, `UNHEALTHY`, is a verdict about a host that is
+/// failing; nothing here runs a host that can fail, so it is never reported rather than
+/// invented.
+pub const HEALTH_STATUS_NOT_APPLICABLE: &str = "NOT_APPLICABLE";
 
 /// Whether `status` is a status a user association carries because its disassociation was
 /// accepted.
@@ -540,6 +551,24 @@ pub struct InstanceUserRecord {
     pub disassociated_due_at: Option<SystemTime>,
 }
 
+/// One license-server host provisioned for a license server endpoint.
+///
+/// A host is provisioned by the create that mints its endpoint and is reported as a
+/// `LicenseServer` of that endpoint ([`license_server`]), so the addresses it was given
+/// are persisted here rather than recomputed per read: what one read reports about a host
+/// is what the next one reports.
+#[derive(Debug, Clone)]
+pub struct LicenseServerHost {
+    /// The subnet of the endpoint's registration the host was provisioned in — the
+    /// subnet this host is the license server for.
+    pub subnet: String,
+    /// The private IPv4 address the host was given.
+    pub ipv4_address: String,
+    /// The IPv6 address the host was given, set only when the Active Directory the
+    /// endpoint's registration recorded uses IPv6 ([`domain_uses_ipv6`]).
+    pub ipv6_address: Option<String>,
+}
+
 /// A license server endpoint, as `CreateLicenseServerEndpoint` stored it.
 #[derive(Debug, Clone)]
 pub struct LicenseServerEndpointRecord {
@@ -567,6 +596,9 @@ pub struct LicenseServerEndpointRecord {
     pub created_at: SystemTime,
     /// When the `PROVISIONING` -> `PROVISIONED` transition falls due.
     pub provisioned_due_at: SystemTime,
+    /// The license-server hosts provisioned for this endpoint, in the order the subnets
+    /// they serve are held in — what `LicenseServers` reports.
+    pub license_servers: Vec<LicenseServerHost>,
     /// When the deletion was accepted, or `None` while the endpoint is still live. The
     /// order deletions were accepted in is what bounds the retained set (see
     /// [`MAX_DELETED_ENDPOINTS_RETAINED`]).
@@ -661,6 +693,9 @@ pub struct ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscrip
     pub pending_transition_due_at: Option<SystemTime>,
     /// Source of the resource ids this service mints.
     pub next_id: u64,
+    /// Source of the host addresses this service allocates to the license servers it
+    /// provisions (see [`allocate_host_addresses`](ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::allocate_host_addresses)).
+    pub next_host_address: u32,
 }
 
 /// The EC2 instances the account starts with, as `(instance id, Availability Zone)`.
@@ -723,6 +758,7 @@ impl Default for ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersu
             account_directories: seed_account_directories().into_iter().collect(),
             pending_transition_due_at: None,
             next_id: 0,
+            next_host_address: 0,
         }
     }
 }
@@ -1183,6 +1219,68 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             .values()
             .filter(|record| !endpoint_deletion_started(&record.provisioning_status))
             .count()
+    }
+
+    /// Provision the license-server hosts of ONE license server endpoint: one host per
+    /// subnet the registration the endpoint is created for provisions into
+    /// (`Settings$Subnets`, "the subnets defined for the registered identity provider"),
+    /// each with its own addresses.
+    ///
+    /// A subnet named twice is one subnet, so it gets one host. A registration that
+    /// recorded no subnet provisions into none, and so gets no host: the endpoint then
+    /// reports an empty `LicenseServers` list rather than a host in a subnet nobody named.
+    /// No more than [`MAX_SUBNETS_PER_UPDATE`] hosts are provisioned for one endpoint —
+    /// a VPC holds no more subnets than that, so there is nowhere for a further host to
+    /// go, and this runs with the service-state lock held, so the work one request buys
+    /// here stays bounded however long the stored subnet list is.
+    ///
+    /// Called once, by the create that mints the endpoint, so what an endpoint reports is
+    /// what it was provisioned with: a later `UpdateIdentityProviderSettings` on its
+    /// registration does not re-provision an endpoint that already exists.
+    pub fn provision_license_servers(
+        &mut self,
+        registration: &IdentityProviderRecord,
+    ) -> Vec<LicenseServerHost> {
+        let dual_stack = domain_uses_ipv6(&registration.identity_provider);
+        let mut provisioned: Vec<LicenseServerHost> = Vec::new();
+        let mut served: HashSet<&str> = HashSet::new();
+        for subnet in &registration.settings.subnets {
+            if provisioned.len() >= MAX_SUBNETS_PER_UPDATE {
+                break;
+            }
+            if !served.insert(subnet.as_str()) {
+                continue;
+            }
+            let (ipv4_address, ipv6_address) = self.allocate_host_addresses(dual_stack);
+            provisioned.push(LicenseServerHost {
+                subnet: subnet.clone(),
+                ipv4_address,
+                ipv6_address,
+            });
+        }
+        provisioned
+    }
+
+    /// Allocate the addresses of one license-server host: an IPv4 address always, and an
+    /// IPv6 address when the host joins a `dual_stack` domain.
+    ///
+    /// Monotonic, so each host is given its own address in allocation order, and the
+    /// address is stored on the endpoint record: a host keeps the address it was
+    /// allocated for as long as it is reported.
+    fn allocate_host_addresses(&mut self, dual_stack: bool) -> (String, Option<String>) {
+        self.next_host_address = self.next_host_address.wrapping_add(1);
+        let host = self.next_host_address;
+        // The host portion of the block, laid out so an allocation never lands on the
+        // network (`.0`) or broadcast (`.255`) address of its /24.
+        let offset = host.wrapping_sub(1);
+        let ipv4 = format!(
+            "{HOST_IPV4_BLOCK}.{}.{}.{}",
+            (offset / (254 * 256)) % 256,
+            (offset / 254) % 256,
+            offset % 254 + 1
+        );
+        let ipv6 = dual_stack.then(|| format!("{HOST_IPV6_BLOCK}::{host:x}"));
+        (ipv4, ipv6)
     }
 
     /// Accept the deletion of one license server endpoint: it enters `DELETING` now and
@@ -2118,13 +2216,68 @@ pub fn endpoint_address(signing_name: &str, region: &str, id: &str) -> String {
     format!("{id}.{signing_name}.{region}.amazonaws.com")
 }
 
+/// The IPv4 block this emulator allocates license-server host addresses out of.
+///
+/// A license server runs on a host in the account's own VPC, so the address a client
+/// reaches it on is a private one: `10.0.0.0/8`, the largest block RFC 1918 reserves for
+/// private use, which is also the block the subnets of a VPC are carved out of.
+const HOST_IPV4_BLOCK: &str = "10";
+
+/// The IPv6 block this emulator allocates license-server host addresses out of.
+///
+/// `fd00::/8`, the unique-local block RFC 4193 reserves for addresses that are routable
+/// only inside a site — the IPv6 counterpart of the private IPv4 block above.
+const HOST_IPV6_BLOCK: &str = "fd00";
+
+/// Whether the Active Directory `identity_provider` describes uses IPv6: it recorded at
+/// least one IPv6 domain address (`ActiveDirectorySettings$DomainIpv6List`).
+///
+/// A host provisioned into such a domain is reachable over IPv6 as well as IPv4, so it is
+/// given both addresses; one in an IPv4-only domain is given no IPv6 address rather than
+/// one nothing reaches.
+pub fn domain_uses_ipv6(identity_provider: &IdentityProvider) -> bool {
+    let IdentityProvider::ActiveDirectoryIdentityProvider(active_directory) = identity_provider;
+    active_directory
+        .active_directory_settings
+        .as_ref()
+        .and_then(|settings| settings.domain_ipv6_list.as_ref())
+        .is_some_and(|addresses| !addresses.is_empty())
+}
+
+/// The `LicenseServer` the model describes, built from the stored host and the
+/// provisioning status of the endpoint the host was provisioned for.
+///
+/// A host is provisioned, and torn down, WITH its endpoint — nothing provisions or
+/// deletes one on its own — so its `ProvisioningStatus` is the endpoint's.
+/// `HealthStatus` is a verdict about a serving host: `HEALTHY` once the host is
+/// provisioned, and [`HEALTH_STATUS_NOT_APPLICABLE`] in every other status, where there
+/// is no serving host to report a verdict about. The addresses are reported from the
+/// same instant, for the same reason the endpoint's own address is: there is nothing to
+/// reach before provisioning completed.
+pub fn license_server(host: &LicenseServerHost, provisioning_status: &str) -> LicenseServer {
+    let provisioned = provisioning_status == PROVISIONING_STATUS_PROVISIONED;
+    let health = if provisioned {
+        HEALTH_STATUS_HEALTHY
+    } else {
+        HEALTH_STATUS_NOT_APPLICABLE
+    };
+    LicenseServer {
+        provisioning_status: Some(provisioning_status.to_string()),
+        health_status: Some(health.to_string()),
+        ipv4_address: provisioned.then(|| host.ipv4_address.clone()),
+        ipv6_address: provisioned.then(|| host.ipv6_address.clone()).flatten(),
+    }
+}
+
 /// The `LicenseServerEndpoint` the model describes, built entirely from the stored
 /// record.
 ///
 /// `ServerEndpoint` is reported only once the endpoint is `PROVISIONED` — there is no
-/// address to connect to while it is still being provisioned. `LicenseServers` is left
-/// absent rather than invented: this emulator provisions no license-server hosts, so
-/// there are none to report. `StatusMessage` is only what the record carries.
+/// address to connect to while it is still being provisioned. `LicenseServers` reports
+/// the hosts the endpoint was provisioned with, each through [`license_server`], so a
+/// client polling the list can watch them come up and read their health; an endpoint
+/// provisioned with no host reports an empty list, which is what it has.
+/// `StatusMessage` is only what the record carries.
 pub fn license_server_endpoint(record: &LicenseServerEndpointRecord) -> LicenseServerEndpoint {
     let provisioned = record.provisioning_status == PROVISIONING_STATUS_PROVISIONED;
     LicenseServerEndpoint {
@@ -2137,7 +2290,13 @@ pub fn license_server_endpoint(record: &LicenseServerEndpointRecord) -> LicenseS
         license_server_endpoint_id: Some(record.id.clone()),
         license_server_endpoint_arn: Some(record.arn.clone()),
         license_server_endpoint_provisioning_status: Some(record.provisioning_status.clone()),
-        license_servers: None,
+        license_servers: Some(
+            record
+                .license_servers
+                .iter()
+                .map(|host| license_server(host, &record.provisioning_status))
+                .collect(),
+        ),
         creation_time: Some(::aws_smithy_types::DateTime::from(record.created_at)),
     }
 }
