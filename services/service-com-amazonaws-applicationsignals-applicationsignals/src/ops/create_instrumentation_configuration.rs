@@ -191,9 +191,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// the stable hash of the location, `ARN` is built from this service's namespace, the
     /// request's region and the identity, `CreatedAt` comes from the clock, and `ExpiresAt`
     /// is the lifetime the type documents (24 hours by default for BREAKPOINT, absent for
-    /// PROBE). A second create at the same identity — service, environment, instrumentation
-    /// type, signal type and location — is a `ConflictException`, because "configurations
-    /// are immutable after creation".
+    /// PROBE). A second create at the same identity — service, environment, signal type and
+    /// location, the four parts the ARN spells — is a `ConflictException`, because
+    /// "configurations are immutable after creation"; the instrumentation type is not part
+    /// of that identity, so a create of the OTHER type at an occupied location conflicts
+    /// too.
     async fn handle(
         &self,
         input: Self::Input,
@@ -238,9 +240,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // conflicts with this create nor counts against the quota.
         store.expire_instrumentation_configurations(&now);
 
+        // The documented conflict is on the service, the environment, the signal type and
+        // the location — not on the instrumentation type, which only decides "which backing
+        // store to query" — so a configuration of EITHER type already stored at this
+        // location is the conflict, and one location never holds two records (which is also
+        // what makes the ARN those four parts mint name a single record, and the tag set
+        // stored under it a single record's).
+        //
         // The conflicting resource is identified by ITS OWN ARN, read off the stored record
         // rather than minted from this request.
-        if let Some(existing) = store.instrumentation_configuration(&scope, &key) {
+        if let Some(existing) = store.instrumentation_configuration_at_location(
+            &input.service,
+            &input.environment,
+            &key,
+        ) {
             return Err(
                 CreateInstrumentationConfigurationErrorModeled::ConflictException(
                     crate::state::instrumentation_configuration_already_exists(&existing.arn),

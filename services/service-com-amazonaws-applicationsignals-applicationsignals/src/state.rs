@@ -189,8 +189,12 @@ pub struct ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// `Service`, `Environment` and `InstrumentationType` together (the type "determines
     /// which backing store to query"), and a list reports exactly one scope's set. Within a
     /// scope the records are keyed by [`instrumentation_key`] — signal type and location
-    /// hash — which is the rest of the identity a create conflicts on, and the ordered map
-    /// gives the list a deterministic order to page over.
+    /// hash — and the ordered map gives the list a deterministic order to page over.
+    ///
+    /// A configuration's IDENTITY is narrower than its place in this map: the service, the
+    /// environment, the signal type and the location, WITHOUT the instrumentation type (see
+    /// [`Self::instrumentation_configuration_at_location`]) — so at most one scope of a
+    /// given service and environment holds a record under any one [`instrumentation_key`].
     pub instrumentation_configurations: BTreeMap<InstrumentationScope, InstrumentationConfigurationSet>,
     /// The next instant [`ComAmazonawsApplicationsignalsApplicationsignalsState::expire_instrumentation_configurations`]
     /// has anything to do, or `None` while it owes nothing — so the pass every create and
@@ -3266,6 +3270,33 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
             .and_then(|set| set.configurations.get(key))
     }
 
+    /// The configuration stored at the identity `service`, `environment` and `key`
+    /// ([`instrumentation_key`]) name — whatever its instrumentation type — or `None` when
+    /// no configuration is stored at that location.
+    ///
+    /// The instrumentation type decides WHICH BACKING STORE a read addresses, but it is not
+    /// part of a configuration's identity: the create's uniqueness rule names four parts
+    /// ("If a configuration already exists for the same service, environment, signal type,
+    /// and location, this operation returns a conflict instead of overwriting it"), and
+    /// those same four parts are what an `InstrumentationConfigurationArn` spells
+    /// ([`instrumentation_configuration_arn`]). So this is the lookup a create conflicts on,
+    /// and keeping it in step with the ARN is what makes one ARN name one record — and
+    /// therefore makes the tag set stored under that ARN one record's.
+    ///
+    /// The scan is over the scopes of one service and environment, bounded like every other
+    /// walk of this store by [`MAX_INSTRUMENTATION_CONFIGURATIONS`].
+    pub fn instrumentation_configuration_at_location(
+        &self,
+        service: &str,
+        environment: &str,
+        key: &str,
+    ) -> Option<&InstrumentationConfiguration> {
+        self.instrumentation_configurations
+            .iter()
+            .filter(|(scope, _)| scope.service == service && scope.environment == environment)
+            .find_map(|(_, set)| set.configurations.get(key))
+    }
+
     /// Store `configuration` in `scope`, recording `at` as the instant the scope's set
     /// changed.
     pub fn put_instrumentation_configuration(
@@ -3526,9 +3557,12 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     }
 }
 
-/// A configuration's key within its [`InstrumentationScope`]: the rest of the identity a
-/// create conflicts on ("If a configuration already exists for the same service,
-/// environment, signal type, and location, this operation returns a conflict").
+/// A configuration's key within its [`InstrumentationScope`]: the two parts of the identity
+/// a create conflicts on ("If a configuration already exists for the same service,
+/// environment, signal type, and location, this operation returns a conflict") that the
+/// scope does not carry. The other two are the scope's service and environment; the scope's
+/// instrumentation type is not one of them (see
+/// [`ComAmazonawsApplicationsignalsApplicationsignalsState::instrumentation_configuration_at_location`]).
 ///
 /// `/` separates the two parts unambiguously: `signal_type` is an enum value
 /// (`DynamicInstrumentationSignalType`) and a location hash is 16 hex characters, so neither
@@ -3540,6 +3574,11 @@ pub fn instrumentation_key(signal_type: &str, location_hash: &str) -> String {
 /// The ARN of the configuration at `location_hash` in `scope`, in the format the modelled
 /// `InstrumentationConfigurationArn` doc states:
 /// `arn:${Partition}:application-signals:${Region}:${Account}:instrumentationConfig/${service}/${environment}/${signalType}/${locationHash}`.
+///
+/// The four parts it spells are a configuration's whole identity \u2014 the instrumentation type
+/// is not among them \u2014 which is the identity a create conflicts on
+/// ([`ComAmazonawsApplicationsignalsApplicationsignalsState::instrumentation_configuration_at_location`]),
+/// so one ARN names at most one stored record.
 pub fn instrumentation_configuration_arn(
     region: &str,
     scope: &InstrumentationScope,

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelInputDeviceTransfer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelInputDeviceTransfer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelInputDeviceTransfer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Cancelling is what ENDS a transfer this account started: the transfer
+//! `TransferInputDevice` recorded on the device
+//! ([`crate::state::InputDeviceTransferRecord`]) is withdrawn, so the device
+//! stays this account's with nothing pending on it — "[c]ancel an input device
+//! transfer that you have requested". Only a transfer this account REQUESTED
+//! can be cancelled, which the store decides from the transfer's direction
+//! ([`crate::state::InputDeviceRecord::cancel_transfer`]).
 //!
 //! ## Shape of an operation
 //!
@@ -149,20 +148,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelInputDeviceTransfer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelInputDeviceTransferErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelInputDeviceTransfer"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        state.settle(now);
+
+        // The cancel is ABOUT a device, so the id is resolved through the store:
+        // an id that names no claimed device at all is the operation's own
+        // modelled 404, never a transfer cancelled for nothing.
+        let device = state
+            .input_device_mut(&input.input_device_id)
+            .ok_or_else(|| {
+                CancelInputDeviceTransferErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::not_found_message(
+                        "InputDevice",
+                        &input.input_device_id,
+                    )),
+                })
+            })?;
+
+        // The store owns which transfer this account may cancel — one it
+        // requested. A device with nothing pending on it is the device's CURRENT
+        // STATE conflicting with the request rather than a missing resource,
+        // which is this operation's modelled 409.
+        match device.cancel_transfer() {
+            crate::state::TransferCancellation::Cancelled => {}
+            crate::state::TransferCancellation::NotBeingTransferred => {
+                return Err(CancelInputDeviceTransferErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "InputDevice {} is not being transferred, so there is no transfer to \
+                             cancel",
+                            input.input_device_id
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The response shape models no member (`smithy_query(query="operation",
+        // operation="CancelInputDeviceTransfer")`), so what the call asserts is
+        // that the device is still this account's with nothing pending on it: a
+        // second cancel has no transfer left to end, and the device can be
+        // transferred on again.
+        Ok(CancelInputDeviceTransferOutput {})
     }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no device store to cancel the transfer in. A modelled server
+/// error, never a fresh engine (which would drop the write on return).
+fn unavailable() -> CancelInputDeviceTransferError {
+    CancelInputDeviceTransferErrorModeled::InternalServerErrorException(
+        InternalServerErrorException {
+            message: Some(crate::state::NO_STORE.to_string()),
+        },
+    )
+    .into()
 }
