@@ -2201,6 +2201,19 @@ pub fn no_such_directory(directory_id: &str) -> String {
     format!("Directory: '{directory_id}' does not exist.")
 }
 
+/// The `EntityDoesNotExistException` message for a remote domain a directory forwards
+/// nowhere. Shared so every operation that resolves a stored conditional forwarder
+/// (`DeleteConditionalForwarder`, `UpdateConditionalForwarder`) says the same thing about
+/// the same failure.
+///
+/// Worded the way the directory-lookup family is ([`no_such_directory`]): the kind of
+/// entity that could not be resolved, the quoted name the request asked for, then "does
+/// not exist." — so the message is built from the request and names what the caller has
+/// to fix, and nothing else. [`refusal`] appends the request id, once.
+pub fn no_such_conditional_forwarder(remote_domain_name: &str) -> String {
+    format!("Conditional forwarder: '{remote_domain_name}' does not exist.")
+}
+
 /// The `EntityDoesNotExistException` the tag API answers for a `ResourceId` that names
 /// no taggable resource.
 ///
