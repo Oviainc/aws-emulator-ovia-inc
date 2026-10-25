@@ -61,6 +61,8 @@ mod open_id_connect_providers;
 mod policy_listing;
 #[path = "all/policy_simulation.rs"]
 mod policy_simulation;
+#[path = "all/policy_tag_listing.rs"]
+mod policy_tag_listing;
 #[path = "all/policy_tags.rs"]
 mod policy_tags;
 #[path = "all/policy_version_listing.rs"]
