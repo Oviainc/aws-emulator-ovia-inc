@@ -91,3 +91,5 @@ mod vocabulary_delete_and_tag_sets;
 mod vocabulary_file_uri;
 #[path = "all/vocabulary_filter_file_uri.rs"]
 mod vocabulary_filter_file_uri;
+#[path = "all/vocabulary_update_term_source.rs"]
+mod vocabulary_update_term_source;
