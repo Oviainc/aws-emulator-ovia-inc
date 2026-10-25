@@ -43,6 +43,8 @@ mod not_found_wire_status;
 mod query_column_selection;
 #[path = "all/query_statement_subset.rs"]
 mod query_statement_subset;
+#[path = "all/quota_service_code.rs"]
+mod quota_service_code;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
