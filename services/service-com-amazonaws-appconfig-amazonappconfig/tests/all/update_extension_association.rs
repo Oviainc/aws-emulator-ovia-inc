@@ -46,8 +46,12 @@ use crate::resource_tags::{arn, pct};
 
 /// `PATCH /extensionassociations/{ExtensionAssociationId}`. The id is bound to an
 /// `@httpLabel`; `Parameters` is the only other member of the request and travels in the
-/// body.
-async fn update_association(router: &MultiServiceRouter, id: &str, body: &Value) -> Answer {
+/// body. `pub(crate)` because the refusal-message suite drives the same front door.
+pub(crate) async fn update_association(
+    router: &MultiServiceRouter,
+    id: &str,
+    body: &Value,
+) -> Answer {
     json_call(
         router,
         "PATCH",
@@ -430,7 +434,7 @@ async fn an_update_this_service_will_not_store_is_refused_and_changes_nothing() 
             parameters: || json!({ "optional": "only this one" }),
             status: 400,
             code: "BadRequestException",
-            message_carries: || "Parameter mandatory is required by extension".to_string(),
+            message_carries: || "Parameter mandatory  is required for extension".to_string(),
         },
         Refusal {
             case: "an empty map against a version that declares a required parameter",
@@ -438,7 +442,7 @@ async fn an_update_this_service_will_not_store_is_refused_and_changes_nothing() 
             parameters: || json!({}),
             status: 400,
             code: "BadRequestException",
-            message_carries: || "Parameter mandatory is required by extension".to_string(),
+            message_carries: || "Parameter mandatory  is required for extension".to_string(),
         },
         Refusal {
             // `Id` is `^[a-z0-9]{4,7}$`, so this addresses an association that could
@@ -448,7 +452,7 @@ async fn an_update_this_service_will_not_store_is_refused_and_changes_nothing() 
             parameters: || json!({ "mandatory": "whatever" }),
             status: 404,
             code: "ResourceNotFoundException",
-            message_carries: || "Extension Association could not be found".to_string(),
+            message_carries: || "ExtensionAssociation could not be found".to_string(),
         },
     ];
 

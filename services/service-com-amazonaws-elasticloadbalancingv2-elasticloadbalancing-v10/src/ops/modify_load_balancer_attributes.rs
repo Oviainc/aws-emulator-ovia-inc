@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyLoadBalancerAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyLoadBalancerAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyLoadBalancerAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores the attributes the request names onto the load balancer `LoadBalancerArn`
+//! names, leaving every attribute it does not name as it was, and answers with the
+//! attributes it wrote in the order the request named them.
+//!
+//! An attribute is accepted only where the model's `LoadBalancerAttribute$Key`
+//! documentation says this load balancer carries it, and only with a value in the domain
+//! that documentation states (`crate::state::LOAD_BALANCER_ATTRIBUTES`): the key must be
+//! one it lists, the load balancer's family must be one the key is listed for, and an
+//! attribute whose value that documentation FIXES cannot be changed. Anything else is the
+//! modelled `InvalidConfigurationRequestException`; an ARN this store holds no load
+//! balancer for is the modelled `LoadBalancerNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +147,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyLoadBalancerAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyLoadBalancerAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyLoadBalancerAttributes"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("ModifyLoadBalancerAttributes")
+        })?;
+
+        let mut guard = state.lock();
+        let Some(load_balancer) = guard.load_balancers.get(&input.load_balancer_arn) else {
+            return Err(
+                ModifyLoadBalancerAttributesErrorModeled::LoadBalancerNotFoundException(
+                    LoadBalancerNotFoundException {
+                        message: Some(crate::state::load_balancer_not_found_message(
+                            &input.load_balancer_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The whole request is checked before the first write, so a caller that sent one
+        // bad attribute beside three good ones can resend the corrected request without
+        // wondering which of them landed.
+        let mut writes: Vec<(String, String)> = Vec::with_capacity(input.attributes.len());
+        for attribute in &input.attributes {
+            let key = attribute.key.clone().unwrap_or_default();
+            // The value is stored exactly as the request wrote it, so a read reports the
+            // caller's own value rather than a re-rendered one.
+            let value = attribute.value.clone().unwrap_or_default();
+            let Some(spec) = crate::state::load_balancer_attribute(&key) else {
+                return Err(invalid_configuration(format!(
+                    "'{key}' is not a load balancer attribute this service supports"
+                )));
+            };
+            if !spec.applies_to(load_balancer) {
+                return Err(invalid_configuration(format!(
+                    "The attribute '{key}' is not supported for a {} load balancer",
+                    family_name(load_balancer.family())
+                )));
+            }
+            if let Err(domain) = spec.domain.check(&value) {
+                return Err(invalid_configuration(format!(
+                    "The value '{value}' is not valid for the attribute '{key}': it must be \
+                     {domain}"
+                )));
+            }
+            // An attribute the documentation fixes for this load balancer keeps that
+            // value: a write restating it changes nothing and is accepted, and a write of
+            // anything else is a configuration the service cannot apply.
+            if let Some(fixed) = spec.fixed_for(load_balancer) {
+                if value != fixed {
+                    return Err(invalid_configuration(format!(
+                        "The attribute '{key}' cannot be changed for a {} load balancer: it is \
+                         always '{fixed}'",
+                        family_name(load_balancer.family())
+                    )));
+                }
+            }
+            writes.push((key, value));
+        }
+
+        // The validated writes land under the SAME lock the lookup was made under, so
+        // the record is still there; an `if let` rather than an unwrap keeps that an
+        // assumption the code does not depend on.
+        if let Some(load_balancer) = guard.load_balancers.get_mut(&input.load_balancer_arn) {
+            for (key, value) in &writes {
+                load_balancer.attributes.insert(key.clone(), value.clone());
+            }
+        }
+
+        // The attributes the call modified, in the order the request named them — not the
+        // whole set, which is what `DescribeLoadBalancerAttributes` reports.
+        Ok(ModifyLoadBalancerAttributesOutput {
+            attributes: Some(
+                writes
+                    .into_iter()
+                    .map(|(key, value)| LoadBalancerAttribute {
+                        key: Some(key),
+                        value: Some(value),
+                    })
+                    .collect(),
+            ),
+        })
+    }
+}
+
+/// The operation's own refusal for an attribute it cannot store: an unknown key, a key
+/// this load balancer does not carry, a value outside the domain the attribute's
+/// documentation states, or a change to an attribute that documentation fixes. The
+/// message names the key and the value from the request and the rule they broke, because
+/// that is what the caller has to fix.
+fn invalid_configuration(detail: String) -> ModifyLoadBalancerAttributesError {
+    ModifyLoadBalancerAttributesErrorModeled::InvalidConfigurationRequestException(
+        InvalidConfigurationRequestException {
+            message: Some(detail),
+        },
+    )
+    .into()
+}
+
+/// How a refusal names the load balancer family it judged the attribute against, in the
+/// words the model's `LoadBalancerTypeEnum` uses.
+fn family_name(family: crate::state::LoadBalancerFamily) -> &'static str {
+    match family {
+        crate::state::LoadBalancerFamily::Application => "application",
+        crate::state::LoadBalancerFamily::Network => "network",
+        crate::state::LoadBalancerFamily::Gateway => "gateway",
     }
 }

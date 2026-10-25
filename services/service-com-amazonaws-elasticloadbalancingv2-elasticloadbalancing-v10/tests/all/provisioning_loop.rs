@@ -114,6 +114,10 @@ pub(crate) fn seed_trust_store(
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect::<HashMap<String, String>>(),
+        // The policy a SHARE of this trust store would attach. Seeded as none, and set
+        // by the one suite that reads a policy back
+        // (`all/load_balancer_network_capacity_and_policy.rs`).
+        resource_policy: None,
     };
     let state = engine.state::<ElbState>();
     let mut store = state.lock();

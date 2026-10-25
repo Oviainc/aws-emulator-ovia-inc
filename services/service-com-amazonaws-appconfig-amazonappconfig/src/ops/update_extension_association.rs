@@ -164,10 +164,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     extension_version_number,
                 )));
             };
+            // The refusal names the extension by the id this association stores, which is
+            // the identifier AppConfig puts in the sentence.
             if let Some(reason) = crate::state::parameter_value_rejection(
                 &version.parameters,
                 parameters,
-                &extension.name,
+                &extension.id,
                 version.version_number,
             ) {
                 return Err(bad_request(reason));

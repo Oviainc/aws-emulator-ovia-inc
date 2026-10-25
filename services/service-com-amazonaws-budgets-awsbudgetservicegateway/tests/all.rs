@@ -53,6 +53,8 @@ mod budget_validation_rules;
 mod calculated_spend;
 #[path = "all/client_error_envelopes.rs"]
 mod client_error_envelopes;
+#[path = "all/create_resource_tag_keys.rs"]
+mod create_resource_tag_keys;
 #[path = "all/notification_alert_delivery.rs"]
 mod notification_alert_delivery;
 #[path = "all/notification_deletion.rs"]

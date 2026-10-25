@@ -17,7 +17,7 @@ use ::aws_smithy_types::base64;
 use crate::ops::types::{
     AccountMetaData, AdditionalInfoRequest, AdditionalInfoResponse, Address, Authority,
     CanadaAdditionalInfo, CaseCreationLimitExceededException, ConflictException,
-    IndonesiaAdditionalInfo,
+    IndonesiaAdditionalInfo, MalaysiaAdditionalInfo,
     InternalServerException, Jurisdiction, ResourceNotFoundException, SupplementalTaxRegistration,
     SupplementalTaxRegistrationEntry, TaxDocumentMetadata, TaxExemption, TaxExemptionDetails,
     TaxExemptionType, TaxRegistration, TaxRegistrationEntry, TaxRegistrationWithJurisdiction,
@@ -194,6 +194,16 @@ pub const COUNTRIES_WITH_DERIVED_LEGAL_NAME: &[&str] = &["BR", "MX"];
 pub const COUNTRIES_WITH_DERIVED_LEGAL_ADDRESS: &[(&str, &[&str])] =
     &[("BR", &["CNPJ"]), ("MX", &[])];
 
+/// The value `Address$addressLine1` and `Address$city` declare as their default
+/// in the model
+/// (`smithy_query(query="shape",shape="com.amazonaws.taxsettings#Address")` ->
+/// both carry `{"default": "Unknown", "addedDefault": true}`).
+///
+/// `@addedDefault` keeps each member nullable on the wire, so a request may omit
+/// it; the value the service substitutes for the omission is this one. See
+/// [`address_with_declared_defaults`], which applies it.
+pub const ADDRESS_MEMBER_DEFAULT: &str = "Unknown";
+
 /// What a stored registration reports for a member the real service fills in
 /// from the tax registration number, where the entry left it out.
 ///
@@ -205,14 +215,12 @@ pub const COUNTRIES_WITH_DERIVED_LEGAL_ADDRESS: &[(&str, &[&str])] =
 /// nothing produced. A later fixer holding a source for the real value fills it
 /// in here, and nothing else changes.
 ///
-/// The value itself is the one the model uses for an address member whose value
-/// is unknown — `Address$addressLine1` and `Address$city` carry `"Unknown"` as
-/// their default
-/// (`smithy_query(query="shape",shape="com.amazonaws.taxsettings#Address")`) —
-/// extended, as this emulator's own choice, to the members with no modelled
-/// default (`postalCode`, and `legalName`), which cannot be left empty: both are
-/// `@required` where they are reported and both forbid a blank value.
-pub const DERIVED_MEMBER_UNKNOWN: &str = "Unknown";
+/// The value itself is [`ADDRESS_MEMBER_DEFAULT`], the one the model declares for
+/// an address member whose value is unknown, extended — as this emulator's own
+/// choice — to the members with no modelled default (`postalCode`, and
+/// `legalName`), which cannot be left empty: both are `@required` where they are
+/// reported and both forbid a blank value.
+pub const DERIVED_MEMBER_UNKNOWN: &str = ADDRESS_MEMBER_DEFAULT;
 
 /// The refusal of an entry whose jurisdiction requires a legal name and that
 /// carries none, stating the rule the way the model does ("For TRNs in other
@@ -710,7 +718,9 @@ pub struct StoredSupplementalRegistration {
     pub registration_type: String,
     /// `SupplementalTaxRegistrationEntry$legalName`, as submitted.
     pub legal_name: String,
-    /// `SupplementalTaxRegistrationEntry$address`, as submitted.
+    /// `SupplementalTaxRegistrationEntry$address`, as submitted, with the
+    /// defaults the model declares for its members materialised
+    /// ([`address_with_declared_defaults`]).
     pub address: Address,
     /// The registration's `TaxRegistrationStatus`.
     pub status: String,
@@ -728,7 +738,9 @@ impl StoredSupplementalRegistration {
             registration_id: entry.registration_id.clone(),
             registration_type: entry.registration_type.clone(),
             legal_name: entry.legal_name.clone(),
-            address: entry.address.clone(),
+            // The address is stored with the defaults the model declares for its
+            // members materialised, so every read of this record reports them.
+            address: address_with_declared_defaults(entry.address.clone()),
             // The write starts the validation of the submitted TRN and reports
             // the status the registration is stored with while that validation
             // is outstanding.
@@ -786,8 +798,10 @@ pub struct StoredTaxRegistration {
     /// filled in where the entry's jurisdiction let it be omitted.
     pub legal_name: String,
     /// `TaxRegistrationEntry$legalAddress`, as submitted, or the address the
-    /// service filled in where the entry's jurisdiction let it be omitted. Also
-    /// the source of the `Jurisdiction` that `ListTaxRegistrations` reports.
+    /// service filled in where the entry's jurisdiction let it be omitted —
+    /// either way with the defaults the model declares for its members
+    /// materialised ([`address_with_declared_defaults`]). Also the source of the
+    /// `Jurisdiction` that `ListTaxRegistrations` reports.
     pub legal_address: Address,
     /// `TaxRegistrationEntry$sector`, one of the model's `Sector` values.
     pub sector: Option<String>,
@@ -837,7 +851,7 @@ impl StoredTaxRegistration {
             .legal_name
             .clone()
             .unwrap_or_else(|| DERIVED_MEMBER_UNKNOWN.to_string());
-        let legal_address = entry.legal_address.clone().unwrap_or_else(|| {
+        let given_address = entry.legal_address.clone().unwrap_or_else(|| {
             // The judge admits an entry carrying no address only when the entry
             // identifies the jurisdiction the address is filled in for, so a
             // record stored here always reports a country.
@@ -851,6 +865,9 @@ impl StoredTaxRegistration {
             });
             derived_legal_address(country_code)
         });
+        // The address is stored with the defaults the model declares for its
+        // members materialised, so every read of this record reports them.
+        let legal_address = address_with_declared_defaults(given_address);
         Self {
             registration_id: entry.registration_id.clone(),
             registration_type: entry.registration_type.clone(),
@@ -1040,9 +1057,17 @@ impl StoredTaxExemption {
 ///
 /// `brazilAdditionalInfo` and `indiaAdditionalInfo` exist only on the response
 /// shape — there is no request member to carry them — so they stay absent.
+///
+/// `malaysiaAdditionalInfo` is the one block with a member that declares a
+/// default, which the projection materialises
+/// ([`malaysia_info_with_declared_defaults`]); every other block is reported as
+/// it was submitted.
 fn additional_info_response(request: &AdditionalInfoRequest) -> AdditionalInfoResponse {
     AdditionalInfoResponse {
-        malaysia_additional_info: request.malaysia_additional_info.clone(),
+        malaysia_additional_info: request
+            .malaysia_additional_info
+            .clone()
+            .map(malaysia_info_with_declared_defaults),
         israel_additional_info: request.israel_additional_info.clone(),
         estonia_additional_info: request.estonia_additional_info.clone(),
         canada_additional_info: request.canada_additional_info.clone(),
@@ -1275,17 +1300,53 @@ pub fn legal_address_is_derived(country_code: &str, registration_type: &str) -> 
 /// The country is what the entry identified ([`entry_country_code`]), so the
 /// jurisdiction every reader reports is the registration's own. The rest of the
 /// address is what the service would have read from the tax authority's registry,
-/// which this emulator has none of, so those members carry
-/// [`DERIVED_MEMBER_UNKNOWN`] — the model's own value for an address member whose
-/// value is not known.
+/// which this emulator has none of, so `postalCode` carries
+/// [`DERIVED_MEMBER_UNKNOWN`], and `addressLine1` and `city` are left to the
+/// defaults the model declares for them ([`address_with_declared_defaults`]).
 pub fn derived_legal_address(country_code: &str) -> Address {
-    Address {
-        address_line1: Some(DERIVED_MEMBER_UNKNOWN.to_string()),
-        city: Some(DERIVED_MEMBER_UNKNOWN.to_string()),
+    address_with_declared_defaults(Address {
         postal_code: DERIVED_MEMBER_UNKNOWN.to_string(),
         country_code: country_code.to_string(),
         ..Address::default()
+    })
+}
+
+/// Materialise the defaults the model declares for the members of an `Address`.
+///
+/// `addressLine1` and `city` are the two members of the shape that declare one,
+/// and both declare [`ADDRESS_MEMBER_DEFAULT`]; every other member declares none
+/// and stays as it was submitted — absent where the request omitted it.
+///
+/// Applied where an address is STORED ([`StoredTaxRegistration::from_entry`],
+/// [`StoredSupplementalRegistration::from_entry`]), so the record holds the
+/// address the service accepted and every reader of it reports the same members
+/// without knowing the rule.
+pub fn address_with_declared_defaults(mut address: Address) -> Address {
+    if address.address_line1.is_none() {
+        address.address_line1 = Some(ADDRESS_MEMBER_DEFAULT.to_string());
     }
+    if address.city.is_none() {
+        address.city = Some(ADDRESS_MEMBER_DEFAULT.to_string());
+    }
+    address
+}
+
+/// Materialise the default the model declares for the members of
+/// `MalaysiaAdditionalInfo`: `serviceTaxCodes` declares `{"default": [],
+/// "addedDefault": true}`
+/// (`smithy_query(query="shape",shape="com.amazonaws.taxsettings#MalaysiaAdditionalInfo")`),
+/// so a stored registration whose country block omitted it reports the declared
+/// empty list. The block's other members declare no default.
+///
+/// The same rule as [`address_with_declared_defaults`], applied to the other
+/// shape of this service whose members declare one.
+pub fn malaysia_info_with_declared_defaults(
+    mut info: MalaysiaAdditionalInfo,
+) -> MalaysiaAdditionalInfo {
+    if info.service_tax_codes.is_none() {
+        info.service_tax_codes = Some(Vec::new());
+    }
+    info
 }
 
 /// Refuse an all-whitespace value for a member the model constrains with its

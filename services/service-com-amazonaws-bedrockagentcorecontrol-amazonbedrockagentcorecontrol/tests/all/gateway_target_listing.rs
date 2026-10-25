@@ -79,6 +79,12 @@ async fn send(
     (status, parsed)
 }
 
+/// Create a gateway and hand back its `gatewayId`, waited out to `READY`.
+///
+/// A gateway takes a target only once the clock-owed transition out of `CREATING` has come
+/// due (`CreateGatewayTarget` refuses it with the modelled `ValidationException` until
+/// then, as `all/control_plane_preconditions.rs` pins), so every row of this suite — which
+/// is about the LISTING, not about that gate — starts from a settled gateway.
 async fn create_gateway(router: &MultiServiceRouter, name: &str) -> String {
     let body = json!({
         "name": name,
@@ -90,10 +96,20 @@ async fn create_gateway(router: &MultiServiceRouter, name: &str) -> String {
         status, 202,
         "case {name:?}: expected HTTP 202 from CreateGateway, got {status} ({created})"
     );
-    created["gatewayId"]
+    let gateway_id = created["gatewayId"]
         .as_str()
         .unwrap_or_default()
-        .to_string()
+        .to_string();
+    tokio::time::sleep(PAST_SETTLE).await;
+    let (status, settled) = send(router, "GET", &format!("/gateways/{gateway_id}/"), None).await;
+    assert_eq!(
+        (status, text(&settled, "status").as_str()),
+        (200, "READY"),
+        "case {name:?}: the gateway must settle to READY before it can take a target, got \
+         {status} {} ({settled})",
+        text(&settled, "status")
+    );
+    gateway_id
 }
 
 async fn create_target(router: &MultiServiceRouter, gateway: &str, body: &Value) -> (u16, Value) {

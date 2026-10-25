@@ -128,7 +128,9 @@ impl From<CreateConfigurationManagerErrorModeled> for CreateConfigurationManager
 /// becomes a stored configuration (`crate::state::deployment_targets_rejection`). The
 /// remaining checks are
 /// the store's own bounds on collections the model gives no length (see
-/// `crate::state`'s `MAX_*` constants), and the `IAMRoleArn` form of
+/// `crate::state`'s `MAX_*` constants), the provider-reserved tag-key namespace a
+/// caller may not assign into (`crate::state::reserved_tag_key_rejection`), and the
+/// `IAMRoleArn` form of
 /// `LocalDeploymentAdministrationRoleArn`, which the model states as an
 /// `@arnReference` rather than as a `@pattern` the boundary could enforce.
 fn definitions_rejection(input: &CreateConfigurationManagerInput) -> Option<String> {

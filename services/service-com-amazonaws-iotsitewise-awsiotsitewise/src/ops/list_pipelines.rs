@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPipelines
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPipelines`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPipelines::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation enumerates the pipelines the writes of the workspace a
+//! request names persisted, in a stable order, paged by `maxResults`/`nextToken`, each
+//! summary read off the stored record so a listed pipeline and a described one never
+//! disagree; this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -156,20 +151,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPipelines` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPipelinesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPipelines"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| internal_failure("the IoT SiteWise store is unavailable".to_string()))?;
+        let now = ::std::time::SystemTime::now();
+
+        // A read: every member reported below is read off the stored record or DERIVED
+        // from the instant a transition it owes falls due, so this listing moves no
+        // pipeline on and two readers of one pipeline cannot disagree.
+        let store = state.lock();
+
+        // The listing is scoped to ONE workspace, so a workspace this service holds no
+        // record of is the modelled refusal rather than an empty page, which would
+        // report absence as success. "Holds" is decided by the STORE, and a pipeline
+        // stored under a workspace is such a record: the writes of this slice key a
+        // pipeline by `(workspaceName, pipelineName)` without consulting the workspace
+        // registry, so refusing on the registry alone would hide pipelines this service
+        // really holds. Resolved BEFORE the page is cut, so a request that is wrong in
+        // both ways reports the resource that is absent.
+        let holds_workspace = store.workspaces.contains_key(&input.workspace_name)
+            || store
+                .pipelines
+                .keys()
+                .any(|(workspace, _)| *workspace == input.workspace_name);
+        if !holds_workspace {
+            return Err(not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            )));
+        }
+
+        // Every pipeline of the named workspace, and no pipeline of another: a pipeline
+        // name is unique only within its workspace, so the workspace half of the key is
+        // what scopes the enumeration.
+        let mut selected: Vec<&crate::state::PipelineRecord> = store
+            .pipelines
+            .values()
+            .filter(|record| record.workspace_name == input.workspace_name)
+            .collect();
+
+        // A stable total order is what makes `nextToken` resumable: oldest first, ties
+        // broken by name so two pipelines created in the same instant still order
+        // deterministically.
+        selected.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+
+        // `nextToken` is this enumeration's resume point: the name of the first pipeline
+        // of the next page, hex-encoded so the token is one wire-safe string inside the
+        // modelled length rather than a raw name. A token whose resume point is not in
+        // this enumeration is refused rather than answered with an empty page.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                selected
+                    .iter()
+                    .position(|record| record.name == resume)
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        // `maxResults` carries the modelled range 1..250 and the declared default of 50,
+        // both applied BEFORE this handler runs — an absent member arrives as that
+        // default and a value out of range never arrives at all — so nothing is being
+        // coerced here; `max(1)` only keeps the slice arithmetic below total.
+        let max_results = input.max_results.max(1) as usize;
+        let end = start.saturating_add(max_results).min(selected.len());
+
+        // "The token to be used for the next set of paginated results": issued only when
+        // a pipeline follows this page.
+        let next_token = selected
+            .get(end)
+            .map(|record| ::hex::encode(record.name.as_bytes()));
+
+        Ok(ListPipelinesOutput {
+            pipeline_summaries: selected[start..end]
+                .iter()
+                .map(|record| summary(record, now))
+                .collect(),
+            next_token,
+        })
     }
+}
+
+/// One stored pipeline as the summary this operation reports, read straight off the
+/// record `CreatePipeline` persisted and `UpdatePipeline` versions — so a listed
+/// pipeline and a described one never disagree.
+///
+/// The version reported is the pipeline's CURRENT one, with the description and the
+/// update instant that version carried, which is what a read naming no version answers
+/// from.
+fn summary(
+    record: &crate::state::PipelineRecord,
+    now: ::std::time::SystemTime,
+) -> PipelineSummary {
+    PipelineSummary {
+        pipeline_name: record.name.clone(),
+        description: record.current.description.clone(),
+        pipeline_arn: record.arn.clone(),
+        version: record.version_label(),
+        status: record.status(now),
+        created_at: crate::state::to_date_time(record.created_at),
+        updated_at: crate::state::to_date_time(record.updated_at()),
+    }
+}
+
+/// Decode a `nextToken` back into the pipeline name it resumes from.
+fn decode_token(token: &str) -> Result<String, ListPipelinesError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
+fn invalid_token() -> ListPipelinesError {
+    ListPipelinesErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: "The nextToken is not a token this operation issued.".to_string(),
+    })
+    .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> ListPipelinesError {
+    ListPipelinesErrorModeled::ResourceNotFoundException(ResourceNotFoundException { message })
+        .into()
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal_failure(message: String) -> ListPipelinesError {
+    ListPipelinesErrorModeled::InternalFailureException(InternalFailureException { message }).into()
 }

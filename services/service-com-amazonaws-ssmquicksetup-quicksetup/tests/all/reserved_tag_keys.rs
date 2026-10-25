@@ -17,7 +17,9 @@
 //! The tables span what the rule generalises over: the casing of the prefix, what
 //! follows it (nothing, a plain tail, a punctuated tail, a multi-byte tail), where the
 //! prefix sits in the key, how many keys one request names, and which operation carries
-//! them.
+//! them. Both readers a stored tag becomes visible through — `GetConfigurationManager`
+//! and `ListTagsForResource` — are checked, since a refused write must leave neither
+//! reporting a reserved key.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -255,6 +257,18 @@ async fn stored_tags(
             )
         })
         .collect()
+}
+
+/// The tags `ListTagsForResource` reports for `manager_arn` — the OTHER reader a stored
+/// tag becomes visible through, so a refused write is shown to have left neither reader
+/// reporting a reserved key. The entries are parsed by the one helper that owns that
+/// reader, `all/list_tags_for_resource.rs`'s `listed`.
+async fn listed_tags(
+    router: &MultiServiceRouter,
+    case: &str,
+    manager_arn: &str,
+) -> BTreeMap<String, String> {
+    super::list_tags_for_resource::listed(router, case, manager_arn).await
 }
 
 /// How many configuration managers the store holds.
@@ -511,6 +525,34 @@ async fn tag_resource_refuses_a_reserved_tag_key() {
                  got {left:?}"
             );
         }
+    }
+}
+
+/// The OTHER reader agrees: after a refused assignment `ListTagsForResource` reports the
+/// stored set unchanged, so no reserved key becomes visible through the tagging reader
+/// even though the write path is what would have stored it.
+#[tokio::test]
+async fn list_tags_for_resource_reports_no_reserved_key_after_a_refused_assignment() {
+    let router = emulator();
+    let stored = seeded();
+
+    for (case, key) in reserved_keys() {
+        // As in `tag_resource_refuses_a_reserved_tag_key`: a body map key is bound by
+        // `TagsMap`'s key `@pattern`, so a multi-byte key never reaches the rule.
+        if !key.is_ascii() {
+            continue;
+        }
+        let arn = create_ok(&router, &case, &stored).await;
+
+        let (status, answer) = tag(&router, &arn, &tags(&[(key.as_str(), "mine")])).await;
+        assert_reserved_refusal(&case, "Tags", &key, status, &answer);
+
+        let listed = listed_tags(&router, &case, &arn).await;
+        assert_eq!(
+            listed, stored,
+            "case {case:?}: ListTagsForResource must report the stored set, expected \
+             {stored:?}, got {listed:?}"
+        );
     }
 }
 

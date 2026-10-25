@@ -6,6 +6,11 @@
 //! becomes version N+1 in [`crate::state`], the previous versions stay readable,
 //! and the clock owes the new version its `UPDATING` -> `READY` transition.
 //!
+//! The new version RUNS AS the execution role the request names, so that role is
+//! resolved against IAM FIRST — a request naming a role that does not exist in this
+//! account, or whose trust policy does not let this service assume it, is refused with
+//! the operation's modelled validation error and no version is published.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -199,27 +204,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the agent runtime store is unavailable".to_string()),
             })
         })?;
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
 
         // A replayed request carrying the same `clientToken` answers with the
         // version that token first published, rather than publishing another.
-        let replayed = store.replayed_result(Self::NAME, input.client_token.as_deref());
-        if let Some((id, version)) = replayed {
-            if let Some(record) = store.agent_runtimes.get(&id) {
-                if let Some(stored) = record.versions.get(&version) {
-                    return Ok(UpdateAgentRuntimeOutput {
-                        agent_runtime_arn: record.agent_runtime_arn.clone(),
-                        agent_runtime_id: record.agent_runtime_id.clone(),
-                        workload_identity_details: record.workload_identity_details.clone(),
-                        agent_runtime_version: stored.version_string(),
-                        created_at: crate::state::timestamp(record.created_at),
-                        last_updated_at: crate::state::timestamp(stored.last_updated_at),
-                        status: stored.status_at(now).to_string(),
-                    });
-                }
-            }
+        // Decided under its own guard, which is DROPPED before the cross-service
+        // call below: a lock is not held across an await.
+        if let Some(replayed) =
+            replayed_output(&state.lock(), Self::NAME, input.client_token.as_deref(), now)
+        {
+            return Ok(replayed);
+        }
+
+        // The version this request would publish runs as the role it names, so
+        // the role is resolved against this account's IAM before anything is
+        // written — the same gate `CreateAgentRuntime` applies to the role it
+        // stores.
+        if crate::state::execution_role_is_unassumable(ctx, &region, &input.role_arn).await {
+            return Err(UpdateAgentRuntimeErrorModeled::ValidationException(
+                crate::state::role_validation_failed(&input.role_arn),
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // Read again under the guard that WRITES: the guard above was dropped for
+        // the call in between, so two requests carrying one token could both have
+        // got past it, and only this read is serialized with the insert.
+        if let Some(replayed) =
+            replayed_output(&store, Self::NAME, input.client_token.as_deref(), now)
+        {
+            return Ok(replayed);
         }
 
         let record = store
@@ -304,4 +321,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(output)
     }
+}
+
+/// The version a `clientToken` already published, when this request is a replay of one
+/// that was served; `None` for a fresh request.
+///
+/// Read TWICE by the handler — once before the execution role is resolved against IAM,
+/// and once under the guard that writes — because the store guard cannot be held across
+/// that await: only the second read is serialized with the write, so two requests
+/// carrying one token cannot both publish a version.
+fn replayed_output(
+    store: &crate::state::ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState,
+    operation: &str,
+    client_token: Option<&str>,
+    now: ::std::time::SystemTime,
+) -> Option<UpdateAgentRuntimeOutput> {
+    let (id, version) = store.replayed_result(operation, client_token)?;
+    let record = store.agent_runtimes.get(&id)?;
+    let stored = record.versions.get(&version)?;
+    Some(UpdateAgentRuntimeOutput {
+        agent_runtime_arn: record.agent_runtime_arn.clone(),
+        agent_runtime_id: record.agent_runtime_id.clone(),
+        workload_identity_details: record.workload_identity_details.clone(),
+        agent_runtime_version: stored.version_string(),
+        created_at: crate::state::timestamp(record.created_at),
+        last_updated_at: crate::state::timestamp(stored.last_updated_at),
+        status: stored.status_at(now).to_string(),
+    })
 }

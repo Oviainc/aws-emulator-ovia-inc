@@ -276,12 +276,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .gateways
             .get_mut(&input.gateway_identifier)
             .ok_or_else(|| {
-                UpdateGatewayErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!(
-                        "no gateway with identifier {} exists in this account",
-                        input.gateway_identifier
-                    )),
-                })
+                UpdateGatewayErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::ACTION_UPDATE,
+                        crate::state::RESOURCE_GATEWAY,
+                    ),
+                )
             })?;
 
         // `name` is `@required` on the request and the model states what it must
