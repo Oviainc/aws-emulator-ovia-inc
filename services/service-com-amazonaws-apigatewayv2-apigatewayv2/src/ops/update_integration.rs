@@ -352,7 +352,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // configures: each is documented as supported only for APIs of one protocol, so
         // a patch cannot put one on an integration of an api of the other. Checked
         // BEFORE anything is written, so a refused patch leaves the record as it was.
-        let mut restricted = vec![
+        let restricted = [
             crate::state::ProtocolRestrictedMember::websocket_only(
                 "ContentHandlingStrategy",
                 input.content_handling_strategy.is_some(),
@@ -393,19 +393,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         ];
         // The restricted VALUES of `IntegrationType`: the member is accepted by either
-        // protocol, so what is gated is the value this request selected.
-        let integration_type_member = input
-            .integration_type
-            .as_deref()
-            .filter(|selected| {
-                crate::state::WEBSOCKET_ONLY_INTEGRATION_TYPES.contains(selected)
-            })
-            .map(|selected| format!("IntegrationType {selected}"));
-        if let Some(member) = integration_type_member.as_deref() {
-            restricted.insert(
-                0,
-                crate::state::ProtocolRestrictedMember::websocket_only(member, true),
-            );
+        // protocol, so what is gated is the value this request selected, through the one
+        // gate every writer of an integration shares
+        // (`crate::state::validate_integration_type_for_protocol`).
+        if let Some(integration_type) = input.integration_type.as_deref() {
+            if let Err(message) = crate::state::validate_integration_type_for_protocol(
+                &api.protocol_type,
+                integration_type,
+            ) {
+                return Err(bad_request(&message));
+            }
         }
         if let Err(message) =
             crate::state::validate_protocol_restricted_members(&api.protocol_type, &restricted)
