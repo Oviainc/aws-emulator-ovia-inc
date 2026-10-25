@@ -68,6 +68,8 @@ fn request_with_tags(operation: &str, name: &str, cluster_arn: &str, tags: &Valu
         "RegisterContainerInstance" => json!({
             "cluster": CLUSTER,
             "instanceIdentityDocument": identity_document(name),
+            "instanceIdentityDocumentSignature":
+                crate::ecs_wire::identity_document_signature(),
             "tags": tags,
         }),
         "RegisterTaskDefinition" => json!({
