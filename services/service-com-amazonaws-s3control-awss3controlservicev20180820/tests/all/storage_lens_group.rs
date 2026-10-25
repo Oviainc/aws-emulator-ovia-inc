@@ -41,11 +41,15 @@ use crate::storage_lens_configuration::{
 
 /// A second signing region, used to pin that a group's ARN names the region its
 /// request was signed for rather than a fixed one.
-const OTHER_REGION: &str = "ap-southeast-2";
+///
+/// `pub(crate)` because the update suite in `tests/all/` pins the same thing
+/// about the ARN an update assigns, over this suite's table rather than a copy
+/// of it.
+pub(crate) const OTHER_REGION: &str = "ap-southeast-2";
 
 /// `StorageLensGroupName`'s modelled maximum length
 /// (`com.amazonaws.s3control#StorageLensGroupName`, len 1..64).
-const NAME_MAX_LEN: usize = 64;
+pub(crate) const NAME_MAX_LEN: usize = 64;
 
 /// The largest resource tag set a create may carry: `TagList` is modelled at
 /// 0..50 entries (`CreateStorageLensGroupRequest$Tags`).
@@ -56,16 +60,16 @@ const MAX_TAGS: usize = 50;
 // ---------------------------------------------------------------------------
 
 /// One `StorageLensGroup` document, described as the leaves below its root.
-struct Group {
-    case: &'static str,
+pub(crate) struct Group {
+    pub(crate) case: &'static str,
     /// The leaves below the group root, WITHOUT `Name`: the name is supplied
     /// per row, so one document can be created under any name.
-    leaves: Vec<Leaf>,
+    pub(crate) leaves: Vec<Leaf>,
 }
 
 impl Group {
     /// This document created under `name`: `Name` plus the row's own leaves.
-    fn submitted(&self, name: &str) -> Vec<Leaf> {
+    pub(crate) fn submitted(&self, name: &str) -> Vec<Leaf> {
         let mut leaves = vec![leaf("Name", name)];
         leaves.extend(self.leaves.iter().cloned());
         leaves
@@ -75,7 +79,7 @@ impl Group {
     /// `StorageLensGroupArn` the one the service assigns — the member is
     /// documented read-only, so a submitted value is replaced rather than
     /// stored.
-    fn expected(&self, name: &str, region: &str) -> Vec<Leaf> {
+    pub(crate) fn expected(&self, name: &str, region: &str) -> Vec<Leaf> {
         let mut leaves: Vec<Leaf> = self
             .submitted(name)
             .into_iter()
@@ -85,7 +89,7 @@ impl Group {
         leaves
     }
 
-    fn request_body(&self, name: &str, tags: Option<&[(String, String)]>) -> String {
+    pub(crate) fn request_body(&self, name: &str, tags: Option<&[(String, String)]>) -> String {
         format!(
             "<CreateStorageLensGroupRequest xmlns=\"{XMLNS}\">\
              <StorageLensGroup>{}</StorageLensGroup>{}\
@@ -101,7 +105,7 @@ impl Group {
 /// namespace, under the emulator's canonical account — the form
 /// `StorageLensGroupArn`'s modelled pattern fixes
 /// (`^arn:[a-z\-]+:s3:[a-z0-9\-]+:\d{12}:storage\-lens\-group\/`).
-fn expected_arn(name: &str, region: &str) -> String {
+pub(crate) fn expected_arn(name: &str, region: &str) -> String {
     format!(
         "arn:aws:s3:{region}:{}:storage-lens-group/{name}",
         ::emulator_server::emulator_account_id()
@@ -112,7 +116,7 @@ fn expected_arn(name: &str, region: &str) -> String {
 /// `StorageLensGroupFilter` (or of its `And` / `Or` operators) as the model
 /// declares them; the object-age and object-size bounds are given non-zero
 /// values on both ends so no leaf is the member's modelled default.
-fn groups() -> Vec<Group> {
+pub(crate) fn groups() -> Vec<Group> {
     vec![
         Group {
             case: "one prefix",
@@ -207,7 +211,7 @@ fn groups() -> Vec<Group> {
 /// within what `StorageLensGroupName` allows (len 1..64, pattern
 /// `^[a-zA-Z0-9\-\_]+$`): the shortest a name can be, the longest, digits
 /// alone, and the hyphen/underscore/mixed-case forms in between.
-fn names() -> Vec<String> {
+pub(crate) fn names() -> Vec<String> {
     let longest = format!("g{}", "r".repeat(NAME_MAX_LEN - 1));
     vec![
         "a".to_string(),
@@ -228,7 +232,7 @@ fn names() -> Vec<String> {
 // Calling the Storage Lens group surface
 // ---------------------------------------------------------------------------
 
-async fn create_group(
+pub(crate) async fn create_group(
     emulator: &Emulator,
     account_id: &str,
     name: &str,
@@ -245,7 +249,7 @@ async fn create_group(
         .await
 }
 
-async fn get_group(emulator: &Emulator, account_id: &str, name: &str) -> Reply {
+pub(crate) async fn get_group(emulator: &Emulator, account_id: &str, name: &str) -> Reply {
     emulator
         .call(
             "GET",

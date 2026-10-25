@@ -169,6 +169,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             })
         })?;
+        // The CDC stream store, shared with KeyspacesStreams: a stream follows one
+        // table's changes, so it cannot outlive that table. Resolved before either store
+        // is locked, and locked AFTER this service's own — one lock order everywhere.
+        let streams = crate::state::cdc_stream_state(&*self.engine).ok_or_else(|| {
+            DeleteTableErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "Amazon Keyspaces could not reach the CDC stream store for this request."
+                        .to_string(),
+                ),
+            })
+        })?;
         let region = crate::state::request_region(ctx);
 
         let now = ::std::time::SystemTime::now();
@@ -239,6 +250,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Tell the store the earliest instant at which `settle` has to look at the
             // tables again.
             store.note_transition_due(settles_at);
+            // The table is on its way out, so its CDC streams go with it: a stream
+            // captures the changes of a table that will not take another, and nothing can
+            // read a stream of a table that is gone. `DELETING` is where that is settled,
+            // because it is the one call that accepts the deletion.
+            streams.lock().forget_streams_for_table(
+                &region,
+                &input.keyspace_name,
+                &input.table_name,
+            );
+            // A tag set belongs to a stream, so the tag sets of the streams just
+            // forgotten go with them: nothing may answer for a stream ARN the stream
+            // store no longer holds, not even in the span before `settle` removes the
+            // table itself.
+            if let Some(table) = store
+                .keyspaces
+                .get_mut(&input.keyspace_name)
+                .and_then(|keyspace| keyspace.tables.get_mut(&input.table_name))
+            {
+                table.cdc_stream_tags.clear();
+            }
         }
         drop(store);
 

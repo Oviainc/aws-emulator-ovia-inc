@@ -179,12 +179,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // The Region the request was signed for is what an AWS-official lens's `LensArn`
-        // is reported in; a custom lens is reported by the ARN its import minted.
+        // is reported in; a custom lens is reported by the ARN its import minted. Resolved
+        // BEFORE the template is taken for writing, with the version this template's
+        // review of the lens is against: both come from the lens catalog, which this write
+        // does not touch.
         let region = crate::state::request_region(ctx.parts());
         let now = std::time::SystemTime::now();
 
         let mut store = state.lock();
-        let lens_arn = store.lens_arn_of(&input.lens_alias, &region);
+        let reviewed = store.reviewed_lens(&input.template_arn, &input.lens_alias, &region);
         // The resource is resolved BEFORE the request's values are judged, so a request
         // that names a template or a lens review that does not exist is answered with
         // that 404 whatever else it carries.
@@ -252,7 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // change: it reports the lens review as it stands and leaves its `UpdatedAt`
         // where it was, rather than recording an update nothing wrote.
         if input.lens_notes.is_some() || input.pillar_notes.is_some() {
-            let written = template.lens_review_notes_mut(&input.lens_alias, now);
+            let written = template.lens_review_record_mut(&input.lens_alias, now);
             if let Some(lens_notes) = input.lens_notes {
                 written.notes = Some(lens_notes);
             }
@@ -268,7 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(UpdateReviewTemplateLensReviewOutput {
             // The template as STORED, which is the resource this lens review belongs to.
             template_arn: Some(template.template_arn.clone()),
-            lens_review: Some(template.to_lens_review(&input.lens_alias, lens_arn)),
+            lens_review: Some(template.to_lens_review(&input.lens_alias, &reviewed)),
         })
     }
 }

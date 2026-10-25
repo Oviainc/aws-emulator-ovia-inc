@@ -30,6 +30,10 @@
 //!   opening balances plus those events ([`derive_holdings`]) rather than written down
 //!   beside them, so a reported balance can never disagree with the transfers that
 //!   produced it;
+//! * an amount is held in the token's smallest unit and QUOTED in the unit that token is
+//!   denominated in ([`amount_string`]), in one place for every operation that reports
+//!   one, so an event's `value` and the balance it moves agree about the unit as well as
+//!   the quantity;
 //! * every contract `GetAssetContract` reports is one the network's ledger holds, so an
 //!   address no contract is deployed at is a not-found rather than an invented answer.
 //!
@@ -114,6 +118,60 @@ pub const SORT_DESCENDING: &str = "DESCENDING";
 pub const NATIVE_TOKEN_ETH: &str = "eth";
 /// The `tokenId` of Bitcoin; see [`NATIVE_TOKEN_ETH`] for where the spelling comes from.
 pub const NATIVE_TOKEN_BTC: &str = "btc";
+
+/// How many decimal places one ether subdivides into: the Ethereum networks hold a
+/// native amount in wei, 10^18 of which make one ether ([`ETH`]).
+pub const NATIVE_TOKEN_ETH_DECIMALS: u32 = 18;
+/// How many decimal places one bitcoin subdivides into: the Bitcoin networks hold a
+/// native amount in satoshi, 10^8 of which make one bitcoin ([`BTC`]).
+pub const NATIVE_TOKEN_BTC_DECIMALS: u32 = 8;
+
+/// How many decimal places an amount of the token that `(contract_address, token_id)`
+/// names is REPORTED with, the ledger holding every amount in that token's smallest
+/// unit.
+///
+/// A NATIVE token — no contract, and the documented 3-character abbreviation of the
+/// network's own currency as its `tokenId` — has a precision the currency itself fixes,
+/// so an amount of it is quoted in the currency: satoshi as bitcoin, wei as ether. A
+/// token a CONTRACT issues carries its precision in that contract's own metadata, which
+/// is no part of the token's identity here, so such an amount is reported in the
+/// contract's own units exactly as the ledger holds it.
+pub fn amount_decimals(contract_address: Option<&str>, token_id: Option<&str>) -> u32 {
+    match (contract_address, token_id) {
+        (None, Some(NATIVE_TOKEN_BTC)) => NATIVE_TOKEN_BTC_DECIMALS,
+        (None, Some(NATIVE_TOKEN_ETH)) => NATIVE_TOKEN_ETH_DECIMALS,
+        _ => 0,
+    }
+}
+
+/// Render `amount` — held in the smallest unit of the token `(contract_address,
+/// token_id)` names — as this API denominates it: a fixed-point decimal with
+/// [`amount_decimals`] places, with the fraction's trailing zeros dropped and the point
+/// itself dropped where nothing is left of it, so a whole amount reads as an integer.
+///
+/// The ONE place a token amount becomes a response string, so `TransactionEvent$value`
+/// and the `TokenBalance$balance` that is derived from those same amounts
+/// ([`derive_holdings`]) can never disagree about the unit they are quoted in.
+pub fn amount_string(
+    amount: i128,
+    contract_address: Option<&str>,
+    token_id: Option<&str>,
+) -> String {
+    let decimals = amount_decimals(contract_address, token_id);
+    if decimals == 0 {
+        return amount.to_string();
+    }
+    let scale = 10u128.pow(decimals);
+    let magnitude = amount.unsigned_abs();
+    let sign = if amount < 0 { "-" } else { "" };
+    let whole = magnitude / scale;
+    let fraction = magnitude % scale;
+    if fraction == 0 {
+        return format!("{sign}{whole}");
+    }
+    let fraction = format!("{fraction:0>width$}", width = decimals as usize);
+    format!("{sign}{whole}.{}", fraction.trim_end_matches('0'))
+}
 
 /// The only value the model's `ResourceType` enum declares, so it is the
 /// `resourceType` every `ResourceNotFoundException` this service raises carries.
@@ -283,31 +341,39 @@ impl StoredTransaction {
     /// `confirmationStatus` are properties of the TRANSACTION, so they come from it
     /// rather than being stored a second time on each event; the `ChainAddress`-typed
     /// members are rendered the way [`StoredTransaction::transaction`] renders them.
+    ///
+    /// The token the event moves ([`StoredEvent::token`]) settles both `tokenId` — "the
+    /// unique identifier for the token involved in the transaction" — and the unit
+    /// `value` is quoted in ([`amount_string`]).
     pub fn events(&self) -> Vec<TransactionEvent> {
         self.events
             .iter()
-            .map(|event| TransactionEvent {
-                network: self.network.clone(),
-                transaction_hash: self.transaction_hash.clone(),
-                event_type: event.event_type.clone(),
-                from: event.from.as_deref().map(derived::normalize_address),
-                to: event.to.as_deref().map(derived::normalize_address),
-                value: event.value.map(|amount| amount.to_string()),
-                contract_address: event
-                    .contract_address
-                    .as_deref()
-                    .map(derived::normalize_address),
-                token_id: event.token_id.clone(),
-                transaction_id: self.transaction_id.clone(),
-                vout_index: event.vout_index,
-                vout_spent: event.vout_spent,
-                spent_vout_transaction_id: event.spent_vout_transaction_id.clone(),
-                spent_vout_transaction_hash: event.spent_vout_transaction_hash.clone(),
-                spent_vout_index: event.spent_vout_index,
-                blockchain_instant: Some(BlockchainInstant {
-                    time: Some(instant_secs(self.transaction_timestamp)),
-                }),
-                confirmation_status: Some(self.confirmation_status.clone()),
+            .map(|event| {
+                let (contract_address, token_id) = event.token();
+                TransactionEvent {
+                    network: self.network.clone(),
+                    transaction_hash: self.transaction_hash.clone(),
+                    event_type: event.event_type.clone(),
+                    from: event.from.as_deref().map(derived::normalize_address),
+                    to: event.to.as_deref().map(derived::normalize_address),
+                    value: event.value.map(|amount| {
+                        amount_string(amount, contract_address.as_deref(), token_id.as_deref())
+                    }),
+                    contract_address: contract_address
+                        .as_deref()
+                        .map(derived::normalize_address),
+                    token_id,
+                    transaction_id: self.transaction_id.clone(),
+                    vout_index: event.vout_index,
+                    vout_spent: event.vout_spent,
+                    spent_vout_transaction_id: event.spent_vout_transaction_id.clone(),
+                    spent_vout_transaction_hash: event.spent_vout_transaction_hash.clone(),
+                    spent_vout_index: event.spent_vout_index,
+                    blockchain_instant: Some(BlockchainInstant {
+                        time: Some(instant_secs(self.transaction_timestamp)),
+                    }),
+                    confirmation_status: Some(self.confirmation_status.clone()),
+                }
             })
             .collect()
     }
@@ -387,6 +453,23 @@ impl StoredEvent {
             }
             _ => None,
         }
+    }
+
+    /// The token this event moves value in, as the `(contractAddress, tokenId)` pair a
+    /// `TokenIdentifier` names a token by — the pair the event REPORTS, not just the one
+    /// its balance settles to.
+    ///
+    /// `TransactionEvent$tokenId` is "the unique identifier for the token involved in
+    /// the transaction", and which token that is follows from the event's type the same
+    /// way [`Self::holding`] resolves it: so a native transfer reports the documented
+    /// 3-character abbreviation of the network's own currency, and an event whose type
+    /// moves no balance reports whatever token it recorded itself.
+    pub fn token(&self) -> (Option<String>, Option<String>) {
+        let token_id = self
+            .holding()
+            .and_then(|(_, token_id)| token_id)
+            .or_else(|| self.token_id.clone());
+        (self.contract_address.clone(), token_id)
     }
 }
 
@@ -541,7 +624,11 @@ impl StoredHolding {
         TokenBalance {
             owner_identifier: Some(key.owner_identifier()),
             token_identifier: Some(key.token_identifier(network)),
-            balance: record.balance.to_string(),
+            balance: amount_string(
+                record.balance,
+                key.contract_address.as_deref(),
+                key.token_id.as_deref(),
+            ),
             at_blockchain_instant: BlockchainInstant {
                 time: Some(instant_secs(asked_at)),
             },
@@ -1175,10 +1262,10 @@ pub fn store_unavailable() -> InternalServerException {
 // ---------------------------------------------------------------------------
 
 /// One Ether in wei, the unit every native Ethereum balance is held in.
-const ETH: i128 = 1_000_000_000_000_000_000;
+const ETH: i128 = 10i128.pow(NATIVE_TOKEN_ETH_DECIMALS);
 
 /// One Bitcoin in satoshi, the unit every native Bitcoin balance is held in.
-const BTC: i128 = 100_000_000;
+const BTC: i128 = 10i128.pow(NATIVE_TOKEN_BTC_DECIMALS);
 
 /// The gas price every fixture Ethereum transaction paid, in wei (20 gwei).
 const EFFECTIVE_GAS_PRICE: i128 = 20_000_000_000;
