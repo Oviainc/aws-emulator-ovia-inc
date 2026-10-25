@@ -235,3 +235,7 @@ mod agent_profile_updates;
 // position for an agent suite is the one gap of this list every new agent suite lands in.
 #[path = "all/agent_recommendations.rs"]
 mod agent_recommendations;
+
+// Declared last for the same reason as the declarations above.
+#[path = "all/agent_recommendation_paging.rs"]
+mod agent_recommendation_paging;

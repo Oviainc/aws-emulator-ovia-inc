@@ -677,8 +677,8 @@ async fn a_host_arn_naming_no_host_is_reported_absent() {
         // The model puts `@httpError 404` on `ResourceNotFoundException`, but the
         // recorded wire response for a host lookup that resolves to nothing is HTTP 400
         // with that same shape and message — the status a client of the real service
-        // branches on; see `HOST_NOT_FOUND_STATUS` in `src/ops/get_host.rs` and the
-        // identical rule in `src/ops/delete_host.rs`.
+        // branches on; see `RESOURCE_NOT_FOUND_STATUS` in `src/state.rs`, the one status
+        // every absent resource of this service is answered with.
         assert_eq!(
             status, 400,
             "case {case:?}: expected GetHost to refuse an absent host, got \

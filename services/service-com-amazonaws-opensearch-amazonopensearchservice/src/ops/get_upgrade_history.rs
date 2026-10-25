@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetUpgradeHistory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetUpgradeHistory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetUpgradeHistory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the engine version upgrades and upgrade eligibility checks performed on a
+//! domain, newest first and paged.
+//!
+//! Every entry is a [`crate::state::UpgradeRun`] `UpgradeDomain` recorded on the
+//! domain — the same record, so what this history reports about a run is what that
+//! call started. Reporting it changes nothing a later caller cannot see: the only
+//! write it causes is whatever the clock already owed the domain, which `settled_mut`
+//! materialises whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +86,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{invalid_next_token, UpgradeRun};
+
+/// The largest page this operation answers with, and the page size a request that
+/// names none gets: `MaxResults` is `@range(max: 100)`, so 100 results is the most
+/// any request can ask for.
+const MAX_PAGE: usize = 100;
+
+/// [`MAX_PAGE`] as the modelled member's own type, for the bound check below.
+const MAX_PAGE_SIZE: i32 = 100;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -158,18 +168,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetUpgradeHistory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetUpgradeHistoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetUpgradeHistory"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        // `MaxResults` is `@range(max: 100)`, so a larger page size is a malformed
+        // request; the boundary validator refuses it before this handler runs, and the
+        // check is repeated here so the rule holds however the request reached us. A
+        // NEGATIVE page size is malformed for the same reason — it is not a page size
+        // at all — so it is refused rather than reinterpreted, while `@default(0)` (no
+        // page size sent) stays the unbounded case below.
+        if input.max_results < 0 || input.max_results > MAX_PAGE_SIZE {
+            return Err(GetUpgradeHistoryErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "MaxResults must be between 0 and {MAX_PAGE_SIZE}: {}",
+                        input.max_results
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // "The name of an existing domain": the history belongs to the domain the
+        // request names, so a name the account holds no domain under names no history.
+        // Settling that domain is the only write this report makes, and it writes only
+        // what the clock already owed it at this instant had nobody called — the
+        // completion of an upgrade among them.
+        let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
+            GetUpgradeHistoryErrorModeled::ResourceNotFoundException(
+                crate::state::domain_not_found(&input.domain_name),
+            )
+        })?;
+
+        // "History of the last 10 upgrades and upgrade eligibility checks": the most
+        // recent run is reported FIRST, so the page a caller reads without asking for
+        // any is the newest end of the history. The store holds the runs oldest first,
+        // which is the same order reversed — so two reads report the same order, and a
+        // token names the same place in it.
+        let history: Vec<&UpgradeRun> = domain.upgrades.iter().rev().collect();
+
+        // The token names the run the next page starts AT, so a caller resumes exactly
+        // where the previous page stopped rather than at an offset a newer run would
+        // have shifted. It is only ever a value this operation handed out, so one that
+        // names no run of this domain — one this service never minted, or one whose run
+        // has since been dropped off the end of the history — is the modelled refusal.
+        // This operation models no `InvalidPaginationTokenException`, so the refusal is
+        // its `ValidationException`.
+        let start = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            None => 0,
+            Some(token) => history
+                .iter()
+                .position(|run| run.upgrade_id == token)
+                .ok_or_else(|| {
+                    GetUpgradeHistoryErrorModeled::ValidationException(invalid_next_token())
+                })?,
+        };
+
+        // "An optional parameter that specifies the maximum number of results to
+        // return": `MaxResults` is `@default(0)`, so a request that asks for no
+        // particular page size reaches here as zero and gets the largest page the model
+        // allows rather than an empty one.
+        let page_size = match usize::try_from(input.max_results) {
+            Ok(0) | Err(_) => MAX_PAGE,
+            Ok(size) => size.min(MAX_PAGE),
+        };
+        let end = start.saturating_add(page_size).min(history.len());
+
+        Ok(GetUpgradeHistoryOutput {
+            upgrade_histories: Some(
+                history[start..end]
+                    .iter()
+                    .map(|run| run.to_history(now))
+                    .collect(),
+            ),
+            // "When nextToken is returned, there are more results available": the token
+            // is the next run in the history, and there is none once this page ended
+            // it.
+            next_token: history.get(end).map(|run| run.upgrade_id.clone()),
+        })
     }
 }

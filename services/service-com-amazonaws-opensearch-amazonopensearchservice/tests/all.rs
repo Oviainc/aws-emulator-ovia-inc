@@ -61,5 +61,7 @@ mod shared_es_signing_name_claim;
 mod single_package_association;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/upgrade_history.rs"]
+mod upgrade_history;
 #[path = "all/vpc_endpoint_access.rs"]
 mod vpc_endpoint_access;

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSecret
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSecret`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSecret::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Modifies a secret's metadata — its description, its KMS key and its external
+//! `Type` — and, when the call carries a value, stores that value as a new
+//! version the staging label `AWSCURRENT` moves to.
 //!
 //! ## Shape of an operation
 //!
@@ -233,20 +227,154 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSecret` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSecretErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSecret"))
+        // "Either SecretBinary or SecretString must have a value, but not both."
+        // (`UpdateSecretRequest$SecretString`, this service's Smithy model.) A
+        // call naming NEITHER is valid here and changes only metadata — this
+        // operation "modifies the details of a secret, including metadata and
+        // the secret value".
+        if input.secret_string.is_some() && input.secret_binary.is_some() {
+            return Err(UpdateSecretErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        "You can't specify both SecretString and SecretBinary in the same request."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        // The permanent removal the clock has already made due, materialised
+        // before this call resolves anything: a secret whose removal was owed at
+        // this instant is gone whether or not anybody called, so an update
+        // addressed to it finds nothing — which is what makes a mutation after a
+        // deletion that skipped the recovery window report the secret missing
+        // rather than succeed.
+        store.expire_due(now);
+
+        let Some(secret) = store.get_mut(&input.secret_id) else {
+            return Err(UpdateSecretErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+        // A secret inside its recovery window still exists, so it is refused by
+        // its state: "The secret is scheduled for deletion."
+        // (`InvalidRequestException`, this service's Smithy model.)
+        if secret.scheduled_for_deletion() {
+            return Err(UpdateSecretErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(crate::state::MARKED_FOR_DELETION_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let stores_a_value = input.secret_string.is_some() || input.secret_binary.is_some();
+        // "If you include SecretString or SecretBinary, then Secrets Manager
+        // creates a new version for the secret, and this parameter specifies the
+        // unique identifier for the new version."
+        // (`UpdateSecretRequest$ClientRequestToken`.) The token is an
+        // @idempotencyToken: a repeat naming a version that already holds
+        // exactly this value is the same request and is answered from what is
+        // stored, while the same token over a different value would modify an
+        // existing version — "You can't modify an existing version, you can only
+        // create a new version."
+        let version_id = input
+            .client_request_token
+            .clone()
+            .unwrap_or_else(crate::state::new_version_id);
+        let replay = stores_a_value
+            && secret.version(&version_id).is_some_and(|existing| {
+                existing.holds_same_value(input.secret_string.as_ref(), input.secret_binary.as_ref())
+            });
+        if stores_a_value && !replay {
+            if secret.version(&version_id).is_some() {
+                return Err(UpdateSecretErrorModeled::ResourceExistsException(
+                    ResourceExistsException {
+                        message: Some(crate::state::token_in_use_message(&version_id, &secret.arn)),
+                    },
+                )
+                .into());
+            }
+            // Bound the secret before it grows, the same way `PutSecretValue`
+            // does: an update that leaves no deprecated version to evict would
+            // grow the store without end, so it is refused with the modelled
+            // quota error. See `state::VERSIONS_PER_SECRET`.
+            let claimed = vec![crate::state::STAGE_CURRENT.to_string()];
+            if !secret.has_room_for_version(&claimed) {
+                return Err(UpdateSecretErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(crate::state::version_quota_message()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The metadata this call names is applied; a member it does not name
+        // keeps the value already stored, since this operation "modifies the
+        // details of a secret" rather than replacing them.
+        if input.description.is_some() {
+            secret.description = input.description.clone();
+        }
+        if let Some(kms_key_id) = input.kms_key_id.clone() {
+            // "If you set this to an empty string, Secrets Manager uses the
+            // Amazon Web Services managed key aws/secretsmanager."
+            // (`UpdateSecretRequest$KmsKeyId`, this service's Smithy model.)
+            secret.kms_key_id = Some(if kms_key_id.is_empty() {
+                crate::state::DEFAULT_KMS_KEY_ALIAS.to_string()
+            } else {
+                kms_key_id
+            });
+        }
+        if input.r#type.is_some() {
+            secret.secret_type = input.r#type.clone();
+        }
+        secret.last_changed_date = now;
+
+        // "If you include SecretString or SecretBinary to create a new secret
+        // version, Secrets Manager automatically moves the staging label
+        // AWSCURRENT to the new version. Then it attaches the label AWSPREVIOUS
+        // to the version that AWSCURRENT was removed from." — which is what
+        // `put_version` does for every write of a value.
+        if stores_a_value && !replay {
+            secret.put_version(
+                crate::state::SecretVersion {
+                    version_id: version_id.clone(),
+                    secret_string: input.secret_string.clone(),
+                    secret_binary: input.secret_binary.clone(),
+                    version_stages: vec![crate::state::STAGE_CURRENT.to_string()],
+                    created_date: now,
+                },
+                now,
+            );
+        }
+
+        Ok(UpdateSecretOutput {
+            arn: Some(secret.arn.clone()),
+            name: Some(secret.name.clone()),
+            // "If Secrets Manager created a new version of the secret during
+            // this operation, then VersionId contains the unique identifier of
+            // the new version." — so a metadata-only update reports none.
+            version_id: stores_a_value.then(|| version_id.clone()),
+        })
     }
+}
+
+/// The modelled server error for a request that cannot reach this service's
+/// store. `service_state` answers `None` only when the engine is not the shared
+/// in-memory one, which is a server-side fault, never a bad request.
+fn state_unavailable() -> UpdateSecretError {
+    UpdateSecretErrorModeled::InternalServiceError(InternalServiceError {
+        message: Some("the Secrets Manager emulator's state store is unavailable".to_string()),
+    })
+    .into()
 }

@@ -167,25 +167,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `AccessType` documents the one cross-member rule the model cannot
-        // express: "If you choose CustomerOwnedIp, you must also provide the
-        // customer-owned IP address pool (CoIP pool)". An absent `AccessType` is
-        // `Private`, which the same documentation names "the default access
-        // type value".
+        // express: the two access types are alternative network paths — "to use
+        // the Amazon Web Services VPC, choose Private. To use the endpoint with
+        // an on-premises network, choose CustomerOwnedIp. If you choose
+        // CustomerOwnedIp, you must also provide the customer-owned IP address
+        // pool (CoIP pool)". The CoIP pool is the pool "IP addresses are
+        // allocated from ... for the endpoint", so the two members have to agree
+        // in BOTH directions: an on-premises endpoint names the pool it
+        // allocates from, and a VPC endpoint allocates from its subnet and so
+        // names none. An absent `AccessType` is `Private`, which the same
+        // documentation names "the default access type value".
         let access_type = input
             .access_type
             .unwrap_or_else(|| crate::state::ACCESS_TYPE_PRIVATE.to_string());
-        if access_type == crate::state::ACCESS_TYPE_CUSTOMER_OWNED_IP
-            && input.customer_owned_ipv4_pool.is_none()
-        {
-            return Err(CreateEndpointErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(format!(
-                        "CustomerOwnedIpv4Pool is required when AccessType is {}",
-                        crate::state::ACCESS_TYPE_CUSTOMER_OWNED_IP
-                    )),
-                },
-            )
-            .into());
+        if let Err(invalid) = crate::state::check_coip_pool(
+            &access_type,
+            input.customer_owned_ipv4_pool.as_deref(),
+        ) {
+            return Err(CreateEndpointErrorModeled::ValidationException(invalid).into());
         }
 
         let now = ::std::time::SystemTime::now();

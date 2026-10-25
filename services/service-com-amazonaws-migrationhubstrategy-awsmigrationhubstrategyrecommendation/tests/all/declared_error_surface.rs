@@ -5,24 +5,25 @@
 //!
 //! The rule under test is a property of the service, not of any one route: a read that
 //! cannot produce its report — because the account holds no such resource, or the id it
-//! was given names none — is refused with an error shape the OPERATION ITSELF declares,
-//! at that shape's modelled `httpError`. So the status a client keys on and the error
-//! code it branches on both come from the operation's own declared failure modes; an
-//! operation whose list carries no not-found reports the condition through the client
-//! error it does carry (`ValidationException`, 400) instead of a 404 nothing in its list
-//! admits.
+//! was given names none — is refused with a shape this SERVICE models, at that shape's
+//! modelled `httpError`. So the status a client keys on and the error code it branches on
+//! are a modelled pair: either one of the operation's own declared failure modes, or a
+//! shape the service models that this crate widens into the operation's error channel
+//! with `extra_errors` because the recorded wire behaviour of the route shows the service
+//! answering it — never a status or a code nothing in the model carries.
 //!
 //! Each row names the condition and the pair it must answer, and the pair is then checked
-//! against the operation's declared error list and that shape's modelled status, so a row
+//! against the shapes the operation can answer and that shape's modelled status, so a row
 //! cannot agree with a wrong expectation. The rows differ along what the rule generalises
-//! over: whether the operation takes an id at all, which declared error reports the
+//! over: whether the operation takes an id at all, which modelled error reports the
 //! condition, how the account came to be empty, and which resource is missing.
 //!
 //! Two refusals of this crate are deliberately NOT rows here: `GetAssessment`'s 400 for
 //! an unknown id and `StopAssessment`'s 404, each of which answers a shape its own list
 //! omits because the recorded wire behaviour of that route shows the service doing so.
 //! They are pinned, with that justification, in `assessment_error_paths.rs` and
-//! `refusal_messages.rs`.
+//! `refusal_messages.rs`. The input-less reads, which have no value to refuse at all,
+//! are tabled as a class in `input_less_reads.rs`.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -33,7 +34,8 @@ use crate::import_and_assess::{
 
 /// The `errors` list each reporting operation under test declares, from
 /// `smithy_query(query="digest")` plus the service-common `InternalServerException` that
-/// digest reports under `common_errors`.
+/// digest reports under `common_errors`. Shapes widened in on top of a list are in
+/// [`WIDENED_ERRORS`].
 const DECLARED_ERRORS: &[(&str, &[&str])] = &[
     (
         "GetLatestAssessmentId",
@@ -85,6 +87,16 @@ const DECLARED_ERRORS: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// The shapes this crate widens into an operation's error channel with `extra_errors`:
+/// ones the SERVICE models that the operation's own `errors` list omits, and that the
+/// recorded wire behaviour of its route shows the service answering.
+///
+/// `GetLatestAssessmentId` is the row here: its input shape has no members, so nothing a
+/// caller sends can be refused, and an account that has started no assessment is a
+/// missing resource — answered with the service's `ResourceNotFoundException` (404).
+const WIDENED_ERRORS: &[(&str, &[&str])] =
+    &[("GetLatestAssessmentId", &["ResourceNotFoundException"])];
+
 /// The `httpError` each error shape of this service declares, from
 /// `smithy_query(query="shape",shape="AccessDeniedException,DependencyException,InternalServerException,ResourceNotFoundException,ThrottlingException,ValidationException")`.
 const MODELLED_STATUS: &[(&str, u16)] = &[
@@ -134,22 +146,22 @@ fn rows() -> Vec<Row> {
             case: "no assessment has ever been started",
             operation: "GetLatestAssessmentId",
             account: Account::Fresh,
-            status: 400,
-            code: "ValidationException",
+            status: 404,
+            code: "ResourceNotFoundException",
         },
         Row {
             case: "servers were imported but no assessment started",
             operation: "GetLatestAssessmentId",
             account: Account::AfterAnImport,
-            status: 400,
-            code: "ValidationException",
+            status: 404,
+            code: "ResourceNotFoundException",
         },
         Row {
             case: "the only start call was refused",
             operation: "GetLatestAssessmentId",
             account: Account::AfterARefusedStart,
-            status: 400,
-            code: "ValidationException",
+            status: 404,
+            code: "ResourceNotFoundException",
         },
         Row {
             case: "no portfolio preferences have ever been saved",
@@ -252,6 +264,21 @@ fn declared(operation: &str) -> &'static [&'static str] {
         .unwrap_or_else(|| panic!("this suite has no declared error list for {operation:?}"))
 }
 
+/// Every error shape `operation` can answer: the ones it declares plus the ones widened
+/// into its error channel.
+fn answerable(operation: &str) -> Vec<&'static str> {
+    let widened = WIDENED_ERRORS
+        .iter()
+        .find(|(name, _)| *name == operation)
+        .map(|(_, errors)| *errors)
+        .unwrap_or(&[]);
+    declared(operation)
+        .iter()
+        .chain(widened.iter())
+        .copied()
+        .collect()
+}
+
 /// The `httpError` the named error shape declares, from the catalog above.
 fn modelled_status(code: &str) -> u16 {
     MODELLED_STATUS
@@ -261,8 +288,9 @@ fn modelled_status(code: &str) -> u16 {
         .unwrap_or_else(|| panic!("this suite has no modelled status for {code:?}"))
 }
 
-/// A read that cannot produce its report is refused with an error the operation declares,
-/// at that error's modelled status — and asking again answers exactly the same thing.
+/// A read that cannot produce its report is refused with an error the operation can
+/// answer, at that error's modelled status — and asking again answers exactly the same
+/// thing.
 #[tokio::test]
 async fn an_unproducible_report_is_refused_with_an_error_the_operation_declares() {
     for row in rows() {
@@ -290,11 +318,11 @@ async fn an_unproducible_report_is_refused_with_an_error_the_operation_declares(
             answer.body
         );
         assert!(
-            declared(operation).contains(&answer.error_code()),
-            "case {case:?}: {operation} answered {:?}, which its modelled errors \
-             {:?} do not declare",
+            answerable(operation).contains(&answer.error_code()),
+            "case {case:?}: {operation} answered {:?}, which is neither one of its \
+             modelled errors nor a shape widened into it {:?}",
             answer.error_code(),
-            declared(operation)
+            answerable(operation)
         );
         assert_eq!(
             answer.status,
@@ -333,8 +361,9 @@ async fn the_latest_assessment_id_refusal_tracks_the_accounts_assessments() {
     let empty = read(&router, "GetLatestAssessmentId").await;
     assert_eq!(
         (empty.status, empty.error_code()),
-        (400, "ValidationException"),
-        "an account with no assessment is refused 400 ValidationException, got {} with {:?}",
+        (404, "ResourceNotFoundException"),
+        "an account with no assessment is refused 404 ResourceNotFoundException, got {} \
+         with {:?}",
         empty.status,
         empty.body
     );

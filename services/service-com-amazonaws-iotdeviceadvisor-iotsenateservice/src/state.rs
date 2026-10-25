@@ -90,6 +90,18 @@ pub const MAX_VERSIONS_PER_DEFINITION: usize = 50;
 /// progress is never dropped.
 pub const MAX_RUNS_PER_DEFINITION: usize = 50;
 
+/// How many runs of one definition may be in progress AT ONCE when they all ask to run in
+/// parallel.
+///
+/// A run whose configuration does not ask for a parallel run holds its definition alone
+/// (see [`SuiteRun::allows_parallel_runs`]), so without a cap only the parallel case is
+/// unbounded: a caller could hold any number of in-progress runs of one definition open,
+/// and retention may never drop a run that is in progress. An OCCUPANCY BOUND this
+/// emulator chooses, not a claim about a published AWS quota, in the same spirit as
+/// [`MAX_SUITE_DEFINITIONS`]: `StartSuiteRun` refuses past it with the modelled
+/// concurrency error it already answers a non-parallel clash with.
+pub const MAX_PARALLEL_RUNS_PER_DEFINITION: usize = 10;
+
 /// How many tags one resource carries at once.
 ///
 /// `TagMap` is `len 0..50` (`smithy_query(query="shape",shape="TagMap")`), so a resource
@@ -354,14 +366,20 @@ impl SuiteRun {
         }
     }
 
-    /// True while this run holds the definition's single run slot: any status that is not
-    /// terminal, so `STOPPING` still counts — a run the caller asked to stop is in
-    /// progress until the stop completes.
+    /// True while this run still occupies its definition: any status that is not terminal,
+    /// so `STOPPING` still counts — a run the caller asked to stop is in progress until
+    /// the stop completes.
     ///
-    /// This is what `StartSuiteRun` refuses a concurrent start on, and what retention
+    /// This is what `StartSuiteRun` weighs a concurrent start against, and what retention
     /// never drops.
     pub fn is_in_progress(&self) -> bool {
         !is_terminal(&self.status)
+    }
+
+    /// True when this run was started asking to run in parallel with others, so it does
+    /// not hold its definition alone. See [`asks_for_parallel_run`].
+    pub fn allows_parallel_runs(&self) -> bool {
+        asks_for_parallel_run(&self.configuration)
     }
 
     /// True when a stop would move this run: it has not been asked to stop yet and has
@@ -596,9 +614,10 @@ impl ComAmazonawsIotdeviceadvisorIotsenateserviceState {
     ///
     /// A run that is still in progress — including one that is `STOPPING` — is never
     /// dropped, so a caller can always read back the run it just started or stopped. That
-    /// cannot defeat the bound: `StartSuiteRun` refuses a start while any run of the
-    /// definition is in progress, so at most one run is ever skipped and the remaining
-    /// candidates still take the count down to `keep`.
+    /// cannot defeat the bound: the number of runs of one definition that can be in
+    /// progress at once is itself capped ([`MAX_PARALLEL_RUNS_PER_DEFINITION`]), so at
+    /// most that many runs are ever skipped and the remaining candidates take the count
+    /// down to `keep`.
     pub fn prune_runs(&mut self, suite_definition_id: &str, keep: usize, now: SystemTime) {
         let mut total = 0usize;
         let mut droppable: Vec<(SystemTime, String, String)> = Vec::new();
@@ -980,6 +999,15 @@ pub fn device_violation(
         };
         format!("{subject} requires {}", naming.requirement())
     })
+}
+
+/// True when a run configuration asks for a run that executes in parallel with others.
+///
+/// `SuiteRunConfiguration$parallelRun` is the input that governs this (the model: "TRUE if
+/// multiple test suites run in parallel"), and it is optional: a caller who sends nothing
+/// has not asked for a parallel run, so an absent member reads the same as `false`.
+pub fn asks_for_parallel_run(configuration: &SuiteRunConfiguration) -> bool {
+    configuration.parallel_run.unwrap_or(false)
 }
 
 /// Every rule the model states in prose for a `SuiteRunConfiguration`, which no modelled

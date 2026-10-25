@@ -55,6 +55,8 @@ mod preset_lifecycle;
 mod preset_listing;
 #[path = "all/preset_update.rs"]
 mod preset_update;
+#[path = "all/queue_capacity_validation.rs"]
+mod queue_capacity_validation;
 #[path = "all/queue_deletion.rs"]
 mod queue_deletion;
 #[path = "all/queue_hopping.rs"]

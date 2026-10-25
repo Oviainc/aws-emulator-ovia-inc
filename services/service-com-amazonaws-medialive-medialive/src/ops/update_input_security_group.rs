@@ -161,6 +161,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
 
+        // A tag key in the reserved namespace names a system tag, which is not
+        // the caller's to set, so a request carrying one is refused before the
+        // store is touched rather than writing it onto the group.
+        if let Some(key) = crate::state::reserved_tag_key_in(input.tags.as_ref()) {
+            return Err(bad_request(crate::state::reserved_tag_key_message(key)));
+        }
+
         // The requested rules are validated BEFORE the store is touched, so a
         // refused update leaves the group's whitelist exactly as it was rather
         // than applying a prefix of the new one. The IPv4 CIDR rule is the one

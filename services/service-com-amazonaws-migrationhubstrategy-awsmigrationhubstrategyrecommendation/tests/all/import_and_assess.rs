@@ -799,14 +799,14 @@ async fn the_latest_assessment_id_follows_the_most_recent_start() {
 
     let empty = get_latest_assessment_id(&router).await;
     assert_eq!(
-        empty.status, 400,
+        empty.status, 404,
         "with no assessment started there is no latest id to report, got {} with {:?}",
         empty.status, empty.body
     );
     assert_eq!(
         empty.error_code(),
-        "ValidationException",
-        "expected ValidationException before any assessment exists, got {:?}",
+        "ResourceNotFoundException",
+        "expected ResourceNotFoundException before any assessment exists, got {:?}",
         empty.body
     );
 

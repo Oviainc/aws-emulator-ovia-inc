@@ -26,6 +26,11 @@
 //! character, a real AWS system key, the longest key the modelled length allows) and
 //! how many reserved keys one request carries; the accepted rows are keys that merely
 //! RESEMBLE the prefix, so what is asserted is a prefix test and not a substring one.
+//!
+//! For `UntagResource` the rows also differ along WHERE the reserved key sits in
+//! `tagKeys`, how many keys travel with it (up to the modelled maximum) and whether it
+//! repeats: the request is refused as a whole whatever its shape, so the ordinary keys
+//! beside the reserved one are not removed either and the resource is not stamped.
 
 use std::collections::BTreeSet;
 
@@ -34,7 +39,7 @@ use service_com_amazonaws_evs_amazonelasticvmwareservice::state::{
     is_reserved_tag_key, RESERVED_TAG_KEY_PREFIX,
 };
 
-use crate::environment_lifecycle::{call, emulator, error_type, Emulator};
+use crate::environment_lifecycle::{call, emulator, error_type, settle, Emulator};
 
 /// The longest key the modelled `TagKey` admits (len 1..128), inside the reserved
 /// namespace: the prefix plus enough characters to reach that bound exactly.
@@ -305,6 +310,171 @@ async fn untag_resource_refuses_a_reserved_key_and_removes_nothing() {
         tags,
         tag_map(&[("cost", "42")]),
         "case {case:?}: expected only the untouched key to remain, got {tags}"
+    );
+}
+
+/// The environment id an environment ARN names (`…:environment/<environmentId>`), so a
+/// test holding the ARN can read the resource back through the id-addressed
+/// `GetEnvironment`.
+fn environment_id_of(resource_arn: &str) -> &str {
+    resource_arn
+        .rsplit('/')
+        .next()
+        .expect("an environment ARN names an environment")
+}
+
+/// The `modifiedAt` the service reports for the environment the ARN names.
+///
+/// A refused request changes nothing about the resource, so this is the stamp a refusal
+/// must leave exactly where it was — the tags being unchanged is one half of that, the
+/// resource's own last-modified stamp the other.
+async fn modified_at(router: &Emulator, case: &str, resource_arn: &str) -> Value {
+    let (status, body) = call(
+        router,
+        "GetEnvironment",
+        &json!({ "environmentId": environment_id_of(resource_arn) }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: reading the environment back: expected HTTP 200, got {status} {body}"
+    );
+    body["environment"]["modifiedAt"].clone()
+}
+
+/// `tagKeys` lists that each carry at least one reserved key, differing in WHERE that
+/// key sits, HOW MANY keys travel with it and whether it repeats — the dimensions the
+/// rule generalises over beside the key's spelling (which [`reserved_keys`] covers).
+///
+/// Every list also names keys the resource really carries ([`starting_tags`]), so a
+/// request that was not refused whole would show as a removal. Each row answers with the
+/// reserved keys the refusal must name.
+fn untag_key_lists() -> Vec<(String, Vec<String>, Vec<String>)> {
+    let prefix = RESERVED_TAG_KEY_PREFIX;
+    let reserved = format!("{prefix}cloudformation:stack-name");
+    let other = format!("{prefix}createdBy");
+    // The modelled `TagKeys` is len 1..200
+    // (`smithy_query(query="shape",shape="TagKeys",model_path="services/service-com-amazonaws-evs-amazonelasticvmwareservice/smithy-model/com-amazonaws-evs-amazonelasticvmwareservice.json")`),
+    // so the longest list a request can carry is 200 keys: the two the resource holds,
+    // 197 it does not, and the reserved one last.
+    let longest = {
+        let mut keys = vec!["team".to_string(), "cost".to_string()];
+        keys.extend((0..197).map(|index| format!("absent-{index}")));
+        keys.push(reserved.clone());
+        assert_eq!(keys.len(), 200, "the longest list is the modelled maximum");
+        keys
+    };
+    vec![
+        (
+            "the reserved key alone".to_string(),
+            vec![reserved.clone()],
+            vec![reserved.clone()],
+        ),
+        (
+            "the reserved key first, before keys the resource carries".to_string(),
+            vec![reserved.clone(), "team".to_string(), "cost".to_string()],
+            vec![reserved.clone()],
+        ),
+        (
+            "the reserved key last, after keys the resource carries".to_string(),
+            vec!["team".to_string(), "cost".to_string(), reserved.clone()],
+            vec![reserved.clone()],
+        ),
+        (
+            "the reserved key between keys the resource carries".to_string(),
+            vec!["team".to_string(), reserved.clone(), "cost".to_string()],
+            vec![reserved.clone()],
+        ),
+        (
+            "two reserved keys among ordinary ones".to_string(),
+            vec![
+                "team".to_string(),
+                reserved.clone(),
+                "cost".to_string(),
+                other.clone(),
+            ],
+            vec![reserved.clone(), other],
+        ),
+        (
+            "the same reserved key twice".to_string(),
+            vec![reserved.clone(), "team".to_string(), reserved.clone()],
+            vec![reserved.clone()],
+        ),
+        (
+            "the longest list the model allows, its last key reserved".to_string(),
+            longest,
+            vec![reserved],
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn untag_resource_refuses_the_whole_request_wherever_the_reserved_key_sits() {
+    let router = emulator();
+    let arn = tagged_environment(&router, "reserved-untag-whole").await;
+    // Past the create transition, so the `modifiedAt` compared below moves only if a
+    // request moves it.
+    settle(&router);
+    let before = modified_at(&router, "baseline", &arn).await;
+
+    for (why, keys, named) in untag_key_lists() {
+        let case = format!("UntagResource with {why}");
+        let (status, body) = call(
+            &router,
+            "UntagResource",
+            &json!({ "resourceArn": arn, "tagKeys": keys }),
+        )
+        .await;
+        assert_tag_policy_refusal(&case, status, &body, &named[0]);
+        let message = body["message"].as_str().unwrap_or_default();
+        for key in &named[1..] {
+            assert!(
+                message.contains(key.as_str()),
+                "case {case:?}: the refusal must name every reserved key the request \
+                 carried, missing {key:?} in {message:?}"
+            );
+        }
+
+        // The request is refused AS A WHOLE: the ordinary keys it named beside the
+        // reserved one are still there, and the resource was not touched at all.
+        let tags = stored_tags(&router, &case, &arn).await;
+        assert_eq!(
+            tags,
+            starting_tags(),
+            "case {case:?}: a refused UntagResource must remove no key, got {tags}"
+        );
+        let after = modified_at(&router, &case, &arn).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: a refused UntagResource must not stamp the resource, \
+             expected modifiedAt {before}, got {after}"
+        );
+    }
+
+    // Neither the list's length nor a key the resource does not carry is what refuses:
+    // the same 200-key shape without a reserved key is accepted, removes exactly the
+    // keys it names that exist, and is not an error for the ones it does not
+    // (`@idempotent`).
+    let case = "UntagResource with the longest list the model allows and no reserved key";
+    let mut keys = vec!["team".to_string()];
+    keys.extend((0..199).map(|index| format!("absent-{index}")));
+    let (status, body) = call(
+        &router,
+        "UntagResource",
+        &json!({ "resourceArn": arn, "tagKeys": keys }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        200,
+        "case {case:?}: expected HTTP 200, got {status} ({}) {body}",
+        error_type(&body)
+    );
+    let tags = stored_tags(&router, case, &arn).await;
+    assert_eq!(
+        tags,
+        tag_map(&[("cost", "42")]),
+        "case {case:?}: expected only the key the request did not name to remain, got {tags}"
     );
 }
 

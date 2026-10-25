@@ -13,21 +13,22 @@
 //! tunnel an Outpost-server installation connection is reported as, cutting an
 //! ordered list into pages with the modelled `Token` the next page resumes from, the
 //! orderable-instance-type catalog and the catalog of orderable hardware
-//! configurations this service publishes, pricing a renewal of the subscription an
+//! configurations this service publishes, the hardware an Outpost of a given form
+//! factor is installed with, pricing a renewal of the subscription an
 //! Outpost's orders hold, and
 //! the two rules this service words its refusals by — the `NotFoundException`
 //! identifier echo and the value-omitting `ValidationException` report.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use sha2::{Digest, Sha256};
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    Address, AssetInfo, AssetInstance, CapacityTaskFailure, CatalogItem, ConnectionDetails,
-    DetailedInstanceTypeItem, EC2Capacity, FormFactorConfig, InstanceTypeCapacity,
-    InstancesToExclude, Order, Outpost, PricingOption, PrivateConnectivityConfig, Quote, Site,
-    SubscriptionPricingDetails,
+    Address, AssetInfo, AssetInstance, AssetLocation, CapacityTaskFailure, CatalogItem,
+    ComputeAttributes, ConnectionDetails, DetailedInstanceTypeItem, EC2Capacity, FormFactorConfig,
+    InstanceTypeCapacity, InstancesToExclude, Order, Outpost, PricingOption,
+    PrivateConnectivityConfig, Quote, Site, SubscriptionPricingDetails,
 };
 
 /// The region every minted ARN falls back to when the request carries no SigV4
@@ -120,12 +121,13 @@ pub const ORDER_STATUS_PREPARING: &str = "PREPARING";
 ///
 /// This is as far as the clock carries an order. The two statuses past it —
 /// `DELIVERED` ("Order was delivered to the Outpost site") and `COMPLETED` ("Order
-/// is complete") — are reached by hardware physically arriving at the site and being
-/// installed, which leaves a record this emulator does not have: an installed asset
-/// on the Outpost ([`OutpostRecord::assets`]), reported by `ListAssets` and by the
-/// line item's own `AssetInformationList`. Reporting an order delivered or complete
-/// with no asset behind it would be a claim about hardware nothing installed, so the
-/// emulator stops where it still has a record to show.
+/// is complete") — are reached by the hardware this order's line items name
+/// physically arriving at the site and being installed, which leaves a record this
+/// emulator does not have: the assets a line item was fulfilled by
+/// (`LineItem$AssetInformationList`). The hardware an Outpost settles with is its
+/// own configuration's ([`installed_hardware`]), not any one order's, so reporting
+/// an order delivered or complete would be a claim about which hardware THAT order
+/// installed, and the emulator stops where it still has a record to show.
 pub const ORDER_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 
 /// The `OrderStatus` of a cancelled order — the model's "`CANCELLED` - Order is
@@ -403,15 +405,14 @@ pub struct OutpostRecord {
     /// `/outposts/{OutpostIdentifier}/assets`), so deleting the Outpost takes its
     /// assets with it.
     ///
-    /// An asset is a PHYSICAL unit — a rack, a compute or storage server, a
-    /// powershelf, a switch — that Amazon Web Services installs on the site after an
-    /// order is fulfilled, so no call in this API creates one and `CreateOutpost`
-    /// leaves this empty: an order this service accepts is never carried as far as
-    /// being delivered and installed, because that is exactly the record it would
-    /// have to invent (see [`ORDER_STATUS_IN_PROGRESS`]). This therefore holds only
-    /// the assets that were actually recorded for the Outpost, and an Outpost
-    /// with no installed hardware is reported as having none rather than as having
-    /// hardware the emulator made up.
+    /// An asset is a PHYSICAL unit — a compute or storage server, a powershelf, a
+    /// switch, a networking asset — that Amazon Web Services installs for the Outpost,
+    /// so no call in this API creates one: `CreateOutpost` leaves this empty, and the
+    /// hardware of the Outpost's own configuration is installed as the Outpost finishes
+    /// provisioning ([`ComAmazonawsOutpostsOutpostsolafserviceState::settle_outposts`],
+    /// [`installed_hardware`]) — the transition it reaches a settled lifecycle status
+    /// by. An Outpost whose form factor names no configuration this service holds is
+    /// installed with nothing and reported as holding no asset.
     pub assets: Vec<AssetInfo>,
     /// The Amazon EC2 instances RUNNING on this Outpost — what
     /// `ListBlockingInstancesForCapacityTask` weighs a capacity task against, and what
@@ -1650,6 +1651,307 @@ pub fn catalog_item_catalog() -> Vec<CatalogItemRecord> {
         .collect()
 }
 
+/// The `AssetType` of a server that provides EC2 capacity, from the modelled value
+/// set [`crate::ops::types::ASSET_TYPE_VALUES`] — "`COMPUTE` - Server asset used for
+/// customer compute", as `ListAssets$AssetTypeFilter` documents it.
+///
+/// It is the one asset type that carries `ComputeAttributes`: the host, the instance
+/// families and the vCPU ceiling are facts about COMPUTE hardware, and the model
+/// documents the member as "information about compute hardware assets".
+pub const ASSET_TYPE_COMPUTE: &str = "COMPUTE";
+
+/// The `AssetType` of a server used by storage services — the model's "`STORAGE` -
+/// Server asset used by storage services". See [`ASSET_TYPE_COMPUTE`].
+pub const ASSET_TYPE_STORAGE: &str = "STORAGE";
+
+/// The `AssetType` of a power shelf — the model's "`POWERSHELF` - Powershelf
+/// assets". See [`ASSET_TYPE_COMPUTE`].
+pub const ASSET_TYPE_POWERSHELF: &str = "POWERSHELF";
+
+/// The `AssetType` of a switch — the model's "`SWITCH` - Switch assets". See
+/// [`ASSET_TYPE_COMPUTE`].
+pub const ASSET_TYPE_SWITCH: &str = "SWITCH";
+
+/// The `AssetType` of the hardware Amazon Web Services manages for networking
+/// purposes — the model's "`NETWORKING` - Asset managed by Amazon Web Services for
+/// networking purposes". See [`ASSET_TYPE_COMPUTE`].
+pub const ASSET_TYPE_NETWORKING: &str = "NETWORKING";
+
+/// The `ComputeAssetState` of installed compute hardware: the model's "`ACTIVE` - The
+/// asset is available and can provide capacity for new compute resources".
+///
+/// Hardware that has been installed is hardware that is there to be used, so that is
+/// the state it is reported in. The other three values the modelled enum declares
+/// (see [`crate::ops::types::COMPUTE_ASSET_STATE_VALUES`]) each describe something
+/// having happened to a host — it is being installed, isolated, or retired — which
+/// this service holds no record of.
+pub const COMPUTE_ASSET_STATE_ACTIVE: &str = "ACTIVE";
+
+/// One physical unit of the hardware an Outpost is installed with.
+struct HardwareUnit {
+    /// The unit's modelled `AssetType`.
+    asset_type: &'static str,
+    /// `AssetLocation$RackElevation`: where the unit sits in its rack, "measured in
+    /// rack units", or `None` for a unit that sits in no rack of this service's — an
+    /// Outposts server is installed in the customer's own rack, whose positions
+    /// Amazon Web Services does not hold.
+    rack_elevation: Option<f32>,
+}
+
+/// The hardware an Outposts RACK is installed with, in installation order.
+///
+/// An Outposts rack is delivered as a whole rack of hardware: the power shelf that
+/// feeds it, the redundant pair of switches and the networking asset that attach it to
+/// its Region, and the compute and storage servers that carry its capacity. WHICH
+/// units one holds is this emulator's own configuration, exactly as which hardware
+/// configurations are offered is ([`CATALOG_ITEMS`]) — AWS publishes no
+/// machine-readable rack layout — and the positions are bottom-up in rack units,
+/// inside the modelled `RackElevation` range (`range(0..99)`), one unit to a position
+/// so no two assets of one rack claim the same one.
+const RACK_HARDWARE: &[HardwareUnit] = &[
+    HardwareUnit {
+        asset_type: ASSET_TYPE_POWERSHELF,
+        rack_elevation: Some(1.0),
+    },
+    HardwareUnit {
+        asset_type: ASSET_TYPE_SWITCH,
+        rack_elevation: Some(2.0),
+    },
+    HardwareUnit {
+        asset_type: ASSET_TYPE_SWITCH,
+        rack_elevation: Some(3.0),
+    },
+    HardwareUnit {
+        asset_type: ASSET_TYPE_NETWORKING,
+        rack_elevation: Some(4.0),
+    },
+    HardwareUnit {
+        asset_type: ASSET_TYPE_COMPUTE,
+        rack_elevation: Some(5.0),
+    },
+    HardwareUnit {
+        asset_type: ASSET_TYPE_COMPUTE,
+        rack_elevation: Some(6.0),
+    },
+    HardwareUnit {
+        asset_type: ASSET_TYPE_COMPUTE,
+        rack_elevation: Some(7.0),
+    },
+    HardwareUnit {
+        asset_type: ASSET_TYPE_COMPUTE,
+        rack_elevation: Some(8.0),
+    },
+    HardwareUnit {
+        asset_type: ASSET_TYPE_COMPUTE,
+        rack_elevation: Some(9.0),
+    },
+    HardwareUnit {
+        asset_type: ASSET_TYPE_COMPUTE,
+        rack_elevation: Some(10.0),
+    },
+    HardwareUnit {
+        asset_type: ASSET_TYPE_STORAGE,
+        rack_elevation: Some(11.0),
+    },
+    HardwareUnit {
+        asset_type: ASSET_TYPE_STORAGE,
+        rack_elevation: Some(12.0),
+    },
+];
+
+/// The hardware an Outposts SERVER is installed with: the one server it is.
+///
+/// "An Outpost asset can be a single server within an Outposts rack or an Outposts
+/// server configuration", as the modelled `AssetId` documents it — so a server
+/// Outpost holds exactly one asset, and it is the compute hardware the Outpost exists
+/// to provide. It sits in no rack of this service's, so it reports neither a `RackId`
+/// nor an `AssetLocation`.
+const SERVER_HARDWARE: &[HardwareUnit] = &[HardwareUnit {
+    asset_type: ASSET_TYPE_COMPUTE,
+    rack_elevation: None,
+}];
+
+/// The hardware configuration an Outpost of `form_factor` is installed with, or
+/// `None` for a form factor this service holds no configuration for.
+///
+/// `SupportedHardwareType` is "the hardware type" of the Outpost and names the same
+/// two kinds of hardware the modelled `FormFactor` does ([`FORM_FACTOR_RACK`]), so it
+/// is what selects the configuration. `CreateOutpost` records only the form factor the
+/// caller named and the model documents no default, so an Outpost that named none
+/// names no configuration either: there is nothing for the service to install on it
+/// and it holds no asset.
+fn hardware_configuration(form_factor: &str) -> Option<&'static [HardwareUnit]> {
+    match form_factor {
+        FORM_FACTOR_RACK => Some(RACK_HARDWARE),
+        FORM_FACTOR_SERVER => Some(SERVER_HARDWARE),
+        _ => None,
+    }
+}
+
+/// How many hardware units one Outpost's installation is identified within, which is
+/// what keeps one Outpost's asset ids clear of the next's. See [`asset_slot`].
+const HARDWARE_UNITS_PER_OUTPOST: u64 = 100;
+
+/// How many values an `AssetIdInput` can take: the modelled `^\d{10}$`.
+const ASSET_ID_SPACE: u64 = 10_000_000_000;
+
+/// The ten-digit slot the unit at `position` of the Outpost created `sequence`th is
+/// identified by.
+///
+/// An `AssetId` a caller reads out of `ListAssets` is the value it then names in
+/// `StartCapacityTask$AssetId` and `GetOutpostSupportedInstanceTypes$AssetId`, whose
+/// modelled `AssetIdInput` is exactly ten digits (`^\d{10}$`) — the narrower form
+/// inside the `AssetId` (`len 1..100`, `^(\w+)$`) those outputs report — so that is
+/// the form installed hardware is identified in. It is DERIVED from the Outpost's own
+/// creation order and the unit's position in its configuration rather than minted:
+/// the id of a unit is therefore stable for as long as the Outpost holds it, and two
+/// Outposts of one store can never hold one asset id, because their slots are
+/// [`HARDWARE_UNITS_PER_OUTPOST`] apart.
+fn asset_slot(sequence: u64, position: usize) -> u64 {
+    let outpost = sequence % (ASSET_ID_SPACE / HARDWARE_UNITS_PER_OUTPOST);
+    let position = u64::try_from(position).unwrap_or_default() % HARDWARE_UNITS_PER_OUTPOST;
+    outpost * HARDWARE_UNITS_PER_OUTPOST + position
+}
+
+/// The `AssetId` of the unit at `position`. See [`asset_slot`].
+fn asset_id(sequence: u64, position: usize) -> String {
+    format!("{:010}", asset_slot(sequence, position))
+}
+
+/// The `RackId` of the rack an Outpost's hardware is installed in, which every unit
+/// of a rack configuration carries: one rack of hardware is one rack.
+///
+/// Derived from the Outpost's own creation order for the reason [`asset_slot`] is,
+/// and rendered to the same ten digits, which the modelled `RackId` (`len 5..20`,
+/// `^[\S \n]+$`) accepts.
+fn rack_id(sequence: u64) -> String {
+    format!("{:010}", asset_slot(sequence, 0))
+}
+
+/// The `HostId` of the Dedicated Host on the compute unit at `position`.
+///
+/// A host id is an Amazon EC2 identifier — `h-` and seventeen hex characters, which
+/// the modelled `HostId` (`len 1..50`, `^[A-Za-z0-9-]*$`) accepts — and names the
+/// same one unit of hardware its asset id does, so it is derived from the same slot:
+/// `ListAssets$HostIdFilter` selects on it, and one host id therefore names one
+/// asset.
+fn host_id(sequence: u64, position: usize) -> String {
+    format!("h-{:017x}", asset_slot(sequence, position))
+}
+
+/// What the compute hardware of `form_factor` runs: every instance family this
+/// service publishes as orderable on that hardware, and the vCPU count of the largest
+/// orderable instance type on it.
+///
+/// Not a second catalog: it is the orderable-instance-type catalog
+/// ([`orderable_instance_type_catalog`]) narrowed to the form factor, so a host can
+/// never report a family or a vCPU ceiling this service does not publish as orderable
+/// on the Outpost it is installed in — which is what makes
+/// `GetOutpostSupportedInstanceTypes` scoped to one of its assets answer the instance
+/// types that asset's own `ComputeAttributes` admit.
+fn compute_profile(
+    instance_types: &[OrderableInstanceTypeRecord],
+    form_factor: &str,
+) -> (Vec<String>, i32) {
+    let offered = instance_types.iter().filter(|record| {
+        record
+            .instance_type
+            .form_factor_configs
+            .iter()
+            .flatten()
+            .any(|config| config.form_factor.as_deref() == Some(form_factor))
+    });
+    // The families in their own stable order (a host reports the same list on every
+    // read, in every process) and the one ceiling the largest of them sets.
+    let mut families: BTreeSet<String> = BTreeSet::new();
+    let mut max_vcpus = 0;
+    for record in offered {
+        let Some(instance_type) = record.instance_type.instance_type.as_deref() else {
+            continue;
+        };
+        let Some((family, _)) = instance_type.split_once('.') else {
+            continue;
+        };
+        families.insert(family.to_string());
+        max_vcpus = max_vcpus.max(record.instance_type.vcp_us.unwrap_or_default());
+    }
+    (families.into_iter().collect(), max_vcpus)
+}
+
+/// Every hardware asset installed on one Outpost, in installation order.
+///
+/// Hardware is what an Outpost IS: Amazon Web Services installs the configuration the
+/// Outpost's form factor names once the order for it is fulfilled, and the Outpost
+/// reaches a settled lifecycle status with that hardware in it — so an Outpost that
+/// has finished provisioning holds one asset per physical unit of its configuration,
+/// each identified by the slot it occupies, typed by what the unit is, placed where it
+/// sits in its rack, and — for the compute units, the only ones the model carries
+/// `ComputeAttributes` for — carrying the Dedicated Host it hosts instances on and the
+/// instance families and vCPU ceiling this service publishes as orderable on that
+/// hardware. An Outpost whose form factor was never recorded names no configuration,
+/// so nothing is installed on it (see [`hardware_configuration`]).
+pub fn installed_hardware(
+    sequence: u64,
+    form_factor: Option<&str>,
+    instance_types: &[OrderableInstanceTypeRecord],
+) -> Vec<AssetInfo> {
+    let Some((form_factor, units)) = form_factor
+        .and_then(|form_factor| hardware_configuration(form_factor).map(|units| (form_factor, units)))
+    else {
+        return Vec::new();
+    };
+    // A configuration may only ever name values the model declares and positions it
+    // allows, so the tables above are checked against the GENERATED value set and the
+    // modelled range rather than trusted to agree with them.
+    debug_assert!(
+        units.iter().all(|unit| {
+            crate::ops::types::ASSET_TYPE_VALUES.contains(&unit.asset_type)
+                && unit
+                    .rack_elevation
+                    .is_none_or(|elevation| (0.0..=99.0).contains(&elevation))
+        }),
+        "every installed unit names a modelled AssetType and a position inside RackElevation"
+    );
+    debug_assert!(
+        units.len() < HARDWARE_UNITS_PER_OUTPOST as usize,
+        "one Outpost's hardware fits in the slots its asset ids are identified within"
+    );
+    let (instance_families, max_vcpus) = compute_profile(instance_types, form_factor);
+    // Every unit of ONE rack of hardware is in that one rack; a server is in no rack
+    // of this service's, so it carries no rack id (see [`SERVER_HARDWARE`]).
+    let rack = (form_factor == FORM_FACTOR_RACK).then(|| rack_id(sequence));
+    units
+        .iter()
+        .enumerate()
+        .map(|(index, unit)| {
+            // The rack itself takes the first slot of the Outpost's range, so the
+            // units take the ones after it.
+            let position = index + 1;
+            AssetInfo {
+                asset_id: Some(asset_id(sequence, position)),
+                rack_id: rack.clone(),
+                asset_type: Some(unit.asset_type.to_string()),
+                compute_attributes: (unit.asset_type == ASSET_TYPE_COMPUTE).then(|| {
+                    ComputeAttributes {
+                        host_id: Some(host_id(sequence, position)),
+                        state: Some(COMPUTE_ASSET_STATE_ACTIVE.to_string()),
+                        instance_families: Some(instance_families.clone()),
+                        // "The instance type capacities configured for this asset.
+                        // This can be changed through a capacity task": nothing has
+                        // configured this host's capacity per instance type, so it
+                        // reports none rather than a split nobody asked for.
+                        instance_type_capacities: None,
+                        max_vcpus: Some(max_vcpus),
+                    }
+                }),
+                asset_location: unit.rack_elevation.map(|rack_elevation| AssetLocation {
+                    rack_elevation: Some(rack_elevation),
+                }),
+            }
+        })
+        .collect()
+}
+
 /// The one `QuotePricingType` the model declares (see
 /// [`crate::ops::types::QUOTE_PRICING_TYPE_VALUES`]): the pricing of this service is
 /// the pricing of a SUBSCRIPTION on hardware, which is the kind of price a
@@ -1975,19 +2277,50 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     }
 
     /// Materialise every Outpost lifecycle transition the clock has already made
-    /// due.
+    /// due, and with it the hardware the Outpost settles with.
     ///
-    /// Every operation that reports or filters on an Outpost calls this FIRST, so a
-    /// read answers the status the Outpost holds at the instant it is asked for and
-    /// never a stale one. It writes only what the clock already owed at that same
-    /// instant, so reading changes nothing a later caller would not have seen
-    /// anyway, and a settled Outpost is left alone.
+    /// Every operation that reports or filters on an Outpost, or that reads one of its
+    /// assets, calls this FIRST, so a read answers the Outpost — and the hardware —
+    /// as it stands at the instant it is asked for and never a stale one. It writes
+    /// only what the clock already owed at that same instant, so reading changes
+    /// nothing a later caller would not have seen anyway, and a settled Outpost is
+    /// left alone.
+    ///
+    /// Provisioning an Outpost is Amazon Web Services installing its hardware, so the
+    /// transition that ends it is also when that hardware arrives: the Outpost's
+    /// configuration is installed on it ([`installed_hardware`]) as it settles, and an
+    /// Outpost that already holds hardware keeps exactly the hardware it holds —
+    /// hardware is installed once.
     pub fn settle_outposts(&mut self) {
         let now = std::time::Instant::now();
-        for record in self.outposts.values_mut() {
-            if record.active_at.is_some_and(|due| now >= due) {
-                record.outpost.life_cycle_status = Some(LIFE_CYCLE_STATUS_ACTIVE.to_string());
-                record.active_at = None;
+        // What the clock owes each Outpost whose provisioning has come due: the hardware
+        // to install on it, or none for one that already holds its own. Worked out
+        // against the catalog first and applied after, because the hardware a unit runs
+        // is read from the same catalog `ListOrderableInstanceTypes` publishes.
+        let settled: Vec<(String, Vec<AssetInfo>)> = self
+            .outposts
+            .iter()
+            .filter(|(_, record)| record.active_at.is_some_and(|due| now >= due))
+            .map(|(outpost_id, record)| {
+                let hardware = match record.assets.is_empty() {
+                    true => installed_hardware(
+                        record.sequence,
+                        record.outpost.supported_hardware_type.as_deref(),
+                        &self.orderable_instance_types,
+                    ),
+                    false => Vec::new(),
+                };
+                (outpost_id.clone(), hardware)
+            })
+            .collect();
+        for (outpost_id, hardware) in settled {
+            let Some(record) = self.outposts.get_mut(&outpost_id) else {
+                continue;
+            };
+            record.outpost.life_cycle_status = Some(LIFE_CYCLE_STATUS_ACTIVE.to_string());
+            record.active_at = None;
+            if !hardware.is_empty() {
+                record.assets = hardware;
             }
         }
     }

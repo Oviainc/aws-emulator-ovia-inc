@@ -40,7 +40,11 @@
 //! `GetNetworkTelemetry` reports.
 //! A global network also holds the TRANSIT GATEWAYS registered with it: each registration
 //! is the tie between the global network and one transit gateway of Amazon VPC, with no id
-//! of its own, so it is keyed by that pair like a customer gateway association.
+//! of its own, so it is keyed by that pair like a customer gateway association. A CONNECT
+//! PEER of such a gateway can in turn be tied to one device of that global network, and
+//! optionally to one of that device's links, by a TRANSIT GATEWAY CONNECT PEER ASSOCIATION,
+//! which has no id either and is keyed by the global network plus the peer's own ARN; that
+//! tie is what registers the peering with the global network's telemetry.
 //! A global network also holds the ROUTE ANALYSES started on it: each is a Route Analyzer
 //! job that analysed the routing path between two attachments against what the global
 //! network held when it was started, and holds the paths it found for `GetRouteAnalysis`
@@ -68,7 +72,8 @@ use crate::ops::types::{
     NetworkResource, NetworkTelemetry, OrganizationStatus, Peering,
     ResourceNotFoundException, RouteAnalysis, RouteAnalysisCompletion,
     RouteAnalysisEndpointOptions, RouteAnalysisEndpointOptionsSpecification, RouteAnalysisPath,
-    ServiceInsertionSegments, Site, SiteToSiteVpnAttachment, Tag, TransitGatewayPeering,
+    ServiceInsertionSegments, Site, SiteToSiteVpnAttachment, Tag,
+    TransitGatewayConnectPeerAssociation, TransitGatewayPeering,
     TransitGatewayRegistration, TransitGatewayRegistrationStateReason,
     TransitGatewayRouteTableAttachment, ValidationException,
     ValidationExceptionField, VpcAttachment, VpcOptions,
@@ -151,6 +156,17 @@ pub const CUSTOMER_GATEWAY_ASSOCIATION_KIND: &str = "customer-gateway-associatio
 /// ([`transit_gateway_registration_key`]) and this name is only how a not-found refusal
 /// spells the resource type.
 pub const TRANSIT_GATEWAY_REGISTRATION_KIND: &str = "transit-gateway-registration";
+/// The resource kind a TRANSIT GATEWAY CONNECT PEER association reports in a refusal that
+/// names it.
+///
+/// Like [`TRANSIT_GATEWAY_REGISTRATION_KIND`] this is not an ARN resource type and no id is
+/// minted for it: "Describes a transit gateway Connect peer association" (`smithy_query
+/// shape=TransitGatewayConnectPeerAssociation`) carries no id, so the global network plus
+/// the peer's own ARN is its identity
+/// ([`transit_gateway_connect_peer_association_key`]) and this name is only how a
+/// not-found refusal spells the resource type.
+pub const TRANSIT_GATEWAY_CONNECT_PEER_ASSOCIATION_KIND: &str =
+    "transit-gateway-connect-peer-association";
 /// See [`GLOBAL_NETWORK_KIND`]. The model constrains this one's id itself:
 /// `CoreNetworkId` carries `pattern ^core-network-([0-9a-f]{8,17})$`
 /// (`smithy_query shape=CoreNetworkId`), which the 17 hex digits of
@@ -276,6 +292,10 @@ pub const LIMIT_PREFIX_LIST_ASSOCIATIONS_PER_CORE_NETWORK: &str =
 /// [`MAX_CUSTOMER_GATEWAY_ASSOCIATIONS_PER_GLOBAL_NETWORK`] bounds.
 pub const LIMIT_CUSTOMER_GATEWAY_ASSOCIATIONS_PER_GLOBAL_NETWORK: &str =
     "customer-gateway-associations-per-global-network";
+/// See [`LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT`]; the quota
+/// [`MAX_TRANSIT_GATEWAY_CONNECT_PEER_ASSOCIATIONS_PER_GLOBAL_NETWORK`] bounds.
+pub const LIMIT_TRANSIT_GATEWAY_CONNECT_PEER_ASSOCIATIONS_PER_GLOBAL_NETWORK: &str =
+    "transit-gateway-connect-peer-associations-per-global-network";
 /// See [`LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT`]; the quota [`MAX_TAGS_PER_RESOURCE`] bounds.
 pub const LIMIT_TAGS_PER_RESOURCE: &str = "tags-per-resource";
 
@@ -358,6 +378,9 @@ pub const FIELD_PEERING_ID: &str = "peeringId";
 pub const FIELD_TRANSIT_GATEWAY_ARN: &str = "transitGatewayArn";
 /// See [`FIELD_PEERING_ID`].
 pub const FIELD_TRANSIT_GATEWAY_ROUTE_TABLE_ARN: &str = "transitGatewayRouteTableArn";
+/// See [`FIELD_PEERING_ID`]: the member carrying the ARN of the transit gateway Connect
+/// peer a global network's Connect peer association names.
+pub const FIELD_TRANSIT_GATEWAY_CONNECT_PEER_ARN: &str = "transitGatewayConnectPeerArn";
 /// See [`FIELD_CORE_NETWORK_ID`]: the references and values a Connect peer create carries
 /// — the Connect attachment the peer is carried over, the inside IP addresses it peers
 /// over, and the subnet it reaches its appliance through.
@@ -737,6 +760,18 @@ pub const MAX_CUSTOMER_GATEWAY_ASSOCIATIONS_PER_GLOBAL_NETWORK: usize = 100;
 /// refused with the modelled `ValidationException` (HTTP 400) naming the member that asked,
 /// and stores nothing.
 pub const MAX_TRANSIT_GATEWAY_REGISTRATIONS_PER_GLOBAL_NETWORK: usize = 100;
+
+/// How many transit gateway Connect peers one global network may hold an association for
+/// here.
+///
+/// CHOSEN, like [`MAX_CUSTOMER_GATEWAY_ASSOCIATIONS_PER_GLOBAL_NETWORK`] and for the same
+/// reason: no published number bounds it and the model carries none, so this bound exists
+/// only so that repeated associates — each naming a Connect peer of a transit gateway of
+/// Amazon VPC, of which this service holds no inventory — cannot grow the store without
+/// end. `AssociateTransitGatewayConnectPeer` DOES model a `ServiceQuotaExceededException`
+/// (`smithy_query query="operation" operation="AssociateTransitGatewayConnectPeer"`), so
+/// reaching it is answered with that modelled error (HTTP 402) and stores nothing.
+pub const MAX_TRANSIT_GATEWAY_CONNECT_PEER_ASSOCIATIONS_PER_GLOBAL_NETWORK: usize = 100;
 
 /// How many Connect peers one Connect attachment may hold here, and how many inside CIDR
 /// blocks one Connect peer may peer over.
@@ -1500,6 +1535,90 @@ pub fn transit_gateway_registration_key(
     transit_gateway_arn: &str,
 ) -> String {
     format!("{global_network_id}/{transit_gateway_arn}")
+}
+
+/// A stored transit gateway Connect peer association: the tie between one Connect peer of a
+/// transit gateway of Amazon VPC and one DEVICE of a global network, optionally over one of
+/// that device's links.
+///
+/// "Associates a transit gateway Connect peer with a device, and optionally, with a link."
+/// (`smithy_query query="doc" shape="AssociateTransitGatewayConnectPeer"`) \u2014 like
+/// [`CustomerGatewayAssociationRecord`] the tie carries no id and no ARN of its own (the
+/// modelled `TransitGatewayConnectPeerAssociation` is the peer's ARN, the global network,
+/// the device, the link and a state: `smithy_query
+/// shape=TransitGatewayConnectPeerAssociation`), so the global network plus the peer's ARN
+/// is its identity and the store keys it by
+/// [`transit_gateway_connect_peer_association_key`] \u2014 which is exactly what
+/// `DisassociateTransitGatewayConnectPeer` addresses, naming those two and nothing else
+/// (`smithy_query query="operation" operation="DisassociateTransitGatewayConnectPeer"`).
+///
+/// Like the records above, its state is a function of the clock rather than a field, so
+/// reading one never writes.
+#[derive(Debug, Clone)]
+pub struct TransitGatewayConnectPeerAssociationRecord {
+    pub global_network_id: String,
+    /// The ARN of the transit gateway Connect peer, as the request carried it: the peer
+    /// belongs to Amazon VPC, so this service stores the reference and holds no record of
+    /// the peer itself (see [`ec2_resource_region`]).
+    pub transit_gateway_connect_peer_arn: String,
+    pub device_id: String,
+    /// The link the device reaches this peering over, or `None` where the association named
+    /// none \u2014 `LinkId` is the one optional member of the request.
+    pub link_id: Option<String>,
+    /// The instant the `PENDING` -> `AVAILABLE` transition the clock owes becomes due.
+    pub available_at: SystemTime,
+}
+
+impl TransitGatewayConnectPeerAssociationRecord {
+    /// This association's state as of `now`.
+    ///
+    /// `TransitGatewayConnectPeerAssociationState` carries PENDING, AVAILABLE, DELETING and
+    /// DELETED (`smithy_query shape=TransitGatewayConnectPeerAssociationState`, mirrored in
+    /// `ops::types::TRANSIT_GATEWAY_CONNECT_PEER_ASSOCIATION_STATE_VALUES`); the first three
+    /// are spelled exactly as [`STATE_PENDING`], [`STATE_AVAILABLE`] and [`STATE_DELETING`],
+    /// so this slice reuses those constants, as [`CustomerGatewayAssociationRecord`] does.
+    pub fn state_at(&self, now: SystemTime) -> &'static str {
+        if now >= self.available_at {
+            STATE_AVAILABLE
+        } else {
+            STATE_PENDING
+        }
+    }
+
+    /// The modelled `TransitGatewayConnectPeerAssociation` for this record, as of `now`.
+    pub fn to_shape(&self, now: SystemTime) -> TransitGatewayConnectPeerAssociation {
+        self.to_shape_with_state(self.state_at(now))
+    }
+
+    /// The modelled `TransitGatewayConnectPeerAssociation` for this record, forcing `state`
+    /// \u2014 used by `DisassociateTransitGatewayConnectPeer`, which reports the association it
+    /// just removed as `DELETING`.
+    pub fn to_shape_with_state(&self, state: &str) -> TransitGatewayConnectPeerAssociation {
+        TransitGatewayConnectPeerAssociation {
+            transit_gateway_connect_peer_arn: Some(self.transit_gateway_connect_peer_arn.clone()),
+            global_network_id: Some(self.global_network_id.clone()),
+            device_id: Some(self.device_id.clone()),
+            link_id: self.link_id.clone(),
+            state: Some(state.to_string()),
+        }
+    }
+}
+
+/// The key the store holds a transit gateway Connect peer association under: the global
+/// network it was made in, then the ARN of the Connect peer tied to one of that network's
+/// devices.
+///
+/// Like [`customer_gateway_association_key`], the ARN alone is not the key: the association
+/// is addressed THROUGH the global network in every one of the three operations' URIs
+/// (`smithy_query query="operation"
+/// operation="AssociateTransitGatewayConnectPeer,DisassociateTransitGatewayConnectPeer,GetTransitGatewayConnectPeerAssociations"`),
+/// so a tie made in a DIFFERENT global network is not addressable here. The same string
+/// identifies the association in a not-found refusal, where no single resource id would.
+pub fn transit_gateway_connect_peer_association_key(
+    global_network_id: &str,
+    transit_gateway_connect_peer_arn: &str,
+) -> String {
+    format!("{global_network_id}/{transit_gateway_connect_peer_arn}")
 }
 
 /// A stored connection: the tie between two devices of one global network.
@@ -3310,6 +3429,18 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// than a stored resource, so no existing quota bounds how many distinct ARNs a caller
     /// can name — and only ever holding a pair once.
     pub transit_gateway_registrations: BTreeMap<String, TransitGatewayRegistrationRecord>,
+    /// Transit gateway Connect peer associations by
+    /// [`transit_gateway_connect_peer_association_key`], each tying a Connect peer of a
+    /// transit gateway of Amazon VPC to one stored device, and optionally one stored link,
+    /// of the global network the key names.
+    ///
+    /// Bounded per global network by
+    /// [`MAX_TRANSIT_GATEWAY_CONNECT_PEER_ASSOCIATIONS_PER_GLOBAL_NETWORK`], for the reason
+    /// the customer gateway associations above are: the subject is a resource of another
+    /// service rather than a stored one, so no existing quota bounds how many distinct ARNs
+    /// a caller can name — and only ever holding a pair once.
+    pub transit_gateway_connect_peer_associations:
+        BTreeMap<String, TransitGatewayConnectPeerAssociationRecord>,
     /// Connections by `ConnectionId`, each carrying the `GlobalNetworkId` that owns it and
     /// the two devices of that global network it ties together.
     pub connections: BTreeMap<String, ConnectionRecord>,
@@ -3373,8 +3504,8 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     ///
     /// A connection is registered here by the operation that ties it to the global network:
     /// `AssociateConnectPeer` for a core network Connect peer and
-    /// `AssociateTransitGatewayConnectPeer` for a transit gateway one — the second still a
-    /// scaffold stub with its own issue. Registering a transit gateway adds nothing here:
+    /// `AssociateTransitGatewayConnectPeer` for a transit gateway one, and the matching
+    /// disassociate removes it again. Registering a transit gateway adds nothing here:
     /// the connections a registered gateway carries are VPN connections of Amazon VPC, of
     /// which this service holds no inventory, so an emulator nobody has registered a
     /// connection with reports the empty telemetry it really holds rather than a
@@ -3589,6 +3720,46 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             .values()
             .filter(|registration| registration.global_network_id == global_network_id)
             .count()
+    }
+
+    /// How many transit gateway Connect peers `global_network_id` is associated with, for
+    /// the per-global-network quota.
+    pub fn transit_gateway_connect_peer_association_count_of(
+        &self,
+        global_network_id: &str,
+    ) -> usize {
+        self.transit_gateway_connect_peer_associations
+            .values()
+            .filter(|association| association.global_network_id == global_network_id)
+            .count()
+    }
+
+    /// Whether `global_network_id` holds a transit gateway registration for a gateway that
+    /// could carry a Connect peer living in `region` and owned by `account`.
+    ///
+    /// "You can only associate transit gateway Connect peers that have been created on a
+    /// transit gateway that's registered in your global network." (`smithy_query
+    /// query="doc" shape="AssociateTransitGatewayConnectPeer"`). WHICH gateway a given
+    /// Connect peer was created on is Amazon VPC's record, which this service holds no
+    /// inventory of, and the peer's own ARN does not name it; what the ARN does fix is the
+    /// Region and the owning account, and a Connect peer always lives in the Region and
+    /// account of the transit gateway it was created on. So the registrations that could
+    /// carry the peer are those of a gateway in that same Region and account, and a global
+    /// network holding none of them holds no gateway the peer can have been created on.
+    pub fn carries_transit_gateway_in(
+        &self,
+        global_network_id: &str,
+        region: &str,
+        account: Option<&str>,
+    ) -> bool {
+        self.transit_gateway_registrations
+            .values()
+            .filter(|registration| registration.global_network_id == global_network_id)
+            .any(|registration| {
+                ec2_resource_region(&registration.transit_gateway_arn, TRANSIT_GATEWAY_TYPE)
+                    == Some(region)
+                    && arn_account_id(&registration.transit_gateway_arn) == account
+            })
     }
 
     /// How many managed prefix lists `core_network_id` is associated with, for the
@@ -3877,6 +4048,21 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             telemetry_key(&record.global_network_id, &record.resource_arn),
             record,
         );
+    }
+
+    /// Drop the registration `global_network_id` holds for the connection `resource_arn`,
+    /// answering the record that was dropped, or `None` where it held none.
+    ///
+    /// The counterpart of [`Self::register_telemetry_resource`]: the operation that unties
+    /// a connection from its global network is what deregisters it, so a global network
+    /// stops reporting the session health of a peering it no longer holds.
+    pub fn deregister_telemetry_resource(
+        &mut self,
+        global_network_id: &str,
+        resource_arn: &str,
+    ) -> Option<TelemetryResourceRecord> {
+        self.telemetry_resources
+            .remove(&telemetry_key(global_network_id, resource_arn))
     }
 
     /// How many route analyses the global network `global_network_id` holds, for the

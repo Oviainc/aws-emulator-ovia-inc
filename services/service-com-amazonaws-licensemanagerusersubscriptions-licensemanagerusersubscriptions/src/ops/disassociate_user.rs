@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the view is recomputed from the associations state holds — which still include
         // the one being torn down, so the instance stays in view until the last teardown
         // the clock owes has completed.
-        state.refresh_instance_view(&record.instance_id);
+        state.refresh_instance_view(&record.instance_id, now);
 
         Ok(DisassociateUserOutput {
             instance_user_summary: crate::state::instance_user_summary(&record),

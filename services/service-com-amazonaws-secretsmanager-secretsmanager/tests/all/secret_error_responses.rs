@@ -131,12 +131,11 @@ fn text(parsed: &Value, member: &str, case: &str) -> String {
         .to_string()
 }
 
-/// Every operation that resolves a `SecretId`, with the other members its
-/// request needs so the call reaches the resolution rather than being refused
-/// earlier. The list is this crate's implemented surface as `OPERATIONS.md`
-/// records it; the stubs (`UpdateSecret`, `RestoreSecret`,
-/// `UpdateSecretVersionStage`, `CancelRotateSecret`, `BatchGetSecretValue`, the
-/// resource-policy operations) answer 501 and carry no modelled message yet.
+/// Operations that resolve a `SecretId`, with the other members their request
+/// needs so the call reaches the resolution rather than being refused earlier.
+/// Every one of them is implemented in this crate (`OPERATIONS.md` records the
+/// surface); `GetRandomPassword`, the one operation still scaffolded, resolves
+/// no `SecretId` at all.
 fn operations_resolving_a_secret_id() -> Vec<(&'static str, Value)> {
     vec![
         ("DescribeSecret", json!({})),
@@ -145,6 +144,13 @@ fn operations_resolving_a_secret_id() -> Vec<(&'static str, Value)> {
         ("DeleteSecret", json!({})),
         ("PutSecretValue", json!({"SecretString": "a-value"})),
         ("RotateSecret", json!({})),
+        ("CancelRotateSecret", json!({})),
+        ("UpdateSecret", json!({"Description": "a description"})),
+        ("RestoreSecret", json!({})),
+        (
+            "UpdateSecretVersionStage",
+            json!({"VersionStage": "AWSCURRENT", "MoveToVersionId": "0".repeat(32)}),
+        ),
         ("TagResource", json!({"Tags": [{"Key": "env", "Value": "test"}]})),
         ("UntagResource", json!({"TagKeys": ["env"]})),
         (
