@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConsumableResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConsumableResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConsumableResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the consumable resources this service holds, as
+//! `CreateConsumableResource` stored them and `UpdateConsumableResource` left them: a
+//! page of summaries, each member read from the persisted record. A listing is a
+//! REPORTING call — it selects, orders and pages what is stored and changes nothing a
+//! later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -93,6 +90,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The one filter name this operation documents, from the `filters` member's own doc:
+/// "Filter names and values can be: name: CONSUMABLE_RESOURCE_NAME values:
+/// case-insensitive matches for the consumable resource name."
+const FILTER_CONSUMABLE_RESOURCE_NAME: &str = "CONSUMABLE_RESOURCE_NAME";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -162,18 +164,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConsumableResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConsumableResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConsumableResources"))
+        use crate::state as batch;
+
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(ListConsumableResourcesErrorModeled::ServerException(
+                batch::unreachable_state(),
+            )
+            .into());
+        };
+
+        // `maxResults`: "This value can be between 1 and 100." A plain `Integer` in the
+        // model, so the published bound is applied here.
+        if let Some(requested) = input.max_results.filter(|requested| {
+            !(batch::MIN_LIST_CONSUMABLE_RESOURCES_RESULTS
+                ..=batch::MAX_LIST_CONSUMABLE_RESOURCES_RESULTS)
+                .contains(requested)
+        }) {
+            return Err(ListConsumableResourcesErrorModeled::ClientException(
+                batch::client_exception(format!(
+                    "maxResults {requested} must be between {} and {}",
+                    batch::MIN_LIST_CONSUMABLE_RESOURCES_RESULTS,
+                    batch::MAX_LIST_CONSUMABLE_RESOURCES_RESULTS
+                )),
+            )
+            .into());
+        }
+
+        let now = batch::now_millis();
+        // The store's lock lives in THIS block and no longer, so nothing holds it while
+        // the transitions it materialised are published below (that call reaches another
+        // service in-process).
+        let mut resources: Vec<batch::ConsumableResource> = {
+            let mut state = state.lock();
+            // A read: this only materialises what the clock already owed at `now`, so a
+            // later caller sees exactly what this caller saw.
+            state.materialize_due(now);
+            state.consumable_resources.values().cloned().collect()
+        };
+        batch::publish_job_state_changes(ctx, &*self.engine, &batch::request_region(ctx)).await;
+
+        // "If used, only those consumable resources that match the filter are listed": each
+        // entry narrows the listing further, and a resource matches an entry when any of
+        // that entry's values matches it.
+        for filter in input.filters.unwrap_or_default() {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let values = filter.values.clone().unwrap_or_default();
+            match name {
+                FILTER_CONSUMABLE_RESOURCE_NAME => {
+                    resources.retain(|resource| {
+                        values
+                            .iter()
+                            .any(|value| batch::matches_name_filter(&resource.name, value))
+                    });
+                }
+                other => {
+                    return Err(ListConsumableResourcesErrorModeled::ClientException(
+                        batch::client_exception(format!("Unknown filter name {other}")),
+                    )
+                    .into());
+                }
+            }
+        }
+
+        // The model documents no order for this listing, and the store is keyed by a name
+        // that is unique per account and region, so the name is what gives one stable
+        // order — without which paging could show a resource twice or never.
+        resources.sort_by(|left, right| left.name.cmp(&right.name));
+
+        // "If this parameter isn't used, then ListConsumableResources returns up to 100
+        // results and a nextToken value if applicable": the page is bounded even when the
+        // request names no size.
+        let page_size = input
+            .max_results
+            .unwrap_or(batch::MAX_LIST_CONSUMABLE_RESOURCES_RESULTS);
+        let (page, next_token) =
+            batch::paginate(resources, Some(page_size), input.next_token.as_deref()).map_err(
+                |message| {
+                    ListConsumableResourcesError::from(
+                        ListConsumableResourcesErrorModeled::ClientException(
+                            batch::client_exception(message),
+                        ),
+                    )
+                },
+            )?;
+
+        let consumable_resources = page
+            .into_iter()
+            .map(|resource| ConsumableResourceSummary {
+                consumable_resource_arn: resource.arn,
+                consumable_resource_name: resource.name,
+                total_quantity: Some(resource.total_quantity),
+                in_use_quantity: Some(resource.in_use_quantity),
+                resource_type: Some(resource.resource_type),
+            })
+            .collect();
+
+        Ok(ListConsumableResourcesOutput {
+            consumable_resources,
+            next_token,
+        })
     }
 }

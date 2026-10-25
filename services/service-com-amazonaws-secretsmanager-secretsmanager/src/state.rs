@@ -357,6 +357,12 @@ pub fn is_valid_secret_name(name: &str) -> bool {
 /// principal.
 pub const POLICY_WILDCARD: &str = "*";
 
+/// What `ValidateResourcePolicy` refuses a document that fails the syntax check
+/// with: that operation "[c]hecks for correct syntax in a policy" (this
+/// service's Smithy model) and reports the failure as this one constant
+/// sentence, naming no part of the document.
+pub const VALIDATE_SYNTAX_ERROR_MESSAGE: &str = "This resource policy contains a syntax error.";
+
 /// What a resource policy document that is not a policy document is refused
 /// with: `MalformedPolicyDocumentException` is "The resource policy has syntax
 /// errors." (this service's Smithy model), and the message names the grammar
@@ -452,6 +458,148 @@ fn names_wildcard_principal(statement: &Value) -> bool {
         .iter()
         .filter_map(|element| statement.get(element))
         .any(is_wildcard_principal)
+}
+
+/// The name reported for the check that a policy does not open the secret to
+/// every principal: "ensure your resource policy does not allow broad access to
+/// your secret, for example policies that use a wildcard for the principal"
+/// (`ValidateResourcePolicy`, this service's Smithy model).
+/// The service reports this check under the name of the request flag that
+/// blocks such a policy outright, `BlockPublicPolicy`.
+pub const BROAD_ACCESS_CHECK_NAME: &str = "BlockPublicPolicyCheck";
+
+/// What that check reports. It describes the statement that failed the check in
+/// policy terms and quotes no part of the document back.
+pub const BROAD_ACCESS_CHECK_MESSAGE: &str =
+    "This resource policy grants broad access to your secret.";
+
+/// The name reported for the check that a policy leaves somebody able to reach
+/// the secret: "Verifies the policy does not lock out a caller"
+/// (`ValidateResourcePolicy`, this service's Smithy model).
+pub const LOCKS_OUT_CALLER_CHECK_NAME: &str = "LockOutCheck";
+
+/// What that check reports.
+pub const LOCKS_OUT_CALLER_CHECK_MESSAGE: &str =
+    "The resource policy locks out callers: a statement denies every principal access to the \
+     secret.";
+
+/// Every check a policy document fails, as `(check name, message)` pairs in the
+/// order the operation documents its checks.
+///
+/// The document has already satisfied the syntax check by being parsed by
+/// [`parse_resource_policy`]; what is left is the broad-access check and the
+/// lock-out check, each a property of the statements the document carries.
+pub fn resource_policy_check_failures(policy: &Value) -> Vec<(&'static str, &'static str)> {
+    let mut failures = Vec::new();
+    if policy_grants_public_access(policy) {
+        failures.push((BROAD_ACCESS_CHECK_NAME, BROAD_ACCESS_CHECK_MESSAGE));
+    }
+    if policy_locks_out_callers(policy) {
+        failures.push((LOCKS_OUT_CALLER_CHECK_NAME, LOCKS_OUT_CALLER_CHECK_MESSAGE));
+    }
+    failures
+}
+
+/// What a document naming a principal that does not exist is refused with: like
+/// the syntax refusal, one constant sentence that names no part of the document.
+pub const VALIDATE_UNSUPPORTED_PRINCIPAL_MESSAGE: &str =
+    "This resource policy contains an unsupported principal.";
+
+/// Whether a resource policy document names a principal this service cannot
+/// resolve to an identity that exists.
+///
+/// A RESOURCE-based policy statement names the identities it applies to, and
+/// each of them has to be one that EXISTS: a document whose statement names
+/// none, or names an identity that cannot exist, is refused rather than reported
+/// on. This emulator serves exactly one account
+/// (`engine::emulator_account_id`), so an identity belonging to any other
+/// account cannot exist here, and neither can an identifier that is neither an
+/// account id nor an ARN. The wildcard names every principal instead of one
+/// identity, and a principal under any other type (a service, a federated
+/// provider, a canonical user) names no account, so neither is resolved here.
+pub fn names_unsupported_policy_principal(policy: &Value) -> bool {
+    policy_statements(policy)
+        .unwrap_or_default()
+        .into_iter()
+        .any(|statement| {
+            let elements: Vec<&Value> = PRINCIPAL_ELEMENTS
+                .iter()
+                .filter_map(|element| statement.get(element))
+                .collect();
+            elements.is_empty()
+                || elements
+                    .into_iter()
+                    .flat_map(account_principals)
+                    .any(|principal| !names_this_account(&principal))
+        })
+}
+
+/// Every identifier of one `Principal` element that names an identity by
+/// account: the bare form and the identifiers under the `AWS` type.
+fn account_principals(principal: &Value) -> Vec<String> {
+    match principal {
+        Value::String(value) => vec![value.clone()],
+        Value::Array(items) => items.iter().flat_map(account_principals).collect(),
+        Value::Object(types) => types
+            .get(AWS_PRINCIPAL_TYPE)
+            .map(account_principals)
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// The principal type whose identifiers name an identity inside an account, as
+/// an account id or as an ARN.
+const AWS_PRINCIPAL_TYPE: &str = "AWS";
+
+/// Whether one `AWS` principal identifier names an identity of the account this
+/// service serves. The wildcard names every principal rather than one identity,
+/// so it is resolvable whatever the account.
+fn names_this_account(principal: &str) -> bool {
+    if principal == POLICY_WILDCARD {
+        return true;
+    }
+    principal_account(principal).is_some_and(|account| account == ::engine::emulator_account_id())
+}
+
+/// The account an `AWS` principal identifier belongs to: the identifier itself
+/// when it is an account id, the account field when it is an ARN, and `None` for
+/// an identifier that is neither.
+fn principal_account(principal: &str) -> Option<&str> {
+    if is_account_id(principal) {
+        return Some(principal);
+    }
+    let account = principal.strip_prefix("arn:")?.split(':').nth(3)?;
+    is_account_id(account).then_some(account)
+}
+
+/// The number of digits of an Amazon Web Services account id.
+const ACCOUNT_ID_LEN: usize = 12;
+
+/// Whether a value is an account id: exactly twelve digits.
+fn is_account_id(value: &str) -> bool {
+    value.len() == ACCOUNT_ID_LEN && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Whether a policy document locks every caller out of the secret: a DENY
+/// statement whose `Principal` is the wildcard, carrying no `Condition` that
+/// narrows which requests it denies, so the deny reaches every caller including
+/// the secret's own account.
+///
+/// A deny that names concrete principals, or one whose reach a condition
+/// narrows, leaves callers outside it able to reach the secret and locks nobody
+/// out.
+pub fn policy_locks_out_callers(policy: &Value) -> bool {
+    policy_statements(policy)
+        .unwrap_or_default()
+        .into_iter()
+        .any(|statement| {
+            statement_effect(statement).as_deref() == Some("deny")
+                && statement
+                    .get("Principal")
+                    .is_some_and(is_wildcard_principal)
+                && statement.get("Condition").is_none()
+        })
 }
 
 /// Whether one `Principal` element is the wildcard: the bare string, or a map

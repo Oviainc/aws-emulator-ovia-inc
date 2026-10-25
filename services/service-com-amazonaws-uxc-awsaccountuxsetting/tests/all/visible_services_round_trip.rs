@@ -6,34 +6,33 @@
 //! Two halves of one rule, both driven over the real wire path through the shared
 //! harness in [`crate::wire`]:
 //!
-//! 1. ADMISSION — the modelled constraints are the whole rule. Every
-//!    `visibleServices` / `visibleRegions` value those constraints admit is
-//!    accepted, whether or not the catalog `ListServices` pages over happens to
-//!    name it: that operation's doc ("For valid service identifiers, call
-//!    ListServices") says where identifiers can be DISCOVERED, and neither it nor
-//!    the model (`smithy_query(query="operation",
-//!    operation="UpdateAccountCustomizations")`) states a refusal for one the
-//!    catalog omits.
+//! 1. ADMISSION — a `visibleServices` member has to satisfy the modelled
+//!    constraints AND name an entry of the catalog `ListServices` enumerates
+//!    ("For valid service identifiers, call ListServices"), while a
+//!    `visibleRegions` member has only the modelled `Region` `@pattern` to
+//!    satisfy, because this service publishes no catalog of Region codes. The
+//!    refusal of a non-member is `visible_service_catalog_membership`'s subject;
+//!    here every service identifier is drawn from the catalog.
 //! 2. ROUND TRIP — the members of a list setting are the caller's, their ORDER is
 //!    the service's. The update stores and answers with those members in the one
 //!    canonical sequence (ascending — `crate::support::reported`), a later
 //!    `GetAccountCustomizations` reports that same sequence, and an update that
 //!    omits the setting leaves it alone ("Omitted settings remain unchanged").
 //!
-//! The round-trip rows are GENERATED from the model's own `@pattern`s by the
-//! shared harness's [`crate::wire::legal_service`] / [`crate::wire::legal_region`]
-//! rather than written out, so the rule is asserted over the class of legal
-//! values and not over the identifiers any one recording used; every generated
-//! value is checked against a hand-written transcription of its pattern
-//! ([`crate::wire::is_legal_service`] / [`crate::wire::is_legal_region`]) before
-//! it is sent, so the generator cannot drift outside the constraint it claims to
-//! cover. The generators are deterministic (no seed, nothing random), so a
-//! failing case names itself.
+//! The round-trip rows are GENERATED rather than written out — the service
+//! identifiers drawn from the catalog the service itself publishes
+//! ([`crate::wire::catalog_services`]), the Region codes from the model's own
+//! `@pattern` by [`crate::wire::legal_region`] — so the rule is asserted over the
+//! class of settable values and not over the identifiers any one recording used;
+//! every generated Region code is checked against a hand-written transcription of
+//! its pattern ([`crate::wire::is_legal_region`]) before it is sent, so the
+//! generator cannot drift outside the constraint it claims to cover. Both are
+//! deterministic (no seed, nothing random), so a failing case names itself.
 
 use crate::support::{reported, reported_owned};
 use crate::wire::{
-    build_router, generated_service_id, get_customizations, is_legal_region, is_legal_service,
-    legal_region, legal_service, strings, update_customizations, whole_catalog,
+    build_router, catalog_services, get_customizations, is_legal_region, is_legal_service,
+    legal_region, update_customizations,
 };
 use serde_json::{json, Value};
 
@@ -45,13 +44,14 @@ struct Row {
     regions: Vec<String>,
 }
 
-/// The table the rule is asserted over: generated values arranged into rows that
-/// differ along list SIZE (0, 1, 2, 3, 5, 8), supplied SEQUENCE (generated order,
-/// reversed, rotated), element FORM (segment count, segment length and character
-/// class, all walked by the generators) and DUPLICATION (a member named twice,
-/// and one named three times) — which is what the rule generalises over.
-fn round_trip_rows() -> Vec<Row> {
-    let services: Vec<String> = (0..24).map(legal_service).collect();
+/// The table the rule is asserted over: values arranged into rows that differ
+/// along list SIZE (0, 1, 2, 3, 5, 8), supplied SEQUENCE (drawn order, reversed,
+/// rotated), element FORM (the catalog's own span of segment counts and lengths
+/// for services, the Region generator's for Regions) and DUPLICATION (a member
+/// named twice, and one named three times) — which is what the rule generalises
+/// over.
+async fn round_trip_rows() -> Vec<Row> {
+    let services: Vec<String> = catalog_services(&build_router(), 24).await;
     let regions: Vec<String> = (0..24).map(legal_region).collect();
     let take = |values: &[String], from: usize, count: usize| -> Vec<String> {
         (0..count).map(|n| values[(from + n) % values.len()].clone()).collect()
@@ -104,17 +104,17 @@ fn round_trip_rows() -> Vec<Row> {
     rows
 }
 
-/// The rule over the generated table: any list the modelled constraints admit is
-/// accepted with HTTP 200, answered back with exactly its members in the canonical
-/// sequence, reported again by `GetAccountCustomizations`, and preserved across an
-/// update that names only the colour.
+/// The rule over the table: any list of settable members is accepted with HTTP
+/// 200, answered back with exactly its members in the canonical sequence,
+/// reported again by `GetAccountCustomizations`, and preserved across an update
+/// that names only the colour.
 #[tokio::test]
 async fn a_supplied_list_setting_round_trips_whatever_its_members() {
-    for row in round_trip_rows() {
+    for row in round_trip_rows().await {
         for service in &row.services {
             assert!(
                 is_legal_service(service),
-                "case {:?}: the generator produced {service:?}, which is outside Service's @pattern/@length",
+                "case {:?}: the catalog reported {service:?}, which is outside Service's @pattern/@length",
                 row.name
             );
         }
@@ -192,7 +192,8 @@ async fn a_supplied_list_setting_round_trips_whatever_its_members() {
 /// both answers, and the record afterwards, are the one canonical sequence.
 #[tokio::test]
 async fn supplying_a_list_reversed_is_answered_with_the_same_canonical_sequence() {
-    for row in round_trip_rows().into_iter().filter(|row| row.services.len() > 1) {
+    let rows = round_trip_rows().await;
+    for row in rows.into_iter().filter(|row| row.services.len() > 1) {
         let reversed: Vec<String> = row.services.iter().rev().cloned().collect();
         let expected = reported_owned(&row.services);
         let router = build_router();
@@ -221,137 +222,6 @@ async fn supplying_a_list_reversed_is_answered_with_the_same_canonical_sequence(
             Some(&expected),
             "case {:?}: Get must report the canonical {expected}, got {fetched:?}",
             row.name
-        );
-    }
-}
-
-/// Admission does not consult the catalog: an identifier legal under the member's
-/// constraints is accepted and read back whether or not `ListServices` names it.
-///
-/// Rows differ along the identifier's form (generated, 64-character, invented
-/// hyphenated, digit-bearing, real-but-omitted), its position in the list, how
-/// many of the list's members are omitted, and whether the row mixes catalog
-/// entries with others. The `outside` identifiers are asserted absent from
-/// `ListServices` first, so each row really does exercise the rule.
-#[tokio::test]
-async fn an_identifier_the_catalog_omits_is_accepted_and_read_back() {
-    let catalog = whole_catalog(&build_router()).await;
-    let generated = generated_service_id(7);
-    let longest = "a".repeat(64);
-    // Identifiers no service catalog names, so this stays true however the
-    // catalog's own contents change.
-    for outside in [generated.as_str(), longest.as_str(), "zzqq-no-such-service"] {
-        assert!(
-            !catalog.contains(&outside.to_string()),
-            "case {outside:?}: this row needs an identifier the catalog does NOT hold, got {catalog:?}"
-        );
-    }
-    let in_catalog = catalog
-        .first()
-        .expect("the catalog must hold at least one entry")
-        .clone();
-
-    // (case, the supplied sequence)
-    let rows: Vec<(&str, Vec<&str>)> = vec![
-        ("the recorded pair of console identifiers", vec!["account-access", "acm"]),
-        ("a real service identifier, hyphenated", vec!["s3-outposts", "ec2"]),
-        ("a generated identifier", vec![generated.as_str()]),
-        ("a 64-character identifier", vec![longest.as_str()]),
-        ("an invented hyphenated identifier", vec!["zzqq-no-such-service"]),
-        ("a digit-bearing identifier", vec!["route53domains", "s3control"]),
-        (
-            "an omitted identifier after a catalog entry",
-            vec![in_catalog.as_str(), "zzqq-no-such-service"],
-        ),
-        (
-            "an omitted identifier before a catalog entry",
-            vec!["zzqq-no-such-service", in_catalog.as_str()],
-        ),
-        (
-            "several omitted identifiers around a catalog entry",
-            vec![generated.as_str(), in_catalog.as_str(), longest.as_str()],
-        ),
-    ];
-
-    for (case, row) in rows {
-        let router = build_router();
-        let expected = reported(&row);
-
-        let (status, error_type, updated) =
-            update_customizations(&router, json!({"visibleServices": strings(&row)})).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?} {row:?}: expected 200, got {status} [{error_type}] ({updated})"
-        );
-        assert_eq!(
-            updated.get("visibleServices"),
-            Some(&expected),
-            "case {case:?} {row:?}: expected {expected}, got {updated:?}"
-        );
-
-        let (_, _, fetched) = get_customizations(&router).await;
-        assert_eq!(
-            fetched.get("visibleServices"),
-            Some(&expected),
-            "case {case:?} {row:?}: Get must report what Update stored, got {fetched:?}"
-        );
-    }
-}
-
-/// The same rule walked over the whole catalog: every entry `ListServices`
-/// reports is accepted, and so is every entry with one legal character appended —
-/// which is inside the member's `@pattern` and `@length` but outside the catalog.
-#[tokio::test]
-async fn neither_a_catalog_entry_nor_a_near_miss_of_one_is_refused() {
-    let router = build_router();
-    let catalog = whole_catalog(&router).await;
-    assert!(
-        !catalog.is_empty(),
-        "the catalog must hold entries for this test to say anything"
-    );
-
-    // The whole catalog in one request. `ListServices` already reports it in the
-    // same ascending order a list setting is canonicalized into, so here the two
-    // coincide.
-    let (status, _, body) =
-        update_customizations(&router, json!({"visibleServices": catalog.clone()})).await;
-    assert_eq!(
-        status, 200,
-        "the whole catalog must be accepted, got {status} ({body})"
-    );
-    assert_eq!(
-        body.get("visibleServices"),
-        Some(&reported_owned(&catalog)),
-        "the whole catalog must be read back canonically, got {body:?}"
-    );
-
-    // Every near miss in ONE request, then each on its own: the first says the
-    // class is accepted, the second pins each identifier.
-    let near_misses: Vec<String> = catalog.iter().map(|entry| format!("{entry}0")).collect();
-    let (status, _, body) =
-        update_customizations(&router, json!({"visibleServices": near_misses.clone()})).await;
-    assert_eq!(
-        status, 200,
-        "a list of near-miss identifiers must be accepted, got {status} ({body})"
-    );
-    assert_eq!(
-        body.get("visibleServices"),
-        Some(&reported_owned(&near_misses)),
-        "the near-miss identifiers must be read back canonically, got {body:?}"
-    );
-
-    for near_miss in &near_misses {
-        let router = build_router();
-        let (status, error_type, body) =
-            update_customizations(&router, json!({"visibleServices": [near_miss]})).await;
-        assert_eq!(
-            status, 200,
-            "case {near_miss:?}: a legal identifier must be accepted, got {status} [{error_type}] ({body})"
-        );
-        assert_eq!(
-            body.get("visibleServices"),
-            Some(&json!([near_miss])),
-            "case {near_miss:?}: the accepted identifier must be read back, got {body:?}"
         );
     }
 }

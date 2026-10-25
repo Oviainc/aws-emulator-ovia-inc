@@ -128,12 +128,6 @@ impl From<ListResourceSetsErrorModeled> for ListResourceSetsError {
     }
 }
 
-/// The largest page `ListResourceSets` serves, which is the maximum the model's
-/// `com.amazonaws.fms#PaginationMaxResults` declares for `MaxResults` (range
-/// 1..100). It bounds the response for EVERY caller, including one that sends no
-/// `MaxResults` at all.
-const MAX_PAGE_SIZE: usize = 100;
-
 /// The `ListResourceSets` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -214,20 +208,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let lower = start.unwrap_or_default();
         let mut remaining = store.resource_sets.range(lower..);
 
-        // The page is bounded whether or not the caller asked for a bound: the
-        // model's `PaginationMaxResults` range is 1..100, so 100 is the largest
-        // page this operation serves, and a caller who sends no `MaxResults` gets
-        // that same bounded page plus a `NextToken` rather than the whole store
-        // projected into one response.
-        //
-        // Clamped into 1..=MAX_PAGE_SIZE rather than only capped: the modelled
-        // range already refuses a page size below 1, and this keeps a page from
-        // ever being empty-with-a-token (which a client would follow forever) if
-        // that validation ever changes.
-        let page_size = input
-            .max_results
-            .map_or(MAX_PAGE_SIZE, |max| usize::try_from(max).unwrap_or(0))
-            .clamp(1, MAX_PAGE_SIZE);
+        // The page is bounded whether or not the caller asked for a bound, by
+        // the one page-size rule every paginated operation of this service
+        // shares ([`crate::state::page_size`]): a caller who sends no
+        // `MaxResults` gets the largest page plus a `NextToken` rather than the
+        // whole store projected into one response.
+        let page_size = crate::state::page_size(input.max_results);
         let resource_sets: Vec<ResourceSetSummary> = remaining
             .by_ref()
             .take(page_size)
