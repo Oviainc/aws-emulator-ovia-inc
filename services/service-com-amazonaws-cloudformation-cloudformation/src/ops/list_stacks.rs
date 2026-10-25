@@ -161,7 +161,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there is no stack store to list, so this
             // answers 501 rather than an empty, truthful-looking list.
@@ -176,11 +175,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Returns the summary information for stacks whose status matches the specified
         // StackStatusFilter … If no StackStatusFilter is specified, summary information
         // for all stacks is returned (including existing stacks and stacks that have
-        // been deleted)."
+        // been deleted)" — all the stacks OF THIS REGION, since CloudFormation lists the
+        // stacks of the Region the request was signed for.
+        let region = crate::state::request_region(ctx.parts());
         let filter = input.stack_status_filter.as_deref().unwrap_or_default();
         let matching: Vec<StackSummary> = store
-            .stacks
-            .iter()
+            .stacks_in(&region)
             .filter(|stack| filter.is_empty() || filter.contains(&stack.status))
             .map(stack_summary)
             .collect();
