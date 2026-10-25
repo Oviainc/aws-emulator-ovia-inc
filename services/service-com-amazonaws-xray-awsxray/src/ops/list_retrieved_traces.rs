@@ -210,8 +210,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             _ => return Err(refuse(trace_format_required())),
         };
         if !crate::state::is_retrieval_token_form(&input.retrieval_token) {
+            // The name the refusal gives the member is the one X-Ray's recorded
+            // answer for THIS operation uses — "execution id", as
+            // `GetRetrievedTracesGraph`'s does — not the member's modelled name.
             return Err(refuse(crate::state::malformed_retrieval_token_message(
-                "retrieval token",
+                "execution id",
                 &input.retrieval_token,
             )));
         }
