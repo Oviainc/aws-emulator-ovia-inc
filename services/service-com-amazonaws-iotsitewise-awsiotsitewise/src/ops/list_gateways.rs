@@ -153,6 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let _ = ctx;
 
+        let now = ::std::time::SystemTime::now();
         let store = state.lock();
 
         // Every gateway the store holds: this operation is account-and-region wide and
@@ -194,7 +195,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let next_token = gateways
             .get(end)
             .map(|gateway| ::hex::encode(gateway.id.as_bytes()));
-        let gateway_summaries = gateways[start..end].iter().copied().map(summary).collect();
+        let gateway_summaries = gateways[start..end]
+            .iter()
+            .map(|gateway| summary(gateway, now))
+            .collect();
 
         Ok(ListGatewaysOutput {
             gateway_summaries,
@@ -209,7 +213,7 @@ const DEFAULT_MAX_RESULTS: i32 = 50;
 /// One stored gateway as the summary this operation reports, read straight off the
 /// record `CreateGateway` persisted and `DescribeGateway` reads back — so a listed
 /// gateway and a described one never disagree.
-fn summary(record: &crate::state::GatewayRecord) -> GatewaySummary {
+fn summary(record: &crate::state::GatewayRecord, now: ::std::time::SystemTime) -> GatewaySummary {
     GatewaySummary {
         gateway_id: record.id.clone(),
         gateway_name: record.name.clone(),
@@ -217,7 +221,7 @@ fn summary(record: &crate::state::GatewayRecord) -> GatewaySummary {
         gateway_version: Some(record.version.clone()),
         // Whatever capabilities are configured on the stored gateway — an empty list
         // until one is, never a capability it was not given.
-        gateway_capability_summaries: Some(record.capability_summaries.clone()),
+        gateway_capability_summaries: Some(record.capability_summaries(now)),
         creation_date: crate::state::to_date_time(record.creation_date),
         last_update_date: crate::state::to_date_time(record.last_update_date),
     }
