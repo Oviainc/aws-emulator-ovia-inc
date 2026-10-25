@@ -23,6 +23,9 @@
 //! * [`shared_path`], the reader for the one case the path half of the claim rule
 //!   cannot settle on its own: two colliding models binding the same URI path space,
 //!   where the ARN in the path names the resource and so the service that owns it;
+//! * [`chime_family`], the same claim rule for the one family whose shared signing name
+//!   is not even its members' endpoint prefix: the six Amazon Chime services, which are
+//!   told apart by the endpoint the request addresses and then by their own path spaces;
 //! * [`front_door`], the body-rejection layer an AWS REST service puts in front of its
 //!   application code, as a wrapper a service serves its operations behind;
 //! * [`validation`], which restores the value a constraint violation echoes to the one
@@ -154,11 +157,12 @@
 //! The path half of the rule predates this crate and is inlined in the `can_handle` of
 //! the service crates that needed it before there was anywhere shared to put it —
 //! `grep -rln 'fn claims_modeled_path' services/*/src/service.rs` lists them (today:
-//! `connect`, `connectcontactlens`, `iam`, `iamtoolbox`, `chimesdkmeetings`,
+//! `connect`, `connectcontactlens`, `iam`, `iamtoolbox`,
 //! `personalizeevents`, `personalizeruntime`, `signerdata`, and the marketplace family
 //! before this crate existed; `s3` carries only `first_path_segment`, and `appconfig`,
 //! `appconfigdata`, `ivs` and `ivsrealtime` carry a `can_handle_parts` shim that calls the
-//! framework helper on a rebuilt request). Those copies are to be MIGRATED onto
+//! framework helper on a rebuilt request; `chimesdkmeetings` carried one until the Chime
+//! family moved onto [`chime_family`]). Those copies are to be MIGRATED onto
 //! [`claims_request`] (they are REST-only cases, so the call is
 //! `claims_request(parts, signing_name, crate::ROUTE_PATH_SEGMENTS, None)`); they are
 //! left in place here only because this change does not own those services' issues and
@@ -192,6 +196,7 @@ pub mod rds_cluster_parameters;
 pub mod agentic_rft_jobs;
 pub mod arn;
 pub mod bedrock;
+pub mod chime_family;
 pub mod db_data_sources;
 /// The `vnd.amazon.eventstream` framing and routing seam a service with a
 /// `@streaming` output member needs, which the scaffold does not generate.

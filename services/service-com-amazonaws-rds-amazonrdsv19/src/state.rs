@@ -104,10 +104,11 @@ pub use blue_green::{
     BLUE_GREEN_STATUS_AVAILABLE, BLUE_GREEN_STATUS_DELETING, BLUE_GREEN_STATUS_PROVISIONING,
 };
 pub use custom_engine_versions::{
-    check_custom_engine, custom_db_engine_version_key, is_ami_backed_custom_engine,
-    reports_engine_media_type, CustomDbEngineVersionRecord,
+    check_custom_engine, custom_db_engine_version_key, custom_engine_version_is_modifiable,
+    is_ami_backed_custom_engine, reports_engine_media_type, CustomDbEngineVersionRecord,
     CUSTOM_DB_ENGINE_VERSION_QUOTA_PER_REGION, CUSTOM_ENGINE_VERSION_ENGINES,
-    CUSTOM_ENGINE_VERSION_STATUS_AVAILABLE, MEDIA_TYPE_CUSTOMER_PROVIDED,
+    CUSTOM_ENGINE_VERSION_STATUS_AVAILABLE, CUSTOM_ENGINE_VERSION_STATUS_CREATING,
+    MEDIA_TYPE_CUSTOMER_PROVIDED,
 };
 pub use db_proxies::{
     check_target_group_name, target_to_wire, DbProxyRecord, DbProxyTargetRecord, RegisteredDatabase,
@@ -1221,8 +1222,22 @@ impl ComAmazonawsRdsAmazonrdsv19State {
                 gone.push(key.clone());
             }
         }
-        for key in gone {
+        for key in gone.drain(..) {
             self.export_tasks.remove(&key);
+        }
+        for (key, version) in self
+            .custom_db_engine_versions
+            .range_mut((region.to_string(), String::new())..)
+        {
+            if key.0 != region {
+                break;
+            }
+            if version.settle(now) {
+                gone.push(key.clone());
+            }
+        }
+        for key in gone {
+            self.custom_db_engine_versions.remove(&key);
         }
     }
 
@@ -1246,6 +1261,33 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             region.to_string(),
             custom_db_engine_version_key(&engine.to_ascii_lowercase(), engine_version),
         ))
+    }
+
+    /// Whether anything in `region` is USING the custom engine version
+    /// `(engine, engine_version)`: a DB instance running it, or a snapshot taken of one.
+    ///
+    /// What a CEV's availability status change is gated on — it "must not currently be in
+    /// use" (`ModifyCustomDBEngineVersion$Status`) — which is what the modelled
+    /// `InvalidCustomDBEngineVersionStateFault` reports. The uses answered from here are
+    /// the two this service holds records of; the automated backups that member also names
+    /// are not records this store carries, so nothing is claimed about them.
+    pub fn custom_db_engine_version_in_use(
+        &self,
+        region: &str,
+        engine: &str,
+        engine_version: &str,
+    ) -> bool {
+        let runs_it = |record_engine: &str, record_version: Option<&str>| {
+            record_engine.eq_ignore_ascii_case(engine)
+                && record_version.is_some_and(|version| version == engine_version)
+        };
+        self.instances_in(region)
+            .into_iter()
+            .any(|instance| runs_it(&instance.engine, instance.engine_version.as_deref()))
+            || self
+                .snapshots_in(region)
+                .into_iter()
+                .any(|snapshot| runs_it(&snapshot.engine, snapshot.engine_version.as_deref()))
     }
 
     /// The custom engine version whose ARN is `arn`, in `region`, or `None` when no stored

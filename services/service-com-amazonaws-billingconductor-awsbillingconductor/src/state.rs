@@ -843,6 +843,68 @@ impl ResourceAssociationRecord {
     }
 }
 
+/// One stretch of time during which an account was a member of a billing group,
+/// measured in the `BillingPeriod` months the billing API reports in.
+///
+/// An account-association read "lists linked accounts that are linked to the payer
+/// account for the specified time period" (`ListAccountAssociations`), so the store
+/// keeps WHEN each membership held rather than only which group holds the account
+/// now. The range is half-open, exactly as every other billing-period range here is
+/// (see [`billing_period_range_covers`]): the account is a member from
+/// `inclusive_start_billing_period` on, and `exclusive_end_billing_period` is the
+/// first period it is no longer one — absent while the membership stands.
+///
+/// `Default` is deliberately NOT derived, for the reason
+/// [`PricingRuleAssociationRecord`] gives: an empty start period is not a billing
+/// period, and a record carrying one would be read as unbounded.
+#[derive(Debug, Clone)]
+pub struct AccountAssociationRecord {
+    /// The FULL billing group ARN ([`normalize_billing_group_arn`]).
+    pub billing_group_arn: String,
+    /// The first billing period the account is a member of that group for.
+    pub inclusive_start_billing_period: String,
+    /// The first billing period it is no longer one, absent while it still is.
+    pub exclusive_end_billing_period: Option<String>,
+}
+
+impl AccountAssociationRecord {
+    /// Does this membership still stand — has nothing ended it?
+    pub fn is_live(&self) -> bool {
+        self.exclusive_end_billing_period.is_none()
+    }
+
+    /// Was the account a member of this group in `billing_period`? Half-open, as
+    /// [`billing_period_range_covers`] reads it, so a membership that began and
+    /// ended in the SAME period covers no period at all — which is what a listing
+    /// for that period reports, and what the live membership says too.
+    pub fn covers(&self, billing_period: &str) -> bool {
+        billing_period_range_covers(
+            Some(&self.inclusive_start_billing_period),
+            self.exclusive_end_billing_period.as_deref(),
+            billing_period,
+        )
+    }
+}
+
+/// The billing group one account was a member of in `billing_period`, out of the
+/// memberships it has had: the NEWEST one covering that period, so an account
+/// released and re-associated within one period is reported in the group it ended up
+/// in. `None` when none of them covers it.
+///
+/// One reverse scan per account, bounded by
+/// [`MAX_ACCOUNT_ASSOCIATIONS_PER_ACCOUNT`], and the only place that decides which
+/// membership a period reports — so every period-scoped read answers the same way.
+fn membership_in<'a>(
+    memberships: &'a [AccountAssociationRecord],
+    billing_period: &str,
+) -> Option<&'a str> {
+    memberships
+        .iter()
+        .rev()
+        .find(|membership| membership.covers(billing_period))
+        .map(|membership| membership.billing_group_arn.as_str())
+}
+
 /// A custom line item as `CreateCustomLineItem` persisted it. `AssociationSize` and
 /// the percentage/flat distinction are DERIVED from this record (see the methods
 /// below), never stored twice.
@@ -1103,7 +1165,10 @@ pub fn responsibility_transfer_owner_account(arn: &str) -> Option<&str> {
 /// * `unassociated_accounts` keeps the released accounts a later
 ///   `ListAccountAssociations` has to report as `UNMONITORED`. Nothing deletes a
 ///   linked account, so this one is capped at [`MAX_UNASSOCIATED_ACCOUNTS`] and
-///   evicts oldest-first.
+///   evicts oldest-first, forgetting the evicted account's billing group
+///   memberships with it; one account keeps at most
+///   [`MAX_ACCOUNT_ASSOCIATIONS_PER_ACCOUNT`] of them, oldest ENDED membership
+///   dropped first.
 /// * the idempotency index is capped at [`MAX_IDEMPOTENCY_TOKENS`], evicts
 ///   oldest-first, and additionally drops the entries that point at a deleted
 ///   group.
@@ -1136,10 +1201,21 @@ pub struct ComAmazonawsBillingconductorAwsbillingconductorState {
     pub custom_line_items: BTreeMap<String, CustomLineItemRecord>,
     /// Billing group name -> ARN ("The billing group name. The names must be unique.").
     pub billing_group_names: BTreeMap<String, String>,
-    /// Account id -> billing group ARN. The index that makes "not associated with
-    /// another billing group" decidable and the MONITORED filter computable. One
-    /// entry per account of a live billing group; a delete reclaims them.
-    pub account_associations: BTreeMap<String, String>,
+    /// Account id -> the billing group memberships that account has had, oldest
+    /// first: the ones that have ended and, last, the one that stands now (at most
+    /// one, since an account belongs to at most one billing group). The index that
+    /// makes "not associated with another billing group" decidable, the MONITORED
+    /// filter computable, and a read scoped to a billing period answerable from the
+    /// membership that was in force THEN (through [`membership_in`]). At most
+    /// [`MAX_ACCOUNT_ASSOCIATIONS_PER_ACCOUNT`] per account, oldest ended membership
+    /// dropped first; a delete ends the memberships the deleted group held.
+    ///
+    /// A handler writes it only through [`Self::associate_account`] and
+    /// [`Self::release_account`], and reads it through
+    /// [`Self::account_billing_group`], [`Self::linked_accounts`] and
+    /// [`Self::billing_group_sizes_in`], so that cap and the one-live-membership
+    /// invariant hold wherever a membership changes.
+    pub account_associations: BTreeMap<String, Vec<AccountAssociationRecord>>,
     /// The auto billing group creation preference of every billing transfer that has
     /// one, keyed by its `ResponsibilityTransferArn`. At most
     /// [`MAX_BILLING_TRANSFER_PREFERENCES`]. Private so the cap below cannot be
@@ -1313,6 +1389,11 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     /// Record a linked account that belongs to no billing group, so a later
     /// `ListAccountAssociations` reports it as `UNMONITORED`. Capped at
     /// [`MAX_UNASSOCIATED_ACCOUNTS`], oldest evicted first.
+    ///
+    /// An evicted account is forgotten whole: the memberships it once had go with it,
+    /// unless it is in a billing group NOW, in which case the membership that stands
+    /// is what keeps it reportable. So the membership history is bounded by the same
+    /// cap as the roster it belongs to.
     pub fn note_unassociated_account(&mut self, account_id: &str) {
         if self
             .unassociated_accounts
@@ -1323,32 +1404,130 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         }
         self.unassociated_accounts.push_back(account_id.to_string());
         while self.unassociated_accounts.len() > MAX_UNASSOCIATED_ACCOUNTS {
-            self.unassociated_accounts.pop_front();
+            let Some(evicted) = self.unassociated_accounts.pop_front() else {
+                break;
+            };
+            if self.account_billing_group(&evicted).is_none() {
+                self.account_associations.remove(&evicted);
+            }
         }
     }
 
-    /// Every linked account this service can report, in account-id order, each with
-    /// the billing group it is associated with (`None` when it is in none).
+    /// Associate `account_id` with `group_arn` from the CURRENT billing period on —
+    /// the period the associating call is made in, the same sense a pricing rule
+    /// association ([`PricingRuleAssociationRecord`]) records.
     ///
-    /// The association index decides: an account that is associated is reported with
-    /// its group even if it is also in the released tail, so a re-associated account
-    /// cannot be reported twice or as `UNMONITORED`.
-    pub fn linked_accounts(&self) -> BTreeMap<String, Option<String>> {
+    /// At most one membership stands at a time, so the one to end is the newest live
+    /// one: a membership of ANOTHER group is ended in this same period, and restating
+    /// the membership the account already has changes nothing — the period it began in
+    /// is the one it is still in force from.
+    pub fn associate_account(&mut self, account_id: &str, group_arn: &str) {
+        let billing_period = current_billing_period();
+        let memberships = self
+            .account_associations
+            .entry(account_id.to_string())
+            .or_default();
+        if let Some(live) = memberships.iter_mut().rev().find(|held| held.is_live()) {
+            if live.billing_group_arn == group_arn {
+                return;
+            }
+            live.exclusive_end_billing_period = Some(billing_period.clone());
+        }
+        memberships.push(AccountAssociationRecord {
+            billing_group_arn: group_arn.to_string(),
+            inclusive_start_billing_period: billing_period,
+            exclusive_end_billing_period: None,
+        });
+        while memberships.len() > MAX_ACCOUNT_ASSOCIATIONS_PER_ACCOUNT {
+            memberships.remove(0);
+        }
+    }
+
+    /// Release `account_id` from `group_arn`: the membership of that group it still
+    /// has ends at the CURRENT billing period, and the account is recorded as
+    /// belonging to no billing group — which is what `UNMONITORED` reports. A no-op
+    /// on the memberships of an account that group does not hold now, so a release
+    /// never rewrites what some other group's membership says.
+    pub fn release_account(&mut self, account_id: &str, group_arn: &str) {
+        let billing_period = current_billing_period();
+        if let Some(live) = self
+            .account_associations
+            .get_mut(account_id)
+            .and_then(|memberships| memberships.iter_mut().rev().find(|held| held.is_live()))
+        {
+            if live.billing_group_arn == group_arn {
+                live.exclusive_end_billing_period = Some(billing_period);
+            }
+        }
+        self.note_unassociated_account(account_id);
+    }
+
+    /// The billing group `account_id` belongs to NOW, or `None` when it is in none —
+    /// the decision "not associated with another billing group" is made from.
+    pub fn account_billing_group(&self, account_id: &str) -> Option<&str> {
+        self.account_associations
+            .get(account_id)?
+            .iter()
+            .rev()
+            .find(|membership| membership.is_live())
+            .map(|membership| membership.billing_group_arn.as_str())
+    }
+
+    /// Every linked account this service can report, in account-id order, each with
+    /// the billing group it was associated with IN `billing_period` (`None` when it
+    /// was in none then).
+    ///
+    /// The roster is every account this service has seen, whatever period is asked
+    /// about: a linked account stays in the consolidated billing family whether or
+    /// not it was in a billing group then, so one that joined a group later is
+    /// reported for an earlier period with no group at all.
+    pub fn linked_accounts(&self, billing_period: &str) -> BTreeMap<String, Option<String>> {
         let mut accounts: BTreeMap<String, Option<String>> = self
             .unassociated_accounts
             .iter()
             .map(|account_id| (account_id.clone(), None))
             .collect();
-        for (account_id, group_arn) in &self.account_associations {
-            accounts.insert(account_id.clone(), Some(group_arn.clone()));
+        for (account_id, memberships) in &self.account_associations {
+            let group_arn = membership_in(memberships, billing_period).map(str::to_string);
+            accounts.insert(account_id.clone(), group_arn);
         }
         accounts
     }
 
+    /// `Size` — "The number of accounts in the particular billing group" — as of
+    /// `billing_period`, for each of the groups in `group_arns` (a group nothing was
+    /// a member of then counts zero).
+    ///
+    /// ONE rule answers every period, the membership index through [`membership_in`],
+    /// so the count cannot disagree with the listing that reports the same
+    /// memberships. And ONE pass over that index answers every group asked about, so a
+    /// listing reporting `Size` for a page of groups never rescans the accounts per
+    /// group: the work is a single bounded pass, whatever period is asked about.
+    pub fn billing_group_sizes_in(
+        &self,
+        group_arns: &[String],
+        billing_period: &str,
+    ) -> BTreeMap<String, i64> {
+        let mut sizes: BTreeMap<String, i64> = group_arns
+            .iter()
+            .map(|group_arn| (group_arn.clone(), 0))
+            .collect();
+        for memberships in self.account_associations.values() {
+            let Some(group_arn) = membership_in(memberships, billing_period) else {
+                continue;
+            };
+            if let Some(size) = sizes.get_mut(group_arn) {
+                *size = size.saturating_add(1);
+            }
+        }
+        sizes
+    }
+
     /// Delete a billing group and everything that only existed because of it: its
-    /// name index entry, its account associations (whose accounts become
-    /// `UNMONITORED`) and the idempotency entries that named it. `None` when no such
-    /// group is stored.
+    /// name index entry, the account memberships it held (which END at the current
+    /// billing period, so those accounts become `UNMONITORED` from now on while the
+    /// periods they were members in still report the group) and the idempotency
+    /// entries that named it. `None` when no such group is stored.
     pub fn remove_billing_group(&mut self, group_arn: &str) -> Option<BillingGroupRecord> {
         let removed = self.billing_groups.remove(group_arn)?;
         self.billing_group_names.remove(&removed.name);
@@ -1373,15 +1552,17 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
                 .retain(|association| association.arn != group_arn);
         }
 
+        // The memberships the group held END with it, rather than being forgotten: a
+        // read scoped to a billing period the group existed in still has to report
+        // the accounts it held then.
         let released: Vec<String> = self
             .account_associations
-            .iter()
-            .filter(|(_, arn)| arn.as_str() == group_arn)
-            .map(|(account_id, _)| account_id.clone())
+            .keys()
+            .filter(|account_id| self.account_billing_group(account_id) == Some(group_arn))
+            .cloned()
             .collect();
         for account_id in released {
-            self.account_associations.remove(&account_id);
-            self.note_unassociated_account(&account_id);
+            self.release_account(&account_id, group_arn);
         }
 
         // The tokens that named one of the deleted ITEMS went with each of them
@@ -1626,9 +1807,7 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
 
     /// The group an account is already associated with, when it is not `group_arn`.
     pub fn conflicting_association(&self, account_id: &str, group_arn: &str) -> Option<&str> {
-        self.account_associations
-            .get(account_id)
-            .map(String::as_str)
+        self.account_billing_group(account_id)
             .filter(|existing| *existing != group_arn)
     }
 
@@ -1943,6 +2122,17 @@ pub const MAX_BILLING_TRANSFER_PREFERENCES: usize = 1000;
 /// every create-and-delete. The oldest released account is forgotten first; an
 /// account that is still associated with a group is never in this tail.
 pub const MAX_UNASSOCIATED_ACCOUNTS: usize = 1024;
+
+/// How many billing group memberships this service remembers per linked account:
+/// the one that stands now plus the ones that have ended.
+///
+/// A CHOSEN bound, not an AWS limit: a caller decides how often it associates and
+/// disassociates an account, and each cycle is one more ended membership to report a
+/// past billing period from. The oldest ENDED membership is dropped first, so a
+/// forgotten one reads back the way that period read before anybody recorded it, and
+/// the membership in force is never the one evicted. A billing period is a month, so
+/// this holds every membership a long history of them could be reported for.
+pub const MAX_ACCOUNT_ASSOCIATIONS_PER_ACCOUNT: usize = 100;
 
 /// How many pricing plans this emulator stores for the account.
 ///

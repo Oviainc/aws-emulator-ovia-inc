@@ -20,6 +20,11 @@
 //!    comparison, the statistic, the datapoint values and their count, how many of the
 //!    evaluated periods carry one, the age of a datapoint, its unit, its dimension set and
 //!    the `TreatMissingData` setting.
+//! 3. The `StateReason` of an evaluated state explains how that state was decided: a window
+//!    that held no datapoint of the metric is reported as the hole it was, naming the
+//!    missing-data arm applied to it, and only the datapoints the evaluation really had are
+//!    reported as graded. Rows differ in the arm in force, how many of the evaluated windows
+//!    hold a real datapoint, the number of evaluation periods and whether the comparison held.
 //!
 //! The recorded case the issue was filed about (a `SearchableDocuments` datapoint driven
 //! past an alarm's threshold, and a forged `AWS/ES` datapoint) is one row of each table.
@@ -416,6 +421,250 @@ async fn an_alarms_state_is_evaluated_from_the_datapoints_it_watches() {
             reported.get("StateValue").and_then(Value::as_str),
             Some(*expected),
             "case {case:?}: expected StateValue {expected}, got {reported}"
+        );
+    }
+}
+
+/// One row of the `StateReason` table.
+struct ReasonRow {
+    /// What this row is about, named by every assertion it makes.
+    case: &'static str,
+    /// The members this row changes on the base alarm.
+    patch: Value,
+    /// The datapoints it publishes into its own series.
+    data: Vec<Datum>,
+    /// The state the evaluation must put the alarm in.
+    state: &'static str,
+    /// The fragments its `StateReason` must carry.
+    reported: Vec<&'static str>,
+    /// The fragments its `StateReason` must NOT carry.
+    not_reported: Vec<&'static str>,
+}
+
+/// One row of the `StateReason` table, in the order the table below reads.
+fn reason_row(
+    case: &'static str,
+    patch: Value,
+    data: Vec<Datum>,
+    state: &'static str,
+    reported: Vec<&'static str>,
+    not_reported: Vec<&'static str>,
+) -> ReasonRow {
+    ReasonRow {
+        case,
+        patch,
+        data,
+        state,
+        reported,
+        not_reported,
+    }
+}
+
+#[tokio::test]
+async fn an_evaluated_state_reason_reports_an_empty_window_as_a_hole_and_names_the_arm() {
+    // The rows differ in the missing-data arm in force, how many of the evaluated windows hold
+    // a real datapoint, how many periods the alarm evaluates and whether the comparison held —
+    // the things the rule generalises over. The recorded case the issue was filed about (one
+    // evaluation period, `notBreaching`, no datapoint published at all) is the first row.
+    let rows: Vec<ReasonRow> = vec![
+        reason_row(
+            "no datapoint at all over one period, missing data treated as not breaching",
+            json!({"TreatMissingData": "notBreaching"}),
+            Vec::new(),
+            "OK",
+            vec![
+                "no datapoints were received for 1 period",
+                "1 missing datapoint was treated as [NonBreaching]",
+            ],
+            vec!["out of the last"],
+        ),
+        reason_row(
+            "no datapoint at all over three periods, missing data treated as not breaching",
+            json!({"EvaluationPeriods": 3, "TreatMissingData": "notBreaching"}),
+            Vec::new(),
+            "OK",
+            vec![
+                "no datapoints were received for 3 periods",
+                "3 missing datapoints were treated as [NonBreaching]",
+            ],
+            vec!["out of the last"],
+        ),
+        reason_row(
+            "no datapoint at all, missing data treated as breaching",
+            json!({"TreatMissingData": "breaching"}),
+            Vec::new(),
+            "ALARM",
+            vec![
+                "no datapoints were received for 1 period",
+                "1 missing datapoint was treated as [Breaching]",
+            ],
+            vec!["out of the last", "NonBreaching"],
+        ),
+        reason_row(
+            "one real non-breaching datapoint beside a window treated as not breaching",
+            json!({"EvaluationPeriods": 2, "TreatMissingData": "notBreaching"}),
+            vec![datum(1.0, 0.0)],
+            "OK",
+            vec![
+                "0 out of the last 2 datapoints",
+                "1 missing datapoint was treated as [NonBreaching]",
+            ],
+            vec!["no datapoints were received"],
+        ),
+        reason_row(
+            "one real breaching datapoint beside a window treated as breaching",
+            json!({"EvaluationPeriods": 2, "TreatMissingData": "breaching"}),
+            vec![datum(42.0, 0.0)],
+            "ALARM",
+            vec![
+                "2 out of the last 2 datapoints",
+                "1 missing datapoint was treated as [Breaching]",
+            ],
+            vec!["no datapoints were received"],
+        ),
+        reason_row(
+            "every evaluated datapoint is real and breaching",
+            json!({}),
+            vec![datum(42.0, 0.0)],
+            "ALARM",
+            vec!["Threshold Crossed: 1 out of the last 1 datapoints"],
+            vec!["missing datapoint", "no datapoints were received"],
+        ),
+        reason_row(
+            "every evaluated datapoint is real and none breaches",
+            json!({}),
+            vec![datum(1.0, 0.0)],
+            "OK",
+            vec!["Threshold Crossed: 0 out of the last 1 datapoints"],
+            vec![
+                "Threshold not Crossed",
+                "missing datapoint",
+                "no datapoints were received",
+            ],
+        ),
+        reason_row(
+            // `missing` substitutes no datapoint, so the two real ones are all the evaluation
+            // had and that is the count it reports — no arm decided anything here.
+            "two real breaching datapoints and a third window the default treatment leaves out",
+            json!({"EvaluationPeriods": 3, "DatapointsToAlarm": 3}),
+            vec![datum(42.0, 0.0), datum(43.0, 70.0)],
+            "ALARM",
+            vec!["2 out of the last 2 datapoints"],
+            vec!["missing datapoint", "no datapoints were received"],
+        ),
+    ];
+
+    // Every row's alarm watches its own series, so all of them are configured on ONE emulator
+    // and the evaluation delay is waited out once rather than per row.
+    let router = build_router();
+    let mut names: Vec<String> = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        let name = format!("reason-{index}");
+        ok(&router, "PutMetricAlarm", &patched(&name, &row.patch)).await;
+        publish(&router, &name, &row.data).await;
+        names.push(name);
+    }
+    wait_for_evaluation();
+
+    for (row, name) in rows.iter().zip(&names) {
+        let case = row.case;
+        let state = row.state;
+        let described = ok(&router, "DescribeAlarms", &json!({"AlarmNames": [name]})).await;
+        let reported = &described["MetricAlarms"][0];
+        assert_eq!(
+            reported.get("StateValue").and_then(Value::as_str),
+            Some(state),
+            "case {case:?}: expected StateValue {state}, got {reported}"
+        );
+        let reason = reported
+            .get("StateReason")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        for fragment in &row.reported {
+            assert!(
+                reason.contains(fragment),
+                "case {case:?}: expected StateReason to report {fragment:?}, got {reason:?}"
+            );
+        }
+        for fragment in &row.not_reported {
+            assert!(
+                !reason.contains(fragment),
+                "case {case:?}: expected StateReason not to claim {fragment:?}, got {reason:?}"
+            );
+        }
+        // `StateReason` is `@length 0..1023`
+        // (`smithy_query(query="shape",shape="StateReason")`).
+        assert!(
+            reason.len() <= 1023,
+            "case {case:?}: StateReason must stay inside its modelled length, got {} \
+             characters: {reason:?}",
+            reason.len()
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_evaluation_with_nothing_to_grade_reports_the_datapoints_it_did_not_have() {
+    // (case, the alarm's `EvaluationPeriods`, the reason the evaluation must report once its
+    //  datapoint has fallen out of the range)
+    //
+    // A one-second period, so the evaluation range the alarms search is short enough to wait
+    // out: no datapoint is left in it, the default `missing` treatment substitutes none, and
+    // the evaluation reports the datapoints it does not have instead of naming an arm.
+    let rows = [
+        (
+            "one evaluation period",
+            1,
+            "Insufficient Data: 1 datapoint was unknown.",
+        ),
+        (
+            "two evaluation periods",
+            2,
+            "Insufficient Data: 2 datapoints were unknown.",
+        ),
+    ];
+
+    let router = build_router();
+    let mut names: Vec<String> = Vec::with_capacity(rows.len());
+    for (index, (_, periods, _)) in rows.iter().enumerate() {
+        let name = format!("aged-out-{index}");
+        let alarm = patched(&name, &json!({"Period": 1, "EvaluationPeriods": periods}));
+        ok(&router, "PutMetricAlarm", &alarm).await;
+        publish(&router, &name, &[datum(42.0, 0.0)]).await;
+        names.push(name);
+    }
+    wait_for_evaluation();
+
+    // The datapoint is still in the range, so each alarm is evaluated into ALARM first.
+    for ((case, _, _), name) in rows.iter().zip(&names) {
+        let described = ok(&router, "DescribeAlarms", &json!({"AlarmNames": [name]})).await;
+        assert_eq!(
+            described["MetricAlarms"][0]
+                .get("StateValue")
+                .and_then(Value::as_str),
+            Some("ALARM"),
+            "case {case:?}: the breaching datapoint must put the alarm in ALARM, got {described}"
+        );
+    }
+
+    // Past the widest of these alarms' evaluation ranges, every window they search is empty.
+    std::thread::sleep(Duration::from_millis(4_600));
+    for ((case, _, expected), name) in rows.iter().zip(&names) {
+        let described = ok(&router, "DescribeAlarms", &json!({"AlarmNames": [name]})).await;
+        let reported = &described["MetricAlarms"][0];
+        assert_eq!(
+            reported.get("StateValue").and_then(Value::as_str),
+            Some("INSUFFICIENT_DATA"),
+            "case {case:?}: with no datapoint left in the range the alarm must report \
+             INSUFFICIENT_DATA, got {reported}"
+        );
+        let reason = reported
+            .get("StateReason")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(
+            reason, *expected,
+            "case {case:?}: expected StateReason {expected:?}, got {reason:?}"
         );
     }
 }

@@ -192,9 +192,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(UpdateExperimentDefinitionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No application with id or name {} exists.",
-                        input.application_identifier
+                    message: Some(crate::state::application_not_found(
+                        &input.application_identifier,
                     )),
                     resource_name: Some(input.application_identifier),
                 },
@@ -218,9 +217,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(UpdateExperimentDefinitionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No experiment definition with id or name {} exists in application {}.",
-                        input.experiment_definition_identifier, application_id
+                    message: Some(crate::state::experiment_definition_not_found(
+                        &input.application_identifier,
+                        &input.experiment_definition_identifier,
                     )),
                     resource_name: Some(input.experiment_definition_identifier),
                 },

@@ -1682,6 +1682,25 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         Some(claimed)
     }
 
+    /// Restart the heartbeat window of the task `token` names at `now`, and report
+    /// whether the store held one.
+    ///
+    /// "This action resets the Heartbeat clock": the window the scheduling state's
+    /// `HeartbeatSeconds` opens is measured from the last heartbeat, which the claim
+    /// starts and this moves on.
+    /// The task's `TimeoutSeconds` is read from the instant the state scheduled it and
+    /// is deliberately NOT touched, because "the Timeout of a task ... is its maximum
+    /// allowed duration, regardless of the number of SendTaskHeartbeat requests
+    /// received". No byte of the record changes size, so the store's total is
+    /// unaffected.
+    pub fn restart_heartbeat_window(&mut self, token: &str, now: SystemTime) -> bool {
+        let Some(task) = self.activity_tasks.get_mut(token) else {
+            return false;
+        };
+        task.heartbeat_at = Some(now);
+        true
+    }
+
     /// Drop the task `token` names, giving back what its record retained, and report
     /// it. `None` when the store holds no task under that token.
     pub fn discard_activity_task(&mut self, token: &str) -> Option<ActivityTask> {

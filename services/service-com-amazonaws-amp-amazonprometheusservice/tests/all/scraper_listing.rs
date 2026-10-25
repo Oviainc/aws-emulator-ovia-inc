@@ -12,7 +12,8 @@
 
 use crate::workspace_lifecycle::{text, Amp};
 use service_com_amazonaws_amp_amazonprometheusservice::ops::types::{
-    AmpConfiguration, CloudWatchConfiguration, Destination, EksConfiguration, Source,
+    AmpConfiguration, CloudWatchConfiguration, Destination, EksConfiguration, ScrapeConfiguration,
+    Source,
 };
 use service_com_amazonaws_amp_amazonprometheusservice::state::{
     Scraper, SCRAPER_PAGE_DEFAULT, STATUS_ACTIVE, STATUS_CREATING,
@@ -53,9 +54,30 @@ pub(crate) fn scraper(
         destination,
         role_configuration: None,
         exporters: Vec::new(),
+        scrape_configuration: scrape_configuration("global:\n  scrape_interval: 30s\n"),
         transition_due: None,
         delete_token: None,
+        update_token: None,
     }
+}
+
+/// A scrape configuration holding `yaml`. `ScrapeConfiguration` is a union whose one
+/// member `configurationBlob` is documented "The base 64 encoded scrape configuration
+/// file", and the `restJson1` wire form of a blob is base-64 — which the framework's own
+/// codec applies, so a test hands it the bytes and never a hand-rolled encoding.
+fn scrape_configuration(yaml: &str) -> ScrapeConfiguration {
+    ScrapeConfiguration::configurationBlob(yaml.as_bytes().to_vec())
+}
+
+/// Seed one scraper into the store the mounted service reads — the SAME record the
+/// handlers read, not a second copy of it. `pub(crate)` for the reason the builder above
+/// is: `CreateScraper` is still scaffolded (its own stub issue), so every suite that
+/// needs a stored scraper seeds one, and they all seed it the one way.
+pub(crate) fn seed(amp: &Amp, record: &Scraper) {
+    amp.store()
+        .lock()
+        .scrapers
+        .insert(record.scraper_id.clone(), record.clone());
 }
 
 /// An EKS cluster source, named by the ARN the `sourceArn` filter matches on.

@@ -161,6 +161,9 @@ mod state_roundtrip;
 #[path = "all/token_ledgers.rs"]
 mod token_ledgers;
 
+#[path = "all/untag_resource.rs"]
+mod untag_resource;
+
 #[path = "all/validation_envelopes.rs"]
 mod validation_envelopes;
 

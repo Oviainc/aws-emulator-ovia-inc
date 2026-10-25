@@ -4,7 +4,8 @@
 //!
 //! The channel-messaging slice keeps every channel this service minted, keyed by its
 //! ARN, and the messages sent to each one inside that channel's record — so deleting a
-//! channel drops its messages with it and no second map can disagree about either.
+//! channel drops its messages with it and no second map can disagree about either. The
+//! channel FLOWS this service minted are kept the same way, keyed by their own ARN.
 //!
 //! Timestamps are held as epoch MILLISECONDS rather than as
 //! [`aws_smithy_types::DateTime`], because the list operations have to order and range
@@ -16,8 +17,9 @@ use std::collections::{HashMap, VecDeque};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    Channel, ChannelMessage, ChannelMessageStatusStructure, ChannelMessageSummary, ChannelSummary,
-    ElasticChannelConfiguration, ExpirationSettings, Identity, MessageAttributeValue, Tag, Target,
+    Channel, ChannelFlow, ChannelFlowSummary, ChannelMessage, ChannelMessageStatusStructure,
+    ChannelMessageSummary, ChannelSummary, ElasticChannelConfiguration, ExpirationSettings,
+    Identity, MessageAttributeValue, Processor, Tag, Target,
 };
 
 /// How many `CreateChannel` idempotency records this emulator keeps.
@@ -29,7 +31,40 @@ use crate::ops::types::{
 /// instead of answering with the first one's ARN. A record is a `ChimeArn` (modelled
 /// `len 5..1600`) keyed by an `AppInstanceArn` (1600) and a `ClientRequestToken`
 /// (modelled `len 2..64`), so 4096 records bound this map at about 13 MiB.
+///
+/// `CreateChannelFlow`'s ledger is bounded the same way, for the same reason and with the
+/// same consequence.
 pub const MAX_CREATE_CHANNEL_IDEMPOTENCY_RECORDS: usize = 4096;
+
+/// What the service states when a `ChannelFlowArn` names no channel flow it holds.
+///
+/// A `ChannelFlowArn` is an app instance's ARN extended by `/channel-flow/<id>`
+/// (`CreateChannelFlow` derives it that way), so an ARN this service holds no channel flow
+/// for names an app instance scope it cannot resolve for the caller. The REQUIREMENT for
+/// that refusal is the modelled `ForbiddenException` — HTTP 403 with `Code` `Forbidden`,
+/// the only terminal client error either of the two operations that read a channel flow by
+/// ARN models for an ARN it cannot resolve (neither lists `NotFoundException`) — and the
+/// sentence is the one Amazon Chime SDK Messaging itself returns for it (observed in the
+/// AWS wire recording this behaviour was implemented against). It names no value from the
+/// request, so it is the same sentence for every caller.
+///
+/// Read by `DescribeChannelFlow` and `DeleteChannelFlow`, so the two sides of one rule
+/// cannot drift.
+pub const UNRESOLVABLE_APP_INSTANCE: &str =
+    "An invalid App Instance ARN was supplied for the input parameter.";
+
+/// How many channel flows this emulator stores at once.
+///
+/// `CreateChannelFlow` is the only way to add one and `DeleteChannelFlow` the only way to
+/// remove one, and that reclamation is the CALLER's option — so without a cap of its own
+/// the map grows with the request stream. Past this many live channel flows
+/// `CreateChannelFlow` answers the modelled `ResourceLimitExceededException` instead of
+/// minting another, which is also how the real service reports a quota it will not
+/// exceed. A `ChannelFlowRecord` holds at most `Name` 256, three `Processor`s of
+/// (`Name` 256 + `LambdaFunctionArn` 2048) and 50 tags of 128 + 256, so on the order of
+/// 26 KiB; 256 flows bound the map at about 7 MiB. This emulator's own choice, not a
+/// modelled or documented service limit.
+pub const MAX_STORED_CHANNEL_FLOWS: usize = 256;
 
 /// How many channels this emulator stores at once.
 ///
@@ -154,17 +189,59 @@ pub struct ComAmazonawsChimesdkmessagingChimemessagingserviceState {
     /// [`MAX_MESSAGE_BYTES_PER_CHANNEL`], so the store cannot grow with the request
     /// stream. No response returns more than the modelled `MaxResults` maximum at once.
     pub channels: HashMap<String, ChannelRecord>,
+    /// Every live channel flow, keyed by its `ChannelFlowArn`. A channel flow is an
+    /// emulated RESOURCE, reclaimed by `DeleteChannelFlow`; because that reclamation is
+    /// the caller's option, the map is additionally capped at
+    /// [`MAX_STORED_CHANNEL_FLOWS`], so the store cannot grow with the request stream.
+    pub channel_flows: HashMap<String, ChannelFlowRecord>,
     /// `(AppInstanceArn, ClientRequestToken) -> ChannelArn`: the result the FIRST
     /// `CreateChannel` carrying that `@idempotencyToken` produced, so a replay answers
     /// with it instead of minting a second channel. The record is the recorded outcome
     /// of that request, so it outlives the channel itself — which is why it is read and
     /// written through [`Self::remembered_channel`] / [`Self::remember_channel`], which
     /// keep the map inside [`MAX_CREATE_CHANNEL_IDEMPOTENCY_RECORDS`].
-    create_channel_idempotency: HashMap<(String, String), String>,
-    /// The order those records were written in, so the oldest can be dropped first.
-    create_channel_idempotency_order: VecDeque<(String, String)>,
+    create_channel_idempotency: IdempotencyLedger,
+    /// The same ledger for `CreateChannelFlow`, whose `ClientRequestToken` is modelled
+    /// `@idempotencyToken` too — read and written through
+    /// [`Self::remembered_channel_flow`] / [`Self::remember_channel_flow`].
+    create_channel_flow_idempotency: IdempotencyLedger,
     /// Draws [`Self::mint_id`], so two ids minted in the same nanosecond differ.
     id_counter: u64,
+}
+
+/// What the FIRST request carrying an `@idempotencyToken` produced, so a replay of it
+/// answers with that result instead of minting a second resource.
+///
+/// One type for every operation in this slice that models such a token, so the bound and
+/// the eviction order are stated once: the oldest record is dropped past
+/// [`MAX_CREATE_CHANNEL_IDEMPOTENCY_RECORDS`], because no operation in the API deletes
+/// one and the map would otherwise grow with the request stream.
+#[derive(Debug, Default)]
+struct IdempotencyLedger {
+    /// `(resource scope, ClientRequestToken) -> the ARN that request returned`.
+    records: HashMap<(String, String), String>,
+    /// The order those records were written in, so the oldest can be dropped first.
+    order: VecDeque<(String, String)>,
+}
+
+impl IdempotencyLedger {
+    /// The ARN an earlier request with this key returned, if the record is still held.
+    fn remembered(&self, key: &(String, String)) -> Option<&String> {
+        self.records.get(key)
+    }
+
+    /// Record what this request returned, dropping the oldest record once the ledger is
+    /// at [`MAX_CREATE_CHANNEL_IDEMPOTENCY_RECORDS`].
+    fn remember(&mut self, key: (String, String), arn: String) {
+        if self.records.insert(key.clone(), arn).is_none() {
+            self.order.push_back(key);
+        }
+        while self.order.len() > MAX_CREATE_CHANNEL_IDEMPOTENCY_RECORDS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.records.remove(&oldest);
+            }
+        }
+    }
 }
 
 impl ComAmazonawsChimesdkmessagingChimemessagingserviceState {
@@ -188,23 +265,63 @@ impl ComAmazonawsChimesdkmessagingChimemessagingserviceState {
     /// The `ChannelArn` an earlier `CreateChannel` with this `(AppInstanceArn,
     /// ClientRequestToken)` returned, if the record is still held.
     pub fn remembered_channel(&self, key: &(String, String)) -> Option<&String> {
-        self.create_channel_idempotency.get(key)
+        self.create_channel_idempotency.remembered(key)
     }
 
     /// Record what this `CreateChannel` returned, dropping the oldest record once the
-    /// map is at [`MAX_CREATE_CHANNEL_IDEMPOTENCY_RECORDS`].
+    /// ledger is at [`MAX_CREATE_CHANNEL_IDEMPOTENCY_RECORDS`].
     pub fn remember_channel(&mut self, key: (String, String), channel_arn: String) {
-        if self
-            .create_channel_idempotency
-            .insert(key.clone(), channel_arn)
-            .is_none()
-        {
-            self.create_channel_idempotency_order.push_back(key);
+        self.create_channel_idempotency.remember(key, channel_arn);
+    }
+
+    /// The `ChannelFlowArn` an earlier `CreateChannelFlow` with this `(AppInstanceArn,
+    /// ClientRequestToken)` returned, if the record is still held.
+    pub fn remembered_channel_flow(&self, key: &(String, String)) -> Option<&String> {
+        self.create_channel_flow_idempotency.remembered(key)
+    }
+
+    /// Record what this `CreateChannelFlow` returned, dropping the oldest record once the
+    /// ledger is at [`MAX_CREATE_CHANNEL_IDEMPOTENCY_RECORDS`].
+    pub fn remember_channel_flow(&mut self, key: (String, String), channel_flow_arn: String) {
+        self.create_channel_flow_idempotency
+            .remember(key, channel_flow_arn);
+    }
+}
+
+/// A channel flow minted by `CreateChannelFlow`: the container for the processor Lambda
+/// functions messages sent to an associated channel go through.
+#[derive(Debug, Clone)]
+pub struct ChannelFlowRecord {
+    pub arn: String,
+    pub app_instance_arn: String,
+    pub name: String,
+    /// The processors as the caller declared them, in request order.
+    pub processors: Vec<Processor>,
+    pub created_millis: i64,
+    pub last_updated_millis: i64,
+    pub tags: Vec<Tag>,
+}
+
+impl ChannelFlowRecord {
+    /// The modelled `ChannelFlow` this record describes, as `DescribeChannelFlow`
+    /// returns it.
+    pub fn to_channel_flow(&self) -> ChannelFlow {
+        ChannelFlow {
+            channel_flow_arn: Some(self.arn.clone()),
+            processors: Some(self.processors.clone()),
+            name: Some(self.name.clone()),
+            created_timestamp: Some(date_time(self.created_millis)),
+            last_updated_timestamp: Some(date_time(self.last_updated_millis)),
         }
-        while self.create_channel_idempotency_order.len() > MAX_CREATE_CHANNEL_IDEMPOTENCY_RECORDS {
-            if let Some(oldest) = self.create_channel_idempotency_order.pop_front() {
-                self.create_channel_idempotency.remove(&oldest);
-            }
+    }
+
+    /// The modelled `ChannelFlowSummary` this record describes, as `ListChannelFlows`
+    /// returns it. The summary carries no timestamps.
+    pub fn to_summary(&self) -> ChannelFlowSummary {
+        ChannelFlowSummary {
+            channel_flow_arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            processors: Some(self.processors.clone()),
         }
     }
 }
@@ -468,4 +585,108 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsChimesdkmessagingChimemessagingserviceState>)
+}
+
+/// The `aws.api#service$arnNamespace` a `LambdaFunctionArn` carries, which is what
+/// `service_common::arn::region_of` matches a processor's ARN against.
+const LAMBDA_ARN_VENDOR: &str = "lambda";
+
+/// Why `CreateChannelFlow` must refuse a processor whose Lambda function this emulator
+/// cannot resolve, or `None` when the channel flow may be written.
+///
+/// A channel flow's processors ARE Lambda functions: Amazon Chime SDK Messaging resolves
+/// `Processor.Configuration.Lambda.ResourceArn` when the flow is created — not when a
+/// message is processed — and refuses the request, persisting nothing, when that function
+/// cannot be invoked. Lambda is reached the way any emulated service reaches another:
+/// through the in-process callback
+/// ([`smithy_server_runtime::OperationContext::callback`]), so this crate names no other
+/// service crate.
+///
+/// `None` also covers the case where this emulator has no Lambda to ask (a router with
+/// only this service mounted, say): nothing is then known about the function, and a
+/// refusal has to be grounded in what Lambda answered, never assumed. What this emulator
+/// does NOT do is decide whether an existing function is invocable BY the Chime SDK —
+/// that is a resource policy on another account's function, which nothing here can read,
+/// so it is never fabricated either way.
+///
+/// An ARN that is not a Lambda function ARN with a Region LABEL is refused WITHOUT asking
+/// anything: there is no endpoint such an ARN resolves to, so nothing about it could be
+/// looked up. The Region is read through `service_common::arn::region_of`, the one owner of
+/// that rule — it reports the field only when it is a Region label (`[a-z0-9-]`, bounded,
+/// non-empty), precisely because the value ends up in an endpoint URL's authority. The
+/// model's `LambdaFunctionArn` pattern already refuses such an ARN before this handler
+/// runs, which makes this the second of two gates rather than the only one.
+pub async fn unresolvable_processor_lambda(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    resource_arn: &str,
+) -> Option<String> {
+    let Some(region) = service_common::arn::region_of(resource_arn, LAMBDA_ARN_VENDOR) else {
+        return Some(format!(
+            "{resource_arn} is not a Lambda function ARN naming a Region, so no Lambda \
+             function can be resolved from it"
+        ));
+    };
+    let config = ::aws_sdk_lambda::Config::builder()
+        .behavior_version(::aws_sdk_lambda::config::BehaviorVersion::latest())
+        .http_client(ctx.callback().http_client())
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .region(::aws_sdk_lambda::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://lambda.{region}.amazonaws.com"))
+        // The transport is in-process: there is nothing to retry, time out or watch for
+        // a stalled stream, and each of those would need a sleep implementation this
+        // client is not given. The same goes for caching the identity: the credentials
+        // are handed over directly.
+        .retry_config(::aws_sdk_lambda::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_lambda::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_lambda::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_lambda::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    let answer = ::aws_sdk_lambda::Client::from_conf(config)
+        .get_function()
+        .function_name(resource_arn)
+        .send()
+        .await;
+    match answer {
+        // The function is there, so nothing about it is a ground to refuse on.
+        Ok(_) => None,
+        // Lambda says this account holds no such function: the refusal is grounded.
+        Err(error) if function_is_absent(&error) => Some(format!(
+            "the processor Lambda function {resource_arn} could not be resolved, so it \
+             cannot be invoked to process messages"
+        )),
+        // Any other answer is this emulator failing to ask, not Lambda reporting a bad
+        // function, so it refuses nothing — and it is worth a warning, because a
+        // deployment with no Lambda to ask is one where this gate does not run.
+        Err(error) => {
+            ::tracing::warn!(
+                %resource_arn,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "could not resolve a channel flow processor's Lambda function; the \
+                 channel flow is created without that check"
+            );
+            None
+        }
+    }
+}
+
+/// Whether a `GetFunction` failure is Lambda reporting that the function is not there,
+/// rather than this emulator failing to ask.
+///
+/// One other service resolves a caller-supplied Lambda function the same way — see
+/// `lambda_function_is_absent` in
+/// `services/service-com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol/src/state.rs`
+/// — so the in-process client policy above and this classifier are to be MIGRATED into
+/// `service-common` as one `lambda` reader, the way the ARN Region read already lives
+/// there. They are left here only because this change does not own that service's issue.
+fn function_is_absent(
+    error: &::aws_sdk_lambda::error::SdkError<
+        ::aws_sdk_lambda::operation::get_function::GetFunctionError,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> bool {
+    error
+        .as_service_error()
+        .is_some_and(::aws_sdk_lambda::operation::get_function::GetFunctionError::is_resource_not_found_exception)
 }

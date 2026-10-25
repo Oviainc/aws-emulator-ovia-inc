@@ -672,13 +672,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ssekms_key_id: encryption.kms_key_id.clone(),
             ssekms_encryption_context: encryption.kms_encryption_context.clone(),
             bucket_key_enabled: encryption.bucket_key_enabled,
+            // "If the expiration is configured for the object … the response includes this
+            // header" (`PutObjectOutput$Expiration`), which is the bucket's own lifecycle
+            // configuration applied to the object just stored — computed from it rather
+            // than stamped on it, so the same answer comes back from every later read.
+            expiration: expiration_of(&store, &input.bucket, &input.key),
             // Everything else this output can carry describes a feature no stored object
-            // here has, so none of it is reported rather than being invented:
-            // `Expiration` needs a lifecycle configuration (none is recorded for any
-            // bucket), the checksum members need a checksum this handler did not compute,
-            // the SSE-C members are refused above, `Size` is for appends in directory
-            // buckets, and `RequestCharged` reports a Requester Pays charge this emulator
-            // does not model.
+            // here has, so none of it is reported rather than being invented: the checksum
+            // members need a checksum this handler did not compute, the SSE-C members are
+            // refused above, `Size` is for appends in directory buckets, and
+            // `RequestCharged` reports a Requester Pays charge this emulator does not
+            // model.
             ..PutObjectOutput::default()
         })
     }
@@ -697,4 +701,18 @@ fn version_id_of(
         .bucket(bucket)
         .and_then(|bucket| bucket.object(key))
         .and_then(|object| object.version_id.clone())
+}
+
+/// The `Expiration` the bucket's lifecycle configuration gives the object stored at
+/// `bucket`/`key`, or `None` when the bucket carries no configuration that expires it.
+///
+/// Read off the STORED object, so the expiry date is dated from the instant the store
+/// recorded and the rule is matched against the tag set and size the object actually has.
+fn expiration_of(
+    store: &crate::state::ComAmazonawsS3Amazons3State,
+    bucket: &str,
+    key: &str,
+) -> Option<String> {
+    let bucket = store.bucket(bucket)?;
+    bucket.object_expiration_header(key, bucket.object(key)?)
 }

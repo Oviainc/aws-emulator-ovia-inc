@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterDaemonTaskDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterDaemonTaskDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterDaemonTaskDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers the next revision of a DAEMON task-definition family and stores it. The
+//! revision comes from a per-family counter (1, 2, 3 …) and the ARN it answers with names
+//! the stored record, which `DescribeDaemonTaskDefinition` reads back.
 //!
 //! ## Shape of an operation
 //!
@@ -195,18 +189,164 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterDaemonTaskDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterDaemonTaskDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterDaemonTaskDefinition"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RegisterDaemonTaskDefinitionErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        // "You must specify a family for a daemon task definition. ... Up to 255 letters
+        // (uppercase and lowercase), numbers, underscores, and hyphens are allowed."
+        if !crate::state::is_valid_name(&input.family) {
+            return Err(
+                RegisterDaemonTaskDefinitionErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "family must be 1 to {} letters, numbers, underscores or \
+                             hyphens; got {:?}",
+                            crate::state::MAX_NAME_LENGTH, input.family
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A daemon is made of containers, so a registration has to describe at least one
+        // — and at most as many as a task definition may hold, which is also what bounds
+        // the work and the stored bytes ONE registration can ask for.
+        if input.container_definitions.is_empty() {
+            return Err(RegisterDaemonTaskDefinitionErrorModeled::ClientException(
+                ClientException {
+                    message: Some(
+                        "containerDefinitions must describe at least one container"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        if input.container_definitions.len() > crate::state::MAX_CONTAINER_DEFINITIONS {
+            return Err(RegisterDaemonTaskDefinitionErrorModeled::ClientException(
+                ClientException {
+                    message: Some(format!(
+                        "containerDefinitions must describe at most {} containers; got {}",
+                        crate::state::MAX_CONTAINER_DEFINITIONS,
+                        input.container_definitions.len()
+                    )),
+                },
+            )
+            .into());
+        }
+        // Every container is identified by its name within the definition, and needs an
+        // image to be runnable.
+        let mut names = ::std::collections::HashSet::new();
+        for (index, definition) in input.container_definitions.iter().enumerate() {
+            let Some(name) = definition
+                .name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+            else {
+                return Err(RegisterDaemonTaskDefinitionErrorModeled::ClientException(
+                    ClientException {
+                        message: Some(format!(
+                            "Invalid setting for containerDefinitions[{index}]: 'name' is \
+                             required"
+                        )),
+                    },
+                )
+                .into());
+            };
+            if definition.image.trim().is_empty() {
+                return Err(RegisterDaemonTaskDefinitionErrorModeled::ClientException(
+                    ClientException {
+                        message: Some(format!(
+                            "Invalid setting for container '{name}': 'image' is required"
+                        )),
+                    },
+                )
+                .into());
+            }
+            if !names.insert(name.to_string()) {
+                return Err(RegisterDaemonTaskDefinitionErrorModeled::ClientException(
+                    ClientException {
+                        message: Some(format!(
+                            "container names must be unique within a daemon task \
+                             definition; '{name}' is repeated"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let region = crate::state::request_region(ctx);
+        let mut guard = state.lock();
+
+        if guard.daemon_task_definitions.len() >= crate::state::MAX_DAEMON_TASK_DEFINITIONS {
+            return Err(
+                RegisterDaemonTaskDefinitionErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "this emulator holds at most {} daemon task-definition \
+                             revisions",
+                            crate::state::MAX_DAEMON_TASK_DEFINITIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "When you register a daemon task definition for the first time, the revision is
+        // 1. Each time that you register a new revision of a daemon task definition in
+        // the same family, the revision value always increases by one." The counter
+        // outlives the revisions it handed out, so a number is never minted twice.
+        let revision = guard
+            .next_daemon_revision
+            .get(&input.family)
+            .copied()
+            .unwrap_or(1);
+        guard
+            .next_daemon_revision
+            .insert(input.family.clone(), revision + 1);
+
+        let record = crate::state::DaemonTaskDefinitionRecord {
+            arn: crate::state::daemon_task_definition_arn(&region, &input.family, revision),
+            family: input.family.clone(),
+            revision,
+            status: crate::state::DAEMON_TASK_DEFINITION_ACTIVE.to_string(),
+            container_definitions: input.container_definitions.clone(),
+            volumes: input.volumes.clone().unwrap_or_default(),
+            cpu: input.cpu.clone(),
+            memory: input.memory.clone(),
+            task_role_arn: input.task_role_arn.clone(),
+            execution_role_arn: input.execution_role_arn.clone(),
+            // "The default is none. If none is specified or no value is provided, the
+            // daemon runs with its own PID/IPC namespace": the mode the daemon runs in is
+            // resolved ONCE, here, so every later read reports it.
+            pid_mode: input
+                .pid_mode
+                .clone()
+                .unwrap_or_else(|| crate::state::DAEMON_NAMESPACE_MODE_NONE.to_string()),
+            ipc_mode: input
+                .ipc_mode
+                .clone()
+                .unwrap_or_else(|| crate::state::DAEMON_NAMESPACE_MODE_NONE.to_string()),
+            tags: input.tags.clone().unwrap_or_default(),
+            // "The principal that registered the daemon task definition": resolved on
+            // the registering call and stored with the revision.
+            registered_by: crate::state::caller_identity_arn(),
+            registered_at: crate::state::now(),
+            delete_requested_at: None,
+        };
+        let arn = record.arn.clone();
+        guard
+            .daemon_task_definitions
+            .insert((input.family.clone(), revision), record);
+
+        Ok(RegisterDaemonTaskDefinitionOutput {
+            daemon_task_definition_arn: Some(arn),
+        })
     }
 }
