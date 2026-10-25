@@ -239,3 +239,8 @@ mod agent_recommendations;
 // Declared last for the same reason as the declarations above.
 #[path = "all/agent_recommendation_paging.rs"]
 mod agent_recommendation_paging;
+
+// Declared last for the same reason as the declarations above: an insertion into this
+// list's sorted middle is what repeatedly refused to merge.
+#[path = "all/global_settings.rs"]
+mod global_settings;
