@@ -224,6 +224,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // key is a property of the data being snapshotted, not of this request, which
         // carries no key member at all.
         let kms_key_identifier = graph.kms_key_identifier.clone();
+        // A snapshot is a copy of the graph AS IT IS NOW: the data it holds and the
+        // configuration it is provisioned with, both captured here so a later restore
+        // reproduces this graph rather than whatever the source graph became (or
+        // whether it still exists at all).
+        let source_configuration = crate::state::GraphConfiguration::from(graph);
+        let data = graph.data.clone();
 
         // `snapshotName` is unique within the account PER REGION: a second snapshot by
         // the same name conflicts with a stored snapshot of the same Region, while the
@@ -302,6 +308,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             snapshot_create_time: ::std::time::SystemTime::now(),
             kms_key_identifier,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
+            source_configuration,
+            data,
         };
 
         // Taking a snapshot takes the SOURCE GRAPH through SNAPSHOTTING (a modelled
