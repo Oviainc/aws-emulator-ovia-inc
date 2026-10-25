@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePullRequestApprovalRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePullRequestApprovalRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePullRequestApprovalRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: attaches an approval rule created ON the pull request (so it carries
+//! no `originApprovalRuleTemplate`) to the stored pull request in `crate::state` and
+//! answers with the stored rule, which `GetPullRequest` then reports.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +183,172 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePullRequestApprovalRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePullRequestApprovalRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePullRequestApprovalRule"))
+        // `approvalRuleName`'s and `approvalRuleContent`'s lengths are modelled, so
+        // the boundary validator already refused anything outside them. What is left
+        // are the rules the model cannot express.
+
+        // Which ids address a pull request is `crate::state`'s rule, so every
+        // operation taking a `pullRequestId` agrees about it; this only maps each
+        // outcome onto the error THIS operation models for it.
+        let pull_request_id = crate::state::normalize_pull_request_id(&input.pull_request_id)
+            .map_err(|problem| match problem {
+                crate::state::PullRequestIdProblem::Missing => {
+                    CreatePullRequestApprovalRuleErrorModeled::PullRequestIdRequiredException(
+                        PullRequestIdRequiredException {
+                            message: Some(
+                                crate::state::PULL_REQUEST_ID_REQUIRED_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+                crate::state::PullRequestIdProblem::Invalid => {
+                    CreatePullRequestApprovalRuleErrorModeled::InvalidPullRequestIdException(
+                        InvalidPullRequestIdException {
+                            message: Some(
+                                crate::state::INVALID_PULL_REQUEST_ID_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+            })?;
+
+        // "An approval rule name is required, but was not specified." The modelled
+        // minimum length is 1, so a name of nothing but whitespace reaches here and
+        // names no rule.
+        if input.approval_rule_name.trim().is_empty() {
+            return Err(
+                CreatePullRequestApprovalRuleErrorModeled::ApprovalRuleNameRequiredException(
+                    ApprovalRuleNameRequiredException {
+                        message: Some(
+                            crate::state::APPROVAL_RULE_NAME_REQUIRED_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The content for the approval rule is empty. You must provide some content
+        // for an approval rule." Likewise reached by whitespace-only content.
+        if input.approval_rule_content.trim().is_empty() {
+            return Err(
+                CreatePullRequestApprovalRuleErrorModeled::ApprovalRuleContentRequiredException(
+                    ApprovalRuleContentRequiredException {
+                        message: Some("the content for the approval rule is empty".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // An approval rule's content is an approval rule JSON document — the same
+        // document an approval rule template carries — so one document grammar
+        // decides both. The refusal says only that the document is not valid: no
+        // deserializer diagnostic and no offset reaches the caller.
+        if !crate::state::is_approval_rule_template_content(&input.approval_rule_content) {
+            return Err(
+                CreatePullRequestApprovalRuleErrorModeled::InvalidApprovalRuleContentException(
+                    InvalidApprovalRuleContentException {
+                        message: Some(
+                            crate::state::INVALID_APPROVAL_RULE_CONTENT_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let now = std::time::SystemTime::now();
+        // A rule a CALLER creates on a pull request is attributed to that caller,
+        // where one an associated template applied is attributed to the service.
+        let last_modified_user = crate::state::caller_identity_arn(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+        let pull_request = store.pull_request_mut(pull_request_id).ok_or_else(|| {
+            CreatePullRequestApprovalRuleErrorModeled::PullRequestDoesNotExistException(
+                PullRequestDoesNotExistException {
+                    message: Some(crate::state::pull_request_does_not_exist_message(
+                        &pull_request_id.to_string(),
+                    )),
+                },
+            )
+        })?;
+
+        // An approval rule is added to a pull request only while it is open: one
+        // that is no longer open takes no new rule.
+        if pull_request.status != crate::state::PULL_REQUEST_STATUS_OPEN {
+            return Err(
+                CreatePullRequestApprovalRuleErrorModeled::PullRequestAlreadyClosedException(
+                    PullRequestAlreadyClosedException {
+                        message: Some(
+                            crate::state::PULL_REQUEST_ALREADY_CLOSED_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Approval rule names must be unique within the scope of a pull request" —
+        // whether the rule already holding the name was created on the pull request
+        // or applied to it by a template.
+        if pull_request
+            .approval_rule(&input.approval_rule_name)
+            .is_some()
+        {
+            return Err(
+                CreatePullRequestApprovalRuleErrorModeled::ApprovalRuleNameAlreadyExistsException(
+                    ApprovalRuleNameAlreadyExistsException {
+                        message: Some(crate::state::approval_rule_name_already_exists_message(
+                            &input.approval_rule_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The approval rule cannot be added. The pull request has the maximum
+        // number of approval rules associated with it."
+        if pull_request.approval_rules.len() >= crate::state::MAX_APPROVAL_RULES_PER_PULL_REQUEST {
+            return Err(
+                CreatePullRequestApprovalRuleErrorModeled::NumberOfRulesExceededException(
+                    NumberOfRulesExceededException {
+                        message: Some(crate::state::number_of_rules_exceeded_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let rule = crate::state::ApprovalRuleRecord {
+            approval_rule_id: crate::state::approval_rule_id(
+                pull_request_id,
+                &input.approval_rule_name,
+                now,
+            ),
+            approval_rule_name: input.approval_rule_name.clone(),
+            // Canonicalized exactly as a template's document is, so
+            // `ruleContentSha256` is the digest of the bytes every reader reports.
+            content: crate::state::canonical_json_document(&input.approval_rule_content),
+            creation_date: now,
+            last_modified_date: now,
+            last_modified_user,
+            // Created ON the pull request, so no template originated it — which is
+            // what makes it a rule that can later be deleted from the pull request.
+            origin_template: None,
+        };
+        let approval_rule = rule.to_modeled();
+        pull_request.approval_rules.push(rule);
+        // "The day and time of the last user or system activity on the pull
+        // request": adding a rule to it is such activity.
+        pull_request.last_activity_date = now;
+
+        Ok(CreatePullRequestApprovalRuleOutput { approval_rule })
     }
 }

@@ -47,6 +47,8 @@ mod managed_list_deletion;
 mod member_accounts;
 #[path = "all/notification_channel_deletion.rs"]
 mod notification_channel_deletion;
+#[path = "all/page_size_resolution.rs"]
+mod page_size_resolution;
 #[path = "all/policy_administrator_gate.rs"]
 mod policy_administrator_gate;
 #[path = "all/policy_document_validation.rs"]

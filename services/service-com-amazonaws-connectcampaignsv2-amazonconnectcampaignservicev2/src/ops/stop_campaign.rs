@@ -164,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(StopCampaignErrorModeled::InternalServerException(
@@ -178,8 +178,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         const ACTION: crate::state::CampaignAction = crate::state::CampaignAction::Stop;
 
+        // A campaign is reachable only through the endpoint of the region it was
+        // created in, so the id is resolved in the region this request was signed for
+        // and a lifecycle write never reaches another region's campaign.
+        let region = crate::state::request_region(ctx);
         let mut store = state.lock();
-        let Some(campaign) = store.campaign_mut(&input.id) else {
+        let Some(campaign) = store.campaign_mut(&region, &input.id) else {
             return Err(StopCampaignErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::CAMPAIGN_NOT_FOUND_MESSAGE.to_string(),

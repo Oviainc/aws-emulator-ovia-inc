@@ -2,6 +2,12 @@
 
 //! Engine state for the com-amazonaws-connectcampaignsv2-amazonconnectcampaignservicev2 service.
 //!
+//! Every record below belongs to ONE region: campaigns and Connect instance
+//! configurations are regional resources, reachable only through the endpoint of the
+//! region they were created in, so the store keeps one set of records per
+//! credential-scope region ([`request_region`]) and every lookup, listing and write
+//! takes the region it is serving and resolves inside that region alone.
+//!
 //! The campaign store is the single source of truth for the campaign lifecycle:
 //! `CreateCampaign` writes a record here, `DescribeCampaign` / `ListCampaigns` /
 //! `GetCampaignState` project it, `Start`/`Pause`/`Resume`/`StopCampaign` move its
@@ -1036,6 +1042,17 @@ pub const MAX_OUTBOUND_REQUESTS_PER_CAMPAIGN: usize = 10_000;
 /// above any plausible workload.
 pub const MAX_ONBOARDED_INSTANCES: usize = 1_000;
 
+/// The most regions this store holds records for at once, counted per region and not
+/// per record: past it a call that would give a further region its first resource is
+/// refused exactly as a full store is, and nothing is written.
+///
+/// The region of a request is its SigV4 credential scope, which the caller chooses,
+/// so without a ceiling a caller could repeat a write under fresh region names until
+/// the process runs out of memory, each one carrying its own set of the stores above.
+/// A partition's regions are a fixed, published set; AWS publishes no limit of this
+/// kind, so the figure is the emulator's own, set well above the largest partition.
+pub const MAX_REGIONS: usize = 64;
+
 /// The service-linked role every onboarded instance's config names.
 ///
 /// `InstanceConfig$serviceLinkedRoleArn` is required, and AWS fills it with the
@@ -1191,6 +1208,18 @@ impl StoredIntegration {
     }
 }
 
+/// Which campaign a call is about: the region whose endpoint holds it, and its id
+/// within that region.
+///
+/// A campaign is identified by the PAIR — the same id in two regions names two
+/// different resources — so the methods that take a campaign's id alongside several
+/// values of its own take this instead of two loose strings.
+#[derive(Debug, Clone, Copy)]
+pub struct CampaignRef<'a> {
+    pub region: &'a str,
+    pub id: &'a str,
+}
+
 /// Why the store refused to take a campaign, as
 /// [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::insert_new_campaign`]
 /// reports it. Nothing is stored in any case.
@@ -1210,47 +1239,90 @@ pub enum InsertRejected {
     NameTaken,
 }
 
-/// Per-service state for com-amazonaws-connectcampaignsv2-amazonconnectcampaignservicev2. A handler reaches it through [`service_state`].
+/// The records of ONE region: everything a client talking to that region's endpoint
+/// can see or change.
 ///
-/// The map answers a `{id}` lookup in O(1); `order` carries the creation order as
+/// `campaigns` answers a `{id}` lookup in O(1); `order` carries the creation order as
 /// `(sequence number, id)` pairs, which the methods below keep in step with the
 /// map, so `ListCampaigns` paginates deterministically and its `nextToken` can
 /// name the sequence number the last page ended at. Growth is bounded:
-/// [`MAX_CAMPAIGNS`] records, enforced by [`Self::insert_new_campaign`].
+/// [`MAX_CAMPAIGNS`] records, enforced by [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::insert_new_campaign`].
 ///
-/// `instance_onboarding` is the second store: one onboarding record per Connect
+/// `instance_onboarding` is the second map: one onboarding record per Connect
 /// instance, keyed by its instance id, bounded at [`MAX_ONBOARDED_INSTANCES`] by
-/// [`Self::start_instance_onboarding`]. It is the one place "is this instance a
-/// campaign target?" is answered, so `CreateCampaign`'s gate and
-/// `GetConnectInstanceConfig` / `GetInstanceOnboardingJobStatus` cannot disagree.
+/// [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::start_instance_onboarding`].
+/// It is the one place "is this instance a campaign target?" is answered, so
+/// `CreateCampaign`'s gate and `GetConnectInstanceConfig` /
+/// `GetInstanceOnboardingJobStatus` cannot disagree.
 ///
 /// `instance_integrations` is the third: the integrations of each Connect instance,
 /// which `PutConnectInstanceIntegration` writes and
 /// `ListConnectInstanceIntegrations` projects, so the list reports what the puts
 /// stored and nothing else.
 #[derive(Debug, Default)]
-pub struct ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
+struct RegionStore {
     campaigns: HashMap<String, StoredCampaign>,
     order: Vec<(u64, String)>,
+    instance_onboarding: HashMap<String, StoredInstanceOnboarding>,
+    instance_integrations: HashMap<String, Vec<StoredIntegration>>,
+}
+
+/// Per-service state for com-amazonaws-connectcampaignsv2-amazonconnectcampaignservicev2. A handler reaches it through [`service_state`].
+///
+/// A campaign and a Connect instance configuration are REGIONAL resources, reachable
+/// only through the endpoint of the region they were created in — which the ARN this
+/// service mints states ([`campaign_arn`]) — so the records live in one
+/// [`RegionStore`] per region, keyed by the credential-scope region of the request
+/// that wrote them ([`request_region`]). Every method below takes that region and
+/// resolves inside its store alone: a resource another region holds is absent from a
+/// page here and its id resolves to nothing, so no caller sees or changes a resource
+/// its endpoint does not serve. A region nothing has been written to yet has no entry,
+/// which every reader answers exactly as it answers an empty one, so reading a region
+/// never creates it.
+///
+/// The sequence counters stay store-wide: an id or cursor value is minted from one
+/// counter whatever region takes it, so no two campaigns, dial requests, profile
+/// requests or integrations anywhere in the store share one.
+#[derive(Debug, Default)]
+pub struct ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
+    /// The records of each region, keyed by the credential-scope region they belong
+    /// to. Bounded at [`MAX_REGIONS`] regions, enforced by [`Self::region_mut`] — the
+    /// one path that gives a region its first record.
+    regions: HashMap<String, RegionStore>,
     next_sequence: u64,
     next_dial_sequence: u64,
     /// The counter the `ProfileOutboundRequestId`s are minted from, store-wide so no
     /// two profile outbound requests share an id (see
     /// [`Self::take_profile_outbound_request`]).
     next_profile_request_sequence: u64,
-    /// One onboarding record per Connect instance, keyed by instance id. Bounded by
-    /// [`MAX_ONBOARDED_INSTANCES`], enforced by [`Self::start_instance_onboarding`].
-    instance_onboarding: HashMap<String, StoredInstanceOnboarding>,
-    /// The integrations of each Connect instance, keyed by instance id, each
-    /// instance's in the order they were first put — the order
-    /// `ListConnectInstanceIntegrations` pages through. Bounded at
-    /// [`MAX_INTEGRATIONS_PER_INSTANCE`] per instance by
-    /// [`Self::put_instance_integration`].
-    instance_integrations: HashMap<String, Vec<StoredIntegration>>,
     next_integration_sequence: u64,
 }
 
 impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
+    /// The records `region` holds, or `None` when nothing has been written to that
+    /// region yet.
+    ///
+    /// The read path: a region with no entry holds no resources, which every reader
+    /// answers exactly as it answers an empty store, so a read never adds an entry and
+    /// never changes what a later caller sees.
+    fn region(&self, region: &str) -> Option<&RegionStore> {
+        self.regions.get(region)
+    }
+
+    /// The records `region` holds, for a WRITER — created empty when that region has
+    /// none yet, since the write is what gives the region its first resource.
+    ///
+    /// `None` when the region has no records and the store already holds
+    /// [`MAX_REGIONS`] regions: the caller chooses the region it signs for, so a new
+    /// region is taken only while there is room for one, and a refusal creates
+    /// nothing. A region already in the store is always handed back.
+    fn region_mut(&mut self, region: &str) -> Option<&mut RegionStore> {
+        if !self.regions.contains_key(region) && self.regions.len() >= MAX_REGIONS {
+            return None;
+        }
+        Some(self.regions.entry(region.to_string()).or_default())
+    }
+
     /// The id the next campaign this store takes will carry: its creation
     /// sequence number, zero-padded to a fixed width.
     ///
@@ -1274,6 +1346,7 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     /// them — of two creates racing on one name, exactly one stores a campaign.
     pub fn insert_new_campaign(
         &mut self,
+        region: &str,
         campaign: StoredCampaign,
     ) -> Result<StoredCampaign, InsertRejected> {
         // A campaign name identifies a campaign within its Connect instance, so a
@@ -1283,32 +1356,47 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
         // the one place that invariant is enforced, so every writer of a campaign
         // name upholds it.
         if self
-            .campaign_named(&campaign.connect_instance_id, &campaign.name)
+            .campaign_named(region, &campaign.connect_instance_id, &campaign.name)
             .is_some()
         {
             return Err(InsertRejected::NameTaken);
         }
-        let full = self.campaigns.len() >= MAX_CAMPAIGNS;
-        let id = campaign.id.clone();
-        match self.campaigns.entry(id.clone()) {
-            // Taking this campaign would discard the one already under that id.
-            std::collections::hash_map::Entry::Occupied(_) => Err(InsertRejected::IdTaken),
-            std::collections::hash_map::Entry::Vacant(_) if full => Err(InsertRejected::StoreFull),
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                let stored = slot.insert(campaign).clone();
-                // Only now, with the record actually in the map, does the order
-                // gain an entry and a sequence number — so "a refusal stores
-                // nothing" holds structurally on every arm above.
-                self.order.push((self.next_sequence, id));
-                self.next_sequence = self.next_sequence.saturating_add(1);
-                Ok(stored)
+        let sequence = self.next_sequence;
+        let outcome = {
+            // Past the region ceiling there is no room for a region's first campaign,
+            // which the caller answers exactly as it answers a full store.
+            let Some(store) = self.region_mut(region) else {
+                return Err(InsertRejected::StoreFull);
+            };
+            let full = store.campaigns.len() >= MAX_CAMPAIGNS;
+            let id = campaign.id.clone();
+            match store.campaigns.entry(id.clone()) {
+                // Taking this campaign would discard the one already under that id.
+                std::collections::hash_map::Entry::Occupied(_) => Err(InsertRejected::IdTaken),
+                std::collections::hash_map::Entry::Vacant(_) if full => {
+                    Err(InsertRejected::StoreFull)
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    let stored = slot.insert(campaign).clone();
+                    // Only now, with the record actually in the map, does the order
+                    // gain an entry and a sequence number — so "a refusal stores
+                    // nothing" holds structurally on every arm above.
+                    store.order.push((sequence, id));
+                    Ok(stored)
+                }
             }
+        };
+        if outcome.is_ok() {
+            self.next_sequence = sequence.saturating_add(1);
         }
+        outcome
     }
 
-    /// The campaign stored under `id`, or `None` when there is none.
-    pub fn campaign(&self, id: &str) -> Option<&StoredCampaign> {
-        self.campaigns.get(id)
+    /// The campaign `region` stores under `id`, or `None` when that region stores
+    /// none — including when another region stores one under that id, which is a
+    /// different resource and not this endpoint's to answer for.
+    pub fn campaign(&self, region: &str, id: &str) -> Option<&StoredCampaign> {
+        self.region(region)?.campaigns.get(id)
     }
 
     /// The campaign `connect_instance_id` holds under `name`, or `None` when that
@@ -1323,46 +1411,50 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     /// whichever the hash map happens to yield first.
     pub fn campaign_named(
         &self,
+        region: &str,
         connect_instance_id: &str,
         name: &str,
     ) -> Option<&StoredCampaign> {
-        self.campaigns_in_order()
+        self.campaigns_in_order(region)
             .map(|(_, campaign)| campaign)
             .find(|campaign| {
                 campaign.connect_instance_id == connect_instance_id && campaign.name == name
             })
     }
 
-    /// The campaign stored under `id`, for a handler that moves its state.
-    pub fn campaign_mut(&mut self, id: &str) -> Option<&mut StoredCampaign> {
-        self.campaigns.get_mut(id)
+    /// The campaign `region` stores under `id`, for a handler that moves its state.
+    /// Resolved exactly as [`Self::campaign`] resolves it, so a lifecycle write
+    /// reaches only the region it was signed for.
+    pub fn campaign_mut(&mut self, region: &str, id: &str) -> Option<&mut StoredCampaign> {
+        self.regions.get_mut(region)?.campaigns.get_mut(id)
     }
 
-    /// Remove the campaign stored under `id`, returning it when it was there.
-    pub fn remove_campaign(&mut self, id: &str) -> Option<StoredCampaign> {
-        let removed = self.campaigns.remove(id)?;
-        self.order.retain(|(_, stored)| stored != id);
+    /// Remove the campaign `region` stores under `id`, returning it when it was there.
+    pub fn remove_campaign(&mut self, region: &str, id: &str) -> Option<StoredCampaign> {
+        let store = self.regions.get_mut(region)?;
+        let removed = store.campaigns.remove(id)?;
+        store.order.retain(|(_, stored)| stored != id);
         Some(removed)
     }
 
-    /// The campaign whose ARN is `arn`, or `None` when no stored campaign carries
-    /// it.
+    /// The campaign of `region` whose ARN is `arn`, or `None` when that region stores
+    /// no campaign carrying it.
     ///
-    /// The whole ARN is compared, not just the id it ends with: an ARN names a
-    /// partition, a region and an account as well as a resource, so one naming a
-    /// different region or account names a different resource and resolves to
-    /// nothing here.
-    pub fn campaign_by_arn(&self, arn: &str) -> Option<&StoredCampaign> {
+    /// Resolved in the region the request was signed for, and then the whole ARN is
+    /// compared, not just the id it ends with: an ARN names a partition, a region and
+    /// an account as well as a resource, so one naming a different region or account
+    /// names a different resource and resolves to nothing here.
+    pub fn campaign_by_arn(&self, region: &str, arn: &str) -> Option<&StoredCampaign> {
         let id = campaign_id_from_arn(arn)?;
-        self.campaigns.get(id).filter(|stored| stored.arn == arn)
+        self.campaign(region, id)
+            .filter(|stored| stored.arn == arn)
     }
 
     /// The campaign whose ARN is `arn`, for a handler that writes to it. Resolved
     /// exactly as [`Self::campaign_by_arn`] resolves it.
-    pub fn campaign_by_arn_mut(&mut self, arn: &str) -> Option<&mut StoredCampaign> {
+    pub fn campaign_by_arn_mut(&mut self, region: &str, arn: &str) -> Option<&mut StoredCampaign> {
         let id = campaign_id_from_arn(arn)?.to_string();
-        self.campaigns
-            .get_mut(&id)
+        self.campaign_mut(region, &id)
             .filter(|stored| stored.arn == arn)
     }
 
@@ -1379,8 +1471,9 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     }
 
     /// Take the outbound request submitted under `client_token` into the buffer of
-    /// the campaign stored under `campaign_id`, and report what became of it (see
-    /// [`OutboundRequestOutcome`]). `None` when no campaign is stored under that id.
+    /// the campaign `campaign` names, and report what became of it (see
+    /// [`OutboundRequestOutcome`]). `None` when that campaign's region stores no
+    /// campaign under that id.
     ///
     /// A `client_token` the campaign has already taken stores nothing and reports
     /// the id it was given then, which is what makes a repeated batch idempotent.
@@ -1393,30 +1486,30 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     /// are both held only while their request is still pending.
     pub fn take_outbound_request(
         &mut self,
-        campaign_id: &str,
+        campaign: CampaignRef<'_>,
         client_token: &str,
         channel_subtype: &str,
         expires_at: ::aws_smithy_types::DateTime,
         now: SystemTime,
     ) -> Option<OutboundRequestOutcome> {
         {
-            let campaign = self.campaigns.get_mut(campaign_id)?;
-            campaign.expire_outbound_requests(now);
+            let stored = self.campaign_mut(campaign.region, campaign.id)?;
+            stored.expire_outbound_requests(now);
             if deadline_passed(expires_at, now) {
                 return Some(OutboundRequestOutcome::Expired);
             }
-            if let Some(taken) = campaign.outbound_requests.get(client_token) {
+            if let Some(taken) = stored.outbound_requests.get(client_token) {
                 return Some(OutboundRequestOutcome::Taken(taken.id.clone()));
             }
-            if campaign.outbound_requests.len() >= MAX_OUTBOUND_REQUESTS_PER_CAMPAIGN {
+            if stored.outbound_requests.len() >= MAX_OUTBOUND_REQUESTS_PER_CAMPAIGN {
                 return Some(OutboundRequestOutcome::BufferFull);
             }
         }
         // Only now, past every refusal, is an id minted — so a refused request
         // consumes no id and leaves no gap in the sequence.
         let id = self.next_dial_request_id();
-        let campaign = self.campaigns.get_mut(campaign_id)?;
-        campaign.outbound_requests.insert(
+        let stored = self.campaign_mut(campaign.region, campaign.id)?;
+        stored.outbound_requests.insert(
             client_token.to_string(),
             StoredOutboundRequest {
                 id: id.clone(),
@@ -1441,9 +1534,9 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     }
 
     /// Take the profile outbound request submitted under `client_token` into the
-    /// profile buffer of the campaign stored under `campaign_id`, and report what
-    /// became of it (see [`OutboundRequestOutcome`]). `None` when no campaign is stored
-    /// under that id.
+    /// profile buffer of the campaign `campaign` names, and report what became of it
+    /// (see [`OutboundRequestOutcome`]). `None` when that campaign's region stores no
+    /// campaign under that id.
     ///
     /// Decided exactly as [`Self::take_outbound_request`] decides a dial request, on
     /// the buffer of profile requests: a `client_token` the campaign has already taken
@@ -1457,7 +1550,7 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     /// request that carries none has no instant to have passed, so it is always taken.
     pub fn take_profile_outbound_request(
         &mut self,
-        campaign_id: &str,
+        campaign: CampaignRef<'_>,
         client_token: &str,
         profile_id: &str,
         expires_at: Option<::aws_smithy_types::DateTime>,
@@ -1465,23 +1558,23 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
         now: SystemTime,
     ) -> Option<OutboundRequestOutcome> {
         {
-            let campaign = self.campaigns.get_mut(campaign_id)?;
-            campaign.expire_profile_outbound_requests(now);
+            let stored = self.campaign_mut(campaign.region, campaign.id)?;
+            stored.expire_profile_outbound_requests(now);
             if expires_at.is_some_and(|expires_at| deadline_passed(expires_at, now)) {
                 return Some(OutboundRequestOutcome::Expired);
             }
-            if let Some(taken) = campaign.profile_outbound_requests.get(client_token) {
+            if let Some(taken) = stored.profile_outbound_requests.get(client_token) {
                 return Some(OutboundRequestOutcome::Taken(taken.id.clone()));
             }
-            if campaign.profile_outbound_requests.len() >= MAX_OUTBOUND_REQUESTS_PER_CAMPAIGN {
+            if stored.profile_outbound_requests.len() >= MAX_OUTBOUND_REQUESTS_PER_CAMPAIGN {
                 return Some(OutboundRequestOutcome::BufferFull);
             }
         }
         // Only now, past every refusal, is an id minted — so a refused request
         // consumes no id and leaves no gap in the sequence.
         let id = self.next_profile_outbound_request_id();
-        let campaign = self.campaigns.get_mut(campaign_id)?;
-        campaign.profile_outbound_requests.insert(
+        let stored = self.campaign_mut(campaign.region, campaign.id)?;
+        stored.profile_outbound_requests.insert(
             client_token.to_string(),
             StoredProfileOutboundRequest {
                 id: id.clone(),
@@ -1493,10 +1586,11 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
         Some(OutboundRequestOutcome::Taken(id))
     }
 
-    /// The onboarding record of `connect_instance_id` when that instance is onboarded
-    /// to Campaigns at `now` — a record exists AND its job has reached `SUCCEEDED` —
-    /// and `None` otherwise. An instance whose job is still `IN_PROGRESS` is not a
-    /// campaign target yet.
+    /// The onboarding record `region` holds for `connect_instance_id` when that
+    /// instance is onboarded to Campaigns there at `now` — a record exists in that
+    /// region AND its job has reached `SUCCEEDED` — and `None` otherwise. An instance
+    /// whose job is still `IN_PROGRESS` is not a campaign target yet, and neither is
+    /// one onboarded only in another region.
     ///
     /// The one place "is this instance onboarded?" is decided, so `CreateCampaign`'s
     /// gate ([`Self::is_onboarded`]) and `GetConnectInstanceConfig`'s projection
@@ -1504,17 +1598,19 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     /// [`StoredInstanceOnboarding::status_at`]), so neither writes anything.
     pub fn onboarded_instance(
         &self,
+        region: &str,
         connect_instance_id: &str,
         now: SystemTime,
     ) -> Option<&StoredInstanceOnboarding> {
-        self.instance_onboarding(connect_instance_id)
+        self.instance_onboarding(region, connect_instance_id)
             .filter(|record| record.status_at(now) == ONBOARDING_STATUS_SUCCEEDED)
     }
 
-    /// Whether `connect_instance_id` is onboarded to Campaigns at `now`, as
+    /// Whether `region` has `connect_instance_id` onboarded to Campaigns at `now`, as
     /// [`Self::onboarded_instance`] decides it.
-    pub fn is_onboarded(&self, connect_instance_id: &str, now: SystemTime) -> bool {
-        self.onboarded_instance(connect_instance_id, now).is_some()
+    pub fn is_onboarded(&self, region: &str, connect_instance_id: &str, now: SystemTime) -> bool {
+        self.onboarded_instance(region, connect_instance_id, now)
+            .is_some()
     }
 
     /// The record [`Self::onboarded_instance`] resolves, mutably — for a caller that
@@ -1522,28 +1618,32 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     /// instance that is not a campaign target yet is not configurable either.
     fn onboarded_instance_mut(
         &mut self,
+        region: &str,
         connect_instance_id: &str,
         now: SystemTime,
     ) -> Option<&mut StoredInstanceOnboarding> {
-        self.instance_onboarding
+        self.regions
+            .get_mut(region)?
+            .instance_onboarding
             .get_mut(connect_instance_id)
             .filter(|record| record.status_at(now) == ONBOARDING_STATUS_SUCCEEDED)
     }
 
-    /// Replace the instance-wide communication limits of `connect_instance_id` with
-    /// `config`, and report whether the store took it.
+    /// Replace the instance-wide communication limits `region` holds for
+    /// `connect_instance_id` with `config`, and report whether the store took it.
     ///
-    /// `false` means the instance is not onboarded at `now`, so there is no instance
-    /// configuration to put the limits on and nothing was written. Writing the whole
-    /// config rather than merging into it is what makes the put idempotent: the same
-    /// call twice leaves the same config stored.
+    /// `false` means the instance is not onboarded in that region at `now`, so there
+    /// is no instance configuration to put the limits on and nothing was written.
+    /// Writing the whole config rather than merging into it is what makes the put
+    /// idempotent: the same call twice leaves the same config stored.
     pub fn put_instance_communication_limits(
         &mut self,
+        region: &str,
         connect_instance_id: &str,
         config: InstanceCommunicationLimitsConfig,
         now: SystemTime,
     ) -> bool {
-        match self.onboarded_instance_mut(connect_instance_id, now) {
+        match self.onboarded_instance_mut(region, connect_instance_id, now) {
             Some(record) => {
                 record.communication_limits = Some(config);
                 true
@@ -1552,35 +1652,48 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
         }
     }
 
-    /// Every stored campaign, in creation order, each with its creation sequence
-    /// number — the value a `ListCampaigns` cursor is built from.
-    pub fn campaigns_in_order(&self) -> impl Iterator<Item = (u64, &StoredCampaign)> {
-        self.order
-            .iter()
-            .filter_map(|(sequence, id)| self.campaigns.get(id).map(|c| (*sequence, c)))
+    /// Every campaign `region` stores, in creation order, each with its creation
+    /// sequence number — the value a `ListCampaigns` cursor is built from. A region
+    /// that stores none yields nothing.
+    pub fn campaigns_in_order<'a>(
+        &'a self,
+        region: &str,
+    ) -> impl Iterator<Item = (u64, &'a StoredCampaign)> + 'a {
+        self.region(region).into_iter().flat_map(|store| {
+            store
+                .order
+                .iter()
+                .filter_map(|(sequence, id)| store.campaigns.get(id).map(|c| (*sequence, c)))
+        })
     }
 
-    /// Start the onboarding job for `connect_instance_id` with `encryption_config`,
-    /// and hand back the record now in the store.
+    /// Start the onboarding job `region` holds for `connect_instance_id` with
+    /// `encryption_config`, and hand back the record now in the store.
     ///
-    /// An instance with no record gets a job that starts at `now`. An instance that
-    /// already has one keeps that job — repeating the call does not re-onboard an
-    /// instance, which is what makes the operation idempotent — and takes the
-    /// request's encryption config, since the call carries the instance's config.
+    /// An instance with no record in that region gets a job that starts at `now` —
+    /// including one already onboarded in another region, whose record is another
+    /// region's resource. An instance that already has one there keeps that job —
+    /// repeating the call does not re-onboard an instance, which is what makes the
+    /// operation idempotent — and takes the request's encryption config, since the
+    /// call carries the instance's config.
     ///
-    /// `None` means the store already holds [`MAX_ONBOARDED_INSTANCES`] instances
+    /// `None` means the region already holds [`MAX_ONBOARDED_INSTANCES`] instances
     /// and nothing was written.
     pub fn start_instance_onboarding(
         &mut self,
+        region: &str,
         connect_instance_id: &str,
         encryption_config: EncryptionConfig,
         now: std::time::SystemTime,
     ) -> Option<StoredInstanceOnboarding> {
-        if let Some(existing) = self.instance_onboarding.get_mut(connect_instance_id) {
+        // Past the region ceiling there is no room for a region's first onboarding
+        // record, which the caller answers exactly as it answers a full store.
+        let store = self.region_mut(region)?;
+        if let Some(existing) = store.instance_onboarding.get_mut(connect_instance_id) {
             existing.encryption_config = encryption_config;
             return Some(existing.clone());
         }
-        if self.instance_onboarding.len() >= MAX_ONBOARDED_INSTANCES {
+        if store.instance_onboarding.len() >= MAX_ONBOARDED_INSTANCES {
             return None;
         }
         let record = StoredInstanceOnboarding::starting(
@@ -1588,22 +1701,26 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
             encryption_config,
             now,
         );
-        self.instance_onboarding
+        store
+            .instance_onboarding
             .insert(connect_instance_id.to_string(), record.clone());
         Some(record)
     }
 
-    /// The onboarding record of `connect_instance_id`, or `None` when the instance
-    /// has never been onboarded.
+    /// The onboarding record `region` holds for `connect_instance_id`, or `None` when
+    /// the instance has never been onboarded there.
     pub fn instance_onboarding(
         &self,
+        region: &str,
         connect_instance_id: &str,
     ) -> Option<&StoredInstanceOnboarding> {
-        self.instance_onboarding.get(connect_instance_id)
+        self.region(region)?
+            .instance_onboarding
+            .get(connect_instance_id)
     }
 
-    /// Delete the onboarding job of `connect_instance_id`, and report what became of
-    /// the request (see [`DeleteOnboardingOutcome`]).
+    /// Delete the onboarding job `region` holds for `connect_instance_id`, and report
+    /// what became of the request (see [`DeleteOnboardingOutcome`]).
     ///
     /// Only a job that has FAILED may be deleted: a job in any other status keeps
     /// its record, so the status a later `GetInstanceOnboardingJobStatus` reports
@@ -1612,41 +1729,46 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     /// every other reader of the record reads it.
     pub fn delete_instance_onboarding(
         &mut self,
+        region: &str,
         connect_instance_id: &str,
         now: SystemTime,
     ) -> DeleteOnboardingOutcome {
-        let Some(record) = self.instance_onboarding.get(connect_instance_id) else {
+        let Some(record) = self.instance_onboarding(region, connect_instance_id) else {
             return DeleteOnboardingOutcome::NoSuchJob;
         };
         if record.status_at(now) != ONBOARDING_STATUS_FAILED {
             return DeleteOnboardingOutcome::NotFailed;
         }
-        self.instance_onboarding.remove(connect_instance_id);
+        if let Some(store) = self.regions.get_mut(region) {
+            store.instance_onboarding.remove(connect_instance_id);
+        }
         DeleteOnboardingOutcome::Deleted
     }
 
-    /// Remove every campaign of `connect_instance_id` from the store, in creation
-    /// order, leaving every other instance's campaigns where they are.
+    /// Remove every campaign `region` stores for `connect_instance_id`, in creation
+    /// order, leaving every other instance's campaigns — and every other region's —
+    /// where they are.
     ///
     /// Each record goes through [`Self::remove_campaign`], so the creation order
     /// loses exactly the entries the map does and a later page walks what is left.
-    fn remove_instance_campaigns(&mut self, connect_instance_id: &str) {
+    fn remove_instance_campaigns(&mut self, region: &str, connect_instance_id: &str) {
         let ids: Vec<String> = self
-            .campaigns_in_order()
+            .campaigns_in_order(region)
             .filter(|(_, campaign)| campaign.connect_instance_id == connect_instance_id)
             .map(|(_, campaign)| campaign.id.clone())
             .collect();
         for id in &ids {
-            self.remove_campaign(id);
+            self.remove_campaign(region, id);
         }
     }
 
-    /// Delete the instance configuration of `connect_instance_id`, and report
-    /// whether there was one to delete.
+    /// Delete the instance configuration `region` holds for `connect_instance_id`,
+    /// and report whether there was one to delete.
     ///
-    /// `false` means the instance holds no configuration at `now` — it was never
-    /// onboarded, its onboarding job has not finished, or its configuration is
-    /// already gone — so nothing was written, and the caller answers as not found.
+    /// `false` means the instance holds no configuration in that region at `now` — it
+    /// was never onboarded there, its onboarding job has not finished, or its
+    /// configuration is already gone — so nothing was written, and the caller answers
+    /// as not found.
     ///
     /// Deleting the configuration takes with it everything held ON that
     /// configuration: the instance's onboarding record (so the instance is no longer
@@ -1660,24 +1782,32 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     /// `false` retains them exactly as they are.
     pub fn delete_instance_config(
         &mut self,
+        region: &str,
         connect_instance_id: &str,
         delete_campaigns: bool,
         now: SystemTime,
     ) -> bool {
-        if self.onboarded_instance(connect_instance_id, now).is_none() {
+        if self
+            .onboarded_instance(region, connect_instance_id, now)
+            .is_none()
+        {
             return false;
         }
         if delete_campaigns {
-            self.remove_instance_campaigns(connect_instance_id);
+            self.remove_instance_campaigns(region, connect_instance_id);
         }
-        self.instance_onboarding.remove(connect_instance_id);
-        self.instance_integrations.remove(connect_instance_id);
+        // The region holds the record the check above resolved, so it is in the map.
+        let Some(store) = self.regions.get_mut(region) else {
+            return false;
+        };
+        store.instance_onboarding.remove(connect_instance_id);
+        store.instance_integrations.remove(connect_instance_id);
         true
     }
 
-    /// Put `config` as an integration of `connect_instance_id`, and hand back the
-    /// record now in the store — so a handler reports what the store holds rather
-    /// than what the request carried.
+    /// Put `config` as an integration `region` holds for `connect_instance_id`, and
+    /// hand back the record now in the store — so a handler reports what the store
+    /// holds rather than what the request carried.
     ///
     /// An integration already stored under the same identity (see
     /// [`integration_key`]) takes the new config and KEEPS its sequence number: that
@@ -1689,6 +1819,7 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     /// and leaves no empty entry behind.
     pub fn put_instance_integration(
         &mut self,
+        region: &str,
         connect_instance_id: &str,
         config: IntegrationConfig,
     ) -> Option<StoredIntegration> {
@@ -1696,11 +1827,15 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
             let (kind, arn) = integration_key(&config);
             (kind, arn.to_string())
         };
-        let held = self
+        let sequence = self.next_integration_sequence;
+        // Past the region ceiling there is no room for a region's first integration,
+        // which the caller answers exactly as it answers a full store.
+        let store = self.region_mut(region)?;
+        let held = store
             .instance_integrations
             .get(connect_instance_id)
             .map_or(0, Vec::len);
-        if let Some(existing) = self
+        if let Some(existing) = store
             .instance_integrations
             .get_mut(connect_instance_id)
             .and_then(|integrations| {
@@ -1717,35 +1852,36 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
         }
         // Only now, past the refusal, is a sequence number taken — so the cursor
         // space has no gaps a refused put left behind.
-        let record = StoredIntegration {
-            sequence: self.next_integration_sequence,
-            config,
-        };
-        self.next_integration_sequence = self.next_integration_sequence.saturating_add(1);
-        self.instance_integrations
+        let record = StoredIntegration { sequence, config };
+        store
+            .instance_integrations
             .entry(connect_instance_id.to_string())
             .or_default()
             .push(record.clone());
+        self.next_integration_sequence = sequence.saturating_add(1);
         Some(record)
     }
 
-    /// Every integration of `connect_instance_id`, in the order they were first put.
+    /// Every integration `region` holds for `connect_instance_id`, in the order they
+    /// were first put.
     ///
     /// An instance that holds none yields nothing, which is not the same as an
     /// instance that is not onboarded: whether the instance exists at all is
     /// [`Self::is_onboarded`]'s answer, not this one's.
-    pub fn instance_integrations(
-        &self,
+    pub fn instance_integrations<'a>(
+        &'a self,
+        region: &str,
         connect_instance_id: &str,
-    ) -> impl Iterator<Item = &StoredIntegration> {
-        self.instance_integrations
-            .get(connect_instance_id)
+    ) -> impl Iterator<Item = &'a StoredIntegration> + 'a {
+        self.region(region)
+            .and_then(|store| store.instance_integrations.get(connect_instance_id))
             .into_iter()
             .flatten()
     }
 
-    /// Remove the integration of `connect_instance_id` that `identifier` names (see
-    /// [`integration_identifier_key`]), and report whether one was removed.
+    /// Remove the integration `region` holds for `connect_instance_id` that
+    /// `identifier` names (see [`integration_identifier_key`]), and report whether one
+    /// was removed.
     ///
     /// `false` means the instance holds no integration under that identity and nothing
     /// was written, which is what the caller answers as not found. The integrations the
@@ -1753,11 +1889,16 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     /// does not renumber the rest or reorder a page a caller is part way through.
     pub fn delete_instance_integration(
         &mut self,
+        region: &str,
         connect_instance_id: &str,
         identifier: &IntegrationIdentifier,
     ) -> bool {
         let key = integration_identifier_key(identifier);
-        let Some(integrations) = self.instance_integrations.get_mut(connect_instance_id) else {
+        let Some(integrations) = self
+            .regions
+            .get_mut(region)
+            .and_then(|store| store.instance_integrations.get_mut(connect_instance_id))
+        else {
             return false;
         };
         let Some(at) = integrations.iter().position(|stored| stored.key() == key) else {
