@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the named tag keys from the tag set the resource the `ResourceArn` names
+//! carries in this service's store, and reports the modelled empty response. The
+//! operation is `@idempotent`: a key the resource does not carry leaves the set alone,
+//! so repeating the call answers the same success.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +83,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -161,30 +158,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (ctx, &self.engine);
+        // The endpoint this request was signed for: a regional endpoint resolves only
+        // the resources created through it.
+        let region = crate::state::request_region(ctx.parts());
 
-        // A member value that fails the constraint its model declares is refused
-        // first, with the modelled `ValidationException` — `Message`,
-        // `Reason: fieldValidationFailed` and a `FieldList` entry naming each
-        // offending member. A well-formed request still reaches the 501 below:
-        // the operation itself is not implemented yet.
+        // Every member whose declared constraint this operation's input struct
+        // hands over (`skip_validation`) is checked here, so a bad value is
+        // refused with the modelled `ValidationException` — `Message`,
+        // `Reason: fieldValidationFailed` and a `FieldList` entry per offending
+        // member — rather than the framework's generic 400.
         validate_input(&input).map_err(|refusal| {
             UntagResourceError::from(UntagResourceErrorModeled::ValidationException(refusal))
         })?;
 
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". The members listed in `skip_validation` on
-        // `UntagResourceInput` are checked by `validate_input` below; every other
-        // modeled constraint is refused BEFORE this handler runs.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: "the com.amazonaws.mwaaserverless workflow store is unavailable"
+                    .to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let mut store = state.lock();
+
+        // Finish every workflow teardown the clock already made due, so a workflow
+        // past its `DELETING` span is as absent to this call as to any other.
+        store.reap_deleted_workflows(SystemTime::now());
+
+        // `TaggableResourceArn` admits exactly one resource kind — a workflow
+        // (`^arn:aws…:airflow-serverless:<region>:<account>:workflow/<name>-<10>$`) — so
+        // the entity this operation resolves is the workflow the ARN names. One the
+        // store does not hold is a lookup miss, and a workflow of ANOTHER region is not
+        // one this endpoint holds.
+        let workflow = store
+            .workflow_in_mut(&region, &input.resource_arn)
+            .ok_or_else(|| {
+                crate::state::lookup_miss(UntagResourceErrorModeled::ResourceNotFoundException(
+                    crate::state::unresolved(
+                        crate::state::UnresolvedEntity::Workflow,
+                        &input.resource_arn,
+                    ),
+                ))
+            })?;
+
+        // "Only the keys are required; the values are ignored": each requested key is
+        // dropped from the tag set the resource carries, and a key it does not carry
+        // leaves the set alone — which is what makes this `@idempotent` operation
+        // answer the same success when it is repeated, or when one request names the
+        // same key twice. Tags the request does not name stay where they are.
+        for key in &input.tag_keys {
+            workflow.tags.remove(key);
+        }
+
+        // The tag set is resource metadata, not the workflow's configuration: removing
+        // a tag publishes no new `WorkflowVersion` and leaves the version, the revision
+        // and the code snapshot this workflow reports untouched.
+        Ok(UntagResourceOutput {})
     }
 }
 
