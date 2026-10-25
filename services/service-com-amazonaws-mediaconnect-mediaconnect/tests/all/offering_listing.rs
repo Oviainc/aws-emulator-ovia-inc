@@ -27,19 +27,26 @@ use crate::reservation_listing::{
     instant_from, CURRENCY_CODE, DURATION_UNITS, ONE_MONTH, PRICE_UNITS, RESOURCE_TYPE,
 };
 
-async fn list_offerings(emulator: &Emulator, query: &str) -> (u16, Option<String>, Value) {
+/// `pub(crate)` because the DescribeOffering suite drives the same listing to learn which
+/// offerings the service publishes, rather than restating the catalogue.
+pub(crate) async fn list_offerings(
+    emulator: &Emulator,
+    query: &str,
+) -> (u16, Option<String>, Value) {
     emulator
         .send("GET", &format!("/v1/offerings{query}"), None)
         .await
 }
 
-/// The `Offerings` member of a ListOfferings response.
-fn listed(body: &Value) -> Vec<Value> {
+/// The `Offerings` member of a ListOfferings response. See [`list_offerings`] for why this
+/// is `pub(crate)`.
+pub(crate) fn listed(body: &Value) -> Vec<Value> {
     body["offerings"].as_array().cloned().unwrap_or_default()
 }
 
-/// The ARNs of the `Offerings` member, in the order the response carries them.
-fn listed_arns(body: &Value) -> Vec<String> {
+/// The ARNs of the `Offerings` member, in the order the response carries them. See
+/// [`list_offerings`] for why this is `pub(crate)`.
+pub(crate) fn listed_arns(body: &Value) -> Vec<String> {
     listed(body)
         .iter()
         .map(|offering| {
@@ -58,7 +65,10 @@ fn listed_arns(body: &Value) -> Vec<String> {
 /// The check runs through the crate's own encoding of that form — the same function
 /// ListOfferings validates a pagination token with — and then re-asserts, field by field,
 /// the parts the form fixes, so a bug in that function cannot hide here.
-fn assert_minted_offering_arn(case: &str, arn: &str, region: &str) {
+///
+/// `pub(crate)` because the DescribeOffering suite asserts the same form of the ARNs it
+/// addresses.
+pub(crate) fn assert_minted_offering_arn(case: &str, arn: &str, region: &str) {
     assert!(
         mc::is_mintable_offering_arn(arn),
         "case {case:?}: a listed OfferingArn must be one this service could mint, got {arn:?}"
