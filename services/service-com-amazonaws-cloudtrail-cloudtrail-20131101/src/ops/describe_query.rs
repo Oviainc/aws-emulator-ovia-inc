@@ -135,6 +135,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The HTTP status a not-found refusal answers with is the service-wide
+// `crate::state::NOT_FOUND_STATUS`: the model annotates
+// `EventDataStoreNotFoundException` and `QueryIdNotFoundException` `@httpError(404)`,
+// but CloudTrail answers 400 for them on the wire — the recorded response for this
+// very operation is `HTTP 400` with `__type` `EventDataStoreNotFoundException` and
+// `Message` "The event data store was not found.". The error CODE is the model's; the
+// status is applied through `crate::scaffolded::Scaffolded::modeled_with_status`.
+use crate::state::NOT_FOUND_STATUS;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -368,17 +377,6 @@ fn invalid_parameter(message: &str) -> DescribeQueryError {
     })
     .into()
 }
-
-/// The HTTP status this service answers a not-found refusal with.
-///
-/// The model annotates `EventDataStoreNotFoundException` and
-/// `QueryIdNotFoundException` `@httpError(404)`, but CloudTrail answers 400 for
-/// them on the wire: the recorded response for this very operation is
-/// `HTTP 400` with `__type` `EventDataStoreNotFoundException` and `Message`
-/// "The event data store was not found.". The error CODE is the model's; only
-/// the status is stated here, through
-/// [`crate::scaffolded::Scaffolded::modeled_with_status`].
-const NOT_FOUND_STATUS: u16 = 400;
 
 /// Refuse the request because no event data store resolved.
 fn event_data_store_not_found() -> DescribeQueryError {

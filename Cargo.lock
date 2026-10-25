@@ -4989,6 +4989,7 @@ dependencies = [
  "rcgen",
  "sec1",
  "serde_json",
+ "service-com-amazonaws-apigatewayv2-apigatewayv2",
  "sha2 0.10.9",
  "tokio",
  "tracing",

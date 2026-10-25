@@ -846,8 +846,10 @@ impl Table {
             rows.retain(|row| {
                 row.values
                     .get(&filter.property_name)
-                    .and_then(|value| compare_values(value, &filter.value))
-                    .is_some_and(|ordering| satisfies(&filter.operator, ordering))
+                    .and_then(|value| crate::state::compare_data_values(value, &filter.value))
+                    .is_some_and(|ordering| {
+                        crate::state::comparison_satisfies(&filter.operator, ordering)
+                    })
             });
         }
         // Applied from the LAST ordering key to the first with a STABLE sort,
@@ -1039,20 +1041,14 @@ const MAX_FILTERS: usize = 10;
 /// See [`MAX_FILTERS`].
 const MAX_ORDER_KEYS: usize = 10;
 
-/// The comparison operators a `propertyFilters` entry may carry.
-///
-/// `operator` is modelled as a plain string with no value list, so this set is
-/// not read off the model: these are the comparisons this service's own query
-/// language spells in a `WHERE` clause (`crate::ops::execute_query`), asked of
-/// the same stored property values. An operator outside the set is refused by
-/// name rather than ignored, which would answer a filtered question with
-/// unfiltered rows.
-const OPERATORS: &[&str] = &["=", "!=", "<", "<=", ">", ">="];
+/// The comparison operators a `propertyFilters` entry may carry, and the one a
+/// filter naming none compares with: the service-wide rule
+/// ([`crate::state::COMPARISON_OPERATORS`]), so a filter means the same thing
+/// in every operation that takes one.
+const OPERATORS: &[&str] = crate::state::COMPARISON_OPERATORS;
 
-/// The operator a filter that names none compares with: a filter carries a
-/// value to compare against, and equality is the comparison that value alone
-/// describes.
-const OPERATOR_EQUALS: &str = "=";
+/// See [`OPERATORS`].
+const OPERATOR_EQUALS: &str = crate::state::COMPARISON_OPERATOR_EQUALS;
 
 /// The two values of the model's `Order` enum (`super::types::ORDER_VALUES`),
 /// named so the sort reads as what it does. `ASCENDING` is the order a key that
@@ -1060,22 +1056,6 @@ const OPERATOR_EQUALS: &str = "=";
 const ORDER_ASCENDING: &str = "ASCENDING";
 /// See [`ORDER_ASCENDING`].
 const ORDER_DESCENDING: &str = "DESCENDING";
-
-/// Whether a comparison that came out `ordering` satisfies `operator`.
-fn satisfies(operator: &str, ordering: ::std::cmp::Ordering) -> bool {
-    use ::std::cmp::Ordering;
-    match operator {
-        "=" => ordering == Ordering::Equal,
-        "!=" => ordering != Ordering::Equal,
-        "<" => ordering == Ordering::Less,
-        "<=" => ordering != Ordering::Greater,
-        ">" => ordering == Ordering::Greater,
-        ">=" => ordering != Ordering::Less,
-        // Unreachable: a filter's operator is checked against `OPERATORS`
-        // before it is applied, and every one of them is matched above.
-        _ => false,
-    }
-}
 
 /// The key a row is ORDERED by: a property's value reduced to something with a
 /// TOTAL order, which is what a sort has to be handed — a relation that calls
@@ -1101,8 +1081,8 @@ impl OrderKey {
         let Some(value) = value else {
             return Self::Absent;
         };
-        if let Some(number) = Number::of(value) {
-            return Self::Number(number.as_double());
+        if let Some(number) = crate::state::data_value_as_double(value) {
+            return Self::Number(number);
         }
         if let Some(text) = value.string_value.as_deref() {
             return Self::Text(text.to_string());
@@ -1152,71 +1132,6 @@ impl PartialEq for OrderKey {
 }
 
 impl Eq for OrderKey {}
-
-/// A number a `DataValue` carries, at the width it travels in.
-///
-/// `INTEGER`, `LONG` and `DOUBLE` are widths of ONE domain, so a filter
-/// comparing a property against a threshold compares numbers whichever member
-/// each of them travels in. The integral widths are kept as an integer rather
-/// than folded into a double, so two `LONG`s too far apart for a double to tell
-/// apart still compare as the distinct values they are.
-enum Number {
-    Integer(i128),
-    Double(f64),
-}
-
-impl Number {
-    /// The number this value carries, or `None` when it carries none.
-    fn of(value: &DataValue) -> Option<Self> {
-        if let Some(double) = value.double_value {
-            return Some(Self::Double(double));
-        }
-        if let Some(integer) = value.integer_value {
-            return Some(Self::Integer(i128::from(integer)));
-        }
-        value.long_value.map(|long| Self::Integer(i128::from(long)))
-    }
-
-    /// This number on the double, the one width every number can be placed on:
-    /// what an ORDERING compares, where a total relation matters more than the
-    /// last bits of a very large integer.
-    fn as_double(&self) -> f64 {
-        match self {
-            Self::Integer(integer) => *integer as f64,
-            Self::Double(double) => *double,
-        }
-    }
-
-    /// Compare two numbers for a FILTER, which judges one pair at a time: two
-    /// integral values compare exactly, and a comparison that involves a double
-    /// compares on the double — `None` when a `NaN` makes the pair
-    /// incomparable.
-    fn compare(&self, other: &Self) -> Option<::std::cmp::Ordering> {
-        match (self, other) {
-            (Self::Integer(left), Self::Integer(right)) => Some(left.cmp(right)),
-            _ => self.as_double().partial_cmp(&other.as_double()),
-        }
-    }
-}
-
-/// Compare two modelled `DataValue`s for a FILTER, or `None` when they carry
-/// nothing comparable: two values of different kinds, or a kind with no order
-/// (a list, a map, a relationship, an expression).
-fn compare_values(left: &DataValue, right: &DataValue) -> Option<::std::cmp::Ordering> {
-    if let (Some(left), Some(right)) = (Number::of(left), Number::of(right)) {
-        return left.compare(&right);
-    }
-    if let (Some(left), Some(right)) = (
-        left.string_value.as_deref(),
-        right.string_value.as_deref(),
-    ) {
-        return Some(left.cmp(right));
-    }
-    if let (Some(left), Some(right)) = (left.boolean_value, right.boolean_value) {
-        return Some(left.cmp(&right));
-    }
-    None
-}
 
 /// The envelope the `nextToken` of a latest-value page carries, so a token
 /// minted elsewhere — for another query, or by hand — is recognisably not one of

@@ -118,3 +118,5 @@ mod remediation_execution;
 mod config_refusal_message_templates;
 #[path = "all/compliance_summary_by_resource_type.rs"]
 mod compliance_summary_by_resource_type;
+#[path = "all/compliance_details_by_resource.rs"]
+mod compliance_details_by_resource;

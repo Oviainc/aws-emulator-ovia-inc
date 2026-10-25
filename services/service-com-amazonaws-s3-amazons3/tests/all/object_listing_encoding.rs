@@ -45,7 +45,10 @@ fn in_path(key: &str) -> String {
 }
 
 /// What a client does with every key-name element of an `encoding-type=url` page.
-fn decoded(written: &str) -> String {
+///
+/// `pub(crate)`: the optional-member suite ([`super::listing_optional_members`]) decodes
+/// the pages it reads through this one helper rather than keeping a second copy.
+pub(crate) fn decoded(written: &str) -> String {
     percent_decode_str(written)
         .decode_utf8()
         .unwrap_or_else(|error| panic!("the response must carry valid UTF-8: {error}"))

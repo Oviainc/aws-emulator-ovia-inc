@@ -50,6 +50,15 @@
 //! under a name mints, which is the shape every operation that reads, deletes or attaches
 //! to one takes.
 //!
+//! BUSINESS GLOSSARIES — the containers for business-concept terms `CreateGlossary`
+//! registers — sit beside that tree in another per-account namespace
+//! ([`ComAmazonawsGlueAwsglueState::glossaries`]). They are keyed by the opaque
+//! `GlossaryId` the create mints, because every operation that addresses a glossary takes
+//! an `Identifier` targeting that shape and no `CatalogId`; the NAME a create carries is a
+//! separate uniqueness constraint on the namespace ([`ComAmazonawsGlueAwsglueState::glossary_by_name`]),
+//! which is what `CreateGlossary`'s modelled `AlreadyExistsException` refuses a second
+//! create under.
+//!
 //! Database and table names are folded to lowercase on the way in — the model says
 //! so for both `DatabaseInput$Name` ("For Hive compatibility, this is folded to
 //! lowercase when it is stored") and `TableInput$Name` — and every lookup folds the
@@ -64,13 +73,14 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     CodeGenConfigurationNode, Column, ColumnStatisticsTaskRun, Connection, ConnectionInput,
     ConnectionPasswordEncryption, ConnectionsList, Crawler, CrawlerTargets, CreateCrawlerInput,
-    CreateCustomEntityTypeInput, CreateJobInput, DataCatalogEncryptionSettings, DataLakePrincipal,
-    Database, DatabaseIdentifier, DatabaseInput, EncryptionAtRest, ErrorDetail, ExecutionProperty,
-    FederatedDatabase, FederatedTable, Job, JobCommand, JobRun, JobUpdate,
-    LakeFormationConfiguration, LineageConfiguration, NotificationProperty, PrincipalPermissions,
-    RLSProperties, RecrawlPolicy, RegistryId, Schedule, SchemaChangePolicy, SchemaId,
-    SourceControlDetails, StartColumnStatisticsTaskRunInput, StartJobRunInput, StorageDescriptor,
-    Table, TableIdentifier, TableInput, TableVersion, UpdateCrawlerInput,
+    CreateCustomEntityTypeInput, CreateGlossaryInput, CreateJobInput,
+    DataCatalogEncryptionSettings, DataLakePrincipal, Database, DatabaseIdentifier, DatabaseInput,
+    EncryptionAtRest, ErrorDetail, ExecutionProperty, FederatedDatabase, FederatedTable, Job,
+    JobCommand, JobRun, JobUpdate, LakeFormationConfiguration, LineageConfiguration,
+    NotificationProperty, PrincipalPermissions, RLSProperties, RecrawlPolicy, RegistryId, Schedule,
+    SchemaChangePolicy, SchemaId, SourceControlDetails, StartColumnStatisticsTaskRunInput,
+    StartJobRunInput, StorageDescriptor, Table, TableIdentifier, TableInput, TableVersion,
+    UpdateCrawlerInput,
 };
 
 /// Ceiling on the databases one catalog may hold.
@@ -180,6 +190,13 @@ pub const MAX_CUSTOM_ENTITY_TYPES: usize = 1_000;
 /// refused rather than stored; `PutFormType` models no limit error, so the refusal is
 /// the closest client error it does model (`InvalidInputException`).
 pub const MAX_FORM_TYPES: usize = 1_000;
+
+/// Ceiling on the business glossaries this emulator will hold, for the same reason as
+/// [`MAX_CRAWLERS`]: `CreateGlossary` writes a record any caller can reach, so the number
+/// of records one process will hold is bounded here. A create past the ceiling is refused
+/// rather than stored; `CreateGlossary` models no limit error, so the refusal is the
+/// closest client error it does model (`InvalidInputException`).
+pub const MAX_GLOSSARIES: usize = 1_000;
 
 /// The `CrawlerState` of a crawler with no run in progress — the state a crawler is in
 /// the moment `CreateCrawler` returns, and the only one this emulator stores until
@@ -446,6 +463,19 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// `DeleteFormType` take an `Identifier` targeting `FormTypeId`, the same shape
     /// `PutFormType`'s `Id` carries. [`Self::form_type_by_id`] is that resolution.
     pub form_types: BTreeMap<String, FormTypeEntry>,
+    /// Every business glossary this emulator holds, keyed by its `GlossaryId`.
+    ///
+    /// Per account, like crawlers and job definitions: `GetGlossary`, `UpdateGlossary`,
+    /// `DeleteGlossary` and `CreateGlossaryTerm` address a glossary by an identifier
+    /// targeting `GlossaryId` alone, with no `CatalogId` member. Keyed by that id rather
+    /// than by name because the id is the whole address and a glossary's name can be
+    /// changed by an update, while the map stays ordered so `ListGlossaries` has one
+    /// deterministic order to page over.
+    ///
+    /// The NAME is a uniqueness constraint over this namespace rather than its key:
+    /// [`Self::glossary_by_name`] is that resolution, and `CreateGlossary`'s modelled
+    /// `AlreadyExistsException` is what a second create under a stored name gets.
+    pub glossaries: BTreeMap<String, GlossaryEntry>,
     /// Every column statistics task run this emulator holds, oldest first.
     ///
     /// A run lives BESIDE the catalog tree rather than on the table it was started for,
@@ -738,6 +768,40 @@ impl ComAmazonawsGlueAwsglueState {
         self.form_types
             .values()
             .find(|form_type| form_type.id == id)
+    }
+
+    /// Whether the store can hold another business glossary, i.e. is below
+    /// [`MAX_GLOSSARIES`].
+    pub fn can_store_glossary(&self) -> bool {
+        self.glossaries.len() < MAX_GLOSSARIES
+    }
+
+    /// The stored glossary whose `Id` is `id`, or `None` when this account holds no
+    /// glossary under that id.
+    ///
+    /// Every operation that addresses a glossary does so by a `GlossaryId`, which is this
+    /// map's key, so the lookup is the key lookup. One copy, shared, so no two operations
+    /// can disagree about which record an identifier names.
+    pub fn glossary(&self, id: &str) -> Option<&GlossaryEntry> {
+        self.glossaries.get(id)
+    }
+
+    /// The stored glossary whose `Id` is `id`, mutably.
+    pub fn glossary_mut(&mut self, id: &str) -> Option<&mut GlossaryEntry> {
+        self.glossaries.get_mut(id)
+    }
+
+    /// The stored glossary carrying this `Name`, or `None` when the name is free.
+    ///
+    /// A glossary's name is unique over this per-account namespace — that is what
+    /// `CreateGlossary`'s modelled `AlreadyExistsException` refuses a second create under
+    /// — and the records are keyed by id, so the resolution is a walk bounded by
+    /// [`MAX_GLOSSARIES`]. The name is matched exactly as sent: the model documents no
+    /// case fold for `GlossaryName`.
+    pub fn glossary_by_name(&self, name: &str) -> Option<&GlossaryEntry> {
+        self.glossaries
+            .values()
+            .find(|glossary| glossary.name == name)
     }
 
     /// The tag set of the resource `resource` names, or `None` when this store holds no
@@ -1596,6 +1660,79 @@ impl FormTypeEntry {
             name,
             schema,
         }
+    }
+}
+
+/// How many glossary ids this process has minted. A nonce source for
+/// [`new_glossary_id`], exactly as [`MINTED_DATABASE_IDS`] is for a database id.
+static MINTED_GLOSSARY_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh `GlossaryId`: the opaque identifier the Data Catalog assigns a business
+/// glossary when `CreateGlossary` stores it.
+///
+/// 32 lowercase hexadecimal characters, i.e. 128 bits, which is the shape a
+/// catalog-assigned Data Catalog id has; `GlossaryId` carries no length or pattern
+/// constraint of its own. The bits come from [`mint_hex_id`], as a database id's do, so
+/// two creates landing in the same nanosecond cannot be given the same id. It is minted
+/// ONCE, at create, and kept on the [`GlossaryEntry`] through every later update — a
+/// rename included — so every read of that glossary reports the same id and two
+/// glossaries never share one.
+///
+/// This names a RESOURCE, not a credential: a credential would come from the credential
+/// store, never from here.
+pub fn new_glossary_id() -> String {
+    mint_hex_id(&MINTED_GLOSSARY_IDS, CATALOG_ID_WORDS)
+}
+
+/// A stored business glossary: the container for glossary terms `CreateGlossary`
+/// registers.
+///
+/// Every member of the modelled glossary is held here — its id, its name and its
+/// description — and nothing else: the model gives a glossary no status, owner or
+/// timestamp. The name and the description come from the request; the id is the one
+/// server-set member, minted by [`new_glossary_id`] when the glossary is stored.
+#[derive(Debug, Clone)]
+pub struct GlossaryEntry {
+    /// `GlossaryId`, minted by [`new_glossary_id`] at create and unchanged afterwards, so
+    /// a caller that kept the id from the create can still address the glossary after it
+    /// has been updated.
+    pub id: String,
+    /// "The name of the glossary" (`CreateGlossaryRequest$Name`), unique over this
+    /// account's glossaries. Stored exactly as sent — the model documents no case fold
+    /// for `GlossaryName`.
+    pub name: String,
+    /// "The description of the glossary", absent when the create carried none: the member
+    /// is optional and the model gives it no default, so a glossary created without one
+    /// reports none rather than an empty string.
+    pub description: Option<String>,
+    /// The `ClientToken` of the request that created this glossary, when it carried one.
+    ///
+    /// `CreateGlossaryRequest$ClientToken` is "a unique, case-sensitive identifier that
+    /// you provide to ensure the idempotency of the request", so a retry of that same
+    /// request is answered with this record instead of being refused as a duplicate name.
+    pub client_token: Option<String>,
+}
+
+impl GlossaryEntry {
+    /// The record a create stores: the name and description it carried, under a freshly
+    /// minted id, beside the idempotency token a retry of that create is recognised by.
+    pub fn new(name: String, description: Option<String>, client_token: Option<String>) -> Self {
+        Self {
+            id: new_glossary_id(),
+            name,
+            description,
+            client_token,
+        }
+    }
+
+    /// The same, read off a `CreateGlossary` request: every member comes from the request
+    /// except the id, which the catalog assigns.
+    pub fn from_create_input(input: &CreateGlossaryInput) -> Self {
+        Self::new(
+            input.name.clone(),
+            input.description.clone(),
+            input.client_token.clone(),
+        )
     }
 }
 
