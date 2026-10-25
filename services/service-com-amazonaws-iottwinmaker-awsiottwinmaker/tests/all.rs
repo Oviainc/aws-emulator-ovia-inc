@@ -77,6 +77,9 @@ mod pricing_plan_tier_and_pending;
 #[path = "all/pricing_plan_update.rs"]
 mod pricing_plan_update;
 
+#[path = "all/property_listing.rs"]
+mod property_listing;
+
 #[path = "all/property_value_read.rs"]
 mod property_value_read;
 
