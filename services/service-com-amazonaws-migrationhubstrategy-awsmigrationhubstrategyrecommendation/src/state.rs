@@ -36,6 +36,12 @@
 //! that preference beside the service's own recommendation, so each read answers what the
 //! update stored.
 //!
+//! Strategy Recommendations is a REGIONAL service, so none of those resources is held
+//! once for the account: the store holds one [`RegionState`] per Region, and a resource
+//! created through one Region's endpoint is reported only by reads signed for that same
+//! Region. Every handler resolves its request's Region with [`request_region`] and then
+//! reaches that Region's portfolio alone.
+//!
 //! And beside those, the account's one **portfolio preferences** record
 //! ([`PortfolioPreferences`]): what `PutPortfolioPreferences` saves and
 //! `GetPortfolioPreferences` reports, member for member.
@@ -57,6 +63,16 @@ use crate::ops::types::{
     OSInfo, PrioritizeBusinessGoals, RecommendationReportDetails, RecommendationSet,
     ResourceNotFoundException, ServerDetail, ServerError, ServerStrategy, SourceCodeRepository,
     StrategyOption, SystemInfo, TransformationTool, ValidationException, GROUP_NAME_VALUES,
+};
+
+/// The Region partitioning of this store: the per-service state struct itself, the Region
+/// a request is served in, and the ceiling on how many Regions the store keeps a
+/// portfolio for.
+pub mod regions;
+
+pub use regions::{
+    request_region, ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState,
+    DEFAULT_REGION, MAX_REGIONS,
 };
 
 /// `ImportFileTaskStatus`'s non-terminal import status: the status a task carries from
@@ -148,7 +164,8 @@ pub const MAX_GROUP_FILTER_ENTRIES: usize = 100;
 /// One import file task, as this emulator persists it.
 #[derive(Debug, Clone)]
 pub struct ImportFileTask {
-    /// Minted by [`ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState::mint_import_file_task_id`].
+    /// Minted by [`ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState::mint_import_file_task_id`],
+    /// unique across every Region's portfolio.
     pub id: String,
     /// `StartImportFileTaskRequest$name`, reported as `importName`.
     pub import_name: String,
@@ -338,7 +355,7 @@ pub struct Assessment {
     pub status_message: Option<String>,
     /// How many servers this assessment covers: the servers the service's data source
     /// held when the assessment started (see
-    /// [`ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState::imported_server_count`]).
+    /// [`RegionState::imported_server_count`]).
     pub servers: i32,
     pub success: i32,
     pub failed: i32,
@@ -675,7 +692,7 @@ pub struct ServerDiscovery {
 #[derive(Debug, Clone, Default)]
 pub struct ServerRecord {
     /// `ServerDetail$id` — a `ResourceId` (`^[0-9a-b]+`, up to 44 characters). It is also
-    /// this server's key in [`ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState::servers`],
+    /// this server's key in [`RegionState::servers`],
     /// which is what gives a list a stable total order to sort and paginate over.
     pub id: String,
     /// `ServerDetail$name`.
@@ -896,7 +913,7 @@ impl ServerRecord {
 pub struct ApplicationComponentRecord {
     /// `ApplicationComponentDetail$id` — a `ResourceId` (`^[0-9a-b]+`, up to 44
     /// characters). It is also this component's key in
-    /// [`ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState::application_components`],
+    /// [`RegionState::application_components`],
     /// which is what gives a list over them a stable total order.
     pub id: String,
     /// `ApplicationComponentDetail$name`.
@@ -1091,9 +1108,10 @@ impl PortfolioPreferences {
     }
 }
 
-/// Per-service state for com-amazonaws-migrationhubstrategy-awsmigrationhubstrategyrecommendation. A handler reaches it through [`service_state`].
+/// One Region's portfolio: the resources of this service a request signed for that
+/// Region can observe, and the only ones it can.
 #[derive(Debug, Default)]
-pub struct ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState {
+pub struct RegionState {
     /// Every import file task, keyed by its id. A `BTreeMap` is what gives
     /// `ListImportFileTask` a stable total order to paginate over.
     pub import_tasks: BTreeMap<String, ImportFileTask>,
@@ -1116,58 +1134,13 @@ pub struct ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendation
     /// The id of the most recently started assessment, which is what
     /// `GetLatestAssessmentId` answers. `None` until one is started.
     pub latest_assessment_id: Option<String>,
-    /// This account's migration and modernization preferences, written by
+    /// This account's migration and modernization preferences in this Region, written by
     /// `PutPortfolioPreferences` and reported by `GetPortfolioPreferences`. `None` until a
     /// save stores them: no preference is set in a fresh account.
     pub portfolio_preferences: Option<PortfolioPreferences>,
-    /// The counter both kinds of id are minted from, so no two resources of this
-    /// service ever share a suffix.
-    pub next_id: u64,
 }
 
-impl ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState {
-    /// The next value of the shared id counter.
-    fn next_sequence(&mut self) -> u64 {
-        self.next_id = self.next_id.wrapping_add(1);
-        self.next_id
-    }
-
-    /// Mint an unused import file task id.
-    ///
-    /// `StartImportFileTaskResponse$id` is a `String` bounded to 1024 with pattern
-    /// `.*\S.*`, so the shape of the id is the emulator's choice; the loop skips an id
-    /// already taken, which is what makes the counter's wrap safe.
-    pub fn mint_import_file_task_id(&mut self) -> String {
-        loop {
-            let id = format!("import-file-task-{:012x}", self.next_sequence());
-            if !self.import_tasks.contains_key(&id) {
-                return id;
-            }
-        }
-    }
-
-    /// Mint an unused assessment id matching `AsyncTaskId`'s `[0-9a-z-:]+`, within its
-    /// 52-character bound.
-    pub fn mint_assessment_id(&mut self) -> String {
-        loop {
-            let id = format!("assessment-{:012x}", self.next_sequence());
-            if !self.assessments.contains_key(&id) {
-                return id;
-            }
-        }
-    }
-
-    /// Mint an unused recommendation report task id matching `RecommendationTaskId`'s
-    /// `[0-9a-z-:]+`, within its 52-character bound (this one is 34 characters).
-    pub fn mint_recommendation_report_id(&mut self) -> String {
-        loop {
-            let id = format!("recommendation-report-{:012x}", self.next_sequence());
-            if !self.recommendation_reports.contains_key(&id) {
-                return id;
-            }
-        }
-    }
-
+impl RegionState {
     /// The import file task `id` names, with any completion the clock owes it already
     /// materialised.
     pub fn settled_import_task_mut(
@@ -1375,12 +1348,12 @@ impl ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState 
     }
 }
 
-/// A task of this account that has not reached a terminal status yet, as
-/// [`ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState::ongoing_task`]
+/// A task of this Region's portfolio that has not reached a terminal status yet, as
+/// [`RegionState::ongoing_task`]
 /// reports it.
 ///
-/// Carries what a refusal caused by the task tells the caller: which task of the account
-/// is still running, and the non-terminal status it holds.
+/// Carries what a refusal caused by the task tells the caller: which task of the
+/// portfolio is still running, and the non-terminal status it holds.
 #[derive(Debug, Clone)]
 pub struct OngoingTask {
     /// What kind of task it is, in this service's own words — one of [`IMPORT_FILE_TASK`],
@@ -1694,21 +1667,6 @@ pub fn no_portfolio_preferences() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(NOTHING_TO_REPORT.to_string()),
     }
-}
-
-/// The region an unsigned request (one carrying no SigV4 credential scope) is served in.
-///
-/// It is the region an in-process call this service makes into another emulated service
-/// is addressed to when the caller named none.
-pub const DEFAULT_REGION: &str = "us-east-1";
-
-/// The region the caller signed for, or [`DEFAULT_REGION`] for an unsigned request.
-///
-/// The scope is parsed by `emulator_server::sigv4_credential_scope`, the framework's
-/// single source of SigV4-scope reading; only the default lives here.
-pub fn request_region(parts: &::http::request::Parts) -> String {
-    ::emulator_server::sigv4_credential_scope(&parts.headers)
-        .map_or_else(|| DEFAULT_REGION.to_string(), |scope| scope.region)
 }
 
 /// The key prefix every import status report object is written under, inside the bucket

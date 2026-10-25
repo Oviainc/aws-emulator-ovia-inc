@@ -10,6 +10,10 @@
 //! the created profile's resource identity (`resourceArn`, `internalId`) — see
 //! [`PutSigningProfileOutput`] for why it is declared by hand.
 //!
+//! A request whose `tags` name a key inside AWS's reserved namespace is refused
+//! 400 `ValidationException` and stores no profile: those keys are the ones
+//! `TagResource` writes, held to the same modelled `TagKey` rule.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -194,6 +198,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(PutSigningProfileErrorModeled::ValidationException(
                 ValidationException {
                     message: Some("signing material cannot be null.".to_string()),
+                    code: Some(crate::state::ERROR_CODE_VALIDATION.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The tags this create carries are the same keys the tagging operations
+        // write, so they are held to the same modelled rule: AWS reserves the
+        // `aws:` prefix for its own tags, which `TagKey`'s pattern states as a
+        // negative lookahead the boundary validator cannot compile. Refused
+        // HERE, before anything is written, so one reserved key refuses the
+        // whole create and no profile is stored.
+        if let Some(key) = crate::state::reserved_tag_key(
+            input
+                .tags
+                .iter()
+                .flat_map(|tags| tags.keys())
+                .map(String::as_str),
+        ) {
+            return Err(PutSigningProfileErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::reserved_tag_key_message(key)),
                     code: Some(crate::state::ERROR_CODE_VALIDATION.to_string()),
                 },
             )

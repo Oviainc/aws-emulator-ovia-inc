@@ -187,7 +187,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateServerConfigErrorModeled::InternalServerException(
                 InternalServerException {
@@ -203,10 +202,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service cannot accept must leave the server's configuration exactly as it was.
         let preference = preference_of(input.strategy_option)?;
 
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        // The update applies to a server of THIS account's portfolio: an id naming none is
-        // reported as the missing resource it is, never silently created.
-        let Some(server) = store.servers.get_mut(&input.server_id) else {
+        // The update applies to a server of THIS account's portfolio in the Region the
+        // request was signed for: an id naming none is reported as the missing resource
+        // it is, never silently created.
+        let found = store
+            .region_mut(&region)
+            .and_then(|portfolio| portfolio.servers.get_mut(&input.server_id));
+        let Some(server) = found else {
             return Err(
                 UpdateServerConfigErrorModeled::ResourceNotFoundException(server_not_found())
                     .into(),

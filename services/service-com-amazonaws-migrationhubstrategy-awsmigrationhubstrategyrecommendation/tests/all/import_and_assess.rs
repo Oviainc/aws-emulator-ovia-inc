@@ -23,6 +23,12 @@ const SIGNED_FOR_EU_WEST_1: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDEXAMPLE/20260101/eu-west-1/migrationhub-strategy/aws4_request, \
      SignedHeaders=host, Signature=abc";
 
+/// The Region every request [`call`] builds is signed for, and so the Region whose
+/// portfolio a suite that seeds the store directly has to seed.
+///
+/// `pub(crate)` so the suites beside this one seed the Region their calls read.
+pub(crate) const TEST_REGION: &str = "eu-west-1";
+
 /// Every value `Condition` admits, from `smithy_query(query="shape",shape="Condition")`.
 /// Spelled out here so a case can span the whole catalog rather than the one condition
 /// the issue cited (`EQUALS`).
