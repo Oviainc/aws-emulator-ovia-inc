@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the request's `Tags` onto the connector or challenge `ResourceArn` names, merged
+//! into the tag map that record already carries: a key the resource does not have yet is
+//! added, and one it does have takes the request's value. The write lands on the same single
+//! map `ListTagsForResource` reads, so a tag is observable through a later read and
+//! disappears with the resource it sits on.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +170,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let mut store = state.lock();
+        // The transition the clock already owes, materialised before the lookup, so a
+        // connector whose teardown has come due cannot be tagged back into existence.
+        store.settle(now);
+
+        // `Tags` carries neither a modelled `@length` nor a `@pattern`, on the map or on
+        // either half of an entry, so every tagging rule is this handler's to enforce — the
+        // same rules both creates hold a caller to. Checked BEFORE the lookup, so a request
+        // carrying a tag no caller may set is refused for that and writes nothing.
+        if let Some(why) = crate::state::tags_rejection(
+            input
+                .tags
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        ) {
+            return Err(validation(why));
+        }
+
+        let resource_arn = input.resource_arn.clone();
+        // ONE lookup, taken mutably: the ceiling below is computed from the very map the
+        // write then lands on, so there is no second lookup that could miss.
+        let Some(tags) = store.tags_of_mut(&resource_arn) else {
+            return Err(not_found(&resource_arn));
+        };
+
+        // The ceiling is on what the RESOURCE ends up carrying, not on what one call sends:
+        // a key the resource already has takes a new value instead of adding an entry, so
+        // only the keys it does not have yet grow the map.
+        let total = tags.len()
+            + input
+                .tags
+                .keys()
+                .filter(|key| !tags.contains_key(key.as_str()))
+                .count();
+        if total > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(validation(format!(
+                "these tags would leave {resource_arn} with {total} tags; a resource may have \
+                 at most {}",
+                crate::state::MAX_TAGS_PER_RESOURCE
+            )));
+        }
+
+        // AWS tagging semantics: a tag is a key with ONE value, so a key the resource already
+        // carries is overwritten rather than duplicated, and every other tag it carries stays.
+        for (key, value) in input.tags {
+            tags.insert(key, value);
+        }
+
+        // `TagResource` models no output members (its output shape is `Unit`): the modelled
+        // 204 and an empty body are the whole answer, and the tags are read back through
+        // `ListTagsForResource`.
+        Ok(TagResourceOutput)
     }
+}
+
+/// Refuse a request this service's tagging rules do not allow — HTTP 400
+/// `ValidationException`, whose own doc names exactly this case ("invalid characters in a name
+/// tag"). The modelled shape is used rather than the scaffold's synthetic one, so the caller
+/// also gets the `Reason` member.
+fn validation(message: String) -> TagResourceError {
+    TagResourceErrorModeled::ValidationException(ValidationException {
+        message,
+        // "The service doesn't return a reason for every validation exception" (`Reason`'s
+        // own doc), and `ValidationExceptionReason` carries no value for a tag a caller may
+        // not set.
+        reason: None,
+    })
+    .into()
+}
+
+/// This service holds no connector or challenge under this ARN — HTTP 404
+/// `ResourceNotFoundException`, whose own doc covers both the resource that is gone and the
+/// one "incorrectly specified". A call naming a deleted resource, or one whose owning
+/// connector's teardown has completed, lands here.
+fn not_found(resource_arn: &str) -> TagResourceError {
+    let resource_type = crate::state::resource_type_of(resource_arn);
+    TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: format!("{resource_type} {resource_arn} could not be found"),
+        resource_id: resource_arn.to_string(),
+        resource_type: resource_type.to_string(),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server-side fault, which this operation models as
+/// `InternalServerException` (HTTP 500). Never answered by constructing a private engine.
+fn store_unavailable() -> TagResourceError {
+    TagResourceErrorModeled::InternalServerException(InternalServerException {
+        message: "the Connector for SCEP connector store is unavailable".to_string(),
+    })
+    .into()
 }
