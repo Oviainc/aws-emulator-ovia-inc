@@ -742,12 +742,20 @@ async fn each_operation_is_authorized_against_its_own_action() {
         path: &'static str,
         body: Option<Value>,
     }
-    let rows: [OperationCase; 10] = [
+    let rows: [OperationCase; 11] = [
         OperationCase {
             action: "rum:GetAppMonitor",
             method: "GET",
             path: "/appmonitor/{name}",
             body: None,
+        },
+        OperationCase {
+            // Reading a monitor's collected data is its own action, so the principal
+            // allowed only `rum:GetAppMonitor` below is refused it.
+            action: "rum:GetAppMonitorData",
+            method: "POST",
+            path: "/appmonitor/{name}/data",
+            body: Some(json!({"TimeRange": {"After": 0}, "MaxResults": 0})),
         },
         OperationCase {
             action: "rum:PutRumMetricsDestination",
