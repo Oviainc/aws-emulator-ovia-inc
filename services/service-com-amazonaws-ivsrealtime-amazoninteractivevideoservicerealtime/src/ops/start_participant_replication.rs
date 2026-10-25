@@ -343,6 +343,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             started_at: ::std::time::SystemTime::now(),
             sequence,
         };
+
+        // Replication starting is an occurrence during the session the replicated
+        // publisher is in, which is what `ListParticipantEvents` reports: the model marks
+        // `Event$destinationStageArn` and `Event$destinationSessionId` "applicable only
+        // if the event name is REPLICATION_STARTED or REPLICATION_STOPPED", so this event
+        // carries the destination this replication names. The publisher itself is not a
+        // replica — it publishes in the source stage — so `replica` stays false.
+        let mut event = crate::state::ParticipantEvent::new(
+            crate::state::EVENT_REPLICATION_STARTED,
+            &record.participant_id,
+        );
+        event.destination_stage_arn = Some(record.destination_stage_arn.clone());
+        event.destination_session_id = Some(record.destination_session_id.clone());
+        crate::state::record_participant_event(
+            &mut store,
+            &record.source_stage_arn,
+            &record.source_session_id,
+            event,
+        );
+
         store
             .participant_replicas
             .entry(input.source_stage_arn)

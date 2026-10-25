@@ -7,6 +7,11 @@
 //! supplied tags, and `createdAt`/`updatedAt` taken at the moment of the call) in this
 //! service's state, then returns the ARN it stored the record under.
 //!
+//! The supplied tags are resolved by tag key before they are stored
+//! ([`crate::state::merge_resource_tags`]), so a request naming one key twice stores
+//! that key once, holding its last value — the state applying those entries through
+//! `TagResource` would leave.
+//!
 //! Three refusals come before the write, all of them modelled:
 //!
 //! * a `scheduledReport.dashboardArn` no stored dashboard answers to is refused with
@@ -276,8 +281,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_execution_at: None,
             health_status: None,
             // Persisted at create time, as the tag list every tagging operation
-            // reads and writes.
-            resource_tags: input.resource_tags.unwrap_or_default(),
+            // reads and writes — resolved by tag key through the resolution every
+            // tagging path shares (`crate::state::merge_resource_tags`), so a request
+            // that names one key twice stores that key once, holding its last value,
+            // exactly as applying those entries through `TagResource` would.
+            resource_tags: crate::state::merge_resource_tags(
+                Vec::new(),
+                input.resource_tags.unwrap_or_default(),
+            ),
         };
         state.scheduled_reports.insert(arn.clone(), record);
         if let Some(token) = input.client_token {

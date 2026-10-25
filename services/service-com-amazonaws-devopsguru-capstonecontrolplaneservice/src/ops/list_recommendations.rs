@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRecommendations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRecommendations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRecommendations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the recommendations DevOps Guru's analysis derived to remediate the
+//! behaviour ONE insight reports: the page of
+//! [`crate::state::ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::recommendations`]
+//! the request's `InsightId` keys, in the store's stable `Name` order, with each
+//! recommendation's prose in the language `Locale` asks for. An `InsightId` the store
+//! holds no insight under names no insight and is refused with
+//! `ResourceNotFoundException`, the same rule `DescribeInsight` and
+//! `ListAnomalousLogGroups` apply to the same map; an `AccountId` other than the one
+//! this emulator serves is refused with `AccessDeniedException`, as `DescribeInsight`
+//! refuses it. It is a REPORTING operation: it never writes.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +165,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRecommendations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRecommendationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRecommendations"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListRecommendationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the DevOps Guru insight store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        // `AccountId` names the member account whose insight to read. This emulator
+        // serves one account and is in no organization, so no other account is
+        // accessible to the caller: that is an authorization refusal, decided BEFORE
+        // any lookup so a refusal cannot report whether the insight exists.
+        let account_id = crate::state::requested_account_id(input.account_id.as_deref());
+        if !crate::state::account_is_accessible(&account_id) {
+            return Err(ListRecommendationsErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: format!(
+                        "Access denied when accessing the recommendations of insight {} in account {account_id}",
+                        input.insight_id
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // `Locale` selects the language the prose is served in; a request naming none
+        // is served the default language. The member is a modelled enum, so the
+        // boundary validator refuses anything else before this handler runs; checking
+        // here keeps such a value a 400 rather than prose in a language nobody asked
+        // for.
+        let locale = match input.locale.as_deref() {
+            None => crate::state::DEFAULT_LOCALE,
+            Some(locale) if LOCALE_VALUES.contains(&locale) => locale,
+            Some(unknown) => {
+                return Err(ListRecommendationsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!("Locale '{unknown}' is not a language this service serves"),
+                        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                        fields: Some(vec![ValidationExceptionField {
+                            name: "Locale".to_string(),
+                            message: format!("must be one of {}", LOCALE_VALUES.join(" | ")),
+                        }]),
+                    },
+                )
+                .into());
+            }
+        };
+
+        let store = state.lock();
+        // The recommendations are reported FOR an insight, so an id the store holds no
+        // insight under names no insight at all — the same refusal `DescribeInsight`
+        // gives for that id, rather than an empty page that would claim the insight
+        // exists and simply has nothing recommended for it.
+        if !store.insights.contains_key(&input.insight_id) {
+            return Err(ListRecommendationsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no insight with id {} exists", input.insight_id),
+                    resource_id: input.insight_id.clone(),
+                    resource_type: crate::state::INSIGHT_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // An insight the analysis recommended nothing for holds no entry, which is an
+        // empty list rather than a refusal: the insight exists either way.
+        let recommendations: Vec<Recommendation> = store
+            .recommendations
+            .get(&input.insight_id)
+            .map(|per_name| {
+                per_name
+                    .values()
+                    .map(|record| record.to_recommendation(locale))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // A token names an offset into ONE insight's recommendations, so it is scoped
+        // to that insight and does not resolve against another's. The language is not
+        // part of that scope: it chooses how each recommendation READS, never which
+        // ones there are, so a walk may switch language between pages.
+        let (page, next_token) = crate::state::page_sized(
+            &recommendations,
+            &format!("ListRecommendations/{}", input.insight_id),
+            input.next_token.as_deref(),
+            crate::state::RECOMMENDATIONS_PAGE_SIZE,
+        )
+        .ok_or_else(|| -> ListRecommendationsError {
+            ListRecommendationsErrorModeled::ValidationException(
+                crate::state::FilterRejection::stale_cursor(
+                    "ListRecommendations",
+                    "the recommendations of this insight",
+                    "InsightId",
+                )
+                .validation_exception(),
+            )
+            .into()
+        })?;
+
+        Ok(ListRecommendationsOutput {
+            recommendations: Some(page),
+            next_token,
+        })
     }
 }

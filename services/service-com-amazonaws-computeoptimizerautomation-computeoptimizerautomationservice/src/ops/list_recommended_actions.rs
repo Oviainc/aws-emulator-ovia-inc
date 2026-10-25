@@ -7,10 +7,11 @@
 //! resumes where the previous page stopped. `@paginated(inputToken: nextToken,
 //! outputToken: nextToken, items: recommendedActions)`.
 //!
-//! A recommended action is produced by Compute Optimizer's own analysis of a
-//! resource, so no operation of THIS API creates one: this handler only reports
-//! what [`crate::state::RecommendedActionStore`] holds (an emulator nothing has
-//! recorded an action into reports an empty list), and it writes nothing.
+//! A recommended action is produced by the analysis of an account's resources
+//! that its enrollment starts, so no request carries one: this handler only
+//! reports what [`crate::state::RecommendedActionStore`] holds (the inventory
+//! recorded for every account this service holds as enrolled), and it writes
+//! nothing.
 //!
 //! ## Shape of an operation
 //!

@@ -11,7 +11,10 @@
 //!   every one, and a caller that names none gets the member's documented default
 //!   ([`crate::state::requested_at_level`]);
 //! * `MaxResults` / `NextToken` page the listing, and a token this service did not
-//!   issue is `InvalidPaginationTokenException` (400).
+//!   issue is `InvalidPaginationTokenException` (400). `MaxResults` bounds what a
+//!   CALLER may ask for, not what this listing serves when none is named: a caller
+//!   that names no `MaxResults` is served the whole filtered history in one page with
+//!   no `NextToken` ([`crate::state::UNASKED_PAGE_SIZE`]).
 //!
 //! Before answering it materialises the decisions the clock has already made due, so
 //! the status a request is filtered on is the one it has at the instant of the call.

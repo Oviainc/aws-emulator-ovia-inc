@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/agent_lifecycle.rs"]
 mod agent_lifecycle;
+#[path = "all/data_source_lifecycle.rs"]
+mod data_source_lifecycle;
 #[path = "all/flow_lifecycle.rs"]
 mod flow_lifecycle;
 #[path = "all/knowledge_base_lifecycle.rs"]

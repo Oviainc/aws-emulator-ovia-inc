@@ -37,6 +37,8 @@ mod login_profiles;
 mod managed_policies;
 #[path = "all/open_id_connect_providers.rs"]
 mod open_id_connect_providers;
+#[path = "all/principal_policy_context_keys.rs"]
+mod principal_policy_context_keys;
 #[path = "all/role_attached_policies.rs"]
 mod role_attached_policies;
 #[path = "all/role_deletion.rs"]

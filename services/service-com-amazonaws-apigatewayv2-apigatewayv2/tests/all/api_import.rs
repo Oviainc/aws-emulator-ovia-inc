@@ -886,6 +886,114 @@ async fn an_integration_timeout_is_held_to_the_modelled_range() {
     }
 }
 
+/// The most characters the base path an import prefixes onto every route's path may run
+/// to: the reader's own bound, so the test tracks it rather than restating a number.
+const MAX_BASE_PATH_CHARS: usize =
+    service_com_amazonaws_apigatewayv2_apigatewayv2::ops::import_api::MAX_BASE_PATH_CHARS;
+
+/// The most routes one api may hold, the quota the read stops at.
+const MAX_ROUTES_PER_API: usize =
+    service_com_amazonaws_apigatewayv2_apigatewayv2::state::MAX_ROUTES_PER_API;
+
+/// A definition declaring one base path of `base_path_segments` segments and `paths`
+/// minimal `GET` operations — the shape whose READ would amplify the body if the base
+/// path the prefix is built from were unbounded, since the prefix is repeated into every
+/// route's path.
+fn prefixed_definition(base_path_chars: usize, paths: usize) -> String {
+    let base_path = format!("/{}", "s".repeat(base_path_chars.saturating_sub(1)));
+    let mut declared = serde_json::Map::new();
+    for index in 0..paths {
+        declared.insert(format!("/p{index}"), json!({ "get": {} }));
+    }
+    json!({
+        "openapi": "3.0.1",
+        "info": { "title": "prefixed-api" },
+        "servers": [{ "url": base_path }],
+        "paths": Value::Object(declared)
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn the_read_is_bounded_by_the_base_path_length_and_the_route_quota() {
+    let router = emulator();
+
+    // The base path at its bound is read; one character past it is refused, because that
+    // prefix is what every route's path carries.
+    for (case, chars, expected) in [
+        ("at the bound", MAX_BASE_PATH_CHARS, 201),
+        ("one past the bound", MAX_BASE_PATH_CHARS + 1, 400),
+    ] {
+        let before = stored_api_count(&router).await;
+        let (status, body) = import(
+            &router,
+            "?basepath=prepend",
+            &prefixed_definition(chars, 1),
+        )
+        .await;
+        assert_eq!(
+            status, expected,
+            "case {case:?}: a base path of {chars} characters, got {status} {body}"
+        );
+        if expected == 400 {
+            assert_eq!(
+                error_code(&body),
+                "BadRequestException",
+                "case {case:?}: expected BadRequestException, got {body}"
+            );
+            assert_eq!(
+                stored_api_count(&router).await,
+                before,
+                "case {case:?}: a refused import must persist nothing"
+            );
+        }
+    }
+
+    // A definition declaring more operations than one api may hold routes is refused for
+    // the quota it exceeds, and persists nothing — the read stops at the quota rather
+    // than collecting every path the body declares.
+    let before = stored_api_count(&router).await;
+    let (status, body) = import(
+        &router,
+        "",
+        &prefixed_definition(1, MAX_ROUTES_PER_API + 1),
+    )
+    .await;
+    assert_eq!(
+        status, 429,
+        "expected 429 past the route quota of {MAX_ROUTES_PER_API}, got {status} {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "TooManyRequestsException",
+        "expected TooManyRequestsException, got {body}"
+    );
+    assert_eq!(
+        as_str(&body, "limitType"),
+        "Route",
+        "expected the refusal to name the limit it exceeded, got {body}"
+    );
+    assert_eq!(
+        stored_api_count(&router).await,
+        before,
+        "a refused import must persist nothing"
+    );
+
+    // A definition declaring exactly the quota is imported, so the stop is at the bound
+    // and not before it.
+    let (status, imported) = import(&router, "", &prefixed_definition(1, MAX_ROUTES_PER_API)).await;
+    assert_eq!(
+        status, 201,
+        "expected 201 at the route quota of {MAX_ROUTES_PER_API}, got {status} {imported}"
+    );
+    let api_id = as_str(&imported, "apiId");
+    let routes = stored_routes(&router, &api_id).await;
+    assert!(
+        routes.contains_key("GET /p0"),
+        "expected the api to hold the routes the definition declared, got {routes:?}"
+    );
+}
+
 /// A definition that warns twice: an operation under a method no route key may carry, and
 /// an operation that declares no integration.
 fn warning_definition() -> String {

@@ -230,16 +230,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A component-model-based composite model has no properties of its own:
         // the component model it reuses provides them, so they are read from that
-        // model's stored record rather than copied at create time.
+        // model's stored record rather than copied at create time. That rule is
+        // the shared `composite_model_properties`, so every view of a composite
+        // model's properties — this one and an asset's instance of it — answers
+        // from the same place.
         let composed = record.composed_asset_model_id(&composite_model_id);
-        let properties = match composed {
-            Some(composed) => store
-                .asset_models
-                .get(composed)
-                .map(|component| component.properties.clone())
-                .unwrap_or_default(),
-            None => composite.properties.clone().unwrap_or_default(),
-        };
+        let properties = store.composite_model_properties(record, &composite_model_id);
         // The composition relationship this composite model was created with, which
         // only a component-model-based one has.
         let composition_details = composed.map(|composed| CompositionDetails {
