@@ -203,8 +203,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The quota `ServiceQuotaExceededException`'s own documentation states:
-        // "Applications: 100 max".
-        if store.applications.len() >= crate::state::MAX_APPLICATIONS {
+        // "Applications: 100 max". The bound itself is enforced where the record is
+        // stored (`state::ComAmazonawsAppconfigAmazonappconfigState::try_insert_application`,
+        // the only way into the map); it is stated here so the refusal is the modelled
+        // quota error rather than a server error, and so nothing is minted for a create
+        // that cannot be stored.
+        if store.application_quota_reached() {
             return Err(CreateApplicationErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: Some(format!(
@@ -219,7 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let id = store.mint_id();
         let application = crate::state::Application::new(
-            id.clone(),
+            id,
             input.name,
             input.description,
             input.tags.unwrap_or_default(),
@@ -227,18 +231,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `mint_id` rejects every id any resource already holds, so the slot is vacant.
         // An occupied one is refused rather than answered from: reporting 201 with
         // another application's record would describe a resource this call never made.
-        let stored = match store.applications.entry(id) {
-            std::collections::hash_map::Entry::Vacant(slot) => slot.insert(application),
-            std::collections::hash_map::Entry::Occupied(_) => {
-                return Err(CreateApplicationErrorModeled::InternalServerException(
-                    InternalServerException {
-                        message: Some(
-                            "The minted application id was already in use".to_string(),
-                        ),
-                    },
-                )
-                .into())
-            }
+        // The same call is what bounds the map, so a create past the quota stores
+        // nothing even if the check above were ever bypassed.
+        let Some(stored) = store.try_insert_application(application) else {
+            return Err(CreateApplicationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("The minted application id was already in use".to_string()),
+                },
+            )
+            .into());
         };
 
         // Answered from the stored record, so a later read reports exactly what this

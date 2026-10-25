@@ -187,13 +187,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `TraceIds` (@length 0..100) and both timestamps are modelled, so the
         // boundary has already refused a missing or over-long list; what the
         // model cannot express is whether the window names an interval at all.
+        // This operation states a refused request parameter under its own
+        // preamble, ahead of the sentence naming what was wrong with it.
         let start = crate::state::epoch_seconds(&input.start_time);
         let end = crate::state::epoch_seconds(&input.end_time);
         let now = crate::state::now_epoch_seconds();
         if let Err(window) = crate::state::validate_window(start, end, now) {
             return Err(StartTraceRetrievalErrorModeled::InvalidRequestException(
                 InvalidRequestException {
-                    message: Some(window.message(start, end)),
+                    message: Some(format!(
+                        "{} {}",
+                        crate::state::INVALID_INPUT_PARAMETERS_PREAMBLE,
+                        window.message(start, end)
+                    )),
                 },
             )
             .into());

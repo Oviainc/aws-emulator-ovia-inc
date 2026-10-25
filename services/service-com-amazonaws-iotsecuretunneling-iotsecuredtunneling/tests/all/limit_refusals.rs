@@ -204,8 +204,7 @@ async fn the_tunnel_count_limit_is_refused_with_the_same_modelled_limit_error() 
         let state = engine.state::<TunnelState>();
         let mut store = state.lock();
         let seed: StoredTunnel = store
-            .tunnels
-            .get(&seed_id)
+            .tunnel(REGION, &seed_id)
             .cloned()
             .expect("the opened tunnel was not persisted");
         let mut filler = 0_usize;
@@ -215,8 +214,7 @@ async fn the_tunnel_count_limit_is_refused_with_the_same_modelled_limit_error() 
             let mut tunnel = seed.clone();
             tunnel.tunnel_id = tunnel_id.clone();
             tunnel.tunnel_arn = tunnel_arn.clone();
-            store.arn_index.insert(tunnel_arn, tunnel_id.clone());
-            store.tunnels.insert(tunnel_id, tunnel);
+            store.insert_tunnel(REGION, tunnel);
             filler += 1;
         }
     }

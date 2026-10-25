@@ -189,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A profile is addressed under its application, so the parent is resolved first:
         // an update naming an application this service does not hold is not found.
-        let Some(application) = store.applications.get_mut(&input.application_id) else {
+        let Some(application) = store.application_mut(&input.application_id) else {
             return Err(UpdateConfigurationProfileErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::application_not_found(

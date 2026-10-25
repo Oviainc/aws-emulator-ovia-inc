@@ -161,6 +161,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the AppInstance store is unavailable".to_string()),
             })
         })?;
+        // The tags given at create time go in the family's shared, ARN-keyed tag
+        // directory, which is where the tagging operations read them from; resolved
+        // before anything is written so a create cannot half-succeed.
+        let tag_directory = crate::state::chime_tags(&*self.engine).ok_or_else(|| {
+            CreateAppInstanceErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the Chime tag directory is unavailable".to_string()),
+            })
+        })?;
         let mut state = state.lock();
 
         // Idempotency (`@idempotencyToken` on `ClientRequestToken`): the same token
@@ -196,22 +205,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let arn = crate::state::new_app_instance_arn(&crate::state::request_region(ctx.parts()));
+        // `TagList` is `@length(min: 1)`, so the member is either absent or non-empty.
+        let tags: Vec<(String, String)> = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
         let record = crate::state::AppInstanceRecord {
             arn: arn.clone(),
             name: input.name,
             metadata: input.metadata,
             created_timestamp: now,
-            last_updated_timestamp: now,
-            tags: input
-                .tags
-                .unwrap_or_default()
-                .into_iter()
-                .map(|tag| (tag.key, tag.value))
-                .collect(),
+            // Nothing has updated this instance yet, so it has no last-updated instant
+            // to report; the first operation that changes it sets one.
+            last_updated_timestamp: None,
             users: ::std::collections::BTreeMap::new(),
         };
 
         state.app_instances.insert(arn.clone(), record);
+        if !tags.is_empty() {
+            tag_directory.lock().tag(&arn, tags);
+        }
         // The instance is stored either way; at the structural token ceiling the token
         // is simply not recorded, so the map cannot grow past it.
         let _recorded = state.record_idempotency(Self::NAME, &input.client_request_token, &arn);

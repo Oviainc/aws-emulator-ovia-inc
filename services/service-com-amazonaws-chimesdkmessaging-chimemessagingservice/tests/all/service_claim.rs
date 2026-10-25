@@ -374,10 +374,11 @@ fn cases() -> Vec<Case> {
         // The ONE residual shared route: `GET /tags` is declared IDENTICALLY by five of
         // the six models, and nothing on the wire distinguishes them once the host names
         // no endpoint — each of the five owns a DIFFERENT resource space, named only by
-        // the ARN the request carries. So the family rule resolves that route by ENDPOINT
-        // PREFIX only: on the emulator's own host no member claims it, and pointed at a
-        // member's endpoint host exactly one does. Pinned so the behaviour is not
-        // mistaken for an oversight.
+        // the ARN the request carries, which tag and untag put in the BODY. So the family
+        // rule resolves that route by ENDPOINT PREFIX, and for a request naming none by
+        // the family's DECLARED tagging owner (Chime SDK Identity), which answers out of
+        // the tag directory every member shares: this service claims it only at its own
+        // endpoint host. Pinned so the behaviour is not mistaken for an oversight.
         Case {
             name: "the tagging route five family models share: GET /tags",
             method: "GET",

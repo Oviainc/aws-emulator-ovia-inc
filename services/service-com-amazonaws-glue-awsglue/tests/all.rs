@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/batch_get_jobs.rs"]
 mod batch_get_jobs;
+#[path = "all/batch_stop_job_run.rs"]
+mod batch_stop_job_run;
 #[path = "all/catalog_identity.rs"]
 mod catalog_identity;
 #[path = "all/catalog_mutations.rs"]

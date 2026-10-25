@@ -3,8 +3,9 @@
 //! @op DeleteBackup
 //! IMPLEMENTED: removes the one backup a `BackupArn` names from the catalogue and
 //! reports the record it removed, in the `DELETED` status that removal leaves it in. A
-//! backup still being created is refused rather than removed, and an ARN this region
-//! holds no backup for answers the `BackupNotFoundException` this operation models.
+//! backup still being created, or one a restore still has, is refused rather than
+//! removed, and an ARN this region holds no backup for answers the
+//! `BackupNotFoundException` this operation models.
 //!
 //! ## Shape of an operation
 //!
@@ -158,19 +159,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.apply_due_transitions(now);
         // "There is another ongoing conflicting backup control plane operation on the
         // table. The backup is either being created, deleted or restored to a table"
-        // (`BackupInUseException`): a backup the clock has not finished creating yet is
-        // not one to remove.
-        if store
+        // (`BackupInUseException`): a backup the clock has not finished creating yet, or
+        // one a restore still has, is not one to remove.
+        if let Some(message) = store
             .backup(&region, &input.backup_arn)
             .map_err(lift)?
-            .still_creating(now)
+            .in_use_message(now)
         {
             return Err(DeleteBackupErrorModeled::BackupInUseException(
                 BackupInUseException {
-                    message: Some(format!(
-                        "Backup is being created: {}",
-                        input.backup_arn
-                    )),
+                    message: Some(message),
                 },
             )
             .into());

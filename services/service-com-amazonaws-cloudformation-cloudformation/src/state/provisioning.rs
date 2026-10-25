@@ -134,6 +134,16 @@
 //! tells a re-deploy to carry the recorded identifier forward rather than read the
 //! resource as replaced.
 //!
+//! A resource of ANOTHER such resource — a Resolver rule routing through a Resolver
+//! endpoint of the same template — names it by a reference the declaration resolved before
+//! either existed, so that property holds the stand-in the naming rules computed. Once the
+//! endpoint's create has answered, a property of a resource this walk has not reached yet
+//! whose value IS that stand-in is re-pointed at the minted identifier
+//! ([`repoint_references`]): the create carries the identifier the owning service knows its
+//! dependency by. A LATER deployment resolves its declarations against the identifiers the
+//! stack already has ([`super::StoredStack::deploy_template`]), which is what makes a
+//! re-deploy of the same template read as unchanged.
+//!
 //! ## Identity, and the isolation these calls can and cannot carry
 //!
 //! The call is signed with the EMULATOR's own credentials, because that is what they are
@@ -453,8 +463,18 @@ pub async fn reconcile(
     previous: &[StoredResource],
 ) -> Materialised {
     let mut outcome = Materialised::default();
+    // The identifiers the owning services MINTED in this walk, each against the stand-in
+    // the naming rules had computed for that resource ([`repoint_references`]).
+    let mut minted: Vec<(String, String)> = Vec::new();
     let mut declared = declared.into_iter();
     for mut resource in declared.by_ref() {
+        // A property of this resource naming one created EARLIER in this walk carries the
+        // stand-in id that resource had when the declaration was resolved, which is not the
+        // id its owning service went on to mint. The reference is re-pointed at the minted
+        // one before anything is asked about this resource, so the create carries the
+        // identifier its service knows the dependency by — and so the comparison below
+        // reads an UNCHANGED declaration as unchanged.
+        repoint_references(&mut resource.properties, &minted);
         if let Some(existing) = previous
             .iter()
             .find(|existing| existing.materialised && is_same_resource(existing, &resource))
@@ -575,7 +595,11 @@ pub async fn reconcile(
             // itself, where that service ASSIGNS the id rather than taking it from a name
             // the template or CloudFormation decided.
             Ok(created) => {
+                let computed = resource.physical_resource_id.clone();
                 adopt_minted_identity(&mut resource, created.physical_resource_id);
+                if resource.physical_resource_id != computed {
+                    minted.push((computed, resource.physical_resource_id.clone()));
+                }
                 resource.attributes.extend(created.attributes);
                 resource.materialised = true;
                 outcome
@@ -608,6 +632,7 @@ pub async fn reconcile(
     // exists in its owning service and keeps the record that says so, so the stack's
     // deletion still deletes it.
     for mut resource in declared {
+        repoint_references(&mut resource.properties, &minted);
         if let Some(existing) = previous
             .iter()
             .find(|existing| existing.materialised && is_same_resource(existing, &resource))
@@ -658,6 +683,67 @@ pub async fn reconcile(
     // in.
     outcome.transitions.extend(deleted.transitions);
     outcome
+}
+
+/// How deep [`repoint_references`] walks a property document.
+///
+/// The document's nesting is the REQUESTER's, and a recursive walk bounded by its input
+/// exhausts the native stack — which aborts the process rather than failing one stack. Past
+/// this depth the values are left exactly as they are: a reference to another resource is a
+/// property of it, never a hundred levels inside one.
+const MAX_REPOINTED_NESTING: usize = 64;
+
+/// Re-point every reference inside one property document from the stand-in identifier a
+/// resource was given before its create to the identifier its owning service MINTED.
+///
+/// The rule: a reference to a resource resolves to the identifier that resource really has,
+/// and for a type whose identity its owning service assigns
+/// ([`super::template::identity_is_service_assigned`]) that identifier only exists once the
+/// create has answered. A declaration is resolved before any of them have, so a property
+/// naming such a resource (`ResolverRuleId: !Ref Rule`) holds the stand-in the naming rules
+/// computed; `minted` pairs each stand-in with what its service answered, and a property
+/// whose value IS one of those stand-ins becomes the minted identifier.
+///
+/// Matched WHOLE value, never as a substring: a reference resolved to the stand-in is the
+/// entire scalar, while a stand-in is often the NAME the declaration asked for — so a
+/// longer value that merely contains one (an association named `<rule name>-assoc`) is a
+/// value of its own and is left exactly as written.
+///
+/// Called by [`reconcile`] for the identifiers minted in the walk it is driving. A resource
+/// is never re-pointed with its OWN pair — it cannot reference itself, and for a type whose
+/// stand-in is the name it declares that pair would rewrite that very property. The
+/// identifiers a stack ALREADY has are not substituted at all:
+/// [`super::StoredStack::deploy_template`] resolves the declarations against them instead.
+fn repoint_references(properties: &mut Value, minted: &[(String, String)]) {
+    repoint(properties, minted, 0);
+}
+
+/// [`repoint_references`] over one value, `depth` levels into the document.
+fn repoint(properties: &mut Value, minted: &[(String, String)], depth: usize) {
+    if minted.is_empty() || depth >= MAX_REPOINTED_NESTING {
+        return;
+    }
+    match properties {
+        Value::String(text) => {
+            if let Some((_, assigned)) = minted
+                .iter()
+                .find(|(computed, _)| computed.as_str() == text.as_str())
+            {
+                *text = assigned.clone();
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                repoint(item, minted, depth + 1);
+            }
+        }
+        Value::Object(members) => {
+            for value in members.values_mut() {
+                repoint(value, minted, depth + 1);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Record the identity an owning service ASSIGNED to a resource it created: the id its

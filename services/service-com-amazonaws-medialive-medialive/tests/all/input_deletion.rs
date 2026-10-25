@@ -16,9 +16,13 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::channel_lifecycle::wait_for_the_clock;
+use crate::support::resolved_input_body;
 use crate::wire::{call, error_code, error_message, medialive};
 
+/// The ids an input configuration names are resolved first, so every create in
+/// this suite is one the service can ingest through (`crate::support`).
 async fn create_input(router: &MultiServiceRouter, case: &str, body: Value) -> Value {
+    let body = resolved_input_body(router, body).await;
     let (status, response) = call(router, "POST", "/prod/inputs", Some(body)).await;
     assert_eq!(
         status, 201,

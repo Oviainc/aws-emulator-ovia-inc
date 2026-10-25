@@ -112,8 +112,16 @@ fn not_owned(member: &str) -> String {
     )
 }
 
-pub(crate) async fn create_members(
+/// The Region the member suites call through unless a case names another: the one
+/// [`call`] signs for.
+pub(crate) const DEFAULT_REGION: &str = "us-east-1";
+
+/// `CreateMembers` through `region`'s endpoint. The region-less [`create_members`]
+/// is this with [`DEFAULT_REGION`], so a suite that spans two administrators and a
+/// suite that stays in one share ONE member-call harness.
+pub(crate) async fn create_members_in(
     router: &Router,
+    region: &str,
     detector_id: &str,
     accounts: &[(&str, &str)],
 ) -> (u16, Value) {
@@ -121,11 +129,38 @@ pub(crate) async fn create_members(
         .iter()
         .map(|(account_id, email)| json!({"accountId": account_id, "email": email}))
         .collect();
-    call(
+    call_in(
         router,
+        region,
         "POST",
         &format!("/detector/{detector_id}/member"),
         Some(json!({"accountDetails": details})),
+    )
+    .await
+}
+
+pub(crate) async fn create_members(
+    router: &Router,
+    detector_id: &str,
+    accounts: &[(&str, &str)],
+) -> (u16, Value) {
+    create_members_in(router, DEFAULT_REGION, detector_id, accounts).await
+}
+
+/// `GetMembers` through `region`'s endpoint, with [`get_members`] over it exactly as
+/// [`create_members_in`] carries [`create_members`].
+pub(crate) async fn get_members_in(
+    router: &Router,
+    region: &str,
+    detector_id: &str,
+    account_ids: &[&str],
+) -> (u16, Value) {
+    call_in(
+        router,
+        region,
+        "POST",
+        &format!("/detector/{detector_id}/member/get"),
+        Some(json!({"accountIds": account_ids})),
     )
     .await
 }
@@ -135,13 +170,7 @@ pub(crate) async fn get_members(
     detector_id: &str,
     account_ids: &[&str],
 ) -> (u16, Value) {
-    call(
-        router,
-        "POST",
-        &format!("/detector/{detector_id}/member/get"),
-        Some(json!({"accountIds": account_ids})),
-    )
-    .await
+    get_members_in(router, DEFAULT_REGION, detector_id, account_ids).await
 }
 
 pub(crate) async fn disassociate_members(

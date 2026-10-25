@@ -214,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let Some(application) = store.applications.get(&input.application_id) else {
+        let Some(application) = store.application(&input.application_id) else {
             return Err(CreateHostedConfigurationVersionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::application_not_found(
@@ -374,8 +374,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let Some(profile) = store
-            .applications
-            .get_mut(&input.application_id)
+            .application_mut(&input.application_id)
             .and_then(|application| {
                 application
                     .profiles

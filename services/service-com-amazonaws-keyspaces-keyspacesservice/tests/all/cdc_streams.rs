@@ -56,12 +56,12 @@ fn cdc_settle_wait() -> Duration {
 /// `tests/all/keyspace_table_lifecycle.rs`'s harness mounts only the control plane,
 /// which is all its suites need; this one mounts the pair because the rules here are
 /// precisely about what crosses between them.
-struct Cdc {
+pub(crate) struct Cdc {
     router: MultiServiceRouter,
 }
 
 impl Cdc {
-    fn start() -> Self {
+    pub(crate) fn start() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signature verification is the emulator's own concern and is exercised
@@ -80,14 +80,14 @@ impl Cdc {
     }
 
     /// One Amazon Keyspaces call (`X-Amz-Target: KeyspacesService.<Op>`).
-    async fn keyspaces(&self, operation: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn keyspaces(&self, operation: &str, body: Value) -> (u16, Value) {
         self.dispatch("cassandra", "KeyspacesService", operation, body)
             .await
     }
 
     /// One KeyspacesStreams call (`X-Amz-Target: KeyspacesStreams.<Op>`), at that
     /// service's own endpoint host.
-    async fn streams(&self, operation: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn streams(&self, operation: &str, body: Value) -> (u16, Value) {
         self.dispatch("cassandra-streams", "KeyspacesStreams", operation, body)
             .await
     }
@@ -134,7 +134,7 @@ impl Cdc {
     }
 
     /// Create `keyspace`, failing the test if it cannot be created.
-    async fn create_keyspace(&self, keyspace: &str) {
+    pub(crate) async fn create_keyspace(&self, keyspace: &str) {
         assert_ok(
             keyspace,
             self.keyspaces("CreateKeyspace", json!({"keyspaceName": keyspace}))
@@ -143,7 +143,7 @@ impl Cdc {
     }
 
     /// `GetTable` for one table, as a 200 body.
-    async fn get_table(&self, case: &str, keyspace: &str, table: &str) -> Value {
+    pub(crate) async fn get_table(&self, case: &str, keyspace: &str, table: &str) -> Value {
         assert_ok(
             case,
             self.keyspaces(
@@ -155,7 +155,12 @@ impl Cdc {
     }
 
     /// The stream ARNs KeyspacesStreams lists for one table, in the order it lists them.
-    async fn listed_stream_arns(&self, case: &str, keyspace: &str, table: &str) -> Vec<String> {
+    pub(crate) async fn listed_stream_arns(
+        &self,
+        case: &str,
+        keyspace: &str,
+        table: &str,
+    ) -> Vec<String> {
         let listed = assert_ok(
             case,
             self.streams(
@@ -174,7 +179,7 @@ impl Cdc {
 }
 
 /// The CDC members of a `GetTable` report, as `(status, viewType, latestStreamArn)`.
-fn reported_cdc(table: &Value) -> (Option<String>, Option<String>, Option<String>) {
+pub(crate) fn reported_cdc(table: &Value) -> (Option<String>, Option<String>, Option<String>) {
     let text = |value: &Value| value.as_str().map(str::to_string);
     (
         text(&table["cdcSpecification"]["status"]),

@@ -338,6 +338,23 @@ pub fn is_trace_id(value: &str) -> bool {
     hex(epoch, 8) && hex(unique, 24)
 }
 
+/// What a READ asked for a trace id that is not of [`is_trace_id`]'s form is
+/// refused with: X-Ray's template, naming the value the request carried and the
+/// rule it broke, and nothing else.
+///
+/// Written once because every reader that takes a `TraceId` refuses the same
+/// malformed id the same way, whichever member carried it.
+pub fn malformed_trace_id_message(trace_id: &str) -> String {
+    format!("Invalid trace id {trace_id}: incorrect id format")
+}
+
+/// What a read naming more trace ids than [`MAX_TRACE_IDS_PER_CALL`] is refused
+/// with: X-Ray's fixed phrase, which states the limit itself — the model
+/// publishes none, so the refusal is the only place a client can read it.
+pub fn exceeding_maximum_query_size_message() -> String {
+    format!("Exceeding maximum query size: {MAX_TRACE_IDS_PER_CALL}")
+}
+
 // ---------------------------------------------------------------------------
 // Bounds on caller-driven work and growth
 //
@@ -3231,26 +3248,111 @@ pub mod filter_expression {
         /// The expression was absent, empty or only whitespace. X-Ray treats an
         /// omitted `FilterExpression` and an empty one identically.
         Empty,
-        /// The expression does not parse.
-        Syntax(String),
-        /// The expression addresses a field X-Ray does not index.
-        UnknownField(String),
+        /// The expression holds input this language does not admit, at the place
+        /// the parse gave up: the line and the one-based column of that place,
+        /// and the input read there.
+        InvalidSymbol {
+            /// The one-based line the parse gave up on.
+            line: usize,
+            /// The one-based column within that line.
+            position: usize,
+            /// The input read at that place and not admitted.
+            symbol: String,
+        },
+        /// The expression broke a bound this emulator declares on how much
+        /// parsing one request may drive ([`MAX_LENGTH`], [`MAX_DEPTH`]) —
+        /// which is this emulator's limit rather than a refusal of the
+        /// language, so it states the limit instead of a location in the input.
+        Bound(String),
     }
 
     impl Error {
-        /// What to tell the caller. The empty case carries X-Ray's own fixed
-        /// wording; the other two are built from the request, naming the field
-        /// or the token at fault so the caller can fix the expression.
+        /// What to tell the caller.
+        ///
+        /// A parse failure carries X-Ray's own template: the location the parse
+        /// gave up at and the input symbol it could not read there, which is
+        /// the actionable part of the refusal — it points at the characters that
+        /// broke the expression. The empty case carries X-Ray's fixed wording,
+        /// and a bound this emulator adds states that bound.
         #[must_use]
         pub fn message(&self) -> String {
             match self {
                 Self::Empty => "Filter Expression is empty".to_string(),
-                Self::Syntax(detail) => format!("Invalid filter expression: {detail}"),
-                Self::UnknownField(path) => {
-                    format!("Invalid filter expression: `{path}` is not an indexed field")
-                }
+                Self::InvalidSymbol {
+                    line,
+                    position,
+                    symbol,
+                } => format!(
+                    "Error Location: line {line}, position {position} : Invalid input symbol: '{symbol}'"
+                ),
+                Self::Bound(detail) => format!("Invalid filter expression: {detail}"),
             }
         }
+    }
+
+    /// The refusal for input at character offset `at` of `expression` that this
+    /// language does not admit: where that offset falls, and the `symbol` read
+    /// there.
+    fn invalid_symbol(expression: &[char], at: usize, symbol: String) -> Error {
+        let before = expression.get(..at.min(expression.len())).unwrap_or_default();
+        Error::InvalidSymbol {
+            line: 1 + before.iter().filter(|character| **character == '\n').count(),
+            position: before
+                .iter()
+                .rev()
+                .take_while(|character| **character != '\n')
+                .count()
+                + 1,
+            symbol,
+        }
+    }
+
+    /// The punctuation a token may begin with, beside the two string quotes —
+    /// the lexemes [`could_begin_a_token`] judges a run of input against.
+    const PUNCTUATION: &[&str] = &[
+        "\"", "'", "(", ")", "{", "}", ",", ":", "=", "!=", "<", "<=", ">", ">=",
+    ];
+
+    /// The words that are not keyword paths: the boolean operators, the boolean
+    /// literals, and the word comparisons [`WORD_COMPARISONS`] names.
+    const WORD_TOKENS: &[&str] = &[
+        "and", "or", "not", "true", "false", "contains", "beginswith", "startswith", "endswith",
+    ];
+
+    /// Whether `text` could still grow into a token of this language: some
+    /// keyword, word token or punctuation mark begins with it, or it is a
+    /// keyword root followed by a caller-chosen suffix (`annotation.<key>`).
+    ///
+    /// This is what decides how much input a refusal reports: a tokenizer reads
+    /// as far as a token could still reach and names what it had read when the
+    /// next character could no longer belong to one.
+    fn could_begin_a_token(text: &str) -> bool {
+        if text.is_empty() {
+            return true;
+        }
+        let lowered = text.to_ascii_lowercase();
+        KEYWORDS.iter().any(|keyword| keyword.starts_with(&lowered))
+            || WORD_TOKENS.iter().any(|word| word.starts_with(&lowered))
+            || KEYWORD_PREFIXES
+                .iter()
+                .any(|prefix| prefix.starts_with(&lowered) || lowered.starts_with(prefix))
+            || PUNCTUATION.iter().any(|mark| mark.starts_with(text))
+    }
+
+    /// The input a tokenizer reports when it cannot read a token at `rest`: the
+    /// longest run there that could still have become one
+    /// ([`could_begin_a_token`]), plus the character that could not belong to
+    /// it.
+    fn unreadable_symbol(rest: &[char]) -> String {
+        let mut read = 0;
+        for take in 1..=rest.len() {
+            let candidate: String = rest[..take].iter().collect();
+            if !could_begin_a_token(&candidate) {
+                break;
+            }
+            read = take;
+        }
+        rest[..(read + 1).min(rest.len())].iter().collect()
     }
 
     /// One lexical item.
@@ -3354,33 +3456,38 @@ pub mod filter_expression {
         },
     }
 
-    /// How a token reads in a refusal message.
-    fn describe(token: &Token) -> String {
-        match token {
-            Token::Field(path) => format!("`{path}`"),
-            Token::Text(text) => format!("the string `{text}`"),
-            Token::Number(number) => format!("the number `{number}`"),
-            Token::Boolean(value) => format!("`{value}`"),
-            Token::And => "`AND`".to_string(),
-            Token::Or => "`OR`".to_string(),
-            Token::Not => "`NOT`".to_string(),
-            Token::Comparison(_) => "a comparison operator".to_string(),
-            Token::OpenParen => "`(`".to_string(),
-            Token::CloseParen => "`)`".to_string(),
-            Token::OpenBrace => "`{`".to_string(),
-            Token::CloseBrace => "`}`".to_string(),
-            Token::Comma => "`,`".to_string(),
-            Token::Colon => "`:`".to_string(),
-        }
+    /// One lexical item and the span of the expression it occupies, in
+    /// characters — which is what lets a refusal name the place the parse gave
+    /// up and the input it had read there.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Spanned {
+        /// The item.
+        token: Token,
+        /// The character offset the item starts at.
+        start: usize,
+        /// The character offset just past the item.
+        end: usize,
     }
 
-    /// Split `expression` into tokens, refusing anything that is not one.
-    fn tokenize(expression: &str) -> Result<Vec<Token>, Error> {
-        let characters: Vec<char> = expression.chars().collect();
-        let mut tokens = Vec::new();
+    /// Split `expression` into tokens, refusing anything that is not one at the
+    /// place it was read.
+    fn tokenize(characters: &[char]) -> Result<Vec<Spanned>, Error> {
+        let mut tokens: Vec<Spanned> = Vec::new();
         let mut at = 0;
+        // Push one token, remembering the span it occupies. Called once the
+        // walk has stepped past the item, so `at` is its end.
+        macro_rules! push {
+            ($start:expr, $token:expr) => {
+                tokens.push(Spanned {
+                    token: $token,
+                    start: $start,
+                    end: at,
+                })
+            };
+        }
         while at < characters.len() {
             let character = characters[at];
+            let start = at;
             match character {
                 whitespace if whitespace.is_whitespace() => at += 1,
                 '"' | '\'' => {
@@ -3388,15 +3495,22 @@ pub mod filter_expression {
                     let mut text = String::new();
                     loop {
                         match characters.get(at) {
+                            // A string the expression never closes runs to the
+                            // end of the input, so that whole run is the input
+                            // read and not admitted.
                             None => {
-                                return Err(Error::Syntax(format!(
-                                    "unterminated string literal, expected a closing {character}"
-                                )))
+                                return Err(invalid_symbol(
+                                    characters,
+                                    start,
+                                    characters[start..].iter().collect(),
+                                ))
                             }
                             Some('\\') => {
                                 let Some(escaped) = characters.get(at + 1) else {
-                                    return Err(Error::Syntax(
-                                        "the expression ends in a trailing `\\`".to_string(),
+                                    return Err(invalid_symbol(
+                                        characters,
+                                        start,
+                                        characters[start..].iter().collect(),
                                     ));
                                 };
                                 text.push(*escaped);
@@ -3412,61 +3526,65 @@ pub mod filter_expression {
                             }
                         }
                     }
-                    tokens.push(Token::Text(text));
+                    push!(start, Token::Text(text));
                 }
                 '(' => {
-                    tokens.push(Token::OpenParen);
                     at += 1;
+                    push!(start, Token::OpenParen);
                 }
                 ')' => {
-                    tokens.push(Token::CloseParen);
                     at += 1;
+                    push!(start, Token::CloseParen);
                 }
                 '{' => {
-                    tokens.push(Token::OpenBrace);
                     at += 1;
+                    push!(start, Token::OpenBrace);
                 }
                 '}' => {
-                    tokens.push(Token::CloseBrace);
                     at += 1;
+                    push!(start, Token::CloseBrace);
                 }
                 ',' => {
-                    tokens.push(Token::Comma);
                     at += 1;
+                    push!(start, Token::Comma);
                 }
                 ':' => {
-                    tokens.push(Token::Colon);
                     at += 1;
+                    push!(start, Token::Colon);
                 }
                 '=' => {
-                    tokens.push(Token::Comparison(Operator::Equal));
                     at += 1;
+                    push!(start, Token::Comparison(Operator::Equal));
                 }
                 '<' | '>' => {
                     let inclusive = characters.get(at + 1) == Some(&'=');
                     at += usize::from(inclusive) + 1;
-                    tokens.push(Token::Comparison(match (character, inclusive) {
-                        ('<', false) => Operator::Less,
-                        ('<', true) => Operator::LessOrEqual,
-                        (_, false) => Operator::Greater,
-                        (_, true) => Operator::GreaterOrEqual,
-                    }));
+                    push!(
+                        start,
+                        Token::Comparison(match (character, inclusive) {
+                            ('<', false) => Operator::Less,
+                            ('<', true) => Operator::LessOrEqual,
+                            (_, false) => Operator::Greater,
+                            (_, true) => Operator::GreaterOrEqual,
+                        })
+                    );
                 }
                 '!' => {
                     if characters.get(at + 1) != Some(&'=') {
-                        return Err(Error::Syntax(
-                            "`!` is only valid as part of `!=`".to_string(),
+                        return Err(invalid_symbol(
+                            characters,
+                            start,
+                            unreadable_symbol(&characters[start..]),
                         ));
                     }
-                    tokens.push(Token::Comparison(Operator::NotEqual));
                     at += 2;
+                    push!(start, Token::Comparison(Operator::NotEqual));
                 }
                 digit
                     if digit.is_ascii_digit()
                         || (digit == '-'
                             && characters.get(at + 1).is_some_and(char::is_ascii_digit)) =>
                 {
-                    let start = at;
                     at += 1;
                     while characters
                         .get(at)
@@ -3475,13 +3593,12 @@ pub mod filter_expression {
                         at += 1;
                     }
                     let literal: String = characters[start..at].iter().collect();
-                    let number = literal.parse::<f64>().map_err(|_| {
-                        Error::Syntax(format!("`{literal}` is not a number"))
-                    })?;
-                    tokens.push(Token::Number(number));
+                    let Ok(number) = literal.parse::<f64>() else {
+                        return Err(invalid_symbol(characters, start, literal));
+                    };
+                    push!(start, Token::Number(number));
                 }
                 word if word.is_alphabetic() || word == '_' => {
-                    let start = at;
                     while characters
                         .get(at)
                         .is_some_and(|next| next.is_alphanumeric() || "_.-".contains(*next))
@@ -3489,7 +3606,7 @@ pub mod filter_expression {
                         at += 1;
                     }
                     let word: String = characters[start..at].iter().collect();
-                    tokens.push(if word.eq_ignore_ascii_case("and") {
+                    let token = if word.eq_ignore_ascii_case("and") {
                         Token::And
                     } else if word.eq_ignore_ascii_case("or") {
                         Token::Or
@@ -3503,10 +3620,15 @@ pub mod filter_expression {
                         Token::Comparison(operator)
                     } else {
                         Token::Field(word)
-                    });
+                    };
+                    push!(start, token);
                 }
-                other => {
-                    return Err(Error::Syntax(format!("unexpected character `{other}`")));
+                _ => {
+                    return Err(invalid_symbol(
+                        characters,
+                        start,
+                        unreadable_symbol(&characters[start..]),
+                    ));
                 }
             }
         }
@@ -3523,22 +3645,25 @@ pub mod filter_expression {
     /// argument   := [label ":"] operand
     /// operand    := text | number | boolean | keyword
     /// ```
-    struct Parser {
-        tokens: Vec<Token>,
+    struct Parser<'a> {
+        /// The expression's characters, so a refusal can name where in the
+        /// input the walk gave up and what it was reading there.
+        source: &'a [char],
+        tokens: Vec<Spanned>,
         at: usize,
     }
 
-    impl Parser {
+    impl Parser<'_> {
         fn peek(&self) -> Option<&Token> {
-            self.tokens.get(self.at)
+            self.tokens.get(self.at).map(|spanned| &spanned.token)
         }
 
-        fn take(&mut self) -> Option<Token> {
-            let token = self.tokens.get(self.at).cloned();
-            if token.is_some() {
-                self.at += 1;
-            }
-            token
+        /// Where the item the walk is looking at begins — the end of the input
+        /// when there is none left.
+        fn peek_start(&self) -> usize {
+            self.tokens
+                .get(self.at)
+                .map_or(self.source.len(), |spanned| spanned.start)
         }
 
         fn eat(&mut self, token: &Token) -> bool {
@@ -3549,19 +3674,46 @@ pub mod filter_expression {
             false
         }
 
-        /// What the walk is looking at, for a refusal message.
-        fn found(&self) -> String {
-            match self.peek() {
-                Some(token) => format!(", found {}", describe(token)),
-                None => ", found the end of the expression".to_string(),
+        /// The refusal for the item the walk cannot read: located where that
+        /// item begins, and naming the item itself — the input symbol that
+        /// could not stand there. When the expression ran OUT before the grammar
+        /// did there is no symbol to name, so the refusal is located at the end
+        /// of the input and names the whole expression.
+        fn invalid(&self) -> Error {
+            match self.tokens.get(self.at) {
+                Some(spanned) => invalid_symbol(
+                    self.source,
+                    spanned.start,
+                    self.source
+                        .get(spanned.start..spanned.end)
+                        .unwrap_or_default()
+                        .iter()
+                        .collect(),
+                ),
+                None => invalid_symbol(
+                    self.source,
+                    self.source.len(),
+                    self.source.iter().collect(),
+                ),
             }
         }
 
-        fn expect(&mut self, token: &Token, what: &str) -> Result<(), Error> {
+        /// The refusal for input at `start` that is not a token of this
+        /// language at all, as the tokenizer states one: the run it could read
+        /// there and the character that broke it.
+        fn unreadable_at(&self, start: usize) -> Error {
+            invalid_symbol(
+                self.source,
+                start,
+                unreadable_symbol(self.source.get(start..).unwrap_or_default()),
+            )
+        }
+
+        fn expect(&mut self, token: &Token) -> Result<(), Error> {
             if self.eat(token) {
                 return Ok(());
             }
-            Err(Error::Syntax(format!("expected {what}{}", self.found())))
+            Err(self.invalid())
         }
 
         fn expression(&mut self, depth: usize) -> Result<Node, Error> {
@@ -3570,8 +3722,8 @@ pub mod filter_expression {
             // which expressions parse does not depend on the fold.
             let mut terms = vec![self.term(depth)?];
             let mut operators: Vec<Token> = Vec::new();
-            while matches!(self.peek(), Some(Token::And | Token::Or)) {
-                let operator = self.take().expect("the token was just peeked");
+            while let Some(operator @ (Token::And | Token::Or)) = self.peek().cloned() {
+                self.at += 1;
                 operators.push(operator);
                 terms.push(self.term(depth)?);
             }
@@ -3580,31 +3732,36 @@ pub mod filter_expression {
 
         fn term(&mut self, depth: usize) -> Result<Node, Error> {
             if depth > MAX_DEPTH {
-                return Err(Error::Syntax(format!(
+                return Err(Error::Bound(format!(
                     "nested more than {MAX_DEPTH} levels deep"
                 )));
             }
-            match self.take() {
-                Some(Token::Not) => Ok(Node::Not(Box::new(self.term(depth + 1)?))),
+            let start = self.peek_start();
+            match self.peek().cloned() {
+                Some(Token::Not) => {
+                    self.at += 1;
+                    Ok(Node::Not(Box::new(self.term(depth + 1)?)))
+                }
                 Some(Token::OpenParen) => {
+                    self.at += 1;
                     let inner = self.expression(depth + 1)?;
-                    self.expect(&Token::CloseParen, "a closing `)`")?;
+                    self.expect(&Token::CloseParen)?;
                     Ok(inner)
                 }
-                Some(Token::Field(path)) => self.predicate(path, depth),
-                Some(other) => Err(Error::Syntax(format!(
-                    "expected a keyword, found {}",
-                    describe(&other)
-                ))),
-                None => Err(Error::Syntax(
-                    "expected a keyword, found the end of the expression".to_string(),
-                )),
+                Some(Token::Field(path)) => {
+                    self.at += 1;
+                    self.predicate(path, start, depth)
+                }
+                _ => Err(self.invalid()),
             }
         }
 
-        fn predicate(&mut self, path: String, depth: usize) -> Result<Node, Error> {
+        fn predicate(&mut self, path: String, start: usize, depth: usize) -> Result<Node, Error> {
+            // A word that names no field of the language is not a keyword this
+            // grammar has a token for at all, so it is reported where it was
+            // read rather than as a field that merely is not indexed.
             if !is_indexed_field(&path) {
-                return Err(Error::UnknownField(path));
+                return Err(self.unreadable_at(start));
             }
             let arguments = if self.eat(&Token::OpenParen) {
                 self.arguments()?
@@ -3613,7 +3770,7 @@ pub mod filter_expression {
             };
             if self.eat(&Token::OpenBrace) {
                 let block = self.expression(depth + 1)?;
-                self.expect(&Token::CloseBrace, "a closing `}`")?;
+                self.expect(&Token::CloseBrace)?;
                 return Ok(Node::Predicate {
                     path,
                     arguments,
@@ -3644,9 +3801,10 @@ pub mod filter_expression {
                 // The label is a member of the keyword, not a field of its own,
                 // so it is not looked up in the catalog.
                 let mut label = None;
-                if let (Some(Token::Field(name)), Some(&Token::Colon)) =
-                    (self.peek(), self.tokens.get(self.at + 1))
-                {
+                if let (Some(Token::Field(name)), Some(Token::Colon)) = (
+                    self.peek(),
+                    self.tokens.get(self.at + 1).map(|spanned| &spanned.token),
+                ) {
                     label = Some(name.clone());
                     self.at += 2;
                 }
@@ -3658,29 +3816,26 @@ pub mod filter_expression {
                     break;
                 }
             }
-            self.expect(&Token::CloseParen, "a closing `)`")?;
+            self.expect(&Token::CloseParen)?;
             Ok(arguments)
         }
 
         fn operand(&mut self) -> Result<Operand, Error> {
-            match self.take() {
-                Some(Token::Text(text)) => Ok(Operand::Text(text)),
-                Some(Token::Number(number)) => Ok(Operand::Number(number)),
-                Some(Token::Boolean(value)) => Ok(Operand::Boolean(value)),
+            let start = self.peek_start();
+            let operand = match self.peek().cloned() {
+                Some(Token::Text(text)) => Operand::Text(text),
+                Some(Token::Number(number)) => Operand::Number(number),
+                Some(Token::Boolean(value)) => Operand::Boolean(value),
                 Some(Token::Field(path)) => {
-                    if is_indexed_field(&path) {
-                        return Ok(Operand::Field(path));
+                    if !is_indexed_field(&path) {
+                        return Err(self.unreadable_at(start));
                     }
-                    Err(Error::UnknownField(path))
+                    Operand::Field(path)
                 }
-                Some(other) => Err(Error::Syntax(format!(
-                    "expected a value, found {}",
-                    describe(&other)
-                ))),
-                None => Err(Error::Syntax(
-                    "expected a value, found the end of the expression".to_string(),
-                )),
-            }
+                _ => return Err(self.invalid()),
+            };
+            self.at += 1;
+            Ok(operand)
         }
     }
 
@@ -3731,20 +3886,19 @@ pub mod filter_expression {
             return Err(Error::Empty);
         }
         if expression.chars().count() > MAX_LENGTH {
-            return Err(Error::Syntax(format!(
+            return Err(Error::Bound(format!(
                 "longer than the {MAX_LENGTH} characters this emulator parses"
             )));
         }
+        let characters: Vec<char> = expression.chars().collect();
         let mut parser = Parser {
-            tokens: tokenize(expression)?,
+            source: &characters,
+            tokens: tokenize(&characters)?,
             at: 0,
         };
         let node = parser.expression(0)?;
-        if let Some(trailing) = parser.peek() {
-            return Err(Error::Syntax(format!(
-                "unexpected trailing {}",
-                describe(trailing)
-            )));
+        if parser.peek().is_some() {
+            return Err(parser.invalid());
         }
         Ok(node)
     }
@@ -3792,6 +3946,18 @@ pub fn epoch_seconds(timestamp: &::aws_smithy_types::DateTime) -> f64 {
 // [StartTime, EndTime] windows
 // ---------------------------------------------------------------------------
 
+/// What X-Ray tells a caller whose `EndTime` is before its `StartTime`.
+///
+/// A FIXED service text, not a sentence computed from the request: the refusal
+/// names neither bound, so the same words answer the same mistake on every
+/// operation that takes a window, and nothing in it varies from run to run.
+pub const INVERTED_WINDOW_MESSAGE: &str = "End time cannot be earlier than start time";
+
+/// The preamble a refused request PARAMETER is stated under by the operations
+/// that word it that way (`StartTraceRetrieval`), ahead of the sentence naming
+/// what was wrong with it.
+pub const INVALID_INPUT_PARAMETERS_PREAMBLE: &str = "Input parameters invalid for request.";
+
 /// Why a `[StartTime, EndTime]` window names no interval of recorded traffic.
 ///
 /// Lives here, beside [`validate_window`], so every operation that takes a
@@ -3807,18 +3973,32 @@ pub enum WindowError {
 }
 
 impl WindowError {
-    /// What to tell the caller, naming the members at fault and the values that
-    /// broke the rule.
+    /// What to tell the caller: the service's own fixed text for an inverted
+    /// window, and — for the bound this emulator adds — the members at fault
+    /// and the values that broke the rule.
     pub fn message(self, start: f64, end: f64) -> String {
         match self {
-            Self::Inverted => format!(
-                "EndTime ({end}) must be at or after StartTime ({start}), in seconds of epoch time"
-            ),
+            Self::Inverted => INVERTED_WINDOW_MESSAGE.to_string(),
             Self::Future => format!(
                 "StartTime ({start}) and EndTime ({end}) must be within {MAX_WINDOW_FUTURE_SKEW_SECONDS} seconds of the present, in seconds of epoch time"
             ),
         }
     }
+}
+
+/// Refuse a `[StartTime, EndTime]` window that runs BACKWARDS: an `EndTime`
+/// before its `StartTime` names no interval at all, whatever instants the two
+/// bounds are.
+///
+/// Split out of [`validate_window`] so a reader that must serve any instant its
+/// store holds — one whose stored timestamps may lie arbitrarily far out — still
+/// refuses an inverted window with the one judgement and the one wording every
+/// other window-taking operation uses.
+pub fn validate_window_order(start: f64, end: f64) -> Result<(), WindowError> {
+    if end < start {
+        return Err(WindowError::Inverted);
+    }
+    Ok(())
 }
 
 /// Refuse a `[StartTime, EndTime]` window that names no interval of recorded
@@ -3832,9 +4012,7 @@ pub fn validate_window(start: f64, end: f64, now: f64) -> Result<(), WindowError
     if !start.is_finite() || !end.is_finite() {
         return Err(WindowError::Future);
     }
-    if end < start {
-        return Err(WindowError::Inverted);
-    }
+    validate_window_order(start, end)?;
     if start > now + MAX_WINDOW_FUTURE_SKEW_SECONDS || end > now + MAX_WINDOW_FUTURE_SKEW_SECONDS {
         return Err(WindowError::Future);
     }
@@ -4246,13 +4424,19 @@ pub fn sampling_rule_name(rule: &SamplingRule) -> Result<&str, SamplingRuleRejec
 
 /// Check a submitted `ResourceARN`: "matches the ARN of the Amazon Web Services
 /// resource on which the service runs"
-/// (`smithy_query(query="shape",shape="SamplingRule")`) — so an ARN, or
-/// [`ANY_RESOURCE_ARN`] for any resource. Written once, because a rule may not
+/// (`smithy_query(query="shape",shape="SamplingRule")`) — so what is judged is
+/// ARN SYNTAX, and the one syntax rule a value can break here is the prefix
+/// every ARN starts with. [`ANY_RESOURCE_ARN`] matches any resource, and a value
+/// that names no resource at all (the empty string) constrains nothing, so
+/// neither is an ARN that has to parse. Written once, because a rule may not
 /// reach a value through `UpdateSamplingRule` that `CreateSamplingRule` refuses.
 pub fn validate_resource_arn(resource_arn: &str) -> Result<(), SamplingRuleRejection> {
-    if resource_arn != ANY_RESOURCE_ARN && !resource_arn.starts_with("arn:") {
+    if resource_arn.is_empty() || resource_arn == ANY_RESOURCE_ARN {
+        return Ok(());
+    }
+    if !resource_arn.starts_with(ARN_PREFIX) {
         return Err(SamplingRuleRejection::Invalid(format!(
-            "ResourceARN must be an ARN or `{ANY_RESOURCE_ARN}`, not `{resource_arn}`"
+            "Invalid resource ARN: {resource_arn}. Malformed ARN - doesn't start with '{ARN_PREFIX}'"
         )));
     }
     Ok(())
@@ -4316,6 +4500,10 @@ pub const SAMPLING_RULE_FORMAT_VERSION: i32 = 1;
 
 /// The `SamplingRule$ResourceARN` that matches any resource.
 pub const ANY_RESOURCE_ARN: &str = "*";
+
+/// What every Amazon Resource Name begins with — the one piece of ARN syntax a
+/// submitted `ResourceARN` is judged against ([`validate_resource_arn`]).
+pub const ARN_PREFIX: &str = "arn:";
 
 /// The `SamplingRule` matcher value that matches anything: the wildcard every
 /// matcher of the service-managed catch-all rule carries.

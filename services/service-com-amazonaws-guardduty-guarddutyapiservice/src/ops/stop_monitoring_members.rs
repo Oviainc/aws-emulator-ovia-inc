@@ -21,11 +21,13 @@
 //! `InvalidInputException` class.
 //!
 //! The contract below also refuses a stop "with autoEnableOrganizationMembers
-//! configuration for your organization set to ALL". That configuration is now
-//! stored — `UpdateOrganizationConfiguration` writes it and
-//! `DescribeOrganizationConfiguration` reports it — so the refusal is implementable
-//! here; it is this operation's own behaviour and is not modelled yet, so a stop
-//! succeeds whatever the organization's auto-enablement says.
+//! configuration for your organization set to ALL": while the administrator's
+//! stored organization configuration auto-enables GuardDuty for every account in
+//! the organization, the organization owns each member relationship, so the whole
+//! call is refused with HTTP 400 under the `InvalidInputException` class
+//! ([`crate::state::organization_managed_members_message`]) and no member moves.
+//! The configuration is the one `UpdateOrganizationConfiguration` writes and
+//! `DescribeOrganizationConfiguration` reports.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -193,8 +195,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         // Only the Region's endpoint that serves the detector administers its
         // members, and only the account that owns it can stop monitoring them.
-        if state.detector_in(&region, &input.detector_id).is_none() {
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
             return Err(not_owned(&input.detector_id));
+        };
+        // An organization that auto-enables GuardDuty for every one of its accounts
+        // keeps it on for all of them, so no member's monitoring can be stopped here
+        // whatever the request names: "you'll receive an error if you attempt to stop
+        // monitoring the member accounts in your organization" (the modelled contract
+        // above). Read before the clock advances, so a refused call changes nothing at
+        // all.
+        if detector.organization.auto_enables_all_members() {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::organization_managed_members_message(
+                    crate::state::STOP_MONITORING_MEMBER_ACTION,
+                ),
+            ));
         }
         // The relationship changes now, so the clock advances once for the whole
         // call: every member this call moves carries the same `UpdatedAt`.

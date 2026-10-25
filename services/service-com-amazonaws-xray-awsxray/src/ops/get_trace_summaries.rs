@@ -188,11 +188,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // [StartTime, EndTime) is a half-open interval, so an EndTime that
         // PRECEDES StartTime describes no interval at all: that is a mistake in
         // the request, refused as invalid, not a window that happens to be
-        // empty. A zero-width window is well formed and selects nothing.
-        if end < start {
-            return Err(invalid_request(
-                "EndTime precedes StartTime, so the requested [StartTime, EndTime) time range is inverted",
-            ));
+        // empty. A zero-width window is well formed and selects nothing. The
+        // judgement and the wording are the crate's ONE window check, shared
+        // with every other operation that takes a required window, so the same
+        // mistake is refused in the same words wherever it is made. This reader
+        // asks only that the window run forwards: it converts whatever instants
+        // the store holds, so it places no bound on how far out a bound lands.
+        if let Err(window) = crate::state::validate_window_order(start, end) {
+            return Err(invalid_request(window.message(start, end)));
         }
 
         // A request asking for behaviour this slice does not implement is
@@ -220,15 +223,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // language with (`crate::state::filter_expression`), compiled into what
         // this reader can answer — and evaluated per trace below. Only an
         // expression that parser refuses, or one this reader cannot evaluate, is
-        // refused, and the refusal names the part at fault; an absent or blank
-        // one selects every trace in the window.
-        let filter = match input
-            .filter_expression
-            .as_deref()
-            .map(str::trim)
-            .filter(|filter| !filter.is_empty())
-        {
+        // refused, and the refusal names the place in the expression at fault;
+        // an absent or blank one selects every trace in the window. The
+        // expression is parsed AS SUBMITTED, so the place a refusal names is an
+        // offset into what the caller sent.
+        let filter = match input.filter_expression.as_deref() {
             None => None,
+            Some(source) if source.trim().is_empty() => None,
             Some(source) => Some(
                 crate::state::filter::parse(source)
                     .map_err(|error| invalid_request(error.message))?,

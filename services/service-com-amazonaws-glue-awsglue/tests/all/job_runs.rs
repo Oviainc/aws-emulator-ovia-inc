@@ -43,18 +43,18 @@ const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/sim2real-glue-job-role";
 /// The lower and upper bound of the window a transition this emulator owes falls due in.
 /// [`JOB_RUN_SETTLES_AFTER`] must sit inside it, and so must every run's stored due
 /// instant.
-const OWED_TRANSITION_WINDOW: (Duration, Duration) =
+pub(crate) const OWED_TRANSITION_WINDOW: (Duration, Duration) =
     (Duration::from_millis(250), Duration::from_millis(750));
 
 /// An emulator plus the engine it runs on, so a test can read and move the due instants
 /// the run lifecycle turns on instead of waiting for them.
-fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     (emulator_on(engine.clone()), engine)
 }
 
 /// A `CreateJob` body: the three `@required` members, plus whatever `extra` adds.
-fn job_body(name: &str, extra: Value) -> Value {
+pub(crate) fn job_body(name: &str, extra: Value) -> Value {
     let mut body = json!({
         "Name": name,
         "Role": ROLE_ARN,
@@ -69,13 +69,17 @@ fn job_body(name: &str, extra: Value) -> Value {
 }
 
 /// Create `name` and start one run of it, answering the id `StartJobRun` minted.
-async fn create_and_start(router: &MultiServiceRouter, name: &str, job: Value) -> String {
+pub(crate) async fn create_and_start(
+    router: &MultiServiceRouter,
+    name: &str,
+    job: Value,
+) -> String {
     ok(router, "CreateJob", &job_body(name, job)).await;
     start_run(router, &json!({ "JobName": name })).await
 }
 
 /// Start a run and answer the `JobRunId` it reports.
-async fn start_run(router: &MultiServiceRouter, body: &Value) -> String {
+pub(crate) async fn start_run(router: &MultiServiceRouter, body: &Value) -> String {
     let started = ok(router, "StartJobRun", body).await;
     started
         .get("JobRunId")
@@ -85,7 +89,7 @@ async fn start_run(router: &MultiServiceRouter, body: &Value) -> String {
 }
 
 /// The `JobRun` structure `GetJobRun` reports for one run.
-async fn get_run(router: &MultiServiceRouter, job_name: &str, run_id: &str) -> Value {
+pub(crate) async fn get_run(router: &MultiServiceRouter, job_name: &str, run_id: &str) -> Value {
     let body = ok(
         router,
         "GetJobRun",
@@ -98,7 +102,10 @@ async fn get_run(router: &MultiServiceRouter, job_name: &str, run_id: &str) -> V
 }
 
 /// The runs one job holds, as the store holds them.
-fn stored_runs(engine: &Arc<engine::InMemoryEngine>, job_name: &str) -> Vec<JobRunEntry> {
+pub(crate) fn stored_runs(
+    engine: &Arc<engine::InMemoryEngine>,
+    job_name: &str,
+) -> Vec<JobRunEntry> {
     let state = engine.state::<ComAmazonawsGlueAwsglueState>();
     let store = state.lock();
     store
@@ -110,7 +117,11 @@ fn stored_runs(engine: &Arc<engine::InMemoryEngine>, job_name: &str) -> Vec<JobR
 
 /// Move the due instant of every unsettled run of `job_name` to `at`, so a test can hold
 /// the transient window open or make the owed transition due without sleeping.
-fn set_due_instant(engine: &Arc<engine::InMemoryEngine>, job_name: &str, at: SystemTime) {
+pub(crate) fn set_due_instant(
+    engine: &Arc<engine::InMemoryEngine>,
+    job_name: &str,
+    at: SystemTime,
+) {
     let state = engine.state::<ComAmazonawsGlueAwsglueState>();
     let mut store = state.lock();
     let job = store
@@ -125,12 +136,12 @@ fn set_due_instant(engine: &Arc<engine::InMemoryEngine>, job_name: &str, at: Sys
 }
 
 /// An instant far enough out that no owed transition falls due during a test.
-fn far_future() -> SystemTime {
+pub(crate) fn far_future() -> SystemTime {
     SystemTime::now() + Duration::from_secs(3600)
 }
 
 /// An instant already past, so the next call settles what the clock owed.
-fn already_past() -> SystemTime {
+pub(crate) fn already_past() -> SystemTime {
     SystemTime::now() - Duration::from_secs(1)
 }
 

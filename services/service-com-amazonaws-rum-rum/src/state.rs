@@ -183,6 +183,126 @@ pub const EXTENDED_METRICS_NAMESPACE: &str = "AWS/RUM";
 /// starts with `AWS/` for your namespace."
 pub const RESERVED_NAMESPACE_PREFIX: &str = "AWS/";
 
+/// One entry of RUM's EXTENDED-metric catalog: the metric name, and the `ValueKey` and
+/// `EventPattern` the model pins for it.
+///
+/// A definition published to the extended-metrics namespace is not free-form — the model
+/// (`MetricDefinitionRequest`) says "Only certain combinations of values for `Name`,
+/// `ValueKey`, and `EventPattern` are valid" and then lists one combination per name — so
+/// the catalog IS the rule, and a definition naming an extended metric is judged against
+/// the row that names it ([`EXTENDED_METRIC_CATALOG`]).
+#[derive(Debug, Clone, Copy)]
+pub struct ExtendedMetric {
+    /// The `Name` this row pins a combination for.
+    pub name: &'static str,
+    /// The `ValueKey` the model requires for this name, or `None` where it requires none
+    /// ("`ValueKey` must be null").
+    pub value_key: Option<&'static str>,
+    /// The JSON object the model requires this name's `EventPattern` to INCLUDE. The
+    /// pattern may carry more than this — "the `EventPattern` can also include information
+    /// used by the `DimensionKeys` field" — so inclusion, not equality, is the rule
+    /// ([`Self::required_event_pattern`], [`event_pattern_includes`]).
+    pub event_pattern: &'static str,
+}
+
+impl ExtendedMetric {
+    /// The required pattern, parsed. `None` only if the literal above is not JSON, which
+    /// would make this row state no requirement at all.
+    pub fn required_event_pattern(&self) -> Option<::serde_json::Value> {
+        ::serde_json::from_str(self.event_pattern).ok()
+    }
+}
+
+/// Every extended metric RUM defines, with the `ValueKey`/`EventPattern` combination the
+/// model pins for each.
+///
+/// Source: the model's `MetricDefinitionRequest` documentation, which lists one "If `Name`
+/// is …, then `ValueKey` must be … and the `EventPattern` must include …" rule per name
+/// (`smithy_query(query="doc", shape="MetricDefinitionRequest")`). The comparison
+/// operators are written here as the characters they are, since the documentation carries
+/// them HTML-escaped, and the two rows whose documented literal is missing a separator
+/// (`NavigationToleratedTransaction`) or carries a stray closing brace (`Http4xxCount`,
+/// `Http5xxCount`) are written as the JSON object those literals describe.
+pub const EXTENDED_METRIC_CATALOG: &[ExtendedMetric] = &[
+    ExtendedMetric {
+        name: "PerformanceNavigationDuration",
+        value_key: Some("event_details.duration"),
+        event_pattern: r#"{"event_type":["com.amazon.rum.performance_navigation_event"]}"#,
+    },
+    ExtendedMetric {
+        name: "PerformanceResourceDuration",
+        value_key: Some("event_details.duration"),
+        event_pattern: r#"{"event_type":["com.amazon.rum.performance_resource_event"]}"#,
+    },
+    ExtendedMetric {
+        name: "NavigationSatisfiedTransaction",
+        value_key: None,
+        event_pattern: r#"{"event_type":["com.amazon.rum.performance_navigation_event"],"event_details":{"duration":[{"numeric":[">",2000]}]}}"#,
+    },
+    ExtendedMetric {
+        name: "NavigationToleratedTransaction",
+        value_key: None,
+        event_pattern: r#"{"event_type":["com.amazon.rum.performance_navigation_event"],"event_details":{"duration":[{"numeric":[">=",2000,"<",8000]}]}}"#,
+    },
+    ExtendedMetric {
+        name: "NavigationFrustratedTransaction",
+        value_key: None,
+        event_pattern: r#"{"event_type":["com.amazon.rum.performance_navigation_event"],"event_details":{"duration":[{"numeric":[">=",8000]}]}}"#,
+    },
+    ExtendedMetric {
+        name: "WebVitalsCumulativeLayoutShift",
+        value_key: Some("event_details.value"),
+        event_pattern: r#"{"event_type":["com.amazon.rum.cumulative_layout_shift_event"]}"#,
+    },
+    ExtendedMetric {
+        name: "WebVitalsFirstInputDelay",
+        value_key: Some("event_details.value"),
+        event_pattern: r#"{"event_type":["com.amazon.rum.first_input_delay_event"]}"#,
+    },
+    ExtendedMetric {
+        name: "WebVitalsLargestContentfulPaint",
+        value_key: Some("event_details.value"),
+        event_pattern: r#"{"event_type":["com.amazon.rum.largest_contentful_paint_event"]}"#,
+    },
+    ExtendedMetric {
+        name: "JsErrorCount",
+        value_key: None,
+        event_pattern: r#"{"event_type":["com.amazon.rum.js_error_event"]}"#,
+    },
+    ExtendedMetric {
+        name: "HttpErrorCount",
+        value_key: None,
+        event_pattern: r#"{"event_type":["com.amazon.rum.http_event"]}"#,
+    },
+    ExtendedMetric {
+        name: "SessionCount",
+        value_key: None,
+        event_pattern: r#"{"event_type":["com.amazon.rum.session_start_event"]}"#,
+    },
+    ExtendedMetric {
+        name: "PageViewCount",
+        value_key: None,
+        event_pattern: r#"{"event_type":["com.amazon.rum.page_view_event"]}"#,
+    },
+    ExtendedMetric {
+        name: "Http4xxCount",
+        value_key: None,
+        event_pattern: r#"{"event_type":["com.amazon.rum.http_event"],"event_details":{"response":{"status":[{"numeric":[">=",400,"<",500]}]}}}"#,
+    },
+    ExtendedMetric {
+        name: "Http5xxCount",
+        value_key: None,
+        event_pattern: r#"{"event_type":["com.amazon.rum.http_event"],"event_details":{"response":{"status":[{"numeric":[">=",500,"<=",599]}]}}}"#,
+    },
+];
+
+/// The catalog row for the extended metric named `name`, or `None` when the catalog lists
+/// no metric under that name — which is what makes a definition a CUSTOM metric, the kind
+/// whose name is free ("For custom metrics, you can specify any name that you like").
+pub fn extended_metric(name: &str) -> Option<&'static ExtendedMetric> {
+    EXTENDED_METRIC_CATALOG.iter().find(|entry| entry.name == name)
+}
+
 /// The most bytes a resource-policy document may carry.
 ///
 /// From the model: `PutResourcePolicy` documents "The maximum size of the policy is 4
@@ -1159,6 +1279,13 @@ pub fn metric_destination_not_found(
 /// * `Namespace` (from the model): "You cannot use any string that starts with `AWS/` for
 ///   your namespace", while an extended metric's namespace "must be omitted or set to
 ///   `AWS/RUM`" — so the reserved space is closed except for RUM's own namespace.
+/// * The KIND of a definition, and the rules that follow from it (from the model): a
+///   definition whose `Namespace` is omitted or `AWS/RUM` is an EXTENDED metric, so its
+///   `Name` has to be one [`EXTENDED_METRIC_CATALOG`] lists and its `ValueKey` and
+///   `EventPattern` have to be the combination that catalog pins for that name ("Only
+///   certain combinations of values for `Name`, `ValueKey`, and `EventPattern` are
+///   valid"). Every other definition is a CUSTOM metric, whose namespace "can't be omitted
+///   and can't be `AWS/RUM`".
 /// * `EventPattern` (from the model): "The pattern that defines the metric, specified as a
 ///   JSON object", so a pattern that is not one defines nothing.
 /// * `DimensionKeys` (from the model): "For both extended metrics and custom metrics, all
@@ -1166,7 +1293,8 @@ pub fn metric_destination_not_found(
 ///   dimension's value is read out of the matched event, so the pattern has to name that
 ///   field, and a definition with dimensions but no pattern names none of them.
 pub fn metric_definition_refusal(definition: &MetricDefinitionRequest) -> Option<String> {
-    if let Some(namespace) = definition.namespace.as_deref() {
+    let namespace = definition.namespace.as_deref();
+    if let Some(namespace) = namespace {
         if namespace.starts_with(RESERVED_NAMESPACE_PREFIX)
             && namespace != EXTENDED_METRICS_NAMESPACE
         {
@@ -1194,6 +1322,18 @@ pub fn metric_definition_refusal(definition: &MetricDefinitionRequest) -> Option
         None => None,
     };
 
+    // Which KIND of metric this definition is, and the rules of that kind. The namespace
+    // decides: a definition published to RUM's own namespace, or to none at all, is an
+    // extended metric, and one published to a namespace of the caller's own is a custom
+    // metric.
+    let extended_namespace =
+        namespace.is_none_or(|namespace| namespace == EXTENDED_METRICS_NAMESPACE);
+    if extended_namespace {
+        if let Some(message) = extended_metric_refusal(definition, namespace, pattern.as_ref()) {
+            return Some(message);
+        }
+    }
+
     // Sorted, so the one dimension a refusal names is the same whichever order the
     // request's map iterated in.
     let mut dimensions: Vec<&str> = definition
@@ -1217,6 +1357,107 @@ pub fn metric_definition_refusal(definition: &MetricDefinitionRequest) -> Option
         .map(|field| {
             format!("DimensionKeys names the field {field}, which the EventPattern does not include.")
         })
+}
+
+/// Why this definition is not the EXTENDED metric its namespace says it is, or `None` when
+/// it is one.
+///
+/// Reached for a definition whose `Namespace` is omitted or [`EXTENDED_METRICS_NAMESPACE`]
+/// — the namespace extended metrics are published to — so the model's extended-metric
+/// rules are the ones in force: the name has to be one the catalog lists, and the
+/// `ValueKey`/`EventPattern` combination has to be the one that row pins. A name the
+/// catalog does NOT list is a custom metric, and a custom metric cannot be published here
+/// at all: "The namespace can't be omitted and can't be `AWS/RUM`. You can use the
+/// `AWS/RUM` namespace only for extended metrics."
+fn extended_metric_refusal(
+    definition: &MetricDefinitionRequest,
+    namespace: Option<&str>,
+    pattern: Option<&::serde_json::Value>,
+) -> Option<String> {
+    let name = definition.name.as_str();
+    let Some(entry) = extended_metric(name) else {
+        return Some(match namespace {
+            Some(namespace) => format!(
+                "Namespace {namespace} can be used only for extended metrics, and {name} is \
+                 not an extended metric: a custom metric is published to a namespace of its \
+                 own."
+            ),
+            None => format!(
+                "Namespace is required for the custom metric {name}: a custom metric's \
+                 namespace cannot be omitted."
+            ),
+        });
+    };
+
+    // "Only certain combinations of values for Name, ValueKey, and EventPattern are
+    // valid": the `ValueKey` of the row that names this metric, and nothing else.
+    let declared_value_key = definition
+        .value_key
+        .as_deref()
+        .filter(|value_key| !value_key.is_empty());
+    if declared_value_key != entry.value_key {
+        return Some(match entry.value_key {
+            Some(required) => format!(
+                "ValueKey must be {required} for the extended metric {name}."
+            ),
+            None => format!("ValueKey must be omitted for the extended metric {name}."),
+        });
+    }
+
+    // "When you define extended metrics, the metric definition is not valid if
+    // EventPattern is omitted", and the pattern it carries has to INCLUDE the row's —
+    // beyond which it may name whatever else the definition's dimensions need. A row whose
+    // literal does not parse states no requirement, so there is nothing to refuse for.
+    let required = entry.required_event_pattern()?;
+    let Some(pattern) = pattern else {
+        return Some(format!(
+            "EventPattern is required for the extended metric {name}, and must include \
+             {required}."
+        ));
+    };
+    if !event_pattern_includes(pattern, &required) {
+        return Some(format!(
+            "EventPattern for the extended metric {name} must include {required}."
+        ));
+    }
+    None
+}
+
+/// Whether the event pattern `pattern` INCLUDES everything `required` asks for.
+///
+/// The model requires an extended metric's pattern to "include" the object it pins for that
+/// metric rather than to equal it, since "the `EventPattern` can also include information
+/// used by the `DimensionKeys` field" — so this is a containment test, applied structurally:
+/// every member of a required object has to be present and itself included, every element
+/// of a required array has to be matched by some element of the pattern's array (a pattern
+/// lists the values it matches, so their order carries no meaning), and a required scalar
+/// has to be that scalar. Two numbers are the same number whichever JSON form they were
+/// written in.
+pub fn event_pattern_includes(
+    pattern: &::serde_json::Value,
+    required: &::serde_json::Value,
+) -> bool {
+    match required {
+        ::serde_json::Value::Object(members) => pattern.as_object().is_some_and(|present| {
+            members.iter().all(|(member, wanted)| {
+                present
+                    .get(member)
+                    .is_some_and(|held| event_pattern_includes(held, wanted))
+            })
+        }),
+        ::serde_json::Value::Array(items) => pattern.as_array().is_some_and(|present| {
+            items.iter().all(|wanted| {
+                present
+                    .iter()
+                    .any(|held| event_pattern_includes(held, wanted))
+            })
+        }),
+        ::serde_json::Value::Number(wanted) => pattern
+            .as_f64()
+            .zip(wanted.as_f64())
+            .is_some_and(|(held, wanted)| held == wanted),
+        scalar => pattern == scalar,
+    }
 }
 
 /// Whether the event pattern `pattern` names the event field `path` — a dot-separated

@@ -114,8 +114,7 @@ fn stored_tokens(engine: &Arc<engine::InMemoryEngine>, tunnel_id: &str) -> (Stri
     engine
         .state::<TunnelState>()
         .lock()
-        .tunnels
-        .get(tunnel_id)
+        .tunnel(REGION, tunnel_id)
         .map(|tunnel| {
             (
                 tunnel.source_access_token.clone(),
@@ -162,8 +161,7 @@ async fn close_tunnel(
             let state = engine.state::<TunnelState>();
             let mut store = state.lock();
             let tunnel = store
-                .tunnels
-                .get_mut(tunnel_id)
+                .tunnel_mut(REGION, tunnel_id)
                 .unwrap_or_else(|| panic!("case {case:?}: the opened tunnel was not persisted"));
             tunnel.created_at -= shift;
             tunnel.last_updated_at -= shift;

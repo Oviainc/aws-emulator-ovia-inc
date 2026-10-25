@@ -498,6 +498,8 @@ async fn deleting_a_cluster_releases_the_container_instances_registered_into_it(
                     "cluster": cluster,
                     "instanceIdentityDocument":
                         crate::ecs_wire::identity_document(&format!("i-{index:017x}")),
+                    "instanceIdentityDocumentSignature":
+                        crate::ecs_wire::identity_document_signature(),
                 }),
                 &case,
             )

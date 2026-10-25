@@ -13,15 +13,16 @@
 //!
 //! The assertions pin RULES over a SET of inputs rather than one request: the
 //! create/read-back table spans both `MetricDestination` values, one and several
-//! definitions per call, and a definition carrying every optional member down to one
-//! carrying none; the catalog test walks every extended metric name and every dimension
-//! field path the model lists; the update table varies which members the replacement adds,
-//! changes and drops, and runs each row against both destination kinds; the refusal table
-//! walks one refused target or one refused definition per row and then shows the stored
-//! definition unchanged; the namespace table walks both sides of the reserved-prefix
-//! boundary; the pagination test is an invariant check over a grid of store sizes and page
-//! sizes; and the `MaxResults` table walks each published bound of the modelled range plus
-//! one past each, beside the documented default page size.
+//! definitions per call, and a definition carrying every optional member down to a custom
+//! metric carrying only the members it must; the catalog test walks every extended metric
+//! name the model pins a combination for and every dimension field path it lists; the
+//! update table varies which members the replacement adds, changes and drops, and runs
+//! each row against both destination kinds; the refusal table walks one refused target or
+//! one refused definition per row and then shows the stored definition unchanged; the
+//! namespace table walks both sides of the reserved-prefix boundary; the pagination test is
+//! an invariant check over a grid of store sizes and page sizes; and the `MaxResults` table
+//! walks each published bound of the modelled range plus one past each, beside the
+//! documented default page size.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -34,27 +35,101 @@ use crate::support::{call, create, emulator, message, percent_encoded, Reply, RE
 /// Source: `smithy_query(query="shape", shape="MetricDestination")`.
 const METRIC_DESTINATIONS: [&str; 2] = ["CloudWatch", "Evidently"];
 
-/// Every metric name RUM's EXTENDED metrics are defined under, as the model lists them.
-/// Source: `smithy_query(query="shape", shape="MetricDefinitionRequest")`, member `Name`.
-const EXTENDED_METRIC_NAMES: [&str; 11] = [
-    "PerformanceNavigationDuration",
-    "PerformanceResourceDuration",
-    "NavigationSatisfiedTransaction",
-    "NavigationToleratedTransaction",
-    "NavigationFrustratedTransaction",
-    "WebVitalsCumulativeLayoutShift",
-    "WebVitalsFirstInputDelay",
-    "WebVitalsLargestContentfulPaint",
-    "JsErrorCount",
-    "HttpErrorCount",
-    "SessionCount",
+/// One extended metric RUM defines: its name, the `ValueKey` the model pins for it (`None`
+/// where it says "`ValueKey` must be null") and the JSON object the model requires its
+/// `EventPattern` to include.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Extended {
+    pub(crate) name: &'static str,
+    pub(crate) value_key: Option<&'static str>,
+    pub(crate) event_pattern: &'static str,
+}
+
+/// Every extended metric the model pins a `Name`/`ValueKey`/`EventPattern` combination
+/// for, in the order it lists them.
+/// Source: `smithy_query(query="doc", shape="MetricDefinitionRequest")` — one "If `Name` is
+/// …, then `ValueKey` must be … and the `EventPattern` must include …" rule per name. The
+/// comparison operators are written here as the characters they are (the documentation
+/// carries them HTML-escaped), and the rows whose documented literal is missing a separator
+/// or carries a stray closing brace are written as the JSON object those literals describe.
+pub(crate) const EXTENDED_METRICS: [Extended; 14] = [
+    Extended {
+        name: "PerformanceNavigationDuration",
+        value_key: Some("event_details.duration"),
+        event_pattern: r#"{"event_type":["com.amazon.rum.performance_navigation_event"]}"#,
+    },
+    Extended {
+        name: "PerformanceResourceDuration",
+        value_key: Some("event_details.duration"),
+        event_pattern: r#"{"event_type":["com.amazon.rum.performance_resource_event"]}"#,
+    },
+    Extended {
+        name: "NavigationSatisfiedTransaction",
+        value_key: None,
+        event_pattern: r#"{"event_type":["com.amazon.rum.performance_navigation_event"],"event_details":{"duration":[{"numeric":[">",2000]}]}}"#,
+    },
+    Extended {
+        name: "NavigationToleratedTransaction",
+        value_key: None,
+        event_pattern: r#"{"event_type":["com.amazon.rum.performance_navigation_event"],"event_details":{"duration":[{"numeric":[">=",2000,"<",8000]}]}}"#,
+    },
+    Extended {
+        name: "NavigationFrustratedTransaction",
+        value_key: None,
+        event_pattern: r#"{"event_type":["com.amazon.rum.performance_navigation_event"],"event_details":{"duration":[{"numeric":[">=",8000]}]}}"#,
+    },
+    Extended {
+        name: "WebVitalsCumulativeLayoutShift",
+        value_key: Some("event_details.value"),
+        event_pattern: r#"{"event_type":["com.amazon.rum.cumulative_layout_shift_event"]}"#,
+    },
+    Extended {
+        name: "WebVitalsFirstInputDelay",
+        value_key: Some("event_details.value"),
+        event_pattern: r#"{"event_type":["com.amazon.rum.first_input_delay_event"]}"#,
+    },
+    Extended {
+        name: "WebVitalsLargestContentfulPaint",
+        value_key: Some("event_details.value"),
+        event_pattern: r#"{"event_type":["com.amazon.rum.largest_contentful_paint_event"]}"#,
+    },
+    Extended {
+        name: "JsErrorCount",
+        value_key: None,
+        event_pattern: r#"{"event_type":["com.amazon.rum.js_error_event"]}"#,
+    },
+    Extended {
+        name: "HttpErrorCount",
+        value_key: None,
+        event_pattern: r#"{"event_type":["com.amazon.rum.http_event"]}"#,
+    },
+    Extended {
+        name: "SessionCount",
+        value_key: None,
+        event_pattern: r#"{"event_type":["com.amazon.rum.session_start_event"]}"#,
+    },
+    Extended {
+        name: "PageViewCount",
+        value_key: None,
+        event_pattern: r#"{"event_type":["com.amazon.rum.page_view_event"]}"#,
+    },
+    Extended {
+        name: "Http4xxCount",
+        value_key: None,
+        event_pattern: r#"{"event_type":["com.amazon.rum.http_event"],"event_details":{"response":{"status":[{"numeric":[">=",400,"<",500]}]}}}"#,
+    },
+    Extended {
+        name: "Http5xxCount",
+        value_key: None,
+        event_pattern: r#"{"event_type":["com.amazon.rum.http_event"],"event_details":{"response":{"status":[{"numeric":[">=",500,"<=",599]}]}}}"#,
+    },
 ];
 
 /// Every additional dimension an extended metric may carry, as the model lists them: the
 /// event field path, and the CloudWatch dimension name it maps to.
 /// Source: `smithy_query(query="shape", shape="MetricDefinitionRequest")`, member
 /// `DimensionKeys`.
-const EXTENDED_DIMENSION_KEYS: [(&str, &str); 6] = [
+pub(crate) const EXTENDED_DIMENSION_KEYS: [(&str, &str); 6] = [
     ("metadata.pageId", "PageId"),
     ("metadata.browserName", "BrowserName"),
     ("metadata.deviceType", "DeviceType"),
@@ -174,8 +249,13 @@ impl Destination {
 /// An event pattern that matches events of `event_type` and names each of `fields` — the
 /// dotted field paths a `DimensionKeys` map keys dimensions by — so the pattern includes
 /// every dimension the definition lists, as the model requires.
-fn event_pattern(event_type: &str, fields: &[&str]) -> String {
-    let mut pattern = json!({"event_type": [event_type]});
+pub(crate) fn event_pattern(event_type: &str, fields: &[&str]) -> String {
+    naming_fields(json!({"event_type": [event_type]}), fields)
+}
+
+/// `pattern`, rendered as the `EventPattern` string a request carries, with each of
+/// `fields` named in it.
+fn naming_fields(mut pattern: Value, fields: &[&str]) -> String {
     for field in fields {
         let mut segments: Vec<&str> = field.split('.').collect();
         let leaf = segments.pop().expect("a field path has a last segment");
@@ -193,13 +273,60 @@ fn event_pattern(event_type: &str, fields: &[&str]) -> String {
 }
 
 /// A `DimensionKeys` map built from the model's catalog entries.
-fn dimension_keys(entries: &[(&str, &str)]) -> Value {
+pub(crate) fn dimension_keys(entries: &[(&str, &str)]) -> Value {
     Value::Object(
         entries
             .iter()
             .map(|(field, dimension)| ((*field).to_string(), json!(dimension)))
             .collect(),
     )
+}
+
+/// The catalog row the model pins for the extended metric `name`.
+fn catalog_row(name: &str) -> &'static Extended {
+    EXTENDED_METRICS
+        .iter()
+        .find(|entry| entry.name == name)
+        .unwrap_or_else(|| panic!("case {name:?}: the model lists no extended metric by that name"))
+}
+
+/// The definition the model pins for the extended metric `name`: that name, the `ValueKey`
+/// its catalog row requires and an `EventPattern` carrying the object that row requires.
+pub(crate) fn extended(name: &str) -> Value {
+    extended_with_dimensions(name, &[])
+}
+
+/// The same, with `dimensions` listed in `DimensionKeys` and their field paths named by the
+/// `EventPattern` — which is exactly what the model allows beyond the required object: "the
+/// EventPattern can also include information used by the DimensionKeys field".
+pub(crate) fn extended_with_dimensions(name: &str, dimensions: &[(&str, &str)]) -> Value {
+    let entry = catalog_row(name);
+    let fields: Vec<&str> = dimensions.iter().map(|(field, _)| *field).collect();
+    let pattern = naming_fields(
+        serde_json::from_str(entry.event_pattern).expect("a catalog pattern is a JSON object"),
+        &fields,
+    );
+    let mut definition = json!({"Name": entry.name, "EventPattern": pattern});
+    if let Some(value_key) = entry.value_key {
+        definition["ValueKey"] = json!(value_key);
+    }
+    if !dimensions.is_empty() {
+        definition["DimensionKeys"] = dimension_keys(dimensions);
+    }
+    definition
+}
+
+/// `definition` with `member` set to `value`, so a row states one difference from the
+/// definition it varies.
+pub(crate) fn with(mut definition: Value, member: &str, value: Value) -> Value {
+    definition[member] = value;
+    definition
+}
+
+/// A custom metric: a name the extended catalog does not list, published to the namespace
+/// `namespace` — which the model requires a custom metric to name.
+pub(crate) fn custom(name: &str, namespace: &str) -> Value {
+    json!({"Name": name, "Namespace": namespace})
 }
 
 /// Create one app monitor to hang destinations and definitions off.
@@ -431,17 +558,12 @@ fn assert_definition(case: &str, reported: &Value, requested: &Value, id: &str) 
     }
 }
 
-/// The 11 extended metric names the model lists, each as a definition of its own, so the
-/// catalog is exercised in full rather than on the one name an example happens to use.
+/// Every extended metric the model lists, each as the definition the model pins for it, so
+/// the catalog is exercised in full rather than on the one name an example happens to use.
 fn catalog_definitions() -> Vec<Value> {
-    EXTENDED_METRIC_NAMES
+    EXTENDED_METRICS
         .iter()
-        .map(|name| {
-            json!({
-                "Name": name,
-                "EventPattern": event_pattern("com.amazon.rum.performance_navigation_event", &[]),
-            })
-        })
+        .map(|entry| extended(entry.name))
         .collect()
 }
 
@@ -449,27 +571,24 @@ fn catalog_definitions() -> Vec<Value> {
 async fn created_definitions_are_read_back_under_the_ids_the_create_minted() {
     let (router, _engine) = emulator();
 
-    let navigation = "com.amazon.rum.performance_navigation_event";
     let rows: Vec<(&str, Destination, Vec<Value>)> = vec![
         (
             "one extended metric, CloudWatch",
             Destination::cloud_watch(),
-            vec![json!({
-                "Name": EXTENDED_METRIC_NAMES[0],
-                "ValueKey": "event_details.duration",
-                "UnitLabel": "Milliseconds",
-                "EventPattern": event_pattern(navigation, &[]),
-            })],
+            vec![with(
+                extended(EXTENDED_METRICS[0].name),
+                "UnitLabel",
+                json!("Milliseconds"),
+            )],
         ),
         (
             "three definitions in one call, CloudWatch",
             Destination::cloud_watch(),
             vec![
-                json!({
-                    "Name": EXTENDED_METRIC_NAMES[8],
-                    "EventPattern": event_pattern("com.amazon.rum.js_error_event", &["metadata.browserName"]),
-                    "DimensionKeys": dimension_keys(&EXTENDED_DIMENSION_KEYS[1..2]),
-                }),
+                extended_with_dimensions(
+                    EXTENDED_METRICS[8].name,
+                    &EXTENDED_DIMENSION_KEYS[1..2],
+                ),
                 json!({
                     "Name": "CartCheckout",
                     "Namespace": "MyApp/Checkout",
@@ -477,7 +596,7 @@ async fn created_definitions_are_read_back_under_the_ids_the_create_minted() {
                     "UnitLabel": "Count",
                     "EventPattern": event_pattern("com.example.cart_checkout", &[]),
                 }),
-                json!({"Name": EXTENDED_METRIC_NAMES[10]}),
+                extended(EXTENDED_METRICS[10].name),
             ],
         ),
         (
@@ -494,14 +613,14 @@ async fn created_definitions_are_read_back_under_the_ids_the_create_minted() {
             "two definitions, another Evidently experiment",
             Destination::evidently("beta"),
             vec![
-                json!({"Name": EXTENDED_METRIC_NAMES[9], "EventPattern": event_pattern("com.amazon.rum.http_event", &[])}),
-                json!({"Name": EXTENDED_METRIC_NAMES[10]}),
+                extended(EXTENDED_METRICS[9].name),
+                extended(EXTENDED_METRICS[11].name),
             ],
         ),
         (
-            "a definition carrying no optional member at all",
+            "a custom metric carrying nothing but the members it must",
             Destination::cloud_watch(),
-            vec![json!({"Name": EXTENDED_METRIC_NAMES[6]})],
+            vec![custom("BareCustom", "MyApp/Bare")],
         ),
     ];
 
@@ -560,15 +679,10 @@ async fn every_extended_metric_name_and_dimension_the_model_lists_round_trips() 
     // Every name in the catalog, plus one definition carrying EVERY dimension field path
     // the model lists, with an event pattern that includes each of them.
     let mut requested = catalog_definitions();
-    requested.push(json!({
-        "Name": EXTENDED_METRIC_NAMES[0],
-        "ValueKey": "event_details.duration",
-        "EventPattern": event_pattern(
-            "com.amazon.rum.performance_navigation_event",
-            &EXTENDED_DIMENSION_KEYS.map(|(field, _)| field),
-        ),
-        "DimensionKeys": dimension_keys(&EXTENDED_DIMENSION_KEYS),
-    }));
+    requested.push(extended_with_dimensions(
+        EXTENDED_METRICS[0].name,
+        &EXTENDED_DIMENSION_KEYS,
+    ));
 
     let created = create_definitions(&router, "catalog", monitor, &destination, &requested).await;
     let stored = stored_by_id(&router, "catalog", monitor, &destination).await;
@@ -594,53 +708,44 @@ async fn every_extended_metric_name_and_dimension_the_model_lists_round_trips() 
 async fn an_update_replaces_the_whole_definition_under_the_id_it_names() {
     let (router, _engine) = emulator();
 
-    let navigation = "com.amazon.rum.performance_navigation_event";
-    let errors = "com.amazon.rum.js_error_event";
     // Each row is one original definition and the replacement applied to it: the rows
     // differ in which members the replacement changes, adds, drops and how many
     // dimensions it lists.
     let rows: Vec<(&str, Value, Value)> = vec![
         (
             "the metric name alone",
-            json!({"Name": EXTENDED_METRIC_NAMES[9], "EventPattern": event_pattern(errors, &[])}),
-            json!({"Name": EXTENDED_METRIC_NAMES[8], "EventPattern": event_pattern(errors, &[])}),
+            extended(EXTENDED_METRICS[9].name),
+            extended(EXTENDED_METRICS[8].name),
         ),
         (
             "a unit label added",
-            json!({"Name": EXTENDED_METRIC_NAMES[0], "ValueKey": "event_details.duration"}),
-            json!({
-                "Name": EXTENDED_METRIC_NAMES[0],
-                "ValueKey": "event_details.duration",
-                "UnitLabel": "Milliseconds",
-            }),
+            extended(EXTENDED_METRICS[0].name),
+            with(
+                extended(EXTENDED_METRICS[0].name),
+                "UnitLabel",
+                json!("Milliseconds"),
+            ),
         ),
         (
-            "every optional member dropped",
-            json!({
-                "Name": EXTENDED_METRIC_NAMES[1],
-                "ValueKey": "event_details.duration",
-                "UnitLabel": "Milliseconds",
-                "EventPattern": event_pattern(navigation, &["metadata.pageId"]),
-                "DimensionKeys": dimension_keys(&EXTENDED_DIMENSION_KEYS[0..1]),
-            }),
-            json!({"Name": EXTENDED_METRIC_NAMES[1]}),
+            "every droppable member dropped",
+            with(
+                extended_with_dimensions(
+                    EXTENDED_METRICS[1].name,
+                    &EXTENDED_DIMENSION_KEYS[0..1],
+                ),
+                "UnitLabel",
+                json!("Milliseconds"),
+            ),
+            extended(EXTENDED_METRICS[1].name),
         ),
         (
             "one dimension becomes three",
-            json!({
-                "Name": EXTENDED_METRIC_NAMES[2],
-                "EventPattern": event_pattern(navigation, &["metadata.pageId"]),
-                "DimensionKeys": dimension_keys(&EXTENDED_DIMENSION_KEYS[0..1]),
-            }),
-            json!({
-                "Name": EXTENDED_METRIC_NAMES[2],
-                "EventPattern": event_pattern(navigation, &EXTENDED_DIMENSION_KEYS[0..3].iter().map(|(field, _)| *field).collect::<Vec<_>>()),
-                "DimensionKeys": dimension_keys(&EXTENDED_DIMENSION_KEYS[0..3]),
-            }),
+            extended_with_dimensions(EXTENDED_METRICS[2].name, &EXTENDED_DIMENSION_KEYS[0..1]),
+            extended_with_dimensions(EXTENDED_METRICS[2].name, &EXTENDED_DIMENSION_KEYS[0..3]),
         ),
         (
             "an extended metric becomes a custom one",
-            json!({"Name": EXTENDED_METRIC_NAMES[10]}),
+            extended(EXTENDED_METRICS[10].name),
             json!({
                 "Name": "CheckoutLatency",
                 "Namespace": "MyApp/Checkout",
@@ -658,7 +763,11 @@ async fn an_update_replaces_the_whole_definition_under_the_id_it_names() {
 
     // The definition created beside the one each row updates: it is never named by the
     // update, so it must come out of every row untouched.
-    let untouched = json!({"Name": EXTENDED_METRIC_NAMES[7], "UnitLabel": "Milliseconds"});
+    let untouched = with(
+        extended(EXTENDED_METRICS[7].name),
+        "UnitLabel",
+        json!("Milliseconds"),
+    );
 
     for (index, (case, original, replacement)) in rows.iter().enumerate() {
         for destination in [Destination::cloud_watch(), Destination::evidently("gamma")] {
@@ -714,16 +823,16 @@ async fn an_update_the_service_cannot_apply_is_refused_and_changes_nothing() {
     put_destination(&router, "setup", monitor, &cloud_watch).await;
     put_destination(&router, "setup", monitor, &evidently).await;
 
-    let original = json!({
-        "Name": EXTENDED_METRIC_NAMES[10],
-        "UnitLabel": "Count",
-        "EventPattern": event_pattern("com.amazon.rum.session_start_event", &[]),
-    });
+    let original = with(
+        extended(EXTENDED_METRICS[10].name),
+        "UnitLabel",
+        json!("Count"),
+    );
     let created =
         create_definitions(&router, "setup", monitor, &cloud_watch, std::slice::from_ref(&original))
             .await;
     let id = id_of("setup", &created[0]);
-    let valid = json!({"Name": EXTENDED_METRIC_NAMES[9]});
+    let valid = extended(EXTENDED_METRICS[9].name);
 
     // Each row refuses for ONE reason: a target that names no resource (404), or a
     // definition the service will not store / a destination pairing the model forbids
@@ -805,7 +914,7 @@ async fn an_update_the_service_cannot_apply_is_refused_and_changes_nothing() {
             monitor,
             cloud_watch.clone(),
             id.clone(),
-            json!({"Name": "Broken", "EventPattern": "{not json"}),
+            json!({"Name": "Broken", "Namespace": "MyApp/Broken", "EventPattern": "{not json"}),
             400,
             "ValidationException",
         ),
@@ -814,7 +923,11 @@ async fn an_update_the_service_cannot_apply_is_refused_and_changes_nothing() {
             monitor,
             cloud_watch.clone(),
             id.clone(),
-            json!({"Name": "Broken", "EventPattern": "[\"com.example.event\"]"}),
+            json!({
+                "Name": "Broken",
+                "Namespace": "MyApp/Broken",
+                "EventPattern": "[\"com.example.event\"]",
+            }),
             400,
             "ValidationException",
         ),
@@ -823,11 +936,14 @@ async fn an_update_the_service_cannot_apply_is_refused_and_changes_nothing() {
             monitor,
             cloud_watch.clone(),
             id.clone(),
-            json!({
-                "Name": EXTENDED_METRIC_NAMES[8],
-                "EventPattern": event_pattern("com.amazon.rum.js_error_event", &["metadata.pageId"]),
-                "DimensionKeys": dimension_keys(&EXTENDED_DIMENSION_KEYS[1..2]),
-            }),
+            with(
+                extended_with_dimensions(
+                    EXTENDED_METRICS[8].name,
+                    &EXTENDED_DIMENSION_KEYS[1..2],
+                ),
+                "EventPattern",
+                json!(event_pattern("com.amazon.rum.js_error_event", &["metadata.pageId"])),
+            ),
             400,
             "ValidationException",
         ),
@@ -836,10 +952,11 @@ async fn an_update_the_service_cannot_apply_is_refused_and_changes_nothing() {
             monitor,
             cloud_watch.clone(),
             id.clone(),
-            json!({
-                "Name": EXTENDED_METRIC_NAMES[8],
-                "DimensionKeys": dimension_keys(&EXTENDED_DIMENSION_KEYS[0..1]),
-            }),
+            with(
+                custom("Dimensioned", "MyApp/Dimensioned"),
+                "DimensionKeys",
+                dimension_keys(&EXTENDED_DIMENSION_KEYS[0..1]),
+            ),
             400,
             "ValidationException",
         ),
@@ -905,11 +1022,12 @@ async fn the_reserved_namespace_prefix_is_the_only_namespace_a_definition_cannot
     let (router, _engine) = emulator();
     let destination = Destination::cloud_watch();
 
-    // Both sides of the boundary the model draws: a custom namespace cannot start with
-    // `AWS/`, while extended metrics are published to `AWS/RUM` itself. The prefix is
+    // Both sides of the boundary the model draws for a CUSTOM metric's namespace: it
+    // cannot start with `AWS/`, and the extended-metrics namespace itself is closed to it
+    // ("You can use the AWS/RUM namespace only for extended metrics"). The prefix is
     // matched as written, so a namespace that merely resembles it is accepted.
     let rows: [(&str, &str, bool); 7] = [
-        ("the extended-metrics namespace itself", "AWS/RUM", true),
+        ("the extended-metrics namespace itself", "AWS/RUM", false),
         ("another AWS namespace", "AWS/Billing", false),
         ("a longer name under the prefix", "AWS/RUMExtended", false),
         ("the prefix with nothing after it", "AWS/", false),
@@ -922,7 +1040,7 @@ async fn the_reserved_namespace_prefix_is_the_only_namespace_a_definition_cannot
         let monitor = format!("namespace-{index}");
         create_monitor(&router, case, &monitor).await;
         put_destination(&router, case, &monitor, &destination).await;
-        let definition = json!({"Name": "NamespacedMetric", "Namespace": namespace});
+        let definition = custom("NamespacedMetric", namespace);
 
         // The same rule governs the create, where one bad definition fails on its own,
         // and the update, where it fails the call.
@@ -948,14 +1066,14 @@ async fn the_reserved_namespace_prefix_is_the_only_namespace_a_definition_cannot
             if *accepted { "created" } else { "refused" }
         );
 
-        // And the update is judged the same way, against a definition created without a
-        // namespace at all.
+        // And the update is judged the same way, against a definition created under a
+        // namespace of its own.
         let seeded = create_definitions(
             &router,
             case,
             &monitor,
             &destination,
-            &[json!({"Name": "Seeded"})],
+            &[custom("Seeded", "MyApp/Seeded")],
         )
         .await;
         let id = id_of(case, &seeded[0]);
@@ -969,6 +1087,37 @@ async fn the_reserved_namespace_prefix_is_the_only_namespace_a_definition_cannot
             String::from_utf8_lossy(&reply.body)
         );
     }
+
+    // The extended-metrics namespace is closed to a custom metric and open to an extended
+    // one: the SAME namespace, accepted or refused by the kind of metric naming it.
+    let monitor = "namespace-extended";
+    create_monitor(&router, "the extended-metrics namespace", monitor).await;
+    put_destination(&router, "the extended-metrics namespace", monitor, &destination).await;
+    for (case, definition) in [
+        (
+            "an extended metric naming AWS/RUM",
+            with(
+                extended(EXTENDED_METRICS[8].name),
+                "Namespace",
+                json!("AWS/RUM"),
+            ),
+        ),
+        (
+            "an extended metric naming no namespace",
+            extended(EXTENDED_METRICS[8].name),
+        ),
+    ] {
+        let created = create_definitions(
+            &router,
+            case,
+            monitor,
+            &destination,
+            std::slice::from_ref(&definition),
+        )
+        .await;
+        let id = id_of(case, &created[0]);
+        assert_definition(case, &created[0], &definition, &id);
+    }
 }
 
 #[tokio::test]
@@ -979,10 +1128,14 @@ async fn a_batch_create_refuses_only_the_definitions_it_cannot_store() {
     create_monitor(&router, "partial", monitor).await;
     put_destination(&router, "partial", monitor, &destination).await;
 
-    let good_one = json!({"Name": EXTENDED_METRIC_NAMES[10], "UnitLabel": "Count"});
-    let good_two = json!({"Name": "Conversions", "Namespace": "MyApp/Funnel"});
-    let bad_namespace = json!({"Name": "Reserved", "Namespace": "AWS/Billing"});
-    let bad_pattern = json!({"Name": "Unparsed", "EventPattern": "{"});
+    let good_one = with(
+        extended(EXTENDED_METRICS[10].name),
+        "UnitLabel",
+        json!("Count"),
+    );
+    let good_two = custom("Conversions", "MyApp/Funnel");
+    let bad_namespace = custom("Reserved", "AWS/Billing");
+    let bad_pattern = with(custom("Unparsed", "MyApp/Unparsed"), "EventPattern", json!("{"));
 
     let reply = batch_create(
         &router,
@@ -1061,7 +1214,7 @@ async fn a_batch_create_refuses_only_the_definitions_it_cannot_store() {
 
     // A batch longer than the documented maximum is refused whole, and persists nothing.
     let oversized: Vec<Value> = (0..=200)
-        .map(|index| json!({"Name": format!("Bulk{index}")}))
+        .map(|index| custom(&format!("Bulk{index}"), "MyApp/Bulk"))
         .collect();
     let refusal = batch_create(&router, monitor, &destination, &oversized).await;
     assert_eq!(
@@ -1101,7 +1254,7 @@ async fn every_page_of_a_destinations_definitions_covers_each_one_exactly_once()
             create_monitor(&router, &case, &monitor).await;
             put_destination(&router, &case, &monitor, &destination).await;
             let requested: Vec<Value> = (0..store_size)
-                .map(|index| json!({"Name": format!("Paged{index}")}))
+                .map(|index| custom(&format!("Paged{index}"), "MyApp/Paged"))
                 .collect();
             let minted: BTreeSet<String> = if store_size == 0 {
                 BTreeSet::new()
@@ -1178,7 +1331,7 @@ async fn max_results_walks_the_modelled_range_and_defaults_to_fifty() {
     put_destination(&router, "max-results", monitor, &destination).await;
     // One more definition than the documented default page, so the default is observable.
     let requested: Vec<Value> = (0..51)
-        .map(|index| json!({"Name": format!("Bounded{index}")}))
+        .map(|index| custom(&format!("Bounded{index}"), "MyApp/Bounded"))
         .collect();
     create_definitions(&router, "max-results", monitor, &destination, &requested).await;
 
@@ -1270,7 +1423,11 @@ async fn definitions_belong_to_the_destination_they_were_created_under() {
 
     // The same definition under both destinations: each is its own metric, with its own
     // id, and neither listing reports the other's.
-    let shared = json!({"Name": EXTENDED_METRIC_NAMES[10], "UnitLabel": "Count"});
+    let shared = with(
+        extended(EXTENDED_METRICS[10].name),
+        "UnitLabel",
+        json!("Count"),
+    );
     let in_cloud_watch = create_definitions(
         &router,
         "scoped",
@@ -1296,7 +1453,11 @@ async fn definitions_belong_to_the_destination_they_were_created_under() {
     );
 
     // Updating one leaves the other exactly as it was.
-    let replacement = json!({"Name": EXTENDED_METRIC_NAMES[9], "UnitLabel": "Count"});
+    let replacement = with(
+        extended(EXTENDED_METRICS[9].name),
+        "UnitLabel",
+        json!("Count"),
+    );
     update_ok(
         &router,
         "scoped",

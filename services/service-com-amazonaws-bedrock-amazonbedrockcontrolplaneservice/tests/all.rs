@@ -55,6 +55,8 @@ mod model_invocation_logging;
 mod prompt_routers;
 #[path = "all/provisioned_model_throughputs.rs"]
 mod provisioned_model_throughputs;
+#[path = "all/provisioned_model_units_wire_form.rs"]
+mod provisioned_model_units_wire_form;
 #[path = "all/resource_policies.rs"]
 mod resource_policies;
 #[path = "all/service_claim.rs"]

@@ -18,6 +18,10 @@
 //! * every tag key this service will not store is refused whichever member carried it, so
 //!   a `DeploymentParameters$Tags` key under the reserved prefix, an empty one or one past
 //!   the published length bound is HTTP 400 and writes nothing;
+//! * an inline treatment-override map past a bound the model publishes for it — its entry
+//!   count, an entity id's length, a treatment key's shape — is refused HTTP 400
+//!   `BadRequestException` in AWS's validation envelope and writes nothing, exactly as the
+//!   start of a run refuses it;
 //! * an identifier or a run number that addresses nothing is HTTP 404
 //!   `ResourceNotFoundException`, and a run number outside the modelled range is refused
 //!   before any handler runs.
@@ -39,7 +43,7 @@ use crate::experiment_definitions::{scope, Scope};
 use crate::resource_tags::{filler, pct};
 use crate::start_experiment_run::{
     assert_reads_back, assert_refused, assert_running, create_test_definition, get_run, id_of,
-    start_run,
+    inline_overrides, one_pair, start_run,
 };
 use crate::update_experiment_definition::instant;
 
@@ -504,6 +508,126 @@ async fn an_update_whose_deployment_tags_name_an_unacceptable_key_is_refused() {
                 "case {case:?}: expected the refused update to leave {started:?}, got {:?}",
                 read.json()
             );
+        }
+    }
+}
+
+/// An update whose inline treatment overrides break a bound the model publishes for them is
+/// refused HTTP 400 `BadRequestException`, states AWS's validation envelope for that member
+/// and writes nothing — the same rule, and the same refusal, `StartExperimentRun` applies,
+/// because the map sits behind a union member the schema walk does not descend into.
+#[tokio::test]
+async fn an_update_whose_overrides_break_a_modelled_bound_is_refused_without_writing() {
+    let router = router();
+    let scope = scope(&router, "run-override-bounds").await;
+
+    // Rows are one step past each bound the inline override map publishes
+    // (`smithy_query(query="shape", shape="TreatmentOverrideMap")`: `length 0..32`, keys
+    // `EntityId` len 1..2048, values `TreatmentKey` `^[a-zA-Z0-9]{1,8}$`), each paired with
+    // the requirement the refusal must state; the last two rows are AT those bounds and are
+    // written, so an accepted and a refused patch differ by one character or one entry.
+    let rows: Vec<(&str, Value, Option<&str>)> = vec![
+        (
+            "thirty-three inline overrides, one past the maximum of 32",
+            json!({ "TreatmentOverrides": { "Inline": inline_overrides(33) } }),
+            Some("Member must have length less than or equal to 32"),
+        ),
+        (
+            "an override whose entity id is below its 1-character bound",
+            json!({ "TreatmentOverrides": { "Inline": one_pair("", "T1") } }),
+            Some("Member must have length greater than or equal to 1"),
+        ),
+        (
+            "an override whose entity id is one character past its 2048 bound",
+            json!({ "TreatmentOverrides": { "Inline": one_pair(&filler(2049, 5), "T1") } }),
+            Some("Member must have length less than or equal to 2048"),
+        ),
+        (
+            "an override naming a treatment key one character past the pattern",
+            json!({ "TreatmentOverrides": { "Inline": one_pair("entity-1", "T12345678") } }),
+            Some("Member must satisfy regular expression pattern: ^[a-zA-Z0-9]{1,8}"),
+        ),
+        (
+            "an override naming a treatment key outside the pattern's character set",
+            json!({ "TreatmentOverrides": { "Inline": one_pair("entity-1", "T-1") } }),
+            Some("Member must satisfy regular expression pattern: ^[a-zA-Z0-9]{1,8}"),
+        ),
+        (
+            "thirty-two inline overrides, the published maximum",
+            json!({ "TreatmentOverrides": { "Inline": inline_overrides(32) } }),
+            None,
+        ),
+        (
+            "an override whose entity id is at its 2048 upper bound",
+            json!({ "TreatmentOverrides": { "Inline": one_pair(&filler(2048, 5), "C") } }),
+            None,
+        ),
+    ];
+
+    for (index, (case, patch, refused)) in rows.iter().enumerate() {
+        let (definition_id, started) = running_run(
+            &router,
+            &scope,
+            &format!("run-override-bounds-{index}"),
+            &json!({ "Description": "as started" }),
+        )
+        .await;
+        let answered = update_run(&router, &scope.application, &definition_id, 1, patch).await;
+
+        match refused {
+            Some(requirement) => {
+                assert_refused(case, &answered, 400, "BadRequestException");
+                let message = answered
+                    .string("Message")
+                    .or_else(|| answered.string("message"))
+                    .unwrap_or_else(|| {
+                        panic!("case {case:?}: no message in {}", answered.json())
+                    });
+                assert!(
+                    message.starts_with("1 validation error detected: "),
+                    "case {case:?}: expected AWS's validation envelope, got {message:?}"
+                );
+                assert!(
+                    message.contains("at 'treatmentOverrides.inline"),
+                    "case {case:?}: expected the message to name the member, got {message:?}"
+                );
+                assert!(
+                    message.contains(requirement),
+                    "case {case:?}: expected the message to state {requirement:?}, got \
+                     {message:?}"
+                );
+                // The refused update left the run exactly as the start wrote it.
+                let read = get_run(&router, &scope.application, &definition_id, 1).await;
+                assert_eq!(
+                    read.json(),
+                    started,
+                    "case {case:?}: expected the refused update to leave {started:?}, got {:?}",
+                    read.json()
+                );
+            }
+            None => {
+                assert_eq!(
+                    answered.status,
+                    200,
+                    "case {case:?}: expected 200, got {} / {}",
+                    answered.status,
+                    String::from_utf8_lossy(&answered.body)
+                );
+                let updated = answered.json();
+                assert_member(
+                    case,
+                    &updated,
+                    "TreatmentOverrides",
+                    patch.get("TreatmentOverrides"),
+                );
+                let read = get_run(&router, &scope.application, &definition_id, 1).await;
+                assert_eq!(
+                    read.json(),
+                    updated,
+                    "case {case:?}: expected the read to report {updated:?}, got {:?}",
+                    read.json()
+                );
+            }
         }
     }
 }

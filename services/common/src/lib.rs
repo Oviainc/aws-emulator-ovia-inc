@@ -203,6 +203,10 @@ pub mod bedrock;
 /// role, which it reserves two of its actions for.
 pub mod chime_app_instance_admins;
 pub mod chime_family;
+/// The TAG directory the Amazon Chime SDK family shares: the tags of a Chime resource,
+/// keyed by its ARN, so whichever member serves one of the generic tagging routes reads
+/// and writes the same tags.
+pub mod chime_tags;
 /// The ONE rule for what a caller-supplied CloudWatch Logs log group NAME may be, for
 /// every service whose API takes one and then writes into the group it names — so two
 /// services asked whether CloudWatch Logs could hold a name cannot answer differently.

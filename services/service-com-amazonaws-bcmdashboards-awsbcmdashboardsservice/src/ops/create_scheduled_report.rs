@@ -12,18 +12,32 @@
 //! that key once, holding its last value — the state applying those entries through
 //! `TagResource` would leave.
 //!
-//! Three refusals come before the write, all of them modelled:
+//! The refusals and the replay that come before the write:
 //!
 //! * a `scheduledReport.dashboardArn` no stored dashboard answers to is refused with
 //!   `ValidationException` (400) — a report can only be scheduled on a dashboard that
 //!   exists, and this operation models no `ResourceNotFoundException`;
-//! * a `clientToken` an earlier successful create already used is refused with
-//!   `ConflictException` (409): the token is an at-most-once create key, so a retry or
-//!   a racing duplicate never mints a second report;
+//! * a `clientToken` an earlier successful create already recorded makes this call that
+//!   same request again: it REPLAYS that create's outcome — HTTP 200 with the ARN the
+//!   first call minted — and creates no second report, which is what the member's
+//!   `@idempotencyToken` is for. `ConflictException` (409) is kept for the conflict the
+//!   model documents, "a resource that already exists or is being created": a duplicate
+//!   that arrives while the create the token started is still in flight
+//!   ([`crate::state::SCHEDULED_REPORT_CREATION_WINDOW`]), so several callers sharing
+//!   one token get exactly one report and one success, and a token presented with a
+//!   materially different request, which would have created a different report. A retry
+//!   that arrives inside that span is deliberately refused as one of those racing
+//!   duplicates — the span is what the two cannot be told apart by, since this handler
+//!   decides and writes under one lock — while the retry an SDK sends once its transport
+//!   has given up lands past it and is replayed. A token whose report this service no
+//!   longer stores has no outcome left to answer with, so it creates a report again and
+//!   records that one;
 //! * past the stored-report quota, `ServiceQuotaExceededException` (402).
 //!
 //! Being state-changing, it emits the audit record `crate::state::record_state_change`
-//! writes on every one of those paths as well as on success.
+//! writes on every one of those paths as well as on success — except the replay, which
+//! creates nothing: it changes nothing a later caller sees, so it accounts for nothing,
+//! exactly as `ExecuteScheduledReport`'s idempotent retry does.
 //!
 //! ## Shape of an operation
 //!
@@ -186,6 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         let requested = input.scheduled_report;
+        let resource_tags = input.resource_tags.unwrap_or_default();
 
         // Tag-on-create takes caller-supplied tag keys, so the reserved `aws:` namespace
         // is refused here exactly as `TagResource` refuses it: a request naming such a key
@@ -193,17 +208,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rather than creating one that carries a tag only AWS may set.
         if let Err(message) = crate::state::check_tag_keys_not_reserved(
             "resourceTags",
-            input
-                .resource_tags
-                .iter()
-                .flatten()
-                .map(|tag| tag.key.as_str()),
+            resource_tags.iter().map(|tag| tag.key.as_str()),
         ) {
             crate::state::record_state_change(ctx, Self::NAME, "-", "ValidationException");
             return Err(CreateScheduledReportErrorModeled::ValidationException(
                 ValidationException { message },
             )
             .into());
+        }
+
+        // The `@idempotencyToken` is what it is modelled as: "A unique, case-sensitive
+        // identifier that you provide to ensure the idempotency of the request". A call
+        // presenting a token an earlier create already recorded is that same request
+        // again — what an SDK's transport retry sends when the first answer was lost —
+        // so it REPLAYS the first call's outcome: the ARN that call minted, at HTTP 200,
+        // with no second report created. Replaying changes nothing a later caller sees,
+        // so — like `ExecuteScheduledReport`'s idempotent retry — it emits no audit
+        // record; the create it replays already emitted one.
+        //
+        // The modelled `ConflictException` (409) stays what the model documents it for,
+        // "a conflict with the current state of the resource. For example, attempting to
+        // create a resource that already exists or is being created", which is two
+        // branches:
+        //
+        // * the report the token started IS BEING CREATED — a duplicate racing the first
+        //   call, inside `crate::state::SCHEDULED_REPORT_CREATION_WINDOW` of it. Several
+        //   callers sharing one token therefore produce exactly one report and one
+        //   success, and the losers are told a creation is in progress;
+        // * the token is presented with a MATERIALLY DIFFERENT request, which would have
+        //   created a different report, so it cannot be answered with the first report's
+        //   ARN whenever it arrives.
+        //
+        // Only a call that got as far as creating records its token: a refused request
+        // created nothing, so its token stays free. The lookup and the insert below both
+        // happen under one lock. A request carrying no token has no idempotency to
+        // resolve, so neither the rendering nor the sweep runs for it.
+        let now = ::std::time::SystemTime::now();
+        let mut fingerprint = String::new();
+        if input.client_token.is_some() {
+            fingerprint =
+                crate::state::scheduled_report_creation_fingerprint(&requested, &resource_tags);
+            // The records whose report this service no longer stores, dropped before any
+            // of them can be read as a retry's outcome: the ARN such a record holds
+            // resolves to nothing, so it is no outcome to answer with.
+            state.forget_creations_of_removed_reports();
+        }
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(prior) = state.scheduled_report_client_tokens.get(token) {
+                let message = if prior.in_progress_at(now) {
+                    format!(
+                        "A scheduled report creation is already in progress for client token {token}"
+                    )
+                } else if prior.request_fingerprint == fingerprint {
+                    return Ok(CreateScheduledReportOutput {
+                        arn: prior.arn.clone(),
+                    });
+                } else {
+                    format!(
+                        "Client token {token} was already used to create scheduled report {} with different request parameters",
+                        prior.arn
+                    )
+                };
+                crate::state::record_state_change(ctx, Self::NAME, "-", "ConflictException");
+                return Err(CreateScheduledReportErrorModeled::ConflictException(
+                    ConflictException { message },
+                )
+                .into());
+            }
         }
 
         // A scheduled report reports on a dashboard, so the dashboard it names has to
@@ -218,27 +289,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
-        }
-
-        // The `@idempotencyToken` is an at-most-once create key: the first call that
-        // presents a token creates the report, and every later call presenting the same
-        // token is refused with the modelled `ConflictException` (409) rather than
-        // minting a second report or mirroring the first one's answer. The check and the
-        // insert below both happen under one lock, so concurrent callers sharing a token
-        // produce exactly one winner. Only a call that got as far as creating records
-        // its token: a refused request created nothing, so its token stays free.
-        if let Some(token) = input.client_token.as_deref() {
-            if state.scheduled_report_client_tokens.contains_key(token) {
-                crate::state::record_state_change(ctx, Self::NAME, "-", "ConflictException");
-                return Err(CreateScheduledReportErrorModeled::ConflictException(
-                    ConflictException {
-                        message: format!(
-                            "A scheduled report creation is already in progress for client token {token}"
-                        ),
-                    },
-                )
-                .into());
-            }
         }
 
         // Every scheduled report is a stored record, so the number a caller can create
@@ -261,7 +311,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A fresh ARN per call, and the ARN is the key the record is stored under.
         let arn = state.mint_scheduled_report_arn();
-        let now = ::std::time::SystemTime::now();
         let record = crate::state::ScheduledReportRecord {
             arn: arn.clone(),
             name: requested.name,
@@ -285,16 +334,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // tagging path shares (`crate::state::merge_resource_tags`), so a request
             // that names one key twice stores that key once, holding its last value,
             // exactly as applying those entries through `TagResource` would.
-            resource_tags: crate::state::merge_resource_tags(
-                Vec::new(),
-                input.resource_tags.unwrap_or_default(),
-            ),
+            resource_tags: crate::state::merge_resource_tags(Vec::new(), resource_tags),
         };
         state.scheduled_reports.insert(arn.clone(), record);
         if let Some(token) = input.client_token {
-            state
-                .scheduled_report_client_tokens
-                .insert(token, arn.clone());
+            // This call's outcome, under the token it presented, so the retry that
+            // presents it again is answered with this ARN rather than creating a second
+            // report — and a duplicate racing it, or a different request reusing the
+            // token, is told why it cannot have one.
+            state.scheduled_report_client_tokens.insert(
+                token,
+                crate::state::ScheduledReportCreation {
+                    arn: arn.clone(),
+                    request_fingerprint: fingerprint,
+                    in_progress_until: now + crate::state::SCHEDULED_REPORT_CREATION_WINDOW,
+                },
+            );
         }
 
         // The record this call changed state, for the audit stream.

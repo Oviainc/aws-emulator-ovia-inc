@@ -15,6 +15,10 @@
 mod app_instance_admin;
 #[path = "all/app_instance_lifecycle.rs"]
 mod app_instance_lifecycle;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
+#[path = "all/resource_update.rs"]
+mod resource_update;
 #[path = "all/signing_name_route_claim.rs"]
 mod signing_name_route_claim;
 #[path = "all/state_roundtrip.rs"]

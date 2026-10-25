@@ -166,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.blob_id.trim().is_empty() {
             return Err(GetBlobErrorModeled::BlobIdRequiredException(
                 BlobIdRequiredException {
-                    message: Some("a blob ID is required".to_string()),
+                    message: Some(crate::state::BLOB_ID_REQUIRED_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -175,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // an object id is wide. Anything else names no object in any repository.
         if !crate::state::is_object_id(&input.blob_id) {
             return Err(GetBlobErrorModeled::InvalidBlobIdException(InvalidBlobIdException {
-                message: Some(format!("the blob ID {} is not valid", input.blob_id)),
+                message: Some(crate::state::INVALID_BLOB_ID_MESSAGE.to_string()),
             })
             .into());
         }

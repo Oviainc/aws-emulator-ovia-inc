@@ -142,8 +142,8 @@ use crate::state::{ResourceEntry, RestApiEntry};
 
 use super::create_rest_api::{API_STATUS_AVAILABLE, ROOT_RESOURCE_PATH};
 use super::put_rest_api::{
-    bound_definition, materialise_definition, parse_definition, plan_resources, ImportScope,
-    ImportedDefinition,
+    bound_definition, materialise_definition, parse_definition, plan_resources, warnings_refusal,
+    ImportScope, ImportedDefinition,
 };
 
 /// The `parameters` key that chooses the created API's endpoint type, from the member's
@@ -483,10 +483,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // creation (true) or not (false) when a warning is encountered": the definition
         // is read before anything is created, so the rollback is that no API exists.
         if input.fail_on_warnings && !definition.warnings.is_empty() {
-            return Err(bad_request(format!(
-                "Errors found during import: {}",
-                definition.warnings.join("; ")
-            )));
+            return Err(bad_request(warnings_refusal(&definition.warnings)));
         }
 
         // A created API holds its root resource and nothing else, so every path the

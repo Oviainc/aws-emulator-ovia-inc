@@ -23,6 +23,8 @@ mod list_setting_order;
 mod member_constraint_field_list;
 #[path = "all/pattern_refusal_rendering.rs"]
 mod pattern_refusal_rendering;
+#[path = "all/reported_account_color.rs"]
+mod reported_account_color;
 #[path = "all/service_catalog.rs"]
 mod service_catalog;
 #[path = "all/state_roundtrip.rs"]

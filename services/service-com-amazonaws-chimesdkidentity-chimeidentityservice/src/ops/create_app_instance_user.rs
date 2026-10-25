@@ -166,6 +166,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the AppInstance store is unavailable".to_string()),
             })
         })?;
+        // The tags given at create time go in the family's shared, ARN-keyed tag
+        // directory, which is where the tagging operations read them from; resolved
+        // before anything is written so a create cannot half-succeed.
+        let tag_directory = crate::state::chime_tags(&*self.engine).ok_or_else(|| {
+            CreateAppInstanceUserErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the Chime tag directory is unavailable".to_string()),
+            })
+        })?;
         let mut state = state.lock();
 
         // The user ARN is the parent's ARN plus the caller's id, so it is fully
@@ -200,6 +209,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // lookup and reports which of the three modelled refusals applies. In every
         // refusal nothing is written.
         let now = ::std::time::SystemTime::now();
+        // `TagList` is `@length(min: 1)`, so the member is either absent or non-empty.
+        let tags: Vec<(String, String)> = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
         let record = crate::state::AppInstanceUserRecord {
             arn: arn.clone(),
             app_instance_arn: input.app_instance_arn.clone(),
@@ -207,14 +223,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: input.name,
             metadata: input.metadata,
             created_timestamp: now,
+            // A user carries a last-updated instant from the moment it is created.
             last_updated_timestamp: now,
             expiration_settings: input.expiration_settings,
-            tags: input
-                .tags
-                .unwrap_or_default()
-                .into_iter()
-                .map(|tag| (tag.key, tag.value))
-                .collect(),
         };
 
         match state.insert_user(record) {
@@ -268,6 +279,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The user is stored either way; at the structural token ceiling the token is
         // simply not recorded, so the map cannot grow past it.
         let _recorded = state.record_idempotency(Self::NAME, &input.client_request_token, &arn);
+        if !tags.is_empty() {
+            tag_directory.lock().tag(&arn, tags);
+        }
 
         Ok(CreateAppInstanceUserOutput {
             app_instance_user_arn: Some(arn),

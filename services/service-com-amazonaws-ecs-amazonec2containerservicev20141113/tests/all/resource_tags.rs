@@ -94,6 +94,8 @@ pub(crate) async fn create(
                 json!({
                     "cluster": CLUSTER,
                     "instanceIdentityDocument": identity_document(name),
+                    "instanceIdentityDocumentSignature":
+                        crate::ecs_wire::identity_document_signature(),
                     "tags": tags,
                 }),
                 case,

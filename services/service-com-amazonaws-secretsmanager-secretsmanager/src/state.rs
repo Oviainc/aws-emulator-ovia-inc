@@ -557,12 +557,18 @@ pub const MALFORMED_POLICY_MESSAGE: &str = "Syntax errors in policy. The resourc
      a JSON object whose Statement is a statement, or a non-empty list of statements, each with an \
      Effect of Allow or Deny.";
 
-/// What a `BlockPublicPolicy` request that names a policy granting broad access
-/// is refused with: `PublicPolicyException` is "The BlockPublicPolicy parameter
-/// is set to true, and the resource policy did not prevent broad access to the
-/// secret." (this service's Smithy model).
-pub const PUBLIC_POLICY_MESSAGE: &str = "Resource policy blocked by BlockPublicPolicy: the policy \
-     allows broad access to the secret.";
+/// What this service says about a resource policy that grants public access to a
+/// secret: `PublicPolicyException` is "The BlockPublicPolicy parameter is set to
+/// true, and the resource policy did not prevent broad access to the secret."
+/// (this service's Smithy model).
+///
+/// One fixed sentence, naming no part of the document, no secret and no
+/// principal, and the SAME sentence wherever the service speaks about that
+/// condition: the `PublicPolicyException` a `BlockPublicPolicy` request is
+/// refused with, and the message the broad-access check reports on the
+/// validation channel ([`BROAD_ACCESS_CHECK_MESSAGE`]).
+pub const PUBLIC_POLICY_MESSAGE: &str =
+    "You can not attach a resource policy that grants Public access to your secret.";
 
 /// The policy elements a statement can name a principal under. A principal is
 /// either the bare wildcard string or a map from principal type to one or more
@@ -654,10 +660,11 @@ fn names_wildcard_principal(statement: &Value) -> bool {
 /// blocks such a policy outright, `BlockPublicPolicy`.
 pub const BROAD_ACCESS_CHECK_NAME: &str = "BlockPublicPolicyCheck";
 
-/// What that check reports. It describes the statement that failed the check in
-/// policy terms and quotes no part of the document back.
-pub const BROAD_ACCESS_CHECK_MESSAGE: &str =
-    "This resource policy grants broad access to your secret.";
+/// What that check reports: the one sentence this service says about a policy
+/// granting public access to a secret, the same on the reporting channel as on
+/// the refusing one ([`PUBLIC_POLICY_MESSAGE`]), so a caller using this
+/// operation as a pre-flight guard reads the very text the refusal will carry.
+pub const BROAD_ACCESS_CHECK_MESSAGE: &str = PUBLIC_POLICY_MESSAGE;
 
 /// The name reported for the check that a policy leaves somebody able to reach
 /// the secret: "Verifies the policy does not lock out a caller"
