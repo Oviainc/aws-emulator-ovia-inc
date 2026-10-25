@@ -237,8 +237,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
+        let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
-        guard.advance_clock(::std::time::SystemTime::now());
+        guard.advance_clock(now);
 
         if !guard.has_active_cluster(&cluster_name) {
             return Err(
@@ -320,10 +321,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             instance.platform_devices = platform_devices;
             instance.tags = tags;
             instance.version += 1;
+            let view = instance.view(crate::state::ContainerInstanceFields::all());
+            // A re-registration is the other way this cluster's capacity comes back —
+            // the instance it names was not counted while it was deregistered — so the
+            // tasks parked on it are placed from here too.
+            guard.place_tasks_awaiting_capacity(&cluster_name, now);
             return Ok(RegisterContainerInstanceOutput {
-                container_instance: Some(
-                    instance.view(crate::state::ContainerInstanceFields::all()),
-                ),
+                container_instance: Some(view),
             });
         }
 
@@ -371,7 +375,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             version: 0,
         };
         let view = record.view(crate::state::ContainerInstanceFields::all());
+        let registered_into = record.cluster_name.clone();
         guard.container_instances.insert(record.arn.clone(), record);
+        // The capacity a task parked on an empty capacity provider was waiting for has
+        // just arrived, so Amazon ECS has somewhere to place it: the placement each such
+        // task is now owed is recorded here and materialised by the clock.
+        guard.place_tasks_awaiting_capacity(&registered_into, now);
 
         Ok(RegisterContainerInstanceOutput {
             container_instance: Some(view),

@@ -61,3 +61,5 @@ mod task_definition_projection;
 mod task_definition_rendering;
 #[path = "all/task_lifecycle.rs"]
 mod task_lifecycle;
+#[path = "all/task_provisioning.rs"]
+mod task_provisioning;

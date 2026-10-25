@@ -121,15 +121,14 @@ fn requirement(kind: &ViolationKind) -> Option<String> {
         ViolationKind::MaxLength(max) => {
             crate::state::max_length_requirement(usize::try_from(*max).unwrap_or(0))
         }
-        ViolationKind::MinValue(min) => crate::state::min_value_requirement(min),
-        ViolationKind::MaxValue(max) => crate::state::max_value_requirement(max),
         ViolationKind::Pattern(pattern) => crate::state::pattern_requirement(pattern),
         ViolationKind::UniqueItems => crate::state::unique_items_requirement(),
-        // Everything else has no no-echo phrase here: the enum and
-        // absent-member classes render exactly as the framework renders them,
-        // so `violation_clause` hands those to `Violation::message` instead,
-        // and a class added upstream has no phrase at all, which declines the
-        // refusal and keeps the framework's wording.
+        // Everything else has no no-echo phrase here: the enum, the numeric
+        // `@range` and the absent-member classes render exactly as the
+        // framework renders them, so `violation_clause` hands those to
+        // `Violation::message` instead, and a class added upstream has no
+        // phrase at all, which declines the refusal and keeps the framework's
+        // wording.
         _ => return None,
     })
 }
@@ -139,22 +138,24 @@ fn requirement(kind: &ViolationKind) -> Option<String> {
 /// Which member path is stated, and whether the rejected value is echoed,
 /// follows the violation's CLASS, as AWS's own refusals do:
 ///
-/// * a value outside an enumerated member's value set is the request's own
-///   string, and AWS reports it the way its request validator does — the
-///   member's lowerCamel path, with that value echoed, so a caller sees which
-///   of its values is not a member of the set. That is exactly the framework's
-///   own rendering, so the framework renders it (`Violation::message`) rather
-///   than this service restating the sentence;
+/// * a SCALAR the caller sent and the request validator refused outright — a
+///   string outside an enumerated member's value set, a number outside the
+///   `@range` its model declares — is reported the way that validator reports
+///   it: the member's lowerCamel path with the rejected value echoed, so a
+///   caller can read out of the message which value of which member was
+///   refused. That is exactly the framework's own rendering, so the framework
+///   renders it (`Violation::message`) rather than this service restating the
+///   sentence;
 /// * an absent member states the `null` it was, which is a fact of the
 ///   request's shape — the framework's rendering again, over the member path
 ///   spelled as the model spells it;
-/// * a bound on a member's SIZE or MAGNITUDE (`@length`, `@range`,
-///   `@uniqueItems`, `@pattern`) is reported by the member's wire path with no
-///   value echoed: the bound is a fact of the model, the member names itself as
-///   the model spells it, and the framework's rendering of the offending value
-///   (`'101 items'`, `'0'`) is a figure internal to the validating walk rather
-///   than anything the caller sent. No renderer in the framework states a
-///   clause without a value, so this one is built here.
+/// * a bound on a member's SIZE or SHAPE (`@length`, `@uniqueItems`,
+///   `@pattern`) is reported by the member's wire path with no value echoed:
+///   the bound is a fact of the model, the member names itself as the model
+///   spells it, and the figure the framework would echo for such a violation
+///   (`'101 items'` for a collection past its cap) is internal to the
+///   validating walk rather than anything the caller sent. No renderer in the
+///   framework states a clause without a value, so this one is built here.
 ///
 /// A COLLECTION member past its cap is the same clause: the member and the
 /// bound, with nothing echoed. Some recorded AWS refusals of a capped
@@ -175,12 +176,16 @@ fn requirement(kind: &ViolationKind) -> Option<String> {
 /// collections of the batched and transactional operations.
 fn violation_clause(violation: &Violation) -> Option<String> {
     match &violation.kind {
-        ViolationKind::MissingRequiredMember | ViolationKind::EnumValue(_) => Some(
+        ViolationKind::MissingRequiredMember
+        | ViolationKind::EnumValue(_)
+        | ViolationKind::MinValue(_)
+        | ViolationKind::MaxValue(_) => Some(
             Violation {
                 path: match &violation.kind {
                     // An absent member names itself as the model spells it; an
-                    // enum violation keeps the validator's own path, which is
-                    // what the recorded refusals for this service state.
+                    // enum or `@range` violation keeps the validator's own
+                    // path, which is what the recorded refusals for this
+                    // service state.
                     ViolationKind::MissingRequiredMember => wire_member_path(&violation.path),
                     _ => violation.path.clone(),
                 },

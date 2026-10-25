@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags the stream the request names carries in `crate::state`'s `streams`
+//! store — what `CreateStream` and `AddTagsToStream` wrote — as one page of the stream's
+//! tag list ordered by key, and whether the list holds more beyond that page. A pure
+//! read: nothing it does changes what a later caller sees.
+//!
+//! The stream is resolved by `StreamName`, by `StreamARN` or by both, through the one
+//! lookup every operation of this service that addresses a stream shares
+//! ([`crate::state::ComAmazonawsKinesisKinesis20131202State::resolve_stream`]).
 //!
 //! ## Shape of an operation
 //!
@@ -102,13 +102,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-kinesis-kinesis-2013120
 // here — hence the `ListTagsForStreamError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#ListTagsForStream")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#ListTagsForStream",
+    // `InternalFailureException` is widened in with `extra_errors`: this SERVICE models it
+    // ("The processing of the request failed because of an unknown error, exception, or
+    // failure"), the operation shape does not list it, and it is the only honest answer
+    // for a service mounted on an engine that holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum ListTagsForStreamErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InvalidArgumentException(InvalidArgumentException),
     LimitExceededException(LimitExceededException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -134,6 +142,39 @@ impl From<ListTagsForStreamErrorModeled> for ListTagsForStreamError {
 /// concrete engine where it mounts the service, not here.
 pub struct ListTagsForStream<Eng> {
     engine: ::std::sync::Arc<Eng>,
+}
+
+/// The modelled refusal for a request whose `StreamName` / `StreamARN` pair names no stream
+/// of this account and region, worded exactly as the other reads word it: one rule, one
+/// phrasing, for every operation that addresses a stream.
+fn lookup_refusal(
+    failure: crate::state::StreamLookupFailure,
+    input: &ListTagsForStreamInput,
+) -> ListTagsForStreamError {
+    match failure {
+        crate::state::StreamLookupFailure::Unspecified => {
+            ListTagsForStreamErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some(crate::state::STREAM_IDENTIFIER_REQUIRED_MESSAGE.to_string()),
+            })
+        }
+        crate::state::StreamLookupFailure::Mismatch => {
+            ListTagsForStreamErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some(crate::state::STREAM_IDENTIFIER_MISMATCH_MESSAGE.to_string()),
+            })
+        }
+        crate::state::StreamLookupFailure::NotFound => {
+            ListTagsForStreamErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::stream_not_found_message(
+                    input
+                        .stream_name
+                        .as_deref()
+                        .or(input.stream_arn.as_deref())
+                        .unwrap_or_default(),
+                )),
+            })
+        }
+    }
+    .into()
 }
 
 impl<Eng> ListTagsForStream<Eng> {
@@ -162,18 +203,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForStream"))
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTagsForStreamError::from(ListTagsForStreamErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the stream store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        // The page this call answers with, bounded BEFORE anything is collected: the
+        // `Limit` the request named, inside the modelled `range 1..50` the boundary
+        // validator already enforces, and the whole tag list for a request naming none.
+        let limit = usize::try_from(
+            input
+                .limit
+                .unwrap_or(crate::state::MAX_LIST_TAGS_FOR_STREAM_LIMIT)
+                .clamp(1, crate::state::MAX_LIST_TAGS_FOR_STREAM_LIMIT),
+        )
+        .unwrap_or(1);
+
+        let store = state.lock();
+        // `StreamId` is documented "Not Implemented. Reserved for future use", so no
+        // stream carries one and a request naming only that member names no stream.
+        let stream = store
+            .resolve_stream(
+                &region,
+                input.stream_name.as_deref(),
+                input.stream_arn.as_deref(),
+            )
+            .map_err(|failure| lookup_refusal(failure, &input))?;
+
+        // "A list of tags associated with StreamName, starting with the first tag after
+        // ExclusiveStartTagKey and up to the specified Limit" (`ListTagsForStreamOutput`),
+        // over the stream's tags in key order.
+        let start_after = input.exclusive_start_tag_key.as_deref();
+        let mut beyond_cursor = stream
+            .tags_ordered()
+            .into_iter()
+            .filter(|tag| start_after.is_none_or(|start| tag.key.as_str() > start));
+        let tags: Vec<Tag> = beyond_cursor.by_ref().take(limit).collect();
+
+        Ok(ListTagsForStreamOutput {
+            // "If set to true, more tags are available. To request additional tags, set
+            // ExclusiveStartTagKey to the key of the last tag returned"
+            // (`ListTagsForStreamOutput$HasMoreTags`): true exactly when the stream carries
+            // a tag past this page.
+            has_more_tags: beyond_cursor.next().is_some(),
+            tags,
+        })
     }
 }

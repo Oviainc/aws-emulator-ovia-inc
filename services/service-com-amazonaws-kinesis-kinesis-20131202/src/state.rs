@@ -3,16 +3,16 @@
 //! Engine state for the com-amazonaws-kinesis-kinesis-20131202 service.
 //!
 //! This module owns the stream records the implemented operations read and write: the
-//! shard map `CreateStream` lays down, the ARN a stream is addressed by, and the single
-//! place where the `CREATING` -> `ACTIVE` transition the clock owes a new stream is
-//! decided ([`Stream::status`]).
+//! shard map `CreateStream` lays down, the ARN a stream is addressed by, the tags assigned
+//! to it, and the single place where the `CREATING` -> `ACTIVE` transition the clock owes a
+//! new stream is decided ([`Stream::status`]).
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     EnhancedMetrics, HashKeyRange, SequenceNumberRange, Shard, StreamDescription,
-    StreamDescriptionSummary, StreamModeDetails, WarmThroughputObject,
+    StreamDescriptionSummary, StreamModeDetails, Tag, WarmThroughputObject,
 };
 
 /// The region a stream is created in when the request carries no SigV4 credential scope
@@ -103,6 +103,12 @@ pub const MAX_SHARDS_TOTAL: u32 = 4_000;
 /// the tags" (`CreateStreamInput$Tags`), which is narrower than the `TagMap` `@length` of
 /// 1..200 the boundary validator enforces.
 pub const MAX_STREAM_TAGS: usize = 50;
+
+/// The most tags `ListTagsForStream` returns in one call, which is also the page a request
+/// naming no `Limit` gets: `Limit` is modelled `range 1..50`
+/// (`smithy_query(query="operation",operation="ListTagsForStream")`), and a stream carries
+/// at most [`MAX_STREAM_TAGS`] tags, so a request naming no limit gets all of them.
+pub const MAX_LIST_TAGS_FOR_STREAM_LIMIT: i32 = 50;
 
 /// How many shards `DescribeStream` returns when the request names no `Limit`: "The
 /// maximum number of shards to return in a single call. The default value is 100"
@@ -239,6 +245,51 @@ impl Stream {
             .unwrap_or(i32::MAX)
     }
 
+    /// The stream's tags as the modelled `Tag` list, ordered by key.
+    ///
+    /// A tag list is paged through by key ("The key to use as the starting point for the
+    /// list of tags... gets all tags that occur after ExclusiveStartTagKey",
+    /// `ListTagsForStreamInput$ExclusiveStartTagKey`), so the tags a stream reports need
+    /// ONE total order that every read agrees on, and the cursor names the key: the order
+    /// is by key.
+    pub fn tags_ordered(&self) -> Vec<Tag> {
+        let mut tags: Vec<Tag> = self
+            .tags
+            .iter()
+            .map(|(key, value)| Tag {
+                key: key.clone(),
+                // `Tag$Value` is "An optional string", and a tag assigned a value carries
+                // it however short it is — `TagValue` is modelled `len 0..256`.
+                value: Some(value.clone()),
+            })
+            .collect();
+        tags.sort_by(|left, right| left.key.cmp(&right.key));
+        tags
+    }
+
+    /// How many tags the stream would carry once `tags` were assigned to it, which is what
+    /// [`MAX_STREAM_TAGS`] bounds: an assignment overwrites a key the stream already
+    /// carries rather than adding a second entry for it.
+    pub fn tag_count_with(&self, tags: &HashMap<String, String>) -> usize {
+        self.tags.len()
+            + tags
+                .keys()
+                .filter(|key| !self.tags.contains_key(key.as_str()))
+                .count()
+    }
+
+    /// Assign `tags` to the stream: a key the stream already carries takes the new value
+    /// ("If tags have already been assigned to the stream, AddTagsToStream overwrites any
+    /// existing tags that correspond to the specified tag keys"), and every tag the
+    /// request does not name stays as it was.
+    ///
+    /// Bounded by the caller: a request that would take the stream past
+    /// [`MAX_STREAM_TAGS`] is refused BEFORE this grows the stored map
+    /// ([`Self::tag_count_with`]).
+    pub fn assign_tags(&mut self, tags: impl IntoIterator<Item = (String, String)>) {
+        self.tags.extend(tags);
+    }
+
     /// The enhanced monitoring configuration the stream reports: one entry carrying the
     /// shard-level metrics that are enabled, which is an empty list until some are.
     fn enhanced_monitoring(&self) -> Vec<EnhancedMetrics> {
@@ -371,6 +422,33 @@ impl ComAmazonawsKinesisKinesis20131202State {
         }
     }
 
+    /// The key of the stream a request's `StreamName` / `StreamARN` pair names, resolved
+    /// by exactly the rule [`Self::resolve_stream`] applies.
+    fn resolve_stream_key(
+        &self,
+        region: &str,
+        name: Option<&str>,
+        arn: Option<&str>,
+    ) -> Result<RegionalName, StreamLookupFailure> {
+        self.resolve_stream(region, name, arn)
+            .map(|stream| RegionalName::new(&stream.region, &stream.name))
+    }
+
+    /// The stream a request's `StreamName` / `StreamARN` pair names, for an operation that
+    /// WRITES to it. One rule, one lookup: the pair is resolved by
+    /// [`Self::resolve_stream_key`] and the stored record is then reached by its key.
+    pub fn resolve_stream_mut(
+        &mut self,
+        region: &str,
+        name: Option<&str>,
+        arn: Option<&str>,
+    ) -> Result<&mut Stream, StreamLookupFailure> {
+        let key = self.resolve_stream_key(region, name, arn)?;
+        self.streams
+            .get_mut(&key)
+            .ok_or(StreamLookupFailure::NotFound)
+    }
+
     /// How many streams `region`'s endpoint holds, which is what
     /// [`MAX_STREAMS_PER_REGION`] bounds.
     pub fn streams_held_in(&self, region: &str) -> usize {
@@ -429,6 +507,17 @@ pub fn stream_not_found_message(identifier: &str) -> String {
     format!(
         "stream {identifier} not found under account {}",
         ::engine::emulator_account_id()
+    )
+}
+
+/// How an operation that needs a ready stream refuses one that is not ready yet: the rule
+/// `ResourceInUseException` publishes ("The resource is not available for this operation.
+/// For successful operation, the resource must be in the ACTIVE state"). Built FROM the
+/// request and the stored record, so the identifier and the status at fault name it.
+pub fn stream_not_active_message(identifier: &str, status: &str) -> String {
+    format!(
+        "stream {identifier} is in state {status}, not {STREAM_ACTIVE}; the stream must be \
+         {STREAM_ACTIVE} for this operation"
     )
 }
 
