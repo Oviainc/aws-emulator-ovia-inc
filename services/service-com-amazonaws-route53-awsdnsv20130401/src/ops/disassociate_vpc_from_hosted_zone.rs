@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateVPCFromHostedZone
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateVPCFromHostedZone`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateVPCFromHostedZone::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes an Amazon VPC from a PRIVATE hosted zone's association list: the list this
+//! operation removes from is the one `AssociateVPCWithHostedZone` appends to,
+//! `GetHostedZone` reports and `ListHostedZonesByVPC` searches by VPC — and the
+//! one a private zone's first association (made by `CreateHostedZone`) starts.
 //!
 //! ## Shape of an operation
 //!
@@ -96,6 +91,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{no_such_hosted_zone, normalize_zone_id, vpc_id_is_well_formed};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -166,20 +163,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateVPCFromHostedZone` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateVPCFromHostedZoneErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateVPCFromHostedZone"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            DisassociateVPCFromHostedZoneErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        // A disassociation names ONE VPC, and `VPC$VPCId` is what identifies it.
+        // Neither member of the shared `VPC` container is modelled as required
+        // (it is also used by the operations that merely report one), so the
+        // handler is what refuses a request naming no VPC at all — the same
+        // refusal `AssociateVPCWithHostedZone` makes for the same input.
+        let vpc_id = input.vpc.vpc_id.as_deref().unwrap_or_default().trim();
+        let vpc_region = input.vpc.vpc_region.as_deref().unwrap_or_default().trim();
+        if !vpc_id_is_well_formed(vpc_id) {
+            return Err(DisassociateVPCFromHostedZoneErrorModeled::InvalidVPCId(InvalidVPCId {
+                message: Some(format!(
+                    "Invalid VPC ID: {vpc_id:?} is not a valid Amazon VPC ID"
+                )),
+            })
+            .into());
+        }
+
+        // The caller may pass the bare id or the `/hostedzone/`-prefixed `Id` a
+        // HostedZone handed it back; both name the same zone.
+        let zone_id = normalize_zone_id(&input.hosted_zone_id).to_string();
+        let mut store = state.lock();
+
+        let zone = store.zones.get(&zone_id).ok_or_else(|| {
+            DisassociateVPCFromHostedZoneErrorModeled::NoSuchHostedZone(no_such_hosted_zone(
+                &input.hosted_zone_id,
+            ))
+        })?;
+
+        // An association is keyed by VPC id (see `StoredZone::vpc_position`), so
+        // a VPC the zone holds no association for is the modelled
+        // `VPCAssociationNotFound`, whose message names the VPC the request
+        // asked about — its id and the region it gave for it — and the zone it
+        // asked about it for. A PUBLIC zone holds no association at all, so the
+        // same refusal answers a request against one: this operation models no
+        // public-zone error of its own, because either way there is no
+        // association to remove.
+        let position = zone.vpc_position(vpc_id).ok_or_else(|| {
+            DisassociateVPCFromHostedZoneErrorModeled::VPCAssociationNotFound(
+                VPCAssociationNotFound {
+                    message: Some(format!(
+                        "No VPC association for {vpc_id}:{vpc_region} to hosted zone {zone_id}"
+                    )),
+                },
+            )
+        })?;
+
+        // "You can't disassociate the last Amazon VPC from a private hosted
+        // zone": a private zone resolves names only for the VPCs associated with
+        // it, so removing the only one would leave a zone no VPC could reach,
+        // and the model declares a refusal for exactly this request.
+        if zone.vpcs.len() == 1 {
+            return Err(DisassociateVPCFromHostedZoneErrorModeled::LastVPCAssociation(
+                LastVPCAssociation {
+                    message: Some(format!(
+                        "The VPC {vpc_id} is the last VPC associated with the hosted zone \
+                         {zone_id}. Route 53 doesn't support disassociating the last VPC from a \
+                         hosted zone."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The change the caller polls through `GetChange`, carrying the
+        // `Comment` this request gave it.
+        let change = store.submit_change(input.comment.clone());
+        let zone = store
+            .zones
+            .get_mut(&zone_id)
+            .expect("the hosted zone resolved above must still be present");
+        zone.vpcs.remove(position);
+
+        Ok(DisassociateVPCFromHostedZoneOutput {
+            change_info: change.to_change_info(),
+        })
     }
 }
