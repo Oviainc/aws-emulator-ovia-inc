@@ -339,6 +339,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             username: input.username.clone(),
             sub,
             attributes,
+            // Nothing is pending for a user an administrator just created: the
+            // attributes above are its values, not values awaiting a
+            // confirmation.
+            pending_attributes: ::std::collections::BTreeMap::new(),
             // A temporary password Amazon Cognito would have messaged to the user
             // is not minted here: this emulator delivers no mail or SMS, so a
             // password nothing can read would be a credential that does not exist.

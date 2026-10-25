@@ -184,34 +184,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(reason));
         }
 
-        // "If you are creating a partner event bus, this specifies the partner
-        // event source that the new event bus will be matched with", and "for
-        // partner event buses, the name must exactly match the name of the partner
-        // event source that this event bus is matched to" (this operation's own
-        // documentation). A partner event source is a resource of this service
-        // (`CreatePartnerEventSource`), and nothing in this emulator has created
-        // one, so a request naming one names a resource that does not exist.
-        if let Some(source) = input.event_source_name.as_deref() {
-            return Err(CreateEventBusErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("Event source {source} does not exist.")),
-                },
-            )
-            .into());
-        }
-
-        // "Custom event bus names can't contain the / character, but you can use
-        // the / character in partner event bus names" (this operation's `Name`).
-        // A partner event bus is the one named by `EventSourceName`, refused just
-        // above, so a `/` here is a name no bus this call can create may carry.
-        if input.name.contains('/') {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Parameter Name is not valid. Reason: {:?} contains the / character, which \
-                 only a partner event bus name may.",
-                input.name
-            )));
-        }
-
         let region = crate::state::request_region(ctx.parts());
         let created = ::std::time::SystemTime::now();
         // The request's own tag count is charged BEFORE the store lock is taken, for
@@ -227,6 +199,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(reason));
         }
         let mut store = state.lock();
+        store.settle_partner_sources(created);
+
+        // "If you are creating a partner event bus, this specifies the partner
+        // event source that the new event bus will be matched with", and "for
+        // partner event buses, the name must exactly match the name of the partner
+        // event source that this event bus is matched to" (this operation's own
+        // documentation). The source is a resource of this service
+        // (`CreatePartnerEventSource`) that an SaaS partner offers to ONE account,
+        // so the bus can be matched only with a source shared with this account:
+        // any other name names a source that does not exist here.
+        if let Some(source) = input.event_source_name.as_deref() {
+            if store
+                .event_source_shared_with(source, crate::state::account_id())
+                .is_none()
+            {
+                return Err(CreateEventBusErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::no_such_event_source(source)),
+                    },
+                )
+                .into());
+            }
+            if input.name != source {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Parameter Name is not valid. Reason: a partner event bus name must exactly \
+                     match the name of the partner event source it is matched to, {source:?}.",
+                )));
+            }
+        } else if input.name.contains('/') {
+            // "Custom event bus names can't contain the / character, but you can
+            // use the / character in partner event bus names" (this operation's
+            // `Name`). A partner event bus is the one named by `EventSourceName`,
+            // so without it a `/` is a name no bus this call can create may carry.
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Parameter Name is not valid. Reason: {:?} contains the / character, which \
+                 only a partner event bus name may.",
+                input.name
+            )));
+        }
 
         // The name is the bus's identity, so a name already stored is a resource
         // that already exists — never a silent overwrite of the stored bus, and
@@ -263,6 +274,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|identifier| crate::state::kms_key_identifier(&region, identifier));
         bus.dead_letter_config = input.dead_letter_config;
         bus.log_config = input.log_config;
+        // The source this bus is matched with, which is what makes it a PARTNER
+        // event bus: the match is stored on the bus, so every later read of the
+        // pair resolves it from one record.
+        bus.event_source_name = input.event_source_name.clone();
         // "Tags to associate with the event bus" (`Tags`): the tags a create names go
         // through the same merge every tag write of this service uses, so one
         // request's repeated key and the per-resource tag bound are resolved the same
@@ -272,6 +287,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(reason));
         }
         store.buses.insert(input.name.clone(), bus);
+
+        // Matching the source with a bus is what starts its ingestion: "an
+        // Amazon Web Services account that creates a partner event bus that
+        // matches the partner event source can use that event bus to receive
+        // events from the partner" (`CreatePartnerEventSource`) — so the source
+        // leaves PENDING here, and stops expiring with it.
+        if let Some(record) = input
+            .event_source_name
+            .as_deref()
+            .and_then(|source| store.partner_source_mut(source))
+        {
+            record.activated = true;
+            record.pending_since = None;
+        }
 
         // Reported from the STORED record rather than from the request, so this
         // response and `DescribeEventBus`'s cannot disagree; the ARN is derived

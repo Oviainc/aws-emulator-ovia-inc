@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEnabledBaselines
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEnabledBaselines`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEnabledBaselines::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the enablements `EnableBaseline` persisted, oldest ARN first, narrowed by every
+//! member of `filter` and paginated by `maxResults` and `nextToken`. Derived entirely from
+//! [`crate::state`], so it is empty before any enablement, every member it reports is the
+//! one the call that applied it persisted, and an enablement the clock has torn down is
+//! gone from it.
+//!
+//! Two filter members select by something this service holds no value for. An
+//! `EnabledBaseline` here is applied directly to its target and this service records no
+//! organizational hierarchy, so no enablement is the child of another one
+//! (`parentIdentifier` absent) and `includeChildren` — which asks for the enablements the
+//! target's member accounts inherited — widens the listing by nothing. No drift is
+//! assessed either, which is why `GetEnabledBaseline` reports no `driftStatusSummary` for
+//! one. An absent value is selected only by an absent filter, so filtering on either
+//! member selects nothing rather than inventing a parent or a drift status to match it.
+//!
+//! Implemented: this operation no longer answers HTTP 501.
 //!
 //! ## Shape of an operation
 //!
@@ -118,6 +126,39 @@ impl From<ListEnabledBaselinesErrorModeled> for ListEnabledBaselinesError {
     }
 }
 
+/// A filter list the caller sent, as the handler matches it: the values as a SET, so
+/// testing one enablement against it costs `O(log k)` rather than a scan, and the whole
+/// per-request scan is bounded by the store's own [`MAX_ENABLED_BASELINES`] cap.
+///
+/// Every enum-typed member of `EnabledBaselineFilter` deserializes to a plain string, but
+/// the schema front door has already refused a value the model's value set does not
+/// declare (HTTP 400), so reaching this handler means each value is one of the modelled
+/// ones — and each of these lists is modelled with a maximum length, so the front door has
+/// bounded their lengths too.
+///
+/// [`MAX_ENABLED_BASELINES`]: crate::state::MAX_ENABLED_BASELINES
+type Filter<'a> = Option<::std::collections::BTreeSet<&'a str>>;
+
+/// The values of one filter member as a [`Filter`] set, or `None` when the caller sent
+/// that member no list at all. Built BEFORE the state lock is taken, so no caller-sized
+/// work happens while the lock is held.
+fn filter_set(values: Option<&Vec<String>>) -> Filter<'_> {
+    values.map(|values| values.iter().map(String::as_str).collect())
+}
+
+/// Whether `actual` is selected by a filter: a member the caller did not send selects
+/// every enablement, and one they did selects the enablements whose value its set holds.
+fn selected(filter: &Filter<'_>, actual: &str) -> bool {
+    filter.as_ref().is_none_or(|values| values.contains(actual))
+}
+
+/// As [`selected`], for a member no stored enablement has a value for at all: an absent
+/// value is selected only by an absent filter, so such a filter selects nothing (see the
+/// module header on `parentIdentifiers` and `inheritanceDriftStatuses`).
+fn selects_an_absent_value(filter: &Filter<'_>) -> bool {
+    filter.is_none()
+}
+
 /// The `ListEnabledBaselines` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -154,18 +195,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEnabledBaselines` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEnabledBaselinesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEnabledBaselines"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListEnabledBaselinesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AWS Control Tower emulator is mounted on an engine that \
+                              holds no state"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Every member of `filter` narrows the listing; a member the caller omitted
+        // narrows nothing. The sets are built here, BEFORE the state lock below, so the
+        // only work done under the lock is one pass over the store.
+        let filter = input.filter.unwrap_or_default();
+        let target_identifiers = filter_set(filter.target_identifiers.as_ref());
+        let baseline_identifiers = filter_set(filter.baseline_identifiers.as_ref());
+        let parent_identifiers = filter_set(filter.parent_identifiers.as_ref());
+        let statuses = filter_set(filter.statuses.as_ref());
+        let inheritance_drift_statuses = filter_set(filter.inheritance_drift_statuses.as_ref());
+
+        let mut store = state.lock();
+        // Only materialises transitions the clock already owed; this operation is
+        // `@readonly` and writes nothing else.
+        store.settle(::std::time::SystemTime::now());
+
+        // A stable total order over the page boundary, so a `nextToken` resumes where the
+        // previous page stopped whatever order the map iterates in. The records are
+        // BORROWED, not cloned: only the page this call returns is materialised.
+        let mut enabled: Vec<&crate::state::EnabledBaseline> = store
+            .enabled_baselines
+            .values()
+            .filter(|enabled_baseline| {
+                selected(&target_identifiers, &enabled_baseline.target_identifier)
+                    && selected(&baseline_identifiers, &enabled_baseline.baseline_identifier)
+                    && selected(&statuses, enabled_baseline.status.as_wire())
+                    // Neither a parent enablement nor an inheritance drift status is
+                    // recorded for an enablement here, so a filter on one selects nothing:
+                    // see the module header, and `includeChildren`, which adds nothing to
+                    // this set because there is no hierarchy to widen it with.
+                    && selects_an_absent_value(&parent_identifiers)
+                    && selects_an_absent_value(&inheritance_drift_statuses)
+            })
+            .collect();
+        enabled.sort_by(|left, right| left.arn.cmp(&right.arn));
+
+        // The token this operation hands out is the index of the next unreturned entry,
+        // so it is only meaningful against a call carrying the same filter — which is what
+        // `nextToken` is documented to require. `ListEnabledBaselinesNextToken` is
+        // modelled `pattern \S+`, so the front door has already refused an empty token and
+        // only an absent one reaches here; both mean "start at the beginning".
+        let start = match input.next_token.as_deref() {
+            None | Some("") => 0usize,
+            Some(token) => match token.parse::<usize>() {
+                Ok(index) if index <= enabled.len() => index,
+                _ => {
+                    return Err(ListEnabledBaselinesErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "nextToken {token} was not returned by a previous \
+                                 ListEnabledBaselines call with these parameters"
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // `maxResults` is modelled `range 5..100`, so the front door has already refused
+        // anything outside it; absent, every remaining entry is returned. The floor of 1
+        // keeps a page from being empty-but-tokened should the model ever widen the range
+        // downwards.
+        let limit = input
+            .max_results
+            .map_or(enabled.len(), |max| max.max(1) as usize);
+        let end = start.saturating_add(limit).min(enabled.len());
+
+        let enabled_baselines: Vec<EnabledBaselineSummary> = enabled[start..end]
+            .iter()
+            .map(|enabled_baseline| EnabledBaselineSummary {
+                arn: enabled_baseline.arn.clone(),
+                baseline_identifier: enabled_baseline.baseline_identifier.clone(),
+                baseline_version: Some(enabled_baseline.baseline_version.clone()),
+                // No drift is assessed and no parent enablement is recorded, so both
+                // optional members are absent rather than invented — the same two members
+                // `GetEnabledBaseline` leaves absent for the same resource.
+                drift_status_summary: None,
+                target_identifier: enabled_baseline.target_identifier.clone(),
+                parent_identifier: None,
+                status_summary: EnablementStatusSummary {
+                    status: Some(enabled_baseline.status.as_wire().to_string()),
+                    last_operation_identifier: Some(
+                        enabled_baseline.last_operation_identifier.clone(),
+                    ),
+                },
+            })
+            .collect();
+
+        Ok(ListEnabledBaselinesOutput {
+            enabled_baselines,
+            next_token: (end < enabled.len()).then(|| end.to_string()),
+        })
     }
 }

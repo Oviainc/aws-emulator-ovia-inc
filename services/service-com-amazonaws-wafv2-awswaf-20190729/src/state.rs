@@ -22,8 +22,8 @@ use ::aws_smithy_schema_server::constraints::{
 };
 
 use crate::ops::types::{
-    IPSet, LabelSummary, OnSourceDDoSProtectionConfig, RegexPatternSet, Rule, RuleGroup, Statement,
-    Tag, WAFAssociatedItemException, WAFDuplicateItemException,
+    IPSet, LabelSummary, ManagedProductDescriptor, OnSourceDDoSProtectionConfig, RegexPatternSet,
+    Rule, RuleGroup, Statement, Tag, WAFAssociatedItemException, WAFDuplicateItemException,
     WAFFeatureNotIncludedInPricingPlanException, WAFInvalidParameterException,
     WAFLimitsExceededException, WAFNonexistentItemException, WAFOptimisticLockException, WebACL,
 };
@@ -831,6 +831,27 @@ pub struct ManagedRuleGroupDescriptor {
     /// The WCUs a web ACL spends on one rule that runs this group; see
     /// [`web_acl_capacity`].
     pub capacity: i64,
+    /// The group's display name (`ManagedProductDescriptor$ProductTitle` is "the
+    /// display name for the managed rule group"), as the WAF Developer Guide's
+    /// rule-group list titles it beside its `Name`.
+    pub product_title: &'static str,
+    /// What the group protects against, in one sentence
+    /// (`ManagedProductDescriptor$ProductDescription` is "a short description of
+    /// the managed rule group"), from the same published list as
+    /// [`Self::product_title`].
+    pub product_description: &'static str,
+    /// Whether the vendor offers this group in NAMED versions a web ACL can pin
+    /// (`ManagedProductDescriptor$IsVersioningSupported`), which is the same thing
+    /// as the guide publishing a version history for it — so this is `true` for
+    /// exactly the entries [`versioned`] builds (see [`BOT_CONTROL_VERSIONS`]) and
+    /// `false` for the ones that carry only [`INITIAL_VERSION_ONLY`].
+    pub is_versioning_supported: bool,
+    /// Whether the group provides "an advanced set of protections, such as the
+    /// the Amazon Web Services Managed Rules rule groups that are used for WAF
+    /// intelligent threat mitigation"
+    /// (`ManagedProductDescriptor$IsAdvancedManagedRuleSet`): the
+    /// intelligent-threat-mitigation groups, which are the versioned ones.
+    pub is_advanced_managed_rule_set: bool,
     /// The versions of this group its vendor offers, OLDEST first.
     ///
     /// "Customers can retrieve the available versions for a managed rule group by
@@ -856,6 +877,42 @@ impl ManagedRuleGroupDescriptor {
     /// published, with no second field to fall out of step with the list.
     pub fn current_default_version(&self) -> Option<&'static str> {
         self.versions.last().map(|release| release.name)
+    }
+
+    /// This published group as the managed PRODUCT a describe reports it.
+    ///
+    /// A managed product IS a published managed rule group —
+    /// `DescribeAllManagedProducts` "provides high-level information for the Amazon
+    /// Web Services Managed Rules rule groups and Amazon Web Services Marketplace
+    /// managed rule groups" (the operation's own doc) — so a descriptor is built
+    /// from this catalogue entry rather than from a second list that could fall
+    /// out of step with it: the `(VendorName, ManagedRuleSetName)` pair that
+    /// identifies the group, its title and description, and its two flags.
+    ///
+    /// `ProductId` is "a unique identifier for the rule group", and a
+    /// vendor-published group is identified by its name within its vendor, so the
+    /// name is that identifier. `ProductLink` is left off: it is "for Amazon Web
+    /// Services Marketplace managed rule groups only", and this catalogue
+    /// publishes no marketplace group. `SnsTopicArn` is the topic "used to provide
+    /// notification of changes to the managed rule group": one topic per group, in
+    /// the region the group's `scope` is reached through, minted through the
+    /// emulator's own ARN builder like every other ARN this service answers.
+    pub fn product(&self, scope: &str, request_region: &str) -> ManagedProductDescriptor {
+        ManagedProductDescriptor {
+            vendor_name: Some(self.vendor_name.to_string()),
+            managed_rule_set_name: Some(self.name.to_string()),
+            product_id: Some(self.name.to_string()),
+            product_link: None,
+            product_title: Some(self.product_title.to_string()),
+            product_description: Some(self.product_description.to_string()),
+            sns_topic_arn: Some(::engine::emulator_arn(
+                "sns",
+                arn_region(scope, request_region),
+                self.name,
+            )),
+            is_versioning_supported: self.is_versioning_supported,
+            is_advanced_managed_rule_set: self.is_advanced_managed_rule_set,
+        }
     }
 }
 
@@ -919,22 +976,126 @@ impl ManagedRuleGroupRelease {
 /// offers at least its initial version, which is what
 /// `ListAvailableManagedRuleGroupVersions` lists and what
 /// [`ManagedRuleGroupDescriptor::current_default_version`] answers the newest of.
+///
+/// And it carries what the group is PUBLISHED as — its display title and its
+/// one-sentence description, from the same list as its name and capacity, plus the
+/// two flags that list implies (see [`descriptor`] and [`versioned`]) — because a
+/// managed product is one of these groups as a describe reports it
+/// ([`ManagedRuleGroupDescriptor::product`]), not a separate catalogue.
 pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
-    descriptor("AWSManagedRulesCommonRuleSet", 700),
-    descriptor("AWSManagedRulesAdminProtectionRuleSet", 100),
-    descriptor("AWSManagedRulesKnownBadInputsRuleSet", 200),
-    descriptor("AWSManagedRulesSQLiRuleSet", 200),
-    descriptor("AWSManagedRulesLinuxRuleSet", 200),
-    descriptor("AWSManagedRulesUnixRuleSet", 100),
-    descriptor("AWSManagedRulesWindowsRuleSet", 200),
-    descriptor("AWSManagedRulesPHPRuleSet", 100),
-    descriptor("AWSManagedRulesWordPressRuleSet", 100),
-    descriptor("AWSManagedRulesAmazonIpReputationList", 25),
-    descriptor("AWSManagedRulesAnonymousIpList", 50),
-    versioned("AWSManagedRulesBotControlRuleSet", 50, BOT_CONTROL_VERSIONS),
-    versioned("AWSManagedRulesATPRuleSet", 50, ATP_VERSIONS),
-    versioned("AWSManagedRulesACFPRuleSet", 50, ACFP_VERSIONS),
-    versioned("AWSManagedRulesAntiDDoSRuleSet", 50, ANTI_DDOS_VERSIONS),
+    descriptor(
+        "AWSManagedRulesCommonRuleSet",
+        700,
+        "Core rule set (CRS)",
+        "Provides protection against exploitation of a wide range of \
+         vulnerabilities, including high risk and commonly occurring \
+         vulnerabilities described in OWASP publications.",
+    ),
+    descriptor(
+        "AWSManagedRulesAdminProtectionRuleSet",
+        100,
+        "Admin protection",
+        "Blocks external access to exposed administrative pages.",
+    ),
+    descriptor(
+        "AWSManagedRulesKnownBadInputsRuleSet",
+        200,
+        "Known bad inputs",
+        "Blocks request patterns that are known to be invalid and are associated \
+         with exploitation or discovery of vulnerabilities.",
+    ),
+    descriptor(
+        "AWSManagedRulesSQLiRuleSet",
+        200,
+        "SQL database",
+        "Blocks request patterns associated with the exploitation of SQL \
+         databases, like SQL injection attacks.",
+    ),
+    descriptor(
+        "AWSManagedRulesLinuxRuleSet",
+        200,
+        "Linux operating system",
+        "Blocks request patterns associated with the exploitation of \
+         vulnerabilities specific to Linux, including Linux-specific local file \
+         inclusion attacks.",
+    ),
+    descriptor(
+        "AWSManagedRulesUnixRuleSet",
+        100,
+        "POSIX operating system",
+        "Blocks request patterns associated with the exploitation of \
+         vulnerabilities specific to POSIX and POSIX-like operating systems.",
+    ),
+    descriptor(
+        "AWSManagedRulesWindowsRuleSet",
+        200,
+        "Windows operating system",
+        "Blocks request patterns associated with the exploitation of \
+         vulnerabilities specific to Windows, like remote execution of PowerShell \
+         commands.",
+    ),
+    descriptor(
+        "AWSManagedRulesPHPRuleSet",
+        100,
+        "PHP application",
+        "Blocks request patterns associated with the exploitation of \
+         vulnerabilities specific to the use of the PHP programming language, \
+         including the injection of unsafe PHP functions.",
+    ),
+    descriptor(
+        "AWSManagedRulesWordPressRuleSet",
+        100,
+        "WordPress application",
+        "Blocks request patterns associated with the exploitation of \
+         vulnerabilities specific to WordPress sites.",
+    ),
+    descriptor(
+        "AWSManagedRulesAmazonIpReputationList",
+        25,
+        "Amazon IP reputation list",
+        "Blocks requests from sources that Amazon threat intelligence associates \
+         with bots or other threats.",
+    ),
+    descriptor(
+        "AWSManagedRulesAnonymousIpList",
+        50,
+        "Anonymous IP list",
+        "Blocks requests from services that permit the obfuscation of viewer \
+         identity, such as VPNs, proxies, Tor nodes and hosting providers.",
+    ),
+    versioned(
+        "AWSManagedRulesBotControlRuleSet",
+        50,
+        BOT_CONTROL_VERSIONS,
+        "Bot Control",
+        "Provides visibility into and control over bot traffic, including common \
+         desirable bots and the targeted detection of self-identifying and \
+         evasive bots.",
+    ),
+    versioned(
+        "AWSManagedRulesATPRuleSet",
+        50,
+        ATP_VERSIONS,
+        "Account takeover prevention",
+        "Detects and manages requests that are part of malicious account takeover \
+         attempts against your login pages.",
+    ),
+    versioned(
+        "AWSManagedRulesACFPRuleSet",
+        50,
+        ACFP_VERSIONS,
+        "Account creation fraud prevention",
+        "Detects and manages requests that are part of malicious account creation \
+         attempts against your account registration pages.",
+    ),
+    versioned(
+        "AWSManagedRulesAntiDDoSRuleSet",
+        50,
+        ANTI_DDOS_VERSIONS,
+        "Anti-DDoS",
+        "Detects and manages requests that are part of a distributed \
+         denial-of-service event against your protected resources.",
+    ),
 ];
 
 /// The versions offered of a group the WAF Developer Guide publishes no version
@@ -987,26 +1148,48 @@ const ANTI_DDOS_VERSIONS: &[ManagedRuleGroupRelease] =
     &[release("Version_1.0", "2025-05-14T00:00:00Z")];
 
 /// One [`MANAGED_RULE_GROUP_CATALOGUE`] entry, of the AWS vendor, offered with
-/// [`INITIAL_VERSION_ONLY`].
-const fn descriptor(name: &'static str, capacity: i64) -> ManagedRuleGroupDescriptor {
-    ManagedRuleGroupDescriptor {
-        vendor_name: AWS_MANAGED_RULE_GROUP_VENDOR,
-        name,
-        capacity,
-        versions: INITIAL_VERSION_ONLY,
-    }
-}
-
-/// [`descriptor`] for a group whose vendor offers `versions` of it, oldest first.
-const fn versioned(
+/// [`INITIAL_VERSION_ONLY`]: a group the guide publishes no version history for,
+/// so it supports no named versions and is not one of the
+/// intelligent-threat-mitigation groups either (see [`versioned`]).
+const fn descriptor(
     name: &'static str,
     capacity: i64,
-    versions: &'static [ManagedRuleGroupRelease],
+    product_title: &'static str,
+    product_description: &'static str,
 ) -> ManagedRuleGroupDescriptor {
     ManagedRuleGroupDescriptor {
         vendor_name: AWS_MANAGED_RULE_GROUP_VENDOR,
         name,
         capacity,
+        product_title,
+        product_description,
+        is_versioning_supported: false,
+        is_advanced_managed_rule_set: false,
+        versions: INITIAL_VERSION_ONLY,
+    }
+}
+
+/// [`descriptor`] for a group whose vendor offers `versions` of it, oldest first.
+///
+/// Those are the intelligent-threat-mitigation groups: the guide publishes a
+/// version history for exactly them, and they are the ones it describes as the
+/// advanced protections — so an entry built here both supports versioning and is
+/// an advanced managed rule set.
+const fn versioned(
+    name: &'static str,
+    capacity: i64,
+    versions: &'static [ManagedRuleGroupRelease],
+    product_title: &'static str,
+    product_description: &'static str,
+) -> ManagedRuleGroupDescriptor {
+    ManagedRuleGroupDescriptor {
+        vendor_name: AWS_MANAGED_RULE_GROUP_VENDOR,
+        name,
+        capacity,
+        product_title,
+        product_description,
+        is_versioning_supported: true,
+        is_advanced_managed_rule_set: true,
         versions,
     }
 }

@@ -190,78 +190,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let lens = input.lens_alias.as_str();
-        // One summary per pillar the lens is organized into, in the lens's own order,
-        // each counting only the questions THAT pillar asks. A lens this emulator holds
-        // no content for is organized into no pillars, so it reports none.
-        let pillar_review_summaries: Vec<PillarReviewSummary> = crate::state::lens_pillars(lens)
-            .iter()
-            .map(|(pillar_id, pillar_name, _)| PillarReviewSummary {
-                pillar_id: Some((*pillar_id).to_string()),
-                pillar_name: Some((*pillar_name).to_string()),
-                // A pillar's notes are what `UpdateLensReview$PillarNotes` records; that
-                // operation is still a stub with its own issue, so no pillar of a review
-                // here carries any.
-                notes: None,
-                risk_counts: Some(crate::state::risk_counts_to_map(
-                    &workload.pillar_risk_counts(lens, pillar_id),
-                )),
-                // The risk counts restricted to the questions a PROFILE prioritises are not
-                // projected for a pillar either: which questions those are is decided by
-                // the profile template this emulator does not carry (`GetProfileTemplate`
-                // is a stub with its own issue), so no question of any workload is
-                // prioritized.
-                prioritized_risk_counts: None,
-            })
-            .collect();
-
-        let metadata = crate::state::lens_metadata(lens);
-
         Ok(GetLensReviewOutput {
             workload_id: Some(workload.workload_id.clone()),
             // Echoed only when the request scoped the read to a milestone: a read of the
             // live review is not a read of any milestone.
             milestone_number: input.milestone_number,
-            lens_review: Some(LensReview {
-                // The lens as the request named it, beside the ARN it resolves to.
-                lens_alias: Some(input.lens_alias.clone()),
-                lens_arn: Some(store.lens_arn_of(lens, &crate::state::request_region(ctx.parts()))),
-                lens_version: metadata.map(|content| content.version.to_string()),
-                lens_name: metadata.map(|content| content.name.to_string()),
-                lens_status: metadata.map(|content| content.status.to_string()),
-                pillar_review_summaries: Some(pillar_review_summaries),
-                // The review's Jira configuration is what `UpdateLensReview` /
-                // `UpdateIntegration` record; both are still stubs, so nothing is
-                // configured here.
-                jira_configuration: None,
-                // "The date and time when the lens review was last updated": a review's
-                // content — the answers recorded against it and its notes — is part of
-                // the workload record, so the instant the workload last changed is the
-                // instant its reviews last changed. A milestone read reports the instant
-                // the RECORDED workload carried, which is what that milestone froze.
-                updated_at: Some(::aws_smithy_types::DateTime::from(workload.updated_at)),
-                // The lens notes `UpdateLensReview$LensNotes` records; that operation is
-                // still a stub with its own issue.
-                notes: None,
-                // The roll-up over THIS lens's questions alone, derived from the stored
-                // answers on every read: it moves when an answer does.
-                risk_counts: Some(crate::state::risk_counts_to_map(
-                    &workload.lens_risk_counts(lens),
-                )),
-                // `GetLensReview` is not `@paginated` and reports every pillar of the
-                // lens in one answer, so there is never a further page to fetch.
-                next_token: None,
-                // "The profiles associated with the workload" — the same list the workload
-                // itself reports, projected from the one place
-                // (`WorkloadRecord::profiles_projection`), so a review and a read of the
-                // workload cannot disagree about which profile it is reviewed against. The
-                // risk counts restricted to the questions a profile prioritises are NOT
-                // projected: which questions those are is decided by the profile template
-                // this emulator does not carry (`GetProfileTemplate` is a stub with its own
-                // issue), so no question of any workload is prioritized.
-                profiles: workload.profiles_projection(),
-                prioritized_risk_counts: None,
-            }),
+            // The lens as the request named it, beside the ARN it resolves to. The review
+            // itself is projected from the workload by the one place that builds this
+            // shape (`WorkloadRecord::to_lens_review`), shared with `UpdateLensReview`, so
+            // a write and the read that follows it cannot disagree.
+            lens_review: Some(workload.to_lens_review(
+                &input.lens_alias,
+                store.lens_arn_of(&input.lens_alias, &crate::state::request_region(ctx.parts())),
+            )),
         })
     }
 }

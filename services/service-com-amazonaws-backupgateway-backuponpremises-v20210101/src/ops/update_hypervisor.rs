@@ -180,49 +180,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             log_group_arn: input.log_group_arn.clone(),
         };
 
-        // One guard spans the host lookup and the write, so two concurrent updates onto
-        // one host cannot both pass a check only one of them should.
+        // The record this ARN names is resolved and written under ONE guard, so a
+        // concurrent update of the same record cannot land between the lookup and the
+        // write. Which hypervisor is written is decided by the ARN alone: the model makes
+        // no input member a key and declares no uniqueness constraint, so a `Host`, `Name`
+        // or `LogGroupArn` another stored record already carries is written like any
+        // other value.
         let updated = state.lock().update_hypervisor(&input.hypervisor_arn, update);
 
-        let updated = match updated {
-            Ok(updated) => updated,
-            Err(crate::state::HypervisorUpdateRefusal::NoSuchHypervisor) => {
-                // This operation resolves exactly one resource type, so an ARN it cannot
-                // resolve is a missing HYPERVISOR whatever else the ARN spells — and this
-                // service answers that with the modelled `ResourceNotFoundException` at
-                // HTTP 400 carrying `ErrorCode` `HypervisorNotFound`
-                // (`crate::state::MissingResource`), the one place the status and the code
-                // are chosen together.
-                let missing = crate::state::MissingResource::Hypervisor;
-                let error = UpdateHypervisorErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        error_code: missing.error_code().map(str::to_string),
-                        message: Some(missing.message(&input.hypervisor_arn)),
-                    },
-                );
-                return Err(match missing.status_override() {
-                    Some(status) => {
-                        crate::scaffolded::Scaffolded::modeled_with_status(error, status)
-                    }
-                    None => error.into(),
+        let Some(updated) = updated else {
+            // This operation resolves exactly one resource type, so an ARN it cannot
+            // resolve is a missing HYPERVISOR whatever else the ARN spells — and this
+            // service answers that with the modelled `ResourceNotFoundException` at
+            // HTTP 400 carrying `ErrorCode` `HypervisorNotFound`
+            // (`crate::state::MissingResource`), the one place the status and the code
+            // are chosen together.
+            let missing = crate::state::MissingResource::Hypervisor;
+            let error =
+                UpdateHypervisorErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    error_code: missing.error_code().map(str::to_string),
+                    message: Some(missing.message(&input.hypervisor_arn)),
                 });
-            }
-            Err(crate::state::HypervisorUpdateRefusal::HostAlreadyImported(_)) => {
-                // A hypervisor record stands for the machine reachable at its host, so no
-                // write may give two records one host: moving a hypervisor onto a host
-                // another one already holds is the same modelled `ConflictException`
-                // (HTTP 409) an import of that host takes, refused BEFORE anything is
-                // written.
-                return Err(UpdateHypervisorErrorModeled::ConflictException(
-                    ConflictException {
-                        error_code: crate::state::HYPERVISOR_ALREADY_EXISTS.to_string(),
-                        message: Some(
-                            crate::state::HYPERVISOR_ALREADY_EXISTS_MESSAGE.to_string(),
-                        ),
-                    },
-                )
-                .into());
-            }
+            return Err(match missing.status_override() {
+                Some(status) => crate::scaffolded::Scaffolded::modeled_with_status(error, status),
+                None => error.into(),
+            });
         };
 
         // The ARN comes off the record the store now holds, so a success says which record

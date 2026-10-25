@@ -121,7 +121,9 @@ impl From<CreateConfigurationManagerErrorModeled> for CreateConfigurationManager
 /// its definitions, so one with none to deploy is refused. Each definition's `Type`
 /// must name a configuration type this service offers, because that is what selects
 /// the service-owned template the definition deploys
-/// (`crate::state::quick_setup_type_rejection`). The deployment targets a definition's
+/// (`crate::state::quick_setup_type_rejection`); its `TypeVersion` is resolved against
+/// that same catalog in the handler, once the type is known to be published
+/// (`crate::state::resolve_type_version`). The deployment targets a definition's
 /// parameters name must be servable, because each targeted account and Region pair
 /// becomes a stored configuration (`crate::state::deployment_targets_rejection`). The
 /// remaining checks are
@@ -283,6 +285,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A definition's `TypeVersion` names one shipped revision of the
+        // service-owned template its `Type` deploys, so it is resolved against the
+        // published catalog the way the type itself is: a version the type publishes
+        // (or the `LATEST` alias, or none at all) resolves to the published version
+        // the definition is deployed at, and anything else is refused. Resolved for
+        // every definition BEFORE the store lock is taken, so a create naming one
+        // unpublished version stores nothing at all.
+        let resolved_versions = match input
+            .configuration_definitions
+            .iter()
+            .map(|definition| {
+                crate::state::resolve_type_version(
+                    "ConfigurationDefinitions.TypeVersion",
+                    &definition.r#type,
+                    definition.type_version.as_deref(),
+                )
+            })
+            .collect::<Result<Vec<String>, String>>()
+        {
+            Ok(versions) => versions,
+            Err(why) => {
+                return Err(CreateConfigurationManagerErrorModeled::ValidationException(
+                    ValidationException { message: Some(why) },
+                )
+                .into())
+            }
+        };
+
         let region = crate::state::request_region(ctx.parts());
         let account = ::engine::emulator_account_id().to_string();
         let created_at = ::std::time::SystemTime::now();
@@ -309,13 +339,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let manager_arn = crate::state::manager_arn(&region, &manager_uuid);
 
         let mut definitions = Vec::with_capacity(input.configuration_definitions.len());
-        for definition in input.configuration_definitions {
+        for (definition, type_version) in input
+            .configuration_definitions
+            .into_iter()
+            .zip(resolved_versions)
+        {
             let definition_id = store.fresh_definition_id();
             let parameters = crate::state::to_btree_map(Some(definition.parameters));
             let record = crate::state::ConfigurationDefinitionRecord {
                 id: definition_id,
                 type_: definition.r#type,
-                type_version: definition.type_version,
+                // The published version this definition is deployed at, so the
+                // definition and every configuration deployed from it report which
+                // version was deployed rather than reporting none.
+                type_version: Some(type_version),
                 parameters,
                 local_deployment_execution_role_name: definition
                     .local_deployment_execution_role_name,
