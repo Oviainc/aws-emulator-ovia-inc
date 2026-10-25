@@ -654,6 +654,24 @@ pub fn blob_id_does_not_exist_message(blob_id: &str) -> String {
     format!("AWS CodeCommit could not find the blob {blob_id} in the repository.")
 }
 
+/// `BlobIdRequiredException`'s message: the sentence the model documents for the
+/// shape, naming nothing from the request. The one place this crate words that code,
+/// for the request boundary (`crate::service`) and for the handlers that check a
+/// blob id the model leaves unconstrained alike — `ObjectId` carries no length
+/// bound, so a blank id reaches a handler rather than the boundary.
+pub const BLOB_ID_REQUIRED_MESSAGE: &str = "A blob ID is required, but was not specified.";
+
+/// `InvalidBlobIdException`'s message: likewise the shape's own documented sentence,
+/// worded here once for every operation that raises the code.
+pub const INVALID_BLOB_ID_MESSAGE: &str = "The specified blob is not valid.";
+
+/// `FileTooLargeException`'s message: again the shape's own documented sentence,
+/// naming nothing from the request, for every operation that refuses content it
+/// cannot serve at that size.
+pub const FILE_TOO_LARGE_MESSAGE: &str =
+    "The specified file exceeds the file size limit for CodeCommit. For more information about \
+     limits in CodeCommit, see Quotas in the CodeCommit User Guide.";
+
 /// The combined size of all the file content one commit may carry, in bytes.
 /// CodeCommit documents this on `FileContentSizeLimitExceededException`: "The
 /// maximum file size is 6 MB, and the combined file content change size is 7 MB."

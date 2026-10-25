@@ -170,14 +170,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .customization(crate::state::calling_account_id());
 
         Ok(GetAccountCustomizationsOutput {
-            // "A value of none indicates that you have not set a color": an
-            // account that never configured one reports `none`, not an absent
-            // member.
-            account_color: Some(
-                stored
-                    .account_color
-                    .unwrap_or_else(|| crate::state::ACCOUNT_COLOR_NONE.to_string()),
-            ),
+            // The reported colour of a stored record, under the ONE rule both
+            // operations that render one share (`AccountUxCustomization::
+            // reported_account_color`): an account that never configured a colour
+            // reports `none`, not an absent member.
+            account_color: Some(stored.reported_account_color().to_string()),
             // "A value of null indicates that you have not configured this
             // feature": an unconfigured list stays absent rather than empty.
             visible_services: stored.visible_services,

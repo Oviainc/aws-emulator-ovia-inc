@@ -338,6 +338,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             creation_time_millis: now,
             last_modified_time_millis: now,
+            // A group just created has had no write superseded: its only generation is
+            // the one projected from the record itself.
+            superseded_versions: Vec::new(),
         };
         state.billing_groups.insert(arn.clone(), record);
         state.billing_group_names.insert(input.name, arn.clone());

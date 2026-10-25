@@ -30,8 +30,12 @@
 //!
 //! The contract below also refuses a disassociation "with autoEnableOrganizationMembers
 //! configuration for your organization set to ALL" under the modern name. That
-//! configuration is not modelled yet, so no request can set it and no call can be
-//! refused for it; when it is, that refusal belongs on the shared state seam.
+//! configuration belongs to the ADMINISTRATOR's detector, not to the member detector
+//! this operation names, and the administrator of a relationship this emulator can
+//! hold is another account — one it holds no detector, and so no organization
+//! configuration, for. So the refusal lives on the administrator-side operations that
+//! read it (`DisassociateMembers`, `StopMonitoringMembers`) and no request here can
+//! reach it.
 //!
 //! This is the ONLY file to touch for this operation.
 //!

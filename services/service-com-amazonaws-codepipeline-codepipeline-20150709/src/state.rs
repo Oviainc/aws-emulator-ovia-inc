@@ -43,6 +43,9 @@ pub mod execution;
 pub mod driver;
 /// The job-worker lifecycle a `Custom`-owned action's work is performed through.
 pub mod jobs;
+/// The stage-condition plane: evaluating a stage's conditions, and the rule
+/// executions that evaluation records.
+pub mod rules;
 
 pub use driver::advance;
 pub use execution::{
@@ -52,6 +55,10 @@ pub use execution::{
     STATUS_SUCCEEDED, STATUS_SUPERSEDED, TRANSITION_INBOUND, TRANSITION_OUTBOUND,
 };
 pub use jobs::{JobProblem, MAX_OUTPUT_VARIABLES_BYTES, MAX_OUTPUT_VARIABLE_VALUE_BYTES};
+pub use rules::{
+    record_rule_execution_into, RuleExecutionLog, RuleExecutionRecord,
+    MAX_RULE_EXECUTIONS_PER_PIPELINE,
+};
 
 /// The region an ARN carries when the request names none.
 ///
@@ -70,6 +77,16 @@ pub const ARN_SERVICE: &str = "codepipeline";
 /// `crate::ops::types::ACTION_OWNER_VALUES` lists them (`AWS`, `Custom`,
 /// `ThirdParty`); named here because two state rules turn on this one value.
 pub const ACTION_OWNER_THIRD_PARTY: &str = "ThirdParty";
+
+/// The `ActionTypeId$provider` of the third-party source whose webhooks this service
+/// registers with the tool that owns them.
+///
+/// `RegisterWebhookWithThirdParty` and `DeregisterWebhookWithThirdParty` are both
+/// "currently supported only for webhooks that target an action type of GitHub", so
+/// the two operations resolve their webhook's target action against this provider. It
+/// is the provider of the `ThirdParty`-owned source action type the catalog carries
+/// ([`BUILT_IN_ACTION_TYPES`]).
+pub const PROVIDER_GITHUB: &str = "GitHub";
 
 /// The `PipelineType` values the model declares
 /// (`smithy_query query="shape" shape="PipelineType"` -> `V1`, `V2`).
@@ -179,6 +196,16 @@ pub const TERMINAL_JOB_STATUSES: [&str; 3] =
 /// transition: a worker that polls twice in a row still observes the job withheld,
 /// and a worker that abandons a job it polled does not strand it.
 pub const JOB_POLL_LEASE: Duration = Duration::from_millis(500);
+
+/// The most nonces one job carries outstanding before the oldest stops claiming it.
+///
+/// A bound is required: a job nobody acknowledges is re-dispatched once per lapsed
+/// [`JOB_POLL_LEASE`] and every nonce published for it stays valid until a worker
+/// claims it ([`JobRecord::outstanding_nonces`]), so without one the set would grow
+/// per poll for as long as the action waits. AWS publishes no figure for how many
+/// dispatches of one job it keeps claimable, so this is this emulator's bound; what is
+/// not chosen is that the nonce of an earlier dispatch still claims the job.
+pub const MAX_OUTSTANDING_NONCES: usize = 64;
 
 /// The most jobs this emulator keeps queued for custom-action job workers, across
 /// every action type.
@@ -551,6 +578,16 @@ pub struct ComAmazonawsCodepipelineCodepipeline20150709State {
     /// [`enqueue_job_into`], the same path the driver takes while it holds only this
     /// field), which is where the [`MAX_QUEUED_JOBS`] bound lives.
     pub jobs: JobQueue,
+    /// The rule executions of each pipeline's stage conditions, oldest first — what
+    /// `ListRuleExecutions` reports.
+    ///
+    /// A record comes into being when the condition plane EVALUATES one of a stage's
+    /// declared rules ([`rules`]), so a pipeline that declares conditions but has
+    /// never run has none. Write it through [`Self::record_rule_execution`] (or
+    /// [`record_rule_execution_into`], the same path the driver takes while it holds
+    /// only this field), which is where the
+    /// [`MAX_RULE_EXECUTIONS_PER_PIPELINE`] bound lives.
+    pub rule_executions: RuleExecutionLog,
 }
 
 impl ComAmazonawsCodepipelineCodepipeline20150709State {
@@ -951,6 +988,9 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
             .retain(|(pipeline_name, _), _| pipeline_name != name);
         self.action_revisions
             .retain(|(pipeline_name, _, _), _| pipeline_name != name);
+        // And the rule executions its stages' conditions recorded: a deleted pipeline
+        // has no stage left for them to belong to.
+        self.rule_executions.remove(name);
     }
 
     /// The pipeline's current execution — the most recently started one still
@@ -978,6 +1018,52 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
                     })
                     .count()
             })
+            .unwrap_or_default()
+    }
+
+    /// Whether `definition`'s target action is the third-party source this service
+    /// registers a webhook with.
+    ///
+    /// `RegisterWebhookWithThirdParty` takes "an existing webhook created with
+    /// PutWebhook to register with a supported third party", and
+    /// `DeregisterWebhookWithThirdParty` is "currently supported only for webhooks
+    /// that target an action type of GitHub": both resolve the webhook's
+    /// `targetPipeline` and `targetAction` to the action the pipeline declares and ask
+    /// whether its provider is that third party ([`PROVIDER_GITHUB`]). ONE rule, so
+    /// the two operations cannot disagree about which webhooks they serve.
+    pub fn webhook_targets_third_party(&self, definition: &WebhookDefinition) -> bool {
+        self.pipelines
+            .get(&definition.target_pipeline)
+            .and_then(|pipeline| {
+                pipeline
+                    .declaration
+                    .stages
+                    .iter()
+                    .flat_map(|stage| &stage.actions)
+                    .find(|action| action.name == definition.target_action)
+            })
+            .is_some_and(|action| action.action_type_id.provider == PROVIDER_GITHUB)
+    }
+
+    /// Record one evaluation of one stage condition's rule against `pipeline_name`.
+    ///
+    /// The one write path into [`Self::rule_executions`] for everything but the
+    /// driver, which reaches [`record_rule_execution_into`] with only that field
+    /// borrowed; both apply the [`MAX_RULE_EXECUTIONS_PER_PIPELINE`] bound.
+    pub fn record_rule_execution(&mut self, pipeline_name: &str, record: RuleExecutionRecord) {
+        record_rule_execution_into(&mut self.rule_executions, pipeline_name, record);
+    }
+
+    /// The rule executions recorded for `pipeline_name`, most recent first — the order
+    /// `ListRuleExecutions` pages through.
+    ///
+    /// A rule execution comes into being when the condition plane evaluates the rule,
+    /// so the stored order is the evaluation order and the newest-first listing is it
+    /// reversed.
+    pub fn rule_executions_for(&self, pipeline_name: &str) -> Vec<&RuleExecutionRecord> {
+        self.rule_executions
+            .get(pipeline_name)
+            .map(|recorded| recorded.iter().rev().collect())
             .unwrap_or_default()
     }
 
@@ -2634,14 +2720,18 @@ pub fn poll_limit(max_batch_size: Option<i32>) -> usize {
     max_batch_size.map_or(usize::MAX, |size| usize::try_from(size).unwrap_or(0))
 }
 
-/// What `ActionTypeNotFoundException` states: the four identifying fields of the
-/// action type the REQUEST named, in the order `ActionTypeId` declares them.
+/// What `ActionTypeNotFoundException` states for an action type the ACCOUNT's own
+/// registrations do not carry: the four identifying fields of the action type the
+/// REQUEST named, in the order `ActionTypeId` declares them, and the account the
+/// lookup was scoped to.
 ///
 /// Built from the request, so it is a template over the caller's own values rather
 /// than text naming one particular action type, and the caller can tell from it which
-/// of the four fields it has to correct. EVERY operation that resolves an action type
-/// by its id and answers `ActionTypeNotFoundException` ("The specified action type
-/// cannot be found") uses it, so one condition is reported one way.
+/// of the four fields it has to correct. This is the wording of the job plane, where
+/// an action type is a REGISTRATION of one account (`PollForJobs` "is valid only for
+/// action types with Custom in the owner field"); the action-type DECLARATION
+/// operations state the same condition the other way, see
+/// [`action_type_declaration_not_found_message`].
 pub fn action_type_not_found_message(id: &ActionTypeId) -> String {
     format!(
         "ActionType (Category='{}', Owner='{}', Provider='{}', Version='{}') is not \
@@ -2651,6 +2741,24 @@ pub fn action_type_not_found_message(id: &ActionTypeId) -> String {
         id.provider,
         id.version,
         ::engine::emulator_account_id()
+    )
+}
+
+/// What `ActionTypeNotFoundException` states for an action type whose DEFINITION was
+/// addressed — the operations that read and write an `ActionTypeDeclaration`
+/// (`GetActionType`, `UpdateActionType`).
+///
+/// AWS states this condition over the request's own id, naming each of the four
+/// members as `owner=[…], category=[…], provider=[…] and version=[…]` and closing
+/// with the sentence that tells a caller an action type is not something an ordinary
+/// account defines for itself. The wording belongs to the error class, so it is built
+/// here once from the request rather than per handler, and nothing of it is taken
+/// from a particular refusal: only the member values the caller asked about.
+pub fn action_type_declaration_not_found_message(id: &ActionTypeId) -> String {
+    format!(
+        "An action type with owner=[{}], category=[{}], provider=[{}] and version=[{}] \
+         doesn't exist. To create an action type, contact the CodePipeline service team.",
+        id.owner, id.category, id.provider, id.version
     )
 }
 
@@ -2706,6 +2814,18 @@ pub struct JobRecord {
     /// The `nonce` the newest poll published for this job, or `None` while no poll
     /// has reported it. The worker presents it to `AcknowledgeJob`.
     pub nonce: Option<String>,
+    /// Every nonce a poll has published for this job while it was still waiting to be
+    /// claimed, oldest first — each of them still claims it.
+    ///
+    /// A redelivery does not invalidate the nonce of an earlier dispatch: the nonce is
+    /// there so that "the job is being worked on by only one job worker", and what
+    /// settles which worker that is is the ACKNOWLEDGEMENT, so until one of them
+    /// claims the job every nonce issued for it reaches it ([`Self::admits_nonce`])
+    /// and the claim closes the whole set ([`Self::claim`]). Bounded by
+    /// [`MAX_OUTSTANDING_NONCES`]: a job may be re-dispatched once per lease for as
+    /// long as no worker claims it, so the set is trimmed oldest-first rather than
+    /// grown per poll.
+    pub outstanding_nonces: Vec<String>,
     /// When the claim the newest poll granted lapses, so the job may be reported to
     /// another worker again (see [`JOB_POLL_LEASE`]).
     pub leased_until: Option<SystemTime>,
@@ -2745,6 +2865,7 @@ impl JobRecord {
             encryption_key: None,
             status: JOB_STATUS_QUEUED.to_string(),
             nonce: None,
+            outstanding_nonces: Vec::new(),
             leased_until: None,
             continuation_token: None,
             queued_at: now,
@@ -2830,11 +2951,49 @@ impl JobRecord {
     /// presents to `AcknowledgeJob`, and hold the job for [`JOB_POLL_LEASE`].
     ///
     /// The nonce is minted per lease and is unpredictable, so the claim it grants
-    /// cannot be taken by a worker that was never handed the job, and the nonce of a
-    /// lease that lapsed no longer reaches it.
+    /// cannot be taken by a worker that was never handed the job. A job that is handed
+    /// out again after its lease lapsed carries a FRESH nonce, and the earlier one
+    /// stays outstanding: a redelivery does not take the job away from the worker that
+    /// was handed it first (see [`Self::outstanding_nonces`]).
     pub fn lease(&mut self, now: SystemTime) {
-        self.nonce = Some(random_uuid_v4());
+        let nonce = random_uuid_v4();
+        self.outstanding_nonces.push(nonce.clone());
+        let overflow = self
+            .outstanding_nonces
+            .len()
+            .saturating_sub(MAX_OUTSTANDING_NONCES);
+        self.outstanding_nonces.drain(..overflow);
+        self.nonce = Some(nonce);
         self.leased_until = Some(now + JOB_POLL_LEASE);
+    }
+
+    /// Whether `nonce` is one of the values that still claims this job.
+    ///
+    /// Every nonce a poll published for the job while it was unclaimed does, and none
+    /// does once a claim has closed them ([`Self::claim`]).
+    pub fn admits_nonce(&self, nonce: &str) -> bool {
+        self.outstanding_nonces
+            .iter()
+            .any(|issued| issued == nonce)
+    }
+
+    /// Record that the worker presenting `nonce` has claimed this job: it is being
+    /// worked on by that worker, and the nonces of every other dispatch stop claiming
+    /// it, which is what makes the claim exclusive.
+    pub fn claim(&mut self, nonce: &str, now: SystemTime) {
+        self.status = JOB_STATUS_IN_PROGRESS.to_string();
+        self.nonce = Some(nonce.to_string());
+        self.outstanding_nonces.clear();
+        self.last_status_change = now;
+    }
+
+    /// Put this job back to waiting for a worker, with no claim outstanding: the
+    /// nonces of the claim that has just ended reach it no more, and the next poll
+    /// mints the one that does.
+    pub fn release(&mut self) {
+        self.nonce = None;
+        self.leased_until = None;
+        self.outstanding_nonces.clear();
     }
 
     /// Whether this job's action configuration satisfies a poll's `queryParam` pair.
@@ -2853,6 +3012,16 @@ impl JobRecord {
 /// planes cannot drift on what a missing job is reported as.
 pub fn job_not_found_message(job_id: &str) -> String {
     format!("Job with id '{job_id}' does not exist.")
+}
+
+/// What `InvalidNonceException` states: the job the nonce was presented for.
+///
+/// The nonce itself is not repeated back — the caller already holds it, and the
+/// condition is about the JOB, which either admits no nonce any more (a worker has
+/// claimed it) or never published this one. One source, so every operation that
+/// refuses a nonce words it the same way.
+pub fn invalid_nonce_message(job_id: &str) -> String {
+    format!("Invalid nonce for job id {job_id}")
 }
 
 /// One artifact of a job, named and placed where its bytes live — or, for an artifact
@@ -4118,6 +4287,9 @@ pub const CURSOR_ACTION_TYPE: &str = "actionType";
 
 /// The cursor kind a `ListActionExecutions` token carries.
 pub const CURSOR_ACTION_EXECUTION: &str = "actionExecution";
+
+/// The cursor kind a `ListRuleExecutions` token carries.
+pub const CURSOR_RULE_EXECUTION: &str = "ruleExecution";
 
 /// An opaque pagination cursor naming the ordered key the next page starts at.
 ///

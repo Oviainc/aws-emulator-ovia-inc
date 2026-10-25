@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchCreatePartition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchCreatePartition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchCreatePartition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Persists each submitted partition on the table it names, so a later partition read
+//! serves it, and sets the one member no `PartitionInput` carries, `CreationTime`. An
+//! absent database or table fails the whole request with `EntityNotFoundException`; a
+//! single partition that cannot be created fails only its own item, reported in
+//! `Errors`.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +161,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchCreatePartition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchCreatePartitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchCreatePartition"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(BatchCreatePartitionErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // The store is resident memory and this create is reachable by any caller, so the
+        // number of partition records one process will hold is bounded store-wide as well
+        // as per table. The store-wide count is read ONCE, before the parent table is
+        // borrowed, and then advanced by what this batch inserts: re-walking the store
+        // per item would give the same answer at a cost per item.
+        let mut stored_partitions = store.stored_partitions();
+        let Some(database) = store.database_mut(&catalog_id, &input.database_name) else {
+            return Err(BatchCreatePartitionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::database_not_found(
+                        &input.database_name,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        let database_name = database.name.clone();
+        let Some(table) = database
+            .tables
+            .get_mut(&crate::state::fold_name(&input.table_name))
+        else {
+            return Err(BatchCreatePartitionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::table_not_found(&input.table_name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // Each submitted partition is created on its own: `Errors` is "the errors
+        // encountered when trying to create the requested partitions", which is where a
+        // partial failure belongs, rather than failing the whole batch or claiming a
+        // clean create. The items are walked in the order they were sent, so a batch
+        // that names the same values twice creates the first and reports the second as
+        // the duplicate it is.
+        let mut errors: Vec<PartitionError> = Vec::new();
+        let mut created = 0usize;
+        for requested in &input.partition_input_list {
+            match table.create_partition(
+                requested,
+                now,
+                stored_partitions < crate::state::MAX_STORED_PARTITIONS,
+            ) {
+                Ok(_) => {
+                    created += 1;
+                    stored_partitions += 1;
+                }
+                Err(refusal) => errors.push(PartitionError {
+                    // `PartitionError$PartitionValues` is "the values that define the
+                    // partition": the ones this item asked for, so a client can tell
+                    // which of its items failed. Reported exactly as sent, including the
+                    // absent list of an input that named none.
+                    partition_values: requested.values.clone(),
+                    error_detail: Some(refusal.to_error_detail()),
+                }),
+            }
+        }
+        ::tracing::info!(
+            operation = "BatchCreatePartition",
+            catalog_id = %catalog_id,
+            database = %database_name,
+            table = %table.name,
+            created,
+            failed = errors.len(),
+            "created Data Catalog partitions in a batch"
+        );
+
+        // The list is reported whether or not anything failed, the way the sibling batch
+        // write `BatchDeleteTable` reports its own: an empty `Errors` is the positive
+        // statement that every submitted partition was created, which is what a client
+        // checks before treating the batch as done.
+        Ok(BatchCreatePartitionOutput {
+            errors: Some(errors),
+        })
     }
 }

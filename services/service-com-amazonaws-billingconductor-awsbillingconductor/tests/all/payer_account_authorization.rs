@@ -31,6 +31,12 @@ use serde_json::{json, Value};
 
 use crate::payer_account_gate::{assert_denied, error_code, Emulator};
 
+/// The billing period the service calls current, read from the same clock it answers from
+/// so a row naming that month holds whatever month the suite runs in.
+fn current_billing_period() -> String {
+    service_com_amazonaws_billingconductor_awsbillingconductor::state::current_billing_period()
+}
+
 /// One reporting read: the modelled operation, the route the model binds it to, the
 /// request body, the output member its result set travels in, and how many rows the PAYER
 /// account must be served for a store holding `population` resources of each kind.
@@ -69,12 +75,17 @@ fn reporting_reads() -> Vec<Read> {
             served: |population| population.min(1),
         },
         Read {
-            case: "ListBillingGroups, a billing period and an ACTIVE status filter",
+            case: "ListBillingGroups, the current billing period and an ACTIVE status filter",
             operation: "ListBillingGroups",
             path: "/list-billing-groups",
             // Every group these rows create carries a primary account, so its derived
-            // `BillingGroupStatus` is `ACTIVE` and the filter selects all of them.
-            body: json!({"BillingPeriod": "2026-01", "Filters": {"Statuses": ["ACTIVE"]}}),
+            // `BillingGroupStatus` is `ACTIVE` and the filter selects all of them. The
+            // period named is the CURRENT one, because a read answers for the month it
+            // names and a group is reported only for the periods from the one it was
+            // created in onward (`tests/all/billing_group_billing_periods.rs`), and these
+            // groups are created now.
+            body: json!({"BillingPeriod": current_billing_period(),
+                         "Filters": {"Statuses": ["ACTIVE"]}}),
             member: "BillingGroups",
             served: |population| population,
         },

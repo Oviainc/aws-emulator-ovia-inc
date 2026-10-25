@@ -7011,14 +7011,22 @@ pub fn update_action_view(
 /// growing without end.
 pub const MAX_ACCESS_STRING_LEN: usize = 8192;
 
+/// How the service words the refusal of a rule list it cannot read.
+///
+/// ONE fixed sentence, whatever is wrong with the list and whichever member
+/// carried it: the service states that the access string as a whole is not one,
+/// and names neither the member nor the token that is not a rule, so nothing of
+/// the request is read back out of the refusal.
+pub const ACCESS_STRING_INVALID: &str = "The access-string is invalid.";
+
 /// Why `access_string` is not an access string, or `None` when it is one.
 ///
 /// The model constrains `AccessString` only with `@pattern "\S"` — any string
 /// carrying a non-space character passes the boundary validator — so the rule
 /// list itself is parsed here, and a request naming something that is not an ACL
 /// rule is refused instead of being stored as a permission set the engine could
-/// never apply. The caller maps the refusal onto its own modelled
-/// `InvalidParameterValueException`.
+/// never apply ([`ACCESS_STRING_INVALID`] is how that refusal reads). The caller
+/// maps the refusal onto its own modelled `InvalidParameterValueException`.
 ///
 /// A SELECTOR — the Redis OSS 7 / Valkey form `(+get ~key1)` — is one rule that
 /// carries a rule list of its own, so it is read as a parenthesised group whose
@@ -7034,11 +7042,9 @@ pub fn access_string_rejection(member: &str, access_string: &str) -> Option<Stri
              {MAX_ACCESS_STRING_LEN} characters."
         ));
     }
-    let refuse = |token: &str| {
-        Some(format!(
-            "Invalid value {token} for {member}: it is not a Valkey or Redis OSS ACL rule."
-        ))
-    };
+    // Every refusal below is the same one sentence, so the walk only has to
+    // decide WHETHER the list is a rule list.
+    let refuse = || Some(ACCESS_STRING_INVALID.to_string());
     let mut rules = 0usize;
     // The selector being read, once its `(` has been seen and before its `)`.
     let mut selector: Option<String> = None;
@@ -7051,7 +7057,7 @@ pub fn access_string_rejection(member: &str, access_string: &str) -> Option<Stri
             }
             let group = selector.take().unwrap_or_default();
             if !is_selector(&group) {
-                return refuse(&group);
+                return refuse();
             }
             rules += 1;
             continue;
@@ -7059,7 +7065,7 @@ pub fn access_string_rejection(member: &str, access_string: &str) -> Option<Stri
         if token.starts_with('(') {
             if token.ends_with(')') && token.len() > 1 {
                 if !is_selector(token) {
-                    return refuse(token);
+                    return refuse();
                 }
                 rules += 1;
             } else {
@@ -7068,15 +7074,15 @@ pub fn access_string_rejection(member: &str, access_string: &str) -> Option<Stri
             continue;
         }
         if !is_access_rule(token) {
-            return refuse(token);
+            return refuse();
         }
         rules += 1;
     }
-    if let Some(unterminated) = selector {
-        return refuse(&unterminated);
+    if selector.is_some() {
+        return refuse();
     }
     if rules == 0 {
-        return Some(format!("Invalid value for {member}: it names no access rule."));
+        return refuse();
     }
     None
 }

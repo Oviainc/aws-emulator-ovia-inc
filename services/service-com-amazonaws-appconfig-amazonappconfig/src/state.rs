@@ -23,6 +23,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
+use aws_smithy_schema_server::constraints::path;
+use aws_smithy_schema_server::{envelope, Violation, ViolationKind};
+
 use crate::ops::types::{
     Action, AppliedExtension, DeletionProtectionSettings, DeploymentEvent,
     ExperimentDefinitionSnapshot, ExperimentRunEvent, ExperimentRunResult, Monitor, Parameter,
@@ -191,6 +194,20 @@ pub const MAX_EXTENSIONS: usize = 100;
 /// already exists adds one more version to that extension, so the per-extension version
 /// history is bounded too.
 pub const MAX_EXTENSION_VERSIONS: usize = 100;
+
+/// The most ids this service can be holding at once, which is what makes
+/// [`ComAmazonawsAppconfigAmazonappconfigState::mint_id`]'s probe terminate: every map
+/// that grows is capped at its own insertion point, so the ids in play are at most the
+/// applications plus what each of them nests, plus the account-scoped stores. Far below
+/// the id space the model's `Id` shape allows (`^[a-z0-9]{4,7}$`), so a free candidate is
+/// always reachable.
+pub const MAX_HELD_RESOURCE_IDS: usize = MAX_APPLICATIONS
+    * (1 + MAX_ENVIRONMENTS_PER_APPLICATION
+        + MAX_CONFIGURATION_PROFILES_PER_APPLICATION
+        + MAX_EXPERIMENT_DEFINITIONS_PER_APPLICATION)
+    + MAX_DEPLOYMENT_STRATEGIES
+    + MAX_EXTENSIONS
+    + MAX_EXTENSION_ASSOCIATIONS;
 
 /// The largest single hosted configuration this emulator stores, and the total it holds
 /// across every configuration profile.
@@ -472,6 +489,136 @@ pub fn parameter_rejection(parameters: &HashMap<String, Parameter>) -> Option<St
             offending.join(",")
         )
     })
+}
+
+/// The most entities one experiment run's inline treatment overrides may assign:
+/// `TreatmentOverrideMap` is `length 0..32`
+/// (`smithy_query(query="shape",shape="TreatmentOverrideMap")`).
+pub const MAX_INLINE_TREATMENT_OVERRIDES: usize = 32;
+
+/// The bounds on an entity id a treatment override names: the same map's KEY is an
+/// `EntityId`, `length 1..2048`.
+pub const MIN_ENTITY_ID_LENGTH: usize = 1;
+/// See [`MIN_ENTITY_ID_LENGTH`].
+pub const MAX_ENTITY_ID_LENGTH: usize = 2048;
+
+/// The shape of the treatment an override assigns an entity to: the same map's VALUE is a
+/// `TreatmentKey`, `^[a-zA-Z0-9]{1,8}$` — the pattern [`treatment_key`] mints within.
+pub const TREATMENT_KEY_PATTERN: &str = "^[a-zA-Z0-9]{1,8}$";
+
+/// The most bytes of a caller-supplied value a refusal echoes, the same bound the
+/// framework's validating walk applies to every value IT echoes: a clause interpolates the
+/// value as-is, so an unelided echo would let one request size the response.
+const MAX_ECHOED_VALUE_BYTES: usize = 256;
+
+/// `value` as a clause states it: itself when short, a character-boundary-safe prefix with
+/// an elision when not — the rendering the framework's own clauses use.
+///
+/// Rendering only: every check runs against the original value, because eliding first
+/// would compare text the caller never sent.
+fn echoed(value: &str) -> String {
+    if value.len() <= MAX_ECHOED_VALUE_BYTES {
+        return value.to_string();
+    }
+    let mut end = MAX_ECHOED_VALUE_BYTES;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... [{} bytes]", &value[..end], value.len())
+}
+
+/// The dotted member path of the inline treatment-override map, as a clause spells one:
+/// the input member, then the union member that holds the map.
+fn inline_overrides_path() -> String {
+    path::join(&[
+        path::member("TreatmentOverrides"),
+        path::member("Inline"),
+    ])
+}
+
+/// The clause path of one entry of that map, which names the entity the entry assigns.
+/// Elided like an echoed value: it embeds caller-supplied text, so it is the same
+/// amplification vector.
+fn inline_override_entry_path(entity: &str) -> String {
+    echoed(&format!(
+        "{}.{}",
+        inline_overrides_path(),
+        path::entry(entity)
+    ))
+}
+
+/// Which constraint the assignment of `entity` to `treatment` breaks, or `None` when it
+/// breaks none: the entity id's own `length` bound and the treatment key's `@pattern`.
+fn inline_override_violation(entity: &str, treatment: &str) -> Option<Violation> {
+    let length = entity.chars().count();
+    let kind = if length < MIN_ENTITY_ID_LENGTH {
+        ViolationKind::MinLength(MIN_ENTITY_ID_LENGTH as i64)
+    } else if length > MAX_ENTITY_ID_LENGTH {
+        ViolationKind::MaxLength(MAX_ENTITY_ID_LENGTH as i64)
+    } else if !matches_treatment_key_pattern(treatment) {
+        return Some(Violation {
+            path: inline_override_entry_path(entity),
+            kind: ViolationKind::Pattern(TREATMENT_KEY_PATTERN.to_string()),
+            value: Some(echoed(treatment)),
+        });
+    } else {
+        return None;
+    };
+    Some(Violation {
+        path: inline_override_entry_path(entity),
+        kind,
+        value: Some(echoed(entity)),
+    })
+}
+
+/// Whether `value` is a treatment key of the shape [`TREATMENT_KEY_PATTERN`] states: one
+/// to eight ASCII letters or digits, and nothing else.
+fn matches_treatment_key_pattern(value: &str) -> bool {
+    let length = value.chars().count();
+    (1..=8).contains(&length) && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+/// Why `overrides` is not a treatment-override assignment this service stores, or `None`
+/// when it is.
+///
+/// This is only what the schema walk does NOT already refuse: the map sits behind a UNION
+/// member, and nothing inside it is reached — not the map's own `length`, not its keys'
+/// and not its values' — so the constraints `TreatmentOverrideMap` publishes are enforced
+/// here instead. The sentence is built from the framework's own [`Violation`] and rendered
+/// by its one envelope, through the same restatement the pre-handler refusal of a modelled
+/// constraint goes through, so a refusal from a handler and one from the boundary read
+/// identically. Every operation that writes treatment overrides refuses through this one
+/// function, so the operation that starts a run and the one that changes its assignments
+/// cannot drift apart.
+pub fn treatment_overrides_rejection(overrides: &TreatmentOverrides) -> Option<String> {
+    let violations = match overrides {
+        TreatmentOverrides::Inline(assignments) => {
+            let assigned = assignments.len();
+            // The collection's own bound first, stated about the map rather than about any
+            // one entry — where the walk checks a collection's `length`, and in the
+            // `<n> entries` rendering it displays a map's length with.
+            if assigned > MAX_INLINE_TREATMENT_OVERRIDES {
+                vec![Violation {
+                    path: inline_overrides_path(),
+                    kind: ViolationKind::MaxLength(MAX_INLINE_TREATMENT_OVERRIDES as i64),
+                    value: Some(format!("{assigned} entries")),
+                }]
+            } else {
+                // Then the entries, by entity id, so one request is refused with one
+                // sentence however the map happened to iterate.
+                let mut entries: Vec<(&String, &String)> = assignments.iter().collect();
+                entries.sort_by(|left, right| left.0.cmp(right.0));
+                entries
+                    .into_iter()
+                    .filter_map(|(entity, treatment)| {
+                        inline_override_violation(entity, treatment)
+                    })
+                    .collect()
+            }
+        }
+    };
+    let stated: Vec<Violation> = violations.iter().map(crate::service::as_stated).collect();
+    envelope(&stated)
 }
 
 /// Why the `supplied` parameter VALUES are not a set this service will store against an
@@ -841,9 +988,18 @@ pub struct Application {
     pub name: String,
     pub description: Option<String>,
     pub tags: HashMap<String, String>,
+    /// Environments created under this application, by environment id. INSERTION goes
+    /// through [`Application::try_insert_environment`], the one place
+    /// [`MAX_ENVIRONMENTS_PER_APPLICATION`] is enforced; the map is reached directly only
+    /// to read, mutate or remove a record it already holds.
     pub environments: HashMap<String, Environment>,
+    /// Configuration profiles created under this application, by profile id. Inserted
+    /// through [`Application::try_insert_profile`], which bounds it at
+    /// [`MAX_CONFIGURATION_PROFILES_PER_APPLICATION`].
     pub profiles: HashMap<String, ConfigurationProfile>,
-    /// Experiment definitions created under this application, by definition id.
+    /// Experiment definitions created under this application, by definition id. Inserted
+    /// through [`Application::try_insert_experiment_definition`], which bounds it at
+    /// [`MAX_EXPERIMENT_DEFINITIONS_PER_APPLICATION`].
     pub experiment_definitions: HashMap<String, ExperimentDefinition>,
 }
 
@@ -862,6 +1018,73 @@ impl Application {
             environments: HashMap::new(),
             profiles: HashMap::new(),
             experiment_definitions: HashMap::new(),
+        }
+    }
+
+    /// Whether this application already holds every environment
+    /// [`MAX_ENVIRONMENTS_PER_APPLICATION`] allows, so a create can state the quota
+    /// refusal it models before minting anything.
+    pub fn environment_quota_reached(&self) -> bool {
+        self.environments.len() >= MAX_ENVIRONMENTS_PER_APPLICATION
+    }
+
+    /// Store a new environment under this application and answer the stored record, or
+    /// `None` when it was not stored: the application already holds
+    /// [`MAX_ENVIRONMENTS_PER_APPLICATION`] of them — the bound that keeps a loop of
+    /// create calls from growing the emulator's heap without limit — or some environment
+    /// already answers to the id, which the caller refuses rather than reporting another
+    /// environment's record as the one it just made.
+    pub fn try_insert_environment(&mut self, environment: Environment) -> Option<&Environment> {
+        if self.environment_quota_reached() {
+            return None;
+        }
+        match self.environments.entry(environment.id.clone()) {
+            std::collections::hash_map::Entry::Vacant(slot) => Some(slot.insert(environment)),
+            std::collections::hash_map::Entry::Occupied(_) => None,
+        }
+    }
+
+    /// Whether this application already holds every configuration profile
+    /// [`MAX_CONFIGURATION_PROFILES_PER_APPLICATION`] allows. See
+    /// [`Application::environment_quota_reached`].
+    pub fn profile_quota_reached(&self) -> bool {
+        self.profiles.len() >= MAX_CONFIGURATION_PROFILES_PER_APPLICATION
+    }
+
+    /// Store a new configuration profile under this application. See
+    /// [`Application::try_insert_environment`], which bounds its map the same way.
+    pub fn try_insert_profile(
+        &mut self,
+        profile: ConfigurationProfile,
+    ) -> Option<&ConfigurationProfile> {
+        if self.profile_quota_reached() {
+            return None;
+        }
+        match self.profiles.entry(profile.id.clone()) {
+            std::collections::hash_map::Entry::Vacant(slot) => Some(slot.insert(profile)),
+            std::collections::hash_map::Entry::Occupied(_) => None,
+        }
+    }
+
+    /// Whether this application already holds every experiment definition
+    /// [`MAX_EXPERIMENT_DEFINITIONS_PER_APPLICATION`] allows. See
+    /// [`Application::environment_quota_reached`].
+    pub fn experiment_definition_quota_reached(&self) -> bool {
+        self.experiment_definitions.len() >= MAX_EXPERIMENT_DEFINITIONS_PER_APPLICATION
+    }
+
+    /// Store a new experiment definition under this application. See
+    /// [`Application::try_insert_environment`], which bounds its map the same way.
+    pub fn try_insert_experiment_definition(
+        &mut self,
+        definition: ExperimentDefinition,
+    ) -> Option<&ExperimentDefinition> {
+        if self.experiment_definition_quota_reached() {
+            return None;
+        }
+        match self.experiment_definitions.entry(definition.id.clone()) {
+            std::collections::hash_map::Entry::Vacant(slot) => Some(slot.insert(definition)),
+            std::collections::hash_map::Entry::Occupied(_) => None,
         }
     }
 
@@ -2560,7 +2783,18 @@ impl AccountSettingsRecord {
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAppconfigAmazonappconfigState {
     /// Every application, by application id.
-    pub applications: HashMap<String, Application>,
+    ///
+    /// PRIVATE on purpose, like the other stores this service grows one request at a
+    /// time: [`Self::try_insert_application`] is the only way in, so the
+    /// [`MAX_APPLICATIONS`] bound cannot be bypassed by a handler inserting into the map
+    /// directly, and neither can the growth of everything nested under an application —
+    /// its environments, profiles and experiment definitions are reached only through a
+    /// record this map already holds, and each of those is bounded by the
+    /// `Application::try_insert_*` that stores it. [`Self::application`],
+    /// [`Self::application_mut`], [`Self::all_applications`] and
+    /// [`Self::remove_application`] are how a handler reads, mutates, lists and forgets
+    /// one.
+    applications: HashMap<String, Application>,
     /// This account's AppConfig settings, as `UpdateAccountSettings` last wrote them —
     /// [`AccountSettingsRecord::default`] (AppConfig's documented defaults) until it
     /// does. Account-scoped rather than per-application: the settings surface is
@@ -2602,14 +2836,78 @@ pub struct ComAmazonawsAppconfigAmazonappconfigState {
 impl ComAmazonawsAppconfigAmazonappconfigState {
     /// Mint a fresh resource id matching the model's `Id` shape (`^[a-z0-9]{4,7}$`),
     /// unique across every resource this service holds.
+    ///
+    /// The probe is BOUNDED. Each round offers the next value of the sequence, so the
+    /// candidates of one pass are distinct, and the store holds at most
+    /// [`MAX_HELD_RESOURCE_IDS`] ids — every map that can grow is capped at its own
+    /// insertion point — so a free candidate is always within that many rounds while
+    /// those caps hold. Past the budget the last candidate is answered rather than
+    /// probing forever: every caller inserts into a VACANT slot only and refuses an
+    /// occupied one with a modelled server error, so an exhausted id space surfaces as
+    /// that error instead of a wedged handler thread.
     pub fn mint_id(&mut self) -> String {
-        loop {
+        let mut candidate = String::new();
+        for _ in 0..=MAX_HELD_RESOURCE_IDS {
             self.id_sequence = self.id_sequence.wrapping_add(1);
-            let candidate = encode_id(self.id_sequence);
+            candidate = encode_id(self.id_sequence);
             if !self.id_taken(&candidate) {
-                return candidate;
+                break;
             }
         }
+        candidate
+    }
+
+    /// Store a new application and answer the stored record, or `None` when it was not
+    /// stored.
+    ///
+    /// The ONLY way into the application map, and so the one place its growth is bounded:
+    /// nothing is stored once this account holds [`MAX_APPLICATIONS`] of them — the bound
+    /// that keeps a loop of create calls from growing the emulator's heap without limit —
+    /// or when some application already answers to the id, which a caller refuses rather
+    /// than reporting another application's record as the one it just made.
+    /// `CreateApplication` is the caller this exists for, and it answers the first case
+    /// with the `ServiceQuotaExceededException` it models (see
+    /// [`Self::application_quota_reached`], which states that refusal before an id is
+    /// minted) and the second with a modelled server error.
+    pub fn try_insert_application(&mut self, application: Application) -> Option<&Application> {
+        if self.applications.len() >= MAX_APPLICATIONS {
+            return None;
+        }
+        match self.applications.entry(application.id.clone()) {
+            std::collections::hash_map::Entry::Vacant(slot) => Some(slot.insert(application)),
+            std::collections::hash_map::Entry::Occupied(_) => None,
+        }
+    }
+
+    /// Whether this account already holds every application [`MAX_APPLICATIONS`] allows,
+    /// so a create can state the quota refusal it models before minting anything.
+    pub fn application_quota_reached(&self) -> bool {
+        self.applications.len() >= MAX_APPLICATIONS
+    }
+
+    /// The application `application_id` holds, for a reader.
+    pub fn application(&self, application_id: &str) -> Option<&Application> {
+        self.applications.get(application_id)
+    }
+
+    /// The application `application_id` holds, for a caller that goes on to mutate the
+    /// record or one nested under it.
+    pub fn application_mut(&mut self, application_id: &str) -> Option<&mut Application> {
+        self.applications.get_mut(application_id)
+    }
+
+    /// Every application this account holds, in no particular order — a listing orders
+    /// them itself.
+    pub fn all_applications(&self) -> impl Iterator<Item = &Application> {
+        self.applications.values()
+    }
+
+    /// Forget the application `application_id` holds, answering the record that was
+    /// removed, or `None` when this account holds none under it. `DeleteApplication` is
+    /// the caller this exists for, and removing the record frees its slot and takes
+    /// everything nested under it.
+    pub fn remove_application(&mut self, application_id: &str) -> Option<Application> {
+        self.applications.remove(application_id)
     }
 
     /// Whether any resource already answers to `id`.

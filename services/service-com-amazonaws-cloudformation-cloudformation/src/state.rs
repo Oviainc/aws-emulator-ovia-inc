@@ -1326,6 +1326,9 @@ impl StoredStack {
         // [`provisioning::reconcile`](provisioning::reconcile), which the deploying
         // operation calls with these records.
         let already_created = self.current_resources();
+        // Whether any record took over an identifier its owning service MINTED, which is
+        // not the one the properties above were resolved against.
+        let mut adopted_minted_identity = false;
         for resource in &mut resources {
             // The record of the same resource this stack already created. Judged by
             // identity first; for a type whose id the OWNING SERVICE assigns, a record
@@ -1367,12 +1370,36 @@ impl StoredStack {
                     // record keeps it: an output naming the resource reports the id a
                     // client can call that service with, and `reconcile` sees the resource
                     // the stack already has rather than one to create again.
+                    if existing.physical_resource_id != resource.physical_resource_id {
+                        adopted_minted_identity = true;
+                    }
                     resource.physical_resource_id = existing.physical_resource_id.clone();
                 }
                 for (name, value) in &existing.attributes {
                     resource.attributes.insert(name.clone(), value.clone());
                 }
             }
+        }
+        // A property naming a resource whose identity its owning service MINTED was
+        // resolved against the stand-in the naming rules recomputed above, not against the
+        // identity now in force, so those properties are resolved ONCE MORE against the
+        // records as they stand. Only a deployment that really took such an identifier over
+        // pays for the second pass; without it a re-deploy of the same template would read
+        // as a CHANGED configuration of every resource that names one.
+        if adopted_minted_identity {
+            let in_force: BTreeMap<String, StoredResource> = resources
+                .iter()
+                .map(|resource| (resource.logical_id.clone(), resource.clone()))
+                .collect();
+            template::resolve_properties(
+                &declared,
+                &mut resources,
+                &template::Scope {
+                    resources: &in_force,
+                    ..scope
+                },
+                &mut budget,
+            );
         }
         // The outputs are evaluated against the identities now in force, which is why this
         // is after the carry-forward above: a resource whose id the owning service assigned

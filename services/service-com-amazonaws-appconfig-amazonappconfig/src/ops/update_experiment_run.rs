@@ -194,6 +194,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // The treatment assignments this update would store are checked through the same
+        // function `StartExperimentRun` refuses through, and before anything is written:
+        // the map sits behind a union member, which the schema walk does not descend into,
+        // so the bounds the model publishes for it are enforced here.
+        if let Some(reason) = input
+            .treatment_overrides
+            .as_ref()
+            .and_then(crate::state::treatment_overrides_rejection)
+        {
+            return Err(UpdateExperimentRunErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(reason),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        }
 
         let now = std::time::SystemTime::now();
         // ONE lock for the whole read-check-write: the exposure this request is checked
@@ -215,7 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let Some(application) = store.applications.get_mut(&application_id) else {
+        let Some(application) = store.application_mut(&application_id) else {
             return Err(UpdateExperimentRunErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some(

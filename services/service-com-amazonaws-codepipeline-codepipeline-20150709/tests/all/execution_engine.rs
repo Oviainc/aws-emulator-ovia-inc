@@ -289,7 +289,10 @@ pub(crate) async fn status_of(emulator: &Emulator, pipeline: &str, execution: &s
 
 /// A zip archive of `entries`, built by the `zip` crate (the same crate the deploy
 /// action reads one with).
-fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+///
+/// `pub(crate)` with the harness: the `s3_deploy_object_key` suite drives the same
+/// extraction path through it rather than growing a second copy.
+pub(crate) fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let mut cursor = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut cursor);

@@ -263,6 +263,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The whole lifecycle is owed from here: the status is derived from this
             // instant rather than stored, and nothing is slept on.
             submitted_at,
+            // Nothing has asked for this query to be cancelled yet; `CancelQuery`
+            // is what records that.
+            cancel_requested_at: None,
             outcome,
         };
         let output = StartQueryOutput {

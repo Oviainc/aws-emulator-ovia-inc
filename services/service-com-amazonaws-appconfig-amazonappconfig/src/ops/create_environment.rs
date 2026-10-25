@@ -189,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An environment only exists under an application, so the parent is resolved
         // before an id is minted for the child.
-        let Some(application) = store.applications.get(&input.application_id) else {
+        let Some(application) = store.application(&input.application_id) else {
             return Err(CreateEnvironmentErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::application_not_found(
@@ -201,8 +201,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         // Bounded so a loop of create calls cannot grow this emulator's heap without
-        // limit; see `state::MAX_ENVIRONMENTS_PER_APPLICATION`.
-        if application.environments.len() >= crate::state::MAX_ENVIRONMENTS_PER_APPLICATION {
+        // limit; see `state::MAX_ENVIRONMENTS_PER_APPLICATION`, which
+        // `Application::try_insert_environment` enforces where the record is stored. It
+        // is stated here so the refusal is the modelled quota error and nothing is minted
+        // for a create that cannot be stored.
+        if application.environment_quota_reached() {
             return Err(CreateEnvironmentErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: Some(format!(
@@ -217,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = store.mint_id();
-        let Some(application) = store.applications.get_mut(&input.application_id) else {
+        let Some(application) = store.application_mut(&input.application_id) else {
             return Err(CreateEnvironmentErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some(
@@ -230,7 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let environment = crate::state::Environment::new(
-            id.clone(),
+            id,
             application.id.clone(),
             input.name,
             input.description,
@@ -240,18 +243,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `mint_id` rejects every id any resource already holds, so the slot is vacant.
         // An occupied one is refused rather than answered from: reporting 201 with
         // another environment's record would describe a resource this call never made.
-        let stored = match application.environments.entry(id) {
-            std::collections::hash_map::Entry::Vacant(slot) => slot.insert(environment),
-            std::collections::hash_map::Entry::Occupied(_) => {
-                return Err(CreateEnvironmentErrorModeled::InternalServerException(
-                    InternalServerException {
-                        message: Some(
-                            "The minted environment id was already in use".to_string(),
-                        ),
-                    },
-                )
-                .into())
-            }
+        // The same call is what bounds the map, so a create past the quota stores nothing
+        // even if the check above were ever bypassed.
+        let Some(stored) = application.try_insert_environment(environment) else {
+            return Err(CreateEnvironmentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("The minted environment id was already in use".to_string()),
+                },
+            )
+            .into());
         };
 
         // Answered from the stored record, including the `State` a brand-new

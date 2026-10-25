@@ -200,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let Some(application) = store.applications.get_mut(&application_id) else {
+        let Some(application) = store.application_mut(&application_id) else {
             return Err(UpdateExperimentDefinitionErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some(

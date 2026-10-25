@@ -207,17 +207,19 @@ pub fn expired_managed_rule_group_version_exception(
     }
 }
 
-/// The sentence `WAFInvalidPermissionPolicyException` carries: the sentence the model
-/// documents for the shape
-/// (`smithy_query(query="shape",shape="WAFInvalidPermissionPolicyException")` — "The
-/// operation failed because the specified policy isn't in the proper format"), its
-/// wrapping whitespace flattened. See [`DUPLICATE_ITEM_MESSAGE`] for why the wording
-/// is a property of the exception type rather than of the call: the rest of that
-/// shape's documentation is the list of restrictions every request is judged against,
-/// not a detail of one call, so the body names neither the policy that was rejected
-/// nor which restriction it broke.
-pub const INVALID_PERMISSION_POLICY_MESSAGE: &str =
-    "The operation failed because the specified policy isn't in the proper format.";
+/// The sentence `WAFInvalidPermissionPolicyException` carries: the wire wording WAF
+/// answers with, as the recorded wafv2 responses show it.
+///
+/// A shape's documentation prose is a description of the error, NOT the sentence the
+/// service puts on the wire for it; where the two differ the recorded wording is the
+/// one callers see, so this constant carries that and not the first sentence of the
+/// shape's `documentation` trait. See [`DUPLICATE_ITEM_MESSAGE`] for why the wording
+/// is a property of the exception type rather than of the call: the restrictions that
+/// shape's documentation lists are what every request is judged against, not a detail
+/// of one call, so the body names neither the policy that was rejected nor which
+/// restriction it broke.
+pub const INVALID_PERMISSION_POLICY_MESSAGE: &str = "The policy specification doesn't \
+     meet the requirements to be attached to an AWS WAF resource.";
 
 /// `WAFInvalidPermissionPolicyException` as WAF returns it: nothing but
 /// [`INVALID_PERMISSION_POLICY_MESSAGE`].

@@ -356,9 +356,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .billing_group_names
                     .insert(updated.name.clone(), group_arn.clone());
             }
-            state
-                .billing_groups
-                .insert(group_arn.clone(), updated.clone());
+            // Through the state method that keeps the generation this write supersedes,
+            // so a read scoped to a billing period the previous generation was in force
+            // in still reports the group as it stood then
+            // (`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::put_billing_group`).
+            state.put_billing_group(updated.clone());
         }
 
         // The audit record for a state-changing call: who asked, what changed and that

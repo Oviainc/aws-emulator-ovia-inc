@@ -185,7 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.action_type_available_in(&key, &region) {
             return Err(UpdateActionTypeErrorModeled::ActionTypeNotFoundException(
                 ActionTypeNotFoundException {
-                    message: Some(crate::state::action_type_not_found_message(&key.to_id())),
+                    message: Some(crate::state::action_type_declaration_not_found_message(
+                        &key.to_id(),
+                    )),
                 },
             )
             .into());

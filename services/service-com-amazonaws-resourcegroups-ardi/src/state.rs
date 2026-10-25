@@ -4,8 +4,8 @@
 //!
 //! Every resource group this emulator holds lives in ONE map, [`ComAmazonawsResourcegroupsArdiState::groups`],
 //! so `CreateGroup`, `GetGroup`, `GetGroupConfiguration`, `ListGroups`, `GroupResources`,
-//! `ListGroupResources`, `ListGroupingStatuses`, `UpdateGroup` and `DeleteGroup` all read
-//! and write the same records. The map is a
+//! `UngroupResources`, `ListGroupResources`, `ListGroupingStatuses`, `UpdateGroup` and
+//! `DeleteGroup` all read and write the same records. The map is a
 //! [`BTreeMap`] keyed by [`GroupKey`] — the region the group was created in and its
 //! name — because this service is REGIONAL: a group belongs to the region whose
 //! endpoint created it, and only that region's callers see it. Within one region
@@ -521,8 +521,9 @@ pub struct GroupRecord {
     /// The group's tags, kept in key order so the stored record is deterministic
     /// (the wire map itself is unordered).
     pub tags: BTreeMap<String, String>,
-    /// Static members added by `GroupResources`, kept sorted by ARN: the sort is
-    /// the listing order `ListGroupResources` pages through.
+    /// Static members added by `GroupResources` and dropped by
+    /// `UngroupResources`, kept sorted by ARN: the sort is the listing order
+    /// `ListGroupResources` pages through.
     pub members: Vec<MemberRecord>,
     /// The last grouping or ungrouping action recorded against each resource of
     /// this group, keyed by resource ARN — what `ListGroupingStatuses` reports.
@@ -812,6 +813,17 @@ impl GroupRecord {
         removed
     }
 
+    /// Whether `resource_arn` is one of this group's static members.
+    ///
+    /// Found by BINARY SEARCH over [`GroupRecord::members`], which
+    /// [`GroupRecord::add_member`] keeps sorted by ARN, so a membership check is
+    /// logarithmic in the group's size however many members it holds.
+    pub fn holds_member(&self, resource_arn: &str) -> bool {
+        self.members
+            .binary_search_by(|member| member.resource_arn.as_str().cmp(resource_arn))
+            .is_ok()
+    }
+
     /// Record `resource_arn` as a member, keeping [`GroupRecord::members`] sorted
     /// by ARN. Adding an ARN that is already a member changes nothing, so
     /// repeating a `GroupResources` call does not duplicate a membership.
@@ -851,6 +863,32 @@ impl GroupRecord {
         );
     }
 
+    /// Drop `resource_arn` from this group's static members, and report whether
+    /// the group HELD it.
+    ///
+    /// Removing an ARN the group does not hold changes nothing and reports
+    /// `false`, so repeating an `UngroupResources` call leaves the same group
+    /// behind. A removal that happened is an UNGROUP action that succeeded, so
+    /// the same call records the grouping status `ListGroupingStatuses` reports
+    /// for that resource — replacing the GROUP record its grouping left, since
+    /// the operation reports each resource's LAST action.
+    pub fn remove_member(&mut self, resource_arn: &str) -> bool {
+        let Ok(at) = self
+            .members
+            .binary_search_by(|member| member.resource_arn.as_str().cmp(resource_arn))
+        else {
+            return false;
+        };
+        self.members.remove(at);
+        self.record_grouping_status(
+            resource_arn,
+            GROUPING_ACTION_UNGROUP,
+            GROUPING_STATUS_SUCCESS,
+            SystemTime::now(),
+        );
+        true
+    }
+
     /// Record that the last grouping action on `resource_arn` in this group was
     /// `action` (a modelled `GroupingType`) and ended in `status` (a modelled
     /// `GroupingStatus`), at `at`.
@@ -859,9 +897,16 @@ impl GroupRecord {
     /// or ungrouping actions records them the same way and `ListGroupingStatuses`
     /// reads one record per resource. Recording a resource again REPLACES its
     /// entry: the operation reports each resource's last action, not a history.
-    /// This slice records only the successful GROUP actions
-    /// [`GroupRecord::add_member`] performs, so the map holds one entry per
-    /// member and is bounded by [`MAX_MEMBERS_PER_GROUP`].
+    /// This slice records the successful GROUP actions
+    /// [`GroupRecord::add_member`] performs and the successful UNGROUP actions
+    /// [`GroupRecord::remove_member`] performs; an ungrouping replaces the record
+    /// its grouping left, so only a NEW membership ever adds an entry.
+    ///
+    /// The map is bounded by [`MAX_MEMBERS_PER_GROUP`], the same ceiling the
+    /// membership itself carries: once it is full, room for a new record is made
+    /// by dropping the OLDEST record of a resource the group no longer holds, so
+    /// a client cycling resources through one group cannot grow the store without
+    /// end and every CURRENT member keeps its record.
     pub fn record_grouping_status(
         &mut self,
         resource_arn: &str,
@@ -877,6 +922,20 @@ impl GroupRecord {
                 updated_at: at,
             },
         );
+        while self.grouping_statuses.len() > MAX_MEMBERS_PER_GROUP {
+            let stale = self
+                .grouping_statuses
+                .iter()
+                .filter(|(arn, _)| !self.holds_member(arn))
+                .min_by_key(|(_, record)| record.updated_at)
+                .map(|(arn, _)| arn.clone());
+            match stale {
+                Some(arn) => self.grouping_statuses.remove(&arn),
+                // Every record belongs to a current member, and the membership
+                // is bounded by the same ceiling: there is nothing to drop.
+                None => break,
+            };
+        }
     }
 }
 

@@ -805,6 +805,11 @@ pub const CALLER_SETTABLE_BILLING_GROUP_STATUSES: &[&str] = &["ACTIVE", "PENDING
 /// `BillingGroupType` and the owner half of `Status` are DERIVED (see the methods
 /// below), never stored, so they cannot drift from the membership and the
 /// preferences they are computed from.
+///
+/// The record carries the group as it stands NOW, plus the generations of it that later
+/// writes superseded ([`BillingGroupVersion`]), because every read of a billing group is
+/// scoped to a billing period and so reports the generation that was in force in that
+/// period — the same shape [`PricingRuleRecord`] keeps for a pricing rule.
 #[derive(Debug, Clone, Default)]
 pub struct BillingGroupRecord {
     pub arn: String,
@@ -823,6 +828,12 @@ pub struct BillingGroupRecord {
     pub tags: BTreeMap<String, String>,
     pub creation_time_millis: i64,
     pub last_modified_time_millis: i64,
+    /// The generations of this group that later writes SUPERSEDED, oldest first, at most
+    /// [`MAX_BILLING_GROUP_VERSIONS`] of them. The generation in effect NOW is not among
+    /// them — it is projected from this record by [`Self::current_version`] — so the
+    /// history and the live group cannot drift. Held on the record so a deleted group
+    /// takes its history with it.
+    pub superseded_versions: Vec<BillingGroupVersion>,
 }
 
 impl BillingGroupRecord {
@@ -831,33 +842,108 @@ impl BillingGroupRecord {
         i64::try_from(self.linked_account_ids.len()).unwrap_or(i64::MAX)
     }
 
-    /// True when the group has a billing owner: either a primary account, or a
-    /// responsibility transfer relationship — the model documents
-    /// `AccountGrouping.ResponsibilityTransferArn` as "When specified, the
-    /// PrimaryAccountId is no longer required".
-    pub fn has_billing_owner(&self) -> bool {
-        self.primary_account_id.is_some() || self.responsibility_transfer_arn.is_some()
+    /// The billing period this group was created in: the first period any read of it
+    /// reports it for, since a resource does not exist in a period that precedes it.
+    pub fn creation_billing_period(&self) -> String {
+        billing_period_at(self.creation_time_millis)
     }
 
-    /// `BillingGroupStatus`. A group with no billing owner
-    /// ([`has_billing_owner`](Self::has_billing_owner)) is `PRIMARY_ACCOUNT_MISSING`,
-    /// whatever any request asked for: that status reports the absence rather than a
-    /// choice. A group that HAS one holds the operational status last asked for, and
-    /// `ACTIVE` until one is.
-    pub fn status(&self) -> &'static str {
+    /// The billing period this group's CURRENT generation is in effect FROM.
+    ///
+    /// A write takes effect in the period it is made in, and `LastModifiedTime` is the
+    /// instant of the write that left the group as it stands, so the period that instant
+    /// falls in is the one the current generation starts in. A second write in the same
+    /// period leaves that period unchanged, which is why one period has one generation.
+    pub fn version_start_billing_period(&self) -> String {
+        billing_period_at(self.last_modified_time_millis)
+    }
+
+    /// This group's CURRENT generation, as a snapshot of the members a write can change.
+    ///
+    /// Projected from the live record rather than stored twice, so the newest generation
+    /// is the group a read of the current period reports.
+    pub fn current_version(&self) -> BillingGroupVersion {
+        BillingGroupVersion {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            pricing_plan_arn: self.pricing_plan_arn.clone(),
+            auto_associate: self.auto_associate,
+            requested_status: self.requested_status.clone(),
+            last_modified_time_millis: self.last_modified_time_millis,
+        }
+    }
+
+    /// Every generation of this group, OLDEST FIRST: the ones later writes superseded,
+    /// frozen as they stood, and then the one in effect now.
+    pub fn versions(&self) -> Vec<BillingGroupVersion> {
+        let mut versions = self.superseded_versions.clone();
+        versions.push(self.current_version());
+        versions
+    }
+
+    /// Does this group exist in `billing_period`? A resource does not exist in a period
+    /// that precedes the one it was created in, and a value that is not a billing period
+    /// at all names no period a group exists in.
+    ///
+    /// The cheap half of [`Self::effective_in`], so a listing can leave the groups a
+    /// period never held out of the sequence it pages over.
+    pub fn exists_in(&self, billing_period: &str) -> bool {
+        match (
+            billing_period_key(billing_period),
+            billing_period_key(&self.creation_billing_period()),
+        ) {
+            (Some(wanted), Some(created)) => wanted >= created,
+            _ => false,
+        }
+    }
+
+    /// The generation of this group that is in force in `billing_period` — what a read
+    /// scoped to that period reports — or `None` when the group did not exist then
+    /// ([`Self::exists_in`]).
+    ///
+    /// The generation in force is the LATEST one whose own start period is at or before
+    /// the period asked about, so a write made later never shows up in an earlier
+    /// period. When the oldest generations have been dropped from the kept history
+    /// ([`MAX_BILLING_GROUP_VERSIONS`]), the oldest one still kept answers for the
+    /// periods before it, because the group itself did exist then.
+    pub fn effective_in(&self, billing_period: &str) -> Option<BillingGroupVersion> {
+        if !self.exists_in(billing_period) {
+            return None;
+        }
+        let wanted = billing_period_key(billing_period)?;
+        let versions = self.versions();
+        versions
+            .iter()
+            .rev()
+            .find(|version| {
+                billing_period_key(&version.start_billing_period())
+                    .is_some_and(|start| start <= wanted)
+            })
+            .or_else(|| versions.first())
+            .cloned()
+    }
+
+    /// `BillingGroupStatus` as the generation `version` reported it — the status a read
+    /// scoped to that generation's periods answers with.
+    ///
+    /// A group with no billing owner ([`has_billing_owner`](Self::has_billing_owner)) is
+    /// `PRIMARY_ACCOUNT_MISSING`, whatever any request asked for: that status reports the
+    /// absence rather than a choice, and neither member it is decided from is one a write
+    /// can change, so it belongs to the record rather than to a generation.
+    pub fn status_of(&self, version: &BillingGroupVersion) -> &'static str {
         if !self.has_billing_owner() {
             return "PRIMARY_ACCOUNT_MISSING";
         }
-        match self.requested_status.as_deref() {
+        match version.requested_status.as_deref() {
             Some("PENDING") => "PENDING",
             _ => "ACTIVE",
         }
     }
 
-    /// `StatusReason`: why the group is in [`status`](Self::status), absent when it
-    /// is `ACTIVE`.
-    pub fn status_reason(&self) -> Option<String> {
-        match self.status() {
+    /// `StatusReason` for the generation `version`: why the group was in
+    /// [`status_of`](Self::status_of) then, absent when that status is `ACTIVE`.
+    pub fn status_reason_of(&self, version: &BillingGroupVersion) -> Option<String> {
+        match self.status_of(version) {
             "PRIMARY_ACCOUNT_MISSING" => Some(
                 "The billing group has no primary account and no responsibility transfer ARN."
                     .to_string(),
@@ -869,6 +955,27 @@ impl BillingGroupRecord {
         }
     }
 
+    /// True when the group has a billing owner: either a primary account, or a
+    /// responsibility transfer relationship — the model documents
+    /// `AccountGrouping.ResponsibilityTransferArn` as "When specified, the
+    /// PrimaryAccountId is no longer required".
+    pub fn has_billing_owner(&self) -> bool {
+        self.primary_account_id.is_some() || self.responsibility_transfer_arn.is_some()
+    }
+
+    /// `BillingGroupStatus` as the group stands NOW: the status of its current
+    /// generation ([`status_of`](Self::status_of)), which is what a write answers with
+    /// and what a read of the current billing period reports.
+    pub fn status(&self) -> &'static str {
+        self.status_of(&self.current_version())
+    }
+
+    /// `StatusReason`: why the group is in [`status`](Self::status), absent when it
+    /// is `ACTIVE`.
+    pub fn status_reason(&self) -> Option<String> {
+        self.status_reason_of(&self.current_version())
+    }
+
     /// `BillingGroupType`: a group that bills through a transfer relationship is
     /// `TRANSFER_BILLING`, every other group is `STANDARD`.
     pub fn billing_group_type(&self) -> &'static str {
@@ -877,6 +984,45 @@ impl BillingGroupRecord {
         } else {
             "STANDARD"
         }
+    }
+}
+
+/// One GENERATION of a billing group: the members a write can change, as they stood
+/// while that generation was in force.
+///
+/// A billing group read is scoped to a billing period (`ListBillingGroups`: "retrieve a
+/// list of billing groups for the given billing period"), so the values a read reports
+/// are the ones that held in that period. A superseded generation is FROZEN: nothing
+/// writes to it again, so a read of a closed period reports the group as it really was
+/// rather than as it has since become. The members no write can change — the ARN, the
+/// primary account, the responsibility transfer ARN and `CreationTime`, none of which
+/// `UpdateBillingGroupInput` can change
+/// (`smithy_query(query="shape",shape="UpdateBillingGroupInput")`) — stay on the record,
+/// so there is one copy of them. The membership a period reports is not here either: it
+/// is kept per period on the account memberships themselves
+/// ([`ComAmazonawsBillingconductorAwsbillingconductorState::billing_group_sizes_in`]).
+#[derive(Debug, Clone, Default)]
+pub struct BillingGroupVersion {
+    pub name: String,
+    pub description: Option<String>,
+    /// `ComputationPreference.PricingPlanArn` as this generation carried it.
+    pub pricing_plan_arn: String,
+    /// `AccountGrouping.AutoAssociate` as this generation carried it.
+    pub auto_associate: Option<bool>,
+    /// The operational status a caller had asked for while this generation was in force —
+    /// see [`BillingGroupRecord::requested_status`].
+    pub requested_status: Option<String>,
+    /// `LastModifiedTime` as this generation reported it, which is also the instant the
+    /// generation took effect — see [`Self::start_billing_period`].
+    pub last_modified_time_millis: i64,
+}
+
+impl BillingGroupVersion {
+    /// The billing period this generation is in effect FROM, inclusive: the period the
+    /// write that left it was made in, derived from that write's instant the same way
+    /// [`BillingGroupRecord::version_start_billing_period`] derives the live one.
+    pub fn start_billing_period(&self) -> String {
+        billing_period_at(self.last_modified_time_millis)
     }
 }
 
@@ -1359,7 +1505,9 @@ pub fn responsibility_transfer_owner_account(arn: &str) -> Option<&str> {
 ///   `pricing_plans` / `pricing_plan_names` hold one entry per plan, at most
 ///   [`MAX_PRICING_PLANS`]; a plan's own association set at most
 ///   [`MAX_PRICING_RULES_PER_PRICING_PLAN`]; `billing_groups` / `billing_group_names` one per group,
-///   at most [`MAX_BILLING_GROUPS`]; a group's membership and its share of
+///   at most [`MAX_BILLING_GROUPS`], one group also carrying the generations of it that
+///   later writes superseded, at most [`MAX_BILLING_GROUP_VERSIONS`], oldest dropped
+///   first; a group's membership and its share of
 ///   `account_associations` at most [`MAX_ACCOUNTS_PER_BILLING_GROUP`]. A create or
 ///   an association past its cap is REFUSED with the modelled
 ///   `ServiceLimitExceededException` — never by evicting a stored resource, which a
@@ -1887,6 +2035,39 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             }
         }
         self.pricing_rules.insert(arn, updated);
+    }
+
+    /// Store `updated` as the billing group's CURRENT generation, keeping the generation
+    /// it replaces when the write takes effect in a DIFFERENT billing period.
+    ///
+    /// The same rule [`Self::put_pricing_rule`] applies to a pricing rule: a generation
+    /// of a billing group is the group as it stood while it was in force, so a write
+    /// landing in a period AFTER the one the current generation started in closes that
+    /// generation — frozen as it stood, so a later read of that period reports the group
+    /// as it really was — while a write landing in the generation's own period REPLACES
+    /// it, because one billing period has one generation of the group.
+    ///
+    /// The kept history is bounded like every other store here: past
+    /// [`MAX_BILLING_GROUP_VERSIONS`] superseded generations the OLDEST is dropped, which
+    /// reads back as the oldest kept generation covering the periods before it — never as
+    /// a group that vanishes from a period it existed in
+    /// ([`BillingGroupRecord::effective_in`]).
+    pub fn put_billing_group(&mut self, mut updated: BillingGroupRecord) {
+        let arn = updated.arn.clone();
+        let superseded = self
+            .billing_groups
+            .get(&arn)
+            .filter(|previous| {
+                previous.version_start_billing_period() != updated.version_start_billing_period()
+            })
+            .map(BillingGroupRecord::current_version);
+        if let Some(superseded) = superseded {
+            updated.superseded_versions.push(superseded);
+            while updated.superseded_versions.len() > MAX_BILLING_GROUP_VERSIONS {
+                updated.superseded_versions.remove(0);
+            }
+        }
+        self.billing_groups.insert(arn, updated);
     }
 
     /// Delete a pricing rule and the index entries that only existed because of
@@ -2505,6 +2686,17 @@ pub const MAX_CUSTOM_LINE_ITEM_VERSIONS: usize = 100;
 /// successor answering for the earlier periods — never as the loss of the rule itself,
 /// which a read of every period from its creation onward must still report.
 pub const MAX_PRICING_RULE_VERSIONS: usize = 100;
+
+/// How many SUPERSEDED generations of one billing group this emulator keeps, so that a
+/// read scoped to a closed billing period can report the group as it stood then.
+///
+/// A CHOSEN bound, not an AWS limit, of the same order as
+/// [`MAX_PRICING_RULE_VERSIONS`] and for the same reason: each write that takes effect
+/// in a new billing period adds a generation, so the kept history has to be capped. The
+/// OLDEST generation is dropped first, which reads back as that generation's successor
+/// answering for the earlier periods — never as the loss of the group itself, which a
+/// read of every period from its creation onward must still report.
+pub const MAX_BILLING_GROUP_VERSIONS: usize = 100;
 
 /// How many pricing rules this emulator stores for the account. A CHOSEN bound;
 /// see [`MAX_PRICING_PLANS`] for why it exists and how it is enforced. A rule IS

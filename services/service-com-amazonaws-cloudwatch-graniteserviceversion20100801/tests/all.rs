@@ -35,6 +35,8 @@ mod dashboards;
 mod datasets;
 #[path = "all/ec2_alarm_actions.rs"]
 mod ec2_alarm_actions;
+#[path = "all/forced_state_actions.rs"]
+mod forced_state_actions;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/insight_rules.rs"]

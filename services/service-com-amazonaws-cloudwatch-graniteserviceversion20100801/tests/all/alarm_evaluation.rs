@@ -745,9 +745,9 @@ async fn an_evaluated_transition_is_recorded_in_the_alarm_history() {
 #[tokio::test]
 async fn a_forced_state_holds_until_the_next_evaluation_is_due() {
     let router = build_router();
-    // The shortest period an alarm may be evaluated on, so the span a forced state stands for
-    // — one evaluation period of the alarm — is the shortest one there is. (`Period`: "Valid
-    // values are 10, 20, 30, and any multiple of 60.")
+    // The shortest period an alarm may be evaluated on (`Period`: "Valid values are 10, 20, 30,
+    // and any multiple of 60."), so the datapoint published below lands in the window the
+    // evaluation that reclaims the state grades.
     let alarm = patched("forced", &json!({"Period": SHORTEST_PERIOD_SECS}));
     ok(&router, "PutMetricAlarm", &alarm).await;
     ok(
@@ -768,8 +768,10 @@ async fn a_forced_state_holds_until_the_next_evaluation_is_due() {
     );
 
     // Past the forced span, the evaluation owns the state again: a datapoint under the
-    // threshold puts the alarm in OK. The span is one evaluation period of the alarm.
-    std::thread::sleep(Duration::from_millis(10_500));
+    // threshold puts the alarm in OK. "Metric alarms returns to their actual state quickly,
+    // often within seconds" (`SetAlarmState`), so that span is the one every transition the
+    // clock owes takes.
+    wait_for_evaluation();
     publish(&router, "forced", &[datum(1.0, 0.0)]).await;
     let described = ok(&router, "DescribeAlarms", &json!({"AlarmNames": ["forced"]})).await;
     assert_eq!(
@@ -785,9 +787,8 @@ async fn a_forced_state_holds_until_the_next_evaluation_is_due() {
 #[tokio::test]
 async fn ignored_missing_data_maintains_the_state_but_a_datapoint_still_decides_it() {
     let router = build_router();
-    // The shortest period an alarm may be evaluated on, so the span a forced state stands for
-    // is the shortest one there is and the evaluation then runs with the look-back window
-    // holding no datapoint at all.
+    // The shortest period an alarm may be evaluated on, so the evaluation that takes the forced
+    // state back runs with the look-back window holding no datapoint at all.
     let alarm = patched(
         "ignoring",
         &json!({"Period": SHORTEST_PERIOD_SECS, "TreatMissingData": "ignore"}),
@@ -799,8 +800,8 @@ async fn ignored_missing_data_maintains_the_state_but_a_datapoint_still_decides_
         &json!({"AlarmName": "ignoring", "StateValue": "ALARM", "StateReason": "testing"}),
     )
     .await;
-    // One evaluation period of the alarm, the span the forced state stands for.
-    std::thread::sleep(Duration::from_millis(10_500));
+    // Past the span the forced state stands for, so the evaluation has taken the alarm back.
+    wait_for_evaluation();
 
     // "ignore — the current alarm state is maintained": with no datapoint to decide on, the
     // evaluation leaves the alarm in the state it has.

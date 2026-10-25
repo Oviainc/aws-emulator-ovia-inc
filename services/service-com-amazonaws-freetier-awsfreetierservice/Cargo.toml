@@ -8,6 +8,10 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# `response_media_type`: the tree's one statement of the media type a service
+# announces on every response, and the operation-seam wrapper that reaches the
+# framework's refusal tail with it.
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

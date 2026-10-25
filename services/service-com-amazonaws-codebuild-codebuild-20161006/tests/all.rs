@@ -45,6 +45,8 @@ mod refusal_wording;
 mod report_group_lifecycle;
 #[path = "all/report_group_reads.rs"]
 mod report_group_reads;
+#[path = "all/resource_policy.rs"]
+mod resource_policy;
 #[path = "all/retry_build.rs"]
 mod retry_build;
 #[path = "all/sandbox_lifecycle.rs"]

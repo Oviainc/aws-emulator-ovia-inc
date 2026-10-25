@@ -11,6 +11,19 @@
 //! number of simultaneous starts on one definition exactly one creates a run and every
 //! other is refused `ConflictException`.
 //!
+//! That guard is RECORDED behaviour, and it is narrower than the modelled sentence below
+//! ("You can start multiple experiment runs from the same experiment definition") reads
+//! on its own: a definition can be run many times, one run after another, but a start
+//! aimed at a definition whose previous run is still `RUNNING` is refused with
+//! `ConflictException` until that run is stopped. So the sentence is about successive
+//! runs, not concurrent ones.
+//!
+//! The treatment assignments a start carries sit behind a UNION member, which the schema
+//! walk does not descend into, so the constraints the model publishes for them are
+//! enforced in this handler through `crate::state::treatment_overrides_rejection` —
+//! before anything is written, and stated in the same envelope the boundary refusal of a
+//! modelled constraint uses.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -202,6 +215,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // The treatment assignments are checked the same way: the bound the model
+        // publishes for them is enforced before anything is written, so a start that
+        // assigns more entities than an override map may hold creates no run.
+        if let Some(reason) = input
+            .treatment_overrides
+            .as_ref()
+            .and_then(crate::state::treatment_overrides_rejection)
+        {
+            return Err(StartExperimentRunErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(reason),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        }
 
         let now = std::time::SystemTime::now();
         // ONE lock for the whole read-check-write: the active-run check below and the
@@ -226,7 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let Some(application) = store.applications.get_mut(&application_id) else {
+        let Some(application) = store.application_mut(&application_id) else {
             return Err(StartExperimentRunErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some(
@@ -342,6 +372,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         definition.next_run_number = run_number.saturating_add(1);
         definition.status = crate::state::EXPERIMENT_DEFINITION_ACTIVE.to_string();
         definition.updated_at = now;
+
+        // An attribution record for the write, like the one a delete leaves: the ids of
+        // the records this call changed and the number it issued, and nothing the caller
+        // sent — a description, a tag or an assignment belongs in the response, not in a
+        // log.
+        tracing::debug!(
+            operation = "StartExperimentRun",
+            outcome = "started",
+            application_id = definition.application_id.as_str(),
+            experiment_definition_id = definition.id.as_str(),
+            run = run_number,
+            "started an experiment run"
+        );
 
         Ok(output)
     }

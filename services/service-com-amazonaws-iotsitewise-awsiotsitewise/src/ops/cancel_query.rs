@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation records a cancellation on the query the shared engine
+//! store holds under the workspace and id the request names, and reports the status
+//! that cancellation leaves it in; this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +152,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelQuery"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            internal_failure("the IoT SiteWise store is unavailable".to_string())
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // The workspace the path names is resolved FIRST, as every handler in this
+        // crate resolves the resource its path names before the one inside it, so a
+        // request that names neither reports the workspace that is absent.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            ));
+        }
+        let key = crate::state::query_key(&input.workspace_name, &input.query_id);
+        let record = store
+            .queries
+            .get_mut(&key)
+            .ok_or_else(|| not_found(crate::state::RESOURCE_QUERY, &input.query_id))?;
+
+        match record.cancel_requested_at {
+            // A repeat cancel is a no-op that reports the status the query stands
+            // in: the operation is modelled `@idempotent`, so retrying it records
+            // no second cancellation and refuses nothing.
+            Some(_) => {}
+            // "Cancels a running query": the cancellation is RECORDED here, and from
+            // here the query's remaining lifecycle is owed by the clock from the
+            // instant it was recorded — `CANCELING` while the cancel is in flight,
+            // `CANCELED` once it has taken effect — so nothing sleeps and no reader
+            // is told the query is still running.
+            None if record.is_cancelable(now) => record.cancel_requested_at = Some(now),
+            // A query that already reached the terminal status its run earned cannot
+            // be cancelled. This service's other cancel operation documents that
+            // rule for it — a job "already in terminal states … cannot be cancelled;
+            // the operation returns a ConflictingOperationException" — and this one
+            // models the same error.
+            None => {
+                let status = record.status(now);
+                let query_id = record.query_id.clone();
+                return Err(conflict(
+                    format!(
+                        "The query {query_id} is in the {status} status; only a query that \
+                         has not reached a terminal status can be cancelled."
+                    ),
+                    &query_id,
+                    crate::state::query_arn(
+                        &crate::state::request_region(ctx.parts()),
+                        &input.workspace_name,
+                        &query_id,
+                    ),
+                ));
+            }
+        }
+
+        Ok(CancelQueryOutput {
+            query_id: record.query_id.clone(),
+            // "The current query status", derived from the record exactly as every
+            // reader of a query derives it, so this response and a read that follows
+            // it cannot disagree.
+            status: record.status(now).to_string(),
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` for the resource of `kind` the request
+/// named: a workspace this service does not hold, or a query the named workspace
+/// does not hold. A query is addressed within a workspace, so the second is also
+/// what a cancel naming a query of ANOTHER workspace answers.
+fn not_found(kind: &str, identifier: &str) -> CancelQueryError {
+    CancelQueryErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: crate::state::not_found_message(kind, identifier),
+    })
+    .into()
+}
+
+/// HTTP 409 `ConflictingOperationException` naming the query the cancellation
+/// could not be applied to.
+fn conflict(message: String, query_id: &str, query_arn: String) -> CancelQueryError {
+    CancelQueryErrorModeled::ConflictingOperationException(ConflictingOperationException {
+        message,
+        resource_id: query_id.to_string(),
+        resource_arn: query_arn,
+    })
+    .into()
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal_failure(message: String) -> CancelQueryError {
+    CancelQueryErrorModeled::InternalFailureException(InternalFailureException { message }).into()
 }

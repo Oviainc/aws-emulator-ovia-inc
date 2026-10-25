@@ -250,7 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // Resolve every resource the deployment names before anything is written.
-        let Some(application) = store.applications.get(&input.application_id) else {
+        let Some(application) = store.application(&input.application_id) else {
             return Err(not_found(
                 crate::state::application_not_found(&input.application_id),
                 input.application_id,
@@ -304,8 +304,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         let Some(environment) = store
-            .applications
-            .get_mut(&input.application_id)
+            .application_mut(&input.application_id)
             .and_then(|application| application.environments.get_mut(&input.environment_id))
         else {
             return Err(StartDeploymentErrorModeled::InternalServerException(

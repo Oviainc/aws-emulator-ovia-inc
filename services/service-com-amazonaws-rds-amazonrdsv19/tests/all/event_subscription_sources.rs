@@ -38,13 +38,13 @@ use crate::db_instances::{
 };
 
 /// A second region, so the regional scope of a subscription is observable.
-const OTHER_REGION: &str = "eu-west-1";
+pub(crate) const OTHER_REGION: &str = "eu-west-1";
 
 /// The canonical account id every generated emulator presents.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// The SNS topic every subscription below publishes to.
-fn topic_arn(region: &str) -> String {
+pub(crate) fn topic_arn(region: &str) -> String {
     format!("arn:aws:sns:{region}:{ACCOUNT}:rds-events")
 }
 
@@ -53,18 +53,18 @@ const SEEDED_INSTANCES: &[&str] = &["emu-src-instance-a", "emu-src-instance-b"];
 
 /// The DB snapshot the `db-snapshot` row resolves its source against, and the instance it
 /// is taken from.
-const SEEDED_SNAPSHOT: &str = "emu-src-snapshot-a";
+pub(crate) const SEEDED_SNAPSHOT: &str = "emu-src-snapshot-a";
 const SNAPSHOT_SOURCE_INSTANCE: &str = "emu-src-snapshot-instance";
 
 /// The DB cluster the `db-cluster` row resolves its source against.
-const SEEDED_CLUSTER: &str = "emu-src-cluster-a";
+pub(crate) const SEEDED_CLUSTER: &str = "emu-src-cluster-a";
 
 /// The DB parameter group the `db-parameter-group` row resolves its source against.
-const SEEDED_PARAMETER_GROUP: &str = "emu-src-parameter-group-a";
+pub(crate) const SEEDED_PARAMETER_GROUP: &str = "emu-src-parameter-group-a";
 
 /// `CreateEventSubscription` in `region`, optionally naming a source type and the sources
 /// the subscription starts with.
-async fn create_subscription(
+pub(crate) async fn create_subscription(
     router: &MultiServiceRouter,
     region: &str,
     name: &str,
@@ -88,7 +88,7 @@ async fn create_subscription(
 }
 
 /// `AddSourceIdentifierToSubscription` in `region`.
-async fn add_source_in(
+pub(crate) async fn add_source_in(
     router: &MultiServiceRouter,
     region: &str,
     name: &str,
@@ -107,7 +107,7 @@ async fn add_source_in(
 }
 
 /// `AddSourceIdentifierToSubscription` in [`REGION`].
-async fn add_source(
+pub(crate) async fn add_source(
     router: &MultiServiceRouter,
     name: &str,
     source_identifier: &str,
@@ -116,7 +116,7 @@ async fn add_source(
 }
 
 /// The source identifiers `DescribeEventSubscriptions` reports for one subscription.
-async fn described_source_ids(router: &MultiServiceRouter, case: &str, name: &str) -> Vec<String> {
+pub(crate) async fn described_source_ids(router: &MultiServiceRouter, case: &str, name: &str) -> Vec<String> {
     let body = expect_ok(
         case,
         call(
@@ -131,7 +131,7 @@ async fn described_source_ids(router: &MultiServiceRouter, case: &str, name: &st
 
 /// Create the DB instances, DB cluster, DB parameter group and DB snapshot the rows
 /// resolve their sources against.
-async fn seed_sources(router: &MultiServiceRouter) {
+pub(crate) async fn seed_sources(router: &MultiServiceRouter) {
     for identifier in SEEDED_INSTANCES
         .iter()
         .copied()

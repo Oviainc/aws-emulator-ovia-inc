@@ -35,31 +35,31 @@ use crate::web_acl_lifecycle::{create_ip_set, create_web_acl, Waf, TEST_REGION};
 /// wafv2:GetRuleGroup. WAF rejects any extra actions or wildcard actions in the
 /// policy." Spelled out here as literals, independently of the service's own
 /// constants, so these suites pin the catalogue and not merely its reuse.
-const CREATE_WEB_ACL: &str = "wafv2:CreateWebACL";
+pub(crate) const CREATE_WEB_ACL: &str = "wafv2:CreateWebACL";
 /// See [`CREATE_WEB_ACL`].
-const UPDATE_WEB_ACL: &str = "wafv2:UpdateWebACL";
+pub(crate) const UPDATE_WEB_ACL: &str = "wafv2:UpdateWebACL";
 /// See [`CREATE_WEB_ACL`].
-const PUT_FIREWALL_MANAGER_RULE_GROUPS: &str = "wafv2:PutFirewallManagerRuleGroups";
+pub(crate) const PUT_FIREWALL_MANAGER_RULE_GROUPS: &str = "wafv2:PutFirewallManagerRuleGroups";
 /// The one OPTIONAL action. See [`CREATE_WEB_ACL`].
-const GET_RULE_GROUP: &str = "wafv2:GetRuleGroup";
+pub(crate) const GET_RULE_GROUP: &str = "wafv2:GetRuleGroup";
 
 /// The IAM policy language version a permission policy must declare ("The policy
 /// must be composed using IAM Policy version 2012-10-17", the same doc).
-const POLICY_VERSION: &str = "2012-10-17";
+pub(crate) const POLICY_VERSION: &str = "2012-10-17";
 
 /// The account a shared rule group's policy names as its principal.
-const OTHER_ACCOUNT: &str = "arn:aws:iam::222222222222:root";
+pub(crate) const OTHER_ACCOUNT: &str = "arn:aws:iam::222222222222:root";
 
 /// A second account, for a policy naming more than one principal.
 const THIRD_ACCOUNT: &str = "arn:aws:iam::333333333333:root";
 
-/// `WAFInvalidPermissionPolicyException`'s sentence: the one the model documents for
-/// the shape
-/// (`smithy_query(query="shape",shape="WAFInvalidPermissionPolicyException")`) — one
+/// `WAFInvalidPermissionPolicyException`'s sentence, as recorded from WAF — one
 /// sentence for the exception TYPE, carrying nothing of the request, the way the
-/// sibling suite `crate::exception_messages` pins every other WAFv2 exception.
-const INVALID_PERMISSION_POLICY: &str =
-    "The operation failed because the specified policy isn't in the proper format.";
+/// sibling suite `crate::exception_messages` pins every other WAFv2 exception. It is
+/// the wire wording, not the description the shape's documentation trait gives the
+/// error (see `crate::invalid_permission_policy_message`).
+const INVALID_PERMISSION_POLICY: &str = "The policy specification doesn't meet the \
+     requirements to be attached to an AWS WAF resource.";
 
 /// `WAFNonexistentItemException`'s sentence, as recorded from WAF (the wording the
 /// sibling suite `crate::exception_messages` pins for every operation).
@@ -76,7 +76,7 @@ const MISSING_RULE_GROUP_ARN: &str = "arn:aws:wafv2:us-west-2:000000000000:regio
      rulegroup/probe-absent-group/00000000-1111-2222-3333-444444444444";
 
 /// The awsJson error body's message member, whichever casing the shape models.
-fn error_message(body: &Value) -> String {
+pub(crate) fn error_message(body: &Value) -> String {
     body.get("Message")
         .or_else(|| body.get("message"))
         .and_then(Value::as_str)
@@ -85,17 +85,17 @@ fn error_message(body: &Value) -> String {
 }
 
 /// An `Allow` statement granting `actions` to `principal`.
-fn allow(actions: Value, principal: Value) -> Value {
+pub(crate) fn allow(actions: Value, principal: Value) -> Value {
     json!({ "Effect": "Allow", "Principal": principal, "Action": actions })
 }
 
 /// A policy document, rendered the way an SDK caller would hand it over.
-fn policy(statements: Value) -> String {
+pub(crate) fn policy(statements: Value) -> String {
     json!({ "Version": POLICY_VERSION, "Statement": statements }).to_string()
 }
 
 /// The three required actions, in the order the documentation lists them.
-fn required_actions() -> Value {
+pub(crate) fn required_actions() -> Value {
     json!([
         CREATE_WEB_ACL,
         UPDATE_WEB_ACL,

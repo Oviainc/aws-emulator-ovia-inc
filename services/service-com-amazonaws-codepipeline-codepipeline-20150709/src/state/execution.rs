@@ -637,8 +637,10 @@ pub enum Job {
         input: ArtifactRef,
         /// The bucket the object is delivered to.
         bucket: String,
-        /// The key (or, with `extract`, the key prefix) the object is delivered under.
-        key: String,
+        /// The key the archive is delivered under, or — with `extract` — the key prefix
+        /// its entries are delivered beneath, which the declaration may leave out so
+        /// the entries land at the root of the bucket.
+        key: Option<String>,
         /// "Extract file before deploy": every entry of the artifact archive is
         /// delivered under `key` instead of the archive itself.
         extract: bool,

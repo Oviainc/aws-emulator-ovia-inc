@@ -35,6 +35,20 @@ impl AccountUxCustomization {
     pub fn set_visible_regions(&mut self, supplied: Vec<String>) {
         self.visible_regions = Some(canonical_members(supplied));
     }
+
+    /// The `accountColor` this record is REPORTED with: the stored value, or
+    /// [`ACCOUNT_COLOR_NONE`] while the account never configured one — "a value of
+    /// `none` indicates that you have not set a color", so an unconfigured colour
+    /// is a present member carrying that value and never an absent one.
+    ///
+    /// Stated HERE, beside the list settings' own shared rule, because every
+    /// operation that renders a customization record reports the colour — the read
+    /// and the update's echo of the record it just stored — and they must agree:
+    /// the same stored record has to report the same colour whichever call a client
+    /// asks through.
+    pub fn reported_account_color(&self) -> &str {
+        self.account_color.as_deref().unwrap_or(ACCOUNT_COLOR_NONE)
+    }
 }
 
 /// The canonical sequence a list setting (`visibleServices` / `visibleRegions`) is
@@ -86,7 +100,9 @@ pub fn canonical_members(mut supplied: Vec<String>) -> Vec<String> {
 }
 
 /// The wire value `AccountColor` uses for "no color set" — the documented default
-/// `GetAccountCustomizations` reports for an account that never set one.
+/// an account that never set one is reported with, by
+/// [`AccountUxCustomization::reported_account_color`], which is the one place that
+/// rule is applied.
 pub const ACCOUNT_COLOR_NONE: &str = "none";
 
 /// The service identifiers `ListServices` enumerates, in the order the catalog is

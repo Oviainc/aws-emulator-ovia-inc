@@ -171,7 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The application the path names must exist: this call patches a record, it never
         // creates one.
-        let Some(application) = store.applications.get_mut(&input.application_id) else {
+        let Some(application) = store.application_mut(&input.application_id) else {
             return Err(UpdateApplicationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::application_not_found(

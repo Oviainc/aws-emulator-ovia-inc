@@ -676,6 +676,15 @@
 //! order the VPC and volume stores are kept in, so a pagination token can name the id the
 //! next page starts at.
 //!
+//! [`ComAmazonawsEc2Amazonec2State::route_server_associations`] holds the connections
+//! between those route servers and the account's VPCs as
+//! [`RouteServerAssociationRecord`]s, keyed by the (route server, VPC) pair that IS the
+//! association — the modelled [`RouteServerAssociation`] shape carries no id of its own — so
+//! one pair can hold only one association and `GetRouteServerAssociations` reports one route
+//! server's associations in VPC order. The association's `State` is a fact of the record's
+//! age, derived by [`RouteServerAssociationRecord::view_at`] like a route server's own two
+//! states.
+//!
 //! ## Account-level settings
 //!
 //! A setting is not a resource: it has no id, nothing creates or deletes it, and an
@@ -1123,6 +1132,7 @@ use crate::ops::types::{
     DnsEntry, PayerResponsibilityEntry, ProductCode,
     Region, ReplaceRootVolumeTask, RequestLaunchTemplateData, RouteServer, RouteServerBfdStatus,
     RouteServerBgpOptions, RouteServerBgpStatus, RouteServerEndpoint, RouteServerPeer,
+    RouteServerAssociation,
     RunInstancesOutput, SecondaryNetwork,
     SecondaryNetworkIpv4CidrBlockAssociation, SecondarySubnet,
     SecondarySubnetIpv4CidrBlockAssociation, SecurityGroup, ServiceConfiguration,
@@ -2567,6 +2577,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     pub route_server_peers: BTreeMap<String, RouteServerPeer>,
     /// When each route server peer's `pending` -> `available` transition falls due.
     pub route_server_peer_available_at: BTreeMap<String, Instant>,
+    /// Every association between one of the account's route servers and one of its VPCs, by
+    /// the (`RouteServerId`, `VpcId`) pair the association IS — see
+    /// [`RouteServerAssociationRecord`] and the module docs. One entry per pair, because a
+    /// pair is either associated or not; ordered by route server and then by VPC, which is
+    /// the order `GetRouteServerAssociations` reports one route server's associations in.
+    ///
+    /// Starts EMPTY: a route server has no association until `AssociateRouteServer` makes
+    /// one.
+    pub route_server_associations: BTreeMap<(String, String), RouteServerAssociationRecord>,
     /// The account's Allowed AMIs setting in each Region a caller has configured it in, by
     /// Region name — see the module docs. A Region with no entry has the setting an account
     /// that never enabled the feature has ([`AllowedImagesSettings::default`]), so a read
@@ -2974,6 +2993,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             route_server_endpoint_client_tokens: HashMap::new(),
             route_server_peers: BTreeMap::new(),
             route_server_peer_available_at: BTreeMap::new(),
+            route_server_associations: BTreeMap::new(),
             allowed_images_settings: BTreeMap::new(),
             fpga_images: BTreeMap::new(),
             fpga_image_client_tokens: HashMap::new(),
@@ -15053,6 +15073,10 @@ impl ComAmazonawsEc2Amazonec2State {
     /// created in it and the instances still running in it; the default group is NOT one,
     /// because the delete removes it. A carrier gateway of the VPC is one too: it is a
     /// gateway "associated with the VPC", and `DeleteVpc` does not remove it.
+    ///
+    /// A route server ASSOCIATION is not one: a recorded `DeleteVpc` of a VPC a route
+    /// server had been associated with succeeded, so the connection is not something the
+    /// caller has to take away first — [`Self::remove_vpc`] takes it with the VPC instead.
     pub fn vpc_dependencies(&self, vpc_id: &str) -> Vec<String> {
         let mut found: Vec<String> = Vec::new();
         for (subnet_id, subnet) in &self.subnets {
@@ -15191,6 +15215,13 @@ impl ComAmazonawsEc2Amazonec2State {
         for group_id in groups {
             self.remove_security_group(&group_id);
         }
+        // A route server association IS the connection between a route server and THIS VPC
+        // (`RouteServerAssociation`), so it cannot outlive the VPC: it goes here rather than
+        // being left behind for `GetRouteServerAssociations` to report a VPC that no longer
+        // exists. The record holds no caller-supplied bytes, so there is nothing to give
+        // back to the budget.
+        self.route_server_associations
+            .retain(|(_, associated_vpc), _| associated_vpc != vpc_id);
         Some(vpc)
     }
 }
@@ -20204,11 +20235,19 @@ pub fn invalid_route_server_id_malformed<E>(route_server_id: &str) -> Scaffolded
 
 /// Refuse a request that named a route server id no route server of the account has: HTTP
 /// 400 `InvalidRouteServerId.NotFound`.
+///
+/// The resource is named in the message the way EC2 names this resource TYPE —
+/// [`ROUTE_SERVER_TAGGABLE_RESOURCE`], the `route-server` member of the model's
+/// `ResourceType` — which is also how the two route server resources under it are named in
+/// [`invalid_route_server_endpoint_id_not_found`] and
+/// [`invalid_route_server_peer_id_not_found`], so one wording rule covers the family.
 pub fn invalid_route_server_id_not_found<E>(route_server_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_ROUTE_SERVER_ID_NOT_FOUND,
         400,
-        format!("The route server ID '{route_server_id}' does not exist"),
+        format!(
+            "The {ROUTE_SERVER_TAGGABLE_RESOURCE} ID '{route_server_id}' does not exist"
+        ),
     )
 }
 
@@ -24401,23 +24440,151 @@ impl ComAmazonawsEc2Amazonec2State {
 }
 
 /// Refuse a request that named a route server endpoint id no endpoint of the account has:
-/// HTTP 400 `InvalidRouteServerEndpointId.NotFound`.
+/// HTTP 400 `InvalidRouteServerEndpointId.NotFound`, naming the resource type the way EC2
+/// names it ([`RESOURCE_TYPE_ROUTE_SERVER_ENDPOINT`]) — the wording rule
+/// [`invalid_route_server_id_not_found`] records for the whole family.
 pub fn invalid_route_server_endpoint_id_not_found<E>(endpoint_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_ROUTE_SERVER_ENDPOINT_ID_NOT_FOUND,
         400,
-        format!("The route server endpoint ID '{endpoint_id}' does not exist"),
+        format!(
+            "The {RESOURCE_TYPE_ROUTE_SERVER_ENDPOINT} ID '{endpoint_id}' does not exist"
+        ),
     )
 }
 
 /// Refuse a request that named a route server peer id no peer of the account has: HTTP 400
-/// `InvalidRouteServerPeerId.NotFound`.
+/// `InvalidRouteServerPeerId.NotFound`, named the same way
+/// ([`RESOURCE_TYPE_ROUTE_SERVER_PEER`]).
 pub fn invalid_route_server_peer_id_not_found<E>(peer_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_ROUTE_SERVER_PEER_ID_NOT_FOUND,
         400,
-        format!("The route server peer ID '{peer_id}' does not exist"),
+        format!("The {RESOURCE_TYPE_ROUTE_SERVER_PEER} ID '{peer_id}' does not exist"),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Route server associations
+// ---------------------------------------------------------------------------
+
+/// An association that is being established: the `associating` member of
+/// `RouteServerAssociationState`
+/// (`smithy_query(query="shape",shape="RouteServerAssociationState")`).
+pub const ROUTE_SERVER_ASSOCIATION_STATE_ASSOCIATING: &str = "associating";
+
+/// An association that is established: that same enum's `associated` member.
+pub const ROUTE_SERVER_ASSOCIATION_STATE_ASSOCIATED: &str = "associated";
+
+/// One stored route server association: the instant the clock owes it its `associating` ->
+/// `associated` move, and nothing else.
+///
+/// The (route server, VPC) PAIR is the whole identity of an association — "A route server
+/// association is the connection established between a route server and a VPC"
+/// (`RouteServerAssociation`), and the modelled shape carries no association id — so the
+/// pair is the key of [`ComAmazonawsEc2Amazonec2State::route_server_associations`] and is
+/// not repeated on the record. `State` is a fact of the record's age, so
+/// [`RouteServerAssociationRecord::view_at`] derives it on read rather than letting two
+/// writers store two different words for one association.
+///
+/// The record holds NO caller-chosen bytes: both ids name resources the store already
+/// holds and charges for, so an association adds nothing to the store's byte budget —
+/// only to the record count [`ComAmazonawsEc2Amazonec2State::has_route_server_association_capacity`]
+/// bounds.
+#[derive(Debug, Clone)]
+pub struct RouteServerAssociationRecord {
+    /// The instant from which this association's `associating` -> `associated` move is
+    /// due. Monotonic ([`Instant`]) for the reason [`RouteServerRecord::available_at`] is:
+    /// it is only ever compared against the clock, never reported, so a wall-clock
+    /// adjustment cannot move an association back to `associating`.
+    pub associated_at: Instant,
+}
+
+impl RouteServerAssociationRecord {
+    /// The association of `route_server_id` with `vpc_id` as of `now`: the pair it joins,
+    /// with the state the clock has reached. A read observes the move the clock already
+    /// owed without writing anything.
+    pub fn view_at(
+        &self,
+        route_server_id: &str,
+        vpc_id: &str,
+        now: Instant,
+    ) -> RouteServerAssociation {
+        RouteServerAssociation {
+            route_server_id: Some(route_server_id.to_string()),
+            vpc_id: Some(vpc_id.to_string()),
+            state: Some(self.state_at(now).to_string()),
+        }
+    }
+
+    /// The association's `RouteServerAssociationState` at `now`.
+    pub fn state_at(&self, now: Instant) -> &'static str {
+        if now < self.associated_at {
+            ROUTE_SERVER_ASSOCIATION_STATE_ASSOCIATING
+        } else {
+            ROUTE_SERVER_ASSOCIATION_STATE_ASSOCIATED
+        }
+    }
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another route server association fits inside the store's record ceiling
+    /// ([`MAX_ROUTE_SERVER_RECORDS`]) — the same contract as
+    /// [`Self::has_route_server_endpoint_capacity`], asked of its own store so a full
+    /// store of one kind cannot refuse a write of another.
+    pub fn has_route_server_association_capacity(&self) -> bool {
+        self.route_server_associations.len() < MAX_ROUTE_SERVER_RECORDS
+    }
+
+    /// The route server the VPC `vpc_id` is already associated with, or `None` when it has
+    /// no association at all.
+    ///
+    /// The ONE place that question is answered, so an associate and anything else that has
+    /// to know whether a VPC is already served by a route server cannot disagree about it.
+    pub fn route_server_association_of_vpc(&self, vpc_id: &str) -> Option<&str> {
+        self.route_server_associations
+            .keys()
+            .find(|(_, associated_vpc)| associated_vpc == vpc_id)
+            .map(|(route_server_id, _)| route_server_id.as_str())
+    }
+
+    /// Associate `route_server_id` with `vpc_id` from `now`, and answer the association as
+    /// of that instant.
+    ///
+    /// The association is written in the non-terminal `associating` state with the clock
+    /// owing it `associated` one [`TRANSITION_DELAY`] later, the same span every other
+    /// clock-owed move of this crate takes, so a caller reading straight after the write
+    /// still sees `associating`.
+    pub fn insert_route_server_association(
+        &mut self,
+        route_server_id: &str,
+        vpc_id: &str,
+        now: Instant,
+    ) -> RouteServerAssociation {
+        let record = RouteServerAssociationRecord {
+            associated_at: now + TRANSITION_DELAY,
+        };
+        let view = record.view_at(route_server_id, vpc_id, now);
+        self.route_server_associations
+            .insert((route_server_id.to_string(), vpc_id.to_string()), record);
+        view
+    }
+
+    /// Every association of the route server `route_server_id` as of `now`, in `VpcId`
+    /// order — the order the store itself is kept in.
+    pub fn route_server_associations_at(
+        &self,
+        route_server_id: &str,
+        now: Instant,
+    ) -> Vec<RouteServerAssociation> {
+        self.route_server_associations
+            .iter()
+            .filter(|((associated_server, _), _)| associated_server == route_server_id)
+            .map(|((associated_server, vpc_id), record)| {
+                record.view_at(associated_server, vpc_id, now)
+            })
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------

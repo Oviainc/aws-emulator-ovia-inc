@@ -21,8 +21,9 @@
 //! `ListSourceCredentials`) only read them.
 //!
 //! Sharing is its own record: a [`StoredResourcePolicy`] is the resource-based
-//! policy attached to one project or report group, and a project carrying one is
-//! what `ListSharedProjects` reports as shared.
+//! policy attached to one project or report group, written by
+//! `PutResourcePolicy` and read back by `GetResourcePolicy`, and a project
+//! carrying one is what `ListSharedProjects` reports as shared.
 //!
 //! The model shapes themselves are what is stored, so a read hands back exactly
 //! the structure the write persisted rather than a second, drifting copy of the
@@ -382,6 +383,41 @@ pub const SANDBOX_STATUS_STOPPED: &str = "STOPPED";
 /// key on it. Recorded behaviour — the model states no message for the error.
 pub const SANDBOX_NOT_FOUND_MESSAGE: &str = "Sandbox does not exist";
 
+/// What CodeBuild states as the reason a request addresses a build project this
+/// account does not hold, carried by the modelled `ResourceNotFoundException`.
+///
+/// Fixed text, under [`SANDBOX_NOT_FOUND_MESSAGE`]'s rule: it names neither the
+/// project nor an ARN, so the sentence is the same for every request and a client can
+/// key on it. Recorded behaviour — the model states no message for the error — and it
+/// is the sentence recorded for CodeBuild's absent-project refusals, so the sites that
+/// still compose one naming the project's ARN are the ones to migrate onto this
+/// constant, which is tracked as its own wire-fidelity issue rather than done here.
+pub const PROJECT_NOT_FOUND_MESSAGE: &str = "Project does not exist";
+
+/// What CodeBuild states as the reason a request addresses a report group this account
+/// does not hold — the sibling of [`PROJECT_NOT_FOUND_MESSAGE`] for the other resource
+/// kind addressed by ARN alone, and fixed text for the same reason.
+pub const REPORT_GROUP_NOT_FOUND_MESSAGE: &str = "Report group does not exist";
+
+/// What CodeBuild states as the reason no resource-based policy is attached to the ARN
+/// a request names, carried by the modelled `ResourceNotFoundException`.
+///
+/// Fixed text, under [`SANDBOX_NOT_FOUND_MESSAGE`]'s rule: the absent thing is the
+/// POLICY rather than the resource, and the sentence names no ARN.
+pub const RESOURCE_POLICY_NOT_FOUND_MESSAGE: &str = "Resource policy does not exist";
+
+/// What CodeBuild states as the reason a value is not the ARN of a resource it can
+/// attach a resource-based policy to, carried by the modelled `InvalidInputException`.
+///
+/// Fixed text, under [`SANDBOX_NOT_FOUND_MESSAGE`]'s rule: it does not echo the value
+/// the request sent back to the caller.
+pub const INVALID_RESOURCE_ARN_MESSAGE: &str = "Invalid resource ARN";
+
+/// What CodeBuild states as the reason a resource policy is not a policy document,
+/// carried by the modelled `InvalidInputException`. Fixed text, for the same reason
+/// [`INVALID_RESOURCE_ARN_MESSAGE`] is.
+pub const INVALID_POLICY_DOCUMENT_MESSAGE: &str = "Invalid policy document";
+
 /// The outcome of a phase that ran to completion, from `StatusType`.
 const PHASE_SUCCEEDED: &str = "SUCCEEDED";
 
@@ -517,8 +553,8 @@ pub struct ComAmazonawsCodebuildCodebuild20161006State {
     /// Bounded by the resources it describes, so it needs no ceiling of its own
     /// beside [`MAX_PROJECTS`] and [`MAX_REPORT_GROUPS`]: an entry is meaningful
     /// only for an ARN this account holds, so the write that creates one
-    /// (`PutResourcePolicy`, still scaffolded) is where the ARN has to resolve to a
-    /// held project or report group before the entry is stored.
+    /// (`PutResourcePolicy`) resolves the ARN to a held project or report group
+    /// before the entry is stored, and removing that resource removes the entry.
     pub resource_policies: BTreeMap<String, StoredResourcePolicy>,
     /// Imported source-repository credentials, keyed by the `ServerType` they
     /// were imported for.
@@ -664,6 +700,65 @@ pub struct StoredResourcePolicy {
     /// Epoch millis the policy was last written at, kept as the integer a list
     /// operation sorts on — the way [`StoredProject`]'s stamps are.
     pub last_modified_millis: i64,
+}
+
+/// The kind of resource a resource-based policy may be attached to: `PutResourcePolicy`
+/// "Stores a resource policy for the ARN of a Project or ReportGroup object", so those
+/// two are the whole set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyTarget {
+    /// A build project, `arn:<partition>:codebuild:<region>:<account>:project/<name>`.
+    Project,
+    /// A report group,
+    /// `arn:<partition>:codebuild:<region>:<account>:report-group/<name>`.
+    ReportGroup,
+}
+
+impl PolicyTarget {
+    /// The kind of resource `arn` names, or `None` when the value is not the ARN of a
+    /// resource of this service a policy can be attached to at all.
+    ///
+    /// The SYNTAX question only, the way [`project_name_from_arn`] and
+    /// [`report_group_name_from_arn`] answer it — whether this account holds the
+    /// resource is
+    /// [`ComAmazonawsCodebuildCodebuild20161006State::holds_policy_target`].
+    pub fn of_arn(arn: &str) -> Option<Self> {
+        if project_name_from_arn(arn).is_some() {
+            return Some(Self::Project);
+        }
+        report_group_name_from_arn(arn).is_some().then_some(Self::ReportGroup)
+    }
+
+    /// What CodeBuild states as the reason this account holds no such resource.
+    pub fn absent_message(self) -> &'static str {
+        match self {
+            Self::Project => PROJECT_NOT_FOUND_MESSAGE,
+            Self::ReportGroup => REPORT_GROUP_NOT_FOUND_MESSAGE,
+        }
+    }
+}
+
+/// Whether `document` is a JSON-formatted policy document.
+///
+/// `PutResourcePolicyInput$policy` is "A JSON-formatted resource policy", and a policy
+/// document is a JSON OBJECT (its `Version` and `Statement` members), so a document
+/// that does not parse, or parses to anything else, is not one. Parsed with
+/// `serde_json`, already a dependency of this crate; the document itself is stored
+/// verbatim rather than re-serialized, so a reader hands back exactly the text the
+/// caller wrote.
+///
+/// Deliberately the JSON question and not the policy GRAMMAR: no member of the
+/// document is modelled, so which statement members a grant must carry, and which
+/// actions and principals CodeBuild accepts in one, is text this emulator would have
+/// to invent a refusal for. Taking a syntactically valid object that grants nothing is
+/// the honest answer here — the document is reported back exactly as given, so a caller
+/// can still see what it stored — while anything that is not a JSON document at all is
+/// refused.
+pub fn is_policy_document(document: &str) -> bool {
+    matches!(
+        ::serde_json::from_str::<::serde_json::Value>(document),
+        Ok(::serde_json::Value::Object(_))
+    )
 }
 
 /// One set of imported source-repository credentials.
@@ -1067,6 +1162,44 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
             IDEMPOTENCY_TOKEN_TTL_MILLIS,
             MAX_IDEMPOTENCY_TOKENS,
         );
+    }
+
+    /// Whether this account holds the project or report group `arn` names — the
+    /// resources a resource-based policy is attached to.
+    ///
+    /// Resolved the way every other ARN-addressed record of this service is: the
+    /// name comes out of the ARN's resource segment for the map lookup, and the
+    /// candidate is kept only if its STORED ARN is exactly the one asked for, so
+    /// an ARN for another partition, region, account or resource type can never
+    /// resolve to a local resource.
+    pub fn holds_policy_target(&self, arn: &str) -> bool {
+        match PolicyTarget::of_arn(arn) {
+            Some(PolicyTarget::Project) => project_name_from_arn(arn).is_some_and(|name| {
+                self.projects
+                    .get(name)
+                    .is_some_and(|stored| stored.project.arn.as_deref() == Some(arn))
+            }),
+            Some(PolicyTarget::ReportGroup) => self.report_group_by_arn(arn).is_some(),
+            None => false,
+        }
+    }
+
+    /// Drop the build project `name` identifies, reporting whether this account
+    /// held one.
+    ///
+    /// The resource-based policy attached to that project goes with it, for the
+    /// reason [`Self::remove_report_group_by_arn`] drops a report group's: a
+    /// [`StoredResourcePolicy`] is meaningful only for a resource this account
+    /// holds, so leaving one behind would hand a later project of the same name —
+    /// which is a project of the same ARN — a grant nobody wrote for it.
+    pub fn remove_project(&mut self, name: &str) -> bool {
+        let Some(stored) = self.projects.remove(name) else {
+            return false;
+        };
+        if let Some(arn) = stored.project.arn.as_deref() {
+            self.resource_policies.remove(arn);
+        }
+        true
     }
 
     /// The report group `arn` names, if this account holds it.
@@ -2099,8 +2232,13 @@ pub enum AuditOutcome {
     ProjectCreated,
     /// A build project's settings were changed and stored.
     ProjectUpdated,
+    /// A build project was removed from the store, with the resource-based policy
+    /// attached to it.
+    ProjectDeleted,
     /// No resource of that name exists (400 `ResourceNotFoundException`).
     NotFound,
+    /// A resource-based policy was stored against a resource's ARN.
+    ResourcePolicyStored,
 }
 
 impl AuditOutcome {
@@ -2115,7 +2253,9 @@ impl AuditOutcome {
             Self::QuotaExceeded => "quota-exceeded",
             Self::ProjectCreated => "project-created",
             Self::ProjectUpdated => "project-updated",
+            Self::ProjectDeleted => "project-deleted",
             Self::NotFound => "not-found",
+            Self::ResourcePolicyStored => "resource-policy-stored",
         }
     }
 }

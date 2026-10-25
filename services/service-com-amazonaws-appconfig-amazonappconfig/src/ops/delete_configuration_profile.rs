@@ -196,7 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolved first and whichever level is missing is the resource the 404 names —
         // the same order `GetConfigurationProfile` and `UpdateConfigurationProfile`
         // resolve this path in.
-        let Some(application) = store.applications.get_mut(&input.application_id) else {
+        let Some(application) = store.application_mut(&input.application_id) else {
             return Err(DeleteConfigurationProfileErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::application_not_found(&input.application_id)),
