@@ -3421,19 +3421,9 @@ impl Interpreter<'_> {
                     },
                     started_at: at,
                     stopped_at: end,
-                    max_concurrency: if plan.concurrency == 0 {
-                        // `MaxConcurrency`'s own default is `0`, which the Amazon
-                        // States Language defines as NO limit, and a Map Run reports
-                        // its limit through a modelled integer: an unlimited Map Run
-                        // therefore reports the largest value that integer carries,
-                        // rather than a `0` a client would read as "none at a time".
-                        // RECORDED: `DescribeMapRun` on a `Map` state that declares
-                        // no `MaxConcurrency` answers `2147483647`
-                        // (`sfn.describe-map-run-default-fields-and-execution-counts`).
-                        i32::MAX
-                    } else {
-                        i32::try_from(plan.concurrency).unwrap_or(i32::MAX)
-                    },
+                    max_concurrency: super::reported_max_concurrency(
+                        i64::try_from(plan.concurrency).unwrap_or(i64::MAX),
+                    ),
                     tolerated_failure_count: i64::try_from(plan.tolerated_count)
                         .unwrap_or(i64::MAX),
                     tolerated_failure_percentage: plan.tolerated_percentage as f32,
@@ -3614,11 +3604,12 @@ impl Interpreter<'_> {
         if failures == 0 {
             return (Ok(Value::Array(results)), at);
         }
-        let total = plan.items.len() as f64;
-        let within_count = failures <= plan.tolerated_count;
-        let within_percentage = plan.tolerated_percentage > 0.0
-            && (failures as f64) * 100.0 <= plan.tolerated_percentage * total;
-        if within_count || within_percentage {
+        if super::within_tolerated_failures(
+            i64::try_from(failures).unwrap_or(i64::MAX),
+            i64::try_from(plan.items.len()).unwrap_or(i64::MAX),
+            i64::try_from(plan.tolerated_count).unwrap_or(i64::MAX),
+            plan.tolerated_percentage,
+        ) {
             return (Ok(Value::Array(results)), at);
         }
         // A Distributed Map reports its own tolerated-failure error; an inline Map

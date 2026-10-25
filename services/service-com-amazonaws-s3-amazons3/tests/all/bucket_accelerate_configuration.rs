@@ -29,6 +29,7 @@
 
 use std::sync::Arc;
 
+use service_com_amazonaws_s3_amazons3::state::MALFORMED_XML_MESSAGE;
 use service_com_amazonaws_s3_amazons3::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -230,22 +231,57 @@ async fn an_accelerate_payload_naming_no_settable_state_is_refused() {
     // Payloads that name no state the service can set, differing in HOW: an empty
     // container, a status just outside the published pair, one differing from a published
     // value only in case (the enum's values are exact), and the empty string.
-    let refused: &[(&str, String)] = &[
-        ("an empty container", payload(None)),
+    //
+    // The third column is the error code this OPERATION owns: the container naming no
+    // state at all is the row the handler judges, and it is answered the code S3 answers
+    // a document that does not validate against its published schema with. A value
+    // outside the enum never reaches the handler — the boundary validator refuses it, and
+    // this operation does not reword that refusal — so those rows pin only the 400 and
+    // that nothing was recorded.
+    let refused: &[(&str, String, Option<&str>)] = &[
+        ("an empty container", payload(None), Some("MalformedXML")),
         (
             "a Status outside the published pair",
             payload(Some("Paused")),
+            None,
         ),
-        ("a Status differing only in case", payload(Some("enabled"))),
-        ("a Status that is the empty string", payload(Some(""))),
+        (
+            "a Status differing only in case",
+            payload(Some("enabled")),
+            None,
+        ),
+        (
+            "a Status that is the empty string",
+            payload(Some("")),
+            None,
+        ),
     ];
-    for (label, body) in refused {
+    for (label, body, code) in refused {
         let answer = send(&router, "PUT", &format!("/{bucket}?accelerate"), body, &[]).await;
         assert_eq!(
             answer.status, 400,
             "case {label:?}: expected HTTP 400, got {} with body {}",
             answer.status, answer.body
         );
+
+        if let Some(code) = code {
+            assert_eq!(
+                answer.error_code(),
+                *code,
+                "case {label:?}: expected {code}, got {:?}",
+                answer.error_code()
+            );
+            // That code's own FIXED published sentence, whole and alone: it says the
+            // document did not validate against the published schema, and that schema is
+            // the same for every document, so the message carries nothing about this
+            // request.
+            assert_eq!(
+                answer.element("Message").as_deref(),
+                Some(MALFORMED_XML_MESSAGE),
+                "case {label:?}: expected the published MalformedXML sentence, got {:?}",
+                answer.element("Message")
+            );
+        }
 
         // And nothing was recorded: the baseline state is still what a read reports.
         let read = send(&router, "GET", &format!("/{bucket}?accelerate"), "", &[]).await;

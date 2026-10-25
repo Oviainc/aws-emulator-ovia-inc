@@ -466,8 +466,16 @@ pub struct InstanceRecord {
     pub owner_account_id: String,
     /// The registration the instance's users were resolved through, when one is known.
     pub identity_provider: Option<IdentityProvider>,
-    /// When the instance's status was last checked, if it ever was. A status check is
-    /// work this service performs, so a read never invents one.
+    /// When this service last checked the instance's status — the instant the write that
+    /// brought the instance into the view established the status reported above.
+    ///
+    /// The status is not taken from any request: it is what this service established about
+    /// the instance, and establishing it is the check. So the writer that brings an
+    /// instance into the view records when it ran
+    /// ([`refresh_instance_view`](ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::refresh_instance_view)),
+    /// a read reports that instant unchanged rather than checking (or inventing) one of its
+    /// own, and a later write about what the instance PROVIDES leaves it alone. `None` only
+    /// for a record written by something other than that writer.
     pub last_status_check_at: Option<SystemTime>,
 }
 
@@ -839,12 +847,12 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         // above is one of the two routes a registration leaves the store by, and both
         // enforce that the same way.
         for key in &dropped_keys {
-            self.drop_instance_users_orphaned_by(key);
+            self.drop_instance_users_orphaned_by(key, now);
         }
         // The views those drops changed are recomputed ONCE for the whole sweep, not once
         // per dropped registration, and not at all when the sweep dropped nothing.
         if dropped {
-            self.refresh_every_instance_view();
+            self.refresh_every_instance_view(now);
         }
         self.pending_transition_due_at = next;
 
@@ -853,7 +861,7 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         // one to finish takes its instance out of this service's view. Dropped in ONE
         // batch, so however many fell due together the work stays linear in what the
         // store holds.
-        self.drop_instance_users(&torn_down);
+        self.drop_instance_users(&torn_down, now);
     }
 
     /// Record that a stored resource owes the clock a status transition at `due_at`.
@@ -1027,9 +1035,13 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// [`begin_instance_user_disassociation`](Self::begin_instance_user_disassociation)
     /// instead, so the non-terminal status it answers with stays observable until the
     /// teardown the clock owes completes.
-    pub fn remove_instance_user(&mut self, arn: &str) -> Option<InstanceUserRecord> {
+    pub fn remove_instance_user(
+        &mut self,
+        arn: &str,
+        now: SystemTime,
+    ) -> Option<InstanceUserRecord> {
         let record = self.instance_users.get(arn)?.clone();
-        self.drop_instance_users(std::slice::from_ref(&record.arn));
+        self.drop_instance_users(std::slice::from_ref(&record.arn), now);
         Some(record)
     }
 
@@ -1042,7 +1054,7 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// precomputed registration map. So a request that finds several teardowns due pays
     /// the associations and the registrations once each rather than a product of the two
     /// with the service-state lock held.
-    fn drop_instance_users(&mut self, arns: &[String]) {
+    fn drop_instance_users(&mut self, arns: &[String], now: SystemTime) {
         let mut dropped: HashSet<String> = HashSet::new();
         let mut affected: Vec<String> = Vec::new();
         for arn in arns {
@@ -1077,7 +1089,7 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         let products_by_key = self.products_by_provider_key();
         for instance_id in affected {
             let naming = self.associations_naming(&instance_id);
-            self.apply_instance_view(&instance_id, &naming, &products_by_key);
+            self.apply_instance_view(&instance_id, &naming, &products_by_key, now);
         }
     }
 
@@ -1098,7 +1110,7 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// A directory that still has a live registration for ANY product keeps its
     /// associations: an association names a directory and no product, so it outlives the
     /// deregistration of any one product for that directory.
-    fn drop_instance_users_orphaned_by(&mut self, key: &str) {
+    fn drop_instance_users_orphaned_by(&mut self, key: &str, now: SystemTime) {
         if self.provider_key_is_registered(key) {
             return;
         }
@@ -1111,7 +1123,7 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             .collect();
         // ONE batched drop however many associations the directory held, so a directory
         // with many users does not cost a rebuild of the association order per user.
-        self.drop_instance_users(&orphaned);
+        self.drop_instance_users(&orphaned, now);
     }
 
     /// Accept the disassociation of one user association: it enters `DISASSOCIATING` now
@@ -1326,13 +1338,18 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// for a directory changes those views exactly as one leaving that set does. One writer
     /// owns the whole write, so no handler can store a registration and leave an instance
     /// reporting products the state no longer implies.
-    pub fn insert_identity_provider(&mut self, key: String, record: IdentityProviderRecord) {
+    pub fn insert_identity_provider(
+        &mut self,
+        key: String,
+        record: IdentityProviderRecord,
+        now: SystemTime,
+    ) {
         let arn = record.arn.clone();
         let product = record.product.clone();
         self.identity_providers.insert(arn.clone(), record);
         self.identity_provider_order.push(arn.clone());
         self.identity_provider_index.insert((key.clone(), product), arn);
-        self.refresh_instance_views_through(&key);
+        self.refresh_instance_views_through(&key, now);
     }
 
     /// Recompute the view of every instance whose user associations resolve through the
@@ -1349,7 +1366,7 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// ([`associations_naming`](Self::associations_naming)). This runs with the
     /// service-state lock held, so one request must not buy work that multiplies with the
     /// store.
-    fn refresh_instance_views_through(&mut self, key: &str) {
+    fn refresh_instance_views_through(&mut self, key: &str, now: SystemTime) {
         let affected: HashSet<String> = self
             .instance_user_order
             .iter()
@@ -1363,7 +1380,7 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         let products_by_key = self.products_by_provider_key();
         for instance_id in affected {
             let naming = self.associations_naming(&instance_id);
-            self.apply_instance_view(&instance_id, &naming, &products_by_key);
+            self.apply_instance_view(&instance_id, &naming, &products_by_key, now);
         }
     }
 
@@ -1412,7 +1429,8 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// DIRECTORIES are registered for (`AssociateUser` carries no `Product`, so they are
     /// read from the registrations rather than taken from the request), so a product stops
     /// being reported as soon as the last association or registration behind it is gone.
-    /// Nothing else is recorded: no status check has been performed, so none is reported.
+    /// An instance this brings INTO the view has its status established here, which is the
+    /// status check `now` is recorded as — see [`InstanceRecord::last_status_check_at`].
     ///
     /// Every write that can change what an instance provides runs this, so no read has to
     /// (and no read does): an association created or removed refreshes the instance it
@@ -1429,10 +1447,10 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// ONE pass over the associations that name the instance and ONE over the
     /// registrations: this runs with the service-state lock held, so the work it costs must
     /// not multiply with how much the store holds beyond the lists it has to read.
-    pub fn refresh_instance_view(&mut self, instance_id: &str) {
+    pub fn refresh_instance_view(&mut self, instance_id: &str, now: SystemTime) {
         let products_by_key = self.products_by_provider_key();
         let naming = self.associations_naming(instance_id);
-        self.apply_instance_view(instance_id, &naming, &products_by_key);
+        self.apply_instance_view(instance_id, &naming, &products_by_key, now);
     }
 
     /// The associations naming `instance_id`, in association order.
@@ -1460,11 +1478,11 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// of each instance (through the reverse index) and the instances — rather than
     /// re-reading two of them per instance: this runs with the service-state lock held, so
     /// one request must not be able to buy work that multiplies with the whole store.
-    pub fn refresh_every_instance_view(&mut self) {
+    pub fn refresh_every_instance_view(&mut self, now: SystemTime) {
         let products_by_key = self.products_by_provider_key();
         for instance_id in self.instance_order.clone() {
             let naming = self.associations_naming(&instance_id);
-            self.apply_instance_view(&instance_id, &naming, &products_by_key);
+            self.apply_instance_view(&instance_id, &naming, &products_by_key, now);
         }
     }
 
@@ -1495,11 +1513,20 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     ///
     /// The one place an [`InstanceRecord`] is built, so the single-instance and the
     /// whole-store refresh above cannot disagree about what the view says.
+    ///
+    /// Bringing an instance INTO the view is what establishes the status reported for it,
+    /// and establishing it is the status check: an instance that is not in the view yet is
+    /// checked at `now`, and that instant is what every later read reports
+    /// ([`InstanceRecord::last_status_check_at`]). Recomputing what an instance already in
+    /// the view PROVIDES reads the registrations behind it, which says nothing new about
+    /// the instance itself, so the recorded instant stands rather than being re-stamped by
+    /// a write about something else.
     fn apply_instance_view(
         &mut self,
         instance_id: &str,
         naming: &[InstanceUserRecord],
         products_by_key: &HashMap<String, Vec<String>>,
+        now: SystemTime,
     ) {
         let Some(first) = naming.first() else {
             self.remove_instance(instance_id);
@@ -1518,11 +1545,14 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
                 }
             }
         }
+        let identity_provider = Some(first.identity_provider.clone());
+        // The instance's status was checked when it entered the view; a recompute of what
+        // it provides is not another check, so the recorded instant is kept.
         let last_status_check_at = self
             .instances
             .get(instance_id)
-            .and_then(|record| record.last_status_check_at);
-        let identity_provider = Some(first.identity_provider.clone());
+            .and_then(|record| record.last_status_check_at)
+            .or(Some(now));
         self.upsert_instance(InstanceRecord {
             instance_id: instance_id.to_string(),
             status: STATUS_ACTIVE.to_string(),
@@ -1783,11 +1813,11 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         // registration it had: nothing is associated through a directory this service no
         // longer integrates with.
         if let Ok(key) = provider_key(&deregistering.identity_provider) {
-            self.drop_instance_users_orphaned_by(&key);
+            self.drop_instance_users_orphaned_by(&key, now);
         }
         // Which products the instances in view provide is read from the LIVE
         // registrations, so a registration leaving that set changes those views.
-        self.refresh_every_instance_view();
+        self.refresh_every_instance_view(now);
         self.tags.remove(arn);
         // The removal the clock now owes.
         self.schedule_transition(due_at);
@@ -1804,16 +1834,20 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// instead, so the `DEREGISTERING` status the operation answers stays observable.
     /// Anything still hanging off the registration goes with it, so no product user
     /// outlives the provider it was subscribed through however the drop was reached.
-    pub fn remove_identity_provider(&mut self, arn: &str) -> Option<IdentityProviderRecord> {
+    pub fn remove_identity_provider(
+        &mut self,
+        arn: &str,
+        now: SystemTime,
+    ) -> Option<IdentityProviderRecord> {
         let record = self.drop_identity_provider(arn)?;
         // No association outlives the last live registration of its directory, however the
         // registration's removal was reached.
         if let Ok(key) = provider_key(&record.identity_provider) {
-            self.drop_instance_users_orphaned_by(&key);
+            self.drop_instance_users_orphaned_by(&key, now);
         }
         // Which products the instances in view provide is read from the registrations, so
         // removing one changes those views.
-        self.refresh_every_instance_view();
+        self.refresh_every_instance_view(now);
         Some(record)
     }
 

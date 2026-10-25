@@ -294,7 +294,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.schedule_transition(record.associated_due_at);
         // The association is also how an instance enters this service's view, which is
         // what `ListInstances` reports (see `crate::state::InstanceRecord`).
-        state.refresh_instance_view(&record.instance_id);
+        state.refresh_instance_view(&record.instance_id, now);
 
         Ok(AssociateUserOutput {
             instance_user_summary: crate::state::instance_user_summary(&record),

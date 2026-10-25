@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelMessageMoveTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelMessageMoveTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation stops the message movement task a handle names: the
+//! messages it has not delivered yet go back to its source queue, the ones it has
+//! already delivered stay in the destination queue, and it answers with how many of them
+//! had been moved. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelMessageMoveTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What cancelling changes in [`crate::state`]
+//!
+//! `StartMessageMoveTask` takes its messages when it starts and schedules each one's
+//! delivery in the destination queue, so the messages a cancellation stops are the ones
+//! whose delivery slot is still ahead: they are taken out of the destination queue and
+//! put back in the source queue, and the cancellation instant is recorded on the task
+//! record, so every later reader projects the same status and the same progress from it.
+//! A handle no recorded task answers to, and a task whose status is not running, are
+//! refused.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +87,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state as sqs;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -155,18 +162,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelMessageMoveTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelMessageMoveTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelMessageMoveTask"))
+        // Request metadata this call records: the access key id identifies the caller in
+        // the audit record below, the way the real service's trail does.
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+
+        let store = sqs::service_state(&*self.engine).ok_or_else(|| {
+            CancelMessageMoveTaskErrorModeled::UnsupportedOperation(sqs::store_unavailable())
+        })?;
+        let mut state = store.lock();
+
+        let now = SystemTime::now();
+        // Retention lapses, visibility timeouts and the deliveries a task's schedule has
+        // already reached are owed by the CLOCK, not by this call: what a task still owes
+        // is what is left once everything already due has been applied.
+        state.materialise_due(now);
+
+        // "One or more specified resources don't exist" (`ResourceNotFoundException`): a
+        // handle no recorded task answers to names no message movement task. The service
+        // words this one for the task rather than for the parameter, so it does not go
+        // through the shared `SourceArn`/`DestinationArn` wording.
+        let Some(task) = state.message_move_task(&input.task_handle) else {
+            return Err(CancelMessageMoveTaskErrorModeled::ResourceNotFoundException(
+                sqs::unknown_message_move_task(),
+            )
+            .into());
+        };
+
+        // "A message movement can only be cancelled when the current status is RUNNING":
+        // a task that has delivered everything it took, or that an earlier call already
+        // cancelled, has nothing left to stop.
+        let status = task.status(now);
+        if status != sqs::MESSAGE_MOVE_RUNNING {
+            return Err(CancelMessageMoveTaskErrorModeled::UnsupportedOperation(
+                UnsupportedOperation {
+                    message: Some(format!(
+                        "The message movement task that you specified for the TaskHandle \
+                         parameter is {status}; a message movement can only be cancelled when \
+                         the current status is {}.",
+                        sqs::MESSAGE_MOVE_RUNNING
+                    )),
+                },
+            )
+            .into());
+        }
+        let source_queue = task.source_queue_name.clone();
+        let destination_queue = task.destination_queue_name.clone();
+
+        // "Cancelling a message movement task does not revert the messages that have
+        // already been moved. It can only stop the messages that have not been moved
+        // yet." The count answered is the task's own progress, the same projection
+        // `ListMessageMoveTasks` reports for it.
+        let moved = state
+            .cancel_message_move_task(&input.task_handle, now)
+            .ok_or_else(|| {
+                CancelMessageMoveTaskErrorModeled::ResourceNotFoundException(
+                    sqs::unknown_message_move_task(),
+                )
+            })?;
+
+        // The audit record for a state change: who, what, where, outcome. No secret and
+        // no credential material — only the access key id and the queues the task names.
+        ::tracing::info!(
+            operation = "CancelMessageMoveTask",
+            akid = %akid,
+            source_queue = %source_queue,
+            destination_queue = %destination_queue,
+            messages_moved = moved,
+            outcome = "cancelled",
+            "message movement task cancelled"
+        );
+
+        Ok(CancelMessageMoveTaskOutput {
+            approximate_number_of_messages_moved: i64::try_from(moved).unwrap_or(i64::MAX),
+        })
     }
 }

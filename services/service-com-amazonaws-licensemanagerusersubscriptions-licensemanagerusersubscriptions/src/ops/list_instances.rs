@@ -9,7 +9,10 @@
 //! An instance is not created by an API of this service: it enters the store through the
 //! user-association plane (`AssociateUser` names the `InstanceId` a user is associated
 //! with), so this operation only REPORTS the instances held in state and invents no
-//! instance, status or status-check date of its own. A store that holds no instance
+//! instance or status of its own. `LastStatusCheckDate` is the instant the write that
+//! brought the instance into the view established its status
+//! ([`crate::state::InstanceRecord::last_status_check_at`]), reported as that writer
+//! recorded it: this call checks no status. A store that holds no instance
 //! answers 200 with an empty `InstanceSummaries` — what AWS answers for an account whose
 //! instances provide no user-based subscriptions.
 //!

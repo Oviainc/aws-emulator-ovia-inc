@@ -391,7 +391,7 @@ async fn an_arn_naming_no_host_is_refused_as_absent_and_writes_nothing() {
         // recorded wire answer of the live service for this call is HTTP 400 (corpus
         // `simparity-wire-aws-v1`, fixture
         // `codestar-connections-host-error-paths#task#3`), which is the status a client
-        // branches on; see `HOST_NOT_FOUND_STATUS` in `src/ops/delete_host.rs`.
+        // branches on; see `RESOURCE_NOT_FOUND_STATUS` in `src/state.rs`.
         assert_eq!(
             status, 400,
             "case {case:?}: expected 400 for an ARN naming no host, got {status} {response:?}"

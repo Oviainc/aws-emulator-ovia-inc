@@ -859,3 +859,124 @@ async fn the_command_execution_store_is_bounded_at_its_growth_site() {
         "eviction must prune the per-sandbox index too, got {indexed}"
     );
 }
+
+/// RULE: `ListCommandExecutionsForSandbox` reports the executions recorded against the
+/// sandbox the request names — by sandbox id or sandbox ARN — in the order
+/// `sortOrder` asks for (newest first unless `ASCENDING` is asked for, the default the
+/// sibling `ListBuildsForProject$sortOrder` documents), a page at a time, and an
+/// execution of another sandbox is never reported under this one.
+#[tokio::test]
+async fn list_command_executions_for_sandbox_pages_the_sandboxs_own_executions() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(Arc::clone(&engine));
+    let (sandbox, sandbox_arn) =
+        seed_sandbox(&engine, "cmd-list", "cmd-list:0001", SeededSandbox::Running);
+    let (other, _) = seed_sandbox(&engine, "cmd-list", "cmd-list:0002", SeededSandbox::Running);
+
+    // Submitted oldest first, which is the order the per-sandbox index keeps.
+    let mut submitted = Vec::new();
+    for command in ["echo one", "echo two", "echo three"] {
+        submitted.push(text(
+            &start_command_execution(&router, &sandbox, command).await,
+            "id",
+        ));
+    }
+    let elsewhere = text(
+        &start_command_execution(&router, &other, "echo elsewhere").await,
+        "id",
+    );
+    let newest_first: Vec<String> = submitted.iter().rev().cloned().collect();
+
+    // (case, the request, the ids expected back in order)
+    let cases: Vec<(&str, Value, Vec<String>)> = vec![
+        (
+            "no sortOrder: newest first",
+            json!({"sandboxId": sandbox}),
+            newest_first.clone(),
+        ),
+        (
+            "ASCENDING: oldest first",
+            json!({"sandboxId": sandbox, "sortOrder": "ASCENDING"}),
+            submitted.clone(),
+        ),
+        (
+            "DESCENDING: newest first",
+            json!({"sandboxId": sandbox, "sortOrder": "DESCENDING"}),
+            newest_first.clone(),
+        ),
+        (
+            "the sandbox named by its ARN",
+            json!({"sandboxId": sandbox_arn, "sortOrder": "ASCENDING"}),
+            submitted.clone(),
+        ),
+        (
+            "one per page",
+            json!({"sandboxId": sandbox, "sortOrder": "ASCENDING", "maxResults": 1}),
+            submitted[..1].to_vec(),
+        ),
+        (
+            "two per page",
+            json!({"sandboxId": sandbox, "sortOrder": "ASCENDING", "maxResults": 2}),
+            submitted[..2].to_vec(),
+        ),
+        (
+            "the other sandbox reports only its own",
+            json!({"sandboxId": other}),
+            vec![elsewhere.clone()],
+        ),
+        (
+            "a sandbox nothing was submitted to",
+            json!({"sandboxId": "cmd-list:nothing"}),
+            vec![],
+        ),
+    ];
+
+    for (case, request, expected) in cases {
+        let (status, body) = call(&router, "ListCommandExecutionsForSandbox", request).await;
+        assert_eq!(status, 200, "{case}: expected 200, got {status} with {body}");
+        let reported: Vec<String> = body["commandExecutions"]
+            .as_array()
+            .expect("a commandExecutions list")
+            .iter()
+            .map(|execution| text(execution, "id"))
+            .collect();
+        assert_eq!(
+            reported, expected,
+            "{case}: expected {expected:?}, got {reported:?}"
+        );
+    }
+
+    // The page token walks the rest of the listing and stops: every execution is
+    // reported exactly once, in order, and the last page carries no token.
+    let mut walked = Vec::new();
+    let mut token = Value::Null;
+    loop {
+        let mut request = json!({
+            "sandboxId": sandbox,
+            "sortOrder": "ASCENDING",
+            "maxResults": 2,
+        });
+        if let (Value::Object(members), Value::String(_)) = (&mut request, &token) {
+            members.insert("nextToken".to_string(), token.clone());
+        }
+        let (status, body) = call(&router, "ListCommandExecutionsForSandbox", request).await;
+        assert_eq!(
+            status, 200,
+            "paging: expected 200, got {status} with {body}"
+        );
+        for execution in body["commandExecutions"]
+            .as_array()
+            .expect("a commandExecutions list")
+        {
+            walked.push(text(execution, "id"));
+        }
+        token = body["nextToken"].clone();
+        if !token.is_string() {
+            break;
+        }
+    }
+    assert_eq!(
+        walked, submitted,
+        "paging must walk every execution once, in order, got {walked:?}"
+    );
+}
