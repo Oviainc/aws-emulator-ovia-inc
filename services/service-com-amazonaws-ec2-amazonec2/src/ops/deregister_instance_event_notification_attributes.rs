@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeregisterInstanceEventNotificationAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeregisterInstanceEventNotificationAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeregisterInstanceEventNotificationAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deregisters tag keys from the scheduled event notification registration of the Region
+//! the request was signed for, in this service's state
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::instance_event_tag_registrations`]) —
+//! the one record this operation, `RegisterInstanceEventNotificationAttributes` and
+//! `DescribeInstanceEventNotificationAttributes` all read and write.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +133,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeregisterInstanceEventNotificationAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeregisterInstanceEventNotificationAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeregisterInstanceEventNotificationAttributes"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            dry_run_operation, request_region, require_service_state, validate_tag_key,
+            InstanceEventTagRegistration,
+        };
+
+        let attribute = &input.instance_tag_attribute;
+        let requested_keys = attribute.instance_tag_keys.as_deref().unwrap_or_default();
+        // "Indicates whether to deregister all tag keys in the current Region. Specify
+        // `false` to deregister all tag keys"
+        // (`DeregisterInstanceTagAttributeRequest$IncludeAllTagsOfInstance`): `false` is the
+        // value that asks for something here, the mirror of the register's `true`.
+        let deregister_all = attribute.include_all_tags_of_instance == Some(false);
+
+        // "You can either specify individual tag keys or deregister all tag keys in the
+        // current Region. You must specify either IncludeAllTagsOfInstance or
+        // InstanceTagKeys in the request" (`DeregisterInstanceTagAttributeRequest`): the two
+        // are alternatives, so a request carrying the flag AT ALL beside a tag key has no
+        // single reading, and one that names neither asks for nothing at all.
+        if attribute.include_all_tags_of_instance.is_some() && !requested_keys.is_empty() {
+            return Err(Scaffolded::invalid_parameter_combination(
+                "The request must specify either IncludeAllTagsOfInstance or \
+                 InstanceTagKeys, not both",
+            ));
+        }
+        if !deregister_all && requested_keys.is_empty() {
+            return Err(Scaffolded::missing_parameter(
+                "The request must specify either IncludeAllTagsOfInstance or \
+                 InstanceTagKeys",
+            ));
+        }
+        // A deregistered key is a TAG key, bounded the way the register bounds the keys it
+        // takes: a key EC2 could never hold is not one any registration holds either. This
+        // request carries keys alone, so it checks exactly the key rule.
+        for key in requested_keys {
+            if key.is_empty() {
+                return Err(Scaffolded::invalid_parameter_value(
+                    "A tag key cannot be empty",
+                ));
+            }
+            validate_tag_key(key)?;
+        }
+
+        // The registration is a fact of the Region the request was signed for: the describe
+        // reports the keys registered "for resources in the current Region".
+        let region = request_region(ctx.parts());
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        let current = store.instance_event_tag_registration(&region);
+        // What the Region is left holding, and the keys this call took out of it: naming
+        // keys removes exactly those, and `IncludeAllTagsOfInstance=false` deregisters every
+        // tag key — which takes the individually registered ones with it.
+        let (left, deregistered): (InstanceEventTagRegistration, Vec<String>) = if deregister_all
+        {
+            (
+                InstanceEventTagRegistration::deregistering_all(),
+                current.instance_tag_keys.iter().cloned().collect(),
+            )
+        } else {
+            (current.deregistering(requested_keys), requested_keys.to_vec())
+        };
+
+        // A `DryRun` request that would have succeeded stops HERE, having written nothing:
+        // "If you have the required permissions, the error response is DryRunOperation"
+        // (`DryRun`). Everything above only reads state.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        // A deregister only ever takes keys OUT, so it can neither cross the store's byte
+        // budget nor add an entry: `left` is derived from the Region's own registration, so
+        // a Region with no entry is left with nothing and gains none, and a Region with one
+        // either holds less than it did or is dropped altogether.
+        if left.is_empty() {
+            store.clear_instance_event_tag_registration(&region);
+        } else {
+            store.set_instance_event_tag_registration(&region, left.clone());
+        }
+
+        // "The resulting set of tag keys"
+        // (`DeregisterInstanceEventNotificationAttributesResult$InstanceTagAttribute`) — the
+        // keys this call deregistered, beside the mode the registration is left in; what
+        // the Region still holds is what a describe reports.
+        Ok(DeregisterInstanceEventNotificationAttributesOutput {
+            instance_tag_attribute: Some(
+                InstanceEventTagRegistration::deregistered(&deregistered, &left).view(),
+            ),
+        })
     }
 }
