@@ -548,6 +548,9 @@ async fn a_deleted_inputs_refusal_names_the_input_id_it_was_given() {
 
     for (case, create_body, update_body) in table {
         let router = medialive();
+        // The resources this row's configuration names are put in the account
+        // first (`crate::support`), so the create is one the service accepts.
+        let create_body = crate::support::resolved_input_body(&router, create_body).await;
         let (status, created) = call(&router, "POST", "/prod/inputs", Some(create_body)).await;
         assert_eq!(
             status, 201,

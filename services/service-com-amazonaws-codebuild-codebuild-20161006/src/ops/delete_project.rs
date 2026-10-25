@@ -127,14 +127,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "DeleteProject (this engine carries no CodeBuild state)",
             ));
         };
-        let _ = ctx;
 
         // Deleting a project that is not there is a success: the operation models no
         // not-found error at all. AWS: "Deletes a build project. When you delete a
         // project, its builds are not deleted." — so the build records, their ids per
         // project and the project's build-number counter all stay, and a number is
-        // never reused.
-        state.lock().projects.remove(&input.name);
+        // never reused. The resource-based policy attached to the project does NOT
+        // stay: it is meaningful only for a resource this account holds, which is why
+        // `crate::state::ComAmazonawsCodebuildCodebuild20161006State::remove_project`
+        // drops it with the project.
+        let held = state.lock().remove_project(&input.name);
+
+        if held {
+            // The lock is dropped before the audit record is written, so a log consumer
+            // can never hold this service's state. Recorded the way
+            // `crate::ops::delete_report_group` records the removal of the other
+            // resource kind a policy attaches to: a call that drops a project, and the
+            // grant hanging off it, leaves a local record.
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::ProjectDeleted,
+                Some(&input.name),
+            );
+        }
 
         Ok(DeleteProjectOutput {})
     }

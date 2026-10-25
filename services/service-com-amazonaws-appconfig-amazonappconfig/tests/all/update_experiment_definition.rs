@@ -815,8 +815,7 @@ async fn an_update_conflicts_while_the_definition_is_active() {
             .expect("the test engine must carry this service's state");
         let mut store = state.lock();
         let application = store
-            .applications
-            .get_mut(&fixed.application_id)
+            .application_mut(&fixed.application_id)
             .expect("the application under test must be stored");
         let definition = application
             .experiment_definitions

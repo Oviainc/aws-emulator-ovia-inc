@@ -115,6 +115,8 @@ mod object_malware_scan;
 mod organization_admin_accounts;
 #[path = "all/organization_configuration.rs"]
 mod organization_configuration;
+#[path = "all/organization_managed_members.rs"]
+mod organization_managed_members;
 #[path = "all/organization_statistics.rs"]
 mod organization_statistics;
 #[path = "all/publishing_destination_lifecycle.rs"]

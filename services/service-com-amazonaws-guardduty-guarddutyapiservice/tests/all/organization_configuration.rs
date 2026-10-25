@@ -33,8 +33,12 @@
 use serde_json::{json, Value};
 
 use crate::detector_lifecycle::{
-    call, enabled_detector, error_code, error_shape, new_router, Router, ABSENT_DETECTOR_ID,
+    call, call_in, enabled_detector, error_code, error_shape, new_router, Router,
+    ABSENT_DETECTOR_ID,
 };
+// The Region a case that does not name one calls through, defined once beside the
+// member-call harness.
+use crate::member_association::DEFAULT_REGION;
 
 /// The error class every GuardDuty client rejection is named by on the wire.
 const CLASS: &str = "InvalidInputException";
@@ -90,10 +94,14 @@ const GOVERNED_NODES: [(&str, &[&str]); 3] = [
 /// (`smithy_query(shape="OrgFeatureAdditionalConfiguration")`).
 const ADDITIONAL_CONFIGURATION: &str = "EC2_AGENT_MANAGEMENT";
 
-/// `DescribeOrganizationConfiguration`, asserting it succeeded.
-async fn describe(router: &Router, detector_id: &str) -> Value {
-    let (status, got) = call(
+/// `DescribeOrganizationConfiguration` through `region`'s endpoint, asserting it
+/// succeeded. The region-less [`describe`] is this with [`DEFAULT_REGION`], so a
+/// suite that spans two administrators and one that stays with a single detector
+/// read an organization configuration through ONE helper.
+pub(crate) async fn describe_in(router: &Router, region: &str, detector_id: &str) -> Value {
+    let (status, got) = call_in(
         router,
+        region,
         "GET",
         &format!("/detector/{detector_id}/admin"),
         None,
@@ -104,6 +112,11 @@ async fn describe(router: &Router, detector_id: &str) -> Value {
         "describe {detector_id}: expected 200, got {status} {got:?}"
     );
     got
+}
+
+/// `DescribeOrganizationConfiguration`, asserting it succeeded.
+async fn describe(router: &Router, detector_id: &str) -> Value {
+    describe_in(router, DEFAULT_REGION, detector_id).await
 }
 
 /// `DescribeOrganizationConfiguration` with a page window.
@@ -134,10 +147,16 @@ async fn describe_page(
     .await
 }
 
-/// `UpdateOrganizationConfiguration` with `body`.
-async fn update(router: &Router, detector_id: &str, body: Value) -> (u16, Value) {
-    call(
+/// `UpdateOrganizationConfiguration` with `body`, through `region`'s endpoint.
+pub(crate) async fn update_in(
+    router: &Router,
+    region: &str,
+    detector_id: &str,
+    body: Value,
+) -> (u16, Value) {
+    call_in(
         router,
+        region,
         "POST",
         &format!("/detector/{detector_id}/admin"),
         Some(body),
@@ -145,13 +164,24 @@ async fn update(router: &Router, detector_id: &str, body: Value) -> (u16, Value)
     .await
 }
 
-/// `UpdateOrganizationConfiguration`, asserting it succeeded.
-async fn update_ok(router: &Router, detector_id: &str, body: Value) {
-    let (status, got) = update(router, detector_id, body.clone()).await;
+/// `UpdateOrganizationConfiguration` with `body`.
+async fn update(router: &Router, detector_id: &str, body: Value) -> (u16, Value) {
+    update_in(router, DEFAULT_REGION, detector_id, body).await
+}
+
+/// `UpdateOrganizationConfiguration` through `region`'s endpoint, asserting it
+/// stored what it was given.
+pub(crate) async fn update_ok_in(router: &Router, region: &str, detector_id: &str, body: Value) {
+    let (status, got) = update_in(router, region, detector_id, body.clone()).await;
     assert_eq!(
         status, 200,
         "update {body}: expected 200, got {status} {got:?}"
     );
+}
+
+/// `UpdateOrganizationConfiguration`, asserting it succeeded.
+async fn update_ok(router: &Router, detector_id: &str, body: Value) {
+    update_ok_in(router, DEFAULT_REGION, detector_id, body).await;
 }
 
 /// One reported feature entry.

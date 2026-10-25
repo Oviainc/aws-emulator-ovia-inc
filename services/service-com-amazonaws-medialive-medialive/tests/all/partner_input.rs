@@ -14,7 +14,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::wire::{call, call_in_region, error_code, medialive, ACCOUNT};
 
+/// The ids an input configuration names are resolved first, so every create in
+/// this suite is one the service can ingest through (`crate::support`).
 async fn create_input(router: &MultiServiceRouter, body: Value) -> Value {
+    let body = crate::support::resolved_input_body(router, body).await;
     let (status, response) = call(router, "POST", "/prod/inputs", Some(body)).await;
     assert_eq!(
         status, 201,

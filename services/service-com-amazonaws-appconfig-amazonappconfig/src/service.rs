@@ -129,7 +129,7 @@ fn without_end_anchor(pattern: &str) -> Option<&str> {
 /// other requirement class — a null member, a length, a numeric bound, an enum value set,
 /// a uniqueness demand — is handed back untouched, so its wording, the member path and the
 /// echoed value stay the framework's and cannot drift per operation.
-fn as_stated(violation: &Violation) -> Violation {
+pub(crate) fn as_stated(violation: &Violation) -> Violation {
     match &violation.kind {
         ViolationKind::Pattern(pattern) => Violation {
             path: violation.path.clone(),

@@ -153,7 +153,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::scaffolded::Scaffolded::not_implemented("RotateTunnelAccessToken")
         })?;
@@ -196,10 +195,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
         let now = ::std::time::SystemTime::now();
+        // Tokens are rotated through the endpoint of the tunnel's own Region and
+        // no other: a tunnel of another Region is not a resource this one holds.
+        let region = crate::state::request_region(ctx);
         let mut store = state.lock();
         store.materialize_expired_tunnels(now);
 
-        let Some(tunnel) = store.tunnels.get_mut(&input.tunnel_id) else {
+        let Some(tunnel) = store.tunnel_mut(&region, &input.tunnel_id) else {
             return Err(RotateTunnelAccessTokenErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::tunnel_not_found_message(&input.tunnel_id)),

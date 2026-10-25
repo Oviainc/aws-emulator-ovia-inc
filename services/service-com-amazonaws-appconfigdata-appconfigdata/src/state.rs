@@ -430,7 +430,7 @@ pub fn served_configuration<Eng: Send + Sync + 'static>(
         Ok(resolved) => resolved,
     };
     // Every id came out of the resolution above, so each lookup holds.
-    let application = store.applications.get(&resolved.application_id)?;
+    let application = store.application(&resolved.application_id)?;
     let profile = application.profiles.get(&resolved.configuration_profile_id)?;
     let environment = application.environments.get(&resolved.environment_id)?;
 

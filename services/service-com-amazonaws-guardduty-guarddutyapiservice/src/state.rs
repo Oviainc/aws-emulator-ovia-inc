@@ -6013,6 +6013,19 @@ const _: () = assert!(enum_carries(
     AUTO_ENABLE_NEW
 ));
 
+/// `AutoEnableMembers` / `OrgFeatureStatus`: auto-enabled for EVERY account in the
+/// organization — the accounts already in it as well as the ones that join. See
+/// [`AUTO_ENABLE_NONE`] for the enums.
+pub const AUTO_ENABLE_ALL: &str = "ALL";
+const _: () = assert!(enum_carries(
+    crate::ops::types::shared_types::AUTO_ENABLE_MEMBERS_VALUES,
+    AUTO_ENABLE_ALL
+));
+const _: () = assert!(enum_carries(
+    crate::ops::types::shared_types::ORG_FEATURE_STATUS_VALUES,
+    AUTO_ENABLE_ALL
+));
+
 /// Every `OrgFeature` member, in the order a read reports them: the crate's
 /// MODEL-DERIVED list, so a feature the model gains cannot be missed here.
 pub const ORG_FEATURES: &[&str] = crate::ops::types::shared_types::ORG_FEATURE_VALUES;
@@ -6117,6 +6130,18 @@ impl Default for OrganizationConfiguration {
 }
 
 impl OrganizationConfiguration {
+    /// Is GuardDuty itself auto-enabled for EVERY account in the organization?
+    ///
+    /// The administrator that configured this keeps GuardDuty on for each of its
+    /// organization's accounts, so the organization — not a single API call — owns
+    /// each member relationship: an account has to leave the organization before
+    /// its relationship can end or its monitoring stop. The operations that would
+    /// do either read this before they write anything (see
+    /// [`organization_managed_members_message`]).
+    pub fn auto_enables_all_members(&self) -> bool {
+        self.auto_enable_members == AUTO_ENABLE_ALL
+    }
+
     /// One feature's `OrgFeatureStatus`, or [`AUTO_ENABLE_NONE`] when the
     /// configuration does not carry that feature.
     pub fn feature_auto_enable(&self, name: &str) -> &str {
@@ -6166,6 +6191,38 @@ impl OrganizationConfiguration {
         feature.auto_enable = auto_enable.to_string();
         Some(feature)
     }
+}
+
+/// The action `DisassociateMembers` attempts, as the refusal below names it.
+pub const DISASSOCIATE_MEMBER_ACTION: &str = "disassociate";
+
+/// The action `StopMonitoringMembers` attempts, as the refusal below names it.
+pub const STOP_MONITORING_MEMBER_ACTION: &str = "stop monitoring";
+
+/// The message a call that would end or suspend a member relationship the
+/// ORGANIZATION manages is refused with, naming the `action` it attempted — one of
+/// [`DISASSOCIATE_MEMBER_ACTION`] and [`STOP_MONITORING_MEMBER_ACTION`].
+///
+/// "With `autoEnableOrganizationMembers` configuration for your organization set to
+/// `ALL`, you'll receive an error if you attempt to disassociate a member account
+/// before removing them from your organization"
+/// (`smithy_query(query="doc",shape="DisassociateMembers")`), and the same
+/// configuration refuses stopping monitoring
+/// (`smithy_query(query="doc",shape="StopMonitoringMembers")`) and disabling
+/// GuardDuty for a member (`smithy_query(query="doc",shape="DeleteMembers")`): one
+/// precondition over the operations that take a member relationship away, so one
+/// message states it and names the remedy the documentation gives.
+///
+/// The precondition holds for the whole call rather than per account: a member
+/// record says which accounts this administrator holds, and nothing records which
+/// of them joined through the organization rather than through an invitation, so
+/// every member of an administrator that auto-enables all of its organization's
+/// accounts is one of them. A later change that records how a member was added can
+/// narrow it to those accounts.
+pub fn organization_managed_members_message(action: &str) -> String {
+    format!(
+        "The request is rejected because the current account cannot {action} the given member account ID while {AUTO_ENABLE_ORGANIZATION_MEMBERS_MEMBER} is set to {AUTO_ENABLE_ALL} for the organization. Remove the account from the organization first."
+    )
 }
 
 /// Refuse an organization `Features` list the operation documents as

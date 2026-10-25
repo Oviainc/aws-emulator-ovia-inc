@@ -269,7 +269,8 @@ async fn enabling_actions_leaves_the_alarm_state_alone() {
     let name = "forced-then-enabled";
     Kind::Metric.create(&router, name, Some(false)).await;
     // A state a caller forced, so the state under test is one nothing else is about to
-    // recompute: `SetAlarmState`'s state stands until this alarm's next evaluation period.
+    // recompute: `SetAlarmState`'s state stands until this alarm's next evaluation, a short
+    // span away, and this row reads it back inside that span.
     ok(
         &router,
         "SetAlarmState",

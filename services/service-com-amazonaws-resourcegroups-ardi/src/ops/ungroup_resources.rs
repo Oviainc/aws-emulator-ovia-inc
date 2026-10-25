@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UngroupResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UngroupResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UngroupResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Drops each ARN in `ResourceArns` from the static memberships of the group `Group`
+//! names, in [`crate::state`], and reports the resources the group no longer holds in
+//! `Succeeded`. Removing an ARN the group does not hold is a no-op, so a repeated call
+//! reports the same outcome and changes nothing.
+//!
+//! Only a group whose stored service configuration declares one of the supported
+//! configuration types ([`crate::state::STATIC_MEMBERSHIP_CONFIGURATION_TYPES`]) holds
+//! static memberships at all; a group populated from a resource query, or one with no
+//! configuration, is refused with `BadRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +167,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UngroupResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UngroupResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UngroupResources"))
+        // Authorization is not emulated: the emulator verifies request signatures
+        // centrally but holds no principals or policies, so the modelled
+        // `ForbiddenException` is deliberately unreachable here and a success says
+        // nothing about the caller's permissions. `ctx` is read for the audit record
+        // this operation emits.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UngroupResourcesErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the resource-groups store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // `ResourceArns` is modelled `length 1..10` and the framework refuses a longer
+        // list before this handler runs. Checking it again here is what BOUNDS the work
+        // below: every scan over the request is at most this many entries.
+        if input.resource_arns.len() > MAX_RESOURCE_ARNS {
+            return Err(UngroupResourcesErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "ResourceArns carries {} entries, which is more than the {} this \
+                     operation accepts",
+                    input.resource_arns.len(),
+                    MAX_RESOURCE_ARNS,
+                )),
+            })
+            .into());
+        }
+        // Every member must be an ARN: the modelled `ResourceArn` is
+        // `arn:<partition>:<service>:<region>:<account>:<resource>`, and a string
+        // that is not one names no resource to remove.
+        if let Some(not_an_arn) = input
+            .resource_arns
+            .iter()
+            .find(|arn| !crate::state::is_resource_arn(arn))
+        {
+            return Err(UngroupResourcesErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "ResourceArns contains {not_an_arn}, which is not a resource ARN"
+                )),
+            })
+            .into());
+        }
+
+        let mut store = state.lock();
+        let not_found = || {
+            UngroupResourcesError::from(UngroupResourcesErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::GROUP_NOT_FOUND_MESSAGE.to_string()),
+                },
+            ))
+        };
+        // `Group` is the only identifier this operation models, and it carries
+        // either a bare group name or a group ARN; `lookup` resolves both, within
+        // the region the request addressed, since a group of another region is
+        // another region's resource.
+        let region = crate::state::request_region(ctx.parts());
+        let key = store.lookup(&region, input.group.as_str()).ok_or_else(not_found)?;
+        let group = store.groups.get_mut(&key).ok_or_else(not_found)?;
+        // Documented: this operation "works only with static groups that you
+        // populated using the GroupResources operation" and "doesn't work with any
+        // resource groups that are automatically populated by tag-based or
+        // CloudFormation stack-based queries" — the same groups `GroupResources`
+        // serves, since a group outside that catalog holds no static membership to
+        // remove.
+        if group.static_membership_configuration_type().is_none() {
+            return Err(UngroupResourcesErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::unsupported_group_message(Self::NAME)),
+            })
+            .into());
+        }
+        // The work done while holding the store lock is bounded by
+        // `MAX_RESOURCE_ARNS` and nothing else: each request entry is looked up by
+        // BINARY SEARCH over the group's memberships, which the record keeps sorted
+        // by ARN.
+        let removed_count = input
+            .resource_arns
+            .iter()
+            .filter(|arn| group.remove_member(arn))
+            .count();
+        // Reported from the memberships the group now holds, not from the request:
+        // an ARN appears in `Succeeded` because the group no longer holds it, which
+        // makes a removal IDEMPOTENT — an ARN that was never a member is already in
+        // the state the request asked for, so it succeeds too, and no action is
+        // recorded against it because none was performed.
+        let succeeded: Vec<String> = input
+            .resource_arns
+            .iter()
+            .filter(|arn| !group.holds_member(arn))
+            .cloned()
+            .collect();
+        let members_left = group.members.len();
+        // Everything below is owned, so the store lock is released before the record
+        // is formatted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, where, what, and
+        // the outcome. Metadata only — the member ARNs are counted, not listed, and
+        // request-derived values are `Debug`-escaped so none can split a record.
+        tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            region = ?region,
+            group = ?key.name,
+            members_requested = input.resource_arns.len(),
+            members_removed = removed_count,
+            members_now_absent = succeeded.len(),
+            members_remaining = members_left,
+            outcome = "ungrouped",
+            "resources removed from a resource group",
+        );
+        Ok(UngroupResourcesOutput {
+            succeeded: Some(succeeded),
+            // Nothing was refused, and a static membership this emulator removes is
+            // dropped immediately — so neither list has an entry.
+            failed: Some(Vec::new()),
+            pending: Some(Vec::new()),
+        })
     }
 }
+
+/// The most `ResourceArns` entries one request carries: the maximum the modelled
+/// `ResourceArnList` declares (`length 1..10`). It is what bounds the per-request
+/// work this handler does while holding the store lock.
+const MAX_RESOURCE_ARNS: usize = 10;

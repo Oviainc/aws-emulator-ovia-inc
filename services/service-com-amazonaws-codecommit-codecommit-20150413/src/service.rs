@@ -229,11 +229,17 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
             "ReactionValueRequiredException",
             "A reaction value is required.",
         ),
-        ("blobId", _) if missing => (
+        // Every member that carries an `ObjectId` naming a blob takes the blob
+        // errors: `beforeBlobId` and `afterBlobId` are `GetBlobDifferences`'s names
+        // for the two sides of one, and it models these same codes for them.
+        ("blobId" | "beforeBlobId" | "afterBlobId", _) if missing => (
             "BlobIdRequiredException",
-            "A blob ID is required, but was not specified.",
+            crate::state::BLOB_ID_REQUIRED_MESSAGE,
         ),
-        ("blobId", _) => ("InvalidBlobIdException", "The specified blob is not valid."),
+        ("blobId" | "beforeBlobId" | "afterBlobId", _) => (
+            "InvalidBlobIdException",
+            crate::state::INVALID_BLOB_ID_MESSAGE,
+        ),
         ("commitMessage", ViolationKind::MaxLength(_)) => (
             "CommitMessageLengthExceededException",
             "The commit message is too long.",

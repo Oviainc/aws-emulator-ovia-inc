@@ -7,6 +7,12 @@
 //! minting/projection logic more than one operation needs (ids, access tokens,
 //! the `ListTunnels` page token, and the clock-owed close of a tunnel whose
 //! `maxLifetimeTimeoutMinutes` has elapsed).
+//!
+//! A tunnel is a REGIONAL resource, so the store is partitioned by the Region of
+//! the endpoint each record was created against ([`request_region`]) and every
+//! lookup names that Region: see
+//! [`ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState::tunnel`] and the
+//! accessors beside it.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -252,14 +258,24 @@ pub struct StoredTunnel {
 /// Per-service state for com-amazonaws-iotsecuretunneling-iotsecuredtunneling. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState {
-    /// Every tunnel, keyed by `tunnelId`.
-    pub tunnels: BTreeMap<String, StoredTunnel>,
+    /// Every tunnel, keyed by the Region of the endpoint it was created against
+    /// and then by its `tunnelId`.
+    ///
+    /// The Region is part of a tunnel's address because a tunnel is a regional
+    /// resource: it is held by one Region's endpoint and is neither readable nor
+    /// mutable through another's. Reach a record through [`Self::tunnel`],
+    /// [`Self::tunnel_mut`], [`Self::tunnels_in_region`], [`Self::insert_tunnel`]
+    /// and [`Self::remove_tunnel`], which all take the Region of the request
+    /// being served, rather than by building a key here.
+    pub tunnels: BTreeMap<(String, String), StoredTunnel>,
     /// The authoritative tag store, keyed by `tunnelArn` then by tag key. Shared
     /// by `OpenTunnel`, `TagResource`, `UntagResource`, `ListTagsForResource` and
-    /// `DescribeTunnel`'s `tunnel.tags`.
+    /// `DescribeTunnel`'s `tunnel.tags`. A tunnel ARN names its own Region, so
+    /// this key is already Region-specific.
     pub tags: BTreeMap<String, BTreeMap<String, String>>,
-    /// `tunnelArn` -> `tunnelId`, so the tag operations resolve an ARN to a tunnel.
-    pub arn_index: BTreeMap<String, String>,
+    /// `(region, tunnelArn)` -> `tunnelId`, so an ARN-addressed operation
+    /// resolves an ARN only to a tunnel of the Region it is serving.
+    pub arn_index: BTreeMap<(String, String), String>,
     /// The soonest instant at which some OPEN tunnel's lifetime runs out, so the
     /// expiry sweep is a single comparison on the overwhelmingly common call
     /// where nothing is due yet, instead of a scan of the whole store under the
@@ -270,6 +286,56 @@ pub struct ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState {
 }
 
 impl ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState {
+    /// The tunnel `tunnel_id` names in `region`, or `None` when that Region's
+    /// endpoint holds no such tunnel — including when another Region does.
+    pub fn tunnel(&self, region: &str, tunnel_id: &str) -> Option<&StoredTunnel> {
+        self.tunnels.get(&tunnel_key(region, tunnel_id))
+    }
+
+    /// [`Self::tunnel`], for the operations that mutate the record they resolve.
+    pub fn tunnel_mut(&mut self, region: &str, tunnel_id: &str) -> Option<&mut StoredTunnel> {
+        self.tunnels.get_mut(&tunnel_key(region, tunnel_id))
+    }
+
+    /// Every tunnel `region`'s endpoint holds, in `tunnelId` order.
+    ///
+    /// The keys are ordered by Region first, so one Region's records are a
+    /// contiguous run and a listing walks that run alone rather than the whole
+    /// store.
+    pub fn tunnels_in_region<'state, 'region: 'state>(
+        &'state self,
+        region: &'region str,
+    ) -> impl Iterator<Item = &'state StoredTunnel> + 'state {
+        self.tunnels
+            .range((
+                ::std::ops::Bound::Included(tunnel_key(region, "")),
+                ::std::ops::Bound::Unbounded,
+            ))
+            .take_while(move |((stored_region, _), _)| stored_region == region)
+            .map(|(_, tunnel)| tunnel)
+    }
+
+    /// Store `tunnel` as a resource of `region`, and index its ARN there, so the
+    /// record and the ARN that addresses it enter the store together.
+    pub fn insert_tunnel(&mut self, region: &str, tunnel: StoredTunnel) {
+        self.arn_index.insert(
+            tunnel_key(region, &tunnel.tunnel_arn),
+            tunnel.tunnel_id.clone(),
+        );
+        self.tunnels
+            .insert(tunnel_key(region, &tunnel.tunnel_id), tunnel);
+    }
+
+    /// Drop the tunnel `tunnel_id` names in `region`, with its ARN index entry
+    /// and its tags — everything the record owns leaves the store together.
+    pub fn remove_tunnel(&mut self, region: &str, tunnel_id: &str) -> Option<StoredTunnel> {
+        let tunnel = self.tunnels.remove(&tunnel_key(region, tunnel_id))?;
+        self.arn_index
+            .remove(&tunnel_key(region, &tunnel.tunnel_arn));
+        self.tags.remove(&tunnel.tunnel_arn);
+        Some(tunnel)
+    }
+
     /// Claim the next creation sequence number.
     pub fn next_creation_seq(&mut self) -> u64 {
         let seq = self.next_creation_seq;
@@ -291,9 +357,13 @@ impl ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState {
         });
     }
 
-    /// The id of the tunnel `arn` names, if this account holds one.
-    pub fn tunnel_id_for_arn(&self, arn: &str) -> Option<String> {
-        self.arn_index.get(arn).cloned()
+    /// The id of the tunnel `arn` names, if `region`'s endpoint holds one.
+    ///
+    /// An ARN names the Region of the resource it addresses, so an ARN minted in
+    /// another Region resolves to nothing here, exactly as the tunnel it names is
+    /// unreachable through this endpoint.
+    pub fn tunnel_id_for_arn(&self, region: &str, arn: &str) -> Option<String> {
+        self.arn_index.get(&tunnel_key(region, arn)).cloned()
     }
 
     /// The number of distinct tag keys `arn` would carry after merging
@@ -377,8 +447,22 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState>)
 }
 
+/// How a regional record is addressed in this store: the Region of the endpoint
+/// the request came in on, then the record's own identifier (a `tunnelId`, or a
+/// `tunnelArn` in the ARN index).
+///
+/// The single place the composite key is built, so the store, the ARN index and
+/// every accessor agree on it.
+fn tunnel_key(region: &str, identifier: &str) -> (String, String) {
+    (region.to_string(), identifier.to_string())
+}
+
 /// The region this request was signed for, or [`DEFAULT_REGION`] when it carries
 /// no SigV4 credential scope to read one from.
+///
+/// This is the Region whose endpoint the caller is talking to, and so the Region
+/// whose resources the request can address at all: every operation of this
+/// service resolves a tunnel within it.
 ///
 /// Kept here rather than hoisted: the only crates above this one are the
 /// read-only `vendor/` framework, and this workspace has no shared `services/`

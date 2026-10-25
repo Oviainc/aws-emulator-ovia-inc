@@ -47,6 +47,8 @@ mod resource_tagging;
 mod state_roundtrip;
 #[path = "all/tag_map_validation.rs"]
 mod tag_map_validation;
+#[path = "all/tag_resource_key_pattern.rs"]
+mod tag_resource_key_pattern;
 #[path = "all/tagging_not_found_text.rs"]
 mod tagging_not_found_text;
 #[path = "all/untag_key_validation.rs"]

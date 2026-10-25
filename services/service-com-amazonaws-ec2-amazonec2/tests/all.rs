@@ -397,3 +397,7 @@ mod launch_template_ssm_alias_catalog;
 // the store of ASNs brought to IPAM, and how the page size and the token narrow it.
 #[path = "all/ipam_byoasns.rs"]
 mod ipam_byoasns;
+// Declared LAST for the reason the header gives: the route server ASSOCIATION slice —
+// associating a route server with a VPC, and reading one route server's associations back.
+#[path = "all/route_server_associations.rs"]
+mod route_server_associations;

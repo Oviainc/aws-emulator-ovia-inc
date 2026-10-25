@@ -53,6 +53,8 @@ mod job_runs;
 mod job_updates;
 #[path = "all/jobs.rs"]
 mod jobs;
+#[path = "all/partitions.rs"]
+mod partitions;
 #[path = "all/registries.rs"]
 mod registries;
 #[path = "all/schema_registry.rs"]

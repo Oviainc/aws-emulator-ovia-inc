@@ -390,6 +390,82 @@ async fn the_quota_refusal_is_audited() {
     );
 }
 
+/// `CreateScheduledReport`'s idempotency paths account for themselves by what they
+/// change: the create leaves one SUCCESS record, the retry that only replays it creates
+/// nothing and so leaves none — the rule the dry run and the idempotent execution
+/// retry follow above — and the token reused for a different request leaves its
+/// ConflictException.
+#[tokio::test]
+async fn scheduled_report_create_retries_are_audited_by_what_they_change() {
+    use super::scheduled_report_lifecycle::EXECUTION_ROLE_ARN;
+
+    let router = router();
+    let (dashboard_arn, _) = source_dashboard(&router, "AuditTokenSource").await;
+    let request = json!({
+        "clientToken": "audited-create-token-0001",
+        "scheduledReport": {
+            "name": "Audited Create",
+            "dashboardArn": dashboard_arn,
+            "scheduledReportExecutionRoleArn": EXECUTION_ROLE_ARN,
+            "scheduleConfig": {"scheduleExpression": "cron(0 8 1 * ? *)"}
+        }
+    });
+
+    let arn = {
+        let (capture, _guard) = capture_events();
+        let created = ok_call(&router, "CreateScheduledReport", &request).await;
+        let arn = created["arn"].as_str().expect("an arn").to_string();
+        assert_record(
+            &capture.record_for("CreateScheduledReport"),
+            "CreateScheduledReport",
+            &arn,
+            "SUCCESS",
+        );
+        arn
+    };
+
+    {
+        let (capture, _guard) = capture_events();
+        super::create_report_client_token::wait_out_the_creation_window().await;
+        ok_call(&router, "CreateScheduledReport", &request).await;
+        let leaked = capture.records_for("CreateScheduledReport");
+        assert!(
+            leaked.is_empty(),
+            "case replayed retry: a call that creates nothing must emit no audit record, captured {leaked:?}"
+        );
+    }
+
+    {
+        let mut different = request.clone();
+        different["scheduledReport"]["name"] = json!("Audited Other");
+        let (capture, _guard) = capture_events();
+        let (status, body) = call(&router, "CreateScheduledReport", &different).await;
+        assert_eq!(
+            status, 409,
+            "case token reuse: expected 409, got {status}: {body}"
+        );
+        assert_record(
+            &capture.record_for("CreateScheduledReport"),
+            "CreateScheduledReport",
+            "-",
+            "ConflictException",
+        );
+    }
+
+    // The audited create is still the only report the token made.
+    let listed = ok_call(&router, "ListScheduledReports", &json!({})).await;
+    assert_eq!(
+        listed["scheduledReports"].as_array().map(Vec::len),
+        Some(1),
+        "the retries must have created no second report: {listed}"
+    );
+    assert_eq!(
+        listed["scheduledReports"][0]["arn"].as_str(),
+        Some(arn.as_str()),
+        "the one stored report is the one the create minted: {listed}"
+    );
+}
+
 /// `ExecuteScheduledReport` accounts for itself: the execution it triggers and each
 /// refusal it answers leave one record naming the report and the outcome, while the two
 /// calls that change nothing — the dry run and the idempotent retry — leave none.

@@ -154,8 +154,7 @@ fn set_status(
         state::service_state(&**engine).expect("the test engine must carry this service's state");
     let mut store = state.lock();
     let application = store
-        .applications
-        .get_mut(application_id)
+        .application_mut(application_id)
         .unwrap_or_else(|| panic!("case {case:?}: the application under test must be stored"));
     let definition = application
         .experiment_definitions

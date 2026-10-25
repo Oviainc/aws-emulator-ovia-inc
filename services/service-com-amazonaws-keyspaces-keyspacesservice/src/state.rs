@@ -1828,6 +1828,37 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
                 .get_mut(resource_arn),
         }
     }
+
+    /// Drop the tag sets of the CDC streams `forgotten_stream_arns` names in `region`.
+    ///
+    /// A tag set belongs to a stream, so it lives exactly as long as that stream: the
+    /// call that forgets streams in the CDC stream store drops their tags HERE, in the
+    /// same request, so the tagging operations can never answer for a stream ARN that
+    /// store no longer holds — not even in the span before [`Self::settle`] removes the
+    /// table that held them. A stream ARN names its own keyspace and table
+    /// ([`parse_resource_arn`]), so a forgotten ARN reaches exactly the one tag set that
+    /// belonged to it and nothing else.
+    pub fn forget_stream_tags(&mut self, region: &str, forgotten_stream_arns: &[String]) {
+        let Some(keyspaces) = self.regions.get_mut(region) else {
+            return;
+        };
+        for stream_arn in forgotten_stream_arns {
+            let Some(ResourceRef::Stream {
+                keyspace_name,
+                table_name,
+                ..
+            }) = parse_resource_arn(stream_arn)
+            else {
+                continue;
+            };
+            if let Some(table) = keyspaces
+                .get_mut(&keyspace_name)
+                .and_then(|keyspace| keyspace.tables.get_mut(&table_name))
+            {
+                table.cdc_stream_tags.remove(stream_arn.as_str());
+            }
+        }
+    }
 }
 
 impl Table {
