@@ -216,6 +216,68 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             }
         }
     }
+
+    /// Whether any distribution this store holds names the connection function `id`.
+    ///
+    /// A `ConnectionFunctionAssociation` carries "The association's ID", which is the
+    /// connection function's own `Id`, so the question is answered against the STORED
+    /// configurations rather than against any request: it is what decides whether a
+    /// published stage reports [`super::FUNCTION_STATUS_ASSOCIATED`] or
+    /// [`super::FUNCTION_STATUS_UNASSOCIATED`].
+    pub fn connection_function_is_associated(&self, id: &str) -> bool {
+        self.distributions.values().any(|distribution| {
+            distribution
+                .config
+                .connection_function_association
+                .as_ref()
+                .is_some_and(|association| association.id == id)
+        })
+    }
+
+    /// Copy the `DEVELOPMENT` stage of the connection function `id` names into its `LIVE`
+    /// stage, and report the summary of the stage that was written — or `None` when this
+    /// store holds no connection function under that id, checked BEFORE the mint so a
+    /// version token is never spent on a resource that is not there.
+    ///
+    /// A publish is a COPY: the stage it writes carries the code and the configuration the
+    /// `DEVELOPMENT` stage holds at this instant, keeps the created time of the connection
+    /// function the copy was taken from, is last modified now, and gets a FRESH version
+    /// token of its own, so an `If-Match` against the `LIVE` stage from before the publish
+    /// no longer matches. The `DEVELOPMENT` stage is left exactly as it was — a publish does
+    /// not edit the stage it reads, and the operation hands back no new token for it.
+    ///
+    /// The status the written stage reports is computed from the stored distributions
+    /// ([`Self::connection_function_is_associated`]): republishing a connection function a
+    /// distribution already names reports it as associated, publishing one nothing names
+    /// reports it as unassociated.
+    pub fn publish_connection_function(
+        &mut self,
+        id: &str,
+        now: SystemTime,
+    ) -> Option<ConnectionFunctionSummary> {
+        if !self.connection_functions.contains_key(id) {
+            return None;
+        }
+        let status = if self.connection_function_is_associated(id) {
+            super::FUNCTION_STATUS_ASSOCIATED
+        } else {
+            super::FUNCTION_STATUS_UNASSOCIATED
+        };
+        let etag = self.next_etag();
+        let function = self.connection_functions.get_mut(id)?;
+        let published = StoredConnectionFunctionStage {
+            stage: super::FUNCTION_STAGE_LIVE.to_string(),
+            config: function.development.config.clone(),
+            code: function.development.code.clone(),
+            status: status.to_string(),
+            etag,
+            created_time: function.development.created_time,
+            last_modified_time: now,
+        };
+        let summary = published.to_summary(&function.name, &function.id, &function.arn);
+        function.live = Some(published);
+        Some(summary)
+    }
 }
 
 /// The ARN of a connection function. CloudFront is a GLOBAL service, so the ARN's region

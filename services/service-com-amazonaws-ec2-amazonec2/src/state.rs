@@ -1012,7 +1012,7 @@ use crate::ops::types::{
     TransitGatewayVpcAttachment,
     UserIdGroupPair, Vpc, VpcBlockPublicAccessExclusion, VpcCidrBlockAssociation,
     VpcCidrBlockState, VpcEndpoint,
-    VpcEndpointConnection, VpnGateway,
+    VpcEndpointConnection, VpnConnection, VpnGateway, VpnStaticRoute,
 };
 use crate::scaffolded::Scaffolded;
 
@@ -2440,6 +2440,12 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`VpcEndpoint`] shape itself. Ordered by id, which is the order
     /// `DescribeVpcEndpoints` reports and pages over.
     pub vpc_endpoints: BTreeMap<String, VpcEndpoint>,
+    /// Every Site-to-Site VPN connection the account holds, by `VpnConnectionId`, as
+    /// [`VpnConnectionRecord`]s — the modelled [`VpnConnection`] every operation that reports
+    /// one answers with, plus the move the clock owes each static route that is not in a
+    /// terminal state yet (see that type, and the "Site-to-Site VPN connections" section of
+    /// this module). Ordered by id, which is the order `DescribeVpnConnections` reports in.
+    pub vpn_connections: BTreeMap<String, VpnConnectionRecord>,
     /// Every transit gateway attachment the account holds, by
     /// `TransitGatewayAttachmentId` — ONE map for every kind of attachment, because one id
     /// space serves them all and an id therefore identifies at most one attachment of one
@@ -2740,6 +2746,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             vpc_endpoint_connection_moves: BTreeMap::new(),
             vpc_endpoint_services: BTreeMap::new(),
             vpc_endpoints: BTreeMap::new(),
+            vpn_connections: BTreeMap::new(),
             transit_gateway_attachments: BTreeMap::new(),
             transit_gateway_multicast_domains: BTreeMap::new(),
             transit_gateway_route_table_announcements: BTreeMap::new(),
@@ -4739,6 +4746,25 @@ impl ComAmazonawsEc2Amazonec2State {
             // The transition is applied once; nothing is owed on this subnet any more.
             false
         });
+        // A VPN static route `CreateVpnConnectionRoute` answered as `pending` is
+        // `available` once its due instant has passed, whether or not anybody called — the
+        // same contract as a `pending` VPC's move above.
+        for record in self.vpn_connections.values_mut() {
+            let VpnConnectionRecord { view, route_moves } = record;
+            route_moves.retain(|destination_cidr_block, pending| {
+                let Some(state) = pending.due_by(now).map(str::to_string) else {
+                    return true;
+                };
+                if let Some(route) = view.routes.iter_mut().flatten().find(|route| {
+                    route.destination_cidr_block.as_deref()
+                        == Some(destination_cidr_block.as_str())
+                }) {
+                    route.state = Some(state);
+                }
+                // The move is applied once; nothing is owed on this route any more.
+                false
+            });
+        }
         // A target network association `AssociateClientVpnTargetNetwork` answered as
         // `associating` is `associated` once its due instant has passed, whether or not
         // anybody called again — the same contract as a `pending` VPC's move above.
@@ -23964,6 +23990,250 @@ impl ComAmazonawsEc2Amazonec2State {
                 record.apply_due_move(to);
             }
         }
+    }
+}
+
+// =============================================================================
+// Site-to-Site VPN connections
+// =============================================================================
+
+/// The id prefix a Site-to-Site VPN connection's `VpnConnectionId` carries.
+pub const VPN_CONNECTION_ID_PREFIX: &str = "vpn";
+
+/// A VPN connection or static route being brought up: the `VpnState` enum's `pending`
+/// member (`smithy_query(query="shape",shape="VpnState")`).
+pub const VPN_STATE_PENDING: &str = "pending";
+
+/// A VPN connection or static route in service: the `VpnState` enum's `available` member.
+pub const VPN_STATE_AVAILABLE: &str = "available";
+
+/// A VPN connection or static route being taken down: the `VpnState` enum's `deleting`
+/// member.
+pub const VPN_STATE_DELETING: &str = "deleting";
+
+/// A VPN connection or static route that is gone: the `VpnState` enum's `deleted` member.
+pub const VPN_STATE_DELETED: &str = "deleted";
+
+/// "Indicates how the routes were provided" (`VpnStaticRoute$Source`) for a route a caller
+/// added itself: the single member the `VpnStaticRouteSource` enum publishes.
+pub const VPN_STATIC_ROUTE_SOURCE_STATIC: &str = "Static";
+
+/// The code EC2 answers for a VPN connection id this account holds no connection for.
+pub const INVALID_VPN_CONNECTION_ID: &str = "InvalidVpnConnectionId";
+
+/// The code EC2 answers for a request that would take a VPN connection past the number of
+/// static routes it can hold — EC2's own `RouteLimitExceeded`, "you've reached the limit on
+/// the number of routes that you can add" (EC2 API error codes).
+pub const ROUTE_LIMIT_EXCEEDED: &str = "RouteLimitExceeded";
+
+/// How many static routes one VPN connection holds here.
+///
+/// A capacity bound in the style of [`MAX_VPCS`], not a published quota: each route is a
+/// record in this process's memory, so the number a caller can add to one connection has to
+/// be finite. A create past it answers [`vpn_route_limit_exceeded`] rather than growing the
+/// connection without limit.
+pub const MAX_VPN_STATIC_ROUTES: usize = 100;
+
+/// Refuse a VPN connection id this account holds no connection for: HTTP 400
+/// [`INVALID_VPN_CONNECTION_ID`].
+///
+/// The message is built from the request — the id it asked about — and the account the
+/// lookup was made in, which is this emulator's own ([`::engine::emulator_account_id`]).
+pub fn invalid_vpn_connection_id<E>(vpn_connection_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_VPN_CONNECTION_ID,
+        400,
+        format!(
+            "The specified VpnConnection ({vpn_connection_id}) for owner ({owner}) \
+             does not exist",
+            owner = ::engine::emulator_account_id(),
+        ),
+    )
+}
+
+/// Refuse a static route create that would take one connection past
+/// [`MAX_VPN_STATIC_ROUTES`]: HTTP 400 [`ROUTE_LIMIT_EXCEEDED`].
+pub fn vpn_route_limit_exceeded<E>(vpn_connection_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        ROUTE_LIMIT_EXCEEDED,
+        400,
+        format!(
+            "The VPN connection '{vpn_connection_id}' has reached the maximum number of \
+             static routes ({MAX_VPN_STATIC_ROUTES})"
+        ),
+    )
+}
+
+/// A requested VPN static route destination block in canonical form, of whichever address
+/// family it names.
+///
+/// `CreateVpnConnectionRouteRequest$DestinationCidrBlock` is "The CIDR block associated with
+/// the local subnet of the customer network" and publishes NO block size, so the family is
+/// decided by the value itself and no prefix-length rule is imposed on it — the same
+/// reasoning as [`canonical_ipv6_cidr`]'s. The block is read by the same two readers the VPC
+/// path uses, so this crate keeps ONE rule for what a CIDR block is, and the host bits are
+/// cleared the way every other CIDR member of this service stores its block ("We modify the
+/// specified CIDR block to its canonical form", `CreateVpcRequest$CidrBlock`,
+/// `CreateSubnetRequest$CidrBlock`) — which is also what makes the destination block
+/// identify ONE route of a connection.
+pub fn canonical_vpn_static_route_cidr(value: &str) -> Result<String, CidrProblem> {
+    if value.contains(':') {
+        return canonical_ipv6_cidr(value);
+    }
+    canonical_ipv4_cidr(value)
+}
+
+/// One Site-to-Site VPN connection: the modelled [`VpnConnection`] every operation that
+/// reports one answers with, plus the move the clock owes each static route that is not in a
+/// terminal state yet.
+///
+/// The routes live on the view, in its own `Routes` member, so the operation that adds one
+/// and the operation that reports them cannot disagree about a connection; only the DUE
+/// INSTANT of a route's `pending` -> `available` move, which `VpnStaticRoute` carries no
+/// member for, is held beside it, keyed by the same destination CIDR block.
+#[derive(Debug, Clone, Default)]
+pub struct VpnConnectionRecord {
+    /// The connection as the model shapes it, carrying the routes reported so far.
+    pub view: VpnConnection,
+    /// The move the clock owes one static route, by destination CIDR block, while one is
+    /// owed. A route that has reached its terminal state has no entry here.
+    pub route_moves: BTreeMap<String, PendingStateMove>,
+}
+
+impl VpnConnectionRecord {
+    /// The connection's `VpnState` as it was last reported.
+    pub fn state(&self) -> &str {
+        self.view.state.as_deref().unwrap_or_default()
+    }
+
+    /// The connection's own `VpnConnectionId`.
+    pub fn vpn_connection_id(&self) -> &str {
+        self.view.vpn_connection_id.as_deref().unwrap_or_default()
+    }
+
+    /// "The static routes associated with the VPN connection" (`VpnConnection$Routes`).
+    pub fn routes(&self) -> &[VpnStaticRoute] {
+        self.view.routes.as_deref().unwrap_or_default()
+    }
+
+    /// The static route for `destination_cidr_block`, if this connection has one.
+    pub fn route(&self, destination_cidr_block: &str) -> Option<&VpnStaticRoute> {
+        self.routes()
+            .iter()
+            .find(|route| route.destination_cidr_block.as_deref() == Some(destination_cidr_block))
+    }
+
+    /// The caller-chosen bytes this record holds: its tags and the destination block of
+    /// each static route.
+    pub fn payload_bytes(&self) -> usize {
+        let routes: usize = self
+            .routes()
+            .iter()
+            .map(|route| route.destination_cidr_block.as_deref().unwrap_or_default().len())
+            .sum();
+        tag_list_bytes(self.view.tags.as_deref().unwrap_or_default()).saturating_add(routes)
+    }
+
+    /// Put the static route for `destination_cidr_block` into this connection and answer it
+    /// as it now stands.
+    ///
+    /// A route of a connection is identified by its destination block, so a connection that
+    /// already carries one for that block is left exactly as it is — including the move the
+    /// clock already owes it, which repeating the request must not push further out. A route
+    /// this call adds is `pending`, the non-terminal `VpnState` of a route being brought up,
+    /// with the clock owing it [`VPN_STATE_AVAILABLE`] one [`TRANSITION_DELAY`] later.
+    ///
+    /// Reach it through [`ComAmazonawsEc2Amazonec2State::put_vpn_static_route`], which also
+    /// charges the bytes the route holds against the store's budget.
+    fn put_static_route(&mut self, destination_cidr_block: &str) -> VpnStaticRoute {
+        if let Some(route) = self.route(destination_cidr_block) {
+            return route.clone();
+        }
+        let route = VpnStaticRoute {
+            destination_cidr_block: Some(destination_cidr_block.to_string()),
+            source: Some(VPN_STATIC_ROUTE_SOURCE_STATIC.to_string()),
+            state: Some(VPN_STATE_PENDING.to_string()),
+        };
+        self.view
+            .routes
+            .get_or_insert_with(Vec::new)
+            .push(route.clone());
+        self.route_moves.insert(
+            destination_cidr_block.to_string(),
+            PendingStateMove::starting_now(VPN_STATE_AVAILABLE),
+        );
+        route
+    }
+}
+
+/// The store's VPN connections, and the one way a connection and a static route are
+/// written. Kept in this section, beside the record they write, rather than in one of the
+/// module's shared `impl` blocks.
+///
+/// [`Self::has_vpn_connection_capacity`] and [`Self::insert_vpn_connection`] are the one
+/// write path for a CONNECTION, and nothing in `src/ops/` reaches them yet: the operation
+/// that will is `CreateVpnConnection`, still a scaffold under its own issue, so today the
+/// only caller is the test harness that seeds a connection for the route and describe
+/// operations. A reader should not take their existence for "an operation already mints
+/// connections".
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another VPN connection fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of
+    /// [`Self::has_transit_gateway_attachment_capacity`] — asked by the writer that mints a
+    /// connection, which is `CreateVpnConnection` once it is implemented.
+    pub fn has_vpn_connection_capacity(&self) -> bool {
+        self.vpn_connections.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// The VPN connection `vpn_connection_id` names, if this account holds one.
+    pub fn vpn_connection(&self, vpn_connection_id: &str) -> Option<&VpnConnectionRecord> {
+        self.vpn_connections.get(vpn_connection_id)
+    }
+
+    /// Store a VPN connection and answer the `VpnConnectionId` it was given — or `None`
+    /// when the store is at [`MAX_STORED_RECORDS_PER_STORE`] and NOTHING was stored.
+    ///
+    /// The id is minted here rather than taken from `view`, the way
+    /// [`Self::insert_transit_gateway_attachment`] mints an attachment id, and the
+    /// caller-chosen bytes the record holds are charged on top of the fixed
+    /// [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs. Its first production
+    /// caller will be `CreateVpnConnection`, which will also charge the members only a
+    /// create can set; until then it is reached from the test harness alone.
+    pub fn insert_vpn_connection(&mut self, mut view: VpnConnection) -> Option<String> {
+        if !self.has_vpn_connection_capacity() {
+            return None;
+        }
+        let vpn_connection_id = self.next_id(VPN_CONNECTION_ID_PREFIX);
+        view.vpn_connection_id = Some(vpn_connection_id.clone());
+        let record = VpnConnectionRecord {
+            view,
+            route_moves: BTreeMap::new(),
+        };
+        self.add_stored_bytes(STORED_RECORD_OVERHEAD_BYTES + record.payload_bytes());
+        self.vpn_connections
+            .insert(vpn_connection_id.clone(), record);
+        Some(vpn_connection_id)
+    }
+
+    /// Put the static route for `destination_cidr_block` into the connection
+    /// `vpn_connection_id` names and answer it as it now stands — or `None` when this
+    /// account holds no such connection, in which case nothing was written.
+    ///
+    /// The ONE place a static route is stored, so the state it starts in, the move the clock
+    /// owes it and the bytes it charges cannot be built two ways.
+    pub fn put_vpn_static_route(
+        &mut self,
+        vpn_connection_id: &str,
+        destination_cidr_block: &str,
+    ) -> Option<VpnStaticRoute> {
+        let record = self.vpn_connections.get_mut(vpn_connection_id)?;
+        let held = record.route(destination_cidr_block).is_some();
+        let route = record.put_static_route(destination_cidr_block);
+        if !held {
+            // A route already held was not stored a second time, so it charges nothing more.
+            self.add_stored_bytes(destination_cidr_block.len());
+        }
+        Some(route)
     }
 }
 
