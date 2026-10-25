@@ -61,6 +61,8 @@ mod invalidation_list;
 mod key_value_store_lifecycle;
 #[path = "all/key_value_store_update.rs"]
 mod key_value_store_update;
+#[path = "all/managed_certificate_details.rs"]
+mod managed_certificate_details;
 #[path = "all/monitoring_subscription.rs"]
 mod monitoring_subscription;
 #[path = "all/origin_access_control_delete.rs"]
