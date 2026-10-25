@@ -212,6 +212,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // So a manager whose teardown has come due is gone before this request looks
+        // for it, rather than being tagged on its way out of the store.
+        store.settle(now);
 
         // The configuration manager is this service's only ARN-addressable resource, so
         // an ARN naming no stored manager names no taggable resource at all.
@@ -226,6 +229,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A manager whose teardown the service has accepted is on its way out, so it
+        // takes no further mutation — tags included — while that teardown is in flight.
+        if manager.is_deleting() {
+            return Err(TagResourceErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::TEARDOWN_IN_FLIGHT_MESSAGE.to_string()),
+            })
+            .into());
+        }
 
         // One resource holds at most `MAX_TAGS` tags however they were assigned, so what
         // the bound applies to is the set this request would LEAVE stored: a pair whose
