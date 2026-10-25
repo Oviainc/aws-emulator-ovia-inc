@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AuthorizeVpcEndpointAccess
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AuthorizeVpcEndpointAccess`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AuthorizeVpcEndpointAccess::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Grants ONE principal — an Amazon Web Services account or a service — access to a
+//! domain through an interface VPC endpoint, and persists it in that domain's
+//! [`crate::state::Domain::vpc_endpoint_access`] set: the same record
+//! `ListVpcEndpointAccess` reports.
+//!
+//! The principal IS the identity of the authorization, so authorizing a principal a
+//! domain already allows replaces that one record rather than adding a second.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +84,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    PRINCIPAL_TYPE_AWS_ACCOUNT, PRINCIPAL_TYPE_AWS_SERVICE, VPC_ENDPOINT_ACCESS_QUOTA,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -158,18 +161,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AuthorizeVpcEndpointAccess` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AuthorizeVpcEndpointAccessErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AuthorizeVpcEndpointAccess"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        // Which principal is being authorized is decided from the request alone, before
+        // the store is touched, so a request that names no principal — or two — changes
+        // nothing.
+        let principal = requested_principal(input.account, input.service)?;
+
+        let mut store = state.lock();
+        // Access is access TO a domain, so a name the registry does not resolve names
+        // nothing that can be reached: the modelled missing-resource refusal rather
+        // than an authorization held against no domain.
+        let domain = store.domains.get_mut(&input.domain_name).ok_or_else(|| {
+            AuthorizeVpcEndpointAccessErrorModeled::ResourceNotFoundException(
+                crate::state::domain_not_found(&input.domain_name),
+            )
+        })?;
+
+        // The set is BOUNDED: past the quota a further principal is refused rather than
+        // stored, which is what stops a caller looping with fresh principals from
+        // growing the state without end. Re-authorizing a principal the domain already
+        // allows replaces its one record, so the bound never refuses it — it does not
+        // grow the set.
+        if !domain.vpc_endpoint_access.contains_key(&principal.id)
+            && domain.vpc_endpoint_access.len() >= VPC_ENDPOINT_ACCESS_QUOTA
+        {
+            return Err(AuthorizeVpcEndpointAccessErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Domain {} already allows the maximum of {VPC_ENDPOINT_ACCESS_QUOTA} principals to access it through an interface VPC endpoint",
+                        input.domain_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let record = AuthorizedPrincipal {
+            principal_type: Some(principal.principal_type.to_string()),
+            principal: Some(principal.id.clone()),
+            // Recorded with the authorization, so a later listing reports the options
+            // this call granted it under rather than nothing.
+            service_options: input.service_options,
+        };
+        // The answer IS the record this call stored, so this grant's answer and a later
+        // `ListVpcEndpointAccess` of the same domain cannot disagree about it.
+        domain
+            .vpc_endpoint_access
+            .insert(principal.id, record.clone());
+
+        Ok(AuthorizeVpcEndpointAccessOutput {
+            authorized_principal: record,
+        })
+    }
+}
+
+/// The principal a request names: what kind of principal it is, and the identity that
+/// names it.
+struct RequestedPrincipal {
+    /// One of `PrincipalType`'s values.
+    principal_type: &'static str,
+    /// `AuthorizedPrincipal$Principal`, and the key the domain's set holds it under.
+    id: String,
+}
+
+/// The principal `Account` and `Service` name, or the refusal for a request that names
+/// no principal or more than one.
+///
+/// An authorization is one principal's access to the domain and the answer carries
+/// exactly one `AuthorizedPrincipal`, whose `PrincipalType` says which of the two kinds
+/// it is — so a request names EXACTLY one of them. Both members are optional in the
+/// model and nothing in it relates them, so neither combination is refused at the
+/// request boundary: it is this operation's own modelled `ValidationException` that
+/// refuses them, with 400.
+fn requested_principal(
+    account: Option<String>,
+    service: Option<String>,
+) -> Result<RequestedPrincipal, AuthorizeVpcEndpointAccessError> {
+    match (account, service) {
+        (Some(account), None) => Ok(RequestedPrincipal {
+            principal_type: PRINCIPAL_TYPE_AWS_ACCOUNT,
+            id: account,
+        }),
+        (None, Some(service)) => Ok(RequestedPrincipal {
+            principal_type: PRINCIPAL_TYPE_AWS_SERVICE,
+            id: service,
+        }),
+        (None, None) => Err(AuthorizeVpcEndpointAccessErrorModeled::ValidationException(
+            ValidationException {
+                message: Some(
+                    "either Account or Service is required: it names the principal being \
+                     granted access to the domain"
+                        .to_string(),
+                ),
+            },
+        )
+        .into()),
+        (Some(_), Some(_)) => Err(AuthorizeVpcEndpointAccessErrorModeled::ValidationException(
+            ValidationException {
+                message: Some(
+                    "Account and Service are mutually exclusive: one call grants access \
+                     to one principal"
+                        .to_string(),
+                ),
+            },
+        )
+        .into()),
     }
 }

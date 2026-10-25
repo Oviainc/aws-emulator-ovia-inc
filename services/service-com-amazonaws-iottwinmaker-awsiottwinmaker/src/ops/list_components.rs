@@ -29,8 +29,9 @@
 //! listing did not mint is refused with the modelled `ValidationException` (HTTP 400).
 //!
 //! This is a REPORTING operation: it writes nothing. A component has no lifecycle of its
-//! own and an entity settles `ACTIVE` inside its own create (see
-//! [`crate::state::Entity`]), so the clock owes this call no transition to materialise.
+//! own, so it reports the status of the entity that holds it — that entity's stored state
+//! with the transition the clock has already made due applied, which
+//! [`crate::state::Entity::state_at`] computes without writing anything back.
 //!
 //! The modelled `AccessDeniedException` and `ThrottlingException` are deliberately
 //! unreachable here: this emulator models no caller principal and no rate state, so
@@ -295,8 +296,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A component has no lifecycle of its own in this service, so it reports
         // the status of the entity that holds it — the status `GetEntity`
-        // reports for the very same component.
-        let status = entity.status();
+        // reports for the very same component, the stored state with the
+        // transition the clock has already made due applied.
+        let status = entity.status(::std::time::SystemTime::now());
         // Both stores the scope comes from are keyed so that iteration IS name
         // order (a composite component's key ends in its own name), so resuming
         // is a skip to the first name at or past the token's.

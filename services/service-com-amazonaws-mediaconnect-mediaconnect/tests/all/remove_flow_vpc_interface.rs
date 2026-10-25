@@ -24,10 +24,9 @@ use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
 use crate::flow_lifecycle::Emulator;
 use crate::flow_outputs::unknown_flow_arn;
-
-/// A role the VPC interface requests below name. `VpcInterfaceRequest$RoleArn` is "the
-/// ARN of the role that you created when you set up MediaConnect as a trusted service".
-const ROLE_ARN: &str = "arn:aws:iam::111122223333:role/MediaConnect";
+// The crate's one builder of a `VpcInterfaceRequest`, beside AddFlowVpcInterfaces' cases,
+// so both suites fill a flow with the same request shape.
+use crate::flow_vpc_interfaces::{vpc_interface_request as vpc_interface_request_with, SUBNET_ID};
 
 /// `DELETE /v1/flows/{FlowArn}/vpcInterfaces/{VpcInterfaceName}` — the
 /// RemoveFlowVpcInterface binding
@@ -49,21 +48,22 @@ async fn remove_vpc_interface(
 /// One VPC interface request, in the shape `CreateFlowRequest$VpcInterfaces` takes
 /// (`smithy_query(query="shape",shape="VpcInterfaceRequest")`: `Name`, `RoleArn`,
 /// `SecurityGroupIds` and `SubnetId` required, `NetworkInterfaceType` optional).
+///
+/// Built through [`crate::flow_vpc_interfaces::vpc_interface_request`], the crate's one
+/// builder of the shape, with the two members these cases do not vary: the subnet, and no
+/// `VpcInterfaceTags`.
 fn vpc_interface_request(
     name: &str,
     network_interface_type: Option<&str>,
     security_group_ids: &[&str],
 ) -> Value {
-    let mut request = json!({
-        "name": name,
-        "roleArn": ROLE_ARN,
-        "securityGroupIds": security_group_ids,
-        "subnetId": "subnet-0123456789abcdef0"
-    });
-    if let Some(network_interface_type) = network_interface_type {
-        request["networkInterfaceType"] = json!(network_interface_type);
-    }
-    request
+    vpc_interface_request_with(
+        name,
+        network_interface_type,
+        security_group_ids,
+        SUBNET_ID,
+        None,
+    )
 }
 
 /// `count` VPC interface requests named `vpc-<n>` from 0, each with the default network
@@ -107,7 +107,14 @@ async fn create_flow_with_vpc_interfaces(
 }
 
 /// The flow's stored VPC interfaces, as DescribeFlow reports them.
-async fn described_vpc_interfaces(emulator: &Emulator, case: &str, flow_arn: &str) -> Vec<Value> {
+///
+/// `pub(crate)` because `tests/all/flow_vpc_interfaces.rs` reads a flow's VPC interfaces
+/// back through the same reader.
+pub(crate) async fn described_vpc_interfaces(
+    emulator: &Emulator,
+    case: &str,
+    flow_arn: &str,
+) -> Vec<Value> {
     let (status, code, described) = emulator.describe_flow(flow_arn).await;
     assert_eq!(
         (status, code.as_deref()),
@@ -122,7 +129,12 @@ async fn described_vpc_interfaces(emulator: &Emulator, case: &str, flow_arn: &st
 
 /// The flow as DescribeFlow reports it, with its VPC interfaces removed — what a removal
 /// must leave untouched.
-async fn described_flow_without_vpc_interfaces(emulator: &Emulator, flow_arn: &str) -> Value {
+///
+/// `pub(crate)` because `tests/all/flow_vpc_interfaces.rs` asserts the same of an add.
+pub(crate) async fn described_flow_without_vpc_interfaces(
+    emulator: &Emulator,
+    flow_arn: &str,
+) -> Value {
     let (_, _, described) = emulator.describe_flow(flow_arn).await;
     let mut flow = described["flow"].clone();
     if let Some(object) = flow.as_object_mut() {

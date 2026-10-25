@@ -47,7 +47,11 @@ const DEFAULT_HTTP_TIMEOUT_MILLIS: i64 = 30_000;
 
 /// Call `ImportApi`: `PUT /v2/apis` with the definition in the `Body` member and `query`
 /// (`""`, or `"?basepath=split"`) carrying the operation's query members.
-async fn import(router: &MultiServiceRouter, query: &str, definition: &str) -> (u16, Value) {
+pub(crate) async fn import(
+    router: &MultiServiceRouter,
+    query: &str,
+    definition: &str,
+) -> (u16, Value) {
     call(
         router,
         "PUT",
@@ -58,7 +62,10 @@ async fn import(router: &MultiServiceRouter, query: &str, definition: &str) -> (
 }
 
 /// Every route of an api, as `RouteKey -> Target`, read back through `GetRoutes`.
-async fn stored_routes(router: &MultiServiceRouter, api_id: &str) -> BTreeMap<String, Option<String>> {
+pub(crate) async fn stored_routes(
+    router: &MultiServiceRouter,
+    api_id: &str,
+) -> BTreeMap<String, Option<String>> {
     let (status, body) = call(router, "GET", &format!("/v2/apis/{api_id}/routes"), None).await;
     assert_eq!(
         status, 200,
@@ -83,7 +90,10 @@ async fn stored_routes(router: &MultiServiceRouter, api_id: &str) -> BTreeMap<St
 
 /// Every integration of an api, as `IntegrationId -> Integration`, read back through
 /// `GetIntegrations`.
-async fn stored_integrations(router: &MultiServiceRouter, api_id: &str) -> BTreeMap<String, Value> {
+pub(crate) async fn stored_integrations(
+    router: &MultiServiceRouter,
+    api_id: &str,
+) -> BTreeMap<String, Value> {
     let (status, body) = call(
         router,
         "GET",

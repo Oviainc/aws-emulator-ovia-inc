@@ -39,6 +39,8 @@ mod graphql_api_update;
 mod resource_tags;
 #[path = "all/source_api_association.rs"]
 mod source_api_association;
+#[path = "all/source_api_disassociation.rs"]
+mod source_api_disassociation;
 #[path = "all/source_graphql_api_association.rs"]
 mod source_graphql_api_association;
 #[path = "all/state_roundtrip.rs"]

@@ -153,6 +153,14 @@ impl JobCase {
         }
     }
 
+    /// The same create carrying `tags` as the job's tag set, for a suite that
+    /// drives the job's tagging sub-resource over a job created already
+    /// tagged.
+    pub(crate) fn with_tags(mut self, tags: &'static [(&'static str, &'static str)]) -> Self {
+        self.tags = tags;
+        self
+    }
+
     fn request_body(&self, client_request_token: &str) -> String {
         let mut xml = format!("<CreateJobRequest xmlns=\"{XMLNS}\">");
         xml.push_str(&format!(

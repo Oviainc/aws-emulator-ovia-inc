@@ -29,6 +29,8 @@ mod billing_group_cost_report;
 mod billing_transfer_preference;
 #[path = "all/custom_line_item_and_create_name_refusals.rs"]
 mod custom_line_item_and_create_name_refusals;
+#[path = "all/custom_line_item_billing_group_scope.rs"]
+mod custom_line_item_billing_group_scope;
 #[path = "all/custom_line_item_tag_lifecycle.rs"]
 mod custom_line_item_tag_lifecycle;
 #[path = "all/delete_custom_line_item.rs"]

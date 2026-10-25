@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetExperimentRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetExperimentRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetExperimentRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports one experiment run of one experiment definition, out of the
+//! record the start of that run wrote. Reporting only — nothing here writes.
 //!
 //! ## Shape of an operation
 //!
@@ -162,20 +155,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetExperimentRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetExperimentRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetExperimentRun"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetExperimentRunErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        // Reporting only: the guard is taken for reading, and nothing below writes, so
+        // this read cannot change what a later caller sees.
+        let store = state.lock();
+
+        // Both path identifiers are `Identifier`s — the resource's "ID or name" — so the
+        // run is reached however its application and definition are addressed.
+        let Some(application) = store.resolve_application(&input.application_identifier) else {
+            return Err(GetExperimentRunErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::application_not_found(
+                        &input.application_identifier,
+                    )),
+                    resource_name: Some(input.application_identifier),
+                },
+            )
+            .into());
+        };
+        let Some(definition) =
+            application.resolve_experiment_definition(&input.experiment_definition_identifier)
+        else {
+            return Err(GetExperimentRunErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::experiment_definition_not_found(
+                        &input.application_identifier,
+                        &input.experiment_definition_identifier,
+                    )),
+                    resource_name: Some(input.experiment_definition_identifier),
+                },
+            )
+            .into());
+        };
+        // A run number the definition never issued addresses no run, and neither does one
+        // whose record the definition no longer holds.
+        let Some(run) = definition.runs.get(&input.run) else {
+            return Err(GetExperimentRunErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::experiment_run_not_found(
+                        &input.application_identifier,
+                        &input.experiment_definition_identifier,
+                        input.run,
+                    )),
+                    resource_name: Some(input.run.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Every member is read out of the stored run, so this reports exactly what the
+        // start of the run wrote and every later read reports the same.
+        Ok(GetExperimentRunOutput {
+            application_id: Some(run.application_id.clone()),
+            experiment_definition_id: Some(run.experiment_definition_id.clone()),
+            run: run.run,
+            description: run.description.clone(),
+            status: Some(run.status.clone()),
+            exposure_percentage: run.exposure_percentage,
+            treatment_overrides: run.treatment_overrides.clone(),
+            result: run.result.clone(),
+            started_at: Some(crate::state::to_date_time(run.started_at)),
+            updated_at: Some(crate::state::to_date_time(run.updated_at)),
+            ended_at: run.ended_at.map(crate::state::to_date_time),
+            experiment_definition_snapshot: Some(run.definition_snapshot.clone()),
+        })
     }
 }

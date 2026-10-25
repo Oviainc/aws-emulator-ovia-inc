@@ -34,10 +34,10 @@ use crate::user_lifecycle::{call, element, elements, error_code, router};
 /// A trust policy with a single statement — the form `CreateRole`'s own modelled
 /// example carries. Every role in this suite is created with it; none of these
 /// assertions is about the trust policy.
-const TRUST_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"dlm.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#;
+pub(crate) const TRUST_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"dlm.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#;
 
 /// Own one row's tag list, which a table row builds from literals.
-fn tags(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+pub(crate) fn tags(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     pairs
         .iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))
@@ -46,7 +46,10 @@ fn tags(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 
 /// The `Tags.member.N.Key`/`.Value` parameters of an awsQuery tag list, after the
 /// parameters `leading` carries.
-fn with_tag_params(leading: Vec<(String, String)>, list: &[(String, String)]) -> Vec<(String, String)> {
+pub(crate) fn with_tag_params(
+    leading: Vec<(String, String)>,
+    list: &[(String, String)],
+) -> Vec<(String, String)> {
     let mut params = leading;
     for (index, (key, value)) in list.iter().enumerate() {
         let position = index + 1;
@@ -57,7 +60,11 @@ fn with_tag_params(leading: Vec<(String, String)>, list: &[(String, String)]) ->
 }
 
 /// Create the role `role_name` carrying `initial`, asserting the create succeeded.
-async fn create_role(router: &MultiServiceRouter, role_name: &str, initial: &[(String, String)]) {
+pub(crate) async fn create_role(
+    router: &MultiServiceRouter,
+    role_name: &str,
+    initial: &[(String, String)],
+) {
     let params = with_tag_params(
         vec![
             param("RoleName", role_name),
@@ -73,7 +80,7 @@ async fn create_role(router: &MultiServiceRouter, role_name: &str, initial: &[(S
 }
 
 /// One `TagRole` call: the HTTP status and the XML body.
-async fn tag_role(
+pub(crate) async fn tag_role(
     router: &MultiServiceRouter,
     role_name: &str,
     list: &[(String, String)],
@@ -84,7 +91,7 @@ async fn tag_role(
 
 /// The tag set `GetRole` reports for `role_name`, as a map, plus how many `<Key>`
 /// elements the response carried — so a duplicated key cannot hide inside a map.
-async fn stored_tags(
+pub(crate) async fn stored_tags(
     router: &MultiServiceRouter,
     role_name: &str,
 ) -> (BTreeMap<String, String>, usize) {
@@ -97,7 +104,7 @@ async fn stored_tags(
 }
 
 /// `expected` as the map `GetRole` must report.
-fn expected_map(expected: &[(String, String)]) -> BTreeMap<String, String> {
+pub(crate) fn expected_map(expected: &[(String, String)]) -> BTreeMap<String, String> {
     expected.iter().cloned().collect()
 }
 
