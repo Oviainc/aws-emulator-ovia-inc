@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTaskSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTaskSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTaskSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a task set in a service that takes its tasks from one — a service whose
+//! deployment controller is not the ECS scheduler — and reports it. The stored record
+//! holds the requested configuration, and the scheduler places the
+//! `computedDesiredCount` tasks the service's desired count and the task set's `scale`
+//! come to, so `DescribeTaskSets` reads the same scale and the same counts back.
 //!
 //! ## Shape of an operation
 //!
@@ -225,18 +221,313 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTaskSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTaskSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTaskSet"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateTaskSetErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        // "The value, specified as a percent total of a service's desiredCount, to scale
+        // the task set. Accepted values are numbers between 0 and 100" — a percentage
+        // outside that range describes no task set, so nothing is created for it.
+        if let Some(scale) = input.scale.as_ref() {
+            if let Some(message) = crate::state::scale_violation(scale) {
+                return Err(CreateTaskSetErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "It must be unique and is case sensitive. Up to 36 ASCII characters in the
+        // range of 33-126 (inclusive) are allowed."
+        if let Some(message) = input
+            .client_token
+            .as_deref()
+            .and_then(crate::state::client_token_violation)
+        {
+            return Err(CreateTaskSetErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // "If a capacityProviderStrategy is specified, the launchType parameter must be
+        // omitted."
+        let requested_strategy = input.capacity_provider_strategy.clone().unwrap_or_default();
+        if !requested_strategy.is_empty() && input.launch_type.is_some() {
+            return Err(CreateTaskSetErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        "launchType must be omitted when capacityProviderStrategy is \
+                         specified"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "The platform version that the tasks in the task set uses ... If one isn't
+        // specified, the LATEST platform version is used": a version this service does
+        // not know names no platform.
+        if crate::state::is_unknown_platform_version(input.platform_version.as_deref()) {
+            return Err(CreateTaskSetErrorModeled::PlatformUnknownException(
+                PlatformUnknownException {
+                    message: Some(crate::state::PLATFORM_UNKNOWN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A caller-supplied tag may not write into the namespace Amazon Web Services
+        // keeps for its own tags, whichever operation carries the `tags` list.
+        if let Some(message) =
+            crate::state::reserved_tag_prefix_violation(input.tags.as_deref().unwrap_or_default())
+        {
+            return Err(CreateTaskSetErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // A service ARN carries the cluster that hosts it, so it names the cluster as
+        // well as the service; a short name takes the `cluster` member's.
+        let (arn_cluster, service_name) =
+            crate::state::cluster_and_service_from_reference(&input.service);
+        let cluster_name = arn_cluster
+            .unwrap_or_else(|| crate::state::cluster_name_from_reference(Some(&input.cluster)));
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        guard.advance_clock(now);
+
+        let Some(cluster) = guard.active_cluster(&cluster_name) else {
+            return Err(CreateTaskSetErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+        let cluster_arn = cluster.arn.clone();
+
+        let service_key = (cluster_name.clone(), service_name.clone());
+        let Some(service) = guard.services.get(&service_key).cloned() else {
+            return Err(CreateTaskSetErrorModeled::ServiceNotFoundException(
+                ServiceNotFoundException {
+                    message: Some(crate::state::SERVICE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+        // "The specified service isn't active. You can't update a service that's
+        // inactive."
+        if !service.is_active() {
+            return Err(CreateTaskSetErrorModeled::ServiceNotActiveException(
+                ServiceNotActiveException {
+                    message: Some(format!(
+                        "service {service_name:?} is {} and cannot be updated",
+                        service.status
+                    )),
+                },
+            )
+            .into());
+        }
+        // "This is used when a service uses the EXTERNAL deployment controller type": a
+        // service whose own scheduler places its tasks (`ECS`) owns no task set at all,
+        // so there is nothing for this call to create in it.
+        if service.places_tasks() {
+            return Err(CreateTaskSetErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "A task set can only be created in a service that uses the \
+                         {} or {} deployment controller.",
+                        crate::state::DEPLOYMENT_CONTROLLER_EXTERNAL,
+                        crate::state::DEPLOYMENT_CONTROLLER_CODE_DEPLOY
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The task definition for the tasks in the task set to use. If a revision isn't
+        // specified, the latest ACTIVE revision is used."
+        let Some((family, revision)) =
+            crate::state::parse_task_definition_reference(&input.task_definition)
+        else {
+            return Err(CreateTaskSetErrorModeled::ClientException(ClientException {
+                message: Some(crate::state::task_definition_reference_message(
+                    &input.task_definition,
+                )),
+            })
+            .into());
+        };
+        let definition = match guard.usable_revision(&family, revision) {
+            Ok(definition) => definition.clone(),
+            Err(refusal) => {
+                let message = Some(refusal.message().to_string());
+                return Err(match refusal {
+                    crate::state::TaskDefinitionRefusal::Inactive => {
+                        CreateTaskSetErrorModeled::InvalidParameterException(
+                            InvalidParameterException { message },
+                        )
+                    }
+                    crate::state::TaskDefinitionRefusal::NotFound => {
+                        CreateTaskSetErrorModeled::ClientException(ClientException { message })
+                    }
+                }
+                .into());
+            }
+        };
+
+        // An `awsvpc` task gets its own elastic network interface, so the task set has to
+        // say which subnets and security groups it takes — the same cross-field rule
+        // `CreateService` and `RunTask` check against the REGISTERED revision.
+        if let Some(message) = crate::state::network_configuration_violation(
+            &definition.network_mode,
+            input.network_configuration.as_ref(),
+        ) {
+            return Err(CreateTaskSetErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        // A revision is placed with a launch type only where it was validated against it
+        // (`TaskDefinition$compatibilities`).
+        if let Some(launch_type) = input.launch_type.as_deref() {
+            if let Err(message) = crate::state::validate_launch_type(&definition, launch_type) {
+                return Err(CreateTaskSetErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "An identifier that you provide to ensure the idempotency of the request": the
+        // same token in the same service is the SAME create, so the stored task set is
+        // reported back unchanged rather than a second one being minted.
+        if let Some(token) = input.client_token.as_deref() {
+            let existing = guard
+                .service_task_sets(&cluster_name, &service_name)
+                .into_iter()
+                .find(|task_set| task_set.client_token.as_deref() == Some(token))
+                .cloned();
+            if let Some(existing) = existing {
+                let view = guard.task_set_view(&existing, crate::state::TaskSetFields::all());
+                return Ok(CreateTaskSetOutput {
+                    task_set: Some(view),
+                });
+            }
+        }
+
+        // "For information about the maximum number of task sets and other quotas, see
+        // Amazon ECS service quotas": a service holds at most
+        // `MAX_TASK_SETS_PER_SERVICE`, which is what `LimitExceededException` is
+        // modelled for.
+        if guard.service_task_sets(&cluster_name, &service_name).len()
+            >= crate::state::MAX_TASK_SETS_PER_SERVICE
+        {
+            return Err(CreateTaskSetErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "A service holds at most {} task sets.",
+                        crate::state::MAX_TASK_SETS_PER_SERVICE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "If no capacityProviderStrategy or launchType is specified, the
+        // defaultCapacityProviderStrategy for the cluster is used" — and when the cluster
+        // has none either, the task set runs on the EC2 capacity registered to it.
+        let effective_strategy = if requested_strategy.is_empty() {
+            guard
+                .active_cluster(&cluster_name)
+                .map(|cluster| cluster.default_capacity_provider_strategy.clone())
+                .unwrap_or_default()
+        } else {
+            requested_strategy
+        };
+        let (launch_type, capacity_provider_strategy) = match input.launch_type.clone() {
+            Some(launch_type) => (Some(launch_type), Vec::new()),
+            None if effective_strategy.is_empty() => (
+                Some(crate::state::DEFAULT_LAUNCH_TYPE.to_string()),
+                Vec::new(),
+            ),
+            None => (None, effective_strategy),
+        };
+
+        let created_at = crate::state::now();
+        let id = guard.next_task_set_id();
+        let record = crate::state::TaskSetRecord {
+            arn: crate::state::task_set_arn(&region, &cluster_name, &service_name, &id),
+            id,
+            cluster_name: cluster_name.clone(),
+            cluster_arn,
+            service_name: service_name.clone(),
+            service_arn: service.arn.clone(),
+            external_id: input.external_id.clone(),
+            // A created task set is not serving production traffic yet:
+            // `UpdateServicePrimaryTaskSet` is what promotes one to `PRIMARY`.
+            status: crate::state::TASK_SET_ACTIVE.to_string(),
+            task_definition_arn: definition.arn.clone(),
+            task_definition: (definition.family.clone(), definition.revision),
+            launch_type,
+            capacity_provider_strategy,
+            platform_version: input.platform_version.clone(),
+            // The members Amazon ECS materialises into the network configuration it
+            // STORES (`assignPublicIp`) are rendered once, here, so every read reports
+            // the same configuration.
+            network_configuration: crate::state::defaulted_network_configuration(
+                input.network_configuration.as_ref(),
+            ),
+            load_balancers: input.load_balancers.clone().unwrap_or_default(),
+            service_registries: input.service_registries.clone().unwrap_or_default(),
+            scale: crate::state::stored_scale(input.scale.as_ref()),
+            tags: input.tags.clone().unwrap_or_default(),
+            client_token: input.client_token.clone(),
+            created_at,
+            updated_at: created_at,
+        };
+        let key = record.key();
+        guard.task_sets.insert(key.clone(), record);
+
+        // The scheduler places the task set's tasks now — the call that changes what the
+        // task set wants is what runs it.
+        if guard.scale_task_set(&key, &definition, &region, now).is_err() {
+            guard.task_sets.remove(&key);
+            return Err(CreateTaskSetErrorModeled::ClientException(ClientException {
+                message: Some(format!(
+                    "this emulator holds at most {} tasks; stop some before placing \
+                     another task set",
+                    crate::state::MAX_TASKS
+                )),
+            })
+            .into());
+        }
+
+        let stored = guard
+            .task_sets
+            .get(&key)
+            .expect("the task set was just inserted");
+        // `CreateTaskSet` has no `include` member to narrow the response with, so the
+        // task set it just created is reported with the tags it was created with.
+        let view = guard.task_set_view(stored, crate::state::TaskSetFields::all());
+        Ok(CreateTaskSetOutput {
+            task_set: Some(view),
+        })
     }
 }
