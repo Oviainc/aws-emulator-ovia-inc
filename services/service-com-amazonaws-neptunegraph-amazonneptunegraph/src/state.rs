@@ -331,6 +331,20 @@ impl GraphData {
         self.statistics_computed_at = as_of;
     }
 
+    /// This data as the data of a graph that is coming up holding it: the same
+    /// nodes and edges, with the statistics over them computed `as_of` the instant
+    /// that graph came up.
+    ///
+    /// What a restore reads a snapshot's captured data through: the new graph's data
+    /// is the captured data, and the statistics over it are the ones the new graph
+    /// came up with rather than the ones the graph it was captured from had. It
+    /// CONSUMES the data, so the one copy taken off the snapshot becomes the new
+    /// graph's own rather than being duplicated again.
+    pub fn into_as_of(mut self, as_of: SystemTime) -> Self {
+        self.statistics_computed_at = as_of;
+        self
+    }
+
     /// The distinct labels of the edges LEAVING `node_id`.
     ///
     /// Derived from the edges rather than stored on the node, so it cannot disagree
@@ -442,6 +456,38 @@ impl Graph {
     }
 }
 
+/// The configuration of one graph: the members that describe how it is provisioned
+/// and reachable, as opposed to its identity, its lifecycle or its data.
+///
+/// A snapshot carries the configuration of the graph it was taken from
+/// ([`Snapshot::source_configuration`]), because a graph restored from a snapshot
+/// reports these members whether or not the restore request carries a value for them:
+/// `RestoreGraphFromSnapshot` accepts no `vectorSearchConfiguration` member at all yet
+/// reports one (`smithy_query(query="operation",
+/// operation="RestoreGraphFromSnapshot")`), so the value can only come from the
+/// snapshot, and the members it does accept override the captured value rather than
+/// replacing a graph's configuration with defaults.
+#[derive(Debug, Clone)]
+pub struct GraphConfiguration {
+    pub provisioned_memory: i32,
+    pub public_connectivity: bool,
+    pub replica_count: i32,
+    pub deletion_protection: bool,
+    pub vector_search_configuration: Option<VectorSearchConfiguration>,
+}
+
+impl From<&Graph> for GraphConfiguration {
+    fn from(graph: &Graph) -> Self {
+        Self {
+            provisioned_memory: graph.provisioned_memory,
+            public_connectivity: graph.public_connectivity,
+            replica_count: graph.replica_count,
+            deletion_protection: graph.deletion_protection,
+            vector_search_configuration: graph.vector_search_configuration.clone(),
+        }
+    }
+}
+
 /// The lifecycle statuses this slice of the emulator puts a graph snapshot into.
 ///
 /// Every variant's wire form is one of the modelled `SnapshotStatus` values
@@ -493,6 +539,21 @@ pub struct Snapshot {
     /// When the pending `CREATING` -> `AVAILABLE` transition falls due. `None` once
     /// there is nothing outstanding.
     pub settles_at: Option<Instant>,
+    /// The configuration of the source graph AS IT WAS when the snapshot was taken:
+    /// what a graph restored from this snapshot is provisioned with, member by
+    /// member, unless the restore request overrides it.
+    ///
+    /// Captured here rather than looked up on the source graph, because a snapshot
+    /// outlives the graph it was taken from and that graph can be reconfigured
+    /// afterwards: a restore reproduces the snapshotted graph, not the current one.
+    pub source_configuration: GraphConfiguration,
+    /// The nodes and edges the source graph held when the snapshot was taken: the
+    /// data a graph restored from this snapshot comes up holding.
+    ///
+    /// Captured for the same reason [`Self::source_configuration`] is — a snapshot is
+    /// a copy of the data as of the instant it was taken, which later writes to the
+    /// source graph (and the deletion of that graph) leave untouched.
+    pub data: GraphData,
 }
 
 impl Snapshot {
@@ -2511,6 +2572,7 @@ graph_record_output!(
     DeleteGraphOutput,
     StopGraphOutput,
     StartGraphOutput,
+    RestoreGraphFromSnapshotOutput,
 );
 
 /// `GraphSummary` is the listing projection of the same record: it carries no
@@ -3504,6 +3566,8 @@ mod tests {
                 kms_key_identifier: SERVICE_OWNED_KMS_KEY.to_string(),
                 tags: BTreeMap::new(),
                 settles_at: None,
+                source_configuration: sample_configuration(),
+                data: GraphData::empty(SystemTime::UNIX_EPOCH),
             });
         }
 
@@ -3584,6 +3648,12 @@ mod tests {
             "case after deleting eu-west-1's 'shared': expected us-east-1's graph to \
              keep its name, got {named:?}"
         );
+    }
+
+    /// The captured source-graph configuration a stored snapshot of
+    /// [`sample_graph`] carries.
+    fn sample_configuration() -> GraphConfiguration {
+        GraphConfiguration::from(&sample_graph("g-0123456789", "arn", "us-east-1"))
     }
 
     /// A stored graph with the members every test here needs and nothing else set.
@@ -3925,6 +3995,8 @@ mod tests {
             kms_key_identifier: SERVICE_OWNED_KMS_KEY.to_string(),
             tags: BTreeMap::new(),
             settles_at: None,
+            source_configuration: sample_configuration(),
+            data: GraphData::empty(SystemTime::UNIX_EPOCH),
         }
     }
 
@@ -4037,6 +4109,8 @@ mod tests {
             kms_key_identifier: SERVICE_OWNED_KMS_KEY.to_string(),
             tags: [("env".to_string(), "prod".to_string())].into_iter().collect(),
             settles_at: None,
+            source_configuration: sample_configuration(),
+            data: GraphData::empty(SystemTime::UNIX_EPOCH),
         });
 
         // (case, the ARN a request names, the tag entries it must resolve to)
@@ -4092,6 +4166,8 @@ mod tests {
             kms_key_identifier: SERVICE_OWNED_KMS_KEY.to_string(),
             tags: BTreeMap::new(),
             settles_at: Some(now + PROVISIONING_SPAN),
+            source_configuration: sample_configuration(),
+            data: GraphData::empty(SystemTime::UNIX_EPOCH),
         };
 
         snapshot.settle(now);

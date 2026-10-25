@@ -497,10 +497,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 CreateEventSourceMappingErrorModeled::ResourceConflictException(
                     ResourceConflictException {
                         r#type: None,
-                        message: Some(format!(
-                            "An event source mapping of this event source and function already \
-                             exists. Update or delete the existing mapping with UUID {}",
-                            existing.uuid
+                        // The refusal names the pair that collided — the event source and
+                        // the function of the mapping that already exists — beside the
+                        // UUID it is updated or deleted by, so a client holding many
+                        // mappings can tell which one this call ran into.
+                        message: Some(crate::state::duplicate_event_source_mapping_message(
+                            existing.event_source_arn.as_deref().unwrap_or_default(),
+                            &existing.function_name,
+                            &existing.uuid,
                         )),
                     },
                 )

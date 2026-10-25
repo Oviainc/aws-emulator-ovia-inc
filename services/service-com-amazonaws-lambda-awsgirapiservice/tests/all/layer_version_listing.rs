@@ -378,8 +378,12 @@ async fn list_layer_versions_reports_every_version_newest_first() {
         );
 
         // Each entry carries exactly what the publish of THAT version answered, and the
-        // same values `GetLayerVersion` reads back.
-        for (item, publish_response) in listed.iter().zip(stored.iter().rev()) {
+        // same values `GetLayerVersion` reads back — except `Description`, which a listing
+        // reports only when the publish stated one (see below).
+        for (item, (publish_response, request)) in listed
+            .iter()
+            .zip(stored.iter().rev().zip(case.versions.iter().rev()))
+        {
             let version = publish_response
                 .get("Version")
                 .and_then(Value::as_i64)
@@ -402,9 +406,19 @@ async fn list_layer_versions_reports_every_version_newest_first() {
                 "LayerVersionArn",
                 Some(json!(format!("{}:{version}", layer_arn(REGION, case.name)))),
             );
+            // A LISTING entry carries the description only when the version carries one:
+            // an omitted `Description` stays absent from the entry, while the version's
+            // own reads (the publish answer and `GetLayerVersion`) default it to the empty
+            // string, so the entry and the read do not agree for a version published
+            // without one.
+            assert_member(
+                &case_name,
+                item,
+                "Description",
+                request.get("Description").cloned(),
+            );
             for member in [
                 "LayerVersionArn",
-                "Description",
                 "CreatedDate",
                 "LicenseInfo",
                 "CompatibleRuntimes",

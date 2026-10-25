@@ -7343,6 +7343,71 @@ pub fn container_service_power_names() -> String {
         .join(", ")
 }
 
+// ---------------------------------------------------------------------------
+// Container API metadata
+// ---------------------------------------------------------------------------
+
+/// The key one container-API metadatum carries its NAME under.
+///
+/// `ContainerServiceMetadataEntry` is modelled as a free `map<string, string>`
+/// (`smithy_query(query="shape",shape="ContainerServiceMetadataEntry")`), so the
+/// keys are not in the model: Lightsail publishes each metadatum as the pair
+/// `name`/`value`, which is the pair the documented way of reading this catalog
+/// selects on (`--query "metadata[?name=='lightsailctlVersion'].value"`).
+pub const CONTAINER_API_METADATA_NAME_KEY: &str = "name";
+
+/// The key one container-API metadatum carries its VALUE under. See
+/// [`CONTAINER_API_METADATA_NAME_KEY`].
+pub const CONTAINER_API_METADATA_VALUE_KEY: &str = "value";
+
+/// The metadatum that reports the current version of the Lightsail Control
+/// (lightsailctl) plugin — the one the modelled `metadata` member calls out
+/// ("Metadata about Lightsail containers, such as the current version of the
+/// Lightsail Control (lightsailctl) plugin").
+pub const CONTAINER_API_METADATA_LIGHTSAILCTL_VERSION: &str = "lightsailctlVersion";
+
+/// The lightsailctl plugin release this emulator's container API publishes, as
+/// that plugin's `major.minor.patch` version. It is the version a client compares
+/// its locally installed plugin against before pushing a container image.
+pub const LIGHTSAILCTL_VERSION: &str = "1.0.6";
+
+/// The container-API metadata catalog, as `(name, value)` pairs in the order the
+/// service reports them.
+///
+/// Service-wide published data, like the bundle and blueprint tables above: it is
+/// the same for every caller and no operation of this service creates, changes or
+/// retires an entry, so it lives here rather than in a per-account record.
+pub const CONTAINER_API_METADATA_SPECS: &[(&str, &str)] = &[(
+    CONTAINER_API_METADATA_LIGHTSAILCTL_VERSION,
+    LIGHTSAILCTL_VERSION,
+)];
+
+/// `specs` as the modelled entry list: one entry per metadatum, each a map of its
+/// name and its value under [`CONTAINER_API_METADATA_NAME_KEY`] and
+/// [`CONTAINER_API_METADATA_VALUE_KEY`].
+pub fn container_api_metadata_from(specs: &[(&str, &str)]) -> Vec<HashMap<String, String>> {
+    specs
+        .iter()
+        .map(|(name, value)| {
+            HashMap::from([
+                (
+                    CONTAINER_API_METADATA_NAME_KEY.to_string(),
+                    (*name).to_string(),
+                ),
+                (
+                    CONTAINER_API_METADATA_VALUE_KEY.to_string(),
+                    (*value).to_string(),
+                ),
+            ])
+        })
+        .collect()
+}
+
+/// The published container-API metadata catalog, as the modelled entry list.
+pub fn container_api_metadata() -> Vec<HashMap<String, String>> {
+    container_api_metadata_from(CONTAINER_API_METADATA_SPECS)
+}
+
 /// Documented defaults and bounds of a public endpoint's health check, each from
 /// its own member's documentation on `ContainerServiceHealthCheckConfig`:
 /// "The default value is `2`" (healthy and unhealthy thresholds, and the

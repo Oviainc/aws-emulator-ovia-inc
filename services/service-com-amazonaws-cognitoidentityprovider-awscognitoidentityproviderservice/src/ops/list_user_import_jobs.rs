@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListUserImportJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListUserImportJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListUserImportJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Renders one page of the STORED user import jobs of a stored user pool, each
+//! with the `Status` the clock puts it in at that instant. A pure read: it
+//! changes nothing a later caller sees. The page resumes strictly after the job
+//! a `PaginationToken` this listing minted names; any other token is refused
+//! with `InvalidParameterException`, and an unknown `UserPoolId` with
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -172,20 +169,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListUserImportJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListUserImportJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListUserImportJobs"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let guard = state.lock();
+        let pool = guard
+            .pool(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // The pool's stored jobs, keyed by `JobId` in ascending order — the
+        // stable order the pagination token indexes into. The model documents no
+        // order for this listing.
+        let job_ids: Vec<String> = pool.user_import_jobs.keys().cloned().collect();
+
+        // The listing a pagination token belongs to: this operation over the
+        // import jobs of this pool, so a token one pool's listing issued names
+        // no page of another pool's listing or of another operation's.
+        let scope = format!("{}|{}", Self::NAME, pool.id);
+        let page = crate::state::page_of(
+            &scope,
+            &job_ids,
+            Some(input.max_results),
+            input.pagination_token.as_deref(),
+        )
+        .ok_or_else(invalid_pagination_token)?;
+
+        // Rendered from the STORED jobs: this read changes nothing.
+        let jobs: Vec<UserImportJobType> = page
+            .keys
+            .iter()
+            .filter_map(|job_id| pool.user_import_jobs.get(job_id))
+            .map(|job| job.to_user_import_job_type(now))
+            .collect();
+
+        // A listing's result member is PRESENT and empty when the pool holds no
+        // import job, which is what a paginating client reads.
+        Ok(ListUserImportJobsOutput {
+            user_import_jobs: Some(jobs),
+            pagination_token: page.next_token,
+        })
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> ListUserImportJobsError {
+    ListUserImportJobsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException` for a `PaginationToken` that
+/// names no page of this listing.
+fn invalid_pagination_token() -> ListUserImportJobsError {
+    ListUserImportJobsErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(
+            "PaginationToken is not a pagination token this operation issued for this user pool"
+                .to_string(),
+        ),
+        // `reasonCode` is AWS's own classification of the bad parameter and this
+        // service's model documents no value for it, so nothing is invented here.
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> ListUserImportJobsError {
+    ListUserImportJobsErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

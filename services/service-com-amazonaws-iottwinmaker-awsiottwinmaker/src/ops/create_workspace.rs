@@ -6,6 +6,12 @@
 //! `ConflictException`; the ARN it mints is indexed so `GetWorkspace` resolves
 //! the record by ARN as well as by id.
 //!
+//! The `tags` this call stores on the workspace are the same set the tagging API
+//! reads and writes, and they follow the same rule: a key in the reserved `aws:`
+//! namespace ([`crate::state::RESERVED_TAG_KEY_PREFIX`], matched however it is
+//! cased) is Amazon Web Services' own, so a request naming one is refused with
+//! `ValidationException` (HTTP 400) and no workspace is created.
+//!
 //! The workspace is provisioned with the service's own BUILT-IN component types
 //! ([`crate::state::built_in_component_types`]): none of them is created
 //! through this API, so they are stored with the workspace and resolve — through
@@ -171,6 +177,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             workspace_id = %input.workspace_id,
             "serving a request"
         );
+        // The reserved tag-key namespace is AWS's own: a create may no more put a
+        // key under it on the new resource than `TagResource` may add one later,
+        // so a request naming one is refused whole and nothing is created.
+        if let Some(message) = crate::state::reserved_tag_keys_violation(
+            "tags",
+            input
+                .tags
+                .iter()
+                .flat_map(|tags| tags.keys().map(String::as_str)),
+        ) {
+            return Err(CreateWorkspaceErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+            .into());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateWorkspaceErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the iottwinmaker store is unavailable".to_string()),
