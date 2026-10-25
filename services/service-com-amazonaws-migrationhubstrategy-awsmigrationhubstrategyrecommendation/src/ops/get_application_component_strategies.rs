@@ -10,9 +10,11 @@
 //! nothing recommended and nobody chose a preference for reports no strategy rather than a
 //! canned list.
 //!
-//! A read: the store is only looked at, so running it changes nothing a later caller sees.
-//! An `applicationComponentId` that names no component of the portfolio is refused with the
-//! modelled 404 `ResourceNotFoundException`.
+//! A read: the only write it makes is materialising what the clock already owed this
+//! portfolio — the completion of an assessment that was due at this same instant, and the
+//! analysis that completion stands for. An `applicationComponentId` that names no
+//! component of the portfolio is refused with the modelled 404
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -162,12 +164,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // A read: the store is only looked at here, so running
-        // GetApplicationComponentStrategies changes nothing a later caller sees. The
+        // A read: the only write it makes is materialising what the clock already owed
+        // this portfolio — an assessment whose completion was due at this same instant
+        // even if nobody had called, and the analysis that completion stands for. The
         // component is looked up in the portfolio of the Region this request was signed
         // for.
         let region = crate::state::request_region(ctx.parts());
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        if let Some(portfolio) = store.region_mut(&region) {
+            portfolio.settle_all(now);
+        }
         let Some(component) = store
             .region(&region)
             .application_components

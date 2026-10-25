@@ -9,10 +9,12 @@
 //! record holds — the ids of the servers the component runs on and the application groups
 //! it belongs to — and whether it belongs to more than one of those groups.
 //!
-//! A read (`@readonly`): it computes its answer from the stored record and writes nothing,
-//! so two identical calls answer the same thing. An `applicationComponentId` naming no
-//! component of the portfolio is refused with the modelled 404
-//! `ResourceNotFoundException`, never answered with a detail nothing holds.
+//! A read (`@readonly`): it computes its answer from the stored record, writing only what
+//! the clock already owed this portfolio (the completion of an assessment that was due at
+//! this same instant, and the analysis that completion stands for), so two identical calls
+//! answer the same thing. An `applicationComponentId` naming no component of the portfolio
+//! is refused with the modelled 404 `ResourceNotFoundException`, never answered with a
+//! detail nothing holds.
 //!
 //! ## Shape of an operation
 //!
@@ -168,12 +170,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // A read: the store is only looked at here, so running
-        // GetApplicationComponentDetails changes nothing a later caller sees. The
+        // A read: the only write it makes is materialising what the clock already owed
+        // this portfolio — an assessment whose completion was due at this same instant
+        // even if nobody had called, and the analysis that completion stands for. The
         // component is looked up in the portfolio of the Region this request was signed
         // for.
         let region = crate::state::request_region(ctx.parts());
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        if let Some(portfolio) = store.region_mut(&region) {
+            portfolio.settle_all(now);
+        }
         let Some(component) = store
             .region(&region)
             .application_components

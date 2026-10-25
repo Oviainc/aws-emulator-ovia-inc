@@ -226,8 +226,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(portfolio) = store.region_mut(&region) {
             portfolio.settle_all(now);
         }
-        let selected: Vec<&ServerRecord> = store
-            .region(&region)
+        let portfolio = store.region(&region);
+        let components = &portfolio.application_components;
+        let selected: Vec<&ServerRecord> = portfolio
             .servers
             .values()
             // `groupIdFilter` scopes the list to the servers that came in with one of the
@@ -262,7 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let end = start.saturating_add(page.size).min(ordered.len());
         let server_infos: Vec<ServerDetail> = ordered[start..end]
             .iter()
-            .map(|server| server.to_server_detail())
+            .map(|server| server.to_server_detail(components))
             .collect();
         // The cursor the next page resumes from, or none once this page ended the list.
         let next_token = ordered.get(end).map(|server| {
