@@ -55,6 +55,8 @@ mod not_found_errors;
 mod profile_deletion;
 #[path = "all/profile_lifecycle.rs"]
 mod profile_lifecycle;
+#[path = "all/refusal_message_rules.rs"]
+mod refusal_message_rules;
 #[path = "all/resource_resolution_refusals.rs"]
 mod resource_resolution_refusals;
 #[path = "all/resource_tagging.rs"]

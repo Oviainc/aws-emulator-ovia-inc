@@ -204,9 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rather than silently restarting the listing.
         let after = match input.next_token.as_deref() {
             Some(token) => Some(st::decode_page_token(token).ok_or_else(|| {
-                ListExecutionsErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
-                    message: "The NextToken is not valid".to_string(),
-                })
+                ListExecutionsErrorModeled::InvalidNextTokenException(st::invalid_next_token())
             })?),
             None => None,
         };

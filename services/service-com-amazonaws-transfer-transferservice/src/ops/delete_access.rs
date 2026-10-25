@@ -196,7 +196,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request rather than a missing grant — so the two cases stay distinguishable.
         if identity_provider_type != st::IDENTITY_PROVIDER_AWS_DIRECTORY_SERVICE {
             return Err(DeleteAccessErrorModeled::InvalidRequestException(
-                st::accesses_require_directory_provider(&input.server_id, &identity_provider_type),
+                st::accesses_require_directory_provider(
+                    st::ACCESS_ACTION_DELETE,
+                    &identity_provider_type,
+                ),
             )
             .into());
         }
