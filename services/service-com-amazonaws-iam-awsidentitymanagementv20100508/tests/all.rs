@@ -27,6 +27,8 @@ mod aws_managed_policy_catalog;
 mod custom_policy_context_keys;
 #[path = "all/entities_for_policy.rs"]
 mod entities_for_policy;
+#[path = "all/group_inline_policies.rs"]
+mod group_inline_policies;
 #[path = "all/group_listing.rs"]
 mod group_listing;
 #[path = "all/human_readable_summaries.rs"]
