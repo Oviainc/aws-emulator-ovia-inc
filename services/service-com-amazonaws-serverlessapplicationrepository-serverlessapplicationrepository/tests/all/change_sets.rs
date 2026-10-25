@@ -323,6 +323,12 @@ fn xml_tags(xml: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// CloudFormation's `TemplateStage` value naming the body as SUBMITTED (model shape
+/// `TemplateStage`: `Original` | `Processed`, whose doc gives `Processed` as the default).
+/// The published body is read back under this stage, since the other one is that body with
+/// the SAM transform applied.
+const TEMPLATE_STAGE_ORIGINAL: &str = "Original";
+
 /// A SAM template over `resources`: a packaged AWS SAM template is a CloudFormation
 /// template declaring the SAM transform.
 fn sam_template(resources: Value) -> Value {
@@ -519,13 +525,23 @@ async fn a_change_set_deploys_the_named_versions_template() {
 
         // The change set CloudFormation holds under that ARN is over the template the
         // named version published — read back through CloudFormation's own GetTemplate.
+        // The published body VERBATIM is the `Original` stage: a packaged SAM template
+        // declares a transform, so CloudFormation's other stage (`Processed`, its default)
+        // is that body with the transform applied rather than the body this service
+        // published.
         let expected_body = versions
             .iter()
             .find(|(semantic_version, _)| semantic_version == deployed)
             .map(|(_, template)| template.to_string())
             .expect("the deployed version is one of the published ones");
         let (status, xml) = deploy
-            .cloudformation("GetTemplate", &[("ChangeSetName", &change_set_id)])
+            .cloudformation(
+                "GetTemplate",
+                &[
+                    ("ChangeSetName", &change_set_id),
+                    ("TemplateStage", TEMPLATE_STAGE_ORIGINAL),
+                ],
+            )
             .await;
         assert_eq!(
             status, 200,
@@ -1265,13 +1281,38 @@ async fn a_later_deployment_updates_the_stack_the_first_one_created() {
         "the executed stack must have completed, got {xml}"
     );
     let (status, xml) = deploy
-        .cloudformation("GetTemplate", &[("StackName", &deployed)])
+        .cloudformation(
+            "GetTemplate",
+            &[
+                ("StackName", &deployed),
+                ("TemplateStage", TEMPLATE_STAGE_ORIGINAL),
+            ],
+        )
         .await;
     assert_eq!(status, 200, "the stack's template must read, got {status} {xml}");
     assert_eq!(
         xml_text(&xml, "TemplateBody"),
         first_template.to_string(),
         "the deployed stack must carry the published template of version 1.0.0"
+    );
+    // And the stage CloudFormation serves by DEFAULT is that same template with the SAM
+    // transform applied: the deployed document, which no longer declares the transform.
+    let (status, xml) = deploy
+        .cloudformation("GetTemplate", &[("StackName", &deployed)])
+        .await;
+    assert_eq!(
+        status, 200,
+        "the stack's processed template must read, got {status} {xml}"
+    );
+    let processed = xml_text(&xml, "TemplateBody");
+    assert!(
+        !processed.contains(SAM_TRANSFORM),
+        "the processed stage of a deployed application declares no transform, got {processed}"
+    );
+    assert!(
+        processed.contains("\"Queue\""),
+        "the processed stage keeps the resources the published template declares, got \
+         {processed}"
     );
 
     // The second deployment, onto the same stack.
@@ -1297,7 +1338,13 @@ async fn a_later_deployment_updates_the_stack_the_first_one_created() {
         "each deployment is its own change set, got {answer}"
     );
     let (status, xml) = deploy
-        .cloudformation("GetTemplate", &[("ChangeSetName", &second_change_set)])
+        .cloudformation(
+            "GetTemplate",
+            &[
+                ("ChangeSetName", &second_change_set),
+                ("TemplateStage", TEMPLATE_STAGE_ORIGINAL),
+            ],
+        )
         .await;
     assert_eq!(
         status, 200,
@@ -1398,7 +1445,13 @@ async fn a_change_set_deploys_the_version_a_prepared_template_names() {
         );
         let change_set_id = text(&answer, "changeSetId");
         let (status, xml) = deploy
-            .cloudformation("GetTemplate", &[("ChangeSetName", &change_set_id)])
+            .cloudformation(
+                "GetTemplate",
+                &[
+                    ("ChangeSetName", &change_set_id),
+                    ("TemplateStage", TEMPLATE_STAGE_ORIGINAL),
+                ],
+            )
             .await;
         assert_eq!(
             status, 200,

@@ -47,6 +47,9 @@ mod agent_recommendation_generations;
 #[path = "all/answer_updates.rs"]
 mod answer_updates;
 
+#[path = "all/check_details.rs"]
+mod check_details;
+
 #[path = "all/custom_lens_answer_writes.rs"]
 mod custom_lens_answer_writes;
 

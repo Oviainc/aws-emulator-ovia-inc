@@ -108,16 +108,30 @@ pub async fn rpc(
     operation: &str,
     body: &Value,
 ) -> Value {
+    rpc_in_region(emulator, REGION, signing_name, target_prefix, operation, body).await
+}
+
+/// The same call with the request signed for `region`: the credential scope is what every
+/// handler reads the request's Region from, so this is the seam for anything reported — or
+/// addressed — per Region.
+pub async fn rpc_in_region(
+    emulator: &Emulator,
+    region: &str,
+    signing_name: &str,
+    target_prefix: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
-        .header("host", format!("{signing_name}.{REGION}.amazonaws.com"))
+        .header("host", format!("{signing_name}.{region}.amazonaws.com"))
         .header("content-type", "application/x-amz-json-1.0")
         .header("x-amz-target", format!("{target_prefix}.{operation}"))
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTESTTESTTEST/20260101/{REGION}/{signing_name}/\
+                "AWS4-HMAC-SHA256 Credential=AKIDTESTTESTTEST/20260101/{region}/{signing_name}/\
                  aws4_request, SignedHeaders=host, Signature=0000"
             ),
         )
@@ -140,7 +154,17 @@ pub async fn rpc(
 
 /// One awsQuery form call against SNS, the protocol that service serves, requiring a 200.
 pub async fn sns(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> String {
-    let (status, text) = sns_call(emulator, action, params).await;
+    sns_in_region(emulator, REGION, action, params).await
+}
+
+/// The same SNS call with the request signed for `region`, requiring a 200.
+pub async fn sns_in_region(
+    emulator: &Emulator,
+    region: &str,
+    action: &str,
+    params: &[(&str, &str)],
+) -> String {
+    let (status, text) = sns_call_in_region(emulator, region, action, params).await;
     assert_eq!(status, 200, "{action}: expected HTTP 200, got {status} / {text}");
     text
 }
@@ -148,6 +172,17 @@ pub async fn sns(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> 
 /// The same call with its HTTP status and body as answered — the seam for a suite that drives
 /// SNS into a REFUSAL and reads what it said.
 pub async fn sns_call(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> (u16, String) {
+    sns_call_in_region(emulator, REGION, action, params).await
+}
+
+/// The same, with the request signed for `region`: the credential scope is what every handler
+/// reads the request's Region from.
+pub async fn sns_call_in_region(
+    emulator: &Emulator,
+    region: &str,
+    action: &str,
+    params: &[(&str, &str)],
+) -> (u16, String) {
     let mut body = format!("Action={action}&Version=2010-03-31");
     for (name, value) in params {
         body.push('&');
@@ -165,12 +200,12 @@ pub async fn sns_call(emulator: &Emulator, action: &str, params: &[(&str, &str)]
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
-        .header("host", format!("sns.{REGION}.amazonaws.com"))
+        .header("host", format!("sns.{region}.amazonaws.com"))
         .header("content-type", "application/x-www-form-urlencoded")
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTESTTESTTEST/20260101/{REGION}/sns/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential=AKIDTESTTESTTEST/20260101/{region}/sns/aws4_request, \
                  SignedHeaders=host, Signature=0000"
             ),
         )

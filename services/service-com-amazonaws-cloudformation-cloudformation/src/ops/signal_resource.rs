@@ -240,14 +240,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             match awaited_type.filter(|_| in_flight && first_time) {
                 None => (stack.stack_id.clone(), None),
                 Some(resource_type) => {
-                    // The physical id the operation in flight gave that resource, where it
-                    // has one: an event reports the resource as the stack holds it.
-                    let physical_resource_id = stack
+                    // The resource as the stack holds it: an event reports the physical id
+                    // the operation in flight gave it, where it has one, and the properties
+                    // it was deployed with.
+                    let held = stack
                         .current_resources()
                         .into_iter()
-                        .find(|resource| resource.logical_id == input.logical_resource_id)
-                        .map(|resource| resource.physical_resource_id)
+                        .find(|resource| resource.logical_id == input.logical_resource_id);
+                    let physical_resource_id = held
+                        .as_ref()
+                        .map(|resource| resource.physical_resource_id.clone())
                         .filter(|physical| !physical.is_empty());
+                    let resource_properties =
+                        held.as_ref().and_then(|resource| resource.properties_blob());
                     let failing = input.status == resource_signal_status::FAILURE;
                     let resource_status = match (updating, failing) {
                         (false, false) => resource_status::CREATE_IN_PROGRESS,
@@ -267,6 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &resource_type,
                         resource_status,
                         Some(signal_received(&input.status, &input.unique_id)),
+                        resource_properties,
                         operation_id,
                         client_request_token,
                     );

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the request's tag keys from the resource `resourceArn` addresses, in the one
+//! tag store keyed by resource ARN (`crate::state::CleanRoomsState::tags`) that
+//! `TagResource` writes and `ListTagsForResource` reads. A key the resource does not
+//! carry removes nothing, so the call is idempotent, and every key not named stays where
+//! it is. An ARN this service holds no resource under is refused: there is nothing to
+//! untag.
 //!
 //! ## Shape of an operation
 //!
@@ -63,6 +61,8 @@
 //! * `ResourceNotFoundException` (HTTP 404) — Request references a resource which does not
 //!   exist.
 //! * `ValidationException` (HTTP 400) — The input fails to satisfy the specified constraints.
+//! * `InternalServerException` (HTTP 500) — widened in through `extra_errors` (see below):
+//!   a shape this SERVICE models, for an unreachable store.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -78,11 +78,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cleanrooms-awsbastionco
 // here — hence the `UntagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cleanrooms#UntagResource")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.cleanrooms#UntagResource",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
+    /// Declared on the SERVICE and on most of its operations, though not on this one:
+    /// the store this emulator keeps its resources in could not be reached, which is a
+    /// server fault and not something the caller can fix.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -134,20 +141,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("cleanrooms state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A well-formed Clean Rooms ARN whose resource segment names no kind of resource
+        // addresses nothing, so the fault is in the member's value, not in a resource
+        // that is missing. The model's pattern cannot express it, so it is refused here.
+        let Some(resource_type) = st::resource_type_of_arn(&input.resource_arn) else {
+            return Err(UntagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(st::invalid_resource_arn_message(&input.resource_arn)),
+                    reason: Some(st::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string()),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "resourceArn".to_string(),
+                        message: st::invalid_resource_arn_message(&input.resource_arn),
+                    }]),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // Only an existing resource can be untagged, and the refusal is decided before
+        // anything is removed, so a refused call changes nothing.
+        if !store.holds_resource_at_arn(&input.resource_arn) {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: st::tagged_resource_not_found_message(&input.resource_arn),
+                    resource_id: input.resource_arn,
+                    resource_type: resource_type.to_string(),
+                },
+            )
+            .into());
+        }
+
+        store.remove_tags(&input.resource_arn, &input.tag_keys);
+        Ok(UntagResourceOutput {})
     }
 }

@@ -8,7 +8,9 @@
 //! `CreateTable` in one request is visible to a `GetTable` in the next. A stored table
 //! carries its own version history beside its live definition
 //! ([`TableEntry::archived_versions`]), so a read of one version serves the definition
-//! that version was written with and not what a later write replaced it by.
+//! that version was written with and not what a later write replaced it by. A table also
+//! holds its PARTITIONS ([`TableEntry::partitions`]), the slices of its data a partition
+//! create registers, because a partition is addressed by its values within one table.
 //!
 //! Beside the catalog the store holds the two account-level resources an ETL client
 //! registers: JOB DEFINITIONS (`CreateJob` writes one, `GetJob` reads it back) and, inside
@@ -77,7 +79,8 @@ use crate::ops::types::{
     DataCatalogEncryptionSettings, DataLakePrincipal, Database, DatabaseIdentifier, DatabaseInput,
     EncryptionAtRest, ErrorDetail, ExecutionProperty, FederatedDatabase, FederatedTable, Job,
     JobCommand, JobRun, JobUpdate, LakeFormationConfiguration, LineageConfiguration,
-    NotificationProperty, PrincipalPermissions, RLSProperties, RecrawlPolicy, RegistryId, Schedule,
+    NotificationProperty, Partition, PartitionInput, PrincipalPermissions, RLSProperties,
+    RecrawlPolicy, RegistryId, Schedule,
     SchemaChangePolicy, SchemaId, SourceControlDetails, StartColumnStatisticsTaskRunInput,
     StartJobRunInput, StorageDescriptor, Table, TableIdentifier, TableInput, TableVersion,
     UpdateCrawlerInput,
@@ -99,6 +102,18 @@ pub const MAX_TABLES_PER_DATABASE: usize = 1_000;
 /// Bounds the product of the two per-container ceilings, which on its own would still
 /// let a caller grow the store far past what one process should hold.
 pub const MAX_STORED_TABLES: usize = 10_000;
+
+/// Ceiling on the partitions ONE table may hold, for the same reason as
+/// [`MAX_DATABASES_PER_CATALOG`]: a partition create is reachable by any caller, so the
+/// number of partition records one process will hold is bounded here. A create past the
+/// ceiling is refused — per item, for a batch create — rather than inserted.
+pub const MAX_PARTITIONS_PER_TABLE: usize = 1_000;
+
+/// Ceiling on the partitions the whole store may hold, across every catalog, database
+/// and table. Bounds the PRODUCT of [`MAX_PARTITIONS_PER_TABLE`] and
+/// [`MAX_STORED_TABLES`], which on its own would still let a caller grow the store far
+/// past what one process should hold.
+pub const MAX_STORED_PARTITIONS: usize = 100_000;
 
 /// Ceiling on the versions of ONE table the store keeps archived, for the same reason
 /// as [`MAX_DATABASES_PER_CATALOG`]: every update archives the definition it replaces,
@@ -626,6 +641,35 @@ impl ComAmazonawsGlueAwsglueState {
         self.stored_archived_table_versions() < MAX_STORED_ARCHIVED_TABLE_VERSIONS
     }
 
+    /// How many partitions the whole store holds. Bounded the same way
+    /// [`Self::stored_tables`] is, over at most [`MAX_STORED_TABLES`] tables.
+    pub fn stored_partitions(&self) -> usize {
+        self.stored_in_catalogs(|catalog| {
+            catalog
+                .databases
+                .values()
+                .map(|database| {
+                    database
+                        .tables
+                        .values()
+                        .map(|table| table.partitions.len())
+                        .sum::<usize>()
+                })
+                .sum()
+        })
+    }
+
+    /// Whether the store as a whole can hold another partition, i.e. is below
+    /// [`MAX_STORED_PARTITIONS`].
+    ///
+    /// A batch create writes SEVERAL partitions under one lock, so a caller that walks a
+    /// batch reads this count once and then counts the partitions it has inserted
+    /// itself: re-walking the store per item would be the same answer at a cost per
+    /// item.
+    pub fn can_store_partition(&self) -> bool {
+        self.stored_partitions() < MAX_STORED_PARTITIONS
+    }
+
     /// How many databases the whole store holds, across every catalog. Bounded by
     /// [`MAX_CATALOGS`] times [`MAX_DATABASES_PER_CATALOG`], so this walk is bounded.
     pub fn stored_databases(&self) -> usize {
@@ -1117,6 +1161,152 @@ pub struct TableEntry {
     /// version [`Self::version_id`] names — so a table that has never been updated has
     /// exactly one version and an empty archive.
     pub archived_versions: BTreeMap<u64, ArchivedTableVersion>,
+    /// The PARTITIONS of this table — "a slice of table data" (`Partition`) — keyed by
+    /// the `Values` that address one.
+    ///
+    /// A partition lives on its table rather than beside the catalog tree because every
+    /// operation that addresses one names its catalog, database and table and then the
+    /// partition's values (`GetPartition$PartitionValues`), so the values identify a
+    /// partition only WITHIN one table. The key is the value list exactly as sent: the
+    /// model documents the Hive case fold for a database and a table name and for
+    /// neither a partition key nor a partition value, and a value is table DATA, which a
+    /// fold would rewrite.
+    ///
+    /// Ordered, so a reader of a table's partitions has one deterministic order to walk
+    /// — lexicographic by value list, which for the partition-key order the values are
+    /// passed in ("ordered in the same order as the partition keys",
+    /// `PartitionInput$Values`) groups a table's partitions by their first key.
+    pub partitions: BTreeMap<Vec<String>, PartitionEntry>,
+}
+
+/// Why a partition could not be created on a table.
+///
+/// One refusal reason per way a create can fail ON the table it addresses, so the
+/// single-partition create and the batch create make the SAME decision: the batch
+/// reports it as a per-item [`ErrorDetail`] inside `PartitionError`, where "the errors
+/// encountered when trying to create the requested partitions" belong, and a
+/// single-partition create raises the matching modelled exception named by
+/// [`Self::error_code`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionCreateRefusal {
+    /// The `PartitionInput` named no partition value at all. "Although this parameter is
+    /// not required by the SDK, you must specify this parameter for a valid input"
+    /// (`PartitionInput$Values`), so an input without values is not a partition the
+    /// catalog can address.
+    ValuesRequired,
+    /// The values do not line up with the table's partition keys: a partition is one
+    /// value per key of the table it belongs to, passed "in the same order as the
+    /// partition keys" (`PartitionInput$Values`), so a list of another length cannot
+    /// name a slice of this table.
+    ValuesDoNotMatchPartitionKeys {
+        /// How many partition keys the addressed table defines.
+        keys: usize,
+        /// How many values the input carried.
+        values: usize,
+    },
+    /// The table already holds a partition with those values.
+    AlreadyExists,
+    /// The store cannot hold another partition ([`MAX_PARTITIONS_PER_TABLE`],
+    /// [`MAX_STORED_PARTITIONS`]).
+    LimitExceeded {
+        /// The ceiling that was reached.
+        limit: usize,
+    },
+}
+
+impl PartitionCreateRefusal {
+    /// The modelled error shape this refusal is reported under: the `ErrorCode` of a
+    /// batch's per-item [`ErrorDetail`], and the exception a single-partition create
+    /// raises.
+    pub fn error_code(&self) -> &'static str {
+        match self {
+            Self::ValuesRequired | Self::ValuesDoNotMatchPartitionKeys { .. } => {
+                "InvalidInputException"
+            }
+            Self::AlreadyExists => "AlreadyExistsException",
+            Self::LimitExceeded { .. } => "ResourceNumberLimitExceededException",
+        }
+    }
+
+    /// This refusal's wording. See [`messages`] for how this crate's unrecorded
+    /// refusals are worded.
+    pub fn message(&self) -> String {
+        match self {
+            Self::ValuesRequired => messages::PARTITION_VALUES_REQUIRED.to_string(),
+            Self::ValuesDoNotMatchPartitionKeys { keys, values } => {
+                messages::partition_values_do_not_match_keys(*keys, *values)
+            }
+            Self::AlreadyExists => messages::PARTITION_ALREADY_EXISTS.to_string(),
+            Self::LimitExceeded { limit } => {
+                format!("the Data Catalog already holds the maximum of {limit} partitions")
+            }
+        }
+    }
+
+    /// This refusal as the per-item error shape a batch reports it in.
+    pub fn to_error_detail(self) -> ErrorDetail {
+        catalog_error_detail(self.error_code(), self.message())
+    }
+}
+
+/// A stored partition of a table: the client-settable definition plus the one member
+/// only the server sets, `CreationTime`.
+#[derive(Debug, Clone)]
+pub struct PartitionEntry {
+    /// The values that address this partition, which are also this entry's key in
+    /// [`TableEntry::partitions`].
+    pub values: Vec<String>,
+    pub storage_descriptor: Option<StorageDescriptor>,
+    pub parameters: Option<HashMap<String, String>>,
+    /// Client-supplied, echoed back exactly as sent.
+    pub last_access_time: Option<::aws_smithy_types::DateTime>,
+    /// Client-supplied, echoed back exactly as sent.
+    pub last_analyzed_time: Option<::aws_smithy_types::DateTime>,
+    /// Server-set, written once at create so every later read reports the same instant.
+    pub creation_time: SystemTime,
+}
+
+impl PartitionEntry {
+    /// Build a stored partition from the client's `PartitionInput` plus the server-set
+    /// `CreationTime`, which no `PartitionInput` carries.
+    ///
+    /// `values` is passed separately because it is the entry's ADDRESS: the caller has
+    /// already checked the input carries a value list that matches the table's partition
+    /// keys, and that same list is the map key the entry is stored under.
+    pub fn from_input(values: Vec<String>, input: &PartitionInput, now: SystemTime) -> Self {
+        Self {
+            values,
+            storage_descriptor: input.storage_descriptor.clone(),
+            parameters: input.parameters.clone(),
+            last_access_time: input.last_access_time,
+            last_analyzed_time: input.last_analyzed_time,
+            creation_time: now,
+        }
+    }
+
+    /// Rebuild the modelled `Partition` output shape from what is stored.
+    ///
+    /// `table` is the table this partition belongs to, read by the caller rather than
+    /// copied onto the partition: the catalog, database and table a partition resides in
+    /// are the table's own attribution, so there is ONE place they are stored and a
+    /// partition read cannot report a database or table that has drifted from the
+    /// table read's.
+    pub fn to_partition(&self, table: &TableEntry) -> Partition {
+        Partition {
+            values: Some(self.values.clone()),
+            database_name: Some(table.database_name.clone()),
+            table_name: Some(table.name.clone()),
+            creation_time: Some(to_date_time(self.creation_time)),
+            last_access_time: self.last_access_time,
+            // Projected the way a table's own storage is
+            // ([`to_storage_descriptor`]), so a partition and its table report a
+            // descriptor the same way.
+            storage_descriptor: self.storage_descriptor.as_ref().map(to_storage_descriptor),
+            parameters: self.parameters.clone(),
+            last_analyzed_time: self.last_analyzed_time,
+            catalog_id: Some(table.catalog_id.clone()),
+        }
+    }
 }
 
 /// One ARCHIVED version of a table: the definition the table carried at an earlier
@@ -1168,7 +1358,75 @@ impl TableEntry {
             // A create archives nothing: it replaced no definition, and the one it
             // writes is the current version.
             archived_versions: BTreeMap::new(),
+            // A table is created empty of partitions: `TableInput` defines the partition
+            // KEYS of a table, never a slice of its data, so the first partition arrives
+            // through a partition create.
+            partitions: BTreeMap::new(),
         }
+    }
+
+    /// How many partition keys this table defines: the number of values that address one
+    /// of its partitions.
+    pub fn partition_key_count(&self) -> usize {
+        self.partition_keys.as_ref().map_or(0, Vec::len)
+    }
+
+    /// The stored partition addressed by `values`, or `None` when this table holds no
+    /// such partition.
+    pub fn partition(&self, values: &[String]) -> Option<&PartitionEntry> {
+        self.partitions.get(values)
+    }
+
+    /// Whether this table can hold another partition, i.e. is below
+    /// [`MAX_PARTITIONS_PER_TABLE`].
+    pub fn can_store_partition(&self) -> bool {
+        self.partitions.len() < MAX_PARTITIONS_PER_TABLE
+    }
+
+    /// Create ONE partition of this table from a client's `PartitionInput`, or say why
+    /// it cannot be created.
+    ///
+    /// The whole create decision for a single partition, in one place, so the
+    /// single-partition create and each item of a batch create accept and refuse exactly
+    /// the same inputs: a partition is one value per partition key of its table, it is
+    /// addressed by those values, and a value list the table already holds a partition
+    /// for is a duplicate rather than an overwrite.
+    ///
+    /// `store_has_room` is whether the STORE as a whole can hold another partition
+    /// ([`ComAmazonawsGlueAwsglueState::can_store_partition`]), which this table cannot
+    /// see from here; the per-table ceiling is checked here.
+    pub fn create_partition(
+        &mut self,
+        input: &PartitionInput,
+        now: SystemTime,
+        store_has_room: bool,
+    ) -> Result<&PartitionEntry, PartitionCreateRefusal> {
+        let values = input.values.clone().unwrap_or_default();
+        if values.is_empty() {
+            return Err(PartitionCreateRefusal::ValuesRequired);
+        }
+        let keys = self.partition_key_count();
+        if values.len() != keys {
+            return Err(PartitionCreateRefusal::ValuesDoNotMatchPartitionKeys {
+                keys,
+                values: values.len(),
+            });
+        }
+        if self.partitions.contains_key(&values) {
+            return Err(PartitionCreateRefusal::AlreadyExists);
+        }
+        if !self.can_store_partition() {
+            return Err(PartitionCreateRefusal::LimitExceeded {
+                limit: MAX_PARTITIONS_PER_TABLE,
+            });
+        }
+        if !store_has_room {
+            return Err(PartitionCreateRefusal::LimitExceeded {
+                limit: MAX_STORED_PARTITIONS,
+            });
+        }
+        let entry = PartitionEntry::from_input(values.clone(), input, now);
+        Ok(self.partitions.entry(values).or_insert(entry))
     }
 
     /// This table's client-settable definition, in the `TableInput` shape a client
@@ -3311,6 +3569,37 @@ pub mod messages {
     /// [`SCHEMA_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and no disclosure of the
     /// requested name.
     pub const REGISTRY_ALREADY_EXISTS: &str = "Registry already exists.";
+
+    /// A partition create whose `PartitionInput` carries no `Values`. NOT recorded: what
+    /// is pinned is the behaviour — `InvalidInputException`, as a per-item error for a
+    /// batch create — and the sentence names the member the input has to carry, which is
+    /// what the model requires of a valid input (`PartitionInput$Values`).
+    pub const PARTITION_VALUES_REQUIRED: &str = "PartitionInput must specify Values.";
+
+    /// A partition create whose value count is not the addressed table's partition-key
+    /// count. NOT recorded: what is pinned is the behaviour — `InvalidInputException`,
+    /// per item for a batch create — and the sentence carries the two counts the request
+    /// and the table disagree on, so a client can see which it got wrong.
+    pub fn partition_values_do_not_match_keys(keys: usize, values: usize) -> String {
+        format!(
+            "Partition values must name one value per partition key of the table; the table \
+             has {keys} partition keys and the input carried {values} values"
+        )
+    }
+
+    /// A partition create for a value list the addressed table already holds a partition
+    /// for. NOT recorded: inferred from the recorded `CreateDatabase` duplicate, like
+    /// [`TABLE_ALREADY_EXISTS`] — `AlreadyExistsException`, and no disclosure of the
+    /// requested values.
+    pub const PARTITION_ALREADY_EXISTS: &str = "Partition already exists.";
+
+    /// A partition read (`GetPartition`) for a value list the addressed table holds no
+    /// partition for. NOT recorded: the wording follows [`table_not_found`], the refusal
+    /// for the resource one step up, and carries only the values the request addressed —
+    /// which are the whole address of a partition within its table.
+    pub fn partition_not_found(values: &[String]) -> String {
+        format!("Partition [{}] not found.", values.join(", "))
+    }
 }
 
 /// Fold a database or table name the way the catalog stores it: ASCII-lowercased.

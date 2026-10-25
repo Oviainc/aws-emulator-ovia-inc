@@ -15,7 +15,7 @@
 //! scaffold's 501 and an unknown `Action`. Each row names the status and the wire code it
 //! expects as well, so a row cannot pass by failing for a different reason.
 
-use crate::stack_lifecycle::{call, create_stack, member, router, xml_text, xml_texts};
+use crate::harness::{call, create_stack, member, router, xml_text, xml_texts};
 
 /// One row of the error-envelope table: a request that must fail, and the status and wire
 /// code it must fail with.

@@ -49,7 +49,7 @@
 //! evaluation of an alarm becomes due [`EVALUATION_DELAY_SECS`] after the write that
 //! configured it ("When this operation creates an alarm, the alarm state is immediately set
 //! to INSUFFICIENT_DATA. The alarm is then evaluated and its state is set appropriately." —
-//! `PutMetricAlarm`), and a state `SetAlarmState` forced stands for one evaluation period
+//! `PutMetricAlarm`), and a state `SetAlarmState` forced stands for that same short span
 //! ([`forced_state_span_secs`]) before the evaluation takes the alarm back over.
 //!
 //! What is NOT evaluated here keeps the state it has, rather than being answered with a
@@ -86,11 +86,6 @@ use crate::ops::types::{AlarmHistoryItem, MetricAlarm, STATISTIC_VALUES};
 /// the next caller a span later — the same window a clock-owed transition takes — and the fold
 /// one alarm costs is charged at most once per span rather than once per request.
 pub const EVALUATION_DELAY_SECS: f64 = 0.5;
-
-/// The evaluation period of an alarm that carries no `Period`: one minute, "the period, in
-/// seconds, over which the statistic is applied" at its shortest regular resolution
-/// (`PutMetricAlarmInput$Period`: "a period can be as short as one minute (60 seconds)").
-const DEFAULT_PERIOD_SECS: f64 = 60.0;
 
 /// The most period windows ONE alarm's LOOK-BACK covers.
 ///
@@ -228,24 +223,19 @@ impl EvaluationBudget {
 /// How long a state `SetAlarmState` forced on a metric alarm stands before the evaluation
 /// takes the alarm back over.
 ///
-/// "Temporarily sets the state of an alarm for testing purposes. […] Metric alarms return to
-/// their actual state quickly" (`SetAlarmState`) — the thing that takes the alarm back is the
-/// next evaluation, and an alarm is evaluated over its `Period` ("the period, in seconds,
-/// over which the statistic is applied"), so that is the span: the forced state stands for
-/// one evaluation period of the alarm it was forced on, and the evaluation owns the state
-/// again from its end.
+/// "Temporarily sets the state of an alarm for testing purposes. […] Metric alarms returns to
+/// their actual state quickly, often within seconds. Because the metric alarm state change
+/// happens quickly, it is typically only visible in the alarm's History tab […] or through
+/// DescribeAlarmHistory" (`SetAlarmState`) — so the thing that takes the alarm back, its next
+/// evaluation, is owed the same short span as every other transition this store's clock owes
+/// ([`EVALUATION_DELAY_SECS`]), not one evaluation period of the alarm: a caller reading
+/// straight after the call still sees the state it forced, and a caller that comes back for
+/// the alarm's actual state finds the evaluation owning it again. Each later force into a
+/// state the evaluation has since taken back is therefore a state CHANGE of its own, which is
+/// what invokes that state's actions again.
 #[must_use]
-pub fn forced_state_span_secs(alarm: &MetricAlarm) -> f64 {
-    period_secs(alarm)
-}
-
-/// The alarm's evaluation period in seconds, defaulting to [`DEFAULT_PERIOD_SECS`] for an
-/// alarm that carries none (a PromQL alarm, which has `EvaluationInterval` instead).
-fn period_secs(alarm: &MetricAlarm) -> f64 {
-    alarm
-        .period
-        .filter(|period| *period >= 1)
-        .map_or(DEFAULT_PERIOD_SECS, f64::from)
+pub fn forced_state_span_secs() -> f64 {
+    EVALUATION_DELAY_SECS
 }
 
 /// How one evaluated window's datapoint stands against the alarm's threshold.

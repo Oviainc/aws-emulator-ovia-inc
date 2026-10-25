@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetOutpostInstanceTypes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetOutpostInstanceTypes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the instance types ONE Outpost's EC2 capacity is CURRENTLY
+//! CONFIGURED with, computed from what this store records about that Outpost's
+//! configuration, cut into pages of at most `MaxResults` with the modelled
+//! `NextToken` the next page resumes from, beside the Outpost's own id and ARN. A
+//! read: it never changes what a later caller sees.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetOutpostInstanceTypes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rule is stated once on
+//! [`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::configured_instance_types`]
+//! and applied here: what is configured on an Outpost is the pools of the capacity
+//! task that completed LAST on each piece of its hardware a task has configured
+//! ("the instance type capacities configured for this asset. This can be changed
+//! through a capacity task"), or — until a capacity task reconfigures it — the
+//! instance types the hardware its orders subscribe to arrived carrying.
+//!
+//! This is the NARROWER of this service's two instance-type reports:
+//! `GetOutpostSupportedInstanceTypes` answers what an Outpost's hardware can
+//! support, which "will generally include instance types that are not currently
+//! configured and therefore cannot be launched with the current Outpost capacity
+//! configuration" — while what this one answers is that current configuration
+//! itself.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +163,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetOutpostInstanceTypes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetOutpostInstanceTypesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetOutpostInstanceTypes"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetOutpostInstanceTypesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Outposts store is unavailable".to_string()),
+            })
+        })?;
+        // The region this request is addressed to: an Outpost is part of its own
+        // region's inventory and of no other's, so that is where the identifier is
+        // resolved — and with it the configuration this store records for it.
+        let region = crate::state::request_region(ctx.parts());
+        // `OutpostId` accepts the bare id or the full Outpost ARN; both name the same
+        // stored Outpost.
+        let outpost_id = crate::state::resolve_outpost_id(&input.outpost_id).ok_or_else(|| {
+            GetOutpostInstanceTypesErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::outpost_id_pattern_report()),
+            })
+        })?;
+        // The resume point the caller's token names. A token this service did not
+        // issue for THIS report is a bad request, not an empty page — the same rule
+        // every other paged answer in this service applies to its own token.
+        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            Some(token) => Some(
+                crate::state::decode_page_token(crate::state::CONFIGURED_INSTANCE_TYPE_PAGE, token)
+                    .ok_or_else(|| {
+                        GetOutpostInstanceTypesErrorModeled::ValidationException(
+                            ValidationException {
+                                message: Some(crate::state::page_token_report(
+                                    "GetOutpostInstanceTypes",
+                                )),
+                            },
+                        )
+                    })?,
+            ),
+            None => None,
+        };
+        let size = crate::state::page_size(input.max_results);
+
+        let mut store = state.lock();
+        // Capacity is configured ON hardware, and a capacity task configures it on
+        // the clock, so both transitions the clock had ALREADY made due are
+        // materialised before the configuration is read: this answers the
+        // configuration the Outpost holds at the instant it is asked for, and writes
+        // nothing a later caller would not have seen anyway.
+        store.settle_outposts();
+        store.settle_capacity_tasks();
+        // The instance types are reported OFF one Outpost, so one the store does not
+        // hold is the not-found error this operation models, worded as the identifier
+        // echo of the value AS SUPPLIED — not of the bare id an ARN resolved to.
+        let outpost = store
+            .outpost(&region, &outpost_id)
+            .map(|record| record.outpost.clone())
+            .ok_or_else(|| {
+                GetOutpostInstanceTypesErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::identifier_not_found(
+                        crate::state::OUTPOST_ID_MEMBER,
+                        &input.outpost_id,
+                    )),
+                })
+            })?;
+        // The boundary a page of this report stops at is an entry's POSITION in the
+        // configuration's own stable order: a configured instance type carries no
+        // creation sequence of its own, and that order is the one the whole report is
+        // reported in.
+        let (instance_types, next_token) = crate::state::page(
+            crate::state::CONFIGURED_INSTANCE_TYPE_PAGE,
+            store
+                .configured_instance_types(&region, &outpost_id)
+                .into_iter()
+                .enumerate()
+                .map(|(position, item)| (position as u64, item)),
+            after,
+            size,
+        );
+
+        Ok(GetOutpostInstanceTypesOutput {
+            // "Information about the instance types": the ones this Outpost's
+            // capacity is configured with, which may be none at all.
+            instance_types: Some(instance_types),
+            next_token,
+            // The Outpost this report is about, as the stored record reports itself —
+            // its bare id and the ARN of the region it belongs to — whichever of the
+            // two identifier forms the caller named it by.
+            outpost_id: outpost.outpost_id.clone(),
+            outpost_arn: outpost.outpost_arn.clone(),
+        })
     }
 }

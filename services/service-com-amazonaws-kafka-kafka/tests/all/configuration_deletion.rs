@@ -26,7 +26,8 @@ use service_com_amazonaws_kafka_kafka::state::{
 // every suite of this crate shares, so this one adds only its own rule and its
 // configuration-shaped requests.
 use super::kafka_harness::{
-    configuration_rows, pct, ClusterRequest, ConfigurationRequest, Emulator, Reply, ACCOUNT, REGION,
+    configuration_rows, pct, sleep_past_activation, ClusterRequest, ConfigurationRequest, Emulator,
+    Reply, ACCOUNT, REGION,
 };
 
 /// The table the suites below walk: the crate's shared configuration table —
@@ -373,6 +374,10 @@ async fn a_configuration_a_cluster_uses_cannot_be_deleted() {
                     .to_string(),
             );
         }
+        // A cluster is deletable once it has finished provisioning, so this row's
+        // clusters are waited out of `CREATING` before any of them is deleted
+        // below.
+        sleep_past_activation();
 
         // Refused while every one of them uses it, and refused again after each
         // user but the last is gone.

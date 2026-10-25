@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetStackPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetStackPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetStackPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores the stack policy body a caller sets on the named stack, which is
+//! what `GetStackPolicy` then reports back. A policy named by URL would have to be fetched
+//! from Amazon S3, which this emulator does not do, so that request is answered 501.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +149,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetStackPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetStackPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetStackPolicy"))
+        // CloudFormation is Regional: the stack this call sets a policy on is the one of
+        // that name in the Region the request is signed for.
+        let region = crate::state::request_region(ctx.parts());
+        // "You can specify either the StackPolicyBody or the StackPolicyURL parameter, but
+        // not both."
+        if input.stack_policy_body.is_some() && input.stack_policy_url.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "You cannot specify both StackPolicyBody and StackPolicyURL",
+            ));
+        }
+        // A `StackPolicyURL` names a policy document in an Amazon S3 bucket, which would
+        // have to be fetched over the network — this emulator makes no outbound
+        // connections, so it is answered 501 rather than with a policy nobody read, as
+        // `CreateStack` and `UpdateStack` answer the same member.
+        if input.stack_policy_url.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "SetStackPolicy with StackPolicyURL (fetching a stack policy from Amazon S3)",
+            ));
+        }
+        let Some(body) = input.stack_policy_body.clone() else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "Either StackPolicyBody or StackPolicyURL must be specified",
+            ));
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no stack to set a policy on, and
+            // nothing was written.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "SetStackPolicy",
+            ));
+        };
+        let mut store = state.lock();
+        store.settle(::std::time::SystemTime::now());
+
+        // A stack policy governs updates to a LIVE stack, so — as for `GetStackPolicy` — a
+        // stack id that resolves a completed deletion names nothing a policy can be set
+        // on.
+        let stack = store
+            .resolve_mut(&region, &input.stack_name)
+            .filter(|stack| stack.is_live())
+            .ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::stack_does_not_exist(&input.stack_name),
+                )
+            })?;
+        // "Sets a stack policy for a specified stack": the policy set last is the one in
+        // force, which is what `GetStackPolicy` reads back.
+        stack.stack_policy_body = Some(body);
+
+        Ok(SetStackPolicyOutput)
     }
 }

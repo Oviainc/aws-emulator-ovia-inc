@@ -24,7 +24,9 @@ use service_com_amazonaws_kafka_kafka::state::{
     TOPIC_DELETION_DELAY,
 };
 
-use crate::kafka_harness::{pct, ClusterRequest, Emulator, Reply, ACCOUNT, REGION};
+use crate::kafka_harness::{
+    pct, sleep_past_activation, ClusterRequest, Emulator, Reply, ACCOUNT, REGION,
+};
 
 /// The topic calls, written as methods on the shared harness's [`Emulator`] so
 /// the suites below read the same way as this crate's cluster suites do. They go
@@ -816,6 +818,9 @@ async fn deleting_a_cluster_takes_its_topics_with_it() {
             .await;
     }
 
+    // A cluster is deletable once it has finished provisioning, so the suite waits
+    // the cluster out of `CREATING` before deleting it.
+    sleep_past_activation();
     let deleted = emulator
         .call("DELETE", &format!("/v1/clusters/{}", pct(&cluster)), None)
         .await;

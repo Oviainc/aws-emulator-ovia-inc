@@ -641,6 +641,40 @@ pub fn nth_path_segment(path: &str, index: usize) -> Option<&str> {
     path.trim_start_matches('/').split('/').nth(index)
 }
 
+/// One `@httpLabel` of a URI path as the codec that deserializes the request decodes it:
+/// percent escapes resolved, and `+` kept VERBATIM.
+///
+/// [`smithy_server_runtime::percent_decode`] is a QUERY decoder — it folds `+` to a space,
+/// which is the `application/x-www-form-urlencoded` rule — while a path label carries PATH
+/// semantics, where `+` is a literal character of the value (the schema server decodes one
+/// with its own `percent_decode_path`, which it does not export). A `+` can never occur
+/// inside an escape, so decoding BETWEEN the `+` characters and putting them back keeps the
+/// literal while leaving every escape to the shared helper: a `%2B` still decodes to `+`,
+/// because it carries no literal `+` to split on.
+///
+/// This is for a service that reads a label off the REQUEST LINE — the
+/// `Service::override_operation` / `override_protocol` seams, which see the URI before any
+/// input is deserialized, and so cannot ask the deserializer what the label said. It sits
+/// beside [`uri_path`] and [`nth_path_segment`], the readers that get it that label.
+///
+/// One copy of the rule predates this helper: `fn percent_decode` in
+/// `service-com-amazonaws-inspectorscan-inspectorscan/src/ops/scan_sbom.rs`, which applies
+/// it to a purl component for the same reason (`+` is literal in a package version). It is
+/// to be MIGRATED onto this, in the change that owns that service; nothing new should
+/// inline the rule again.
+#[must_use]
+pub fn percent_decode_path_label(label: &str) -> String {
+    // Nothing to resolve and no `+` to preserve: the label is already its own value.
+    if !label.contains('%') && !label.contains('+') {
+        return label.to_string();
+    }
+    label
+        .split('+')
+        .map(smithy_server_runtime::percent_decode)
+        .collect::<Vec<String>>()
+        .join("+")
+}
+
 /// The path of a request URI, without its query string and without the authority an
 /// absolute-form URI carries.
 ///
@@ -1058,6 +1092,31 @@ mod tests {
             assert_eq!(
                 actual, expected,
                 "case {case:?}: the path of {uri:?} expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// A path label is decoded with PATH semantics: escapes resolved, `+` kept as the
+    /// literal character it is on a path, unlike the query decoder the helper is built on.
+    #[test]
+    fn a_path_label_keeps_its_plus_and_resolves_its_escapes() {
+        // (case, label, expected value)
+        let rows: [(&str, &str, &str); 8] = [
+            ("nothing to decode", "provider-abc1234567", "provider-abc1234567"),
+            ("a literal plus is a literal on a path", "c++", "c++"),
+            ("an escaped plus decodes to a plus", "a%2Bb", "a+b"),
+            ("a literal and an escaped plus together", "a+b%2Bc", "a+b+c"),
+            ("an escaped slash", "service-role%2Fname", "service-role/name"),
+            ("an escaped colon", "arn%3Aaws", "arn:aws"),
+            ("an escaped percent", "100%25", "100%"),
+            ("the empty label", "", ""),
+        ];
+
+        for (case, label, expected) in rows {
+            let actual = percent_decode_path_label(label);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: decoding {label:?} expected {expected:?}, got {actual:?}"
             );
         }
     }

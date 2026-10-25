@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the [`crate::state::Deployment`] record its parent api holds,
+//! unless a stage of that api is still serving it. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -62,6 +56,10 @@
 //!   See the message field for more information.
 //! * `TooManyRequestsException` (HTTP 429) — A limit has been exceeded. See the accompanying
 //!   error message for details.
+//! * `BadRequestException` (HTTP 400) — widened in through `extra_errors` (see below): the
+//!   shape this SERVICE models for a request that "is not valid, for example, the input is
+//!   incomplete or incorrect", which is what a delete of a deployment a stage is still
+//!   serving is. This operation's own modelled `errors` list omits it.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -101,9 +99,17 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteDeploymentOutput {
 // here — hence the `DeleteDeploymentError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.apigatewayv2#DeleteDeployment")]
+// `BadRequestException` — a shape this SERVICE models, and one `CreateDeployment` on the
+// very same resource lists — is widened in through `extra_errors`: a deployment a stage
+// is still serving cannot be removed, and API Gateway refuses that request as one that
+// "is not valid" (HTTP 400) rather than as a missing resource (404) or a rate limit (429).
+#[smithy_macros::operation_error(
+    "com.amazonaws.apigatewayv2#DeleteDeployment",
+    extra_errors = ["BadRequestException"]
+)]
 #[derive(Debug)]
 pub enum DeleteDeploymentErrorModeled {
+    BadRequestException(BadRequestException),
     NotFoundException(NotFoundException),
     TooManyRequestsException(TooManyRequestsException),
 }
@@ -159,18 +165,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDeployment"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteDeployment",
+            ));
+        };
+        let mut store = state.lock();
+
+        // A deployment is a CHILD of an api: it is addressed through the api that owns
+        // it, so an api that does not exist holds no deployment to remove.
+        let Some(api) = store.apis.get_mut(&input.api_id) else {
+            return Err(not_found(crate::state::invalid_identifier_message(
+                "API",
+                &input.api_id,
+            )));
+        };
+
+        // A deployment is addressed by the api that owns it AND its own id, so an id
+        // that names a deployment of ANOTHER api is not found here either — the same
+        // addressing `GetDeployment` reports on.
+        if !api.deployments.contains_key(&input.deployment_id) {
+            return Err(not_found(crate::state::invalid_identifier_message(
+                "Deployment",
+                &input.deployment_id,
+            )));
+        }
+
+        // A stage of this api holds the reference, through its `DeploymentId`. Removing
+        // the deployment would leave those stages serving nothing — and a stage is what
+        // makes a deployment callable over the internet — so the delete is refused while
+        // any of them serves it and the store is left exactly as it was: the caller
+        // moves those stages onto another deployment, or deletes them, first.
+        if !api
+            .stages_serving_deployment(&input.deployment_id)
+            .is_empty()
+        {
+            return Err(DeleteDeploymentErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(ACTIVE_STAGES_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The api OWNS its deployments, so removing the entry is the whole delete: a
+        // later GetDeployment finds nothing, GetDeployments no longer pages over it, and
+        // a second DeleteDeployment of the same id answers 404 rather than removing
+        // anything again.
+        api.deployments.remove(&input.deployment_id);
+
+        Ok(DeleteDeploymentOutput)
     }
+}
+
+/// The sentence API Gateway refuses the delete of a deployment a stage is still serving
+/// with. It names nothing from the request: the caller's fix is the same whichever stage
+/// holds the reference and whichever deployment it points at, so no stage name is echoed
+/// back — `GetStages` is what reports which stage serves what.
+const ACTIVE_STAGES_MESSAGE: &str =
+    "Active stages pointing to this deployment must be moved or deleted";
+
+/// This operation's "the resource specified in the request was not found" refusal, as
+/// every other reader and writer of an api's child resources spells it: the modelled
+/// `NotFoundException`, whose message names the identifier that resolved to nothing.
+fn not_found(message: String) -> DeleteDeploymentError {
+    DeleteDeploymentErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message),
+        resource_type: ::std::option::Option::None,
+    })
+    .into()
 }

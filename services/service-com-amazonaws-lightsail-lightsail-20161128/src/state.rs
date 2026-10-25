@@ -887,6 +887,15 @@ pub const STATIC_IP_PAGE_SIZE: usize = 10;
 /// token is not returned if there are no more results to display."
 pub const EXPORT_SNAPSHOT_RECORD_PAGE_SIZE: usize = 10;
 
+/// How many domain recordsets one `GetDomains` page carries.
+///
+/// CHOSEN: Lightsail publishes no page size for this operation, only that the
+/// response carries a `nextPageToken` when more recordsets remain — "A next page
+/// token is not returned if there are no more results to display." Matches
+/// [`INSTANCE_PAGE_SIZE`], so every stored-resource listing in this slice pages
+/// the same way.
+pub const DOMAIN_PAGE_SIZE: usize = 10;
+
 /// How many log entries one `GetOperationsForResource` page carries.
 ///
 /// CHOSEN: Lightsail publishes a page size for `GetOperations` only ("Results

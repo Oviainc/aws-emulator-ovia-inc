@@ -64,6 +64,12 @@
 //! the aliases are every lens AWS publishes, of which the content catalog carries the ones
 //! this emulator holds questions for.
 //!
+//! The Trusted Advisor check content lives here for the same reason
+//! ([`trusted_advisor_checks`]): a check is associated to one best practice of one lens, so
+//! the checks a best practice reports (`ListCheckDetails`) and the question set that best
+//! practice comes from have to agree about which choice is which, and the association is
+//! resolved through the question's own choice catalog rather than restated beside it.
+//!
 //! The modelled `ResourceNotFoundException` / `ConflictException` constructors live
 //! here for the same reason: every operation that resolves an identifier or enforces a
 //! uniqueness rule must word the failure identically, so there is ONE place each
@@ -76,9 +82,15 @@ use sha2::{Digest, Sha256};
 
 pub mod official_lenses;
 pub mod recommendation_catalog;
+pub mod trusted_advisor_checks;
 
 pub use recommendation_catalog::{
     recommendation_content, RecommendationContent, RECOMMENDATION_CATALOG,
+};
+
+pub use trusted_advisor_checks::{
+    check_result, checks_for_best_practice, CheckResult, TrustedAdvisorCheck,
+    CHECK_PROVIDER_TRUSTED_ADVISOR, TRUSTED_ADVISOR_CHECK_CATALOG,
 };
 
 pub use official_lenses::{
@@ -142,6 +154,13 @@ pub const CHOICE_STATUS_SELECTED: &str = "SELECTED";
 /// (`smithy_query(query="shape", shape="TrustedAdvisorIntegrationStatus")`), and a
 /// workload nobody enabled the integration for is not integrated.
 pub const DEFAULT_TRUSTED_ADVISOR_INTEGRATION_STATUS: &str = "DISABLED";
+
+/// `TrustedAdvisorIntegrationStatus$ENABLED`: what a workload's discovery configuration
+/// reports once a caller has activated the Trusted Advisor integration for it
+/// (`smithy_query(query="shape", shape="TrustedAdvisorIntegrationStatus")`) — the status
+/// under which that workload's Trusted Advisor checks are fetched
+/// ([`WorkloadRecord::trusted_advisor_integration_enabled`]).
+pub const TRUSTED_ADVISOR_INTEGRATION_ENABLED: &str = "ENABLED";
 
 /// The `DISABLED` member every account-level opt-in status of this service publishes:
 /// `OrganizationSharingStatus`, `DiscoveryIntegrationStatus` and
@@ -2241,6 +2260,48 @@ impl WorkloadRecord {
             workload_resource_definition: stored
                 .and_then(|config| config.workload_resource_definition.clone()),
         }
+    }
+
+    /// Whether this workload's Trusted Advisor integration is activated: whether the
+    /// discovery configuration it reports carries
+    /// [`TRUSTED_ADVISOR_INTEGRATION_ENABLED`].
+    ///
+    /// It is what the Trusted Advisor checks of this workload's best practices are fetched
+    /// under — "discovery integration status in respect to Trusted Advisor for the
+    /// workload" (`smithy_query(query="shape", shape="WorkloadDiscoveryConfig")`) — so a
+    /// workload nobody activated it for has no check to report, and activating it (through
+    /// `CreateWorkload`'s or `UpdateWorkload`'s `DiscoveryConfig`) is what makes the checks
+    /// of a best practice appear.
+    pub fn trusted_advisor_integration_enabled(&self) -> bool {
+        self.effective_discovery_config()
+            .trusted_advisor_integration_status
+            .as_deref()
+            == Some(TRUSTED_ADVISOR_INTEGRATION_ENABLED)
+    }
+
+    /// The accounts a Trusted Advisor check of this workload is reported for, in reporting
+    /// order: the account that OWNS the workload, then each account the workload's
+    /// `AccountIds` names, in the workload's own order.
+    ///
+    /// A check detail is reported "by account related to the workload"
+    /// (`smithy_query(query="operation", operation="ListCheckDetails")`), and the accounts
+    /// related to a workload are the one it lives in and the ones it was created with
+    /// ("the list of Amazon Web Services account IDs associated with the workload" —
+    /// `smithy_query(query="shape", shape="Workload", member="AccountIds")`). Distinct in
+    /// the account id, so a workload that lists its own account, or lists one twice, is
+    /// reported for it once.
+    pub fn check_account_ids(&self) -> Vec<String> {
+        // Membership is tested against a set rather than by scanning what is already kept:
+        // `AccountIds` is a list the caller chose the length of, so a scan per entry would
+        // make building the reporting order cost work quadratic in that length.
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let mut accounts: Vec<String> = Vec::with_capacity(self.account_ids.len() + 1);
+        for account_id in std::iter::once(&self.owner).chain(self.account_ids.iter()) {
+            if seen.insert(account_id.as_str()) {
+                accounts.push(account_id.clone());
+            }
+        }
+        accounts
     }
 
     /// The `Workload` shape `GetWorkload`/`UpdateWorkload` return.
@@ -6805,6 +6866,24 @@ pub fn decode_question_token(token: &str) -> Option<String> {
     Some(decode_cursor(token)?.get("q")?.as_str()?.to_string())
 }
 
+/// Encode a cursor over the Trusted Advisor checks of one best practice: the
+/// `(account id, check id)` pair last served, in the same opaque scheme as
+/// [`encode_next_token`]. A check is reported once per account the workload covers
+/// ([`WorkloadRecord::check_account_ids`]), so it takes both to name a position. Its own
+/// keys, so a cursor issued by another paginated operation is not a cursor here.
+pub fn encode_check_next_token(account_id: &str, check_id: &str) -> String {
+    encode_cursor(&::serde_json::json!({ "ca": account_id, "ck": check_id }))
+}
+
+/// The `(account id, check id)` a checks `NextToken` points just past, or `None` when the
+/// token is not one this service issued.
+pub fn decode_check_next_token(token: &str) -> Option<(String, String)> {
+    let cursor = decode_cursor(token)?;
+    let account_id = cursor.get("ca")?.as_str()?.to_string();
+    let check_id = cursor.get("ck")?.as_str()?.to_string();
+    Some((account_id, check_id))
+}
+
 /// One page of a lens's questions: the questions to report, and the `NextToken` the next
 /// page resumes from when the selection does not fit in this one.
 #[derive(Debug)]
@@ -6980,6 +7059,16 @@ pub const CHOICE_UPDATES_MEMBER: &str = "ChoiceUpdates";
 /// records an answer.
 pub const ANSWER_REASON_MEMBER: &str = "Reason";
 
+/// The members a request names ONE best practice of a lens review by: the pillar, the
+/// question that pillar asks and the choice that question offers
+/// (`ListCheckDetailsInput$PillarId` / `$QuestionId` / `$ChoiceId`, each `@required`). A
+/// finding about one of them names it, so a caller is told WHICH part of the path to fix.
+pub const PILLAR_ID_MEMBER: &str = "PillarId";
+/// See [`PILLAR_ID_MEMBER`].
+pub const QUESTION_ID_MEMBER: &str = "QuestionId";
+/// See [`PILLAR_ID_MEMBER`].
+pub const CHOICE_ID_MEMBER: &str = "ChoiceId";
+
 /// The refusal for the first enum member of an answer-recording request carrying a value
 /// outside its modelled value set, if any does: the answer's own `Reason` (an
 /// `AnswerReason`) and each `ChoiceUpdate`'s `Status` (a `ChoiceStatus`) and `Reason` (a
@@ -7067,23 +7156,43 @@ pub fn undefined_choice_refusal(
         ),
     ];
     for (member, choice_ids) in named {
-        let mut undefined: Vec<&str> = choice_ids
-            .filter(|choice_id| !question.defines_choice(choice_id))
-            .collect();
-        if !undefined.is_empty() {
-            undefined.sort_unstable();
-            undefined.dedup();
-            return Some(member_constraint_exception(
-                member,
-                &format!(
-                    "every choice must be a choice of question {}, which {} is not",
-                    question.question_id,
-                    undefined.join(", ")
-                ),
-            ));
+        if let Some(exception) = undefined_choice_member_refusal(member, question, choice_ids) {
+            return Some(exception);
         }
     }
     None
+}
+
+/// The refusal for the `ChoiceId`s ONE member of a request names that are not choices of
+/// the question the request is about, if any of them is not.
+///
+/// The rule [`undefined_choice_refusal`] applies to each member that carries a choice of an
+/// ANSWER, stated once for any member that names a choice: a choice belongs to the question
+/// that offers it, so an id naming a choice of another question — or of none — belongs to
+/// no choice of this question. `member` is the member the finding names, and the offending
+/// ids are sorted and deduplicated, so the refusal does not depend on the order the request
+/// listed them in.
+pub fn undefined_choice_member_refusal<'id>(
+    member: &str,
+    question: &ReviewQuestion,
+    choice_ids: impl Iterator<Item = &'id str>,
+) -> Option<crate::ops::types::ValidationException> {
+    let mut undefined: Vec<&str> = choice_ids
+        .filter(|choice_id| !question.defines_choice(choice_id))
+        .collect();
+    if undefined.is_empty() {
+        return None;
+    }
+    undefined.sort_unstable();
+    undefined.dedup();
+    Some(member_constraint_exception(
+        member,
+        &format!(
+            "every choice must be a choice of question {}, which {} is not",
+            question.question_id,
+            undefined.join(", ")
+        ),
+    ))
 }
 
 /// Whether an answer-recording request asks for a change to the answer at all.

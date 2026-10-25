@@ -4,7 +4,10 @@
 //! Renders the cluster's bootstrap-broker strings from its persisted brokers and
 //! access settings: one `<host>:<port>` entry per stored broker node, and one
 //! string per access path the cluster actually enables. A path the cluster does
-//! not enable has no string at all.
+//! not enable has no string at all. A cluster the service is still provisioning
+//! has no brokers yet ([`crate::state::cluster_has_broker_nodes`]), so it is
+//! refused with `BadRequestException` rather than answered with endpoints nothing
+//! serves on.
 //!
 //! Authentication and authorization are NOT this handler's business: the emulator
 //! verifies every request signature centrally (see `AGENTS.md`), so the modelled
@@ -234,6 +237,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A cluster the service is still provisioning has no brokers yet, so
+        // there are no endpoints to bootstrap against: the reader refuses rather
+        // than reporting hostnames nothing is serving on. Checked for either
+        // kind of cluster, the serverless endpoint included.
+        if !crate::state::cluster_has_broker_nodes(&cluster.state) {
+            let state = cluster.state.clone();
+            return Err(GetBootstrapBrokersErrorModeled::BadRequestException(
+                BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::bootstrap_brokers_unavailable_message(&state)),
+                },
+            )
+            .into());
+        }
 
         // MSK Serverless offers ONE access path: a client authenticates with IAM
         // access control over TLS, on the SASL/IAM port. So a serverless cluster

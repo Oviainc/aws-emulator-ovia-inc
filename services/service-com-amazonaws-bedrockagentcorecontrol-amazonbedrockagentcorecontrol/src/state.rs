@@ -21,7 +21,8 @@
 //!
 //! Helpers the handlers share (the region a request was signed for, the
 //! canonical ARNs, id minting, the clock-owed status transition, the response
-//! envelopes, the cross-service Lambda check a gateway target needs) live here
+//! envelopes, the cross-service Lambda check a gateway target needs and the
+//! cross-service IAM check a caller-supplied execution role needs) live here
 //! rather than in any one `ops/` file, so create/get/list/update/delete cannot
 //! drift from each other.
 
@@ -29,19 +30,19 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AgentRuntime, AgentRuntimeArtifact, AuthorizerConfiguration, CapacityProviderConfiguration,
-    CertificateConfiguration, CreateGatewayOutput, CreateGatewayTargetOutput,
-    CredentialProviderConfiguration, CustomTransformConfiguration, FilesystemConfiguration,
-    GatewayInterceptorConfiguration, GatewayPolicyEngineConfiguration,
+    AgentRuntime, AgentRuntimeArtifact, AgentRuntimeVersionSummary, AuthorizerConfiguration,
+    CapacityProviderConfiguration, CertificateConfiguration, CreateGatewayOutput,
+    CreateGatewayTargetOutput, CredentialProviderConfiguration, CustomTransformConfiguration,
+    FilesystemConfiguration, GatewayInterceptorConfiguration, GatewayPolicyEngineConfiguration,
     GatewayProtocolConfiguration, GatewaySummary, GetGatewayOutput, GetGatewayTargetOutput,
-    Harness, HarnessAgentCoreRuntimeEnvironment, HttpTargetConfiguration,
-    InferenceTargetConfiguration,
-    HarnessAgentCoreRuntimeEnvironmentRequest, HarnessEnvironmentArtifact,
-    HarnessEnvironmentProvider, HarnessEnvironmentProviderRequest, HarnessHook,
-    HarnessMemoryConfiguration, HarnessModelConfiguration, HarnessSkill, HarnessSystemContentBlock,
-    HarnessTool, HarnessTruncationConfiguration, IndexedKey, LifecycleConfiguration,
+    Harness, HarnessAgentCoreRuntimeEnvironment, HarnessAgentCoreRuntimeEnvironmentRequest,
+    HarnessEnvironmentArtifact, HarnessEnvironmentProvider, HarnessEnvironmentProviderRequest,
+    HarnessHook, HarnessMemoryConfiguration, HarnessModelConfiguration, HarnessSkill,
+    HarnessSystemContentBlock, HarnessTool, HarnessTruncationConfiguration,
+    HttpTargetConfiguration, IndexedKey, InferenceTargetConfiguration, LifecycleConfiguration,
     McpTargetConfiguration, Memory, MemoryStrategy, MetadataConfiguration, NamespaceKeyEntry,
     NetworkConfiguration, PrivateEndpoint, ProtocolConfiguration, RequestHeaderConfiguration,
+    ResourceNotFoundException,
     RuntimeMetadataConfiguration, StreamDeliveryResources, TargetConfiguration, TargetSummary,
     ToolDefinition, ToolSchema,
     UpdateGatewayOutput, ValidationException, ValidationExceptionField, WafConfiguration,
@@ -150,6 +151,45 @@ pub fn gateway_status_conflict(operation: &str, status: &str) -> ValidationExcep
         field_list: None,
     }
 }
+
+/// The modelled not-found error for a resource of this service that is not
+/// there: what could not be carried out, the resource it was for, and the one
+/// remedy the caller has, in the form this service's recorded refusals take
+/// ("Failed to retrieve gateway because it doesn't exist. Retry the request
+/// with a different resource identifier.").
+///
+/// `action` is what the operation was doing to the MISSING resource — `retrieve`
+/// for one being read, including one read as the parent a request addresses
+/// through — and `resource` is that resource's own noun. The identifier the
+/// request named is NOT echoed: it is the caller's own value, and the remedy
+/// does not depend on it.
+///
+/// Shared by the handlers rather than written per operation, so one resource
+/// cannot be reported missing in two different sentences by two operations.
+pub fn resource_not_found(action: &str, resource: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Failed to {action} {resource} because it doesn't exist. Retry the request with a \
+             different resource identifier."
+        )),
+    }
+}
+
+/// The `action` [`resource_not_found`] takes for a resource being READ: a
+/// `Get…` of it, and a read of the parent a `Create…`, `List…` or any other
+/// request addresses through.
+pub const ACTION_RETRIEVE: &str = "retrieve";
+
+/// The `action` for a resource a `Delete…` could not find.
+pub const ACTION_DELETE: &str = "delete";
+
+/// The `action` for a resource an `Update…` could not find.
+pub const ACTION_UPDATE: &str = "update";
+
+/// The resource nouns [`resource_not_found`] names, as the recorded refusals
+/// word them: a gateway, and a target OF a gateway.
+pub const RESOURCE_GATEWAY: &str = "gateway";
+pub const RESOURCE_GATEWAY_TARGET: &str = "target";
 
 /// How many gateways this emulator will hold, and how many targets one gateway
 /// will hold.
@@ -286,6 +326,28 @@ impl AgentRuntimeVersionRecord {
     /// pattern `^([1-9][0-9]{0,4})$`).
     pub fn version_string(&self) -> String {
         self.version.to_string()
+    }
+
+    /// This version's `AgentRuntimeVersionSummary`, as every listing of versions
+    /// reports it. `agent_runtime_arn` is the owning runtime's, which the summary
+    /// reports and the version itself does not store twice.
+    pub fn summary(&self, agent_runtime_arn: &str, now: SystemTime) -> AgentRuntimeVersionSummary {
+        AgentRuntimeVersionSummary {
+            agent_runtime_arn: agent_runtime_arn.to_string(),
+            agent_runtime_version: self.version_string(),
+            status: self.status_at(now).to_string(),
+        }
+    }
+
+    /// The `capacityProviderId` this version runs on, when it was configured with
+    /// a capacity provider at all.
+    pub fn capacity_provider_id(&self) -> Option<&str> {
+        let configuration = self.capacity_provider_configuration.as_ref()?;
+        ::service_common::arn::resource_id_of_type(
+            &configuration.capacity_provider_arn,
+            CAPACITY_PROVIDER_RESOURCE,
+        )
+        .filter(|id| !id.is_empty())
     }
 }
 
@@ -1216,6 +1278,72 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
             .retain(|token| live.contains_key(token));
     }
 
+    /// Every stored agent-runtime VERSION associated with the capacity provider
+    /// `capacity_provider_id`, each with the opaque page cursor that identifies
+    /// it, in one deterministic order.
+    ///
+    /// The association is the one this service persists: a version carries a
+    /// `capacityProviderConfiguration` naming the provider's ARN
+    /// ([`AgentRuntimeVersionRecord::capacity_provider_id`]), which is what makes
+    /// that version one "you must disassociate before you can delete the
+    /// capacity provider" (`smithy_query doc
+    /// shape=ListAgentRuntimeVersionsByCapacityProvider`).
+    ///
+    /// The cursor is `<agentRuntimeId>/<version zero-padded to five digits>` —
+    /// five because `AgentRuntimeVersion` is `^([1-9][0-9]{0,4})$` — so the
+    /// cursors sort exactly as the rows do and a page can resume strictly after
+    /// the one it ended on.
+    pub fn runtime_versions_for_capacity_provider(
+        &self,
+        capacity_provider_id: &str,
+        now: SystemTime,
+    ) -> Vec<(String, AgentRuntimeVersionSummary)> {
+        let mut rows = Vec::new();
+        for record in self.agent_runtimes.values() {
+            for version in record.versions.values() {
+                if version.capacity_provider_id() != Some(capacity_provider_id) {
+                    continue;
+                }
+                rows.push((
+                    format!("{}/{:05}", record.agent_runtime_id, version.version),
+                    version.summary(&record.agent_runtime_arn, now),
+                ));
+            }
+        }
+        // The maps are ordered, but a runtime id and a version number are two
+        // keys: sorting on the composed cursor is what makes the one order the
+        // pager walks and the cursors it hands out agree.
+        rows.sort_by(|(left, _), (right, _)| left.cmp(right));
+        rows
+    }
+
+    /// Whether this account holds a capacity provider that
+    /// `capacity_provider_id` names.
+    ///
+    /// The only record of a capacity provider this service persists today is the
+    /// association an agent-runtime version carries: `CreateCapacityProvider` is
+    /// still scaffolded (see its own `src/ops/create_capacity_provider.rs`), so
+    /// an id no stored version is configured with names nothing in this account.
+    ///
+    /// KNOWN DEVIATION, which that stub owns and this read resolves the day it
+    /// lands: a capacity provider that exists with NO associated runtime version
+    /// is answered `AccessDeniedException` (403) here, where the real service
+    /// answers 200 with an empty `agentRuntimes` list — the listing is documented
+    /// as naming "the runtimes you must disassociate before you can delete the
+    /// capacity provider", so an empty page is a legitimate answer for a provider
+    /// nothing uses. Nothing in this emulator can mint or hold such a provider
+    /// yet, so there is no state from which to tell it apart from an id that
+    /// names nothing; when `CreateCapacityProvider` is implemented, its store
+    /// becomes the authority this reads and the empty-provider case answers 200.
+    pub fn holds_capacity_provider(&self, capacity_provider_id: &str) -> bool {
+        self.agent_runtimes.values().any(|record| {
+            record
+                .versions
+                .values()
+                .any(|version| version.capacity_provider_id() == Some(capacity_provider_id))
+        })
+    }
+
     /// The gateway whose PUBLISHED endpoint host is the one a data-plane request
     /// addressed: the gateway `gateway_id` names, and only while the URL it
     /// published is the one on `region`'s gateway host.
@@ -1689,6 +1817,68 @@ pub fn inline_tool_definitions(configuration: &TargetConfiguration) -> Option<&[
 /// straight after the call still observes the transient status.
 pub const GATEWAY_SETTLE_DELAY: Duration = Duration::from_millis(500);
 
+/// The ARN resource type of a capacity provider: `CapacityProviderArn` is
+/// `arn:aws…:bedrock-agentcore:…:capacity-provider/{capacityProviderId}`
+/// (`smithy_query shape=CapacityProviderConfiguration`).
+pub const CAPACITY_PROVIDER_RESOURCE: &str = "capacity-provider";
+
+/// The error SHAPE this service names when it denies a request on permissions:
+/// `AccessDeniedException` (HTTP 403), which
+/// `ListAgentRuntimeVersionsByCapacityProvider` models and which the service
+/// declares as a common error
+/// (`smithy_query query=service_info`, `common_errors`).
+pub const ACCESS_DENIED_SHAPE: &str = "AccessDeniedException";
+
+/// Why a request naming a capacity provider this account does not hold is
+/// denied, in the words the recorded service uses for this operation's denial:
+/// the member it was denied over, and the clause naming where the deny came
+/// from, which the authorizer renders.
+///
+/// ONE sentence, and no echo of the caller's value: authorization here is
+/// resolved against the resource the path label names, and the emulator can see
+/// only that no capacity provider of this account answers to it — not which of
+/// the real authorizer's reasons applied. The status and the error code are what
+/// a client branches on; stating a second, unrecorded reason would be this
+/// file's words rather than the service's.
+pub const CAPACITY_PROVIDER_DENIAL: &str = "Request denied: capacityProviderId does not match \
+     the required format with an explicit deny in a resource-based policy";
+
+/// The `capacityProviderId` a `ListAgentRuntimeVersionsByCapacityProvider`
+/// request names, read off the request line itself rather than off a
+/// deserialized input.
+///
+/// `None` for every other request. The route is the modelled one —
+/// `POST /capacity-providers/{capacityProviderId}/runtime-versions`
+/// (`smithy_query operation=ListAgentRuntimeVersionsByCapacityProvider`) — and
+/// the label is non-greedy, so the id is exactly one path segment, percent-decoded
+/// as the codec would decode it. `uri` is the request line's, which may be
+/// absolute and may carry a query string, so the PATH is taken out of it first.
+///
+/// This exists because that operation authorizes BEFORE it validates (see
+/// `crate::service::EmulatedService::override_operation`), which is earlier than
+/// any handler runs and so earlier than a deserialized input exists.
+pub fn capacity_provider_runtime_versions_id(method: &str, uri: &str) -> Option<String> {
+    if !method.eq_ignore_ascii_case("POST") {
+        return None;
+    }
+    // The path is read through the ONE shared reader for a request-line URI, which the
+    // routing seams see as a `&str` that may be absolute: `service_common::uri_path`.
+    let (id, tail) = ::service_common::uri_path(uri)
+        .strip_prefix("/capacity-providers/")?
+        .split_once('/')?;
+    // A trailing slash is trimmed so the seam fires for every spelling the router
+    // claims: this service's other routes are written with one (`/runtimes/`,
+    // `/gateways/{id}/targets/`), and a form the modelled route does not match
+    // never reaches here at all, because the service does not claim it.
+    //
+    // The label is decoded with PATH semantics (`+` is a literal there, not a space)
+    // through the shared reader that states that rule once for the whole tree,
+    // `service_common::percent_decode_path_label`, so this seam and the deserializer
+    // see the one id for every spelling of the label.
+    (tail.trim_end_matches('/') == "runtime-versions" && !id.is_empty())
+        .then(|| ::service_common::percent_decode_path_label(id))
+}
+
 /// The Lambda function ARN a target configuration names, for the one
 /// configuration shape that names one: an MCP target whose tool handler is a
 /// Lambda function (`TargetConfiguration.mcp.lambda.lambdaArn`).
@@ -1902,6 +2092,81 @@ fn function_is_absent(
         .is_some_and(
             ::aws_sdk_lambda::operation::get_function::GetFunctionError::is_resource_not_found_exception,
         )
+}
+
+/// The IAM service principal this service assumes a caller-supplied execution
+/// role as.
+///
+/// Source: the model's own `awsService.cloudTrailEventSource`,
+/// `bedrock-agentcore.amazonaws.com` (`smithy_query query=service_info`) — the
+/// principal an AgentCore execution role's trust policy has to admit.
+pub const SERVICE_PRINCIPAL: &str = "bedrock-agentcore.amazonaws.com";
+
+/// The request member a caller names an execution role in, on every operation of
+/// this service that takes one (`CreateAgentRuntime`, `UpdateAgentRuntime`,
+/// `CreateGateway`).
+pub const ROLE_ARN_MEMBER: &str = "roleArn";
+
+/// Why a role this service could not assume is refused, in the `fieldList` entry
+/// the refusal carries for `roleArn`.
+pub const ROLE_UNASSUMABLE: &str =
+    "names a role that does not exist in this account, or whose trust policy does not \
+     allow this service to assume it";
+
+/// The modelled validation error for an execution role this service could not
+/// assume.
+///
+/// The sentence names the ARN that was refused and the two things to check, the
+/// way the real service words it; the member that failed is reported in the
+/// `fieldList` the shape declares for exactly that.
+pub fn role_validation_failed(role_arn: &str) -> ValidationException {
+    ValidationException {
+        message: format!(
+            "Role validation failed for '{role_arn}'. Please verify that the role exists and \
+             its trust policy allows assumption by this service"
+        ),
+        reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: ROLE_ARN_MEMBER.to_string(),
+            message: ROLE_UNASSUMABLE.to_string(),
+        }]),
+    }
+}
+
+/// Whether IAM reports that this service could not assume the execution role
+/// `role_arn` — the role is not there, or its trust policy withholds the grant.
+///
+/// An agent runtime RUNS AS the role the caller names, so the role is resolved
+/// when the runtime is WRITTEN, and a request naming one this service cannot
+/// assume is refused with the operation's modelled validation error with nothing
+/// persisted. IAM is reached the way any emulated service reaches another:
+/// through the in-process callback
+/// ([`smithy_server_runtime::OperationContext::callback`]), so this crate names
+/// no other service crate.
+///
+/// Not every `roleArn` of this service is gated on it: the recorded service
+/// ACCEPTS a `CreateGateway` whose role cannot be assumed, so only the
+/// operations that store an agent runtime's execution role
+/// (`CreateAgentRuntime`, `UpdateAgentRuntime`) call this.
+///
+/// `false` means the request may be written. That includes every case where
+/// nothing is KNOWN about the role — a value that names no IAM role of this
+/// account (`service_common::iam_role::role_name`, the tree's one reading of a
+/// caller-supplied role ARN), or an emulator with no IAM to ask (a router with
+/// only this service mounted, say) — because a refusal has to be grounded in
+/// what IAM answered, never assumed.
+pub async fn execution_role_is_unassumable(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+) -> bool {
+    // The whole question — which role of this account the value names, what IAM
+    // answers about it, and whether the trust policy it carries admits this
+    // service's principal — is the ONE reading every service that resolves a
+    // caller-supplied execution role shares
+    // (`service_common::iam_role::role_is_unassumable`), so this crate states
+    // only WHICH principal has to be admitted and WHICH operations ask.
+    ::service_common::iam_role::role_is_unassumable(ctx, region, role_arn, SERVICE_PRINCIPAL).await
 }
 
 /// The credential a gateway target reports when the caller configured none: the

@@ -59,6 +59,8 @@ mod list_services;
 mod list_tags_for_resource;
 #[path = "all/max_results_range.rs"]
 mod max_results_range;
+#[path = "all/page_bounds.rs"]
+mod page_bounds;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/service_dependency_metrics.rs"]

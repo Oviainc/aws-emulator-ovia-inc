@@ -273,6 +273,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let rollback_configuration = change_set.rollback_configuration.clone();
             let deployment_config = change_set.deployment_config.clone();
             let resource_types = change_set.resource_types.clone();
+            // The template's PROCESSED stage, the document the stack deploys: computed
+            // once when the change set was created — off the store lock, over the same
+            // body the plan was computed from — so this call only reads it.
+            let processed_template = change_set.processed_template.clone();
             // "DO_NOTHING - if the stack creation fails, do nothing. This is equivalent to
             // specifying true for the DisableRollback parameter."
             let disable_rollback = input.disable_rollback.or_else(|| {
@@ -308,8 +312,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // change set has to keep, replace or delete in the services that own them.
             let previous_resources = stack.current_resources().to_vec();
             // The change set's configuration becomes the stack's: this is the call that
-            // applies it, which is why the template only now reaches the stack.
-            stack.set_template_body(template_body);
+            // applies it, which is why the template only now reaches the stack. The
+            // PROCESSED stage it carries is the one the change set computed and stored
+            // when it was created, so the deployment carried out here is exactly the one
+            // `DescribeChangeSet` described.
+            stack.set_template_body(template_body, processed_template);
             stack.parameters = parameters;
             stack.capabilities = capabilities;
             stack.tags = tags;
@@ -324,9 +331,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(retain_except_on_create) = input.retain_except_on_create {
                 stack.retain_except_on_create = Some(retain_except_on_create);
             }
-            if let Some(token) = &input.client_request_token {
-                stack.client_request_token = Some(token.clone());
-            }
+            // "All events triggered by a given stack operation are assigned the same
+            // client request token": the caller's token when it named one, otherwise the
+            // one CloudFormation assigns the operation this execution starts.
+            let client_request_token = input
+                .client_request_token
+                .clone()
+                .unwrap_or_else(crate::state::new_client_request_token);
+            stack.client_request_token = Some(client_request_token.clone());
             // `Stack$ChangeSetId` is the change set that last acted on the stack.
             stack.change_set_id = Some(change_set_id.clone());
             let operation_id = crate::state::new_operation_id();
@@ -340,7 +352,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // resources and outputs are computed from that body and the parameters in
             // force, and are reported once this operation completes — exactly as they are
             // for `CreateStack` and `UpdateStack`.
-            stack.deploy_template();
+            let cannot_deploy = stack.deploy_template().err();
             // "After the call successfully completes, CloudFormation starts updating the
             // stack": a CREATE change set creates the stack it had left in
             // REVIEW_IN_PROGRESS, an UPDATE change set updates one that already exists —
@@ -351,7 +363,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     status::CREATE_IN_PROGRESS,
                     status::CREATE_COMPLETE,
                     Some(operation_id),
-                    input.client_request_token.clone(),
+                    Some(client_request_token),
                 );
             } else {
                 stack.begin_transition(
@@ -359,8 +371,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     status::UPDATE_IN_PROGRESS,
                     status::UPDATE_COMPLETE,
                     Some(operation_id),
-                    input.client_request_token.clone(),
+                    Some(client_request_token),
                 );
+            }
+            // A template this service cannot deploy — one whose transforms it cannot
+            // apply, or one its reader will not read — ends the operation in the modelled
+            // failure state with the reason, rather than in a completion reporting a
+            // deployment nothing performed.
+            if let Some(reason) = cannot_deploy {
+                let failed = if creates_the_stack {
+                    status::CREATE_FAILED
+                } else {
+                    status::UPDATE_FAILED
+                };
+                stack.fail_pending_transition(failed, reason);
             }
             let region = stack.region.clone();
             let declared = stack.current_resources().to_vec();

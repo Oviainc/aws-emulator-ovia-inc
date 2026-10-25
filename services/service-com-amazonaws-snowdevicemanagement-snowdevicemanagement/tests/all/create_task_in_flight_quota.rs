@@ -195,6 +195,27 @@ async fn create_in(
     .await
 }
 
+/// `CreateTask` in `region`, aimed at `device`, carrying a `clientToken`.
+async fn create_with_token(
+    router: &MultiServiceRouter,
+    region: &str,
+    device: &str,
+    token: &str,
+) -> Answer {
+    call_in(
+        router,
+        region,
+        "POST",
+        "/task",
+        Some(json!({
+            "targets": [device],
+            "command": { "reboot": {} },
+            "clientToken": token,
+        })),
+    )
+    .await
+}
+
 /// `CancelTask` in `region`.
 async fn cancel_in(router: &MultiServiceRouter, region: &str, task_id: &str) -> Answer {
     call_in(
@@ -240,6 +261,18 @@ fn trim_history(engine: &Arc<engine::InMemoryEngine>, region: &str, keep: usize)
     let state = service_state(&**engine).expect("the in-memory engine carries this service's state");
     let mut store = state.lock();
     store.trim_task_history(region, keep)
+}
+
+/// Apply the STORE-WIDE retention bound with a `keep` this suite chooses, answering
+/// how many records it dropped.
+///
+/// Driven with a small bound for the same reason as [`trim_history`]: what is under
+/// test is which records it forgets, which is the same whatever the number is.
+/// `CreateTask` applies it with `STORE_TASK_HISTORY_LIMIT`.
+fn trim_store_history(engine: &Arc<engine::InMemoryEngine>, keep: usize) -> usize {
+    let state = service_state(&**engine).expect("the in-memory engine carries this service's state");
+    let mut store = state.lock();
+    store.trim_store_task_history(keep)
 }
 
 /// Percent-encode a `nextToken` for a query string: the token is base64, whose `+`,
@@ -639,4 +672,184 @@ async fn the_history_bound_forgets_the_oldest_terminal_tasks_and_nothing_in_flig
             row.case
         );
     }
+}
+
+#[tokio::test]
+async fn the_store_wide_history_bound_forgets_the_oldest_terminal_tasks_of_every_region() {
+    // The Region a record is partitioned by is the one the request was signed for, so
+    // the bound that keeps the store finite is counted over every Region at once: past
+    // the records the store keeps, the oldest TERMINAL tasks make room WHEREVER they
+    // live, nothing in flight is forgotten, and a store already inside the bound
+    // forgets nothing.
+    let case = "tasks in two regions, the oldest of each cancelled";
+    let (router, engine, _) = emulator();
+    let filled_device = a_device_in(&engine, FILLED_REGION);
+    let other_device = a_device_in(&engine, OTHER_REGION);
+
+    // Created oldest first, alternating Regions, so which records the bound forgets
+    // cannot be read off one partition's order.
+    const PER_REGION: usize = 3;
+    let mut created: Vec<(&str, String)> = Vec::new();
+    for _ in 0..PER_REGION {
+        for (region, device) in [
+            (FILLED_REGION, &filled_device),
+            (OTHER_REGION, &other_device),
+        ] {
+            let minted = fill_in_flight(&router, &engine, region, device, 1, case).await;
+            created.push((region, minted[0].clone()));
+        }
+    }
+
+    // The two oldest records, one in each Region, are the only terminal ones: a cancel
+    // reaches an execution no device has started, which the hold keeps true.
+    let terminal: Vec<(&str, String)> = created.iter().take(2).cloned().collect();
+    for (region, task_id) in &terminal {
+        ok(&cancel_in(&router, region, task_id).await, case);
+    }
+
+    // One record over the bound, so exactly the oldest terminal ones make room.
+    let keep = created.len() - terminal.len();
+    assert_eq!(
+        trim_store_history(&engine, keep),
+        terminal.len(),
+        "case {case:?}: the bound must forget the records past it, and only terminal ones"
+    );
+
+    for (region, task_id) in &terminal {
+        assert_not_found(&describe_in(&router, region, task_id).await, case);
+        let device = if *region == FILLED_REGION {
+            &filled_device
+        } else {
+            &other_device
+        };
+        assert_not_found(
+            &describe_execution_in(&router, region, task_id, device).await,
+            case,
+        );
+    }
+    for (region, task_id) in created.iter().skip(terminal.len()) {
+        let described = ok(&describe_in(&router, region, task_id).await, case);
+        assert_eq!(
+            string(&described, "state", case),
+            "IN_PROGRESS",
+            "case {case:?}: a task still in flight must be kept, got {described}"
+        );
+    }
+
+    // Each Region kept exactly its own surviving records, so the store-wide pass did
+    // not touch a partition's answer beyond what it forgot.
+    for (region, device) in [
+        (FILLED_REGION, &filled_device),
+        (OTHER_REGION, &other_device),
+    ] {
+        let expected: BTreeSet<String> = created
+            .iter()
+            .skip(terminal.len())
+            .filter(|(task_region, _)| *task_region == region)
+            .map(|(_, task_id)| task_id.clone())
+            .collect();
+        assert_eq!(
+            listed_task_ids(&router, region, None, case).await,
+            expected,
+            "case {case:?}: {region} must report exactly the records it kept"
+        );
+        for task_id in &expected {
+            ok(
+                &describe_execution_in(&router, region, task_id, device).await,
+                case,
+            );
+        }
+    }
+
+    // Nothing terminal is left, so a bound below what is in flight still forgets
+    // nothing: an in-flight record is never a candidate.
+    assert_eq!(
+        trim_store_history(&engine, 0),
+        0,
+        "case {case:?}: a store holding nothing terminal must forget nothing"
+    );
+    assert_eq!(
+        trim_store_history(&engine, keep),
+        0,
+        "case {case:?}: a store inside the bound must forget nothing"
+    );
+}
+
+#[tokio::test]
+async fn the_token_index_forgets_the_entries_of_the_records_it_no_longer_holds() {
+    // The `clientToken` index is added to by a request, so it carries the same kind
+    // of bound as the task history: an entry whose task the store forgot indexes
+    // nothing and goes first, and a token the store has forgotten mints a task the
+    // way an unused one does — while a token whose task is still held keeps
+    // reporting it.
+    let case = "one token per region, the first region's record forgotten";
+    let (router, engine, _) = emulator();
+
+    let mut created: Vec<(&str, String, String)> = Vec::new();
+    for (region, device) in [
+        (FILLED_REGION, a_device_in(&engine, FILLED_REGION)),
+        (OTHER_REGION, a_device_in(&engine, OTHER_REGION)),
+    ] {
+        let token = format!("token-of-{region}");
+        let body = ok(
+            &create_with_token(&router, region, &device, &token).await,
+            case,
+        );
+        let task_id = string(&body, "taskId", case);
+        hold_pending(&engine);
+        // The same token reports the task it created, in the Region it was used in.
+        let repeated = ok(
+            &create_with_token(&router, region, &device, &token).await,
+            case,
+        );
+        assert_eq!(
+            string(&repeated, "taskId", case),
+            task_id,
+            "case {case:?}: a repeated token must report the task it created"
+        );
+        created.push((region, token, task_id));
+    }
+
+    // Forget the first Region's record: cancelling it makes it terminal, and the
+    // store-wide bound then has one candidate.
+    let (forgotten_region, forgotten_token, forgotten_task) = created[0].clone();
+    ok(
+        &cancel_in(&router, forgotten_region, &forgotten_task).await,
+        case,
+    );
+    assert_eq!(
+        trim_store_history(&engine, created.len() - 1),
+        1,
+        "case {case:?}: the terminal record past the bound must be forgotten"
+    );
+    assert_not_found(
+        &describe_in(&router, forgotten_region, &forgotten_task).await,
+        case,
+    );
+
+    // Its token indexes nothing now, so the create carrying it mints a fresh task.
+    let device = a_device_in(&engine, forgotten_region);
+    let fresh = ok(
+        &create_with_token(&router, forgotten_region, &device, &forgotten_token).await,
+        case,
+    );
+    let fresh_id = string(&fresh, "taskId", case);
+    assert_ne!(
+        fresh_id, forgotten_task,
+        "case {case:?}: a token whose task the store forgot must mint a new one"
+    );
+
+    // And the other Region's token still reports its own task: the pruning forgot
+    // only the entries of records the store no longer holds.
+    let (kept_region, kept_token, kept_task) = created[1].clone();
+    let kept_device = a_device_in(&engine, kept_region);
+    let kept = ok(
+        &create_with_token(&router, kept_region, &kept_device, &kept_token).await,
+        case,
+    );
+    assert_eq!(
+        string(&kept, "taskId", case),
+        kept_task,
+        "case {case:?}: the token of a record the store still holds must report it"
+    );
 }

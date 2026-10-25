@@ -47,6 +47,12 @@
 //! a request's recorded votes put it in is derived the same way, by
 //! [`change_request_status_from_approvals`], and [`change_request_is_terminal`] says
 //! which statuses admit no modification at all.
+//!
+//! Tags are the one thing here that belongs to no single kind of resource: `tags` is
+//! keyed by resource ARN, so the tagging operations read and write the same entry a
+//! create filled in, whichever kind of resource the ARN names
+//! ([`CleanRoomsState::holds_resource_at_arn`] is what resolves one, and
+//! [`resource_type_of_arn`] what an ARN that resolves to nothing is reported as).
 
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
@@ -304,6 +310,59 @@ pub const MIN_SELECTED_ANALYSIS_METHODS: usize = 2;
 /// type of the resource that was not found rather than one of the four that is not it.
 /// `ConflictException$resourceType`, which is optional, is left absent instead.
 pub const RESOURCE_TYPE_ANALYSIS_TEMPLATE: &str = "ANALYSIS_TEMPLATE";
+
+/// The resource type a privacy-budget-template 404 reports, for the same reason as
+/// [`RESOURCE_TYPE_ANALYSIS_TEMPLATE`]: the member is required and the model's
+/// `ResourceType` catalog names no privacy budget template, so it reports the type of
+/// the resource that was not found rather than one of the four that is not it.
+pub const RESOURCE_TYPE_PRIVACY_BUDGET_TEMPLATE: &str = "PRIVACY_BUDGET_TEMPLATE";
+
+/// The resource types a tagging refusal reports for the remaining kinds of resource an
+/// ARN can address, named the same way as [`RESOURCE_TYPE_ANALYSIS_TEMPLATE`].
+pub const RESOURCE_TYPE_CONFIGURED_TABLE_ASSOCIATION: &str = "CONFIGURED_TABLE_ASSOCIATION";
+/// See [`RESOURCE_TYPE_CONFIGURED_TABLE_ASSOCIATION`].
+pub const RESOURCE_TYPE_ID_NAMESPACE_ASSOCIATION: &str = "ID_NAMESPACE_ASSOCIATION";
+/// See [`RESOURCE_TYPE_CONFIGURED_TABLE_ASSOCIATION`].
+pub const RESOURCE_TYPE_ID_MAPPING_TABLE: &str = "ID_MAPPING_TABLE";
+/// See [`RESOURCE_TYPE_CONFIGURED_TABLE_ASSOCIATION`].
+pub const RESOURCE_TYPE_CONFIGURED_AUDIENCE_MODEL_ASSOCIATION: &str =
+    "CONFIGURED_AUDIENCE_MODEL_ASSOCIATION";
+/// See [`RESOURCE_TYPE_CONFIGURED_TABLE_ASSOCIATION`].
+pub const RESOURCE_TYPE_INTERMEDIATE_TABLE: &str = "INTERMEDIATE_TABLE";
+
+/// Each kind of resource an ARN can address, as `(the keyword its ARN's resource
+/// segment is introduced by, the resource type a refusal about it reports)`.
+///
+/// Read off the ARN patterns the model declares, one per kind: `CollaborationArn`
+/// (`:collaboration/<id>`), `MembershipArn` (`:membership/<id>`), `ConfiguredTableArn`
+/// (`:configuredtable/<id>`), `ConfiguredTableAssociationArn`
+/// (`:configuredtableassociation/<id>/<id>`), `AnalysisTemplateArn`
+/// (`:membership/<id>/analysistemplate/<id>`), `PrivacyBudgetTemplateArn`
+/// (`:privacybudgettemplate/<id>`), `IdNamespaceAssociationArn`, `IdMappingTableArn`,
+/// `ConfiguredAudienceModelAssociationArn` and `IntermediateTableArn` (each
+/// `:membership/<id>/<keyword>/<id>`). A sub-resource's ARN carries its parent's keyword
+/// too, so [`resource_type_of_arn`] takes the DEEPEST keyword the ARN names.
+pub const ARN_RESOURCE_KEYWORDS: [(&str, &str); 10] = [
+    ("collaboration", RESOURCE_TYPE_COLLABORATION),
+    ("membership", RESOURCE_TYPE_MEMBERSHIP),
+    ("configuredtable", RESOURCE_TYPE_CONFIGURED_TABLE),
+    (
+        "configuredtableassociation",
+        RESOURCE_TYPE_CONFIGURED_TABLE_ASSOCIATION,
+    ),
+    ("analysistemplate", RESOURCE_TYPE_ANALYSIS_TEMPLATE),
+    ("privacybudgettemplate", RESOURCE_TYPE_PRIVACY_BUDGET_TEMPLATE),
+    (
+        "idnamespaceassociation",
+        RESOURCE_TYPE_ID_NAMESPACE_ASSOCIATION,
+    ),
+    ("idmappingtable", RESOURCE_TYPE_ID_MAPPING_TABLE),
+    (
+        "configuredaudiencemodelassociation",
+        RESOURCE_TYPE_CONFIGURED_AUDIENCE_MODEL_ASSOCIATION,
+    ),
+    ("intermediatetable", RESOURCE_TYPE_INTERMEDIATE_TABLE),
+];
 
 /// `ConflictExceptionReason` for a resource that already exists (model shape
 /// `ConflictExceptionReason`: ALREADY_EXISTS | SUBRESOURCES_EXIST | INVALID_STATE).
@@ -628,8 +687,12 @@ pub struct ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
     /// so a read is a lookup and not a scan, and which types a table holds a rule for
     /// stays on the table itself, in `ConfiguredTable$analysisRuleTypes`.
     pub configured_table_analysis_rules: HashMap<(String, String), ConfiguredTableAnalysisRule>,
-    /// Tags by resource ARN, shared by collaboration and membership ARNs so a later
-    /// TagResource/ListTagsForResource slice has one place to read and write.
+    /// Tags by resource ARN — one place every taggable resource's tags are read and
+    /// written, whichever kind of resource the ARN names: a create stores the tags it
+    /// was given here, the tagging operations add to and remove from the same entry
+    /// ([`CleanRoomsState::add_tags`], [`CleanRoomsState::remove_tags`]), and a delete
+    /// drops it with the resource. A resource carrying no tags holds NO entry, so the
+    /// absent entry and the empty map are one state.
     pub tags: HashMap<String, HashMap<String, String>>,
     /// Analysis templates by `AnalysisTemplate.id`. The modelled shape is stored as-is:
     /// every one of its members is absolute, so nothing is derived per caller.
@@ -908,6 +971,90 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
         self.privacy_budget_templates
             .get(template_id)
             .filter(|template| template.collaboration_id == collaboration_id)
+    }
+
+    /// Whether this store holds a resource under `resource_arn`.
+    ///
+    /// Every tagging operation addresses its resource by the ARN that resource was
+    /// minted with, so the ARN is resolved against the stored records that CARRY one
+    /// rather than against the ARN's text: a well-formed ARN of a resource that was
+    /// never created, or one a delete removed, holds nothing — which is what the 404
+    /// those operations model reports. Every kind of resource this slice persists an
+    /// ARN for is covered, so one kind's tags are not reachable while another's are.
+    pub fn holds_resource_at_arn(&self, resource_arn: &str) -> bool {
+        self.collaborations
+            .values()
+            .any(|record| record.arn == resource_arn)
+            || self
+                .memberships
+                .values()
+                .any(|membership| membership.arn == resource_arn)
+            || self
+                .configured_tables
+                .values()
+                .any(|table| table.arn == resource_arn)
+            || self
+                .analysis_templates
+                .values()
+                .any(|template| template.arn == resource_arn)
+            || self
+                .privacy_budget_templates
+                .values()
+                .any(|template| template.arn == resource_arn)
+    }
+
+    /// The tags stored for `resource_arn`: the empty map for a resource nobody has
+    /// tagged, which is what a resource carrying no tags reports.
+    pub fn tags_of(&self, resource_arn: &str) -> HashMap<String, String> {
+        self.tags.get(resource_arn).cloned().unwrap_or_default()
+    }
+
+    /// How many tags `resource_arn` would carry if `tags` were added to it: a key it
+    /// already carries takes a new value rather than adding an entry, so only the keys
+    /// it does not yet carry grow the set.
+    pub fn tag_count_after_adding(
+        &self,
+        resource_arn: &str,
+        tags: &HashMap<String, String>,
+    ) -> usize {
+        match self.tags.get(resource_arn) {
+            None => tags.len(),
+            Some(stored) => {
+                stored.len() + tags.keys().filter(|key| !stored.contains_key(*key)).count()
+            }
+        }
+    }
+
+    /// Add `tags` to the tags of `resource_arn`.
+    ///
+    /// A key the resource already carries takes the new value and every other key stays
+    /// where it is, so tagging a resource twice leaves it carrying the union of both
+    /// calls rather than only the second one's keys.
+    pub fn add_tags(&mut self, resource_arn: &str, tags: HashMap<String, String>) {
+        if tags.is_empty() {
+            return;
+        }
+        self.tags
+            .entry(resource_arn.to_string())
+            .or_default()
+            .extend(tags);
+    }
+
+    /// Remove `tag_keys` from the tags of `resource_arn`.
+    ///
+    /// A key the resource does not carry removes nothing, and a resource left with no
+    /// tags holds no entry at all — the same state it was in before anybody tagged it,
+    /// so the two are indistinguishable to a later read.
+    pub fn remove_tags(&mut self, resource_arn: &str, tag_keys: &[String]) {
+        let Some(tags) = self.tags.get_mut(resource_arn) else {
+            return;
+        };
+        for key in tag_keys {
+            tags.remove(key);
+        }
+        if tags.is_empty() {
+            self.tags.remove(resource_arn);
+        }
     }
 
     /// Materialize every protected-query transition the CLOCK already owes at `now`.
@@ -1349,6 +1496,65 @@ pub fn duplicate_membership_message(account_id: &str, collaboration_id: &str) ->
         "Cannot create membership for account: {account_id}. \
          The account is already a member of collaboration: {collaboration_id}"
     )
+}
+
+/// The most tags one resource can carry.
+///
+/// `TagMap` is `len 0..200`, and `ListTagsForResourceOutput$tags` IS a `TagMap`, so a
+/// stored set past that many entries could not be reported at all; a call that would push
+/// a resource past it is refused rather than accepted. Tags are also the one thing in
+/// this store that grows per call WITHOUT a new resource, so this is the bound on that
+/// growth.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
+/// The message a tagging operation reports when its `resourceArn` names no resource
+/// this service holds.
+///
+/// Composed from the request's `resourceArn`: a tagging operation addresses its
+/// resource by ARN and by nothing else, so the ARN is the one value whose resolution
+/// failed. It deliberately does not say which kind of resource the ARN looks like.
+pub fn tagged_resource_not_found_message(resource_arn: &str) -> String {
+    format!("No such resource: {resource_arn}")
+}
+
+/// The message a tagging operation reports when its `resourceArn` addresses no kind of
+/// Clean Rooms resource at all, so there is nothing it could name.
+///
+/// The boundary validator already refuses an ARN outside `CleanroomsArn`'s pattern; what
+/// reaches here is a well-formed Clean Rooms ARN whose resource segment names none of
+/// the kinds in [`ARN_RESOURCE_KEYWORDS`], which is a fault in the member's VALUE rather
+/// than a resource that is missing.
+pub fn invalid_resource_arn_message(resource_arn: &str) -> String {
+    format!("resourceArn does not identify a Clean Rooms resource: {resource_arn}")
+}
+
+/// The message `TagResource` reports when the call would leave a resource carrying more
+/// than [`MAX_TAGS_PER_RESOURCE`] tags.
+///
+/// Composed from the limit and the number of tags the resource would have carried: those
+/// two are what the decision was made on.
+pub fn tag_limit_exceeded_message(limit: usize, would_carry: usize) -> String {
+    format!("a resource can carry at most {limit} tags, and this request would leave it carrying {would_carry}")
+}
+
+/// The kind of resource `resource_arn`'s resource segment names, as the resource type a
+/// refusal about it reports, or `None` when it names none of them.
+///
+/// An ARN's last colon-separated field is its resource segment, `<keyword>/<id>`, nested
+/// under its parent for a sub-resource, so the kind is the DEEPEST keyword of
+/// [`ARN_RESOURCE_KEYWORDS`] the segment carries: the parent keyword a sub-resource ARN
+/// also carries names the parent, not the resource the ARN addresses.
+pub fn resource_type_of_arn(resource_arn: &str) -> Option<&'static str> {
+    let resource_segment = resource_arn.splitn(6, ':').nth(5)?;
+    resource_segment
+        .split('/')
+        .filter_map(|segment| {
+            ARN_RESOURCE_KEYWORDS
+                .iter()
+                .find(|(keyword, _)| *keyword == segment)
+                .map(|(_, resource_type)| *resource_type)
+        })
+        .next_back()
 }
 
 /// The `isMetricsEnabled` a created resource carries: what the caller asked for, else

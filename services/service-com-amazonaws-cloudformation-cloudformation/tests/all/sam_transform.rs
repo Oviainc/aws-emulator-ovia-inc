@@ -550,7 +550,14 @@ async fn a_deployed_sam_stack_holds_the_synthesized_resources_and_keeps_its_own_
         &router,
         "sam-deployed",
         &template,
-        &[member("Capabilities.member.1", "CAPABILITY_IAM")],
+        &[
+            member("Capabilities.member.1", "CAPABILITY_IAM"),
+            // "If your stack template contains one or more macros […] you must acknowledge
+            // this capability. This includes the AWS::Include and AWS::Serverless
+            // transforms, which are macros hosted by CloudFormation": the SAM transform is
+            // one of them, so a request that DEPLOYS this template acknowledges it.
+            member("Capabilities.member.2", "CAPABILITY_AUTO_EXPAND"),
+        ],
     )
     .await;
     assert_eq!(code, 200, "the stack must be created, got {code} {body}");
@@ -613,7 +620,7 @@ async fn a_deployed_sam_stack_holds_the_synthesized_resources_and_keeps_its_own_
         "the Original stage is the submitted body, got {body}"
     );
 
-    let (code, body) = get_template(&router, "sam-deployed").await;
+    let (code, body) = get_template(&router, "sam-deployed", None).await;
     assert_eq!(code, 200, "the template must be readable, got {code} {body}");
     let processed = xml_text(&body, "TemplateBody").unwrap_or_default();
     assert!(

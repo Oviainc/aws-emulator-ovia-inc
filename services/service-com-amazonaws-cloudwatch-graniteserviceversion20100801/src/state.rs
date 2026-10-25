@@ -703,8 +703,8 @@ pub struct StoredAlarm {
     /// INSUFFICIENT_DATA. The alarm is then evaluated and its state is set appropriately."
     /// (`PutMetricAlarm`) — so a write starts a span during which the alarm still reports the
     /// state the write left it in, and the evaluation becomes due at its end. `SetAlarmState`
-    /// starts a longer one: the state it forces stands until the next periodic evaluation is
-    /// due ([`alarm_evaluation::forced_state_span_secs`]).
+    /// starts one of the same length: the state it forces stands until that evaluation is due
+    /// ([`alarm_evaluation::forced_state_span_secs`]).
     pub evaluation_due_secs: f64,
     /// The instant, in epoch seconds, until which a state `SetAlarmState` forced on this alarm
     /// stands; `None` when the alarm reports its own evaluated state.

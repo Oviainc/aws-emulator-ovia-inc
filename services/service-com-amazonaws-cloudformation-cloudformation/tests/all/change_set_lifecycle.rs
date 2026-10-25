@@ -23,13 +23,14 @@ use service_com_amazonaws_cloudformation_cloudformation::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::stack_lifecycle::{
-    assert_stack_id_shape, call, create_stack, describe_stack, get_template, member,
-    router_with_engine, store, xml_text, xml_texts, ACCOUNT_ID, REGION,
+use crate::harness::{
+    call, create_stack, get_template, member, router_with_engine, store, xml_text, xml_texts,
+    REGION,
 };
+use crate::stack_lifecycle::{assert_stack_id_shape, describe_stack, ACCOUNT_ID};
 
 /// `CreateChangeSet`, with the members a case varies spelled as an SDK sends them.
-async fn create_change_set(
+pub async fn create_change_set(
     router: &MultiServiceRouter,
     stack_name: &str,
     change_set_name: &str,
@@ -44,7 +45,7 @@ async fn create_change_set(
 }
 
 /// A `CREATE` change set for a stack that does not exist yet.
-async fn create_creating_change_set(
+pub async fn create_creating_change_set(
     router: &MultiServiceRouter,
     stack_name: &str,
     change_set_name: &str,
@@ -62,7 +63,7 @@ async fn create_creating_change_set(
     .await
 }
 
-async fn describe_change_set(
+pub async fn describe_change_set(
     router: &MultiServiceRouter,
     change_set: &str,
     stack_name: Option<&str>,
@@ -74,7 +75,7 @@ async fn describe_change_set(
     call(router, "DescribeChangeSet", &members).await
 }
 
-async fn execute_change_set(
+pub async fn execute_change_set(
     router: &MultiServiceRouter,
     change_set: &str,
     stack_name: Option<&str>,
@@ -143,7 +144,7 @@ pub(crate) async fn settle_the_store(
 }
 
 /// The change set as it reads once its creation has settled.
-async fn settled_change_set(
+pub async fn settled_change_set(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     change_set: &str,
@@ -298,7 +299,7 @@ async fn a_create_change_set_materialises_its_stack_and_execute_completes_it() {
 
         // "CloudFormation creates a stack with a unique stack ID, but no template or
         // resources": the template is the CHANGE SET's until it is executed.
-        let (code, body) = get_template(&router, case.stack_name).await;
+        let (code, body) = get_template(&router, case.stack_name, None).await;
         assert_eq!(
             code, 400,
             "case {:?}: a stack in review has no template yet, got {code} {body}",
@@ -420,7 +421,7 @@ async fn a_create_change_set_materialises_its_stack_and_execute_completes_it() {
         );
         // The template reached the stack, byte for byte, and is readable back through the
         // stack now.
-        let (code, body) = get_template(&router, case.stack_name).await;
+        let (code, body) = get_template(&router, case.stack_name, None).await;
         assert_eq!(
             code, 200,
             "case {:?}: the executed stack's template is readable, got {code} {body}",
@@ -631,7 +632,7 @@ async fn an_update_change_set_reports_the_changes_its_template_would_make() {
             "case {:?}: executing an UPDATE change set updates the stack, got {body}",
             case.case
         );
-        let (code, body) = get_template(&router, &stack_name).await;
+        let (code, body) = get_template(&router, &stack_name, None).await;
         assert_eq!(
             code, 200,
             "case {:?}: the updated template is readable, got {code} {body}",

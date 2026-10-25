@@ -485,10 +485,14 @@ pub fn parameter_rejection(parameters: &HashMap<String, Parameter>) -> Option<St
 /// create side and the update side cannot drift apart, and each half reads the names
 /// sorted so a request breaking the rule twice is refused with the same wording whichever
 /// order the map happened to iterate in.
+///
+/// Both halves identify the extension by the system-generated `Id` the recorded refusal
+/// carries, never by the caller-chosen `Name`: the id is the value AppConfig puts in the
+/// sentence, and a name is not interchangeable with it.
 pub fn parameter_value_rejection(
     declared: &HashMap<String, Parameter>,
     supplied: &HashMap<String, String>,
-    extension_name: &str,
+    extension_id: &str,
     version_number: i32,
 ) -> Option<String> {
     let mut names: Vec<&str> = supplied.keys().map(String::as_str).collect();
@@ -498,7 +502,7 @@ pub fn parameter_value_rejection(
         .find(|name| !declared.contains_key(*name))
     {
         return Some(format!(
-            "Extension {extension_name} version {version_number} declares no parameter \
+            "Extension {extension_id} version {version_number} declares no parameter \
              named {unknown}."
         ));
     }
@@ -512,9 +516,12 @@ pub fn parameter_value_rejection(
         .into_iter()
         .find(|name| !supplied.contains_key(*name))
         .map(|missing| {
+            // The recorded refusal's own shape: the parameter name, TWO spaces, the
+            // condition, the extension's id and version, and the clause saying what is
+            // wrong — no value was supplied, as distinct from one that was rejected.
             format!(
-                "Parameter {missing} is required by extension {extension_name} version \
-                 {version_number}."
+                "Parameter {missing}  is required for extension {extension_id} \
+                 version {version_number}, but a value has not been supplied."
             )
         })
 }
@@ -2307,9 +2314,15 @@ pub fn resource_arn_not_found(resource_arn: &str) -> String {
 /// Built on the same template as every other not-found refusal of this service, and like
 /// the extension's it echoes no identifier: the id travels in the URI, so the refusal
 /// states the kind and the account it was looked up in.
+///
+/// The kind is the single word `ExtensionAssociation`, as this resource's recorded refusal
+/// spells it — the same one-word form the deployment strategy's uses. A kind's token is
+/// the one its own recorded message carries and is NOT derived from the shape name by
+/// splitting it into words, which is why the kinds recorded as two words
+/// (`Configuration Profile`, `Hosted Configuration Version`) keep theirs.
 pub fn extension_association_not_found() -> String {
     not_found_message(
-        "Extension Association",
+        "ExtensionAssociation",
         &[],
         AccountClause::Reported,
         NOT_FOUND_FULL_STOP,

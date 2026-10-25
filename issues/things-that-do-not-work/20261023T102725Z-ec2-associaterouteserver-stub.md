@@ -34,3 +34,16 @@ $headers.content-type: value_mismatch (expected 'text/xml;charset=UTF-8', got 't
 Boot the ec2 emulator
 Call AssociateRouteServer and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Update
+`AssociateRouteServer` has since been implemented, and its `//! SCAFFOLDED, NOT IMPLEMENTED:`
+census line deleted, by the fix for
+`issues/things-that-now-work/20261023T102725Z-ec2-getrouteserverassociations-stub.md`: its
+reader `GetRouteServerAssociations` could not be proven over a store nothing could write, so
+the writer landed in the same change. The handler now resolves the route server id with
+`state::require_known_route_server` (so the refusal this issue records,
+`InvalidRouteServerId.NotFound` with "The route-server ID '<id>' does not exist", is what the
+recorded unit gets), resolves the VPC id, refuses a VPC that already holds an association, and
+writes the (route server, VPC) pair in the clock-owed `associating` state. Whoever picks this
+issue up should replay `ec2-networking-association-error-paths-vpc-and-network#task#3` first
+and close it if nothing remains.

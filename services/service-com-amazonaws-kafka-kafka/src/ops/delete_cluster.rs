@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCluster
-//! Deletes a stored cluster. `currentVersion`, when the request supplies it, must
+//! Deletes a stored cluster. The cluster must be in a state the service accepts a
+//! delete from ([`crate::state::is_deletable_cluster_state`]): a cluster still
+//! moving under the service's own control — one being provisioned, updated or
+//! repaired — is refused with `BadRequestException`, leaving the registry
+//! untouched, so a caller racing the provisioning window cannot destroy a cluster
+//! mid-flight. `currentVersion`, when the request supplies it, must
 //! match the cluster's stored `CurrentVersion` — that is the optimistic-concurrency
-//! check that keeps a delete from racing an update. The cluster leaves the registry,
-//! so the next reader no longer sees it: that is what the bootstrap plan for this
-//! service specifies (describe after delete answers 404), rather than the real
-//! service's longer-lived `DELETING` window.
+//! check that keeps a delete from racing an update. The cluster then leaves the
+//! registry, so the next reader no longer sees it: that is what the bootstrap plan
+//! for this service specifies (describe after delete answers 404), rather than the
+//! real service's longer-lived `DELETING` window.
 //!
 //! A `ClusterArn` that is not shaped like an MSK cluster ARN is a
 //! `BadRequestException`; a well-formed one this endpoint's region holds no cluster
@@ -187,6 +192,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // A delete is accepted only from a state the cluster is not already
+        // leaving on its own: while it is being provisioned, updated or repaired
+        // the service owns the record, so the destructive call is refused and
+        // nothing is removed.
+        let cluster_state = cluster.state.clone();
+        if !crate::state::is_deletable_cluster_state(&cluster_state) {
+            return Err(
+                DeleteClusterErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::cluster_not_deletable_message(
+                        &cluster_state,
+                    )),
+                })
+                .into(),
+            );
+        }
 
         // A supplied version must be the one the cluster is actually at; a stale
         // one means the caller is deleting a cluster it has not seen the latest

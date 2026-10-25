@@ -215,6 +215,11 @@ async fn every_reported_date_time_member_is_an_rfc3339_string() {
     )
     .await;
 
+    // The gateway has to be READY before it takes a target, so the clock-owed
+    // `CREATING` -> `READY` transition is waited out here — after the `CREATING` read
+    // above, which is what this row needs the transient status for.
+    tokio::time::sleep(PAST_SETTLE).await;
+
     let created_target = ok(
         &router,
         "POST",

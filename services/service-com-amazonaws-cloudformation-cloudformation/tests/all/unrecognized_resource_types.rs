@@ -300,7 +300,17 @@ async fn create_stack_is_held_to_the_published_resource_type_catalogue() {
             template,
             unrecognized,
         } = case;
-        let (status, body) = create_stack(&router, stack_name, &template, &[]).await;
+        // A template that declares a transform may only be DEPLOYED by a request that
+        // acknowledges the macro capability ("you must acknowledge this capability […]
+        // This includes the AWS::Include and AWS::Serverless transforms"), so a row whose
+        // body declares one sends it: what this suite holds the service to is the type
+        // catalogue, not the acknowledgement.
+        let acknowledgement: Vec<(String, String)> = if template.contains("\"Transform\"") {
+            vec![member("Capabilities.member.1", "CAPABILITY_AUTO_EXPAND")]
+        } else {
+            Vec::new()
+        };
+        let (status, body) = create_stack(&router, stack_name, &template, &acknowledgement).await;
         if unrecognized.is_empty() {
             assert_eq!(
                 status, 200,
@@ -323,7 +333,12 @@ async fn create_stack_is_held_to_the_published_resource_type_catalogue() {
                 "case {case:?}: expected DescribeStacks to report {stack_id:?}, got body \
                  {described_body}"
             );
-            let (templated, template_body) = get_template(&router, stack_name).await;
+            // The body the stack STORED is its `Original` stage: "To get the user-submitted
+            // template, specify Original." (A template declaring a transform has a
+            // PROCESSED stage that differs from it, which `template_stages_and_resource_events.rs`
+            // is the suite for.)
+            let (templated, template_body) =
+                get_template(&router, stack_name, Some("Original")).await;
             assert_eq!(
                 templated, 200,
                 "case {case:?}: expected GetTemplate to answer for the created stack, got \
@@ -441,7 +456,7 @@ async fn every_operation_that_submits_a_template_refuses_an_unrecognised_type() 
 
     // The stack still carries the template it was created with: a refused update changed
     // nothing.
-    let (status, body) = get_template(&router, "update-target").await;
+    let (status, body) = get_template(&router, "update-target", None).await;
     assert_eq!(
         status, 200,
         "expected GetTemplate to answer for the stack, got {status} with body {body}"

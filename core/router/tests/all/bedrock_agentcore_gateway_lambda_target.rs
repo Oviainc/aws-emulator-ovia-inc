@@ -14,6 +14,7 @@
 //! function at all — for which Lambda is not consulted and nothing may be refused.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -21,6 +22,11 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request here is signed for, and the Region the gateway's ARNs carry.
 const REGION: &str = "us-east-1";
+
+/// The settle span AgentCore Control gives a gateway's clock-owed `CREATING` -> `READY`
+/// transition (`state::GATEWAY_SETTLE_DELAY`), plus slack. A gateway takes no target
+/// until that transition is due, so every row here waits it out before adding one.
+const PAST_GATEWAY_SETTLE: Duration = Duration::from_millis(900);
 
 /// The account id every emulated ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT: &str = "000000000000";
@@ -134,7 +140,8 @@ async fn create_function(router: &MultiServiceRouter, name: &str) -> String {
     arn
 }
 
-/// Create a gateway and return its `gatewayId`.
+/// Create a gateway and return its `gatewayId`, once the gateway is READY to take a
+/// target.
 async fn create_gateway(router: &MultiServiceRouter, name: &str) -> String {
     let (status, created) = call(
         router,
@@ -148,6 +155,7 @@ async fn create_gateway(router: &MultiServiceRouter, name: &str) -> String {
         status, 202,
         "case {name:?}: expected HTTP 202 from CreateGateway, got {status} ({created})"
     );
+    tokio::time::sleep(PAST_GATEWAY_SETTLE).await;
     text(&created, "gatewayId")
 }
 

@@ -4,13 +4,17 @@
 //! IMPLEMENTED: mutates the SAME stored stack (same `StackId`) — replaces the template
 //! unless `UsePreviousTemplate` is set, merges `Parameters` honouring
 //! `UsePreviousValue`, applies the configuration members the request carries, sets
-//! `LastUpdatedTime` and records the `UPDATE_IN_PROGRESS` event. The template the stack
-//! now carries is DEPLOYED: its resources and its outputs are re-evaluated, and take
-//! effect when the update completes, so a caller reading mid-update still sees the values
-//! in force. A resource the new template declares anew is CREATED in the service that
-//! owns it, and one it no longer declares is deleted there, exactly as on a create
-//! (see [`crate::state::provisioning`]); a resource an owning service refuses leaves the
-//! stack in `UPDATE_FAILED` with that service's own refusal as the reason.
+//! `LastUpdatedTime` and records the `UPDATE_IN_PROGRESS` event. The PROCESSED stage of
+//! the template the stack now carries is DEPLOYED: its resources and its outputs are
+//! re-evaluated and take effect when the update completes, so a caller reading mid-update
+//! still sees the values in force, and the resources the new template adds, changes or
+//! drops report their own events. A resource the new template declares anew is CREATED in
+//! the service that owns it, and one it no longer declares is deleted there, exactly as on
+//! a create (see [`crate::state::provisioning`]); a resource an owning service refuses
+//! leaves the stack in `UPDATE_FAILED` with that service's own refusal as the reason. A
+//! template that declares a transform the request has not acknowledged with
+//! `CAPABILITY_AUTO_EXPAND` is refused with the modelled
+//! `InsufficientCapabilitiesException`.
 //!
 //! The template is PROCESSED before it is deployed, exactly as a create's is: an
 //! `Fn::Transform` naming `AWS::Include` is the Amazon S3 object its `Location` names,
@@ -203,6 +207,7 @@ use crate::state::{
 /// copies the stack's event log.
 struct PreviousValues {
     template_body: Option<String>,
+    processed_template: crate::state::template::Processed,
     parameters: Vec<StoredParameter>,
     tags: Vec<StoredTag>,
     notification_arns: Vec<String>,
@@ -216,6 +221,7 @@ impl PreviousValues {
     fn of(stack: &StoredStack) -> Self {
         Self {
             template_body: stack.template_body.clone(),
+            processed_template: stack.processed_template.clone(),
             parameters: stack.parameters.clone(),
             tags: stack.tags.clone(),
             notification_arns: stack.notification_arns.clone(),
@@ -347,6 +353,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // was written.
             return Err(crate::scaffolded::Scaffolded::not_implemented("UpdateStack"));
         };
+        // The body this update deploys, with its transforms applied — computed BEFORE the
+        // store lock below, because it is caller-sized work that must not be done while
+        // every other request waits. `UsePreviousTemplate` ("Reuse the existing template
+        // that is associated with the stack that you are updating") needs no work at all:
+        // the stack already carries that body's processed stage.
+        let submitted = match &input.template_body {
+            Some(body) => {
+                // The documented `TemplateBody` maximum, which the model carries no
+                // `@length` for.
+                crate::state::validate_template_body(body)
+                    .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+                // The documented per-template quotas, the ceilings
+                // `DescribeAccountLimits` advertises for this account: a body past one is
+                // refused before the update starts, so the stack keeps the template it
+                // has rather than one holding none of what the body declared.
+                crate::state::validate_template_quotas(body)
+                    .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+                // A submitted template is only one CloudFormation can deploy: a body
+                // declaring a resource type it does not recognise is refused before the
+                // update starts, so the stack keeps the template it has
+                // (`crate::state::resource_types`).
+                crate::state::validate_resource_types(body)
+                    .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+                Some((body.clone(), crate::state::template::process(body)))
+            }
+            None => None,
+        };
         // The update runs as the `RoleARN` it names, so a role CloudFormation cannot
         // assume is refused before the stack is touched — the same check `CreateStack`
         // makes. A request that names none keeps the role already on the stack, which was
@@ -388,35 +421,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             PreviousValues::of(previous)
         };
 
-        let template_body = match &input.template_body {
-            Some(body) => {
-                // The documented `TemplateBody` maximum, which the model carries no
-                // `@length` for.
-                crate::state::validate_template_body(body)
-                    .map_err(crate::scaffolded::Scaffolded::validation_error)?;
-                // The documented per-template quotas, the ceilings
-                // `DescribeAccountLimits` advertises for this account: a body past one is
-                // refused before the update starts, so the stack keeps the template it
-                // has rather than one holding none of what the body declared.
-                crate::state::validate_template_quotas(body)
-                    .map_err(crate::scaffolded::Scaffolded::validation_error)?;
-                // A submitted template is only one CloudFormation can deploy: a body
-                // declaring a resource type it does not recognise is refused before the
-                // update starts, so the stack keeps the template it has
-                // (`crate::state::resource_types`).
-                crate::state::validate_resource_types(body)
-                    .map_err(crate::scaffolded::Scaffolded::validation_error)?;
-                body.clone()
-            }
+        let (template_body, processed_template) = match submitted {
+            Some((body, processed)) => (body, processed),
             // `UsePreviousTemplate`: "Reuse the existing template that is associated with
             // the stack that you are updating." A stack a `CREATE` change set created and
             // nothing has executed yet carries no template to reuse.
-            None => previous.template_body.clone().ok_or_else(|| {
-                crate::scaffolded::Scaffolded::validation_error(format!(
-                    "Stack [{}] has no template to reuse",
-                    input.stack_name
-                ))
-            })?,
+            None => (
+                previous.template_body.clone().ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::validation_error(format!(
+                        "Stack [{}] has no template to reuse",
+                        input.stack_name
+                    ))
+                })?,
+                previous.processed_template.clone(),
+            ),
         };
         // "In some cases, you must explicitly acknowledge that your stack template contains
         // certain capabilities in order for CloudFormation to update the stack ... If you
@@ -472,6 +490,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => previous.deployment_config.clone(),
         };
 
+        // The macro acknowledgement the template needs, against the capabilities in force
+        // on this update (the request's when it restated them, the stack's otherwise):
+        // "If your stack template contains one or more macros [...] you must acknowledge
+        // this capability."
+        let missing = crate::state::missing_auto_expand_capability(&template_body, &capabilities);
+        if !missing.is_empty() {
+            return Err(UpdateStackErrorModeled::InsufficientCapabilitiesException(
+                InsufficientCapabilitiesException {
+                    message: Some(crate::state::template::insufficient_capabilities_message(
+                        &missing,
+                    )),
+                },
+            )
+            .into());
+        }
+
         // CloudFormation refuses an update that would change nothing about the stack.
         if Some(&template_body) == previous.template_body.as_ref()
             && parameters == previous.parameters
@@ -513,6 +547,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let transform_failure = match &processing {
             crate::state::include::Processed::Failed(reason) => Some(reason.clone()),
             _ => None,
+        };
+        // The transforms the template DECLARES are applied to the spliced document, so the
+        // stage this update deploys and `GetTemplate` serves is the whole pipeline's — and
+        // that expansion, like the splice, happens before the store lock below.
+        let processed_template = match &processing {
+            crate::state::include::Processed::Expanded(processed) => {
+                crate::state::template::process(processed)
+            }
+            _ => processed_template,
         };
         // The store lock is taken for the write and RELEASED at the end of this block: the
         // calls that create or delete the stack's resources run after it, and each of
@@ -561,9 +604,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // What the stack's resources are BEFORE this deployment: what the update has
             // to keep, replace or delete in the services that own them.
             let previous_resources = stack.current_resources().to_vec();
-            stack.set_template_body(template_body);
-            // The processed body, where the transforms the submitted one names produced one:
-            // that is the template this update deploys.
+            // The update's template and the PROCESSED stage of it this service computed:
+            // the stage is what the update deploys. Where the submitted body named an
+            // `AWS::Include`, the spliced document is recorded too — it is the body that
+            // stage was computed over.
+            stack.set_template_body(template_body, processed_template);
             if let crate::state::include::Processed::Expanded(processed) = processing {
                 stack.set_processed_template_body(processed);
             }
@@ -580,9 +625,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(retain_except_on_create) = input.retain_except_on_create {
                 stack.retain_except_on_create = Some(retain_except_on_create);
             }
-            if let Some(token) = &input.client_request_token {
-                stack.client_request_token = Some(token.clone());
-            }
+            // "All events triggered by a given stack operation are assigned the same
+            // client request token": the caller's token when it named one, otherwise the
+            // one CloudFormation assigns the operation itself.
+            let client_request_token = input
+                .client_request_token
+                .clone()
+                .unwrap_or_else(crate::state::new_client_request_token);
+            stack.client_request_token = Some(client_request_token.clone());
             // "Structure that contains a new stack policy body": present replaces the
             // stored policy, absent leaves it alone, as for the other restated members.
             if let Some(policy) = &input.stack_policy_body {
@@ -592,10 +642,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 stack.resource_types = resource_types.clone();
             }
             stack.last_updated_time = Some(now);
-            // The update deploys the template the stack now carries: its resources and its
-            // outputs are re-evaluated from the new body and the merged parameters, and
-            // reported once the update completes.
-            stack.deploy_template();
+            // The update deploys the PROCESSED stage of the template the stack now
+            // carries: its resources and its outputs are re-evaluated from the new body
+            // and the merged parameters, each resource the deployment acts on reports its
+            // own events, and all of it is reported once the update completes.
+            let cannot_deploy = stack.deploy_template().err();
             // The update starts now and settles to UPDATE_COMPLETE once the clock makes
             // that due; the stack id never changes.
             stack.begin_transition(
@@ -603,8 +654,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 status::UPDATE_IN_PROGRESS,
                 status::UPDATE_COMPLETE,
                 Some(operation_id.clone()),
-                input.client_request_token.clone(),
+                Some(client_request_token),
             );
+            // A template this service cannot deploy ends the update in the modelled
+            // UPDATE_FAILED with the reason, rather than in an UPDATE_COMPLETE that
+            // reports a deployment nothing performed. The resources and outputs in force
+            // are left as they were, which is what a failed update leaves behind.
+            if let Some(reason) = cannot_deploy {
+                stack.fail_pending_transition(status::UPDATE_FAILED, reason);
+            }
             (
                 stack.stack_id.clone(),
                 stack.region.clone(),

@@ -43,6 +43,8 @@ mod environment_state_wire_form;
 mod environment_update;
 #[path = "all/experiment_definitions.rs"]
 mod experiment_definitions;
+#[path = "all/extension_association_refusal_messages.rs"]
+mod extension_association_refusal_messages;
 #[path = "all/extension_associations.rs"]
 mod extension_associations;
 #[path = "all/extensions.rs"]
