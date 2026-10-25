@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListScheduledActions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListScheduledActions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListScheduledActions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the configuration changes scheduled on one domain, from the records that
+//! domain holds ([`crate::state::ScheduledChange`]) — a page of them per call, in the
+//! order they are scheduled to happen, resumed by the token the previous page handed
+//! out. It only REPORTS: the records it answers with are written by the calls that
+//! schedule a change, never by a read of them.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +83,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{invalid_pagination_token, ScheduledChange};
+
+/// The largest page this operation answers with, and the page size a request that
+/// names none gets: `MaxResults` is `@range(max: 100)`, so 100 results is the most
+/// any request can ask for.
+const MAX_PAGE: usize = 100;
+
+/// [`MAX_PAGE`] as the modelled member's own type, for the bound check below.
+const MAX_PAGE_SIZE: i32 = 100;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -158,18 +165,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListScheduledActions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListScheduledActionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListScheduledActions"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        // `MaxResults` is `@range(max: 100)`, so a larger page size is a malformed
+        // request; the boundary validator refuses it before this handler runs, and the
+        // check is repeated here so the rule holds however the request reached us. A
+        // NEGATIVE page size is malformed for the same reason — it is not a page size
+        // at all — so it is refused rather than reinterpreted, while `@default(0)` (no
+        // page size sent) stays the unbounded case below.
+        if input.max_results < 0 || input.max_results > MAX_PAGE_SIZE {
+            return Err(ListScheduledActionsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "MaxResults must be between 0 and {MAX_PAGE_SIZE}: {}",
+                        input.max_results
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // "A list of configuration changes that are scheduled for a domain": the
+        // listing belongs to the domain the request names, so a name the account holds
+        // no domain under names nothing to list. Settling that domain is the only write
+        // this report makes, and it writes only what the clock already owed it at this
+        // instant had nobody called.
+        let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
+            ListScheduledActionsErrorModeled::ResourceNotFoundException(
+                crate::state::domain_not_found(&input.domain_name),
+            )
+        })?;
+
+        // "The time when the change is scheduled to happen" is what orders the
+        // listing: the next change due is reported first, and the action id breaks a
+        // tie, so two reads of the same records report the same order — which is what
+        // lets a token name a place in the set.
+        let mut scheduled: Vec<&ScheduledChange> = domain.scheduled_actions.values().collect();
+        scheduled.sort_by(|left, right| {
+            left.scheduled_at
+                .cmp(&right.scheduled_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        // The token names the action the next page starts AT, so a caller resumes
+        // exactly where the previous page stopped rather than at an offset a newly
+        // scheduled or applied change would have shifted. It is only ever a value this
+        // operation handed out, so one that names no action of this domain — one this
+        // service never minted, one whose action has since been applied, or one carried
+        // over from another domain's listing — is the modelled refusal.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => scheduled
+                .iter()
+                .position(|action| action.id == token)
+                .ok_or_else(|| {
+                    ListScheduledActionsErrorModeled::InvalidPaginationTokenException(
+                        invalid_pagination_token(token),
+                    )
+                })?,
+        };
+
+        // "An optional parameter that specifies the maximum number of results to
+        // return": `MaxResults` is `@default(0)`, so a request that asks for no
+        // particular page size reaches here as zero and gets the largest page the model
+        // allows rather than an empty one.
+        let page_size = match usize::try_from(input.max_results) {
+            Ok(0) | Err(_) => MAX_PAGE,
+            Ok(size) => size.min(MAX_PAGE),
+        };
+        let end = start.saturating_add(page_size).min(scheduled.len());
+
+        Ok(ListScheduledActionsOutput {
+            scheduled_actions: Some(
+                scheduled[start..end]
+                    .iter()
+                    .map(|action| action.to_action())
+                    .collect(),
+            ),
+            // "When nextToken is returned, there are more results available": the token
+            // is the next action in the set, and there is none once this page ended the
+            // set.
+            next_token: scheduled.get(end).map(|action| action.id.clone()),
+        })
     }
 }
