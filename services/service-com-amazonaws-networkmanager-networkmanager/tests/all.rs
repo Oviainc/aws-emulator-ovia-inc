@@ -39,6 +39,8 @@ mod core_network_policy_version_restore;
 mod core_network_policy_versions;
 #[path = "all/core_network_prefix_list_association.rs"]
 mod core_network_prefix_list_association;
+#[path = "all/core_network_prefix_list_associations.rs"]
+mod core_network_prefix_list_associations;
 #[path = "all/core_network_segment_actions.rs"]
 mod core_network_segment_actions;
 #[path = "all/customer_gateway_association_lifecycle.rs"]
