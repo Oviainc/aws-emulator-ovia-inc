@@ -859,6 +859,18 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// (`^[a-z0-9]([a-z0-9]|-(?!-)){1,61}[a-z0-9]$`) admits only lowercase, so
     /// there is no case to fold and no [`name_key`] to build.
     pub account_alias: Option<String>,
+    /// The account-level properties the account has persisted, keyed by the
+    /// property key itself — "keys are in the format `Namespace/PropertyName`"
+    /// (`GetAccountPropertiesResponse$Properties`). `PutAccountProperties` is what
+    /// fills this map and `GetAccountProperties` is what reports it.
+    ///
+    /// A `BTreeMap` so the store's own enumeration order is total and stable; the
+    /// modelled response member is a map, so what a read reports is the SET of
+    /// pairs the account holds rather than an order. Keys are stored VERBATIM: `accountPropertyKeyType`'s pattern
+    /// (`^[A-Za-z][A-Za-z0-9/_-]*$`) admits both cases and the namespace part of a
+    /// key is a name the caller chose, so there is no case to fold and no
+    /// [`name_key`] to build.
+    pub account_properties: BTreeMap<String, String>,
     /// Monotonic counter feeding
     /// [`next_saml_provider_uuid`](Self::next_saml_provider_uuid).
     pub saml_provider_uuid_seq: u64,
@@ -2457,6 +2469,54 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsIamAwsidentitymanagementv20100508State>)
+}
+
+/// How many characters an account property key may carry, and the alphabet it may
+/// be spelled in: `accountPropertyKeyType` is length 1..50 with pattern
+/// `^[A-Za-z][A-Za-z0-9/_-]*$`
+/// (`smithy_query(query="shape", shape="accountPropertiesMapType")`). A map KEY's
+/// own constraints are outside the framework's constraint walk, so the operation
+/// taking these keys is what takes them against the published bound.
+pub const MAX_ACCOUNT_PROPERTY_KEY_CHARACTERS: usize = 50;
+
+/// How many account-level properties one account may hold. AWS publishes no quota
+/// for these properties, so this bound is the emulator's own: it is what stops the
+/// property map growing without end on repeated writes of fresh keys, and it sits
+/// far above any set of namespaces and properties the service configures (each
+/// entry is itself bounded, by [`MAX_ACCOUNT_PROPERTY_KEY_CHARACTERS`] and the
+/// published 1024-character value length). A write that would carry the account
+/// past it is refused with the modelled `InvalidInputException` — this operation
+/// models no limit error — and stores nothing; re-setting a property the account
+/// already holds is never refused, because the bound is taken against what the
+/// account would hold AFTER the write.
+pub const MAX_ACCOUNT_PROPERTIES_PER_ACCOUNT: usize = 1_000;
+
+/// Whether `key` is within the published length and alphabet of
+/// `accountPropertyKeyType` — see [`MAX_ACCOUNT_PROPERTY_KEY_CHARACTERS`] for both
+/// and for why this is checked here rather than by the constraint walk.
+pub fn is_account_property_key_shape(key: &str) -> bool {
+    (1..=MAX_ACCOUNT_PROPERTY_KEY_CHARACTERS).contains(&key.chars().count())
+        && key.starts_with(|first: char| first.is_ascii_alphabetic())
+        && key
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "/_-".contains(character))
+}
+
+/// The NAMESPACE an account property key names, or `None` when `key` is not in the
+/// account property key format.
+///
+/// The one definition of that format: "each key uses the format
+/// `Namespace/PropertyName`. The key must contain exactly one `/` separating the
+/// namespace from the property name, and cannot start or end with `/`"
+/// (`PutAccountPropertiesRequest$Properties`). So a key with no separator, with
+/// more than one, or with either part empty names no property, and the namespace a
+/// well-formed key names is the part before the separator — the value the
+/// one-namespace-per-request rule is taken against.
+pub fn account_property_namespace(key: &str) -> Option<&str> {
+    let (namespace, property_name) = key.split_once('/')?;
+    let names_one_property =
+        !namespace.is_empty() && !property_name.is_empty() && !property_name.contains('/');
+    names_one_property.then_some(namespace)
 }
 
 /// The reserved tag key among `keys`, if any — the lowest one, so the refusal names
