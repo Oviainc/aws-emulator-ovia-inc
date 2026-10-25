@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFunctionScalingConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFunctionScalingConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFunctionScalingConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! REPORTS the scaling configuration `PutFunctionScalingConfig` stored for the qualifier
+//! the request addressed, off the one record [`crate::state`] holds for it. It changes
+//! nothing a later caller sees: the only writes it can make are the ones the CLOCK
+//! already owed — a function's activation and bounds whose application instant has passed
+//! (see [`crate::state::FunctionScalingConfigRecord::materialize`]) — which would have
+//! been owed at the same instant even if nobody had called.
+//!
+//! The qualifier is read exactly as the write reads it (see
+//! [`crate::state::FunctionRecord::published_qualifier`]), so the two operations agree on
+//! which qualifiers exist, and one naming none is refused the modelled 404. A qualifier
+//! that exists but holds no configuration is not an error: the function is there, so the
+//! answer reports its ARN and no scaling configuration at all, because nothing invents
+//! bounds nobody set.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +160,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFunctionScalingConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFunctionScalingConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFunctionScalingConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(service_error("Lambda state is not reachable on this engine"));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // The function the configuration belongs to. `FunctionName` is an
+        // `UnqualifiedFunctionName` here, whose pattern admits no qualifier of its own, so
+        // the `Qualifier` parameter is the only thing that names one. Resolution is also
+        // what brings the record up to whatever the clock already made due.
+        let (record, _) =
+            crate::state::resolve_function(&mut store, &input.function_name, None, &region, now)
+                .map_err(|failure| match failure {
+                    crate::state::ResolveFailure::Malformed(message) => invalid_parameter(message),
+                    crate::state::ResolveFailure::NotFound(message) => not_found(message),
+                })?;
+
+        let Some(qualifier) = record.published_qualifier(&input.qualifier) else {
+            return Err(not_found(format!(
+                "Function not found: {}",
+                record.versioned_arn(&input.qualifier)
+            )));
+        };
+
+        // Answered out of the stored record, so a configuration that was accepted but
+        // never persisted reports nothing here. A qualifier nobody has configured carries
+        // no configuration, and none is invented for it.
+        let arn = record.published_qualifier_arn(&qualifier);
+        match record.function_scaling_configs.get(&qualifier) {
+            Some(stored) => Ok(stored.reported(arn)),
+            None => Ok(GetFunctionScalingConfigOutput {
+                function_arn: Some(arn),
+                applied_function_scaling_config: None,
+                requested_function_scaling_config: None,
+            }),
+        }
     }
+}
+
+/// The modelled 400 for a `FunctionName` that is not one of the documented name forms.
+fn invalid_parameter(message: String) -> GetFunctionScalingConfigError {
+    GetFunctionScalingConfigErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled 404 for a name and qualifier that name no function or no such version.
+fn not_found(message: String) -> GetFunctionScalingConfigError {
+    GetFunctionScalingConfigErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled 500 for a failure of the store itself.
+fn service_error(message: &str) -> GetFunctionScalingConfigError {
+    GetFunctionScalingConfigErrorModeled::ServiceException(ServiceException {
+        r#type: None,
+        message: Some(message.to_string()),
+    })
+    .into()
 }
