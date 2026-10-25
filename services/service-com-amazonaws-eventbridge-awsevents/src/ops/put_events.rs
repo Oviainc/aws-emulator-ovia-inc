@@ -255,7 +255,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 };
                 if !routing.contains_key(&accepted.bus) {
                     let compiled = store.bus(&accepted.bus).map(|bus| {
-                        bus.rules.values().filter_map(CompiledRule::of).collect::<Vec<_>>()
+                        bus.rules
+                            .values()
+                            .filter_map(|rule| CompiledRule::of(rule, &store))
+                            .collect::<Vec<_>>()
                     });
                     routing.insert(accepted.bus.clone(), compiled);
                     archiving.insert(
@@ -931,6 +934,36 @@ pub(crate) struct CompiledTarget {
     /// `Target$DeadLetterConfig`: "the queue to use as the dead-letter queue",
     /// where an event that could not be delivered to this target is sent.
     dead_letter_arn: Option<String>,
+    /// `RetryPolicy$MaximumRetryAttempts`: "the maximum number of retry attempts
+    /// to make before the request fails", which bounds how many times a
+    /// retryable invocation failure is tried again (see
+    /// [`invoke_api_destination`]).
+    maximum_retry_attempts: Option<i32>,
+    /// The API destination this target names, resolved from the store while the
+    /// rule was compiled — `None` for a target that is not one, and for an ARN
+    /// naming a destination this account does not hold.
+    api_destination: Option<ApiDestination>,
+}
+
+/// What an API-destination target's invocation is made of: the endpoint and
+/// method the STORED destination carries, and whether that destination is in a
+/// state EventBridge invokes.
+///
+/// Read off the record once, where the rule is compiled, for the reason
+/// [`CompiledRule`] gives: the delivery pass holds no lock, and the destination
+/// a target names is part of the routing table that pass works from.
+#[derive(Clone)]
+struct ApiDestination {
+    name: String,
+    /// `ApiDestinationRecord::invocation_endpoint`, the URL the invocation is
+    /// made against.
+    endpoint: String,
+    /// One of `ApiDestinationHttpMethod`'s values, the method the invocation
+    /// uses.
+    method: String,
+    /// Whether the destination's `ApiDestinationState` is `ACTIVE`: one whose
+    /// connection is not authorized is not invoked.
+    active: bool,
 }
 
 impl CompiledRule {
@@ -938,7 +971,14 @@ impl CompiledRule {
     /// it: a `DISABLED` rule ("EventBridge does not match any events against
     /// the rule"), a rule carrying only a `ScheduleExpression` (it self-triggers
     /// instead), or a pattern that no longer parses.
-    pub(crate) fn of(rule: &crate::state::RuleRecord) -> Option<Self> {
+    ///
+    /// `store` is read for what a TARGET needs beside the rule itself — the API
+    /// destination an api-destination target names — so the delivery pass needs
+    /// no lock of its own.
+    pub(crate) fn of(
+        rule: &crate::state::RuleRecord,
+        store: &crate::state::ComAmazonawsEventbridgeAwseventsState,
+    ) -> Option<Self> {
         if !rule.matches_published_events() {
             return None;
         }
@@ -961,10 +1001,32 @@ impl CompiledRule {
                         .dead_letter_config
                         .as_ref()
                         .and_then(|config| config.arn.clone()),
+                    maximum_retry_attempts: target
+                        .raw
+                        .retry_policy
+                        .as_ref()
+                        .and_then(|policy| policy.maximum_retry_attempts),
+                    api_destination: api_destination(store, &target.arn),
                 })
                 .collect(),
         })
     }
+}
+
+/// The API destination `arn` names, as the invocation needs it — `None` when the
+/// ARN names no API destination, or names one this account does not hold.
+fn api_destination(
+    store: &crate::state::ComAmazonawsEventbridgeAwseventsState,
+    arn: &str,
+) -> Option<ApiDestination> {
+    let name = crate::state::api_destination_name_in_arn(arn)?;
+    let record = store.api_destination(name)?;
+    Some(ApiDestination {
+        name: record.name.clone(),
+        endpoint: record.invocation_endpoint.clone(),
+        method: record.http_method.clone(),
+        active: store.api_destination_state(record) == crate::state::API_DESTINATION_STATE_ACTIVE,
+    })
 }
 
 /// How many target deliveries ONE `PutEvents` request may make, across every
@@ -990,6 +1052,20 @@ const MAX_DELIVERIES_PER_REQUEST: usize = 100;
 /// would admit hundreds of megabytes of message bodies from one request.
 const MAX_DELIVERED_BYTES_PER_REQUEST: usize = 8 * 1024 * 1024;
 
+/// How long ONE `PutEvents` request may spend WAITING on API destination
+/// endpoints, across every attempt it makes.
+///
+/// This operation's OWN bound, not a limit AWS publishes. Each attempt is capped
+/// at [`API_DESTINATION_TIMEOUT`] and each delivery at
+/// [`MAX_API_DESTINATION_ATTEMPTS`] attempts, but the PRODUCT with the fan-out is
+/// not: a request matching many targets whose endpoints never answer would
+/// otherwise hold the publisher for as long as that product takes. It is four
+/// full attempt timeouts, so a realistic retry sequence against one slow
+/// endpoint finishes inside it, and a request that exhausts it stops attempting
+/// and says so.
+const MAX_ENDPOINT_WAIT_PER_REQUEST: ::std::time::Duration =
+    ::std::time::Duration::from_secs(20);
+
 /// What one `PutEvents` request has left to spend on delivering to targets.
 ///
 /// ONE budget for the whole request, spent across every entry, rule and target:
@@ -1000,15 +1076,19 @@ const MAX_DELIVERED_BYTES_PER_REQUEST: usize = 8 * 1024 * 1024;
 pub(crate) struct DeliveryBudget {
     deliveries: usize,
     bytes: usize,
+    /// What is left of [`MAX_ENDPOINT_WAIT_PER_REQUEST`].
+    endpoint_wait: ::std::time::Duration,
 }
 
 impl DeliveryBudget {
-    /// A fresh budget: [`MAX_DELIVERIES_PER_REQUEST`] deliveries and
-    /// [`MAX_DELIVERED_BYTES_PER_REQUEST`] bytes.
+    /// A fresh budget: [`MAX_DELIVERIES_PER_REQUEST`] deliveries,
+    /// [`MAX_DELIVERED_BYTES_PER_REQUEST`] bytes and
+    /// [`MAX_ENDPOINT_WAIT_PER_REQUEST`] of waiting on endpoints.
     pub(crate) fn new() -> Self {
         Self {
             deliveries: 0,
             bytes: 0,
+            endpoint_wait: MAX_ENDPOINT_WAIT_PER_REQUEST,
         }
     }
 
@@ -1023,6 +1103,16 @@ impl DeliveryBudget {
         self.deliveries = deliveries;
         self.bytes = total;
         true
+    }
+
+    /// Whether this request may still WAIT on an endpoint.
+    fn may_wait_on_an_endpoint(&self) -> bool {
+        !self.endpoint_wait.is_zero()
+    }
+
+    /// Charge what one attempt at an endpoint took.
+    fn charge_endpoint_wait(&mut self, spent: ::std::time::Duration) {
+        self.endpoint_wait = self.endpoint_wait.saturating_sub(spent);
     }
 }
 
@@ -1101,6 +1191,10 @@ pub(crate) async fn deliver(
         return None;
     }
 
+    // What a RETRIED invocation spent, filled in by the invocation that retries
+    // (see [`invoke_api_destination`]) and read by the dead-letter message
+    // below; `None` for an invocation nothing retried.
+    let mut retries: Option<Retries> = None;
     // EventBridge acts AS the target's role for the kinds AWS invokes under one,
     // so a role it cannot assume, or one whose policies withhold the target's API
     // call, is a delivery that fails before the call is made. The decision is
@@ -1115,7 +1209,10 @@ pub(crate) async fn deliver(
         .filter(|_| kind.invoked_under_target_role());
     let outcome = match role_refusal(iam, role_arn, &target.arn, kind.action()) {
         Some((code, message)) => crate::state::InvocationOutcome::Failed { code, message },
-        None => kind.invoke(ctx, clients, region, &target.arn, body).await,
+        None => {
+            kind.invoke(ctx, clients, region, target, body, &mut retries, budget)
+                .await
+        }
     };
 
     // "If EventBridge can't deliver an event to a target, it sends the event to
@@ -1138,7 +1235,18 @@ pub(crate) async fn deliver(
                     SQS_ARN_NAMESPACE,
                 )
                 .unwrap_or(region);
-                dead_letter(ctx, clients, dlq_region, &queue, handover, body, code, message).await;
+                dead_letter(
+                    ctx,
+                    clients,
+                    dlq_region,
+                    &queue,
+                    handover,
+                    body,
+                    code,
+                    message,
+                    retries.as_ref(),
+                )
+                .await;
             }
         }
         count_failed_invocation(cloudwatch, handover.rule);
@@ -1177,6 +1285,10 @@ enum TargetKind {
     /// A Step Functions state machine: `states:StartExecution` with the event as
     /// the execution input.
     StateMachine,
+    /// One of this service's own API destinations: an HTTP request to the
+    /// endpoint the destination holds, carrying the event as the body (see
+    /// [`invoke_api_destination`]).
+    ApiDestination,
 }
 
 /// The ARN namespace of Amazon SQS, whose queues a rule delivers to.
@@ -1192,6 +1304,8 @@ const STATES_ARN_NAMESPACE: &str = "states";
 const FUNCTION_RESOURCE_TYPE: &str = "function";
 /// The resource type a Step Functions state machine ARN names.
 const STATE_MACHINE_RESOURCE_TYPE: &str = "stateMachine";
+/// The resource type one of this service's own API destination ARNs names.
+const API_DESTINATION_RESOURCE_TYPE: &str = "api-destination";
 
 impl TargetKind {
     /// The kind `arn` names, or `None` when this emulator has no invocation for
@@ -1219,6 +1333,14 @@ impl TargetKind {
             STATES_ARN_NAMESPACE if parsed.resource_type() == STATE_MACHINE_RESOURCE_TYPE => {
                 Some(Self::StateMachine)
             }
+            // This service's own resource: an API destination, whose ARN carries
+            // the destination's name and its unique id
+            // (`crate::state::api_destination_arn`).
+            crate::state::ARN_NAMESPACE
+                if parsed.resource_type() == API_DESTINATION_RESOURCE_TYPE =>
+            {
+                Some(Self::ApiDestination)
+            }
             _ => None,
         }
     }
@@ -1231,6 +1353,7 @@ impl TargetKind {
             Self::Function => "lambda:InvokeFunction",
             Self::Topic => "sns:Publish",
             Self::StateMachine => "states:StartExecution",
+            Self::ApiDestination => "events:InvokeApiDestination",
         }
     }
 
@@ -1241,14 +1364,18 @@ impl TargetKind {
     /// is recorded as NOT ATTEMPTED rather than counted as a failed invocation:
     /// dead-lettering an event for a gap in the emulator would report a failure
     /// that AWS never produces.
+    #[allow(clippy::too_many_arguments)]
     async fn invoke(
         self,
         ctx: &smithy_server_runtime::OperationContext<'_>,
         clients: &mut Clients,
         region: &str,
-        arn: &str,
+        target: &CompiledTarget,
         body: &str,
+        retries: &mut Option<Retries>,
+        budget: &mut DeliveryBudget,
     ) -> crate::state::InvocationOutcome {
+        let arn = target.arn.as_str();
         // The target's OWN Region — the ARN's — which is not necessarily the one
         // this request was signed for, falling back to it when the ARN names no
         // Region label.
@@ -1304,6 +1431,9 @@ impl TargetKind {
                     .send()
                     .await,
             ),
+            Self::ApiDestination => {
+                invoke_api_destination(ctx, target, body, retries, budget).await
+            }
         }
     }
 
@@ -1314,6 +1444,7 @@ impl TargetKind {
             Self::Function => LAMBDA_ARN_NAMESPACE,
             Self::Topic => SNS_ARN_NAMESPACE,
             Self::StateMachine => STATES_ARN_NAMESPACE,
+            Self::ApiDestination => crate::state::ARN_NAMESPACE,
         }
     }
 
@@ -1330,7 +1461,11 @@ impl TargetKind {
     /// stop the delivery.
     fn invoked_under_target_role(self) -> bool {
         match self {
-            Self::StateMachine => true,
+            // An API destination is invoked under the target's role as well:
+            // EventBridge needs `events:InvokeApiDestination` on the
+            // destination, and the `RoleArn` the target names is what carries
+            // it.
+            Self::StateMachine | Self::ApiDestination => true,
             Self::Queue | Self::Function | Self::Topic => false,
         }
     }
@@ -1367,12 +1502,322 @@ where
     }
 }
 
+/// What a RETRIED invocation spent, as the dead-letter message reports it.
+struct Retries {
+    /// How many times the invocation was tried AGAIN after the first attempt.
+    attempts: i32,
+    /// Whether the target's retry allowance is what stopped the delivery, as
+    /// opposed to a failure that is not retried at all.
+    exhausted: bool,
+}
+
+/// What the dead-letter message names as the condition that stopped a delivery
+/// which used its retry allowance up.
+const MAXIMUM_RETRY_ATTEMPTS_CONDITION: &str = "MaximumRetryAttempts";
+
+/// The time ONE attempt at an API destination's endpoint is given.
+///
+/// AWS documents a 5 second client execution timeout for an API destination
+/// endpoint, after which the attempt is abandoned and retried within the
+/// target's retry policy. It is a CAP on an attempt, never a wait: an attempt
+/// that answers sooner costs what it costs.
+const API_DESTINATION_TIMEOUT: ::std::time::Duration = ::std::time::Duration::from_secs(5);
+
+/// How many attempts ONE api-destination delivery may make, whatever the
+/// target's `RetryPolicy` asks for.
+///
+/// This operation's OWN bound, not a limit AWS publishes (`MaximumRetryAttempts`
+/// is modelled up to 185). Every attempt is a real request made while the
+/// publisher waits for `PutEvents` to answer, and the fan-out around it is
+/// already bounded ([`MAX_DELIVERIES_PER_REQUEST`]) while the product with the
+/// retry count is not. A target asking for more is retried this many times and
+/// says so in the log.
+const MAX_API_DESTINATION_ATTEMPTS: i32 = 6;
+
+/// The content type AWS sends an API destination's invocation with.
+const API_DESTINATION_CONTENT_TYPE: &str = "application/json; charset=utf-8";
+/// The user agent AWS sends an API destination's invocation with.
+const API_DESTINATION_USER_AGENT: &str = "Amazon/EventBridge/ApiDestinations";
+
+/// The error code recorded for an api-destination delivery nothing
+/// acknowledged.
+///
+/// No recorded output names this code — what is recorded is that the dead-letter
+/// message carries one — so it names the condition and the detail (the endpoint,
+/// the final status or the timeout, and how many attempts were made) is in the
+/// message beside it.
+const API_DESTINATION_NOT_DELIVERED: &str = "ApiDestinationInvocationFailed";
+
+/// The error types that are the TRANSPORT's own refusal rather than an answer
+/// from an endpoint: this emulator serves nothing at that URL, or more than one
+/// of its services claims it. Either way the attempt reached no endpoint.
+const TRANSPORT_REFUSALS: [&str; 2] = ["UnknownService", "AmbiguousService"];
+
+/// How much of a non-2xx answer is read to tell the transport's own refusal from
+/// an endpoint's answer. The envelope is two short fields; anything larger is an
+/// answer from something that served the request, so it is not read at all.
+const MAX_REFUSAL_ENVELOPE_BYTES: usize = 4 * 1024;
+
+/// Whether `body` is the in-process transport's OWN refusal of the request —
+/// this emulator serves nothing at the endpoint the destination names — rather
+/// than an answer from an endpoint that served it.
+///
+/// The refusal is told by the error type its envelope carries
+/// ([`TRANSPORT_REFUSALS`]); the bridge the request crosses keeps the body but
+/// not the headers, so the envelope is where that type can be read at all.
+fn is_transport_refusal(body: &[u8]) -> bool {
+    if body.len() > MAX_REFUSAL_ENVELOPE_BYTES {
+        return false;
+    }
+    let Ok(envelope) = ::serde_json::from_slice::<::serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(error_type) = envelope.get("__type").and_then(::serde_json::Value::as_str) else {
+        return false;
+    };
+    // The type may carry a shape namespace; the code is its last segment.
+    let code = error_type.rsplit('#').next().unwrap_or(error_type);
+    TRANSPORT_REFUSALS.contains(&code)
+}
+
+/// Invoke an API destination target: an HTTP request to the endpoint the stored
+/// destination holds, carrying the event, retried within the target's
+/// `RetryPolicy`.
+///
+/// The rule AWS follows: EventBridge makes the destination's `HttpMethod`
+/// request to its `InvocationEndpoint` with the event as the body, bounded by a
+/// client execution timeout ([`API_DESTINATION_TIMEOUT`]); an answer in the 2xx
+/// range is the delivery, a 4xx is the endpoint REFUSING it and is not tried
+/// again, and a 5xx or an attempt that never answered is tried again up to
+/// `RetryPolicy$MaximumRetryAttempts` — after which the event goes to the
+/// target's dead-letter queue like any other undeliverable one (see [`deliver`]).
+///
+/// The request goes through the IN-PROCESS emulator transport and nothing else
+/// ([`smithy_server_runtime::EmbeddedEmulator::http_connector`]), so an endpoint
+/// a caller stored reaches only what this emulator serves itself: no socket is
+/// opened and no name is resolved. An endpoint this emulator serves nothing at
+/// answers the transport's own refusal, which is an attempt that reached no
+/// endpoint rather than an answer from one — the retryable class, exactly as an
+/// endpoint that never answers is.
+///
+/// The connection's authorization material and `InvocationHttpParameters` are
+/// NOT merged into the request here; that merge is its own change.
+async fn invoke_api_destination(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    target: &CompiledTarget,
+    body: &str,
+    retries: &mut Option<Retries>,
+    budget: &mut DeliveryBudget,
+) -> crate::state::InvocationOutcome {
+    let Some(destination) = target.api_destination.as_ref() else {
+        return crate::state::InvocationOutcome::Failed {
+            code: API_DESTINATION_NOT_DELIVERED.to_string(),
+            message: format!(
+                "Target {} names no api destination this account holds, so no request was made \
+                 to one.",
+                target.arn
+            ),
+        };
+    };
+    // "An API destination ... is ACTIVE only while the connection it uses is
+    // authorized": an inactive destination is not invoked, so no request is made
+    // and the event is not delivered.
+    if !destination.active {
+        return crate::state::InvocationOutcome::Failed {
+            code: API_DESTINATION_NOT_DELIVERED.to_string(),
+            message: format!(
+                "Api destination {} is not ACTIVE, so no request was made to its invocation \
+                 endpoint.",
+                destination.name
+            ),
+        };
+    }
+    let allowance = target.maximum_retry_attempts.unwrap_or(i32::MAX);
+    let asked = allowance.saturating_add(1);
+    let attempts = asked.clamp(1, MAX_API_DESTINATION_ATTEMPTS);
+    // Whether THIS EMULATOR's bound is what the delivery will stop at, rather
+    // than the allowance the target asked for: a condition the target's retry
+    // policy did not produce must not be reported as one it did.
+    let bounded_by_this_emulator = asked > attempts;
+    if bounded_by_this_emulator {
+        ::tracing::warn!(
+            destination = %destination.name,
+            asked = allowance,
+            bound = MAX_API_DESTINATION_ATTEMPTS,
+            "this target asks for more invocation attempts than one delivery makes in this \
+             emulator; the delivery stops at the bound"
+        );
+    }
+    let transport = ctx.callback().http_connector();
+    let mut last = String::new();
+    let mut made = 0;
+    // Whether the REQUEST's endpoint-wait budget is what stopped the attempts,
+    // rather than the target's retry allowance.
+    let mut stopped_by_this_emulator = false;
+    while made < attempts {
+        // One yield per attempt, so a retried delivery stays interruptible.
+        ::tokio::task::yield_now().await;
+        // What the whole REQUEST has left to wait on endpoints, which is what
+        // bounds the product of the fan-out and the per-attempt timeout.
+        if !budget.may_wait_on_an_endpoint() {
+            ::tracing::warn!(
+                destination = %destination.name,
+                bound = ?MAX_ENDPOINT_WAIT_PER_REQUEST,
+                "this request reached the time it may spend waiting on api destination \
+                 endpoints; this delivery makes no further attempt"
+            );
+            last = "this request reached the time this emulator lets one spend waiting on \
+                    api destination endpoints"
+                .to_string();
+            stopped_by_this_emulator = true;
+            break;
+        }
+        made += 1;
+        let started = ::std::time::Instant::now();
+        let attempt = attempt_api_destination(&transport, destination, body).await;
+        budget.charge_endpoint_wait(started.elapsed());
+        match attempt {
+            Attempt::Delivered => return crate::state::InvocationOutcome::Invoked,
+            // The endpoint ANSWERED and refused: "a 4xx response is not
+            // retried", so the delivery fails on this attempt.
+            Attempt::Refused(detail) => {
+                *retries = Some(Retries {
+                    attempts: made - 1,
+                    exhausted: false,
+                });
+                return crate::state::InvocationOutcome::Failed {
+                    code: API_DESTINATION_NOT_DELIVERED.to_string(),
+                    message: api_destination_failure(destination, &detail, made),
+                };
+            }
+            Attempt::Retryable(detail) => last = detail,
+        }
+    }
+    if bounded_by_this_emulator {
+        last = format!(
+            "{last}; this emulator stops one delivery at {MAX_API_DESTINATION_ATTEMPTS} \
+             attempts, so the target's retry allowance was not reached"
+        );
+    }
+    *retries = Some(Retries {
+        attempts: (made - 1).max(0),
+        // The retry allowance is the condition only when IT is what ran out —
+        // never when a bound of this emulator's own stopped the attempts first.
+        exhausted: !stopped_by_this_emulator && !bounded_by_this_emulator,
+    });
+    crate::state::InvocationOutcome::Failed {
+        code: API_DESTINATION_NOT_DELIVERED.to_string(),
+        message: api_destination_failure(destination, &last, made),
+    }
+}
+
+/// The message a failed api-destination delivery is recorded and dead-lettered
+/// with: which destination, what the last attempt came to, and how many attempts
+/// were made.
+fn api_destination_failure(destination: &ApiDestination, detail: &str, attempts: i32) -> String {
+    format!(
+        "Api destination {} did not accept the event after {attempts} attempt(s) at {}: {detail}",
+        destination.name, destination.endpoint
+    )
+}
+
+/// What ONE attempt at an API destination's endpoint came to.
+enum Attempt {
+    /// The endpoint acknowledged the event.
+    Delivered,
+    /// The endpoint answered and did not accept it, which is not retried.
+    Refused(String),
+    /// The attempt is one the delivery may make again: the endpoint answered a
+    /// server error, did not answer within the timeout, or was never reached.
+    Retryable(String),
+}
+
+/// Make one attempt, bounded by [`API_DESTINATION_TIMEOUT`], and classify it.
+async fn attempt_api_destination(
+    transport: &::aws_smithy_runtime_api::client::http::SharedHttpConnector,
+    destination: &ApiDestination,
+    body: &str,
+) -> Attempt {
+    use ::aws_smithy_runtime_api::client::http::HttpConnector;
+
+    let method = match ::http::Method::from_bytes(destination.method.as_bytes()) {
+        Ok(method) => method,
+        Err(_) => {
+            return Attempt::Retryable(format!(
+                "its stored HttpMethod {:?} is not an HTTP method",
+                destination.method
+            ))
+        }
+    };
+    // Every value here comes from the stored destination, so an endpoint that is
+    // not a URI fails HERE rather than panicking.
+    let request = ::http::Request::builder()
+        .method(method)
+        .uri(&destination.endpoint)
+        .header(::http::header::CONTENT_TYPE, API_DESTINATION_CONTENT_TYPE)
+        .header(::http::header::USER_AGENT, API_DESTINATION_USER_AGENT)
+        .body(::aws_smithy_types::body::SdkBody::from(
+            ::bytes::Bytes::from(body.to_owned()),
+        ))
+        .map_err(|error| error.to_string())
+        .and_then(|request| {
+            ::aws_smithy_runtime_api::http::Request::try_from(request)
+                .map_err(|error| error.to_string())
+        });
+    let request = match request {
+        Ok(request) => request,
+        Err(error) => {
+            return Attempt::Retryable(format!(
+                "its stored invocation endpoint does not render a request ({error})"
+            ))
+        }
+    };
+    match ::tokio::time::timeout(API_DESTINATION_TIMEOUT, transport.call(request)).await {
+        // Nothing answered inside the client execution timeout.
+        Err(_elapsed) => Attempt::Retryable(format!(
+            "the endpoint did not answer within {} seconds",
+            API_DESTINATION_TIMEOUT.as_secs()
+        )),
+        Ok(Err(error)) => Attempt::Retryable(format!(
+            "the endpoint could not be reached ({})",
+            ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+        )),
+        Ok(Ok(response)) => {
+            let status = response.status().as_u16();
+            // A refusal the TRANSPORT itself made is not an answer from an
+            // endpoint: the in-process emulator serves nothing at this URL (or
+            // more than one service claims it), so the attempt reached no
+            // endpoint at all — which is the same class as an endpoint that
+            // never answers, not a 4xx the endpoint sent back.
+            if response
+                .body()
+                .bytes()
+                .is_some_and(is_transport_refusal)
+            {
+                return Attempt::Retryable(
+                    "no endpoint answered: this emulator serves nothing at that invocation \
+                     endpoint"
+                        .to_string(),
+                );
+            }
+            match status {
+                200..=299 => Attempt::Delivered,
+                // The endpoint answered that it will not take the event.
+                400..=499 => Attempt::Refused(format!("the endpoint answered HTTP {status}")),
+                _ => Attempt::Retryable(format!("the endpoint answered HTTP {status}")),
+            }
+        }
+    }
+}
+
 /// Send one undeliverable event to the target's dead-letter queue.
 ///
 /// "EventBridge adds the following custom attributes to the dead-letter
 /// message": the rule and target the event could not be delivered to, and the
 /// error code and message of the refusal — so a consumer of the queue can tell
-/// which delivery failed and why without parsing the event.
+/// which delivery failed and why without parsing the event. A delivery that was
+/// RETRIED also carries how many retries it made and, when the allowance is what
+/// stopped it, that condition.
 #[allow(clippy::too_many_arguments)]
 async fn dead_letter(
     ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -1383,13 +1828,23 @@ async fn dead_letter(
     body: &str,
     code: &str,
     message: &str,
+    retries: Option<&Retries>,
 ) {
-    let attributes = [
-        ("RULE_ARN", handover.rule_arn),
-        ("TARGET_ARN", handover.target.arn.as_str()),
-        ("ERROR_CODE", code),
-        ("ERROR_MESSAGE", message),
+    let mut attributes: Vec<(&str, String)> = vec![
+        ("RULE_ARN", handover.rule_arn.to_string()),
+        ("TARGET_ARN", handover.target.arn.clone()),
+        ("ERROR_CODE", code.to_string()),
+        ("ERROR_MESSAGE", message.to_string()),
     ];
+    if let Some(retries) = retries {
+        attributes.push(("RETRY_ATTEMPTS", retries.attempts.to_string()));
+        if retries.exhausted {
+            attributes.push((
+                "EXHAUSTED_RETRY_CONDITION",
+                MAXIMUM_RETRY_ATTEMPTS_CONDITION.to_string(),
+            ));
+        }
+    }
     let mut request = clients
         .sqs(ctx, region)
         .send_message()

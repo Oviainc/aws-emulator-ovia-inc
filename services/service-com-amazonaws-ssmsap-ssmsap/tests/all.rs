@@ -17,6 +17,8 @@ mod app_registry_arn;
 mod application_lifecycle;
 #[path = "all/application_reference_refusals.rs"]
 mod application_reference_refusals;
+#[path = "all/component_cross_references.rs"]
+mod component_cross_references;
 #[path = "all/component_listing.rs"]
 mod component_listing;
 #[path = "all/component_reads.rs"]

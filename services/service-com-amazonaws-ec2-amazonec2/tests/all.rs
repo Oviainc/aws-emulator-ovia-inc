@@ -378,3 +378,10 @@ mod image_recycle_bin;
 // copy computes from the stored source, and what it refuses.
 #[path = "all/copy_fpga_image.rs"]
 mod copy_fpga_image;
+// Declared LAST for the reason the header gives: what a stored network interface blocks
+// (the group, subnet and VPC deletes it is a dependency of), and the public Systems Manager
+// parameter catalog a `resolve:ssm:` launch-template `ImageId` resolves through.
+#[path = "all/network_interface_dependencies.rs"]
+mod network_interface_dependencies;
+#[path = "all/launch_template_ssm_alias_catalog.rs"]
+mod launch_template_ssm_alias_catalog;

@@ -617,6 +617,30 @@ impl Api {
             .collect()
     }
 
+    /// The route KEYS of this api's routes that are associated with `authorizer_id`, in
+    /// the store's stable `RouteId` order.
+    ///
+    /// A route holds the reference (through its `AuthorizerId`), so the authorizer is the
+    /// one that cannot be removed while any of them exists: a deleted authorizer would
+    /// leave those routes naming nothing. An empty `AuthorizerId` names no authorizer, the
+    /// same reading [`Api::unresolved_route_reference`] gives it.
+    ///
+    /// The KEY is what identifies a route to a caller — it is the route's name within its
+    /// api — so it is what a refusal about the reference names.
+    pub fn route_keys_using_authorizer(&self, authorizer_id: &str) -> Vec<String> {
+        self.routes
+            .values()
+            .filter(|route| {
+                route
+                    .authorizer_id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .is_some_and(|id| id == authorizer_id)
+            })
+            .map(|route| route.route_key.clone())
+            .collect()
+    }
+
     /// The refusal message for a reference of this route that this api cannot resolve,
     /// or `None` when every reference names a child resource this api holds.
     ///
@@ -1435,6 +1459,14 @@ pub fn validate_route_key_variables<'a>(
 /// than echoing the id back.
 pub const UNRESOLVED_AUTHORIZER_MESSAGE: &str = "Invalid authorizer ID specified. Setting \
     the authorization type to CUSTOM or COGNITO_USER_POOLS requires a valid authorizer.";
+
+/// The sentence this service answers `NotFoundException` with for an `AuthorizerId` no
+/// authorizer of the addressed api carries.
+///
+/// API Gateway answers an unknown authorizer identifier with this sentence alone: unlike
+/// the api-level [`invalid_identifier_message`], it names neither the account nor the
+/// identifier the request carried.
+pub const INVALID_AUTHORIZER_IDENTIFIER_MESSAGE: &str = "Invalid Authorizer identifier specified";
 
 /// The message this service answers `NotFoundException` with for a request naming a
 /// resource no record holds: the sentence API Gateway answers an unknown identifier

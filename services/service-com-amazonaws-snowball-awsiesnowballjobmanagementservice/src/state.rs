@@ -14,8 +14,8 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     Address, ClusterListEntry, ClusterMetadata, DeviceConfiguration, JobListEntry, JobMetadata,
-    JobResource, Notification, OnDeviceServiceConfiguration, PickupDetails, ServiceVersion,
-    ShippingDetails, TaxDocuments,
+    JobResource, LongTermPricingListEntry, Notification, OnDeviceServiceConfiguration,
+    PickupDetails, ServiceVersion, ShippingDetails, TaxDocuments,
 };
 
 /// What a handler says when the engine it was constructed with does not carry this
@@ -105,6 +105,14 @@ pub const MAX_STORED_LONG_TERM_PRICING: usize = 1_000;
 /// contract AWS has taken the upfront payment for and is holding to is reported as
 /// `ACTIVE`.
 pub const LONG_TERM_PRICING_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The status a long-term pricing contract carries once the term it was bought for has run
+/// out.
+///
+/// The same modelled member carries it, and the entry's own end date is what decides which
+/// of the two a contract is in: a contract whose end date has passed is no longer one the
+/// service is holding to.
+pub const LONG_TERM_PRICING_STATUS_EXPIRED: &str = "EXPIRED";
 
 /// The most clusters this store holds.
 ///
@@ -689,12 +697,15 @@ impl StoredJob {
 }
 
 /// One stored long-term pricing contract: the id the service minted for it, the term and
-/// device type it was bought for, and the window it runs over — everything
-/// `ListLongTermPricing` reports about a contract that has no job associated with it yet.
+/// device type it was bought for, and the window it runs over.
 ///
-/// `CurrentActiveJob`, `ReplacementJob` and `JobIds` are deliberately absent: each names a
-/// job associated with the contract, which only `CreateJob` and `UpdateLongTermPricing`
-/// can produce, and neither associates one yet.
+/// `CurrentActiveJob` and `JobIds` are deliberately not held here: each names a job
+/// associated with the contract, and a job carries the `LongTermPricingId` it was ordered
+/// under ([`StoredJob::long_term_pricing_id`]), so the association is read off the jobs the
+/// store holds
+/// ([`ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState::jobs_billed_to_long_term_pricing`])
+/// and the two can never disagree. `ReplacementJob` is what `UpdateLongTermPricing` names,
+/// which does not associate one yet.
 #[derive(Debug, Clone)]
 pub struct StoredLongTermPricing {
     pub long_term_pricing_id: String,
@@ -711,6 +722,56 @@ pub struct StoredLongTermPricing {
     /// `LongTermPricingType` names.
     pub long_term_pricing_end_date: SystemTime,
     pub long_term_pricing_status: String,
+}
+
+impl StoredLongTermPricing {
+    /// This contract's `LongTermPricingStatus` at `now`: the status it was stored with while
+    /// the term it was bought for still has time to run, and
+    /// [`LONG_TERM_PRICING_STATUS_EXPIRED`] from its end date on — a change the clock owes
+    /// rather than one a call makes, so it is derived at each read instead of being written.
+    pub fn status_at(&self, now: SystemTime) -> &str {
+        if now < self.long_term_pricing_end_date {
+            &self.long_term_pricing_status
+        } else {
+            LONG_TERM_PRICING_STATUS_EXPIRED
+        }
+    }
+
+    /// This record as the modelled `LongTermPricingListEntry` `ListLongTermPricing` pages
+    /// over, for a store whose clock reads `now` and in which `billed` are the jobs ordered
+    /// under this contract, in creation order.
+    ///
+    /// `JobIds` is "The IDs of the jobs that are associated with a long-term pricing type",
+    /// so it is every one of those jobs; a contract no job has been ordered under yet
+    /// reports none at all rather than an empty list. `CurrentActiveJob` is "The current
+    /// active jobs on the device the long-term pricing type", so it is the newest of them
+    /// whose order still has a device of its own ([`StoredJob::is_master`],
+    /// [`JobState::holds_device`]) — the device the contract is paying for right now — and
+    /// `None` once none of them has one. `ReplacementJob` is what
+    /// `UpdateLongTermPricing` names, and no stored contract carries one yet.
+    pub fn to_list_entry(&self, now: SystemTime, billed: &[&StoredJob]) -> LongTermPricingListEntry {
+        let job_ids: Vec<String> = billed.iter().map(|job| job.job_id.clone()).collect();
+        let current_active_job = billed
+            .iter()
+            .rfind(|job| !job.is_master() && job.job_state.holds_device())
+            .map(|job| job.job_id.clone());
+        LongTermPricingListEntry {
+            long_term_pricing_id: Some(self.long_term_pricing_id.clone()),
+            long_term_pricing_end_date: Some(::aws_smithy_types::DateTime::from(
+                self.long_term_pricing_end_date,
+            )),
+            long_term_pricing_start_date: Some(::aws_smithy_types::DateTime::from(
+                self.long_term_pricing_start_date,
+            )),
+            long_term_pricing_type: Some(self.long_term_pricing_type.clone()),
+            current_active_job,
+            replacement_job: None,
+            is_long_term_pricing_auto_renew: Some(self.is_long_term_pricing_auto_renew),
+            long_term_pricing_status: Some(self.status_at(now).to_string()),
+            snowball_type: Some(self.snowball_type.clone()),
+            job_ids: (!job_ids.is_empty()).then_some(job_ids),
+        }
+    }
 }
 
 /// One stored cluster: the id and state the service minted for it plus every
@@ -1331,6 +1392,28 @@ pub fn page_of_jobs(
     )
 }
 
+/// One page of `records`, as [`page_of`] pages any listing: the `LongTermPricingListEntry`
+/// list `ListLongTermPricing` reports, with the cursor its next page resumes at.
+///
+/// `billed` answers, for one record, the jobs ordered under it in creation order, so an
+/// entry is built from the whole store rather than from the record alone.
+#[allow(clippy::type_complexity)]
+pub fn page_of_long_term_pricing<'a>(
+    records: &[&StoredLongTermPricing],
+    next_token: Option<&str>,
+    page_size: usize,
+    now: SystemTime,
+    billed: impl Fn(&str) -> Vec<&'a StoredJob>,
+) -> Option<(Vec<LongTermPricingListEntry>, Option<String>)> {
+    page_of(
+        records,
+        next_token,
+        page_size,
+        |record| record.long_term_pricing_id.as_str(),
+        |record| record.to_list_entry(now, &billed(&record.long_term_pricing_id)),
+    )
+}
+
 /// One page of `clusters`, as [`page_of`] pages any listing: the `ClusterListEntry` list
 /// `ListClusters` reports, with the cursor its next page resumes at.
 #[allow(clippy::type_complexity)]
@@ -1375,12 +1458,9 @@ pub struct ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     /// [`Self::holds_long_term_pricing`]) rather than against the id's form, so exactly the
     /// ids this emulator minted are the ones it accepts.
     pub long_term_pricing: HashMap<String, StoredLongTermPricing>,
-    /// The ids in `long_term_pricing` in creation order, so a listing of the contracts
-    /// pages deterministically the way `job_order` lets `ListJobs` page over jobs.
-    ///
-    /// `ListLongTermPricing` is the reader this order is for and is still a scaffold stub,
-    /// so until it is implemented the order is maintained by the insertion point and read
-    /// only by this crate's tests.
+    /// The ids in `long_term_pricing` in creation order, so `ListLongTermPricing` pages
+    /// over the contracts deterministically the way `job_order` lets `ListJobs` page over
+    /// jobs.
     pub long_term_pricing_order: Vec<String>,
     /// The ids in `clusters` in creation order, so `ListClusters` pages deterministically.
     pub cluster_order: Vec<String>,
@@ -1459,6 +1539,30 @@ impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     /// are exactly the ones `CreateLongTermPricing` minted a contract for.
     pub fn holds_long_term_pricing(&self, long_term_pricing_id: &str) -> bool {
         self.long_term_pricing.contains_key(long_term_pricing_id)
+    }
+
+    /// Every long-term pricing contract this store holds in creation order — the order
+    /// `ListLongTermPricing` pages over.
+    ///
+    /// Every contract is here whatever its term has done since: nothing in this API removes
+    /// one, and a contract whose term has run out is one whose end date says so.
+    pub fn long_term_pricing_in_creation_order(&self) -> Vec<&StoredLongTermPricing> {
+        self.long_term_pricing_order
+            .iter()
+            .filter_map(|id| self.long_term_pricing.get(id))
+            .collect()
+    }
+
+    /// The jobs ordered under the contract `long_term_pricing_id`, in creation order.
+    ///
+    /// A job carries the id it was ordered under, so the association is read off the stored
+    /// jobs: an export order's main job and each of its job parts carry the order's id and
+    /// are each one of these jobs, exactly as `ListJobs` reports them separately.
+    pub fn jobs_billed_to_long_term_pricing(&self, long_term_pricing_id: &str) -> Vec<&StoredJob> {
+        self.jobs_in_creation_order()
+            .into_iter()
+            .filter(|job| job.long_term_pricing_id.as_deref() == Some(long_term_pricing_id))
+            .collect()
     }
 
     /// Whether this store can hold another address, i.e. is below

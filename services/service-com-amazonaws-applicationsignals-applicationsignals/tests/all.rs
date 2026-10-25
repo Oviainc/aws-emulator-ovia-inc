@@ -43,6 +43,8 @@ mod grouping_configuration;
 mod instrumentation_configuration_arn;
 #[path = "all/instrumentation_configuration_deletion.rs"]
 mod instrumentation_configuration_deletion;
+#[path = "all/instrumentation_configuration_identity.rs"]
+mod instrumentation_configuration_identity;
 #[path = "all/instrumentation_configuration_status.rs"]
 mod instrumentation_configuration_status;
 #[path = "all/instrumentation_configuration_tags.rs"]

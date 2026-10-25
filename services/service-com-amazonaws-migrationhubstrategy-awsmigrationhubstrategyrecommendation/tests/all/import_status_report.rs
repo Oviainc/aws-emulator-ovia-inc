@@ -64,12 +64,22 @@ fn emulator_with_object_storage() -> MultiServiceRouter {
 /// S3 is a REST service: the bucket and key live in the URI, and the credential scope
 /// names `s3`, which is what routes the request there.
 async fn s3(router: &MultiServiceRouter, method: &str, path: &str) -> (u16, Vec<u8>) {
+    s3_with_body(router, method, path, Bytes::new()).await
+}
+
+/// As [`s3`], with `body` as the request's own bytes.
+async fn s3_with_body(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: Bytes,
+) -> (u16, Vec<u8>) {
     let request = ::http::Request::builder()
         .method(method)
         .uri(path)
         .header("host", "s3.eu-west-1.amazonaws.com")
         .header("authorization", SIGNED_FOR_S3_EU_WEST_1)
-        .body(Bytes::new())
+        .body(body)
         .expect("the test request is well formed");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
@@ -78,8 +88,17 @@ async fn s3(router: &MultiServiceRouter, method: &str, path: &str) -> (u16, Vec<
 
 /// Create the bucket `name` through S3's own front door, as the account's owner would
 /// before naming it to an import.
+///
+/// The create names its `LocationConstraint`: a create that names none can only mean
+/// us-east-1, the Region the unspecified constraint stands for, so S3 refuses one sent to
+/// any other Region's endpoint and this suite signs for eu-west-1.
 async fn create_bucket(case: &str, router: &MultiServiceRouter, name: &str) {
-    let (status, body) = s3(router, "PUT", &format!("/{name}")).await;
+    let payload = "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                   <LocationConstraint>eu-west-1</LocationConstraint>\
+                   </CreateBucketConfiguration>";
+    let (status, body) =
+        s3_with_body(router, "PUT", &format!("/{name}"), Bytes::from_static(payload.as_bytes()))
+            .await;
     assert_eq!(
         status,
         200,

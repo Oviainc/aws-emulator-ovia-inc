@@ -83,7 +83,10 @@ fn public_access_block_payload(members: &[(&str, bool)]) -> String {
 }
 
 /// `PUT /<bucket>?publicAccessBlock` — `PutPublicAccessBlock`.
-async fn put_public_access_block(
+///
+/// `pub(crate)`: the guardrail suite ([`super::public_access_guardrails`]) turns the same
+/// switches on through this one helper rather than spelling the payload a second way.
+pub(crate) async fn put_public_access_block(
     router: &MultiServiceRouter,
     bucket: &str,
     members: &[(&str, bool)],

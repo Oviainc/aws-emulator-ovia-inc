@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPlatformApplications
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPlatformApplications`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPlatformApplications::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +72,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -147,23 +139,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_PLATFORM_APPLICATIONS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// One page of the platform applications this account holds.
+    ///
+    /// A pure REPORT of persisted state: every entry comes from a record the
+    /// mobile-push create wrote, carrying the ARN that record is held under and the
+    /// attributes it holds, and nothing here writes.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPlatformApplications` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPlatformApplicationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPlatformApplications"))
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(ListPlatformApplicationsErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the SNS store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = store.lock();
+
+        let all: Vec<PlatformApplication> = store
+            .platform_applications_in_order()
+            .into_iter()
+            .map(|application| PlatformApplication {
+                platform_application_arn: Some(application.arn.clone()),
+                attributes: Some(application.reported_attributes()),
+            })
+            .collect();
+
+        // A page of "up to 100" applications, with a token only while applications
+        // remain — a token this listing did not mint names no page to serve.
+        let Some((page, next_token)) =
+            state::paginate(all, input.next_token.as_deref(), state::PAGE_SIZE)
+        else {
+            return Err(ListPlatformApplicationsErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(state::INVALID_NEXT_TOKEN_REFUSAL.to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(ListPlatformApplicationsOutput {
+            platform_applications: Some(page),
+            next_token,
+        })
     }
 }

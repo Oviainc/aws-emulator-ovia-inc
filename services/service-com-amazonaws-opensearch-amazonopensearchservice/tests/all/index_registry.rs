@@ -45,8 +45,9 @@ async fn create(emulator: &Emulator, domain: &str, body: Value) -> Answer {
         .await
 }
 
-/// `GetIndex`: `GET /opensearch/domain/{DomainName}/index/{IndexName}`.
-async fn get(emulator: &Emulator, domain: &str, index: &str) -> Answer {
+/// `GetIndex`: `GET /opensearch/domain/{DomainName}/index/{IndexName}`. The reader a
+/// sibling suite proves its writes through, rather than growing a second copy of it.
+pub(crate) async fn get(emulator: &Emulator, domain: &str, index: &str) -> Answer {
     emulator
         .call(
             "GET",
@@ -80,7 +81,13 @@ fn stored_names(emulator: &Emulator, domain: &str, case: &str) -> Vec<String> {
 }
 
 /// A create that must be accepted, asserting the status it reports.
-async fn created_index(emulator: &Emulator, domain: &str, index: &str, schema: &Value, case: &str) {
+pub(crate) async fn created_index(
+    emulator: &Emulator,
+    domain: &str,
+    index: &str,
+    schema: &Value,
+    case: &str,
+) {
     let answer = create(
         emulator,
         domain,

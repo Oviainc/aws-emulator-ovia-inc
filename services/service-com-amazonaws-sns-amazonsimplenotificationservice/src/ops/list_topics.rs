@@ -160,7 +160,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(ListTopicsErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some("Invalid parameter: NextToken".to_string()),
+                    message: Some(state::INVALID_NEXT_TOKEN_REFUSAL.to_string()),
                 },
             )
             .into());

@@ -667,19 +667,19 @@ async fn a_refused_website_configuration_changes_nothing() {
             "<RedirectAllRequestsTo><HostName>www.example.com</HostName>\
              <Protocol>ftp</Protocol></RedirectAllRequestsTo>"
                 .to_string(),
-            "ValidationException",
+            "MalformedXML",
         ),
         (
             "a published protocol differing only in case".to_string(),
             "<RedirectAllRequestsTo><HostName>www.example.com</HostName>\
              <Protocol>HTTPS</Protocol></RedirectAllRequestsTo>"
                 .to_string(),
-            "ValidationException",
+            "MalformedXML",
         ),
         (
             "an empty error document key".to_string(),
             format!("{}{}", index_document("index.html"), error_document("")),
-            "ValidationException",
+            "MalformedXML",
         ),
     ];
 

@@ -288,6 +288,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let grants = requested_grants(&input)?;
         crate::state::validate_acl_grants(&grants, &bucket.region).map_err(refusal)?;
 
+        // Block Public Access: with `BlockPublicAcls` on, S3 "causes the following
+        // behavior: PUT Bucket ACL and PUT Object ACL calls fail if the specified ACL is
+        // public" (`PublicAccessBlockConfiguration$BlockPublicAcls`). The refusal is
+        // `AccessDenied` — the guardrail denies the call — and the stored ACL is left
+        // exactly as it was.
+        if bucket
+            .public_access_block()
+            .is_some_and(|settings| settings.block_public_acls)
+            && crate::state::acl_grants_public_access(&grants)
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                ACCESS_DENIED_MESSAGE,
+            ));
+        }
+
         // "Sets the permissions on an existing bucket using access control lists" (this
         // operation's documentation): the ACL the request names becomes the bucket's ACL
         // in full, whether it had one already or still carried the default.

@@ -396,6 +396,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let object = match input.version_id.as_deref() {
             None => bucket.object(&input.key),
             Some(version_id) => {
+                // A `versionId` that is not SHAPED like one cannot name a version of
+                // anything, so it is a malformed argument rather than an absent version:
+                // `InvalidArgument` with HTTP 400, which leaves `NoSuchVersion`/404 for a
+                // well-formed id the bucket holds no version for.
+                if !crate::state::version_id_is_well_formed(version_id) {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::INVALID_ARGUMENT_CODE,
+                        crate::state::INVALID_ARGUMENT_STATUS,
+                        crate::state::INVALID_VERSION_ID_MESSAGE,
+                    ));
+                }
                 let Some(held) = bucket.stored_version(&input.key, version_id) else {
                     return Err(crate::scaffolded::Scaffolded::unmodeled(
                         crate::state::NO_SUCH_VERSION_CODE,

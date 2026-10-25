@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateIndex
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateIndex`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateIndex::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes the schema of one index of the named domain: every section, property and
+//! member the request names is written onto the stored schema and everything else
+//! the index carries stays, so a later read reports the index as this call left it.
+//! A field's type is settled by the write that first maps it, so an update that
+//! would re-type a field the index already maps is refused and changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +86,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::INDEX_STATUS_UPDATED;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -163,18 +162,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateIndex` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateIndexErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateIndex"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        // `IndexName`'s pattern is not enforced at the request boundary (see
+        // `crate::state::is_index_name`), so a name no index could have is refused
+        // here, as a malformed request, before the store is consulted: the same
+        // check `CreateIndex` and `GetIndex` make.
+        if !crate::state::is_index_name(&input.index_name) {
+            return Err(UpdateIndexErrorModeled::ValidationException(
+                crate::state::malformed_index_name("IndexName", &input.index_name),
+            )
+            .into());
+        }
+
+        // The schema is a set of named sections, so a document carrying a scalar or
+        // an array instead names no change to make and is refused rather than
+        // becoming this index's schema.
+        if !matches!(input.index_schema, ::aws_smithy_types::Document::Object(_)) {
+            return Err(UpdateIndexErrorModeled::ValidationException(
+                crate::state::malformed_index_schema("IndexSchema"),
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // An index belongs to a domain, so an update against a name the store holds
+        // no domain for is the modelled not-found refusal. `settled_mut` first
+        // materialises any configuration change the clock already owes that domain,
+        // which this call neither starts nor changes.
+        let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
+            UpdateIndexErrorModeled::ResourceNotFoundException(crate::state::domain_not_found(
+                &input.domain_name,
+            ))
+        })?;
+        // The domain exists; the name it carries names no index OF it. An update
+        // mints nothing (`CreateIndex` is what creates an index), so that is the
+        // modelled missing-resource refusal.
+        let index = domain.indexes.get_mut(&input.index_name).ok_or_else(|| {
+            UpdateIndexErrorModeled::ResourceNotFoundException(crate::state::index_not_found(
+                &input.domain_name,
+                &input.index_name,
+            ))
+        })?;
+
+        // A field's type is settled by the write that first maps it: a later update
+        // may add to that field's mapping but not re-type it. Checked against the
+        // STORED schema and before anything is written, so a refused update leaves
+        // the index exactly as it was, and so of two updates mapping one field with
+        // different types the one that arrives first settles the type while the
+        // other is refused.
+        if let Some(conflict) =
+            crate::state::mapping_type_conflict(&index.schema, &input.index_schema)
+        {
+            return Err(UpdateIndexErrorModeled::ValidationException(
+                crate::state::mapping_type_immutable(&conflict),
+            )
+            .into());
+        }
+
+        // "The updated JSON schema for the index including any CHANGES to mappings,
+        // settings, and semantic enrichment configuration": what the request names
+        // is written onto the stored schema, and what it does not name the index
+        // keeps, so `GetIndex` reports the index as this call left it.
+        let merged = crate::state::merged_index_schema(&index.schema, &input.index_schema);
+
+        // Because an update MERGES, the stored document grows across calls even
+        // though each request is bounded on its own: past the per-index quota the
+        // update is refused rather than growing the store further. This operation
+        // models no limit error, so the refusal is its `ValidationException`.
+        let values = crate::state::index_schema_values(&merged);
+        if values > crate::state::INDEX_SCHEMA_QUOTA {
+            return Err(UpdateIndexErrorModeled::ValidationException(
+                crate::state::index_schema_over_quota(values),
+            )
+            .into());
+        }
+        index.schema = merged;
+
+        // `UpdateIndexResponse$Status` is "the status of the index update
+        // operation": this call updated the index, so it is `UPDATED`.
+        Ok(UpdateIndexOutput {
+            status: INDEX_STATUS_UPDATED.to_string(),
+        })
     }
 }

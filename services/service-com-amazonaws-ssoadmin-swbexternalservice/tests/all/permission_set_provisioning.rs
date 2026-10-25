@@ -96,7 +96,7 @@ fn organization_fixture() -> (MultiServiceRouter, String, Arc<engine::InMemoryEn
 /// accounts — is still applied by the service's own `materialize_due`, exactly as in
 /// production: this moves only the CLOCK's instant, which is the clock's business and not
 /// the wire's.
-fn hold_provisionings(engine: &Arc<engine::InMemoryEngine>, due_at: SystemTime) {
+pub(crate) fn hold_provisionings(engine: &Arc<engine::InMemoryEngine>, due_at: SystemTime) {
     with_store(engine, |store| {
         for record in &mut store.permission_set_provisionings {
             record.succeeded_due = due_at;

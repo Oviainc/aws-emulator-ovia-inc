@@ -27,14 +27,14 @@
 //!
 //! Where the recorded assets come from: an asset is a PHYSICAL unit of hardware —
 //! a compute or storage server, a powershelf, a switch — that Amazon Web Services
-//! installs on the site once an order is fulfilled, so no call in this API creates
-//! one, and the order `CreateOrder` accepts is never carried as far as being
-//! delivered and installed (see [`crate::order_lifecycle`]). Each row therefore
-//! RECORDS its assets on the stored Outpost
-//! through the same store seam [`crate::quote_lifecycle`] ages a quote through, and
-//! then asks over the wire: what the list answers about what is
-//! recorded is the whole of rules 1 to 3. The hardware below is the rows' own data;
-//! the emulator is never expected to produce an asset of its own.
+//! installs, so no call in this API creates one; the hardware an Outpost settles with
+//! is its own configuration's, which [`crate::outpost_hardware_installation`] states
+//! and exercises. Each row here RECORDS its assets on the stored Outpost
+//! through the same store seam [`crate::quote_lifecycle`] ages a quote through — while
+//! the Outpost is still provisioning, so the installation the clock owes it leaves the
+//! recorded hardware alone — and then asks over the wire: what the list answers about
+//! what is recorded is the whole of rules 1 to 3. The hardware below is the rows' own
+//! data, spanning members and values no one configuration holds at once.
 
 use serde_json::{json, Value};
 

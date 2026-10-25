@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Cover for `CreateWebhook`, driven over the wire the router serves: `POST /` with
-//! `X-Amz-Target: CodeBuild_20161006.<Operation>` on awsJson1_1.
+//! Cover for `CreateWebhook` and `UpdateWebhook`, driven over the wire the router
+//! serves: `POST /` with `X-Amz-Target: CodeBuild_20161006.<Operation>` on awsJson1_1.
 //!
 //! The rule under test is that a webhook is a record kept against a project whose
 //! source provider sends repository events: it is created once per project, computed
 //! from the project the request names, and reported by a later read exactly as it was
-//! persisted. Every table below spans a catalogue the model declares, not one recorded
-//! request.
+//! persisted. An update rewrites that record's configuration from the request it
+//! carries — the request IS the configuration afterwards, so a member it omits is
+//! cleared — while the members identifying the created webhook, and its secret unless
+//! `rotateSecret` asks for a new one, are left alone. Every table below spans a
+//! catalogue the model declares, not one recorded request.
 
 use std::sync::Arc;
 
@@ -597,5 +600,467 @@ async fn creating_a_webhook_touches_the_projects_last_modified() {
         stored.project.last_modified.map(|at| at.to_millis().unwrap_or_default()),
         Some(stored.last_modified_millis),
         "the reported lastModified must be the instant the store holds"
+    );
+}
+
+// --- UpdateWebhook ------------------------------------------------------------------
+
+/// The configuration members `UpdateWebhook` models, from
+/// `smithy_query(query="operation", operation="UpdateWebhook")`: everything in its input
+/// beside the `projectName` that identifies the webhook and the `rotateSecret` flag.
+const CONFIGURATION_MEMBERS: &[&str] = &[
+    "branchFilter",
+    "filterGroups",
+    "buildType",
+    "pullRequestBuildPolicy",
+];
+
+/// The members that identify the webhook CodeBuild created, which no update may touch:
+/// `UpdateWebhook`'s input models none of them.
+const IDENTITY_MEMBERS: &[&str] = &["url", "payloadUrl", "manualCreation", "status"];
+
+/// A webhook configuration that sets every member [`CONFIGURATION_MEMBERS`] names, so a
+/// later update can be seen to replace — and to clear — each one. The enum values are
+/// the model's: `WebhookFilterType`, `WebhookBuildType`,
+/// `PullRequestBuildCommentApproval` and `PullRequestBuildApproverRole`.
+fn full_configuration() -> Value {
+    json!({
+        "branchFilter": "^refs/heads/main$",
+        "filterGroups": [[
+            {"type": "EVENT", "pattern": "PUSH,PULL_REQUEST_CREATED"},
+            {"type": "HEAD_REF", "pattern": "^refs/heads/main$"},
+        ]],
+        "buildType": "BUILD",
+        "pullRequestBuildPolicy": {
+            "requiresCommentApproval": "ALL_PULL_REQUESTS",
+            "approverRoles": ["GITHUB_WRITE"],
+        },
+    })
+}
+
+/// Create a project with `source_type` and connect `configuration` to it as its
+/// webhook, returning the webhook the creating call reported.
+async fn create_project_with_webhook(
+    router: &MultiServiceRouter,
+    project: &str,
+    source_type: &str,
+    mut configuration: Value,
+) -> Value {
+    create_project(router, project, source_type).await;
+    configuration["projectName"] = json!(project);
+    let (status, body) = call(router, "CreateWebhook", configuration).await;
+    assert_eq!(
+        status, 200,
+        "CreateWebhook {project:?}: expected 200, got {status} with {body}"
+    );
+    body["webhook"].clone()
+}
+
+/// Call `UpdateWebhook` for `project` with `request` as the rest of the input.
+async fn update_webhook(
+    router: &MultiServiceRouter,
+    project: &str,
+    mut request: Value,
+) -> (u16, Value) {
+    request["projectName"] = json!(project);
+    call(router, "UpdateWebhook", request).await
+}
+
+/// Assert that `webhook` reports the same configuration as `expected`, member by member.
+fn assert_same_configuration(case: &str, webhook: &Value, expected: &Value) {
+    for member in CONFIGURATION_MEMBERS {
+        assert_eq!(
+            webhook[*member], expected[*member],
+            "{case}: expected {member} {}, got {}",
+            expected[*member], webhook[*member]
+        );
+    }
+}
+
+/// The secret the store holds for `project`'s webhook, and the instant it reports as
+/// that secret's last modification, in milliseconds.
+fn stored_secret(
+    engine: &Arc<engine::InMemoryEngine>,
+    project: &str,
+) -> (Option<String>, Option<i64>) {
+    let state = engine.state::<CodeBuildState>();
+    let guard = state.lock();
+    let webhook = guard
+        .projects
+        .get(project)
+        .and_then(|stored| stored.project.webhook.clone());
+    let secret = webhook.as_ref().and_then(|webhook| webhook.secret.clone());
+    let stamp = webhook
+        .as_ref()
+        .and_then(|webhook| webhook.last_modified_secret)
+        .and_then(|at| at.to_millis().ok());
+    (secret, stamp)
+}
+
+/// Move `project`'s webhook secret stamp a minute into the past, so an assertion about
+/// a rotation is about the write and not about how fast the test runs. Returns the
+/// stamp the store holds afterwards.
+fn rewind_secret_stamp(engine: &Arc<engine::InMemoryEngine>, project: &str) -> Option<i64> {
+    let state = engine.state::<CodeBuildState>();
+    let mut guard = state.lock();
+    let webhook = guard
+        .projects
+        .get_mut(project)
+        .and_then(|stored| stored.project.webhook.as_mut())?;
+    let rewound = webhook
+        .last_modified_secret
+        .and_then(|at| at.to_millis().ok())
+        .map(|at| at - 60_000)?;
+    webhook.last_modified_secret = Some(state::datetime(rewound));
+    Some(rewound)
+}
+
+/// Every configuration member the input models, set on its own and all at once: the
+/// request is the webhook's configuration afterwards, so each member it carries is
+/// stored and each one it omits is cleared, while the members identifying the created
+/// webhook are left exactly as they were.
+#[tokio::test]
+async fn an_update_replaces_the_configuration_it_models() {
+    // One row per member of [`CONFIGURATION_MEMBERS`], plus a request that carries no
+    // configuration at all and one that carries every member.
+    let cases: &[(&str, Value)] = &[
+        (
+            "branchFilter alone",
+            json!({"branchFilter": "^refs/heads/release$"}),
+        ),
+        (
+            "filterGroups alone",
+            json!({"filterGroups": [
+                [{"type": "EVENT", "pattern": "PULL_REQUEST_MERGED"}],
+                [{"type": "EVENT", "pattern": "PUSH"}, {"type": "FILE_PATH", "pattern": "^src/"}],
+            ]}),
+        ),
+        ("buildType alone", json!({"buildType": "BUILD_BATCH"})),
+        (
+            "pullRequestBuildPolicy alone",
+            json!({"pullRequestBuildPolicy": {
+                "requiresCommentApproval": "FORK_PULL_REQUESTS",
+                "approverRoles": ["GITHUB_ADMIN", "GITHUB_MAINTAIN"],
+            }}),
+        ),
+        ("no configuration at all", json!({})),
+        ("every member at once", full_configuration()),
+    ];
+
+    for (index, (case, request)) in cases.iter().enumerate() {
+        let router = emulator();
+        let project = format!("uw-set-{index}");
+        let created =
+            create_project_with_webhook(&router, &project, "GITHUB", full_configuration()).await;
+        assert_same_configuration(
+            &format!("{case}: the created webhook"),
+            &created,
+            &full_configuration(),
+        );
+
+        let (status, body) = update_webhook(&router, &project, request.clone()).await;
+        assert_eq!(
+            status, 200,
+            "{case}: expected 200, got {status} with {body}"
+        );
+        let updated = body["webhook"].clone();
+
+        assert_same_configuration(case, &updated, request);
+        for member in IDENTITY_MEMBERS {
+            assert_eq!(
+                updated[*member], created[*member],
+                "{case}: {member} identifies the created webhook and must be left alone, \
+                 got {} where the creating call reported {}",
+                updated[*member], created[*member]
+            );
+        }
+
+        // Round trip: the project reports exactly the configuration the update stored,
+        // and a second read reports the same again.
+        let stored = read_project(&router, &project).await["webhook"].clone();
+        assert_same_configuration(&format!("{case}: read back"), &stored, request);
+        let again = read_project(&router, &project).await["webhook"].clone();
+        assert_eq!(
+            again, stored,
+            "{case}: a second read must report the same webhook, got {again}"
+        );
+    }
+}
+
+/// `rotateSecret` across every provider that takes a webhook: a new secret is minted
+/// exactly when the caller asks for one and the provider supports one at all, it is
+/// reported only by the call that minted it, and the stamp moves only then.
+#[tokio::test]
+async fn rotate_secret_mints_a_new_secret_only_when_asked() {
+    for (source_type, _) in SOURCE_TYPES.iter().filter(|(_, supported)| *supported) {
+        for rotate in [false, true] {
+            let case = format!("rotateSecret {rotate} on {source_type}");
+            let engine = Arc::new(engine::InMemoryEngine::new());
+            let router = emulator_on(Arc::clone(&engine));
+            let project = format!("uw-rot-{}-{rotate}", source_type.to_ascii_lowercase());
+            let created =
+                create_project_with_webhook(&router, &project, source_type, json!({})).await;
+
+            // AWS documents on `Webhook$secret` that "a Bitbucket webhook does not
+            // support secret", and on `rotateSecret` that it "is ignored" there.
+            let carries_secret = *source_type != "BITBUCKET";
+            let rotated = rotate && carries_secret;
+
+            let (before_secret, _) = stored_secret(&engine, &project);
+            let before_stamp = rewind_secret_stamp(&engine, &project);
+            assert_eq!(
+                before_secret.is_some(),
+                carries_secret,
+                "{case}: expected the created webhook's stored secret present={carries_secret}, \
+                 got {before_secret:?}"
+            );
+
+            let (status, body) =
+                update_webhook(&router, &project, json!({"rotateSecret": rotate})).await;
+            assert_eq!(
+                status, 200,
+                "{case}: expected 200, got {status} with {body}"
+            );
+            let updated = body["webhook"].clone();
+            let (after_secret, after_stamp) = stored_secret(&engine, &project);
+
+            assert_eq!(
+                updated["secret"].is_string(),
+                rotated,
+                "{case}: the secret is reported by the call that minted it and by no \
+                 other, so expected present={rotated}, got {:?}",
+                updated["secret"]
+            );
+            if rotated {
+                assert_eq!(
+                    after_secret.as_deref(),
+                    updated["secret"].as_str(),
+                    "{case}: the stored secret must be the one the caller was handed, got \
+                     {after_secret:?}"
+                );
+                assert_ne!(
+                    after_secret, before_secret,
+                    "{case}: a rotation must replace the stored secret, got \
+                     {after_secret:?}"
+                );
+                assert!(
+                    after_stamp.unwrap_or_default() > before_stamp.unwrap_or_default(),
+                    "{case}: expected lastModifiedSecret to move past {before_stamp:?}, got \
+                     {after_stamp:?}"
+                );
+            } else {
+                assert_eq!(
+                    after_secret, before_secret,
+                    "{case}: nothing asked for a new secret, so the stored one must stand, \
+                     got {after_secret:?}"
+                );
+                assert_eq!(
+                    after_stamp, before_stamp,
+                    "{case}: lastModifiedSecret reports when the secret last changed, so it \
+                     must not move here, got {after_stamp:?}"
+                );
+            }
+            assert_eq!(
+                updated["lastModifiedSecret"].is_null(),
+                after_stamp.is_none(),
+                "{case}: the reported lastModifiedSecret must be the one the store holds, \
+                 got {:?} against {after_stamp:?}",
+                updated["lastModifiedSecret"]
+            );
+            // Whatever the secret did, the webhook that was created is still this
+            // project's webhook.
+            for member in IDENTITY_MEMBERS {
+                assert_eq!(
+                    updated[*member], created[*member],
+                    "{case}: {member} must be left as created, got {}",
+                    updated[*member]
+                );
+            }
+        }
+    }
+}
+
+/// What an update cannot apply is refused, and a refused update changes nothing: the
+/// project or the webhook is missing, a filter group can never be satisfied, or the
+/// build type does not go with the project's source.
+#[tokio::test]
+async fn an_update_refuses_what_it_cannot_apply() {
+    // No project, no webhook to update.
+    let router = emulator();
+    let (status, body) = update_webhook(&router, "no-such-project", json!({})).await;
+    assert_eq!(
+        status, 400,
+        "UpdateWebhook on an unknown project: expected 400, got {status} with {body}"
+    );
+    assert!(
+        error_type(&body).contains("ResourceNotFoundException"),
+        "UpdateWebhook on an unknown project: expected ResourceNotFoundException, got {body}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no-such-project"),
+        "the refusal must name the project that was not found, got {body}"
+    );
+
+    // A project that has no webhook has no configuration to rewrite.
+    create_project(&router, "uw-no-webhook", "GITHUB").await;
+    let (status, body) = update_webhook(
+        &router,
+        "uw-no-webhook",
+        json!({"branchFilter": "^refs/heads/main$"}),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "UpdateWebhook on a project with no webhook: expected 400, got {status} with {body}"
+    );
+    assert!(
+        error_type(&body).contains("ResourceNotFoundException"),
+        "UpdateWebhook on a project with no webhook: expected ResourceNotFoundException, \
+         got {body}"
+    );
+    assert!(
+        read_project(&router, "uw-no-webhook").await["webhook"].is_null(),
+        "a refused UpdateWebhook must persist nothing"
+    );
+
+    // A configuration no webhook event can ever satisfy, and a build type the project's
+    // source does not take. Each row names the input member its refusal is about.
+    let refused: &[(&str, Value, &str)] = &[
+        (
+            "a lone HEAD_REF group",
+            json!({"filterGroups": [[{"type": "HEAD_REF", "pattern": "^refs/heads/main$"}]]}),
+            "filterGroups",
+        ),
+        ("an empty group", json!({"filterGroups": [[]]}), "filterGroups"),
+        (
+            "a second group without EVENT",
+            json!({"filterGroups": [
+                [{"type": "EVENT", "pattern": "PUSH"}],
+                [{"type": "FILE_PATH", "pattern": "^src/"}],
+            ]}),
+            "filterGroups",
+        ),
+        (
+            "a runner build type on a repository source",
+            json!({"buildType": "RUNNER_BUILDKITE_BUILD"}),
+            "buildType",
+        ),
+    ];
+    for (index, (case, request, member)) in refused.iter().enumerate() {
+        let router = emulator();
+        let project = format!("uw-bad-{index}");
+        let created =
+            create_project_with_webhook(&router, &project, "GITHUB", full_configuration()).await;
+        let (status, body) = update_webhook(&router, &project, request.clone()).await;
+        assert_eq!(
+            status, 400,
+            "{case}: expected 400, got {status} with {body}"
+        );
+        assert!(
+            error_type(&body).contains("InvalidInputException"),
+            "{case}: expected InvalidInputException, got {body}"
+        );
+        assert!(
+            body["message"].as_str().unwrap_or_default().contains(member),
+            "{case}: the refusal must name the member it is about, got {body}"
+        );
+        assert_same_configuration(
+            &format!("{case}: after the refusal"),
+            &read_project(&router, &project).await["webhook"],
+            &created,
+        );
+    }
+
+    // The converse of the runner rule: a `NO_SOURCE` project takes a runner webhook and
+    // nothing else, so moving it to a repository-event build type is refused too.
+    let router = emulator();
+    create_project_with_webhook(
+        &router,
+        "uw-runner",
+        "NO_SOURCE",
+        json!({"buildType": "RUNNER_BUILDKITE_BUILD"}),
+    )
+    .await;
+    for build_type in ["BUILD", "BUILD_BATCH"] {
+        let case = format!("buildType {build_type} on a NO_SOURCE project");
+        let (status, body) =
+            update_webhook(&router, "uw-runner", json!({"buildType": build_type})).await;
+        assert_eq!(
+            status, 400,
+            "{case}: expected 400, got {status} with {body}"
+        );
+        assert!(
+            error_type(&body).contains("InvalidInputException"),
+            "{case}: expected InvalidInputException, got {body}"
+        );
+        assert_eq!(
+            read_project(&router, "uw-runner").await["webhook"]["buildType"].as_str(),
+            Some("RUNNER_BUILDKITE_BUILD"),
+            "{case}: a refused update must leave the stored build type alone"
+        );
+    }
+}
+
+/// Rewriting the webhook changes the project's settings, which is what
+/// `Project$lastModified` reports — and two updates never report the same instant.
+#[tokio::test]
+async fn an_update_touches_the_projects_last_modified() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(Arc::clone(&engine));
+    create_project_with_webhook(&router, "uw-stamped", "GITHUB", full_configuration()).await;
+
+    // Rewind the stored instants, so the assertion below is about the write and not
+    // about how fast the test runs.
+    {
+        let state = engine.state::<CodeBuildState>();
+        let mut guard = state.lock();
+        let stored = guard
+            .projects
+            .get_mut("uw-stamped")
+            .expect("the project is persisted");
+        stored.created_millis -= 60_000;
+        stored.last_modified_millis -= 60_000;
+        stored.project.created = Some(state::datetime(stored.created_millis));
+        stored.project.last_modified = Some(state::datetime(stored.last_modified_millis));
+    }
+
+    let mut stamps = Vec::new();
+    for branch_filter in ["^refs/heads/main$", "^refs/heads/release$"] {
+        let (status, body) =
+            update_webhook(&router, "uw-stamped", json!({"branchFilter": branch_filter})).await;
+        assert_eq!(
+            status, 200,
+            "UpdateWebhook {branch_filter}: expected 200, got {status} with {body}"
+        );
+        let state = engine.state::<CodeBuildState>();
+        let guard = state.lock();
+        let stored = guard
+            .projects
+            .get("uw-stamped")
+            .expect("the project is persisted");
+        assert!(
+            stored.last_modified_millis > stored.created_millis,
+            "UpdateWebhook {branch_filter}: expected lastModified to move past created, \
+             got {} vs {}",
+            stored.last_modified_millis,
+            stored.created_millis
+        );
+        assert_eq!(
+            stored
+                .project
+                .last_modified
+                .map(|at| at.to_millis().unwrap_or_default()),
+            Some(stored.last_modified_millis),
+            "UpdateWebhook {branch_filter}: the reported lastModified must be the instant \
+             the store holds"
+        );
+        stamps.push(stored.last_modified_millis);
+    }
+    assert!(
+        stamps[1] > stamps[0],
+        "two updates must not report the same lastModified, got {stamps:?}"
     );
 }

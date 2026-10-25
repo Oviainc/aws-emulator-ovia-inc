@@ -55,7 +55,7 @@ const LATEST: &str = "$LATEST";
 
 /// The message Lambda's function-URL operations refuse with when the function URL asked
 /// about does not exist
-/// (`state::FUNCTION_URL_NOT_FOUND_MESSAGE`): `ResourceNotFoundException`'s own wording,
+/// (`state::RESOURCE_NOT_FOUND_MESSAGE`): `ResourceNotFoundException`'s own wording,
 /// naming no resource.
 const NOT_FOUND_MESSAGE: &str = "The resource you requested does not exist.";
 

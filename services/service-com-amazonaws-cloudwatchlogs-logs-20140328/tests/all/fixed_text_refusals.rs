@@ -9,10 +9,12 @@
 //!   group, nor a policy name, nor a word for the kind of resource (`DeleteIndexPolicy`,
 //!   `GetDataProtectionPolicy` / `DeleteDataProtectionPolicy`, `GetTransformer` /
 //!   `DeleteTransformer`);
-//! * an `expectedRevisionId` that is not the resource policy's current revision is refused
-//!   as a conflict against the resource the caller is to re-read and retry, naming neither
-//!   the revision presented, nor the stored one, nor the policy's name or ARN
-//!   (`PutResourcePolicy`, `DeleteResourcePolicy`).
+//! * an `expectedRevisionId` that IS a revision the service issued and a later write
+//!   superseded is refused as a conflict against the resource the caller is to re-read and
+//!   retry, naming neither the revision presented, nor the stored one, nor the policy's name
+//!   or ARN (`PutResourcePolicy`, `DeleteResourcePolicy`); a value the service never issued
+//!   as a revision is a bad parameter instead, refused with that class's own fixed text,
+//!   because no retry of it can ever succeed.
 //!
 //! Where a request DOES identify the missing resource the refusal still names it — a log
 //! group the account does not hold is refused by naming the log group — so the boundary of
@@ -26,9 +28,10 @@
 //! missing, which operation refuses it (reader and delete), which identifier form names its
 //! group, and how it came to be missing (never held, deleted, deleted twice); and for the
 //! revision guard, which operation presents the revision, whether the request also names
-//! the policy, and which form the stale revision takes (one the policy really held and a
-//! later write superseded, one no write ever minted, and a value that is no revision at
-//! all). Any single resource or revision an issue happens to mention is one row.
+//! the policy, and which form the presented revision takes (one the policy really held and a
+//! later write superseded, one in the form of a revision that no write ever minted, and a
+//! value that is no revision at all). Any single resource or revision an issue happens to
+//! mention is one row.
 
 use serde_json::{json, Value};
 
@@ -46,6 +49,14 @@ const UNIDENTIFIED_NOT_FOUND: &str = "Specified resource does not exist!";
 /// The whole message a write or delete presenting a superseded revision is refused with.
 const REVISION_CONFLICT: &str =
     "A conflicting operation is currently in progress against this resource. Please try again.";
+
+/// The code CloudWatch Logs answers when a parameter is specified incorrectly, which is what
+/// a value the service never issued as a revision id is.
+const INVALID_PARAMETER: &str = "InvalidParameterException";
+
+/// The whole message a write or delete presenting a value that is no revision this service
+/// ever issued is refused with.
+const INVALID_REVISION: &str = "Invalid ExpectedRevisionId";
 
 /// The whole message a request naming a log group the account does not hold is refused
 /// with: the resource it names IS in the message, which is what the fixed text above is
@@ -349,17 +360,33 @@ async fn a_superseded_revision_is_refused_as_a_conflict_against_the_resource() {
         "case the update: an accepted write moves the policy to a new revision, got {current:?}"
     );
 
-    // The forms a stale revision takes: one the policy really held until a later write
-    // superseded it, one of the same form that no write ever minted, and a value that is no
-    // revision at all.
+    // The forms a revision the policy does not hold takes, each with the class it belongs to:
+    // one the policy really held until a later write superseded it is the optimistic-lock
+    // CONFLICT, while a value this service never issued — one of the same form that no write
+    // ever minted, and a value that is no revision at all — is a bad PARAMETER.
     let stale_revisions = [
-        ("superseded", superseded.clone()),
-        ("never minted", "ffffffffffffffffffffffffffffffff".to_string()),
-        ("not a revision", "not-a-revision".to_string()),
+        (
+            "superseded",
+            superseded.clone(),
+            CONFLICT,
+            REVISION_CONFLICT,
+        ),
+        (
+            "never minted",
+            "ffffffffffffffffffffffffffffffff".to_string(),
+            INVALID_PARAMETER,
+            INVALID_REVISION,
+        ),
+        (
+            "not a revision",
+            "not-a-revision".to_string(),
+            INVALID_PARAMETER,
+            INVALID_REVISION,
+        ),
     ];
     // The requests that present a revision: the write, the delete naming the policy, and
     // the delete addressing the resource alone.
-    for (stale_case, stale) in &stale_revisions {
+    for (stale_case, stale, expected_code, expected_message) in &stale_revisions {
         assert_ne!(
             stale, &current,
             "case {stale_case:?}: a stale row must not be the live revision"
@@ -390,12 +417,12 @@ async fn a_superseded_revision_is_refused_as_a_conflict_against_the_resource() {
             let case = format!("{request_case} at a {stale_case} revision");
             let (code, message) = logs.refusal(operation, &body).await;
             assert_eq!(
-                code, CONFLICT,
-                "case {case:?} ({operation}): a lost revision race is a conflict, got {code} {message:?}"
+                code, *expected_code,
+                "case {case:?} ({operation}): expected {expected_code}, got {code} {message:?}"
             );
             assert_eq!(
-                message, REVISION_CONFLICT,
-                "case {case:?} ({operation}): expected {REVISION_CONFLICT:?}, got {message:?}"
+                message, *expected_message,
+                "case {case:?} ({operation}): expected {expected_message:?}, got {message:?}"
             );
             for carried in [stale.as_str(), current.as_str(), POLICY, arn.as_str()] {
                 assert!(

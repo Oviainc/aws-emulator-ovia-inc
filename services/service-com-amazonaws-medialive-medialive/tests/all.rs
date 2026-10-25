@@ -125,6 +125,9 @@ mod input_device_thumbnail;
 #[path = "all/input_device_transfer_accept.rs"]
 mod input_device_transfer_accept;
 
+#[path = "all/input_device_transfer_cancel.rs"]
+mod input_device_transfer_cancel;
+
 #[path = "all/input_device_transfers.rs"]
 mod input_device_transfers;
 

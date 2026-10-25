@@ -2,10 +2,13 @@
 
 //! @op ListSpeechSynthesisTasks
 //! Reports this service's speech synthesis tasks, ordered by creation date and
-//! optionally filtered by status. A REPORT, not a mutation: the only state it writes
-//! is [`crate::state::settle_task_status`], which materialises a status transition the
-//! clock had ALREADY made due — the same thing `GetSpeechSynthesisTask` does, and
-//! nothing a caller could not have observed by waiting instead of calling.
+//! optionally filtered by status. A REPORT, not a mutation: the only state it writes is
+//! what the clock had ALREADY made due on the task store
+//! ([`crate::state::ComAmazonawsPollyParrotV1State::retained_synthesis_tasks`]) — a
+//! status transition that fell due, and the dropping of a task past its documented
+//! retention window — the same thing `GetSpeechSynthesisTask` does, and nothing a
+//! caller could not have observed by waiting instead of calling. A task the service no
+//! longer holds is not reported and takes up no page slot.
 //!
 //! `MaxResults` (range 1..100) is the only page bound this operation has: a request
 //! that names it gets at most that many tasks and a `NextToken` while a further one
@@ -258,24 +261,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // ONE clock reading for the whole call, so the status this call settles, the
+        // ONE clock reading for the whole call, so the task store this call reads, the
         // status it filters on and the status it reports are the same one.
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
-        // Each task's status as of NOW, exactly as `GetSpeechSynthesisTask` reads it: a
-        // transition the clock ALREADY owed the task is materialised, and one not yet
-        // due is left alone. That is the only write a report makes, and it changes
-        // nothing a caller could not have seen by waiting instead of calling.
-        for task in guard.synthesis_tasks.values_mut() {
-            crate::state::settle_task_status(task, now);
-        }
+        // The task store as of NOW, exactly as `GetSpeechSynthesisTask` reads it: a task
+        // whose retention window has run out is no longer held, and a transition the
+        // clock ALREADY owed a task it still holds is materialised while one not yet due
+        // is left alone. That is the only write a report makes, and it changes nothing a
+        // caller could not have seen by waiting instead of calling.
+        let tasks = guard.retained_synthesis_tasks(now);
 
         // Ordering has to see every matching task before the window can be taken from
         // it, so this pass collects POINTERS into the store — one machine word per
         // matching task, nothing copied — and the window below is what decides how much
         // is actually materialised.
-        let mut matching: Vec<&crate::state::StoredSynthesisTask> = guard
-            .synthesis_tasks
+        let mut matching: Vec<&crate::state::StoredSynthesisTask> = tasks
             .values()
             // "Status of the speech synthesis tasks returned in a List operation".
             .filter(|task| {
