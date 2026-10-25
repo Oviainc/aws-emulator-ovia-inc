@@ -16,6 +16,11 @@
 //!    members over different element shapes, one and several offending elements, an
 //!    element that breaks two of its shape's constraints at once, and — as the contrast —
 //!    a violation on the collection's OWN `@length`, which is not nested.
+//! 3. **A clause whose requirement is an enum's admitted value set states the POSITION
+//!    alone**: `Value at '<path>' failed to satisfy constraint: Member must satisfy enum
+//!    value set: [ … ]`, with the value the member held NOT echoed, unlike every other
+//!    constraint class. The rows span enum-constrained members of three operations, in the
+//!    body and in the query string, over enums of two and five values.
 //!
 //! Every expectation is derived from the model, cited per row
 //! (`smithy_query(query="operation")` / `query="shape"`), never from a recorded response
@@ -276,6 +281,128 @@ async fn a_reported_pattern_is_the_expression_without_the_models_anchors() {
         assert_eq!(
             reply.message, expected,
             "case {case}: expected {expected:?}, got {:?}",
+            reply.message
+        );
+    }
+}
+
+/// Rule 3: an enum clause names the position and the admitted set, and does NOT echo the
+/// value the member held.
+///
+/// The rows differ along what the rule generalises over: which operation and member carry
+/// the enum, whether the value travels in the BODY or in the QUERY string, and how many
+/// values the enum publishes (two, three and five). Each row's admitted set is the model's
+/// (`smithy_query(query="shape",shape=...)`), asserted member by member rather than as one
+/// ordered list, because the ORDER a Bedrock enum clause lists its set in is an open
+/// question recorded in
+/// `issues/things-that-do-not-work/20261024T033000Z-bedrock-enum-validation-message-wording.md`.
+#[tokio::test]
+async fn an_enum_clause_states_the_admitted_set_and_not_the_value() {
+    /// One enum-constrained member driven outside its set.
+    ///
+    /// A named struct rather than a tuple, for the reason [`Row`] is one: the row carries a
+    /// request, the member it offends at, the value it offends with and the set the clause
+    /// must state.
+    struct EnumRow {
+        case: &'static str,
+        method: &'static str,
+        path: &'static str,
+        body: Option<Value>,
+        member: &'static str,
+        /// The value the request carries, which the clause must NOT echo.
+        value: &'static str,
+        /// The values the model admits for that member.
+        admitted: &'static [&'static str],
+    }
+
+    let emulator = emulator();
+    let rows = vec![
+        EnumRow {
+            // `DataRetentionMode`, five values.
+            case: "PutAccountDataRetention mode outside DataRetentionMode",
+            method: "PUT",
+            path: "/data-retention",
+            body: Some(json!({ "mode": "retain-everything" })),
+            member: "mode",
+            value: "retain-everything",
+            admitted: &[
+                "aws_review",
+                "default",
+                "inherit",
+                "none",
+                "provider_data_share",
+            ],
+        },
+        EnumRow {
+            // `ModelModality`, three values, carried in the query string.
+            case: "ListFoundationModels byOutputModality outside ModelModality",
+            method: "GET",
+            path: "/foundation-models?byOutputModality=AUDIO",
+            body: None,
+            member: "byOutputModality",
+            value: "AUDIO",
+            admitted: &["EMBEDDING", "IMAGE", "TEXT"],
+        },
+        EnumRow {
+            // `InferenceType`, two values.
+            case: "ListFoundationModels byInferenceType outside InferenceType",
+            method: "GET",
+            path: "/foundation-models?byInferenceType=ONDEMAND",
+            body: None,
+            member: "byInferenceType",
+            value: "ONDEMAND",
+            admitted: &["ON_DEMAND", "PROVISIONED"],
+        },
+        EnumRow {
+            // `SortOrder`, two values, on another operation.
+            case: "ListProvisionedModelThroughputs sortOrder outside SortOrder",
+            method: "GET",
+            path: "/provisioned-model-throughputs?sortOrder=sideways",
+            body: None,
+            member: "sortOrder",
+            value: "sideways",
+            admitted: &["Ascending", "Descending"],
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let reply = refuse(&emulator, row.method, row.path, row.body).await;
+        assert_eq!(
+            (reply.status, reply.error.as_deref()),
+            (400, Some("ValidationException")),
+            "case {case}: expected 400 ValidationException, got {} {:?}",
+            reply.status,
+            reply.message
+        );
+        let expected_open = format!(
+            "1 validation error detected: Value at '{}' failed to satisfy constraint: \
+             Member must satisfy enum value set: [",
+            row.member
+        );
+        assert!(
+            reply.message.starts_with(&expected_open),
+            "case {case}: expected the clause to open {expected_open:?}, got {:?}",
+            reply.message
+        );
+        assert!(
+            reply.message.ends_with(']'),
+            "case {case}: the clause closes the value set, got {:?}",
+            reply.message
+        );
+        for admitted_value in row.admitted {
+            assert!(
+                reply.message.contains(admitted_value),
+                "case {case}: the set must state the modelled value {admitted_value:?}, \
+                 got {:?}",
+                reply.message
+            );
+        }
+        assert!(
+            !reply.message.contains(row.value),
+            "case {case}: an enum clause states the admitted set, never the value the \
+             member held ({:?}), got {:?}",
+            row.value,
             reply.message
         );
     }
