@@ -69,8 +69,9 @@ fn attachment_uri(attachment_id: &str) -> String {
 }
 
 /// The widest `ExternalRegionCode` the model admits: `length 1..63` on the member of
-/// `ExternalRegionCodeList` (`smithy_query shape=ExternalRegionCodeList`).
-fn widest_region_code() -> String {
+/// `ExternalRegionCodeList` (`smithy_query shape=ExternalRegionCodeList`). Shared with the
+/// suites that drive a resource at that bound.
+pub(crate) fn widest_region_code() -> String {
     "r".repeat(63)
 }
 
