@@ -158,7 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region =
             crate::state::request_region(ctx).map_err(DescribeDBClusterParametersError::validation)?;
         let page_size = crate::state::check_max_records(input.max_records)
-            .map_err(DescribeDBClusterParametersError::validation)?;
+            .map_err(DescribeDBClusterParametersError::invalid_parameter_value)?;
         // `Filters`: "This parameter is not currently supported", so a request that carries
         // one is refused rather than served as though the filter had been applied.
         if input.filters.iter().flatten().next().is_some() {

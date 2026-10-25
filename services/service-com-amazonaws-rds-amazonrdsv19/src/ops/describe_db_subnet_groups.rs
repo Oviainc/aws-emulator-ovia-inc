@@ -147,7 +147,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region =
             crate::state::request_region(ctx).map_err(DescribeDBSubnetGroupsError::validation)?;
         let page_size = crate::state::check_max_records(input.max_records)
-            .map_err(DescribeDBSubnetGroupsError::validation)?;
+            .map_err(DescribeDBSubnetGroupsError::invalid_parameter_value)?;
         // `Filters`: "This parameter isn't currently supported." — refused rather than
         // ignored: silently dropping a filter would report groups the caller excluded.
         if input
