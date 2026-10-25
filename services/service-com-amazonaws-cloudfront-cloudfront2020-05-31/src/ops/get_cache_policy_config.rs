@@ -150,7 +150,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let store = state.lock();
 
-        let Some(stored) = store.cache_policy(&input.id) else {
+        // A cache policy id names ONE policy whoever created it, so the read resolves a
+        // policy AWS published as readily as one this account created.
+        let Some(stored) = store.readable_cache_policy(&input.id) else {
             return Err(GetCachePolicyConfigErrorModeled::NoSuchCachePolicy(
                 crate::state::no_such_cache_policy(),
             )

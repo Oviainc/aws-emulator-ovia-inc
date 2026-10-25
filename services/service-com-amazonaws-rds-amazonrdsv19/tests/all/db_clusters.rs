@@ -915,12 +915,14 @@ async fn the_report_filters_and_pages_the_clusters_it_holds() {
         None,
         "expected no marker where no record remains, got {first}"
     );
-    // Each published bound of `MaxRecords`, and one value past each.
+    // Each published bound of `MaxRecords`, and one value past each. A value outside the
+    // documented window is one the parameter does not accept, so it is refused with
+    // `InvalidParameterValue`.
     for (case, value, status, code) in [
         ("the lowest MaxRecords", "20", 200, ""),
         ("the highest MaxRecords", "100", 200, ""),
-        ("one below the lowest", "19", 400, "ValidationException"),
-        ("one above the highest", "101", 400, "ValidationException"),
+        ("one below the lowest", "19", 400, "InvalidParameterValue"),
+        ("one above the highest", "101", 400, "InvalidParameterValue"),
     ] {
         let response = call(&router, "DescribeDBClusters", &[("MaxRecords", value)]).await;
         if status == 200 {

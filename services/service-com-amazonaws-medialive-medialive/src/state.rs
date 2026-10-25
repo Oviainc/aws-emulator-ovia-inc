@@ -425,9 +425,14 @@ pub mod sdi_source_state {
 /// the clock owes it `ACTIVE`, the one state the enum names for a network that
 /// exists, has not failed and nothing has deleted. The rest belong to operations
 /// no handler implements yet: `UPDATING` to `UpdateNetwork`, `DELETING` and
-/// `DELETED` to `DeleteNetwork`, `IDLE` and `IN_USE` to the cluster attachments
-/// this store has none of (`CreateCluster` is still a scaffold), and the two
-/// `*_FAILED` states to failures this emulator does not inject.
+/// `DELETED` to `DeleteNetwork`, and the two `*_FAILED` states to failures this
+/// emulator does not inject. `IDLE` and `IN_USE` are the two the model documents
+/// nothing about for a network (`State` carries the one sentence above and no
+/// member says what puts a network in either), so this emulator never claims
+/// one: a network's attachments are reported through its
+/// `AssociatedClusterIds`
+/// ([`ComAmazonawsMedialiveMedialiveState::clusters_using_network`]) rather than
+/// guessed at through its state.
 pub mod network_state {
     pub const CREATING: &str = "CREATING";
     pub const ACTIVE: &str = "ACTIVE";

@@ -1227,10 +1227,6 @@ async fn delete_collection(
 // Amazon S3: AWS::S3::Bucket
 // ---------------------------------------------------------------------------
 
-/// The error codes Amazon S3 answers when the bucket a `CreateBucket` names is one the
-/// account already owns, which is the bucket this deployment wanted.
-const BUCKET_ALREADY_THERE: [&str; 2] = ["BucketAlreadyOwnedByYou", "BucketAlreadyExists"];
-
 /// The error code Amazon S3 answers for a bucket it does not hold.
 const NO_SUCH_BUCKET: &str = "NoSuchBucket";
 
@@ -1273,13 +1269,13 @@ async fn create_bucket(
         .send()
         .await
     {
-        let refusal = refusal_of(&error);
-        // "For legacy compatibility, if you re-create an existing bucket that you already
-        // own … Amazon S3 returns 200 OK": the bucket this deployment wanted is already
-        // there. Judged on the error CODE, never on the message.
-        if !BUCKET_ALREADY_THERE.contains(&refusal.code.as_str()) {
-            return Err(refusal);
-        }
+        // Whatever Amazon S3 answers short of success is a bucket this deployment did not
+        // create, including a name that is already in use: "for legacy compatibility, if
+        // you re-create an existing bucket that you already own in the North Virginia
+        // Region, Amazon S3 returns 200 OK" is a SUCCESS S3 itself answers where it holds
+        // — nothing here has to stand in for it — and everywhere else a name in use is a
+        // refusal, which fails the resource like any other.
+        return Err(refusal_of(&error));
     }
     // "VersioningConfiguration — enables multiple versions of all objects in this bucket",
     // whose one member is `Status`. The value is the template's: S3's own deserializer is
@@ -1730,10 +1726,6 @@ fn malformed_property(property: &str) -> Refusal {
 // IAM: AWS::IAM::Role
 // ---------------------------------------------------------------------------
 
-/// The error code IAM answers when the entity a create names already exists, which is the
-/// resource this deployment wanted.
-const ENTITY_ALREADY_EXISTS: &str = "EntityAlreadyExists";
-
 /// The error code IAM answers for an entity it does not hold.
 const NO_SUCH_ENTITY: &str = "NoSuchEntity";
 
@@ -1745,6 +1737,11 @@ const NO_SUCH_ENTITY: &str = "NoSuchEntity";
 /// the resource is refused here, naming the property, rather than a role being created
 /// with a trust policy this module invented or a stack completing over a role nothing
 /// created.
+///
+/// A name IAM will not create a role under — `EntityAlreadyExists`, which is what an IAM
+/// name the ACCOUNT already holds answers, since role names are account-global — fails the
+/// resource like any other refusal: the role that is there is not this stack's, and a
+/// stack never reports a resource it did not create.
 ///
 /// `ManagedPolicyArns` is applied too, with `AttachRolePolicy` per entry: IAM is what
 /// judges whether a policy ARN is attachable, so a policy it refuses fails the resource
@@ -1816,12 +1813,13 @@ async fn create_role(
             }
         }
         Err(error) => {
-            let refusal = refusal_of(&error);
-            // The role is already there under this name: the resource this deployment
-            // wanted.
-            if refusal.code != ENTITY_ALREADY_EXISTS {
-                return Err(refusal);
-            }
+            // What IAM answered is what the resource is: a name it will not create a role
+            // under is a role this deployment did not create, and CloudFormation reports
+            // no resource it did not create. IAM role names are unique across the whole
+            // ACCOUNT, so this is also what a template whose role name is not
+            // Region-qualified gets when it is deployed a second time — the refusal
+            // belongs to the stack, not to this module.
+            return Err(refusal_of(&error));
         }
     }
     // "Policies — adds or updates an inline policy document that is embedded in the

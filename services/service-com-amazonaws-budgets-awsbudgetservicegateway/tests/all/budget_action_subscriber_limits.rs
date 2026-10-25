@@ -160,7 +160,10 @@ fn subscriber_rows() -> Vec<Row> {
 /// How many actions the STORE holds for a budget — read from the state struct directly,
 /// so what a refused write did to the store is asserted independently of any read
 /// operation's own projection.
-fn stored_action_count(
+///
+/// `pub(crate)` so the sibling suites in this test target observe a refused write the
+/// same way rather than copying the state access.
+pub(crate) fn stored_action_count(
     engine: &Arc<engine::InMemoryEngine>,
     account_id: &str,
     budget_name: &str,

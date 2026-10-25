@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCapacityProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCapacityProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCapacityProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates ONE capacity provider — the single record in [`crate::state`] the request's
+//! `CapacityProviderName` addresses, in either of its documented forms. Every
+//! configuration member the request STATES replaces the stored one; every member it
+//! OMITS leaves the stored value alone, so a partial update is a partial update. The
+//! provider's identity and lifecycle are untouched: the ARN stays the one minted at
+//! creation, and the `State` stays whatever the clock owes it. A provider whose deletion
+//! is already in progress is refused `ResourceConflictException` instead — "another
+//! operation is in progress" — and the answer is read back out of the record this call
+//! wrote, so `GetCapacityProvider` reports exactly the same thing.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +156,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCapacityProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCapacityProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCapacityProvider"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateCapacityProviderErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // The provider is addressed the way every capacity-provider operation addresses
+        // it: by its name, or by the ARN that names the same record.
+        let record = crate::state::resolve_capacity_provider(
+            &mut store,
+            &input.capacity_provider_name,
+            &region,
+            now,
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => invalid_parameter(message),
+            crate::state::ResolveFailure::NotFound(message) => {
+                UpdateCapacityProviderErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+                .into()
+            }
+        })?;
+
+        // A provider the clock still owes a removal for is on its way out, and there is
+        // nothing left to reconfigure: "another operation is in progress" is what
+        // `ResourceConflictException` covers beside an already existing resource.
+        if record.is_deleting() {
+            return Err(
+                UpdateCapacityProviderErrorModeled::ResourceConflictException(
+                    ResourceConflictException {
+                        r#type: None,
+                        message: Some(format!(
+                            "The operation cannot be performed at this time. The capacity \
+                             provider is currently in the following state: {}",
+                            record.state
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every member the request carries replaces the stored value, and every member
+        // it omits leaves the stored value alone — the same rule every other update in
+        // this service follows. The members this operation models are the three it can
+        // change; the VPC configuration, the operator role, the instance requirements
+        // and the encryption key are not among them, so they stay as created.
+        let mut changed = false;
+        if let Some(scaling_config) = input.capacity_provider_scaling_config {
+            record.scaling_config = Some(scaling_config);
+            changed = true;
+        }
+        if let Some(propagate_tags) = input.propagate_tags {
+            record.propagate_tags = Some(propagate_tags);
+            changed = true;
+        }
+        if let Some(telemetry_config) = input.telemetry_config {
+            record.telemetry_config = Some(telemetry_config);
+            changed = true;
+        }
+        // "The date and time when the capacity provider was last modified": a call that
+        // changed nothing modified nothing, so it leaves the stamp where it was.
+        if changed {
+            record.last_modified = crate::state::iso8601(now);
+        }
+
+        // Answered by reading the record back out of the store, so
+        // `GetCapacityProvider` reports exactly what this call persisted.
+        Ok(UpdateCapacityProviderOutput {
+            capacity_provider: record.reported(),
+        })
     }
+}
+
+/// The modelled 400 this operation refuses a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> UpdateCapacityProviderError {
+    UpdateCapacityProviderErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
 }

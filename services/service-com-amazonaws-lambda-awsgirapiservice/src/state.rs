@@ -94,7 +94,11 @@
 //! freshly created provider is `Pending` and the move to `Active` is owed by the CLOCK
 //! rather than by anybody calling — the record stores the instant that move becomes due
 //! and [`CapacityProviderRecord::materialize`] brings it up to whatever the clock has
-//! already made due.
+//! already made due. `UpdateCapacityProvider` rewrites the configuration members its
+//! request states on that same record and leaves the ones it omits alone, and
+//! `DeleteCapacityProvider` moves it into the enum's `Deleting` value with the instant
+//! its removal becomes due ([`CapacityProviderRecord::begin_delete`]), which the clock
+//! then owes exactly as it owes the activation.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime};
@@ -2015,6 +2019,11 @@ impl LayerRecord {
 pub const CAPACITY_PROVIDER_STATE_PENDING: &str = "Pending";
 /// See [`CAPACITY_PROVIDER_STATE_PENDING`].
 pub const CAPACITY_PROVIDER_STATE_ACTIVE: &str = "Active";
+/// See [`CAPACITY_PROVIDER_STATE_PENDING`]. `DeleteCapacityProvider` is the one call that
+/// moves a provider into it: tearing the compute resources it manages down is owed by the
+/// clock, so the record stays visible in this state until the removal is due (see
+/// [`CapacityProviderRecord::begin_delete`]).
+pub const CAPACITY_PROVIDER_STATE_DELETING: &str = "Deleting";
 
 /// How long after `CreateCapacityProvider` the move from `Pending` to `Active` becomes
 /// due.
@@ -2025,6 +2034,17 @@ pub const CAPACITY_PROVIDER_STATE_ACTIVE: &str = "Active";
 /// sees the `Pending` state the create answered with. The instant it becomes due is
 /// stored on the record and nothing sleeps for it.
 pub const CAPACITY_PROVIDER_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// How long after `DeleteCapacityProvider` a provider's REMOVAL becomes due.
+///
+/// An EMULATOR-CHOSEN span (how long Lambda takes to tear the compute resources down is
+/// not in the model), deliberately non-zero for the same reason as
+/// [`CAPACITY_PROVIDER_ACTIVATION_DELAY`]: a caller that reads the provider straight
+/// after deleting it sees the `Deleting` state the delete answered with, and so does an
+/// update that arrives while that deletion is in progress. The instant the removal
+/// becomes due is stored on the record and nothing sleeps for it (see
+/// [`CapacityProviderRecord::begin_delete`]).
+pub const CAPACITY_PROVIDER_DELETE_DELAY: Duration = Duration::from_millis(500);
 
 /// The most capacity providers this emulator keeps.
 ///
@@ -2073,6 +2093,10 @@ pub struct CapacityProviderRecord {
     /// When the move from `Pending` to `Active` becomes due; see
     /// [`CapacityProviderRecord::materialize`].
     pub active_due: SystemTime,
+    /// When this provider's REMOVAL becomes due, once a `DeleteCapacityProvider` has
+    /// asked for it; `None` for a provider nobody has deleted. See
+    /// [`CapacityProviderRecord::begin_delete`].
+    pub removal_due: Option<SystemTime>,
     /// `LastModified`: "The date and time when the capacity provider was last
     /// modified", in the same ISO-8601 form as every other timestamp this service
     /// reports.
@@ -2090,6 +2114,35 @@ impl CapacityProviderRecord {
         if self.state == CAPACITY_PROVIDER_STATE_PENDING && now >= self.active_due {
             self.state = CAPACITY_PROVIDER_STATE_ACTIVE.to_string();
         }
+    }
+
+    /// Accept a `DeleteCapacityProvider` of this provider.
+    ///
+    /// The model's `CapacityProviderState` enum carries `Deleting`, so a provider whose
+    /// compute resources are still being torn down is reported in that state: what the
+    /// call persists is the state and the instant the removal becomes due
+    /// ([`CAPACITY_PROVIDER_DELETE_DELAY`]). The removal itself is owed by the CLOCK and
+    /// applied by [`ComAmazonawsLambdaAwsgirapiserviceState::materialize_all`] and
+    /// [`resolve_capacity_provider`]; nothing sleeps for it.
+    pub fn begin_delete(&mut self, now: SystemTime) {
+        self.state = CAPACITY_PROVIDER_STATE_DELETING.to_string();
+        self.last_modified = iso8601(now);
+        self.removal_due = Some(now + CAPACITY_PROVIDER_DELETE_DELAY);
+    }
+
+    /// Whether this provider's deletion is in progress, which is what makes a call that
+    /// would change its configuration a conflict with "another operation is in progress"
+    /// rather than an accepted change.
+    #[must_use]
+    pub fn is_deleting(&self) -> bool {
+        self.removal_due.is_some()
+    }
+
+    /// Whether the clock has already made this provider's removal due; see
+    /// [`CapacityProviderRecord::begin_delete`].
+    #[must_use]
+    pub fn is_removed_by(&self, now: SystemTime) -> bool {
+        self.removal_due.is_some_and(|due| now >= due)
     }
 
     /// The `CapacityProvider` the wire reports for this record, built entirely out of
@@ -2717,6 +2770,11 @@ impl ComAmazonawsLambdaAwsgirapiserviceState {
         for function in self.functions.values_mut() {
             function.materialize(now);
         }
+        // A provider whose removal the clock already made due is gone, exactly as a
+        // mapping's is below: it would have been gone at the same instant even if nobody
+        // had called.
+        self.capacity_providers
+            .retain(|_, provider| !provider.is_removed_by(now));
         for provider in self.capacity_providers.values_mut() {
             provider.materialize(now);
         }
@@ -2728,6 +2786,31 @@ impl ComAmazonawsLambdaAwsgirapiserviceState {
         for mapping in self.event_source_mappings.values_mut() {
             mapping.materialize(now);
         }
+    }
+
+    /// The ARNs of every function version configured to run on the capacity provider
+    /// `provider_arn` names, in a stable order.
+    ///
+    /// A function names the provider it runs on through
+    /// `FunctionConfiguration$CapacityProviderConfig`, whose one
+    /// `LambdaManagedInstancesCapacityProviderConfig` carries the provider's ARN, and a
+    /// published version froze the configuration it was published from — so both the
+    /// `$LATEST` configuration and every published version's count as a user of the
+    /// provider.
+    #[must_use]
+    pub fn capacity_provider_users(&self, provider_arn: &str) -> Vec<String> {
+        let mut users = Vec::new();
+        for function in self.functions.values() {
+            if configured_capacity_provider(&function.config) == Some(provider_arn) {
+                users.push(function.versioned_arn(VERSION_LATEST));
+            }
+            for version in function.versions.values() {
+                if configured_capacity_provider(&version.config) == Some(provider_arn) {
+                    users.push(function.versioned_arn(&version.version.to_string()));
+                }
+            }
+        }
+        users
     }
 
     /// Every entry `ListFunctions` can report, in pagination order.
@@ -2963,6 +3046,21 @@ pub fn layer_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("layer:{name}"))
 }
 
+/// The capacity provider a function configuration runs on, when it names one.
+///
+/// `CapacityProviderConfig` carries exactly one
+/// `LambdaManagedInstancesCapacityProviderConfig`, whose required `CapacityProviderArn`
+/// is the reference, so this is the one place that reads it.
+#[must_use]
+pub fn configured_capacity_provider(config: &FunctionConfig) -> Option<&str> {
+    config.capacity_provider_config.as_ref().map(|capacity| {
+        capacity
+            .lambda_managed_instances_capacity_provider_config
+            .capacity_provider_arn
+            .as_str()
+    })
+}
+
 /// Resolve a `CapacityProviderName` (in either of its documented forms) to one stored
 /// capacity provider.
 ///
@@ -2977,6 +3075,11 @@ pub fn resolve_capacity_provider<'a>(
     let name = parse_capacity_provider_name(capacity_provider_name).ok_or_else(|| {
         ResolveFailure::Malformed(capacity_provider_name_message(capacity_provider_name))
     })?;
+    // A provider whose removal the clock already made due is gone before this lookup
+    // sees it, so addressing it is addressing a provider this account no longer holds.
+    store
+        .capacity_providers
+        .retain(|_, provider| !provider.is_removed_by(now));
     let Some(record) = store.capacity_providers.get_mut(&name) else {
         return Err(ResolveFailure::NotFound(format!(
             "Capacity provider not found: {}",

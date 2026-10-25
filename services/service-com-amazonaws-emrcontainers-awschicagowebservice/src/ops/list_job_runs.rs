@@ -204,14 +204,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let mut state = store.lock();
         state.settle();
 
         // This operation models no not-found error, so an unknown virtual cluster is
         // refused as an invalid request. A cluster that exists in any state still lists
-        // its job runs, including a terminated one.
-        if !state.virtual_clusters.contains_key(&input.virtual_cluster_id) {
+        // its job runs, including a terminated one — but only at the endpoint of the
+        // region it was created in.
+        if state
+            .virtual_cluster(&region, &input.virtual_cluster_id)
+            .is_none()
+        {
             return Err(ListJobRunsErrorModeled::ValidationException(ValidationException {
                 message: Some(format!(
                     "Virtual cluster {} was not found",

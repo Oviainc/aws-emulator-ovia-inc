@@ -19,6 +19,10 @@
 // else appends to.
 #[path = "all/kinesisvideo_signing_name_routing.rs"]
 mod kinesisvideo_signing_name_routing;
+// Out of order for the same reason, and placed beside it rather than in the sorted span
+// of its own name or in the appended tail, both of which concurrent suites land into.
+#[path = "all/cognito_vended_session_reads_sse_kms_object.rs"]
+mod cognito_vended_session_reads_sse_kms_object;
 #[path = "all/pi_resource_metadata_reflects_rds_configuration.rs"]
 mod pi_resource_metadata_reflects_rds_configuration;
 #[path = "all/amplifybackend_app_registration.rs"]

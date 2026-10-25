@@ -637,9 +637,9 @@ async fn a_property_the_create_cannot_take_leaves_the_stack_failed() {
         let body = create_and_settle(&router, case, stack_name, template).await;
         assert_eq!(
             opt_element(&body, "StackStatus").as_deref(),
-            Some("CREATE_FAILED"),
-            "case {case:?}: expected the stack to fail rather than create a workspace \
-             configured differently from its declaration, got {body}"
+            Some("ROLLBACK_COMPLETE"),
+            "case {case:?}: expected the failed create to be rolled back rather than \
+             create a workspace configured differently from its declaration, got {body}"
         );
         let reason = opt_element(&body, "StackStatusReason").unwrap_or_default();
         assert!(

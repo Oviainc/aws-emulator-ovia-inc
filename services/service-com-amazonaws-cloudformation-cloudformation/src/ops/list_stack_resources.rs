@@ -178,7 +178,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there is no stack store to read, so this
             // answers 501 rather than an empty, truthful-looking list.
@@ -196,7 +195,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Running stacks: You can specify either the stack's name or its unique stack ID.
         // Deleted stacks: You must specify the unique stack ID." A name that resolves to
         // nothing is a `ValidationError`, as it is on every other read of a stack.
-        let stack = store.resolve(&input.stack_name).ok_or_else(|| {
+        let region = crate::state::request_region(ctx.parts());
+        let stack = store.resolve(&region, &input.stack_name).ok_or_else(|| {
             crate::scaffolded::Scaffolded::validation_error(crate::state::stack_does_not_exist(
                 &input.stack_name,
             ))

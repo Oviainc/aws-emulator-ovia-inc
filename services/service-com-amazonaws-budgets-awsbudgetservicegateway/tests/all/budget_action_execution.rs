@@ -75,8 +75,13 @@ pub(crate) async fn seed_budget(router: &MultiServiceRouter, account_id: &str, n
 
 /// The `ExecutionRoleArn` every row uses: "the role passed for action execution and
 /// reversion", satisfying `RoleArn`'s `@length(32, 618)` and its `arn:aws:iam::<12
-/// digits>:role/<name>` pattern.
-const EXECUTION_ROLE_ARN: &str = "arn:aws:iam::111122223333:role/budget-action-executor";
+/// digits>:role/<name>` pattern — built from the request's own account, since "roles and
+/// actions must be in the same account" (`Action$ExecutionRoleArn`).
+///
+/// `pub(crate)` so the sibling suites in this test target name a role the same way.
+pub(crate) fn execution_role_arn(account_id: &str) -> String {
+    format!("arn:aws:iam::{account_id}:role/budget-action-executor")
+}
 
 /// `Definition.IamActionDefinition` — `PolicyArn` satisfies `PolicyArn`'s
 /// `@length(25, 684)` and pattern; `Roles` is one of the three optional attach lists.
@@ -158,7 +163,7 @@ pub(crate) fn create_body(
         "ActionType": action_type,
         "ActionThreshold": threshold,
         "Definition": definition,
-        "ExecutionRoleArn": EXECUTION_ROLE_ARN,
+        "ExecutionRoleArn": execution_role_arn(account_id),
         "ApprovalModel": approval_model,
         "Subscribers": subscribers
     });

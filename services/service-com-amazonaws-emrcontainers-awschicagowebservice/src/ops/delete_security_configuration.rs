@@ -166,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let mut state = store.lock();
         state.settle();
 
@@ -175,9 +175,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modelled `ResourceNotFoundException` instead of serving a deleted resource.
         //
         // This operation models no not-found error, so an id that names no stored
-        // configuration is refused as an invalid request rather than answered as a no-op:
-        // the output reports the id that WAS deleted, and there was none.
-        let Some(record) = state.remove_security_configuration(&input.id) else {
+        // configuration in this region is refused as an invalid request rather than
+        // answered as a no-op: the output reports the id that WAS deleted, and there was
+        // none.
+        let Some(record) = state.remove_security_configuration(&region, &input.id) else {
             return Err(DeleteSecurityConfigurationErrorModeled::ValidationException(
                 ValidationException {
                     // The not-found message form the recorded refusals of this service

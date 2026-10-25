@@ -720,7 +720,7 @@ async fn a_change_set_cannot_be_executed_before_its_creation_completes() {
         let state = store(&engine);
         let mut held = state.lock();
         let change_set = held
-            .resolve_change_set_mut("pending-exec-set", Some("pending-exec"))
+            .resolve_change_set_mut(REGION, "pending-exec-set", Some("pending-exec"))
             .expect("the change set just created");
         let pending = change_set
             .pending
@@ -763,7 +763,7 @@ async fn a_change_set_cannot_be_executed_before_its_creation_completes() {
         let state = store(&engine);
         let mut held = state.lock();
         let change_set = held
-            .resolve_change_set_mut("pending-exec-set", Some("pending-exec"))
+            .resolve_change_set_mut(REGION, "pending-exec-set", Some("pending-exec"))
             .expect("the change set created above");
         let pending = change_set
             .pending

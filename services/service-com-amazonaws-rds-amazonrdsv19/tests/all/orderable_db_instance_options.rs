@@ -438,7 +438,8 @@ async fn max_records_is_bounded_and_the_marker_resumes_the_report() {
         if expected == 200 {
             expect_ok(case, response);
         } else {
-            expect_error(case, response, 400, "ValidationException");
+            // A value outside the documented window is one the parameter does not accept.
+            expect_error(case, response, 400, "InvalidParameterValue");
         }
     }
 
