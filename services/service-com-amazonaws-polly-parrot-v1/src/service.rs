@@ -222,6 +222,9 @@ pub mod errors {
     pub const TEXT_LENGTH_EXCEEDED: &str = "Maximum text length has been exceeded";
     /// OBSERVED: `UnsupportedPlsLanguageException`.
     pub const UNSUPPORTED_PLS_LANGUAGE: &str = "Unsupported PLS language";
+    /// The model's own sentence for `InvalidTaskIdException`.
+    pub const INVALID_TASK_ID: &str =
+        "The provided Task ID is not valid. Please provide a valid Task ID and try again.";
     /// The model's own sentence for `LanguageNotSupportedException`.
     pub const LANGUAGE_NOT_SUPPORTED: &str =
         "The language specified is not currently supported by Amazon Polly in this capacity.";
@@ -238,6 +241,7 @@ pub mod errors {
         ("InvalidNextTokenException", Some(INVALID_NEXT_TOKEN)),
         ("InvalidSampleRateException", Some(INVALID_SAMPLE_RATE)),
         ("InvalidSsmlException", Some(INVALID_SSML)),
+        ("InvalidTaskIdException", Some(INVALID_TASK_ID)),
         ("LanguageNotSupportedException", Some(LANGUAGE_NOT_SUPPORTED)),
         ("LexiconNotFoundException", Some(LEXICON_NOT_FOUND)),
         ("LexiconSizeExceededException", Some(LEXICON_SIZE_EXCEEDED)),
@@ -289,6 +293,13 @@ pub mod errors {
     pub fn invalid_ssml() -> InvalidSsmlException {
         InvalidSsmlException {
             message: Some(INVALID_SSML.to_string()),
+        }
+    }
+
+    /// The `TaskId` is not an identifier Amazon Polly could have minted for a task.
+    pub fn invalid_task_id() -> InvalidTaskIdException {
+        InvalidTaskIdException {
+            message: Some(INVALID_TASK_ID.to_string()),
         }
     }
 
@@ -382,6 +393,7 @@ pub mod errors {
                 ("InvalidNextTokenException", invalid_next_token().message),
                 ("InvalidSampleRateException", invalid_sample_rate().message),
                 ("InvalidSsmlException", invalid_ssml().message),
+                ("InvalidTaskIdException", invalid_task_id().message),
                 (
                     "LanguageNotSupportedException",
                     language_not_supported().message,

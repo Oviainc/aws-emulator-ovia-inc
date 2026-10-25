@@ -20,7 +20,7 @@
 use serde_json::{json, Value};
 
 use crate::global_network_lifecycle::{
-    error_code, expected_arn, ids_of, is_minted_id, Emulator, PAST_SETTLE,
+    error_code, expected_scoped_arn, ids_of, is_minted_id, Emulator, PAST_SETTLE,
 };
 
 /// The documented maximum length, in characters, of `Vendor`, `Model` and `SerialNumber`:
@@ -287,8 +287,8 @@ async fn create_device_stores_every_member_and_get_devices_answers_from_the_stor
         );
         assert_eq!(
             device["DeviceArn"],
-            json!(expected_arn("device", &device_id)),
-            "case {name}: the ARN must name the minted id, got {device}"
+            json!(expected_scoped_arn("device", &network, &device_id)),
+            "case {name}: the ARN must name the global network and the minted id, got {device}"
         );
         assert_eq!(
             device["GlobalNetworkId"],

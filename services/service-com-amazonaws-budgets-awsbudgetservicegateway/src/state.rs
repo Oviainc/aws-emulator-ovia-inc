@@ -233,8 +233,9 @@ pub struct ActionExecution {
 /// already started and has not settled yet.
 ///
 /// An action in one of them is the locked resource `ResourceLockedException` ("the
-/// server rejected that particular method for the requested resource") names: a second
-/// execution cannot be started over work that is still running.
+/// server rejected that particular method for the requested resource") names: while the
+/// work runs, none of the methods that mutate the action — a second execution, an update
+/// of its members, its deletion — is accepted.
 pub fn action_is_in_progress(status: &str) -> bool {
     matches!(
         status,

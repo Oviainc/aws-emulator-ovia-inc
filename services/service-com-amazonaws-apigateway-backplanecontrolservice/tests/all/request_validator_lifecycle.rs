@@ -27,7 +27,7 @@ use crate::rest_api_lifecycle::{
 };
 
 /// `CreateRequestValidator` on `api` with `request`.
-async fn create_validator(gateway: &Gateway, api: &str, request: Value) -> Answer {
+pub(crate) async fn create_validator(gateway: &Gateway, api: &str, request: Value) -> Answer {
     gateway
         .call(
             "POST",
@@ -38,7 +38,7 @@ async fn create_validator(gateway: &Gateway, api: &str, request: Value) -> Answe
 }
 
 /// `GetRequestValidator` for `validator` of `api`.
-async fn get_validator(gateway: &Gateway, api: &str, validator: &str) -> Answer {
+pub(crate) async fn get_validator(gateway: &Gateway, api: &str, validator: &str) -> Answer {
     gateway
         .call(
             "GET",
@@ -50,7 +50,12 @@ async fn get_validator(gateway: &Gateway, api: &str, validator: &str) -> Answer 
 
 /// `CreateRequestValidator` with `request`, asserting the modelled 201 and answering the
 /// body.
-async fn created_validator(gateway: &Gateway, api: &str, case: &str, request: Value) -> Value {
+pub(crate) async fn created_validator(
+    gateway: &Gateway,
+    api: &str,
+    case: &str,
+    request: Value,
+) -> Value {
     let answer = create_validator(gateway, api, request).await;
     assert_eq!(
         answer.status, 201,

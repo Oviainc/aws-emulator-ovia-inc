@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisconnectParticipant
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisconnectParticipant`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisconnectParticipant::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Disconnects one participant from one stage: the participant record the stage's
+//! session holds for it moves to `DISCONNECTED` — through
+//! `crate::state::leave_stage_session`, the one place a participant leaves, so a session
+//! the departure empties ends exactly as a data-plane departure would end it — and any
+//! ingest configuration that participant was publishing to the stage with is left
+//! associated with no stage (`crate::state::NO_ASSOCIATED_STAGE_ARN`), which is what the
+//! operation's own doc states it does.
+//!
+//! `reason` describes "why this participant is being disconnected" and no member of any
+//! shape this service reports carries it (`Participant`, `ParticipantSummary` and `Event`
+//! each have no such member), so it is read and not persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -89,10 +92,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivsrealtime-amazoninter
 // here — hence the `DisconnectParticipantError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivsrealtime#DisconnectParticipant")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivsrealtime#DisconnectParticipant",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DisconnectParticipantErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    // Widened in through `extra_errors`: the SERVICE models `InternalServerException`
+    // (HTTP 500) though `DisconnectParticipant` does not list it, and it is the only
+    // honest answer if the shared engine cannot hand back this service's store.
+    InternalServerException(InternalServerException),
     PendingVerification(PendingVerification),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
@@ -144,23 +154,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DISCONNECT_PARTICIPANT_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Disconnect the named participant from the named stage.
+    ///
+    /// A mutation the request asks for, not one a read may make: the participant the
+    /// stage holds leaves the session it is in, and a configuration it was publishing
+    /// with is dissociated from the stage.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisconnectParticipant` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisconnectParticipantErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisconnectParticipant"))
+        // Nothing here reads request metadata: the participant this disconnects is named
+        // entirely by the `stageArn` and `participantId` members, whose modelled lengths
+        // and patterns the framework's constraint walk refuses with a 400
+        // `ValidationException` before `handle` runs.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::store_unavailable(
+                DisconnectParticipantErrorModeled::InternalServerException,
+            )
+        })?;
+        let mut store = state.lock();
+
+        // Both identifiers the request carries name a resource, so neither being held is
+        // the modelled `ResourceNotFoundException` (HTTP 404) — the stage first, then the
+        // participant "attached" to it, resolved through the ONE lookup for "does this
+        // stage have this participant" (`crate::state::stage_participant`) that
+        // `StartParticipantReplication` resolves one with.
+        if !store.stages.contains_key(&input.stage_arn) {
+            return Err(crate::state::resource_not_found(
+                DisconnectParticipantErrorModeled::ResourceNotFoundException,
+                &input.stage_arn,
+            ));
+        }
+        if crate::state::stage_participant(&store, &input.stage_arn, &input.participant_id).is_none()
+        {
+            return Err(crate::state::resource_not_found(
+                DisconnectParticipantErrorModeled::ResourceNotFoundException,
+                &input.participant_id,
+            ));
+        }
+
+        // The sessions of this stage the participant is still CONNECTED in — the ONE
+        // lookup for that (`crate::state::connected_sessions_of`, beside the departure it
+        // feeds) — and the configurations it is publishing to the stage with. Both are
+        // read BEFORE anything is written, because the second is a fact about a
+        // participant that is publishing right now
+        // (`crate::state::ingest_configuration_publishers`, the same lookup a
+        // configuration's reported `state` and a forced delete follow) and the disconnect
+        // below is exactly what ends that.
+        let connected_sessions =
+            crate::state::connected_sessions_of(&store, &input.stage_arn, &input.participant_id);
+        let publishing_with: Vec<String> = store
+            .ingest_configurations
+            .values()
+            .filter(|configuration| configuration.stage_arn == input.stage_arn)
+            .filter(|configuration| {
+                crate::state::ingest_configuration_publishers(&store, configuration)
+                    .iter()
+                    .any(|publisher| publisher.participant_id == input.participant_id)
+            })
+            .map(|configuration| configuration.arn.clone())
+            .collect();
+
+        // "Disconnects a specified participant from a specified stage": the participant
+        // leaves the stage through the one place a participant leaves, so it is reported
+        // `DISCONNECTED` and a session it emptied ends — the same departure a client
+        // dropping off the data plane records. A participant that is already disconnected
+        // has nothing to leave, so this writes nothing for it.
+        for session_id in &connected_sessions {
+            crate::state::leave_stage_session(
+                &mut store,
+                &input.stage_arn,
+                session_id,
+                &input.participant_id,
+            );
+        }
+
+        // "If the participant is publishing using an IngestConfiguration,
+        // DisconnectParticipant also updates the stageArn in the IngestConfiguration to be
+        // an empty string": the configuration stays, and keeps its ingest key, but is
+        // associated with no stage ([`crate::state::NO_ASSOCIATED_STAGE_ARN`]) — so a read
+        // of it reports the empty `stageArn` and no publisher.
+        for arn in &publishing_with {
+            if let Some(configuration) = store.ingest_configurations.get_mut(arn) {
+                configuration.stage_arn = crate::state::NO_ASSOCIATED_STAGE_ARN.to_string();
+            }
+        }
+
+        // `DisconnectParticipantResponse` models no member at all, so the operation's
+        // whole answer is its modelled 200 plus the state written above.
+        Ok(DisconnectParticipantOutput {})
     }
 }
