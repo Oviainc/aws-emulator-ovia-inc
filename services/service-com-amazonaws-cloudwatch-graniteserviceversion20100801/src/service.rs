@@ -45,6 +45,22 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// Run `work` without occupying an async worker.
+///
+/// The alarm-evaluation pass ([`crate::state::alarm_actions::settle_alarms`]) is CPU-bound
+/// and holds this service's store lock for its whole span, so it must not run on the thread
+/// the runtime serves other requests with. `block_in_place` moves the current task off that
+/// worker, which keeps the runtime serving while the pass runs; it is available only on a
+/// multi-thread runtime — the one the emulator boots — so on a current-thread runtime (a
+/// `#[tokio::test]`, or a caller driving the router in-process) the work runs inline, where
+/// there is no other worker to protect.
+pub(crate) fn off_the_async_worker<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
+        _ => work(),
+    }
+}
+
 /// The `com-amazonaws-cloudwatch-graniteserviceversion20100801` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
