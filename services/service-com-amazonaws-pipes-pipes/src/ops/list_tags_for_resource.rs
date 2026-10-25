@@ -2,9 +2,10 @@
 
 //! @op ListTagsForResource
 //! IMPLEMENTED: reports the tags persisted on the pipe the request's `resourceArn` names.
-//! An ARN no stored pipe carries is `NotFoundException` (404). A pipe with no tags reports
-//! no `tags` member at all, because `TagMap` is `@length(min: 1)`. This is the ONLY file to
-//! touch for this operation.
+//! An ARN no stored pipe carries is `NotFoundException` (404) carrying the tagging layer's
+//! constant sentence. A pipe with no tags reports an EMPTY `tags` map rather than no
+//! member, so a caller can read it without first asking whether it is there. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -152,15 +153,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle_due_transitions();
 
         let pipe = state.pipe_by_arn(&input.resource_arn).ok_or_else(|| {
-            ListTagsForResourceErrorModeled::NotFoundException(crate::state::pipe_not_found(
-                crate::state::pipe_name_in_arn(&input.resource_arn),
-            ))
+            ListTagsForResourceErrorModeled::NotFoundException(crate::state::resource_not_found())
         })?;
 
-        // `tag_map()` reports `None` for an untagged pipe: an empty map is not a legal
-        // `TagMap`, which is `@length(min: 1)`.
+        // The tagging layer reports the pipe's tag map whether or not it holds any, so a
+        // caller can read the member without first asking whether it is there.
         Ok(ListTagsForResourceOutput {
-            tags: pipe.tag_map(),
+            tags: Some(pipe.tags_reported()),
         })
     }
 }
