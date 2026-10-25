@@ -19,6 +19,8 @@ mod catalog_identity;
 mod catalog_mutations;
 #[path = "all/catalog_projections.rs"]
 mod catalog_projections;
+#[path = "all/connection_updates.rs"]
+mod connection_updates;
 #[path = "all/crawlers.rs"]
 mod crawlers;
 #[path = "all/custom_entity_types.rs"]

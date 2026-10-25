@@ -7,6 +7,18 @@
 //! clock had ALREADY made due — the same thing `GetSpeechSynthesisTask` does, and
 //! nothing a caller could not have observed by waiting instead of calling.
 //!
+//! `MaxResults` (range 1..100) is the only page bound this operation has: a request
+//! that names it gets at most that many tasks and a `NextToken` while a further one
+//! exists, and a request that names none gets every matching task in one response with
+//! no `NextToken`. The model declares no default page size, so the report a caller did
+//! not bound is not truncated at one.
+//!
+//! One response still materialises at most [`REPORT_MATERIALISATION_CEILING`] tasks —
+//! not a page size, but the window this handler will ever build in memory at once, so
+//! the size of a response cannot follow the store without limit. It is orders of
+//! magnitude above any task count a caller lists in one call, and the same cursor pages
+//! past it, so no task is dropped.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -110,19 +122,22 @@ impl From<ListSpeechSynthesisTasksErrorModeled> for ListSpeechSynthesisTasksErro
     }
 }
 
-/// How many tasks one `ListSpeechSynthesisTasks` page carries when the request names
-/// no `MaxResults`.
-///
-/// CHOSEN: Amazon Polly documents `MaxResults` (1..100) but no default page size, so
-/// this is the emulator's own. It is small enough that the paging path is the normal
-/// path rather than one only a huge store reaches.
-pub const SYNTHESIS_TASK_PAGE_SIZE: usize = 20;
-
 /// The largest page the model allows: the `max` of `MaxResults`'s range
 /// (`smithy_query(query="operation", operation="ListSpeechSynthesisTasks")`). The
 /// boundary validator already refuses anything outside that range, so this only
 /// bounds the window the handler builds.
 const MAX_RESULTS_CEILING: i32 = 100;
+
+/// The most tasks ONE response will ever materialise, whatever the store holds.
+///
+/// Not a page size, and nothing the caller can raise: `MaxResults` is the only page
+/// bound this operation has, and a request that names none is answered in full. This is
+/// the ceiling on the window the handler builds and clones, so the memory and the
+/// response one request can cost do not follow the store without limit. CHOSEN: far
+/// above any number of synthesis tasks a caller lists in one call, so an unbounded
+/// report is in practice never cut here; when it is, the report pages on through the
+/// same `NextToken` cursor and no task is lost.
+pub const REPORT_MATERIALISATION_CEILING: usize = 5_000;
 
 /// The field separator inside a page cursor. An ASCII unit separator, so it cannot
 /// occur in a `TaskId` (`^[a-zA-Z0-9_-]{1,100}$`) or in a `TaskStatus` value.
@@ -224,14 +239,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        let page_size = match input.max_results {
-            // The boundary validator already refused anything outside the modeled
-            // 1..100 range, so the clamp only restates that invariant and the
-            // converted value cannot be out of a `usize`'s reach.
-            Some(max_results) => usize::try_from(max_results.clamp(1, MAX_RESULTS_CEILING))
-                .expect("a value clamped to 1..=100 fits a usize"),
-            None => SYNTHESIS_TASK_PAGE_SIZE,
-        };
+        // The page bound the CALLER asked for, and the only one there is. `None` means
+        // the caller bounded nothing, so the whole matching report is owed in one
+        // response, up to the ceiling on what one response materialises. The boundary
+        // validator already refused anything outside the modeled 1..100 range, so the
+        // clamp only restates that invariant and the converted value cannot be out of a
+        // `usize`'s reach.
+        let window = input
+            .max_results
+            .map_or(REPORT_MATERIALISATION_CEILING, |max_results| {
+                usize::try_from(max_results.clamp(1, MAX_RESULTS_CEILING))
+                    .expect("a value clamped to 1..=100 fits a usize")
+            });
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListSpeechSynthesisTasksErrorModeled::ServiceFailureException(
@@ -251,6 +270,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::settle_task_status(task, now);
         }
 
+        // Ordering has to see every matching task before the window can be taken from
+        // it, so this pass collects POINTERS into the store — one machine word per
+        // matching task, nothing copied — and the window below is what decides how much
+        // is actually materialised.
         let mut matching: Vec<&crate::state::StoredSynthesisTask> = guard
             .synthesis_tasks
             .values()
@@ -270,9 +293,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         matching.sort_by(|left, right| order_key(left).cmp(&order_key(right)));
 
-        // One task past the page is enough to know whether a further page exists.
-        let has_further_page = matching.len() > page_size;
-        matching.truncate(page_size);
+        // One task past the window is enough to know whether a further page exists. The
+        // truncation happens HERE, before the tasks are cloned into the response below,
+        // so `window` bounds what one call allocates and not just what it reports: at
+        // most `window` tasks are ever copied, however large the store is.
+        let has_further_page = matching.len() > window;
+        matching.truncate(window);
         let next_token = if has_further_page {
             matching.last().map(|last| {
                 let (created_millis, task_id) = order_key(last);

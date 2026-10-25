@@ -12,14 +12,20 @@
 //! * a create persists the job and `Describe` replays every stored member, for every
 //!   shape of request the model allows (one definition or a list, each strategy, each
 //!   kind of parameter range, warm start, autotune, tags, any signed region);
-//! * a request past a published per-tuning-job quota is the modelled
-//!   `ResourceLimitExceeded`, tested on each quota's own bound and one past it;
+//! * a request past one of the account's published quotas on the training jobs a tuning
+//!   job runs is the modelled `ResourceLimitExceeded`, tested on each quota's own bound
+//!   and one past it, and the refusal names that quota, its limit, the account's
+//!   utilisation and the request's delta;
 //! * a request breaking a cross-member rule the model's constraints cannot express is a
 //!   400 `ValidationException` naming the member, and persists nothing;
+//! * an invalid hyperparameter range is named in a bracketed list built from the request,
+//!   followed by the constraint its kind requires;
 //! * a name already in use is the modelled `ResourceInUse` and keeps the stored job;
 //! * the job ends `Failed` with a reason saying no training job ran, once the clock owes
 //!   that transition — never with a best training job or an objective metric value for
 //!   work nothing performed;
+//! * a stop moves a running job to `Stopping` and leaves `Stopped` to the clock, and a
+//!   job that has already ended has nothing to stop;
 //! * a call that CHANGES this service's state leaves a structured audit record naming the
 //!   operation, the resource and the access key id the request presented.
 
@@ -702,6 +708,319 @@ async fn capacity_past_a_published_quota_is_refused_with_resource_limit_exceeded
             "case {case:?}: a refused create stores no job, got {status} with {described}"
         );
     }
+}
+
+/// RULE: an invalid hyperparameter range is refused with a message built from the
+/// REQUEST — every range breaking the same constraint named in one bracketed,
+/// comma-separated list of the hyperparameter names the request gave them, followed by
+/// the constraint that range kind requires — and never with the parsed values read back,
+/// so a client extracts the offending hyperparameters from the list it sent.
+#[tokio::test]
+async fn invalid_hyperparameter_ranges_are_named_in_a_bracketed_list() {
+    let emulator = Emulator::new();
+
+    /// The constraint clause a reversed continuous range is refused with.
+    const CONTINUOUS_ORDER: &str = "For continuous parameter ranges, the value of MinValue \
+        must be smaller than the value of MaxValue. Specify a value for MinValue that is \
+        smaller than the value of MaxValue.";
+    /// The same, for an integer range.
+    const INTEGER_ORDER: &str = "For integer parameter ranges, the value of MinValue must be \
+        smaller than the value of MaxValue. Specify a value for MinValue that is smaller \
+        than the value of MaxValue.";
+
+    // Rows differ along the range KIND, the NUMBER of offending ranges (so the list is
+    // exercised at one and at several names), WHERE the ranges sit (the tuning job config's
+    // own `ParameterRanges` or a training job definition's `HyperParameterRanges`), and the
+    // way the values are written — `"1.0"`/`"0.5"` are the same numbers as `"1"`/`"0.5"`,
+    // and neither spelling may appear in the refusal.
+    let mut rows: Vec<(&str, Value, Vec<&str>, &str)> = Vec::new();
+
+    let mut body = valid_body("one-continuous");
+    body["HyperParameterTuningJobConfig"]["ParameterRanges"]["ContinuousParameterRanges"] =
+        json!([{ "Name": "eta", "MinValue": "1.0", "MaxValue": "0.5" }]);
+    rows.push((
+        "one continuous range whose bounds are the wrong way round",
+        body,
+        vec!["eta"],
+        CONTINUOUS_ORDER,
+    ));
+
+    let mut body = valid_body("two-continuous");
+    body["HyperParameterTuningJobConfig"]["ParameterRanges"]["ContinuousParameterRanges"] = json!([
+        { "Name": "eta", "MinValue": "1.0", "MaxValue": "0.5" },
+        { "Name": "gamma", "MinValue": "2", "MaxValue": "1" },
+    ]);
+    rows.push((
+        "two continuous ranges, both the wrong way round",
+        body,
+        vec!["eta", "gamma"],
+        CONTINUOUS_ORDER,
+    ));
+
+    let mut body = valid_body("one-integer");
+    body["HyperParameterTuningJobConfig"]["ParameterRanges"]["IntegerParameterRanges"] =
+        json!([{ "Name": "max_depth", "MinValue": "10", "MaxValue": "3" }]);
+    rows.push((
+        "one integer range whose bounds are the wrong way round",
+        body,
+        vec!["max_depth"],
+        INTEGER_ORDER,
+    ));
+
+    let mut body = valid_body("definition-ranges");
+    body["HyperParameterTuningJobConfig"]["ParameterRanges"] = json!({});
+    body["TrainingJobDefinition"]["HyperParameterRanges"] = json!({
+        "ContinuousParameterRanges": [
+            { "Name": "lambda", "MinValue": "0.9", "MaxValue": "0.1" },
+        ],
+    });
+    rows.push((
+        "a range carried by the training job definition",
+        body,
+        vec!["lambda"],
+        CONTINUOUS_ORDER,
+    ));
+
+    for (case, body, offending, constraint) in rows {
+        let name = str_field(&body, "HyperParameterTuningJobName");
+        let (status, refused) = emulator
+            .call("CreateHyperParameterTuningJob", &body)
+            .await;
+        assert_eq!(
+            (status, error_code(&refused).as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected 400 ValidationException, got {status} with {refused}"
+        );
+        let text = message(&refused);
+        assert_eq!(
+            text,
+            format!(
+                "The hyperparameter ranges [{}] are not valid. {constraint}",
+                offending.join(",")
+            ),
+            "case {case:?}: the refusal's message, got {text:?}"
+        );
+        // The values the caller sent are its own: nothing re-renders them, so no refusal
+        // reports a bound at all.
+        for value in ["1.0", "0.5", "MinValue 1", "MaxValue 0.5"] {
+            assert!(
+                !text.contains(value),
+                "case {case:?}: the refusal must not quote a parsed bound ({value:?}), got \
+                 {text:?}"
+            );
+        }
+
+        // A refused create persists nothing.
+        let (status, described) = emulator
+            .call(
+                "DescribeHyperParameterTuningJob",
+                &json!({ "HyperParameterTuningJobName": name }),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a refused create stores no job, got {status} with {described}"
+        );
+    }
+}
+
+/// RULE: the capacity a tuning job asks for is held to the ACCOUNT's published quotas on
+/// the training jobs a tuning job runs, the parallel one weighed first, and a request past
+/// one is refused with the modelled `ResourceLimitExceeded` stating that quota by name,
+/// its limit, what the account is using of it and the delta the request asked for — all in
+/// the unit the quota is counted in — plus how to ask for more.
+#[tokio::test]
+async fn capacity_past_an_account_quota_names_the_quota_the_limit_and_the_utilization() {
+    let emulator = Emulator::new();
+    let parallel_quota =
+        service_com_amazonaws_sagemaker_sagemaker::state::PARALLEL_TRAINING_JOBS_PER_TUNING_JOB_QUOTA_NAME;
+    let total_quota =
+        service_com_amazonaws_sagemaker_sagemaker::state::TRAINING_JOBS_PER_TUNING_JOB_QUOTA_NAME;
+
+    // Rows differ along WHICH quota the request is past, by how far (one over the bound,
+    // and far over it), and whether the other dimension is legal — so the row that is past
+    // both pins which quota is weighed first.
+    let rows: Vec<(&str, i64, i64, &str, i64, i64)> = vec![
+        (
+            "one past the parallel quota",
+            MAX_TRAINING_JOBS,
+            MAX_PARALLEL_TRAINING_JOBS + 1,
+            parallel_quota,
+            MAX_PARALLEL_TRAINING_JOBS,
+            MAX_PARALLEL_TRAINING_JOBS + 1,
+        ),
+        (
+            "far past the parallel quota",
+            999_999_999,
+            999_999_999,
+            parallel_quota,
+            MAX_PARALLEL_TRAINING_JOBS,
+            999_999_999,
+        ),
+        (
+            "one past the total quota, legal in parallel",
+            MAX_TRAINING_JOBS + 1,
+            MAX_PARALLEL_TRAINING_JOBS,
+            total_quota,
+            MAX_TRAINING_JOBS,
+            MAX_TRAINING_JOBS + 1,
+        ),
+        (
+            "far past the total quota, legal in parallel",
+            1_000_000,
+            1,
+            total_quota,
+            MAX_TRAINING_JOBS,
+            1_000_000,
+        ),
+    ];
+
+    for (index, (case, total, parallel, quota, limit, delta)) in rows.into_iter().enumerate() {
+        let name = format!("account-quota-case-{index}");
+        let mut body = valid_body(&name);
+        body["HyperParameterTuningJobConfig"]["ResourceLimits"] = json!({
+            "MaxNumberOfTrainingJobs": total,
+            "MaxParallelTrainingJobs": parallel,
+        });
+
+        let (status, refused) = emulator
+            .call("CreateHyperParameterTuningJob", &body)
+            .await;
+        assert_eq!(
+            (status, error_code(&refused).as_str()),
+            (400, "ResourceLimitExceeded"),
+            "case {case:?}: expected 400 ResourceLimitExceeded, got {status} with {refused}"
+        );
+        // Nothing in this emulator launches a training job for a tuning job, so the
+        // account is using none of either quota — read off the store, not assumed.
+        let text = message(&refused);
+        assert_eq!(
+            text,
+            format!(
+                "The account-level service limit '{quota}' is {limit} TrainingJobs, with \
+                 current utilization of 0 TrainingJobs and a request delta of {delta} \
+                 TrainingJobs. Please use AWS Service Quotas to request an increase for \
+                 this quota. If AWS Service Quotas is not available, contact AWS support \
+                 to request an increase for this quota."
+            ),
+            "case {case:?}: the refusal's message, got {text:?}"
+        );
+
+        let (status, described) = emulator
+            .call(
+                "DescribeHyperParameterTuningJob",
+                &json!({ "HyperParameterTuningJobName": name }),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a refused create stores no job, got {status} with {described}"
+        );
+    }
+}
+
+/// RULE: `StopHyperParameterTuningJob` moves a RUNNING job to `Stopping` and leaves the
+/// `Stopped` it owes to the clock, so a caller acting straight after the stop still
+/// observes the transient status; a job the account does not hold is the modelled
+/// `ResourceNotFound`, and a job that has already ended has nothing to stop.
+#[tokio::test]
+async fn stopping_a_tuning_job_moves_it_through_stopping_to_stopped() {
+    let emulator = Emulator::new();
+    let name = "stops-cleanly";
+    emulator
+        .ok("CreateHyperParameterTuningJob", &valid_body(name))
+        .await;
+    let describe = json!({ "HyperParameterTuningJobName": name });
+
+    // A second stop while one is in flight changes nothing, so both rows are accepted and
+    // the job is still `Stopping` after them.
+    for attempt in ["first", "repeated"] {
+        emulator
+            .ok("StopHyperParameterTuningJob", &describe)
+            .await;
+        let stopping = emulator
+            .ok("DescribeHyperParameterTuningJob", &describe)
+            .await;
+        assert_eq!(
+            str_field(&stopping, "HyperParameterTuningJobStatus"),
+            "Stopping",
+            "case {attempt:?} stop: the span before `Stopped` is never zero, got {stopping}"
+        );
+        assert!(
+            stopping.get("FailureReason").is_none(),
+            "case {attempt:?} stop: a job asked to stop has not failed, got {stopping}"
+        );
+    }
+
+    tokio::time::sleep(PAST_SETTLE_DUE).await;
+    let stopped = emulator
+        .ok("DescribeHyperParameterTuningJob", &describe)
+        .await;
+    assert_eq!(
+        str_field(&stopped, "HyperParameterTuningJobStatus"),
+        "Stopped",
+        "case stopped: the clock owes a stopping job `Stopped`, got {stopped}"
+    );
+    assert!(
+        stopped.get("HyperParameterTuningEndTime").is_some()
+            && stopped.get("FailureReason").is_none(),
+        "case stopped: a stopped job ended without failing, got {stopped}"
+    );
+    // The job ended because the caller asked it to, so a later stop has nothing to do.
+    let (status, refused) = emulator
+        .call("StopHyperParameterTuningJob", &describe)
+        .await;
+    assert_eq!(
+        (status, error_code(&refused).as_str()),
+        (400, "ValidationException"),
+        "case stopped: stopping a job that has ended, got {status} with {refused}"
+    );
+    let reread = emulator
+        .ok("DescribeHyperParameterTuningJob", &describe)
+        .await;
+    assert_eq!(
+        reread, stopped,
+        "case stopped: the refused stop must change nothing, got {reread}"
+    );
+
+    // A job that ran to its own terminal status is equally past stopping.
+    let ended = "ends-before-the-stop";
+    emulator
+        .ok("CreateHyperParameterTuningJob", &valid_body(ended))
+        .await;
+    tokio::time::sleep(PAST_SETTLE_DUE).await;
+    let (status, refused) = emulator
+        .call(
+            "StopHyperParameterTuningJob",
+            &json!({ "HyperParameterTuningJobName": ended }),
+        )
+        .await;
+    assert_eq!(
+        (status, error_code(&refused).as_str()),
+        (400, "ValidationException"),
+        "case ended: stopping a job that already failed, got {status} with {refused}"
+    );
+
+    // A name the account holds no job under is the modelled not-found, worded the way
+    // every tuning-job reference states it.
+    let (status, absent) = emulator
+        .call(
+            "StopHyperParameterTuningJob",
+            &json!({ "HyperParameterTuningJobName": "no-such-tuning-job" }),
+        )
+        .await;
+    assert_eq!(
+        (status, error_code(&absent).as_str()),
+        (400, "ResourceNotFound"),
+        "case absent: stopping a job that was never created, got {status} with {absent}"
+    );
+    assert_eq!(
+        message(&absent),
+        service_com_amazonaws_sagemaker_sagemaker::state::tuning_job_not_found(
+            "no-such-tuning-job"
+        ),
+        "case absent: the refusal's message, got {absent}"
+    );
 }
 
 /// RULE: a tuning job name is unique within an account and Region, so a second create

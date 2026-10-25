@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopHyperParameterTuningJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopHyperParameterTuningJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopHyperParameterTuningJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: moves the tuning job `HyperParameterTuningJobName` names into `Stopping`
+//! in `crate::state`, with the instant the clock owes it `Stopped`, so a caller that
+//! describes it straight after observes the transient status and one that waits observes
+//! the terminal one. A job this account does not hold is the modelled `ResourceNotFound`,
+//! and a job that has already ended has nothing to stop. This is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +151,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopHyperParameterTuningJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopHyperParameterTuningJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopHyperParameterTuningJob"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The name is not case sensitive, so the lookup folds it the way the create did.
+        let Some(job) = store
+            .tuning_jobs
+            .get_mut(&crate::state::entity_key(
+                &input.hyper_parameter_tuning_job_name,
+            ))
+        else {
+            return Err(StopHyperParameterTuningJobErrorModeled::ResourceNotFound(
+                ResourceNotFound {
+                    message: Some(crate::state::tuning_job_not_found(
+                        &input.hyper_parameter_tuning_job_name,
+                    )),
+                },
+            )
+            .into());
+        };
+        // Whatever the clock already owed this job is materialised first, so the stop is
+        // judged against the status a describe would report at this instant rather than
+        // against a stale one. That transition is a state change like any other, so it
+        // leaves the same audit record here as it does on a reporting path.
+        let settled = job.settle_status(now);
+        if job.is_terminal() {
+            // There is no running job to stop: the status the caller would be asking for
+            // is one the job has already passed.
+            let arn = job.arn.clone();
+            let refusal = crate::scaffolded::Scaffolded::validation(format!(
+                "The hyperparameter tuning job \"{}\" is {} and is not running, so there is \
+                 nothing to stop.",
+                job.name, job.status
+            ));
+            drop(store);
+            if settled {
+                crate::state::record_state_change(Self::NAME, &arn, ctx);
+            }
+            return Err(refusal);
+        }
+        // A job already stopping is left alone: the stop the earlier call started is still
+        // in flight, and restarting its span would push the terminal status further away.
+        let stopping = job.status == crate::state::TUNING_STATUS_STOPPING;
+        if !stopping {
+            job.request_stop(now);
+        }
+        let arn = job.arn.clone();
+        drop(store);
+
+        // Recorded only when this call actually moved the job: a repeat of a stop already
+        // in flight changed nothing. A transition the clock owed is a move too, so either
+        // one leaves the record.
+        if !stopping || settled {
+            crate::state::record_state_change(Self::NAME, &arn, ctx);
+        }
+        Ok(StopHyperParameterTuningJobOutput)
     }
 }

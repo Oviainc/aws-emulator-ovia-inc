@@ -1,15 +1,40 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetExport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetExport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: renders the API definition the named stage SERVES — the `Deployment` the
+//! stage points at, which is the snapshot "a deployed version of a RestApi" means — as an
+//! OpenAPI document in the dialect `exportType` names (`swagger` → Swagger/OpenAPI 2.0,
+//! `oas30` → OpenAPI 3.0.x), serialized in the media type `accepts` asks for.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetExport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every value of the document comes from the stored records: each resource of the
+//! deployment that carries a method becomes a `paths` entry, each method on it an
+//! operation keyed by its lowercased verb (the `ANY` catch-all becomes API Gateway's own
+//! `x-amazon-apigateway-any-method` key, the same key `PutRestApi` IMPORTS it from), each
+//! method response a `responses` entry with the headers its `responseParameters` declare,
+//! the API's name/description/version its `info`, the API's binary media types the
+//! `x-amazon-apigateway-binary-media-types` extension, the gateway responses configured on
+//! the API the `x-amazon-apigateway-gateway-responses` extension, and the api id + region
+//! + stage name the invoke endpoint the dialect renders in its own place (`host`/
+//! `basePath`/`schemes` for 2.0, `servers` for 3.0). The vendor extensions are rendered
+//! only when the request's `parameters` ask for them, as that member documents: the
+//! integration and authorizer extensions for the value that names each, and the extensions
+//! describing the API itself — its gateway responses — for the value that asks for API
+//! Gateway's own extension set (`extensions=apigateway`).
+//!
+//! The document is served as the FILE it is: the response reports the attachment's
+//! unspecified byte stream as its `contentType` whichever spelling `accepts` selected, and
+//! that spelling shows in the `contentDisposition` filename's extension.
+//!
+//! This is a REPORTING operation: it writes nothing, so two exports of one stage answer
+//! the same document (only the `contentDisposition` filename carries the instant of the
+//! call, the way API Gateway stamps the downloaded file).
+//!
+//! What the document does NOT carry, and why: a `Model`'s schema (no operation of this
+//! service creates a `Model` yet, and a `$ref` to a definition the document does not
+//! carry would be a dangling reference rather than an exported model), and the content of
+//! the documentation parts a stage's `documentationVersion` froze (those records are
+//! reported by the documentation operations; merging them into the definition is not part
+//! of what this renders).
 //!
 //! ## Shape of an operation
 //!
@@ -94,6 +119,1165 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::{BTreeMap, HashMap};
+
+use serde_json::{Map, Value};
+
+use crate::state::{AuthorizerEntry, DeploymentEntry, MethodEntry, ResourceEntry, RestApiEntry, StageEntry};
+
+/// The `exportType` for Swagger/OpenAPI 2.0: "'swagger' for Swagger/OpenAPI 2.0"
+/// (`GetExportRequest$exportType`).
+pub const EXPORT_TYPE_SWAGGER: &str = "swagger";
+
+/// The `exportType` for OpenAPI 3.0.x: "'oas30' for OpenAPI 3.0.x"
+/// (`GetExportRequest$exportType`).
+pub const EXPORT_TYPE_OAS30: &str = "oas30";
+
+/// The `swagger` version field of a 2.0 document, which the OpenAPI 2.0 specification
+/// fixes at exactly `2.0`.
+const SWAGGER_DOCUMENT_VERSION: &str = "2.0";
+
+/// The `openapi` version field of the 3.0 document an `oas30` export is. API Gateway
+/// exports the latest 3.0 patch release, `3.0.1`, which is the version `PutRestApi`'s own
+/// test definitions declare.
+const OAS30_DOCUMENT_VERSION: &str = "3.0.1";
+
+/// The media type an export is serialized in unless `accepts` asks for the other one:
+/// "The content-type of the export, for example application/json"
+/// (`GetExportRequest$accepts`).
+pub const MEDIA_TYPE_JSON: &str = "application/json";
+
+/// The other media type an export may be serialized in: "Currently application/json and
+/// application/yaml are supported" (`GetExportRequest$accepts`).
+pub const MEDIA_TYPE_YAML: &str = "application/yaml";
+
+/// The media type an export is SERVED as, whichever spelling its document is written in.
+///
+/// An export is a FILE the caller downloads, not a document the caller reads off the
+/// response: the payload is an attachment ([`content_disposition`]), so what the response
+/// reports as its content type is the unspecified byte stream an attachment is, and the
+/// serialization `accepts` selected shows in that attachment's filename extension.
+const MEDIA_TYPE_OCTET_STREAM: &str = "application/octet-stream";
+
+/// The `{subtype}` of a media RANGE that accepts every media type of its type, which
+/// leaves the default media type; see [`Serialization::parse`].
+const MEDIA_SUBTYPE_ANY: &str = "*";
+
+/// The `parameters` key that selects the vendor extensions an export carries:
+/// "extensions='integrations' or extensions='apigateway' … extensions='authorizers'"
+/// (`GetExportRequest$parameters`).
+const EXTENSIONS_PARAMETER: &str = "extensions";
+
+/// The `extensions` values that ask for the integration extension: "extensions=
+/// 'integrations' or extensions='apigateway' will export the API with
+/// x-amazon-apigateway-integration extensions" (`GetExportRequest$parameters`).
+const EXTENSIONS_INTEGRATIONS: &[&str] = &["integrations", EXTENSIONS_APIGATEWAY];
+
+/// The `extensions` value that asks for API Gateway's OWN extension set rather than one
+/// extension of it: it asks for the integration extension, as `integrations` does, and for
+/// the extensions that describe the API itself rather than one of its methods (see
+/// [`gateway_responses_extension`]).
+const EXTENSIONS_APIGATEWAY: &str = "apigateway";
+
+/// The `extensions` value that asks for the authorizer extension: "extensions=
+/// 'authorizers' will export the API with x-amazon-apigateway-authorizer extensions"
+/// (`GetExportRequest$parameters`).
+const EXTENSIONS_AUTHORIZERS: &str = "authorizers";
+
+/// The `parameters` key that asks for Postman's own extensions; see
+/// [`postman_not_generated`].
+const POSTMAN_PARAMETER: &str = "postman";
+
+/// The values that turn a flag parameter OFF: anything else written on one asks for it,
+/// and so does the valueless spelling a flag is normally written in.
+const DISABLED_FLAG_VALUES: &[&str] = &["false", "0", "no"];
+
+/// The document key the integration of a method is exported under — API Gateway's own
+/// OpenAPI extension, the counterpart of the `Integration` record.
+const INTEGRATION_EXTENSION: &str = "x-amazon-apigateway-integration";
+
+/// The document key an `Authorizer` is exported under, on the security scheme the
+/// methods it authorizes name.
+const AUTHORIZER_EXTENSION: &str = "x-amazon-apigateway-authorizer";
+
+/// The document key the API's own gateway responses are exported under — API Gateway's
+/// own OpenAPI extension, keyed by `responseType`; see [`gateway_responses_extension`].
+const GATEWAY_RESPONSES_EXTENSION: &str = "x-amazon-apigateway-gateway-responses";
+
+/// The document key that says which kind of authorization a security scheme stands for.
+const AUTHTYPE_EXTENSION: &str = "x-amazon-apigateway-authtype";
+
+/// The `x-amazon-apigateway-authtype` of a method signed with SigV4.
+const AUTHTYPE_SIGV4: &str = "awsSigv4";
+
+/// The `x-amazon-apigateway-authtype` of a method authorized by a `TOKEN`/`REQUEST`
+/// authorizer of the API.
+const AUTHTYPE_CUSTOM: &str = "custom";
+
+/// The `x-amazon-apigateway-authtype` of a method authorized by a Cognito user pool.
+const AUTHTYPE_COGNITO: &str = "cognito_user_pools";
+
+/// The scheme name the SigV4 requirement of an `AWS_IAM` method is exported under.
+const SIGV4_SCHEME_NAME: &str = "sigv4";
+
+/// The scheme name the API-key requirement of a method with `apiKeyRequired` is exported
+/// under.
+const API_KEY_SCHEME_NAME: &str = "api_key";
+
+/// The scheme names this export reserves for the authorizations that are not an
+/// `Authorizer` of the API; see [`unique_scheme_name`].
+const RESERVED_SCHEME_NAMES: &[&str] = &[SIGV4_SCHEME_NAME, API_KEY_SCHEME_NAME];
+
+/// The OpenAPI security scheme type every scheme API Gateway exports carries: each one
+/// is satisfied by a value in a named header.
+const API_KEY_SCHEME_TYPE: &str = "apiKey";
+
+/// Where a security scheme's value is carried: a request header.
+const HEADER_LOCATION: &str = "header";
+
+/// The header an `AWS_IAM` or Cognito method's credential is carried in.
+const AUTHORIZATION_HEADER: &str = "Authorization";
+
+/// The header a client presents an API key in: from `RestApi$apiKeySource`, "HEADER to
+/// read the API key from the X-API-Key header of a request".
+const API_KEY_HEADER: &str = "x-api-key";
+
+/// The `authorizationType` whose caller signs the request: "`AWS_IAM` for using AWS IAM
+/// permissions" (`Method$authorizationType`).
+const AUTHORIZATION_AWS_IAM: &str = "AWS_IAM";
+
+/// The `authorizationType`s served by an `Authorizer` of the API: "`CUSTOM` for using a
+/// custom authorizer, or `COGNITO_USER_POOLS` for using a Cognito user pool"
+/// (`Method$authorizationType`).
+const AUTHORIZATION_BY_AUTHORIZER: &[&str] = &["CUSTOM", AUTHORIZATION_COGNITO_USER_POOLS];
+
+/// The `authorizationType` whose authorizer is a Cognito user pool; see
+/// [`AUTHORIZATION_BY_AUTHORIZER`].
+const AUTHORIZATION_COGNITO_USER_POOLS: &str = "COGNITO_USER_POOLS";
+
+/// The `Authorizer$type` whose tokens come from a Cognito user pool, from the operation
+/// that creates one — referenced rather than re-declared, so the spelling cannot drift
+/// between the create and the export side.
+use super::create_authorizer::AUTHORIZER_TYPE_COGNITO_USER_POOLS as AUTHORIZER_TYPE_COGNITO;
+
+/// The prefix of a method request parameter mapping expression: a key "matching the
+/// pattern of method.request.{location}.{name}" (`Method$requestParameters`).
+const REQUEST_PARAMETER_PREFIX: &str = "method.request.";
+
+/// The `{location}` of a `method.request.{location}.{name}` expression, mapped to the
+/// OpenAPI parameter location it names: "where location is querystring, path, or header"
+/// (`Method$requestParameters`).
+const REQUEST_PARAMETER_LOCATIONS: &[(&str, &str)] = &[
+    ("querystring.", "query"),
+    ("path.", "path"),
+    (HEADER_LOCATION_SEGMENT, HEADER_LOCATION),
+];
+
+/// The `{location}` segment of a header request parameter; see
+/// [`REQUEST_PARAMETER_LOCATIONS`].
+const HEADER_LOCATION_SEGMENT: &str = "header.";
+
+/// The OpenAPI parameter location of a path parameter, which the resource path's own
+/// template declares.
+const PATH_LOCATION: &str = "path";
+
+/// The schema type every parameter and header of an exported definition carries. API
+/// Gateway's method request parameters and method response headers are untyped mapping
+/// expressions, so what the document can say about one is that it is a string.
+const STRING_SCHEMA_TYPE: &str = "string";
+
+/// The scheme an API's default invoke endpoint is reached over: "clients can invoke your
+/// API with the default https://{api_id}.execute-api.{region}.amazonaws.com endpoint"
+/// (`RestApi$disableExecuteApiEndpoint`).
+const INVOKE_SCHEME: &str = "https";
+
+/// The `{basePath}` server variable an `oas30` document's single server is parameterized
+/// by, so the exported URL names the stage the export is of.
+const BASE_PATH_VARIABLE: &str = "basePath";
+
+/// Which OpenAPI dialect an export is rendered in — the two values `exportType` accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dialect {
+    /// Swagger/OpenAPI 2.0: `host` + `basePath` + `schemes`, `securityDefinitions`, and
+    /// a parameter's type written directly on the parameter.
+    Swagger,
+    /// OpenAPI 3.0.x: `servers`, `components.securitySchemes`, and a parameter's type in
+    /// its own `schema`.
+    Oas30,
+}
+
+impl Dialect {
+    /// The dialect `export_type` names. `Err` carries the message for a value outside the
+    /// two the member documents: an export type is the name of the EXPORTER that renders
+    /// it, so a value naming none is refused as the exporter the service does not have,
+    /// built from the value the request asked for.
+    fn parse(export_type: &str) -> Result<Self, String> {
+        match export_type {
+            EXPORT_TYPE_SWAGGER => Ok(Self::Swagger),
+            EXPORT_TYPE_OAS30 => Ok(Self::Oas30),
+            other => Err(format!("No API exporter for type '{other}'")),
+        }
+    }
+}
+
+/// Which media type an export is serialized in — the two `accepts` documents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Serialization {
+    Json,
+    Yaml,
+}
+
+impl Serialization {
+    /// The serialization `accepts` asks for, defaulting to JSON for a request that asks
+    /// for nothing or for anything (`*/*`, or any other wildcard range that covers it).
+    ///
+    /// An `Accept` header carries media RANGES, each with an optional quality
+    /// (RFC 9110 §12.5.1), so the ranges are read in quality order — highest first,
+    /// ties in the order they were written, a `q=0` range excluded as "not acceptable" —
+    /// and the first one this service can serialize wins. Media types are compared case
+    /// insensitively, as RFC 9110 §8.3.1 makes them. `Err` carries the message for a
+    /// header that names a media type but none this service can serialize — including a
+    /// header that excludes every range it names, which says that nothing this service
+    /// serializes is acceptable; a header naming no media type at all asks for nothing in
+    /// particular and leaves the default.
+    fn parse(accepts: Option<&str>) -> Result<Self, String> {
+        let Some(accepts) = accepts else {
+            return Ok(Self::Json);
+        };
+        let mut ranges: Vec<(f64, usize, String)> = Vec::new();
+        let mut named = 0usize;
+        for (position, range) in accepts.split(',').enumerate() {
+            let mut parts = range.split(';');
+            let media_type = parts
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            if media_type.is_empty() {
+                continue;
+            }
+            named += 1;
+            // A parameter that is not a quality says nothing about which media type is
+            // preferred, and an unparseable quality is no quality at all: both leave the
+            // range at the default 1.
+            let quality = parts
+                .filter_map(|parameter| {
+                    let (name, value) = parameter.split_once('=')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("q")
+                        .then(|| value.trim().parse::<f64>().ok())
+                        .flatten()
+                })
+                .next()
+                .unwrap_or(1.0);
+            if quality > 0.0 {
+                ranges.push((quality, position, media_type));
+            }
+        }
+        if named == 0 {
+            return Ok(Self::Json);
+        }
+        if !ranges.is_empty() {
+            ranges.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
+            for (_, _, media_type) in &ranges {
+                match media_type.as_str() {
+                    MEDIA_TYPE_JSON => return Ok(Self::Json),
+                    MEDIA_TYPE_YAML => return Ok(Self::Yaml),
+                    // A range may name a wildcard subtype (`*/*`, `application/*`), which
+                    // accepts every media type of that type — so the default one is
+                    // served.
+                    other => {
+                        if let Some((kind, MEDIA_SUBTYPE_ANY)) = other.split_once('/') {
+                            let default_kind = MEDIA_TYPE_JSON
+                                .split_once('/')
+                                .map_or(MEDIA_TYPE_JSON, |(kind, _)| kind);
+                            if kind == MEDIA_SUBTYPE_ANY || kind == default_kind {
+                                return Ok(Self::Json);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Err(format!(
+            "Invalid accept type specified: {accepts}; accepts must be one of \
+             {MEDIA_TYPE_JSON}, {MEDIA_TYPE_YAML}"
+        ))
+    }
+
+    /// The file extension the downloaded export carries; see [`content_disposition`].
+    fn file_extension(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Yaml => "yaml",
+        }
+    }
+
+    /// `document` as the bytes of the export body.
+    ///
+    /// `Err` carries the message for a document the serializer could not write. Neither
+    /// writer can fail on a document built by this module — it is a finite tree of
+    /// strings, numbers, booleans, arrays and string-keyed objects — so this is the
+    /// impossible case, reported as such rather than answered with a body in the other
+    /// spelling than the `contentType` says.
+    fn render(self, document: &Value) -> Result<Vec<u8>, String> {
+        match self {
+            // Pretty-printed: an export is a document a developer downloads and reads.
+            Self::Json => ::serde_json::to_string_pretty(document)
+                .map(String::into_bytes)
+                .map_err(|error| format!("the export could not be written as JSON: {error}")),
+            Self::Yaml => yaml_text(document).map(String::into_bytes),
+        }
+    }
+}
+
+/// The vendor extensions a request's `parameters` ask the export to carry.
+#[derive(Debug, Clone, Copy, Default)]
+struct Extensions {
+    /// `extensions=integrations` / `extensions=apigateway`.
+    integrations: bool,
+    /// `extensions=authorizers`.
+    authorizers: bool,
+    /// `extensions=apigateway`: API Gateway's own extension set, which carries the
+    /// extensions describing the API itself beside the per-method ones.
+    apigateway: bool,
+}
+
+/// The YAML spelling of `document`, emitted by the YAML crate this service already parses
+/// an API definition with rather than by a second hand-written writer.
+///
+/// A mapping keeps the order it was built in (the emitter's hash preserves insertion
+/// order), so the YAML and the JSON spelling of one export carry the same document.
+/// `Err` carries the emitter's refusal, which a document built by this module cannot
+/// provoke (see [`Serialization::render`]).
+fn yaml_text(document: &Value) -> Result<String, String> {
+    let mut rendered = String::new();
+    let mut emitter = ::yaml_rust2::emitter::YamlEmitter::new(&mut rendered);
+    emitter
+        .dump(&yaml_node(document))
+        .map_err(|error| format!("the export could not be written as YAML: {error}"))?;
+    rendered.push('\n');
+    Ok(rendered)
+}
+
+/// One node of [`yaml_text`]'s document.
+fn yaml_node(value: &Value) -> ::yaml_rust2::yaml::Yaml {
+    use ::yaml_rust2::yaml::Yaml;
+    match value {
+        Value::Null => Yaml::Null,
+        Value::Bool(flag) => Yaml::Boolean(*flag),
+        Value::Number(number) => number
+            .as_i64()
+            .map_or_else(|| Yaml::Real(number.to_string()), Yaml::Integer),
+        Value::String(text) => Yaml::String(text.clone()),
+        Value::Array(items) => Yaml::Array(items.iter().map(yaml_node).collect()),
+        Value::Object(entries) => Yaml::Hash(
+            entries
+                .iter()
+                .map(|(key, value)| (Yaml::String(key.clone()), yaml_node(value)))
+                .collect(),
+        ),
+    }
+}
+
+/// The extensions `parameters` asks for.
+///
+/// A key the member documents no meaning for is ignored, as a query string parameter a
+/// service does not read is. An `extensions` value outside the documented set is refused
+/// with the member and the values it accepts named; a `postman` that ASKS for the Postman
+/// extensions is answered by [`postman_not_generated`].
+fn read_extensions(
+    parameters: Option<&HashMap<String, String>>,
+) -> Result<Extensions, GetExportError> {
+    let mut extensions = Extensions::default();
+    let Some(parameters) = parameters else {
+        return Ok(extensions);
+    };
+    // `postman` is a flag: it is written with no value at all (`?postman`), so a key with
+    // an empty value asks for it, and only a value that says otherwise turns it off.
+    if parameters
+        .get(POSTMAN_PARAMETER)
+        .is_some_and(|value| !DISABLED_FLAG_VALUES.contains(&value.trim().to_ascii_lowercase().as_str()))
+    {
+        return Err(postman_not_generated());
+    }
+    let Some(requested) = parameters.get(EXTENSIONS_PARAMETER) else {
+        return Ok(extensions);
+    };
+    // "any combination of the following parameters are supported", so one `extensions`
+    // value may name several of them.
+    for name in requested
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        if EXTENSIONS_INTEGRATIONS.contains(&name) {
+            extensions.integrations = true;
+            if name == EXTENSIONS_APIGATEWAY {
+                extensions.apigateway = true;
+            }
+        } else if name == EXTENSIONS_AUTHORIZERS {
+            extensions.authorizers = true;
+        } else {
+            return Err(GetExportErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "Invalid extensions specified: {name}; extensions must be one of {}, \
+                     {EXTENSIONS_AUTHORIZERS}",
+                    EXTENSIONS_INTEGRATIONS.join(", ")
+                )),
+            })
+            .into());
+        }
+    }
+    Ok(extensions)
+}
+
+/// What `GetExport` answers when a document this module built could not be WRITTEN.
+///
+/// Neither writer can fail on such a document (see [`Serialization::render`]), so this is
+/// the impossible case; it is reported on the emulator's own channel, as
+/// [`crate::state::state_unavailable`] reports the other one, rather than as a
+/// `BadRequestException` that would blame the request for a failure of this emulator.
+fn export_not_written(reason: String) -> GetExportError {
+    crate::scaffolded::Scaffolded::NotImplemented(crate::scaffolded::NotImplemented {
+        message: reason,
+    })
+}
+
+/// What `GetExport` answers a `postman` parameter with.
+///
+/// The parameter asks for "Postman extensions, allowing for import to the Postman tool":
+/// a second vendor's extension set this emulator has no record to render and does not
+/// generate. A document returned without them would be an export the caller asked for and
+/// did not get, so the call is answered as the not-written-yet it is rather than silently
+/// serving the plain definition.
+fn postman_not_generated() -> GetExportError {
+    crate::scaffolded::Scaffolded::NotImplemented(crate::scaffolded::NotImplemented {
+        message: format!(
+            "the Postman extensions GetExport's {POSTMAN_PARAMETER} parameter asks for are \
+             not generated by this emulator; export without that parameter for the OpenAPI \
+             definition itself"
+        ),
+    })
+}
+
+/// The `Content-Disposition` of the exported file: an attachment named for the export type
+/// and the instant it was taken, which is the form API Gateway's own CLI examples show
+/// (`attachment; filename="swagger_2018-04-11T22:08:08Z.json"`).
+fn content_disposition(export_type: &str, serialization: Serialization) -> String {
+    let stamp = crate::state::now()
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default();
+    format!(
+        "attachment; filename=\"{export_type}_{stamp}.{}\"",
+        serialization.file_extension()
+    )
+}
+
+/// The default invoke host of `api_id` in `region`:
+/// `{api-id}.execute-api.{region}.amazonaws.com`, from
+/// `RestApi$disableExecuteApiEndpoint`. Built from the same label the data plane claims a
+/// request on ([`crate::service::invoke::EXECUTE_API_LABEL`]), so the endpoint this
+/// document names is the endpoint the emulator answers.
+fn invoke_host(api_id: &str, region: &str) -> String {
+    format!(
+        "{api_id}.{}.{region}.amazonaws.com",
+        crate::service::invoke::EXECUTE_API_LABEL
+    )
+}
+
+/// The document a `GetExport` call answers with.
+fn export_document(
+    api: &RestApiEntry,
+    stage: &StageEntry,
+    deployment: &DeploymentEntry,
+    region: &str,
+    dialect: Dialect,
+    extensions: Extensions,
+) -> Value {
+    let mut schemes = Map::new();
+    let mut paths = Map::new();
+    // The deployment's own resource tree, by path: the definition is of what the stage
+    // SERVES, so a resource created after this deployment is not in it until the API is
+    // redeployed.
+    let mut resources: Vec<&ResourceEntry> = deployment.resources.values().collect();
+    resources.sort_by(|left, right| left.path.cmp(&right.path));
+    for resource in resources {
+        // A resource with no method describes no operation, so it is not a path of the
+        // definition.
+        if resource.methods.is_empty() {
+            continue;
+        }
+        let mut item = Map::new();
+        for (verb, method) in &resource.methods {
+            item.insert(
+                operation_key(verb),
+                operation_object(api, resource, method, dialect, extensions, &mut schemes),
+            );
+        }
+        paths.insert(resource.path.clone(), Value::Object(item));
+    }
+
+    let mut document = Map::new();
+    let host = invoke_host(&api.id, region);
+    match dialect {
+        Dialect::Swagger => {
+            document.insert("swagger".to_string(), Value::from(SWAGGER_DOCUMENT_VERSION));
+            document.insert("info".to_string(), info_object(api, deployment));
+            document.insert("host".to_string(), Value::from(host));
+            // A 2.0 `basePath` "MUST start with a leading slash".
+            document.insert(
+                "basePath".to_string(),
+                Value::from(format!("/{}", stage.stage_name)),
+            );
+            document.insert(
+                "schemes".to_string(),
+                Value::Array(vec![Value::from(INVOKE_SCHEME)]),
+            );
+            document.insert("paths".to_string(), Value::Object(paths));
+            if !schemes.is_empty() {
+                document.insert("securityDefinitions".to_string(), Value::Object(schemes));
+            }
+        }
+        Dialect::Oas30 => {
+            document.insert("openapi".to_string(), Value::from(OAS30_DOCUMENT_VERSION));
+            document.insert("info".to_string(), info_object(api, deployment));
+            document.insert(
+                "servers".to_string(),
+                Value::Array(vec![server_object(&host, &stage.stage_name)]),
+            );
+            document.insert("paths".to_string(), Value::Object(paths));
+            if !schemes.is_empty() {
+                let mut components = Map::new();
+                components.insert("securitySchemes".to_string(), Value::Object(schemes));
+                document.insert("components".to_string(), Value::Object(components));
+            }
+        }
+    }
+    if extensions.apigateway {
+        if let Some(responses) = gateway_responses_extension(api) {
+            document.insert(GATEWAY_RESPONSES_EXTENSION.to_string(), responses);
+        }
+    }
+    if !api.binary_media_types.is_empty() {
+        document.insert(
+            super::put_rest_api::BINARY_MEDIA_TYPES_EXTENSION.to_string(),
+            Value::Array(
+                api.binary_media_types
+                    .iter()
+                    .map(|media_type| Value::from(media_type.as_str()))
+                    .collect(),
+            ),
+        );
+    }
+    Value::Object(document)
+}
+
+/// The one server of an `oas30` document: the stage's invoke URL, with the stage name as
+/// the `{basePath}` variable's value.
+fn server_object(host: &str, stage_name: &str) -> Value {
+    let mut default = Map::new();
+    default.insert("default".to_string(), Value::from(stage_name));
+    let mut variables = Map::new();
+    variables.insert(BASE_PATH_VARIABLE.to_string(), Value::Object(default));
+    let mut server = Map::new();
+    server.insert(
+        "url".to_string(),
+        Value::from(format!("{INVOKE_SCHEME}://{host}/{{{BASE_PATH_VARIABLE}}}")),
+    );
+    server.insert("variables".to_string(), Value::Object(variables));
+    Value::Object(server)
+}
+
+/// The document's `info`: the API's own name, description and version.
+///
+/// `version` is required of an OpenAPI document and optional on a `RestApi`, so an API
+/// that carries none is exported under what identifies the definition being exported —
+/// the instant the deployment was created, else the deployment's id. Both are stored
+/// values, so two exports of one stage carry the same `info`.
+fn info_object(api: &RestApiEntry, deployment: &DeploymentEntry) -> Value {
+    let mut info = Map::new();
+    info.insert("title".to_string(), Value::from(api.name.as_str()));
+    if let Some(description) = &api.description {
+        info.insert("description".to_string(), Value::from(description.as_str()));
+    }
+    let version = api.version.clone().unwrap_or_else(|| {
+        deployment
+            .created_date
+            .and_then(|at| at.fmt(::aws_smithy_types::date_time::Format::DateTime).ok())
+            .unwrap_or_else(|| deployment.id.clone())
+    });
+    info.insert("version".to_string(), Value::from(version));
+    Value::Object(info)
+}
+
+/// The Path Item Object key a method's verb is exported under: the lowercased verb, or
+/// API Gateway's `ANY` extension key.
+///
+/// Read out of the table the IMPORT side maps the same keys back to verbs with
+/// ([`crate::ops::put_rest_api::OPERATION_KEYS`]), so a definition exported from an API
+/// and imported again names the same methods.
+fn operation_key(verb: &str) -> String {
+    super::put_rest_api::OPERATION_KEYS
+        .iter()
+        .find(|(_, candidate)| *candidate == verb)
+        .map_or_else(|| verb.to_ascii_lowercase(), |(key, _)| (*key).to_string())
+}
+
+/// One method of the deployment, as the Operation Object it is exported as.
+fn operation_object(
+    api: &RestApiEntry,
+    resource: &ResourceEntry,
+    method: &MethodEntry,
+    dialect: Dialect,
+    extensions: Extensions,
+    schemes: &mut Map<String, Value>,
+) -> Value {
+    let mut operation = Map::new();
+    // `operationName` is "a human-friendly operation identifier" of the method
+    // (`Method$operationName`), which is what an OpenAPI `operationId` is.
+    if let Some(name) = &method.operation_name {
+        operation.insert("operationId".to_string(), Value::from(name.as_str()));
+    }
+    let parameters = parameter_objects(resource, method, dialect);
+    if !parameters.is_empty() {
+        operation.insert("parameters".to_string(), Value::Array(parameters));
+    }
+    operation.insert("responses".to_string(), responses_object(method, dialect));
+    let security = security_requirement(api, method, extensions, schemes);
+    if let Some(security) = security {
+        operation.insert("security".to_string(), Value::Array(vec![security]));
+    }
+    if extensions.integrations {
+        if let Some(integration) = &method.integration {
+            operation.insert(
+                INTEGRATION_EXTENSION.to_string(),
+                integration_extension(integration),
+            );
+        }
+    }
+    Value::Object(operation)
+}
+
+/// The Parameter Objects of one method: the parameters the resource's path template
+/// declares, then the request parameters the method declares.
+///
+/// A path template expression has to have a matching path parameter for the document to
+/// be a valid OpenAPI definition, so the template's own parameters are always rendered —
+/// a `method.request.path.{name}` entry for one of them is that same parameter, not a
+/// second one.
+fn parameter_objects(
+    resource: &ResourceEntry,
+    method: &MethodEntry,
+    dialect: Dialect,
+) -> Vec<Value> {
+    let template = path_parameters(&resource.path);
+    let mut parameters: Vec<Value> = template
+        .iter()
+        .map(|name| parameter_object(name, PATH_LOCATION, true, dialect))
+        .collect();
+    for (expression, required) in &method.request_parameters {
+        let Some((location, name)) = request_parameter(expression) else {
+            continue;
+        };
+        if location == PATH_LOCATION && template.iter().any(|declared| declared == name) {
+            continue;
+        }
+        parameters.push(parameter_object(name, location, *required, dialect));
+    }
+    parameters
+}
+
+/// The parameter names a resource path's template declares, in path order: `/pets/{petId}`
+/// declares `petId`, and the greedy `{proxy+}` path part declares `proxy`.
+fn path_parameters(path: &str) -> Vec<String> {
+    path.split('/')
+        .filter_map(|segment| segment.strip_prefix('{')?.strip_suffix('}'))
+        .map(|name| name.trim_end_matches('+').to_string())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// A `method.request.{location}.{name}` mapping expression as the OpenAPI parameter
+/// location and name it names; `None` for a key outside that documented form.
+fn request_parameter(expression: &str) -> Option<(&'static str, &str)> {
+    let rest = expression.strip_prefix(REQUEST_PARAMETER_PREFIX)?;
+    REQUEST_PARAMETER_LOCATIONS
+        .iter()
+        .find_map(|(segment, location)| {
+            rest.strip_prefix(segment)
+                .filter(|name| !name.is_empty())
+                .map(|name| (*location, name))
+        })
+}
+
+/// One Parameter Object. A path parameter is always required, which both OpenAPI versions
+/// demand of one ("If the parameter location is 'path' … its value MUST be true").
+fn parameter_object(name: &str, location: &str, required: bool, dialect: Dialect) -> Value {
+    let mut parameter = Map::new();
+    parameter.insert("name".to_string(), Value::from(name));
+    parameter.insert("in".to_string(), Value::from(location));
+    parameter.insert(
+        "required".to_string(),
+        Value::from(required || location == PATH_LOCATION),
+    );
+    match dialect {
+        Dialect::Swagger => {
+            parameter.insert("type".to_string(), Value::from(STRING_SCHEMA_TYPE));
+        }
+        Dialect::Oas30 => {
+            parameter.insert("schema".to_string(), string_schema());
+        }
+    }
+    Value::Object(parameter)
+}
+
+/// The `{"type": "string"}` schema a 3.0 parameter or header carries; see
+/// [`STRING_SCHEMA_TYPE`].
+fn string_schema() -> Value {
+    let mut schema = Map::new();
+    schema.insert("type".to_string(), Value::from(STRING_SCHEMA_TYPE));
+    Value::Object(schema)
+}
+
+/// The Responses Object of one method: one entry per stored `MethodResponse`, carrying the
+/// headers its `responseParameters` declare.
+///
+/// A method response's `responseModels` name `Model` records, which no operation of this
+/// emulator creates yet (`CreateModel` is still a scaffold), so no schema is referenced:
+/// a `$ref` to a definition the document does not carry would be a dangling reference
+/// rather than an exported model.
+fn responses_object(method: &MethodEntry, dialect: Dialect) -> Value {
+    let mut responses = Map::new();
+    for (status_code, response) in &method.method_responses {
+        let mut body = Map::new();
+        body.insert(
+            "description".to_string(),
+            Value::from(format!("{status_code} response")),
+        );
+        let headers = header_objects(response, dialect);
+        if !headers.is_empty() {
+            body.insert("headers".to_string(), Value::Object(headers));
+        }
+        responses.insert(status_code.clone(), Value::Object(body));
+    }
+    Value::Object(responses)
+}
+
+/// The Header Objects of one method response: the `method.response.header.{name}` mapping
+/// expressions its `responseParameters` declare, by header name.
+fn header_objects(response: &GetMethodResponseOutput, dialect: Dialect) -> Map<String, Value> {
+    let mut headers = Map::new();
+    // A `BTreeMap` first, so the document's header order does not depend on a `HashMap`'s
+    // iteration order.
+    let declared: BTreeMap<&String, &bool> = response
+        .response_parameters
+        .as_ref()
+        .map(|parameters| parameters.iter().collect())
+        .unwrap_or_default();
+    for expression in declared.into_keys() {
+        let Some(name) =
+            expression.strip_prefix(super::put_method_response::METHOD_RESPONSE_HEADER_PREFIX)
+        else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let mut header = Map::new();
+        match dialect {
+            Dialect::Swagger => {
+                header.insert("type".to_string(), Value::from(STRING_SCHEMA_TYPE));
+            }
+            Dialect::Oas30 => {
+                header.insert("schema".to_string(), string_schema());
+            }
+        }
+        headers.insert(name.to_string(), Value::Object(header));
+    }
+    headers
+}
+
+/// The one Security Requirement Object of a method, or `None` for a method that needs no
+/// authorization at all.
+///
+/// Every scheme a method needs is named in ONE requirement object, because the entries of
+/// one object all have to be satisfied: a method with `apiKeyRequired` and an
+/// `authorizationType` needs both. The schemes themselves are collected into the
+/// document's own scheme map as they are named. An authorization the method carries is
+/// never dropped from the document: a method authorized by an `Authorizer` whose record
+/// cannot be read still exports a scheme, named by the `authorizerId` it carries, so the
+/// document cannot describe a guarded method as an open one — and a name that would
+/// overwrite a DIFFERENT scheme already in the document (a reserved one, or another
+/// authorizer of the same name) is disambiguated by [`unique_scheme_name`], so no method
+/// ends up pointing at a scheme that is not its own.
+fn security_requirement(
+    api: &RestApiEntry,
+    method: &MethodEntry,
+    extensions: Extensions,
+    schemes: &mut Map<String, Value>,
+) -> Option<Value> {
+    let mut requirement = Map::new();
+    if method.authorization_type == AUTHORIZATION_AWS_IAM {
+        schemes.insert(SIGV4_SCHEME_NAME.to_string(), sigv4_scheme());
+        requirement.insert(SIGV4_SCHEME_NAME.to_string(), Value::Array(Vec::new()));
+    } else if AUTHORIZATION_BY_AUTHORIZER.contains(&method.authorization_type.as_str()) {
+        // The authorizer record lives on the API: a deployment snapshots the resource
+        // tree, and `Method$authorizerId` names an `Authorizer` of the API.
+        let authorizer = method
+            .authorizer_id
+            .as_deref()
+            .and_then(|id| api.authorizers.get(id));
+        let scheme = match authorizer {
+            Some(authorizer) => authorizer_scheme(authorizer, extensions),
+            None => unresolved_authorizer_scheme(&method.authorization_type),
+        };
+        let proposed = authorizer.map_or_else(
+            || {
+                method
+                    .authorizer_id
+                    .clone()
+                    .unwrap_or_else(|| method.authorization_type.to_ascii_lowercase())
+            },
+            |authorizer| authorizer.name.clone(),
+        );
+        let name = unique_scheme_name(
+            proposed,
+            method.authorizer_id.as_deref(),
+            &scheme,
+            schemes,
+        );
+        schemes.insert(name.clone(), scheme);
+        requirement.insert(
+            name,
+            Value::Array(
+                method
+                    .authorization_scopes
+                    .iter()
+                    .map(|scope| Value::from(scope.as_str()))
+                    .collect(),
+            ),
+        );
+    }
+    if method.api_key_required {
+        schemes.insert(API_KEY_SCHEME_NAME.to_string(), api_key_scheme());
+        requirement.insert(API_KEY_SCHEME_NAME.to_string(), Value::Array(Vec::new()));
+    }
+    (!requirement.is_empty()).then_some(Value::Object(requirement))
+}
+
+/// The key `scheme` is exported under: `proposed` where that key is free or already holds
+/// this very scheme, and a qualified key otherwise.
+///
+/// A document's schemes live in ONE map, while an authorizer's name is the caller's and
+/// need be neither unique nor different from the names this export reserves for the
+/// SigV4 and API-key schemes. The key is therefore qualified — by the authorizer's id,
+/// which is unique by construction, and then by a counter — until it names nothing else,
+/// so every definition stays in the document and a method's requirement always names the
+/// scheme it is actually guarded by.
+fn unique_scheme_name(
+    proposed: String,
+    authorizer_id: Option<&str>,
+    scheme: &Value,
+    schemes: &Map<String, Value>,
+) -> String {
+    let taken = |name: &str| -> bool {
+        RESERVED_SCHEME_NAMES.contains(&name)
+            || schemes
+                .get(name)
+                .is_some_and(|existing| existing != scheme)
+    };
+    if !taken(&proposed) {
+        return proposed;
+    }
+    if let Some(authorizer_id) = authorizer_id {
+        let qualified = format!("{proposed}-{authorizer_id}");
+        if !taken(&qualified) {
+            return qualified;
+        }
+    }
+    // A counter, so the key this returns is never one that names another scheme: the
+    // document holds finitely many schemes, so some suffix is free.
+    for discriminator in 2..=schemes.len().saturating_add(2) {
+        let qualified = format!("{proposed}-{discriminator}");
+        if !taken(&qualified) {
+            return qualified;
+        }
+    }
+    proposed
+}
+
+/// The security scheme of a method whose `authorizationType` names an `Authorizer` the
+/// API has no record for: the kind of authorization the METHOD carries, in the header a
+/// token is presented in, with no extension to render from a record that is not there.
+fn unresolved_authorizer_scheme(authorization_type: &str) -> Value {
+    let mut scheme = Map::new();
+    scheme.insert("type".to_string(), Value::from(API_KEY_SCHEME_TYPE));
+    scheme.insert("name".to_string(), Value::from(AUTHORIZATION_HEADER));
+    scheme.insert("in".to_string(), Value::from(HEADER_LOCATION));
+    scheme.insert(
+        AUTHTYPE_EXTENSION.to_string(),
+        Value::from(authtype(authorization_type == AUTHORIZATION_COGNITO_USER_POOLS)),
+    );
+    Value::Object(scheme)
+}
+
+/// The `x-amazon-apigateway-authtype` of an authorization served by an authorizer: the
+/// Cognito one, or the custom one every other authorizer is.
+fn authtype(cognito: bool) -> &'static str {
+    if cognito {
+        AUTHTYPE_COGNITO
+    } else {
+        AUTHTYPE_CUSTOM
+    }
+}
+
+/// The security scheme of an `AWS_IAM` method: the SigV4 credential in the
+/// `Authorization` header.
+fn sigv4_scheme() -> Value {
+    let mut scheme = Map::new();
+    scheme.insert("type".to_string(), Value::from(API_KEY_SCHEME_TYPE));
+    scheme.insert("name".to_string(), Value::from(AUTHORIZATION_HEADER));
+    scheme.insert("in".to_string(), Value::from(HEADER_LOCATION));
+    scheme.insert(AUTHTYPE_EXTENSION.to_string(), Value::from(AUTHTYPE_SIGV4));
+    Value::Object(scheme)
+}
+
+/// The security scheme of a method with `apiKeyRequired`: the API key in its header.
+fn api_key_scheme() -> Value {
+    let mut scheme = Map::new();
+    scheme.insert("type".to_string(), Value::from(API_KEY_SCHEME_TYPE));
+    scheme.insert("name".to_string(), Value::from(API_KEY_HEADER));
+    scheme.insert("in".to_string(), Value::from(HEADER_LOCATION));
+    Value::Object(scheme)
+}
+
+/// The security scheme of a method authorized by `authorizer`, carrying the authorizer
+/// extension when the request asked for it.
+fn authorizer_scheme(authorizer: &AuthorizerEntry, extensions: Extensions) -> Value {
+    let mut scheme = Map::new();
+    scheme.insert("type".to_string(), Value::from(API_KEY_SCHEME_TYPE));
+    scheme.insert("name".to_string(), Value::from(identity_header(authorizer)));
+    scheme.insert("in".to_string(), Value::from(HEADER_LOCATION));
+    scheme.insert(
+        AUTHTYPE_EXTENSION.to_string(),
+        Value::from(authtype(authorizer.r#type == AUTHORIZER_TYPE_COGNITO)),
+    );
+    if extensions.authorizers {
+        scheme.insert(
+            AUTHORIZER_EXTENSION.to_string(),
+            authorizer_extension(authorizer),
+        );
+    }
+    Value::Object(scheme)
+}
+
+/// The header an authorizer's identity is carried in: the header its `identitySource`
+/// mapping expression names ("the mapping expression is method.request.header.Auth",
+/// `Authorizer$identitySource`), and `Authorization` for an authorizer whose identity
+/// source is not a single header expression.
+fn identity_header(authorizer: &AuthorizerEntry) -> String {
+    authorizer
+        .identity_source
+        .as_deref()
+        .and_then(|source| request_parameter(source.trim()))
+        .filter(|(location, _)| *location == HEADER_LOCATION)
+        .map_or_else(
+            || AUTHORIZATION_HEADER.to_string(),
+            |(_, name)| name.to_string(),
+        )
+}
+
+/// One `Authorizer` as the `x-amazon-apigateway-authorizer` object a method's scheme
+/// carries: the record's own members, under the extension's own names.
+fn authorizer_extension(authorizer: &AuthorizerEntry) -> Value {
+    let mut extension = Map::new();
+    extension.insert(
+        "type".to_string(),
+        Value::from(authorizer.r#type.to_ascii_lowercase()),
+    );
+    for (key, value) in [
+        ("authorizerUri", &authorizer.authorizer_uri),
+        ("authorizerCredentials", &authorizer.authorizer_credentials),
+        ("identitySource", &authorizer.identity_source),
+        (
+            "identityValidationExpression",
+            &authorizer.identity_validation_expression,
+        ),
+    ] {
+        if let Some(value) = value {
+            extension.insert(key.to_string(), Value::from(value.as_str()));
+        }
+    }
+    extension.insert(
+        "authorizerResultTtlInSeconds".to_string(),
+        Value::from(authorizer.authorizer_result_ttl_in_seconds),
+    );
+    if !authorizer.provider_arns.is_empty() {
+        extension.insert(
+            "providerARNs".to_string(),
+            Value::Array(
+                authorizer
+                    .provider_arns
+                    .iter()
+                    .map(|arn| Value::from(arn.as_str()))
+                    .collect(),
+            ),
+        );
+    }
+    Value::Object(extension)
+}
+
+/// One `Integration` as the `x-amazon-apigateway-integration` object of its method: the
+/// stored record's members under the extension's own names, with its integration
+/// responses keyed the way the extension keys them — by the selection pattern that picks
+/// the response, and `default` for the one that has none.
+///
+/// The extension writes the integration's `type` in lower case (`mock`, `aws_proxy`,
+/// `http`), which is the spelling the import side of an API definition reads.
+fn integration_extension(integration: &GetIntegrationOutput) -> Value {
+    let mut extension = Map::new();
+    if let Some(kind) = &integration.r#type {
+        extension.insert("type".to_string(), Value::from(kind.to_ascii_lowercase()));
+    }
+    for (key, value) in [
+        ("httpMethod", &integration.http_method),
+        ("uri", &integration.uri),
+        ("connectionType", &integration.connection_type),
+        ("connectionId", &integration.connection_id),
+        ("credentials", &integration.credentials),
+        ("passthroughBehavior", &integration.passthrough_behavior),
+        ("contentHandling", &integration.content_handling),
+        ("cacheNamespace", &integration.cache_namespace),
+    ] {
+        if let Some(value) = value {
+            extension.insert(key.to_string(), Value::from(value.as_str()));
+        }
+    }
+    for (key, value) in [
+        ("requestParameters", &integration.request_parameters),
+        ("requestTemplates", &integration.request_templates),
+    ] {
+        if let Some(value) = value.as_ref().filter(|map| !map.is_empty()) {
+            extension.insert(key.to_string(), string_map(value));
+        }
+    }
+    extension.insert(
+        "timeoutInMillis".to_string(),
+        Value::from(integration.timeout_in_millis),
+    );
+    if let Some(parameters) = integration
+        .cache_key_parameters
+        .as_ref()
+        .filter(|parameters| !parameters.is_empty())
+    {
+        extension.insert(
+            "cacheKeyParameters".to_string(),
+            Value::Array(
+                parameters
+                    .iter()
+                    .map(|parameter| Value::from(parameter.as_str()))
+                    .collect(),
+            ),
+        );
+    }
+    let responses = integration_responses(integration);
+    if !responses.is_empty() {
+        extension.insert("responses".to_string(), Value::Object(responses));
+    }
+    if let Some(tls) = &integration.tls_config {
+        let mut rendered = Map::new();
+        rendered.insert(
+            "insecureSkipVerification".to_string(),
+            Value::from(tls.insecure_skip_verification),
+        );
+        extension.insert("tlsConfig".to_string(), Value::Object(rendered));
+    }
+    Value::Object(extension)
+}
+
+/// The `responses` of an integration extension; see [`integration_extension`].
+fn integration_responses(integration: &GetIntegrationOutput) -> Map<String, Value> {
+    let mut responses = Map::new();
+    let stored: BTreeMap<&String, &GetIntegrationResponseOutput> = integration
+        .integration_responses
+        .as_ref()
+        .map(|stored| stored.iter().collect())
+        .unwrap_or_default();
+    for response in stored.into_values() {
+        let mut rendered = Map::new();
+        if let Some(status_code) = &response.status_code {
+            rendered.insert("statusCode".to_string(), Value::from(status_code.as_str()));
+        }
+        for (key, value) in [
+            ("responseParameters", &response.response_parameters),
+            ("responseTemplates", &response.response_templates),
+        ] {
+            if let Some(value) = value.as_ref().filter(|map| !map.is_empty()) {
+                rendered.insert(key.to_string(), string_map(value));
+            }
+        }
+        if let Some(content_handling) = &response.content_handling {
+            rendered.insert(
+                "contentHandling".to_string(),
+                Value::from(content_handling.as_str()),
+            );
+        }
+        // "default" is the response with no selection pattern — the one API Gateway picks
+        // when no pattern matches.
+        let key = response
+            .selection_pattern
+            .as_deref()
+            .filter(|pattern| !pattern.is_empty())
+            .unwrap_or("default");
+        responses.insert(key.to_string(), Value::Object(rendered));
+    }
+    responses
+}
+
+/// The API's gateway responses as the `x-amazon-apigateway-gateway-responses` object,
+/// keyed by `responseType`, each carrying the status code, response parameters and
+/// response templates its record holds; `None` for an API that configured none.
+///
+/// This describes the API ITSELF rather than one of its methods, so it is part of API
+/// Gateway's own extension set: a request that asks for that set (`extensions=apigateway`)
+/// gets it, and a request that asks for a method-level extension only, or for no extension
+/// at all, gets the definition without it. Only the CUSTOMIZED responses are part of what
+/// the extension describes: a response type the API carries no record for is answered by
+/// the response API Gateway generates itself (`RestApiEntry::gateway_responses`), which
+/// nothing configured and so nothing exports.
+fn gateway_responses_extension(api: &RestApiEntry) -> Option<Value> {
+    let mut responses = Map::new();
+    for (response_type, response) in &api.gateway_responses {
+        let mut rendered = Map::new();
+        if let Some(status_code) = &response.status_code {
+            rendered.insert("statusCode".to_string(), Value::from(status_code.as_str()));
+        }
+        for (key, value) in [
+            ("responseParameters", &response.response_parameters),
+            ("responseTemplates", &response.response_templates),
+        ] {
+            if let Some(value) = value.as_ref().filter(|map| !map.is_empty()) {
+                rendered.insert(key.to_string(), string_map(value));
+            }
+        }
+        responses.insert(response_type.clone(), Value::Object(rendered));
+    }
+    (!responses.is_empty()).then_some(Value::Object(responses))
+}
+
+/// One `map<string,string>` of a record as a document object, with its entries in key
+/// order so the exported document does not depend on a `HashMap`'s iteration order.
+fn string_map(values: &HashMap<String, String>) -> Value {
+    let ordered: BTreeMap<&String, &String> = values.iter().collect();
+    Value::Object(
+        ordered
+            .into_iter()
+            .map(|(key, value)| (key.clone(), Value::from(value.as_str())))
+            .collect(),
+    )
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -167,18 +1351,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetExport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetExportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetExport"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let bad_request = |message: String| -> Self::Error {
+            GetExportErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // What the request asks for is resolved before the store is read, so a request
+        // naming an export this service does not produce is refused the same way whether
+        // or not the API exists.
+        let dialect = Dialect::parse(&input.export_type).map_err(bad_request)?;
+        let serialization = Serialization::parse(input.accepts.as_deref()).map_err(bad_request)?;
+        let extensions = read_extensions(input.parameters.as_ref())?;
+        let region = crate::state::request_region(ctx.parts());
+
+        let store = state.lock();
+        let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
+            GetExportErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
+            })
+        })?;
+        let stage = api.stages.get(&input.stage_name).ok_or_else(|| {
+            GetExportErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_STAGE.to_string()),
+            })
+        })?;
+        // The stage serves ONE deployment, and that deployment is the definition this
+        // export renders.
+        let deployment = api.deployments.get(&stage.deployment_id).ok_or_else(|| {
+            GetExportErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_DEPLOYMENT.to_string()),
+            })
+        })?;
+
+        let document = export_document(api, stage, deployment, &region, dialect, extensions);
+        let body = serialization
+            .render(&document)
+            .map_err(export_not_written)?;
+        Ok(GetExportOutput {
+            content_type: Some(MEDIA_TYPE_OCTET_STREAM.to_string()),
+            content_disposition: Some(content_disposition(&input.export_type, serialization)),
+            body: Some(body),
+        })
     }
 }

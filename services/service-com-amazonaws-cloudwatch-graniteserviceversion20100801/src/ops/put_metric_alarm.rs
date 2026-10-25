@@ -9,6 +9,13 @@
 //! by `InstanceId`; any other request carrying one is refused with HTTP 400
 //! `ValidationError` and stores nothing.
 //!
+//! The same refusal answers a configuration CloudWatch would not create: a `Period` it does
+//! not evaluate on (10, 20, 30 or a multiple of 60), a total evaluation period
+//! (`Period` x `EvaluationPeriods`) past the published ceiling, a `Period` no clock boundary
+//! matches on an alarm whose `EvaluationWindow` is a wall clock window, and a `Metrics` query
+//! array that does not resolve to the single time series an alarm watches. Each is checked
+//! before the write, so a refused request stores nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -252,6 +259,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::HashSet;
+
 /// The dimension that makes a metric a per-instance EC2 metric: an EC2 instance action can
 /// only ever execute against the instance the alarm's metric names, and `InstanceId` is the
 /// dimension that names it.
@@ -364,6 +373,353 @@ fn carries_unsatisfiable_ec2_action(input: &PutMetricAlarmInput) -> bool {
     .any(|arn| is_ec2_instance_action(arn))
 }
 
+/// The sub-minute `Period` values an ALARM is evaluated on: "Valid values are 10, 20, 30, and
+/// any multiple of 60." (`PutMetricAlarmInput$Period`).
+///
+/// Narrower than the periods a metric may be READ at (`crate::state::SUB_MINUTE_PERIODS`,
+/// which also admits 1 and 5): a read aggregates stored datapoints on demand, while an alarm
+/// has to be SCHEDULED at its period, and these are the sub-minute cadences CloudWatch
+/// schedules.
+const HIGH_RESOLUTION_ALARM_PERIODS: [i32; 3] = [10, 20, 30];
+
+/// One minute in seconds: every alarm period that is not high resolution is a multiple of it.
+const REGULAR_PERIOD_SECS: i32 = 60;
+
+/// One hour in seconds, the resolution boundary the evaluation-horizon ceiling turns on:
+/// "For alarms with a period of less than one hour (3,600 seconds), the total evaluation
+/// period can't be longer than one day (86,400 seconds)." (`PutMetricAlarmInput$Period`).
+const ONE_HOUR_SECS: i64 = 3_600;
+
+/// The longest total evaluation period an alarm may cover: "An alarm's total current
+/// evaluation period can be no longer than seven days, so `Period` multiplied by
+/// `EvaluationPeriods` can't be more than 604,800 seconds." (`PutMetricAlarmInput$Period`).
+const MAX_HORIZON_SECS: i64 = 604_800;
+
+/// The same ceiling for an alarm whose period is shorter than [`ONE_HOUR_SECS`]: one day.
+const MAX_SUB_HOUR_HORIZON_SECS: i64 = 86_400;
+
+/// The refusal for an evaluation horizon past [`MAX_SUB_HOUR_HORIZON_SECS`], in the words the
+/// rule is published in: "For alarms with a period of less than one hour (3,600 seconds), the
+/// total evaluation period can't be longer than one day (86,400 seconds)."
+/// (`PutMetricAlarmInput$Period`).
+const SUB_HOUR_HORIZON_REFUSAL: &str =
+    "For alarms with a period of less than one hour (3,600 seconds), the total evaluation \
+     period can't be longer than one day (86,400 seconds).";
+
+/// The refusal for an evaluation horizon past [`MAX_HORIZON_SECS`], in the words that rule is
+/// published in: "An alarm's total current evaluation period can be no longer than seven days,
+/// so Period multiplied by EvaluationPeriods can't be more than 604,800 seconds."
+/// (`PutMetricAlarmInput$Period`).
+const HORIZON_REFUSAL: &str =
+    "An alarm's total current evaluation period can be no longer than seven days, so Period \
+     multiplied by EvaluationPeriods can't be more than 604,800 seconds.";
+
+/// The `Period` values an alarm that aligns its evaluated range to clock boundaries may carry:
+/// "When you use a wall clock window, the alarm's period must be 1 minute (60 seconds), 5
+/// minutes (300 seconds), 1 hour (3,600 seconds), 1 day (86,400 seconds), or 1 week (604,800
+/// seconds). Other period values aren't supported with a wall clock window."
+/// (`smithy_query(query="doc",shape="WallClockWindow")`) — the clock boundaries an aligned
+/// window can start at.
+const WALL_CLOCK_PERIODS: [i32; 5] = [60, 300, 3_600, 86_400, 604_800];
+
+/// The refusal for a `Period` no wall clock boundary matches, in the words the rule is
+/// published in (see [`WALL_CLOCK_PERIODS`]).
+const WALL_CLOCK_PERIOD_REFUSAL: &str =
+    "When you use a wall clock window, the alarm's period must be 1 minute (60 seconds), 5 \
+     minutes (300 seconds), 1 hour (3,600 seconds), 1 day (86,400 seconds), or 1 week (604,800 \
+     seconds). Other period values aren't supported with a wall clock window.";
+
+/// The metric math function an alarm's expression may not call at all, and CloudWatch's own
+/// refusal for it: a search returns every series its query matches, and an alarm watches one
+/// time series ("Any expression used in a `PutMetricAlarm` operation must return a single time
+/// series.", `MetricDataQuery`).
+const SEARCH_FUNCTION: &str = "SEARCH";
+
+/// CloudWatch's refusal for an alarm expression that calls [`SEARCH_FUNCTION`].
+///
+/// A fixed sentence, not built from the request: the function is unsupported for this kind of
+/// alarm however it is called, so the message names neither the query nor the expression.
+const SEARCH_REFUSAL: &str = "SEARCH is not supported on Metric Alarms.";
+
+/// The envelope CloudWatch wraps a metric math expression refusal in.
+///
+/// The expression is validated by the metrics query service this operation calls, and
+/// CloudWatch reports that call's own failure: its message is the expression error followed by
+/// this envelope, naming the service and the status it answered with. It carries no per-run
+/// value — the request id in it is empty — so it is a fixed part of the refusal's wording.
+const EXPRESSION_REFUSAL_ENVELOPE: &str = " (Service: AmazonCloudWatch; Status Code: 400; \
+                                           Error Code: ValidationException; Request ID: ; \
+                                           Proxy: null)";
+
+/// The metric math functions whose value is MORE than one time series: `METRICS()` returns
+/// every metric the request retrieves (`MetricDataQuery$Expression`, "Metric Math Syntax and
+/// Functions"), so an expression that is one is not the single series an alarm watches unless
+/// a function around it reduces it to one.
+const MULTI_SERIES_FUNCTIONS: [&str; 1] = ["METRICS"];
+
+/// The refusal for an alarm configuration CloudWatch would not create, or `None` when this
+/// request is one it would.
+///
+/// Everything the service checks ACROSS members, which the boundary validator cannot: the
+/// cadence an alarm can be scheduled at, the span its evaluation may cover, and whether its
+/// query array resolves to the single time series an alarm watches. Checked before anything is
+/// written, so a refused request leaves the store exactly as it was.
+fn configuration_refusal(input: &PutMetricAlarmInput) -> Option<String> {
+    if let Some(period) = input.period {
+        if !is_alarm_period(period) {
+            let valid = HIGH_RESOLUTION_ALARM_PERIODS
+                .map(|period| period.to_string())
+                .join(", ");
+            return Some(format!(
+                "Period must be {valid} or a multiple of {REGULAR_PERIOD_SECS}; got {period}"
+            ));
+        }
+        // An aligned window starts at a clock boundary, so only the periods a clock boundary
+        // repeats at can be evaluated in one.
+        if matches!(
+            input.evaluation_window,
+            Some(EvaluationWindow::WallClockWindow(_))
+        ) && !WALL_CLOCK_PERIODS.contains(&period)
+        {
+            return Some(WALL_CLOCK_PERIOD_REFUSAL.to_string());
+        }
+        if let Some(periods) = input.evaluation_periods {
+            let horizon = i64::from(period).saturating_mul(i64::from(periods));
+            if i64::from(period) < ONE_HOUR_SECS {
+                if horizon > MAX_SUB_HOUR_HORIZON_SECS {
+                    return Some(SUB_HOUR_HORIZON_REFUSAL.to_string());
+                }
+            } else if horizon > MAX_HORIZON_SECS {
+                return Some(HORIZON_REFUSAL.to_string());
+            }
+        }
+    }
+    unresolvable_metrics(input)
+}
+
+/// Whether `period` is a cadence an alarm is evaluated at
+/// ([`HIGH_RESOLUTION_ALARM_PERIODS`], or a multiple of [`REGULAR_PERIOD_SECS`]).
+fn is_alarm_period(period: i32) -> bool {
+    HIGH_RESOLUTION_ALARM_PERIODS.contains(&period)
+        || (period >= REGULAR_PERIOD_SECS && period % REGULAR_PERIOD_SECS == 0)
+}
+
+/// Why the request's `Metrics` array does not define the one time series an alarm watches, or
+/// `None` when it does.
+///
+/// Three rules, all from `MetricDataQuery`, whose documentation is written for this operation
+/// as well as for `GetMetricData`:
+///
+/// * "A math expression can use the `Id` of the other metrics or queries to refer to those
+///   metrics" — the ids an expression refers to are the ids of the SAME request's queries, so
+///   an id no query in the array defines resolves to nothing and the alarm could never be
+///   evaluated.
+/// * "Any expression used in a `PutMetricAlarm` operation must return a single time series." —
+///   a search returns every series its query matches, which is why CloudWatch supports the
+///   function in `GetMetricData` and not in an alarm at all, however the call is wrapped.
+/// * The same sentence for the expression whose result the alarm watches (the one returning
+///   data): it may not be a multi-series expression, while the same call wrapped in a function
+///   that reduces it to one series is fine — which is why that check is for a multi-series
+///   call nothing encloses.
+fn unresolvable_metrics(input: &PutMetricAlarmInput) -> Option<String> {
+    let queries = input.metrics.as_deref()?;
+    let defined: HashSet<&str> = queries.iter().map(|query| query.id.as_str()).collect();
+    for query in queries {
+        let Some(expression) = query.expression.as_deref() else {
+            continue;
+        };
+        // "This field can contain either a Metrics Insights query, or a metric math
+        // expression": an Insights query is SQL-like and refers to metrics by name rather
+        // than to the ids of other queries, so neither id rule below speaks about it.
+        if !is_metrics_insights_query(expression) {
+            if let Some(unknown) = referenced_ids(expression)
+                .into_iter()
+                .find(|referenced| !defined.contains(referenced.as_str()))
+            {
+                // Built from the request: the expression that could not be resolved, and the
+                // id in it that names no query of this request.
+                return Some(format!(
+                    "Error in expression '{}': ID '{unknown}' not \
+                     found{EXPRESSION_REFUSAL_ENVELOPE}",
+                    query.id
+                ));
+            }
+        }
+        if calls_function(expression, SEARCH_FUNCTION) {
+            return Some(SEARCH_REFUSAL.to_string());
+        }
+        // "When used in PutMetricAlarm, specify true for the one expression result to use as
+        // the alarm." … "If you omit this, the default of true is used."
+        // (`MetricDataQuery$ReturnData`)
+        if query.return_data != Some(false) && returns_many_series(expression) {
+            return Some(format!(
+                "the Expression of query {} returns more than one time series, and the \
+                 expression an alarm watches must return a single time series",
+                query.id
+            ));
+        }
+    }
+    None
+}
+
+/// Whether `expression` is a Metrics Insights query rather than a metric math expression: a
+/// Metrics Insights query is a SELECT statement ("Metrics Insights query components and
+/// syntax", `MetricDataQuery$Expression`).
+fn is_metrics_insights_query(expression: &str) -> bool {
+    expression
+        .trim_start()
+        .get(..SELECT_KEYWORD.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(SELECT_KEYWORD))
+}
+
+/// The keyword a Metrics Insights query opens with.
+const SELECT_KEYWORD: &str = "SELECT";
+
+/// The query ids a metric math expression refers to.
+///
+/// A reference is a word that is not a function call, spelled the way a query id is: "The
+/// valid characters are letters, numbers, and underscore. The first character must be a
+/// lowercase letter." (`MetricDataQuery$Id`) — which is also what tells a reference from a
+/// metric math function name, and from a number. Quoted literals carry a search query or a
+/// label rather than ids, so they are skipped.
+///
+/// Metric math is CloudWatch's own expression language and no published grammar for it exists
+/// outside the service, so the words are read here rather than through a parser crate.
+fn referenced_ids(expression: &str) -> Vec<String> {
+    let mut referenced = Vec::new();
+    let characters: Vec<char> = expression.chars().collect();
+    let mut index = 0;
+    while let Some(&current) = characters.get(index) {
+        if current == '\'' || current == '"' {
+            index = end_of_literal(&characters, index, current);
+            continue;
+        }
+        if !is_word_character(current) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while characters.get(index).copied().is_some_and(is_word_character) {
+            index += 1;
+        }
+        if !opens_call(&characters, index) && current.is_ascii_lowercase() {
+            referenced.push(word(&characters, start, index));
+        }
+    }
+    referenced
+}
+
+/// The functions `expression` CALLS, each with the number of function calls enclosing it: a
+/// call at zero is the value of the expression itself, and one at a positive depth is an
+/// argument of the function around it (whose own value is what the expression returns).
+///
+/// Plain parentheses GROUP rather than call, so a call inside them is still unenclosed.
+fn called_functions(expression: &str) -> Vec<(String, usize)> {
+    let mut called: Vec<(String, usize)> = Vec::new();
+    let characters: Vec<char> = expression.chars().collect();
+    let mut index = 0;
+    // One entry per open parenthesis: whether it opened a FUNCTION CALL rather than grouped a
+    // sub-expression.
+    let mut open: Vec<bool> = Vec::new();
+    let mut enclosing_calls = 0usize;
+    let mut after_word = false;
+    while let Some(&current) = characters.get(index) {
+        match current {
+            '\'' | '"' => {
+                index = end_of_literal(&characters, index, current);
+                after_word = false;
+            }
+            '(' => {
+                open.push(after_word);
+                if after_word {
+                    enclosing_calls += 1;
+                }
+                after_word = false;
+                index += 1;
+            }
+            ')' => {
+                if open.pop() == Some(true) {
+                    enclosing_calls = enclosing_calls.saturating_sub(1);
+                }
+                after_word = false;
+                index += 1;
+            }
+            current if is_word_character(current) => {
+                let start = index;
+                while characters.get(index).copied().is_some_and(is_word_character) {
+                    index += 1;
+                }
+                if opens_call(&characters, index) {
+                    called.push((word(&characters, start, index), enclosing_calls));
+                }
+                after_word = true;
+            }
+            current if current.is_whitespace() => index += 1,
+            _ => {
+                after_word = false;
+                index += 1;
+            }
+        }
+    }
+    called
+}
+
+/// Whether `expression` calls `function`, at any depth.
+fn calls_function(expression: &str, function: &str) -> bool {
+    called_functions(expression)
+        .iter()
+        .any(|(called, _)| called.eq_ignore_ascii_case(function))
+}
+
+/// Whether the value of `expression` is more than one time series: it calls one of
+/// [`MULTI_SERIES_FUNCTIONS`] with no enclosing function call to reduce the result to a single
+/// series.
+fn returns_many_series(expression: &str) -> bool {
+    called_functions(expression)
+        .iter()
+        .any(|(called, enclosing_calls)| {
+            *enclosing_calls == 0
+                && MULTI_SERIES_FUNCTIONS
+                    .iter()
+                    .any(|function| called.eq_ignore_ascii_case(function))
+        })
+}
+
+/// Whether `character` may appear in a metric math word (a query id or a function name).
+fn is_word_character(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
+}
+
+/// The word `characters[start..end]` spells.
+fn word(characters: &[char], start: usize, end: usize) -> String {
+    characters
+        .get(start..end)
+        .unwrap_or_default()
+        .iter()
+        .collect()
+}
+
+/// The index just past the `quote`d literal that starts at `index`, whose opening quote is
+/// also its closing one. An unclosed literal runs to the end of the expression.
+fn end_of_literal(characters: &[char], index: usize, quote: char) -> usize {
+    let mut end = index + 1;
+    while characters.get(end).is_some_and(|current| *current != quote) {
+        end += 1;
+    }
+    end.saturating_add(1)
+}
+
+/// Whether the word ending at `index` is a function call: the next character that is not
+/// whitespace opens an argument list.
+fn opens_call(characters: &[char], index: usize) -> bool {
+    characters
+        .get(index..)
+        .unwrap_or_default()
+        .iter()
+        .find(|current| !current.is_whitespace())
+        == Some(&'(')
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -468,6 +824,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation_error(
                 EC2_ACTION_REFUSAL,
             ));
+        }
+
+        // The rest of what CloudWatch checks across this request's members before it will
+        // create an alarm at all — the cadence it would be evaluated at, the span that
+        // evaluation covers, and whether its query array resolves to one time series. Refused
+        // here, before the write, for the same reason as the EC2 precondition above.
+        if let Some(message) = configuration_refusal(&input) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(message));
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
@@ -581,9 +945,11 @@ fn write_alarm(
         // "Indicates whether actions should be executed during any changes to the alarm
         // state. The default is TRUE." (PutMetricAlarmInput$ActionsEnabled)
         actions_enabled: Some(input.actions_enabled.unwrap_or(true)),
-        ok_actions: input.ok_actions.clone(),
-        alarm_actions: input.alarm_actions.clone(),
-        insufficient_data_actions: input.insufficient_data_actions.clone(),
+        ok_actions: crate::state::configured_actions(input.ok_actions.as_deref()),
+        alarm_actions: crate::state::configured_actions(input.alarm_actions.as_deref()),
+        insufficient_data_actions: crate::state::configured_actions(
+            input.insufficient_data_actions.as_deref(),
+        ),
         state_value,
         state_reason,
         state_reason_data,

@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTrainingJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTrainingJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: admits a training job into `crate::state` — refusing an
+//! `AlgorithmSpecification` that does not name the training algorithm exactly once (the
+//! `AlgorithmName` reference is RESOLVED FIRST, so a request naming an algorithm this
+//! account does not hold is refused for that whatever else the spec carries) with a 400
+//! `ValidationException`, a `TrainingJobName` already in use with the modelled
+//! `ResourceInUse` and a request past the store's bound with the modelled
+//! `ResourceLimitExceeded` — and stores it as `InProgress` together with the instant the
+//! clock owes its terminal status. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTrainingJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## No training container ever runs here
+//!
+//! The job's work is the container image the spec names, and this emulator has no
+//! container runtime, so the accepted job ends `Failed` with
+//! [`crate::state::NO_TRAINING_CONTAINER_RUNTIME_REASON`] rather than reporting a
+//! `Completed` nothing earned, a training duration nothing spent or metrics nothing
+//! measured. Everything around the run — admission, validation, the minted ARN, the
+//! replay through `DescribeTrainingJob`, the terminal status — is real.
 //!
 //! ## Shape of an operation
 //!
@@ -276,6 +284,13 @@ impl<Eng> CreateTrainingJob<Eng> {
     }
 }
 
+/// A 400 `ValidationException`: the refusal of a request this operation models no error
+/// for. Every rule it answers is one the model states in prose rather than in a
+/// constraint trait, so the centralized validation walk cannot have refused it already.
+fn refuse(message: impl Into<String>) -> CreateTrainingJobError {
+    crate::scaffolded::Scaffolded::validation(message.into())
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for CreateTrainingJob<Eng>
 {
@@ -293,18 +308,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTrainingJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTrainingJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTrainingJob"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(&region, "training-job", &input.training_job_name);
+        let now = ::std::time::SystemTime::now();
+
+        // `AlgorithmSpecification` "identifies the training algorithm to use" (this
+        // operation's own doc), so without it there is no job to run. The model leaves the
+        // member optional, so this is the service's own rule. It is judged before the
+        // store is locked: nothing about it needs state.
+        let Some(specification) = input.algorithm_specification.as_ref() else {
+            return Err(refuse(
+                "AlgorithmSpecification is required to identify the training algorithm.",
+            ));
+        };
+        // The algorithm is named EITHER by a registered `AlgorithmName` or by a
+        // `TrainingImage`; the two are independent optional members the model cannot make
+        // exclusive, so "exactly one" is this operation's own rule.
+        let mut store = state.lock();
+
+        // The `AlgorithmName` reference is RESOLVED FIRST, before the exclusion is
+        // weighed: the service has to find the algorithm to know what the request asks
+        // for, so a name this account holds no algorithm under is refused for THAT — a
+        // request that also carries a `TrainingImage` included — rather than being
+        // classified as a conflict between two members. `AlgorithmName` is modelled
+        // `ArnOrName`, so either form resolves to the one stored record and the refusal
+        // reports the ARN it resolved to.
+        if let Some(named) = specification.algorithm_name.as_deref() {
+            let key = crate::state::name_from_arn_or_name(named);
+            if !store.algorithms.contains_key(key) {
+                let algorithm_arn = crate::state::resource_arn(&region, "algorithm", key);
+                return Err(refuse(crate::state::entity_does_not_exist(
+                    crate::state::ALGORITHM_ENTITY,
+                    &algorithm_arn,
+                )));
+            }
+        }
+        match (
+            specification.algorithm_name.is_some(),
+            specification.training_image.is_some(),
+        ) {
+            (true, true) => {
+                return Err(refuse(
+                    "AlgorithmSpecification may name only one of AlgorithmName and \
+                     TrainingImage.",
+                ));
+            }
+            (false, false) => {
+                return Err(refuse(
+                    "AlgorithmSpecification must name either AlgorithmName or TrainingImage.",
+                ));
+            }
+            _ => {}
+        }
+
+        // `TrainingJobName`'s doc: "The name must be unique within an Amazon Web Services
+        // Region in an Amazon Web Services account." A name already in use is refused with
+        // the modelled `ResourceInUse`, never overwritten: otherwise the caller reads a 200
+        // for a job it did not create and loses the one it did. Checked before the store's
+        // bound, so the per-name rule answers the same whatever the store holds.
+        if store.training_jobs.contains_key(&input.training_job_name) {
+            return Err(CreateTrainingJobErrorModeled::ResourceInUse(ResourceInUse {
+                message: Some(format!(
+                    "Training job names must be unique within an Amazon Web Services \
+                     account and Region, and \"{}\" already exists.",
+                    input.training_job_name
+                )),
+            })
+            .into());
+        }
+        // The store is bounded, so a caller varying `TrainingJobName` cannot grow it
+        // without end. `ResourceLimitExceeded` is the limit failure this operation models.
+        // The bound is the emulator's OWN (`crate::state::MODEL_QUOTA`) rather than a
+        // published account quota, so the refusal states it in its own words instead of
+        // pointing at Service Quotas — the form every other store bound in this crate uses.
+        if !store.training_jobs_below_quota() {
+            return Err(CreateTrainingJobErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for training jobs is {}, with \
+                         current utilization of {} and a request delta of 1.",
+                        crate::state::TRAINING_JOB_QUOTA,
+                        store.training_jobs.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        store.training_jobs.insert(
+            input.training_job_name.clone(),
+            crate::state::TrainingJob {
+                name: input.training_job_name.clone(),
+                arn: arn.clone(),
+                // AWS returns an accepted training job `InProgress` with nothing of its
+                // work begun, so the move out of it is owed by the clock rather than taken
+                // on this call.
+                status: crate::state::TRAINING_STATUS_IN_PROGRESS.to_string(),
+                secondary_status: Some(
+                    crate::state::TRAINING_SECONDARY_STATUS_STARTING.to_string(),
+                ),
+                creation_time: now,
+                last_modified_time: now,
+                training_end_time: None,
+                // A warm pool is the cluster KEPT ALIVE after a run finishes
+                // (`ResourceConfig$KeepAlivePeriodInSeconds`); no cluster is provisioned
+                // for this job, so there is none to retain and no retained billable time
+                // to report.
+                warm_pool_status: None,
+                training_plan_arn: input
+                    .resource_config
+                    .as_ref()
+                    .and_then(|config| config.training_plan_arn.clone()),
+                failure_reason: None,
+                ends_at: now + crate::state::TRAINING_JOB_ENDS_AFTER,
+                // Set only on a training job a tuning job launched; a caller's own create
+                // has no parent.
+                tuning_job_arn: None,
+                tags: input.tags.clone().unwrap_or_default(),
+                request: input,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateTrainingJobOutput {
+            training_job_arn: arn,
+        })
     }
 }

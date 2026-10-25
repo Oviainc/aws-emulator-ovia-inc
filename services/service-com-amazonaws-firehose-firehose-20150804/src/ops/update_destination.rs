@@ -294,6 +294,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         destination.config = applied(&destination.config, update)?;
+        // The configuration the update leaves behind is normalised exactly as a created
+        // one is: the parameters Firehose fills in itself are materialised against the
+        // role the updated destination now delivers under, in the canonical order.
+        destination.config.normalise_processors();
         // "After the update is applied successfully, the version ID is updated, and can be
         // retrieved using DescribeDeliveryStream."
         stream.version_id += 1;

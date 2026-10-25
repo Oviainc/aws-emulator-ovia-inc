@@ -509,8 +509,9 @@ async fn a_second_call_replaces_the_configuration_and_leaves_the_state() {
     );
     assert_eq!(
         second.get("AlarmActions"),
-        None,
-        "AlarmActions: expected the replaced configuration to drop it, got {second}"
+        Some(&json!([])),
+        "AlarmActions: expected the replaced configuration to report no action as the empty \
+         list, got {second}"
     );
     for (member, expected) in [
         ("QueryResultsToEvaluate", json!(10)),

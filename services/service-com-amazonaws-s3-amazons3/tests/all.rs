@@ -85,6 +85,8 @@ mod object_encryption;
 mod object_listing_and_deletion;
 #[path = "all/object_listing_encoding.rs"]
 mod object_listing_encoding;
+#[path = "all/object_retention.rs"]
+mod object_retention;
 #[path = "all/object_storage.rs"]
 mod object_storage;
 #[path = "all/object_tagging.rs"]
