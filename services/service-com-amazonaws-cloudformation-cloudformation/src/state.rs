@@ -97,7 +97,11 @@
 //! EXTENSION REGISTRY — the resource types, modules and Hooks it has registered or
 //! activated, and the versions of each (see [`registry`]). It is a store of its own, not a
 //! stack's: nothing in a registry record settles on the stack clock, and `DescribeType`
-//! reads it the way `DescribeStacks` reads the stacks.
+//! reads it the way `DescribeStacks` reads the stacks. The one transition a registry record
+//! owes is a clock of its own: `TestType` starts the contract tests of one extension
+//! version and the conclusion they reach becomes due [`STATUS_TRANSITION_DELAY`] later, so
+//! `DescribeType` reports `IN_PROGRESS` to a caller reading straight after the call and the
+//! conclusion to one reading after that instant (see [`registry::PendingTypeTests`]).
 //!
 //! ## The publisher registration
 //!
@@ -2252,7 +2256,8 @@ pub struct ComAmazonawsCloudformationCloudformationState {
     /// This account and Region's extension registry, in the order its records entered it,
     /// so `DescribeType` reads back exactly what a registry write wrote (see
     /// [`registry`]). A registry record has nothing to do with a stack's lifecycle, so it
-    /// is neither settled nor reclaimed with one.
+    /// is never reclaimed with one; the one transition the clock owes it is the conclusion
+    /// of the contract tests `TestType` started, which [`Self::settle`] installs.
     pub extensions: Vec<registry::StoredExtension>,
     /// This account's extension-publisher registration, once `RegisterPublisher` has
     /// written one (see [`publisher`]). The publisher id "applies to your account in all
@@ -2295,6 +2300,9 @@ impl ComAmazonawsCloudformationCloudformationState {
         self.settle_drift_detections(now);
         for template in &mut self.generated_templates {
             template.settle(now);
+        }
+        for extension in &mut self.extensions {
+            extension.settle(now);
         }
         self.reclaim_retired_stacks();
         self.reclaim_orphaned_change_sets();
@@ -2733,6 +2741,18 @@ impl ComAmazonawsCloudformationCloudformationState {
     pub fn extension_by_arn(&self, region: &str, arn: &str) -> Option<&registry::StoredExtension> {
         self.extensions
             .iter()
+            .find(|extension| extension.region == region && extension.arn == arn)
+    }
+
+    /// [`Self::extension_by_arn`], for a registry WRITER: the record a request named by
+    /// `Arn`, in the Region the request was signed for.
+    pub fn extension_by_arn_mut(
+        &mut self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&mut registry::StoredExtension> {
+        self.extensions
+            .iter_mut()
             .find(|extension| extension.region == region && extension.arn == arn)
     }
 
