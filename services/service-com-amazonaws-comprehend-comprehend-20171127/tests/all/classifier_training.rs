@@ -28,7 +28,7 @@ use service_com_amazonaws_comprehend_comprehend_20171127::state::{
     service_state, TrainingBudget, MAX_CLASSIFIER_FIT_OPERATIONS,
 };
 
-use crate::comprehend_client::Comprehend;
+use crate::comprehend_client::{create_bucket_payload, Comprehend};
 
 /// How long the budget a suite classifies through may run for. The service's own
 /// training budget is its business; this is only so a test that asks the model for a
@@ -193,7 +193,9 @@ const CORPORA: &[Corpus] = &[
 
 /// Create `BUCKET`, so the training's reads have somewhere to go.
 async fn create_bucket(comprehend: &Comprehend) {
-    let (status, body) = comprehend.s3("PUT", &format!("/{BUCKET}"), b"").await;
+    let (status, body) = comprehend
+        .s3("PUT", &format!("/{BUCKET}"), create_bucket_payload().as_bytes())
+        .await;
     assert_eq!(
         status,
         200,

@@ -16,7 +16,9 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# `time`: an api-destination delivery bounds each attempt at the endpoint by the
+# client execution timeout AWS documents for one (`ops::put_events`).
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 # `unbounded_depth`: the parser's own depth default is replaced by this service's

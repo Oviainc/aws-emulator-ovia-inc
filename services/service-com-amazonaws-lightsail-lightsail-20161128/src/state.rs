@@ -9093,6 +9093,27 @@ pub fn certificate_serial_number(id: &str) -> String {
         .join(":")
 }
 
+/// Why the certificate a request named is not one a distribution may serve
+/// HTTPS traffic with.
+///
+/// The rule is the same whichever operation records the attachment — the create
+/// that names a certificate on a new distribution, or the attach that sets one
+/// later — so it is owned here, and each handler only renders the refusal in its
+/// own error channel. See
+/// [`ComAmazonawsLightsailLightsail20161128State::attachable_certificate`].
+#[derive(Debug, Clone)]
+pub enum CertificateNotAttachable {
+    /// This account holds no certificate of that name: Lightsail's
+    /// `DoesNotExist` envelope, built through
+    /// [`crate::scaffolded::Scaffolded::resource_does_not_exist`] with
+    /// [`RESOURCE_TYPE_CERTIFICATE`].
+    DoesNotExist,
+    /// The certificate exists but the certificate authority has not issued it,
+    /// so it secures nothing: the modelled `OperationFailureException`, whose
+    /// message this variant carries.
+    NotIssued(String),
+}
+
 /// One stored SSL/TLS certificate: the request the caller made, the members the
 /// service assigned, and the validation state it is in.
 #[derive(Debug, Clone)]
@@ -10586,6 +10607,34 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// The certificate `name` names, for a reporting operation.
     pub fn certificate(&self, name: &str) -> Option<&StoredCertificate> {
         self.certificates.get(name)
+    }
+
+    /// The certificate `name` names, when it is one a distribution may serve
+    /// HTTPS traffic with — the ONE owner of that rule.
+    ///
+    /// A distribution's certificate has to be a certificate this account holds,
+    /// addressed by its exact name, and one the certificate authority has
+    /// already issued: "Only certificates with a status of ISSUED can be
+    /// attached to a distribution." Every operation that records a certificate
+    /// on a distribution asks here FIRST, so a request naming a certificate
+    /// this account does not hold, or one still being validated, is refused
+    /// before anything is written and no distribution record is left naming a
+    /// certificate that secures nothing.
+    pub fn attachable_certificate(
+        &self,
+        name: &str,
+    ) -> Result<&StoredCertificate, CertificateNotAttachable> {
+        let certificate = self
+            .certificate(name)
+            .ok_or(CertificateNotAttachable::DoesNotExist)?;
+        if !certificate.is_issued() {
+            return Err(CertificateNotAttachable::NotIssued(format!(
+                "The certificate {name} is {}: only certificates with a status of {} can be \
+                 attached to a distribution.",
+                certificate.status, CERTIFICATE_STATUS_ISSUED
+            )));
+        }
+        Ok(certificate)
     }
 
     /// Store a newly requested certificate.

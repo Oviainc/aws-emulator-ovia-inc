@@ -542,19 +542,19 @@ async fn a_version_id_the_bucket_holds_no_version_for_is_not_found() {
         .await
         .expect("an enabled bucket mints a version id");
 
-    // Ids that name no stored version, differing in how: one shaped like a minted id, one
-    // that is a single character, one differing from the stored id in its last character,
+    // Ids that are SHAPED like a version id and name no stored version, differing in how:
+    // one shaped like a minted id, one differing from the stored id in its last character,
     // and `null` — which names the version a write makes while the bucket is NOT enabled,
-    // and this key has none, every write to it having been versioned.
+    // and this key has none, every write to it having been versioned. An id that is not
+    // shaped like one at all is a different answer; the table below this one covers it.
     let mut almost = minted.clone();
     almost.pop();
     almost.push(if minted.ends_with('A') { 'B' } else { 'A' });
-    let rows: [(&str, String); 4] = [
+    let rows: [(&str, String); 3] = [
         (
             "an id shaped like a minted one",
             "QUJDREVGR0hJSktMTU5PUFFSU1RVVldY".to_string(),
         ),
-        ("a one-character id", "x".to_string()),
         ("an id differing in one character", almost),
         ("the null version of a key that has none", "null".to_string()),
     ];
@@ -607,6 +607,110 @@ async fn a_version_id_the_bucket_holds_no_version_for_is_not_found() {
         assert_eq!(
             still.status, 200,
             "case {case:?}: the stored version must survive a refused read, got {}",
+            still.status
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_version_id_that_is_not_shaped_like_one_is_a_malformed_argument() {
+    let router = router();
+    let name = "versioned-source";
+    bucket(&router, name).await;
+    set_versioning(&router, name, "Enabled").await;
+    let minted = write_version(&router, name, "object.txt", "the one stored version", b"held")
+        .await
+        .expect("an enabled bucket mints a version id");
+
+    // A `versionId` is either the literal `null` or a token of the form this service mints
+    // — 32 characters of the URL-safe Base64 alphabet — so anything else cannot name a
+    // version of any object in any bucket. That is a malformed ARGUMENT, which S3 answers
+    // `InvalidArgument` with HTTP 400, never the `NoSuchVersion`/404 it reserves for a
+    // well-formed id that names no stored version.
+    //
+    // The rows differ along what the shape rule generalises over: LENGTH on both sides of
+    // the published 32 (one character, one short, one long, far too long) and the
+    // ALPHABET at exactly that length (a character outside URL-safe Base64, and the two
+    // characters standard Base64 uses where the URL-safe alphabet does not).
+    let short = minted[..minted.len() - 1].to_string();
+    let long = format!("{minted}A");
+    let plus = format!("{}+", &minted[..minted.len() - 1]);
+    let slash = format!("{}/", &minted[..minted.len() - 1]);
+    let bang = format!("{}!", &minted[..minted.len() - 1]);
+    let rows: [(&str, String); 7] = [
+        ("a one-character id", "x".to_string()),
+        ("one character short of the minted length", short),
+        ("one character past the minted length", long),
+        ("far longer than any minted id", "v".repeat(256)),
+        ("a word that is not an id at all", "not-a-version".to_string()),
+        (
+            "standard Base64's plus, which the URL-safe alphabet does not use",
+            plus,
+        ),
+        (
+            "a character outside the Base64 alphabet entirely",
+            bang,
+        ),
+    ];
+
+    for (case, version_id) in rows.into_iter().chain([(
+        "standard Base64's slash, which would end the path segment",
+        slash,
+    )]) {
+        for (operation, answer) in [
+            (
+                "GetObject",
+                get_object(
+                    &router,
+                    name,
+                    "object.txt",
+                    &format!("?versionId={version_id}"),
+                    &[],
+                )
+                .await,
+            ),
+            (
+                "HeadObject",
+                head_object(&router, name, "object.txt", &format!("?versionId={version_id}"))
+                    .await,
+            ),
+            (
+                "DeleteObject",
+                delete_object(&router, name, "object.txt", &format!("?versionId={version_id}"))
+                    .await,
+            ),
+        ] {
+            assert_eq!(
+                answer.status, 400,
+                "case {case:?}/{operation}: a versionId that is not shaped like one is a \
+                 malformed argument, got {} for {version_id:?} with body {:?}",
+                answer.status,
+                text(&answer)
+            );
+            if operation != "HeadObject" {
+                // A HEAD carries no body, so there is no error document to read a code
+                // out of; the status is the whole answer.
+                assert_eq!(
+                    answer.error_code(),
+                    "InvalidArgument",
+                    "case {case:?}/{operation}: expected InvalidArgument, got {:?}",
+                    answer.error_code()
+                );
+            }
+        }
+
+        // None of the refusals touched the stored version.
+        let still = get_object(
+            &router,
+            name,
+            "object.txt",
+            &format!("?versionId={minted}"),
+            &[],
+        )
+        .await;
+        assert_eq!(
+            still.status, 200,
+            "case {case:?}: the stored version must survive a refused call, got {}",
             still.status
         );
     }

@@ -230,15 +230,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Validated BEFORE anything is written, so a refused tag set leaves the bucket's
         // current tags exactly as they were, and against the BUCKET's own published
-        // limits (the shared rule, with this resource's tag count). AWS refuses these with
-        // `InvalidTag`, a code this service's model does not declare as a shape and so
-        // cannot render, so the refusal goes out through the framework's 400
-        // `ValidationException` channel — the same channel `CreateBucket` uses for the
-        // unmodelled bucket quota refusal.
+        // limits (the shared rule, with this resource's tag count). The wire code is the
+        // rejection's own ([`crate::state::TagSetRejection::code`]): a set carrying more
+        // tags than the bucket may hold is `BadRequest`, and a tag that does not pass
+        // input validation is `InvalidTag`. Neither is a shape in this model, so both go
+        // out through the unmodelled channel carrying the code a client branches on.
         if let Err(rejection) =
             crate::state::validate_tag_set(&tags, crate::state::BUCKET_TAG_SET_LIMITS)
         {
-            return Err(crate::scaffolded::Scaffolded::validation(
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                rejection.code(),
+                crate::state::TAG_REJECTION_STATUS,
                 rejection.to_string(),
             ));
         }

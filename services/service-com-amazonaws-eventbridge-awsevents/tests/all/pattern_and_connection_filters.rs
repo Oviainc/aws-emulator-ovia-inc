@@ -226,8 +226,11 @@ async fn test_event_pattern_answers_the_pattern_language_over_the_envelope() {
             false,
         ),
         (
-            "cidr at the narrow bound, covering one address",
-            json!({ "detail": { "client-ip": [{ "cidr": "10.0.1.7/32" }] } }),
+            // The narrowest block the language admits: a mask as wide as the
+            // family names one address rather than a block, which the service
+            // refuses (see `pattern_refusal_wording`).
+            "cidr at the narrow bound, covering two addresses",
+            json!({ "detail": { "client-ip": [{ "cidr": "10.0.1.6/31" }] } }),
             base_event(),
             true,
         ),

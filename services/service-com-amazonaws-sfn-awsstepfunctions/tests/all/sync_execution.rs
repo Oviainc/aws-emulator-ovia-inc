@@ -26,8 +26,9 @@
 //!    immediately").
 //!
 //! Each table below spans one class of those rules; the recorded Express workflow
-//! this suite's issue was filed about — a definition whose `Task` state invokes a
-//! Lambda function — is ONE row of the first one.
+//! this suite's issue was filed about — a definition whose `Task` state names a bare
+//! Lambda function ARN, which is no service-integration call — is ONE row of the
+//! first one.
 
 use serde_json::{json, Value};
 
@@ -190,10 +191,11 @@ async fn a_sync_start_answers_the_outcome_the_definition_computed() {
         },
         SyncCase {
             // The shape of the recorded Express workflow this suite's issue was
-            // filed about: a `Task` state that invokes a Lambda function, which
-            // cannot be invoked from inside this process and is therefore not
-            // faked.
-            case: "a Task state's service integration is not run",
+            // filed about: a `Task` state whose `Resource` is a bare Lambda
+            // function ARN, which names a resource rather than one of the service
+            // integrations this emulator calls (`state::integration`), so nothing
+            // is run for it and nothing is faked.
+            case: "a Task state whose Resource names no integration call is not run",
             definition: r#"{"StartAt":"T","States":{"T":{"Type":"Task","Resource":"arn:aws:lambda:us-west-2:000000000000:function:f","End":true}}}"#,
             input: Some(r#"{"first_name":"Alejandro"}"#),
             status: "FAILED",

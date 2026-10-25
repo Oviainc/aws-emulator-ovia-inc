@@ -149,7 +149,11 @@ fn s3files(
     )
 }
 
-/// `PUT /<bucket>` — S3's `CreateBucket`, with no location constraint.
+/// `PUT /<bucket>` — S3's `CreateBucket`, naming the Region this suite is signed for as
+/// its location constraint.
+///
+/// A create sent to a REGIONAL endpoint has to name one: the unspecified constraint means
+/// us-east-1, so S3 refuses a create that leaves it out anywhere else.
 fn create_bucket(router: &MultiServiceRouter, runtime: &tokio::runtime::Runtime, bucket: &str) {
     let answer = send(
         router,
@@ -158,7 +162,10 @@ fn create_bucket(router: &MultiServiceRouter, runtime: &tokio::runtime::Runtime,
         "PUT",
         &format!("/{bucket}"),
         "application/xml",
-        bytes::Bytes::new(),
+        bytes::Bytes::from(format!(
+            "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <LocationConstraint>{REGION}</LocationConstraint></CreateBucketConfiguration>"
+        )),
     );
     assert_eq!(
         answer.status, 200,

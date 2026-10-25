@@ -188,6 +188,269 @@ fn managed_knowledge_base(name: &str) -> Value {
     })
 }
 
+/// Every error `CreateDataSource` declares, paired with the HTTP status its
+/// model binds to that error.
+///
+/// Source: this service's Smithy model
+/// (`smithy_query(query="operation",operation="CreateDataSource")`).
+const CREATE_DATA_SOURCE_MODELLED_ERRORS: [(&str, u16); 7] = [
+    ("AccessDeniedException", 403),
+    ("ConflictException", 409),
+    ("InternalServerException", 500),
+    ("ResourceNotFoundException", 404),
+    ("ServiceQuotaExceededException", 402),
+    ("ThrottlingException", 429),
+    ("ValidationException", 400),
+];
+
+/// The same for `GetDataSource`, whose union is narrower: it mints nothing, so
+/// it declares neither a conflict nor a quota refusal.
+///
+/// Source: this service's Smithy model
+/// (`smithy_query(query="operation",operation="GetDataSource")`).
+const GET_DATA_SOURCE_MODELLED_ERRORS: [(&str, u16); 5] = [
+    ("AccessDeniedException", 403),
+    ("InternalServerException", 500),
+    ("ResourceNotFoundException", 404),
+    ("ThrottlingException", 429),
+    ("ValidationException", 400),
+];
+
+/// The code an operation nobody has implemented answers with. It is in no
+/// operation's modelled union, so a client's generated error taxonomy has no
+/// branch for it and it surfaces as a bare client error.
+const UNIMPLEMENTED_CODE: &str = "NotImplemented";
+
+/// Assert `answer` refuses `operation` with one of the errors that operation's
+/// model declares, carrying the status the model binds to it.
+///
+/// The exact-code check subsumes the two before it; those two are kept because
+/// they are what make a failure read as "this code is outside the operation's
+/// union" rather than as a plain string mismatch.
+fn assert_modelled_refusal(
+    case: &str,
+    operation: &str,
+    union: &[(&str, u16)],
+    expected_code: &str,
+    answer: &Answer,
+) {
+    let code = answer.error_type.clone().unwrap_or_else(|| {
+        panic!("case {case}: expected {operation} to answer an error code, got {answer:?}")
+    });
+    assert_ne!(
+        code, UNIMPLEMENTED_CODE,
+        "case {case}: {operation} is implemented, so it must never answer the \
+         unimplemented-operation code, got {answer:?}"
+    );
+    let Some((_, modelled_status)) = union.iter().find(|(name, _)| *name == code) else {
+        panic!(
+            "case {case}: {operation} answered {code:?}, which is not among the errors its \
+             model declares ({union:?}), got {answer:?}"
+        );
+    };
+    assert_eq!(
+        code, expected_code,
+        "case {case}: expected {operation} to answer {expected_code}, got {answer:?}"
+    );
+    assert_eq!(
+        answer.status, *modelled_status,
+        "case {case}: expected {code} to carry HTTP {modelled_status}, got {answer:?}"
+    );
+}
+
+/// `CreateDataSource` and `GetDataSource` are implemented, so each one serves a
+/// well-formed request and refuses every other with an error its OWN model
+/// declares, at that error's modelled status — never with the code an
+/// unimplemented operation answers, which no client's error taxonomy carries a
+/// branch for.
+#[tokio::test]
+async fn data_source_operations_refuse_only_with_their_modelled_errors() {
+    let emulator = Emulator::new();
+    let knowledge_base_id = emulator
+        .knowledge_base(vector_knowledge_base("modelled-errors-kb"))
+        .await;
+
+    // A well-formed request is SERVED: the operations answer their modelled
+    // success, so the refusals below are refusals of the request rather than of
+    // the operation.
+    let created = emulator
+        .create_data_source(
+            &knowledge_base_id,
+            json!({
+                "name": "modelled-errors-source",
+                "dataSourceConfiguration": {
+                    "type": "S3",
+                    "s3Configuration": { "bucketArn": "arn:aws:s3:::ingestion-demo-docs" },
+                },
+            }),
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "case a well-formed create: expected CreateDataSource -> 200, got {created:?}"
+    );
+    let data_source_id = created.ds_string("dataSourceId");
+    let fetched = emulator
+        .get_data_source(&knowledge_base_id, &data_source_id)
+        .await;
+    assert_eq!(
+        fetched.status, 200,
+        "case a well-formed read: expected GetDataSource -> 200, got {fetched:?}"
+    );
+    assert_eq!(
+        fetched.ds_string("name"),
+        "modelled-errors-source",
+        "case a well-formed read: expected the name the create supplied, got {:?}",
+        fetched.ds("name")
+    );
+
+    // Rows differ along the kind of bad request: a resource the store does not
+    // hold, a required member left out, and a value outside a member's modelled
+    // constraint (its pattern or its length). The refusals that come from the
+    // `dataSourceConfiguration` discriminator have their own test below, so they
+    // are not restated here; one row per operation names a resource the store
+    // does not hold, so the union is exercised on a code other than
+    // `ValidationException` too.
+    //
+    // The constraints are this service's model
+    // (`smithy_query(query="operation",operation="CreateDataSource")`):
+    // `knowledgeBaseId` and `name` carry patterns, `description` is length
+    // 1..200 and `clientToken` is length 33..256.
+    let s3_configuration = json!({
+        "type": "S3",
+        "s3Configuration": { "bucketArn": "arn:aws:s3:::ingestion-demo-docs" },
+    });
+    let over_long_description = "d".repeat(201);
+    let create_cases: Vec<(&str, String, Value, &str)> = vec![
+        (
+            "a well-formed knowledgeBaseId the store does not hold",
+            "0123456789".to_string(),
+            json!({
+                "name": "orphan-source",
+                "dataSourceConfiguration": s3_configuration.clone(),
+            }),
+            "ResourceNotFoundException",
+        ),
+        (
+            "a knowledgeBaseId shorter than the modelled Id pattern admits",
+            "short".to_string(),
+            json!({
+                "name": "bad-id-source",
+                "dataSourceConfiguration": s3_configuration.clone(),
+            }),
+            "ValidationException",
+        ),
+        (
+            "a knowledgeBaseId longer than the modelled Id pattern admits",
+            "0123456789a".to_string(),
+            json!({
+                "name": "bad-id-source",
+                "dataSourceConfiguration": s3_configuration.clone(),
+            }),
+            "ValidationException",
+        ),
+        (
+            "no name, which the model requires",
+            knowledge_base_id.clone(),
+            json!({ "dataSourceConfiguration": s3_configuration.clone() }),
+            "ValidationException",
+        ),
+        (
+            "no dataSourceConfiguration, which the model requires",
+            knowledge_base_id.clone(),
+            json!({ "name": "nameless-configuration" }),
+            "ValidationException",
+        ),
+        (
+            "a name outside the modelled Name pattern",
+            knowledge_base_id.clone(),
+            json!({
+                "name": "a name with spaces!",
+                "dataSourceConfiguration": s3_configuration.clone(),
+            }),
+            "ValidationException",
+        ),
+        (
+            "a description shorter than the modelled minimum length",
+            knowledge_base_id.clone(),
+            json!({
+                "name": "empty-description",
+                "description": "",
+                "dataSourceConfiguration": s3_configuration.clone(),
+            }),
+            "ValidationException",
+        ),
+        (
+            "a description longer than the modelled maximum length",
+            knowledge_base_id.clone(),
+            json!({
+                "name": "long-description",
+                "description": over_long_description,
+                "dataSourceConfiguration": s3_configuration.clone(),
+            }),
+            "ValidationException",
+        ),
+        (
+            "a clientToken shorter than the modelled minimum length",
+            knowledge_base_id.clone(),
+            json!({
+                "name": "short-token",
+                "clientToken": "too-short",
+                "dataSourceConfiguration": s3_configuration,
+            }),
+            "ValidationException",
+        ),
+    ];
+
+    for (case, requested_knowledge_base, request, expected_code) in create_cases {
+        let refused = emulator
+            .create_data_source(&requested_knowledge_base, request)
+            .await;
+        assert_modelled_refusal(
+            case,
+            "CreateDataSource",
+            &CREATE_DATA_SOURCE_MODELLED_ERRORS,
+            expected_code,
+            &refused,
+        );
+    }
+
+    // The reader's own union is narrower, and the same rule holds over it.
+    let get_cases: Vec<(&str, &str, &str, &str)> = vec![
+        (
+            "a data-source id nothing holds",
+            knowledge_base_id.as_str(),
+            "0123456789",
+            "ResourceNotFoundException",
+        ),
+        (
+            "a dataSourceId outside the modelled Id pattern",
+            knowledge_base_id.as_str(),
+            "short",
+            "ValidationException",
+        ),
+        (
+            "a knowledgeBaseId outside the modelled Id pattern",
+            "short",
+            data_source_id.as_str(),
+            "ValidationException",
+        ),
+    ];
+
+    for (case, requested_knowledge_base, requested_data_source, expected_code) in get_cases {
+        let refused = emulator
+            .get_data_source(requested_knowledge_base, requested_data_source)
+            .await;
+        assert_modelled_refusal(
+            case,
+            "GetDataSource",
+            &GET_DATA_SOURCE_MODELLED_ERRORS,
+            expected_code,
+            &refused,
+        );
+    }
+}
+
 /// Assert `id` is shaped as the model's `Id` demands (`^[0-9a-zA-Z]{10}$`).
 fn assert_well_formed_id(case: &str, member: &str, id: &str) {
     assert_eq!(

@@ -787,6 +787,215 @@ impl ShardPageToken {
     }
 }
 
+/// What a shard iterator is tagged with, so a string the service never issued is refused
+/// rather than read as a position in a shard.
+const SHARD_ITERATOR_TAG: &str = "shardIterator";
+
+/// How long a shard iterator stays usable: "A shard iterator expires 5 minutes after it is
+/// returned to the requester" (`GetShardIterator`).
+pub const SHARD_ITERATOR_TTL: Duration = Duration::from_secs(300);
+
+/// Where in a shard a reader starts, which is what a shard iterator names.
+///
+/// The five positions are the `ShardIteratorType` values the model declares
+/// (`smithy_query(query="shape",shape="ShardIteratorType")`), reduced to what a reader
+/// needs to resolve a position: a sequence number, an instant, or one of the two ends of
+/// the shard's retained data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShardPosition {
+    /// `TRIM_HORIZON` — "the last untrimmed record in the shard in the system, which is the
+    /// oldest data record in the shard".
+    TrimHorizon,
+    /// `LATEST` — "just after the most recent record in the shard, so that you always read
+    /// the most recent data in the shard".
+    Latest,
+    /// `AT_SEQUENCE_NUMBER` — "the position denoted by a specific sequence number".
+    AtSequenceNumber(String),
+    /// `AFTER_SEQUENCE_NUMBER` — "right after the position denoted by a specific sequence
+    /// number".
+    AfterSequenceNumber(String),
+    /// `AT_TIMESTAMP` — "the position denoted by a specific time stamp", in milliseconds
+    /// since the epoch, as `GetShardIteratorInput$Timestamp` documents ("A time stamp is the
+    /// Unix epoch date with precision in milliseconds").
+    AtTimestamp(u128),
+}
+
+impl ShardPosition {
+    /// How the position travels inside an iterator: the `ShardIteratorType` that names it
+    /// and, for the three types that take one, the value the request supplied.
+    fn encoded(&self) -> String {
+        match self {
+            Self::TrimHorizon => SHARD_ITERATOR_TYPE_TRIM_HORIZON.to_string(),
+            Self::Latest => SHARD_ITERATOR_TYPE_LATEST.to_string(),
+            Self::AtSequenceNumber(sequence_number) => {
+                format!("{SHARD_ITERATOR_TYPE_AT_SEQUENCE_NUMBER}={sequence_number}")
+            }
+            Self::AfterSequenceNumber(sequence_number) => {
+                format!("{SHARD_ITERATOR_TYPE_AFTER_SEQUENCE_NUMBER}={sequence_number}")
+            }
+            Self::AtTimestamp(millis) => {
+                format!("{SHARD_ITERATOR_TYPE_AT_TIMESTAMP}={millis}")
+            }
+        }
+    }
+
+    /// The position `encoded` carries, or `None` for a field no [`Self::encoded`] produces.
+    fn decoded(encoded: &str) -> Option<Self> {
+        let (iterator_type, value) = match encoded.split_once('=') {
+            Some((iterator_type, value)) => (iterator_type, Some(value)),
+            None => (encoded, None),
+        };
+        match (iterator_type, value) {
+            (SHARD_ITERATOR_TYPE_TRIM_HORIZON, None) => Some(Self::TrimHorizon),
+            (SHARD_ITERATOR_TYPE_LATEST, None) => Some(Self::Latest),
+            (SHARD_ITERATOR_TYPE_AT_SEQUENCE_NUMBER, Some(value)) => {
+                (!value.is_empty()).then(|| Self::AtSequenceNumber(value.to_string()))
+            }
+            (SHARD_ITERATOR_TYPE_AFTER_SEQUENCE_NUMBER, Some(value)) => {
+                (!value.is_empty()).then(|| Self::AfterSequenceNumber(value.to_string()))
+            }
+            (SHARD_ITERATOR_TYPE_AT_TIMESTAMP, Some(value)) => {
+                value.parse().ok().map(Self::AtTimestamp)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The `ShardIteratorType` values the model declares
+/// (`smithy_query(query="shape",shape="ShardIteratorType")`). Each names one
+/// [`ShardPosition`], and the three that take a value are the ones whose documentation says
+/// which member supplies it.
+pub const SHARD_ITERATOR_TYPE_AT_SEQUENCE_NUMBER: &str = "AT_SEQUENCE_NUMBER";
+/// See [`SHARD_ITERATOR_TYPE_AT_SEQUENCE_NUMBER`].
+pub const SHARD_ITERATOR_TYPE_AFTER_SEQUENCE_NUMBER: &str = "AFTER_SEQUENCE_NUMBER";
+/// See [`SHARD_ITERATOR_TYPE_AT_SEQUENCE_NUMBER`].
+pub const SHARD_ITERATOR_TYPE_AT_TIMESTAMP: &str = "AT_TIMESTAMP";
+/// See [`SHARD_ITERATOR_TYPE_AT_SEQUENCE_NUMBER`].
+pub const SHARD_ITERATOR_TYPE_TRIM_HORIZON: &str = "TRIM_HORIZON";
+/// See [`SHARD_ITERATOR_TYPE_AT_SEQUENCE_NUMBER`].
+pub const SHARD_ITERATOR_TYPE_LATEST: &str = "LATEST";
+
+/// Which shard of which stream a reader is positioned in, where in it, and when the
+/// iterator was handed out.
+///
+/// "A shard iterator specifies the shard position from which to start reading data records
+/// sequentially" (`GetShardIterator`), and the position is all a later `GetRecords` needs,
+/// so every part of it travels INSIDE the iterator: handing one out writes nothing a later
+/// caller could see. The stream's ARN and creation instant are both carried, so a name a
+/// delete released and a later create took again is not read with the earlier stream's
+/// iterator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardIteratorToken {
+    /// The ARN of the stream the shard belongs to.
+    pub stream_arn: String,
+    /// When that stream was created, in milliseconds since the epoch.
+    pub stream_created_at_millis: u128,
+    /// The id of the shard being read.
+    pub shard_id: String,
+    /// Where in the shard the reader starts.
+    pub position: ShardPosition,
+    /// When the iterator was handed out, in milliseconds since the epoch.
+    pub issued_at_millis: u128,
+}
+
+impl ShardIteratorToken {
+    /// The iterator that starts at `position` in `shard_id` of `stream`, handed out at
+    /// `issued_at`.
+    pub fn new(
+        stream: &Stream,
+        shard_id: &str,
+        position: ShardPosition,
+        issued_at: SystemTime,
+    ) -> Self {
+        Self {
+            stream_arn: stream.arn.clone(),
+            stream_created_at_millis: epoch_millis(stream.created_at),
+            shard_id: shard_id.to_string(),
+            position,
+            issued_at_millis: epoch_millis(issued_at),
+        }
+    }
+
+    /// This iterator as the opaque `ShardIterator` a client is handed.
+    ///
+    /// Opaque (hex of a tagged byte string) because the model gives `ShardIterator` no
+    /// structure: a client passes back what it was handed rather than constructing one. Two
+    /// hex characters per byte keeps a stream ARN, a shard id and a position inside the
+    /// modelled length 1..512.
+    pub fn encode(&self) -> String {
+        hex::encode(format!(
+            "{SHARD_ITERATOR_TAG}:{}:{}:{}:{}:{}",
+            self.issued_at_millis,
+            self.stream_created_at_millis,
+            self.shard_id,
+            self.position.encoded(),
+            self.stream_arn
+        ))
+    }
+
+    /// The iterator `iterator` carries, or `None` when it is not one this service issued.
+    pub fn decode(iterator: &str) -> Option<Self> {
+        let decoded = String::from_utf8(hex::decode(iterator).ok()?).ok()?;
+        // The ARN carries colons of its own, so it is the LAST field: the tag, the two
+        // instants, the shard id (whose `@pattern` admits no colon) and the position (whose
+        // own fields carry none) are taken first.
+        let mut fields = decoded.splitn(6, ':');
+        if fields.next()? != SHARD_ITERATOR_TAG {
+            return None;
+        }
+        let issued_at_millis = fields.next()?.parse().ok()?;
+        let stream_created_at_millis = fields.next()?.parse().ok()?;
+        let shard_id = fields.next()?.to_string();
+        let position = ShardPosition::decoded(fields.next()?)?;
+        let stream_arn = fields.next()?.to_string();
+        if shard_id.is_empty() || stream_arn.is_empty() {
+            return None;
+        }
+        Some(Self {
+            stream_arn,
+            stream_created_at_millis,
+            shard_id,
+            position,
+            issued_at_millis,
+        })
+    }
+
+    /// Whether the iterator names `stream`: the same ARN, created at the same instant.
+    pub fn names(&self, stream: &Stream) -> bool {
+        self.stream_arn == stream.arn
+            && self.stream_created_at_millis == epoch_millis(stream.created_at)
+    }
+
+    /// Whether the iterator is past its lifetime at `now` ([`SHARD_ITERATOR_TTL`]).
+    ///
+    /// A mint instant no clock of this emulator could have produced — one that cannot be
+    /// represented, or one still in the future — names no position either, so it counts as
+    /// past its lifetime rather than reaching the store.
+    pub fn is_expired(&self, now: SystemTime) -> bool {
+        let millis = u64::try_from(self.issued_at_millis).unwrap_or(u64::MAX);
+        let Some(issued_at) = UNIX_EPOCH.checked_add(Duration::from_millis(millis)) else {
+            return true;
+        };
+        match now.duration_since(issued_at) {
+            Ok(age) => age > SHARD_ITERATOR_TTL,
+            // Handed out after the instant it is being used at, which no iterator of this
+            // emulator ever is.
+            Err(_) => true,
+        }
+    }
+}
+
+/// How a read states that the stream the request named holds no shard under the `ShardId`
+/// it named. Built FROM the request, so the shard and the stream at fault name it, the way
+/// [`stream_not_found_message`] names a missing stream.
+pub fn shard_not_found_message(shard_id: &str, stream_identifier: &str) -> String {
+    format!(
+        "shard {shard_id} of stream {stream_identifier} not found under account {}",
+        ::engine::emulator_account_id()
+    )
+}
+
 /// How a request that pairs `NextToken` with a member the token already determines is
 /// refused: "Don't specify StreamName or StreamCreationTimestamp if you specify NextToken
 /// because the latter unambiguously identifies the stream" (`ListShardsInput$NextToken`).

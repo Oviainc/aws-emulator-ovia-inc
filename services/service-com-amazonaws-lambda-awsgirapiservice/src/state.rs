@@ -28,8 +28,13 @@
 //! holds one [`PolicyRecord`] per qualifier a statement was added to — the
 //! function-level policy under [`VERSION_LATEST`], and one per published version or
 //! alias. `AddPermission` appends exactly the statement its request described and
-//! `GetPolicy` reports the document those statements make up, so no policy text is ever
-//! echoed back out of a request body.
+//! `GetPolicy` reports the document those statements make up, so a statement is never
+//! echoed back out of a request body. `PutResourcePolicy` addresses the same policy by
+//! ARN and supplies the WHOLE document instead ("This operation replaces any existing
+//! policy on the Lambda resource"), so it stores that document on the same
+//! [`PolicyRecord`] ([`PolicyRecord::of_document`]) and `GetResourcePolicy` and
+//! `DeleteResourcePolicy` report and remove exactly what is stored there: both surfaces
+//! read ONE policy per resource rather than a copy each.
 //!
 //! The asynchronous-invocation slice hangs off the same record. `InvokeAsync` answers
 //! "202 Accepted ... the request is queued for invocation", so what it persists is the
@@ -393,6 +398,27 @@ pub const STATEMENT_EFFECT_ALLOW: &str = "Allow";
 /// and answers `PolicyLengthExceededException` ("The permissions policy for the resource
 /// is too large") for a call that would push the policy past it. Not adjustable.
 pub const MAX_POLICY_SIZE_BYTES: usize = 20_480;
+
+/// The message every resource-policy operation states when the ARN it was given names
+/// no policy: a resource of a kind this store holds no records of, or one nobody has
+/// attached a policy to. It states the fact and nothing from the request, so the two
+/// cases read alike. Source for the wording: the answer the corpus unit
+/// `lambda.resource-policy-lifecycle` carries for a `GetResourcePolicy` after the policy
+/// was deleted.
+pub const NO_RESOURCE_POLICY_MESSAGE: &str = "The resource you requested does not exist.";
+
+/// The message `PutResourcePolicy` and `DeleteResourcePolicy` both state when the
+/// `RevisionId` they were given is not the stored policy's.
+///
+/// The condition carries nothing from the request — the id given is simply not the
+/// current one — and the sentence points the caller at where the current one comes from,
+/// which is what both members document ("To retrieve the current revision ID, use the
+/// GetResourcePolicy operation"). Source for the wording: the answers the corpus units
+/// `lambda.resource-policy-revisionid-precondition` and
+/// `lambda.resource-policy-stale-revision-delete-rejected` carry.
+pub const RESOURCE_POLICY_REVISION_MISMATCH_MESSAGE: &str =
+    "The value of RevisionId provided doesn't match the policy's latest revision ID. Use the \
+     GetResourcePolicy API action to retrieve the current revision ID and try again.";
 
 /// Where the code of a function came from.
 ///
@@ -797,13 +823,82 @@ impl PolicyStatement {
     }
 }
 
+/// The member of a policy document that carries its statements, as the IAM policy
+/// language names it.
+const POLICY_STATEMENT_MEMBER: &str = "Statement";
+
+/// The member of a policy statement that carries its id, as the IAM policy language
+/// names it; it is the `StatementId` an `AddPermission` grant was made under.
+const STATEMENT_ID_MEMBER: &str = "Sid";
+
+/// Whether `document` is a policy document.
+///
+/// The `ResourcePolicy` member is "formatted as a JSON string", and the policy language
+/// writes a policy as a JSON OBJECT (a `Version` and the statements under
+/// [`POLICY_STATEMENT_MEMBER`]), so a value that is not one is no policy at all.
+#[must_use]
+pub fn is_policy_document(document: &str) -> bool {
+    ::serde_json::from_str::<::serde_json::Value>(document).is_ok_and(|parsed| parsed.is_object())
+}
+
+/// The `Sid` of the rendered policy statement `statement`, when it carries one.
+fn statement_id_of(statement: &::serde_json::Value) -> Option<&str> {
+    statement
+        .get(STATEMENT_ID_MEMBER)
+        .and_then(::serde_json::Value::as_str)
+}
+
+/// `document` with `statement` — one rendered policy statement — appended to the
+/// statements it carries, or `None` when the two cannot be merged at all.
+///
+/// A document this store holds was accepted as a JSON object and a statement is rendered
+/// here, so both parse and the merge is always made; `None` is the answer for a value
+/// that is somehow neither, which lets the caller keep the statement rather than report a
+/// grant it did not store (see [`PolicyRecord::add_statement`]).
+///
+/// The merged document is RE-SERIALIZED, so a document that carried its members in
+/// another order, or any whitespace, is reported in this one afterwards: the policy is
+/// the same policy, but only a document nobody has added a statement to since is reported
+/// byte for byte as it was supplied.
+fn document_with_statement(document: &str, statement: &str) -> Option<String> {
+    let (Ok(mut parsed), Ok(added)) = (
+        ::serde_json::from_str::<::serde_json::Value>(document),
+        ::serde_json::from_str::<::serde_json::Value>(statement),
+    ) else {
+        return None;
+    };
+    let members = parsed.as_object_mut()?;
+    let held = members
+        .entry(POLICY_STATEMENT_MEMBER)
+        .or_insert_with(|| ::serde_json::Value::Array(Vec::new()));
+    match held {
+        // The language admits a single statement as well as a list of them, so a
+        // document carrying one becomes a document carrying both.
+        ::serde_json::Value::Array(statements) => statements.push(added),
+        single => {
+            let first = single.take();
+            *single = ::serde_json::Value::Array(vec![first, added]);
+        }
+    }
+    Some(parsed.to_string())
+}
+
 /// The resource-based policy of one function, version or alias: the statements
-/// `AddPermission` has added to it, and the revision they are at.
+/// `AddPermission` has added to it, or the document a `PutResourcePolicy` stored, and
+/// the revision they are at.
 #[derive(Debug, Clone)]
 pub struct PolicyRecord {
     /// The statements, in the order they were added, so the document reports them
-    /// deterministically.
+    /// deterministically. Empty for a policy held as a whole [`PolicyRecord::document`].
     pub statements: Vec<PolicyStatement>,
+    /// The whole policy document a caller supplied, exactly as it was supplied.
+    ///
+    /// `PutResourcePolicy` "replaces any existing policy on the Lambda resource. If you
+    /// previously added permissions using the AddPermission operation, the new policy
+    /// overwrites those permissions", so a policy stored that way IS that document: the
+    /// statements above are then empty and a later grant is merged into it (see
+    /// [`PolicyRecord::add_statement`]). `None` for a policy made up of statements.
+    pub document: Option<String>,
     /// The revision this policy is at. `GetPolicy` reports it, and `AddPermission`'s
     /// `RevisionId` precondition is checked against it ("For AddPermission and
     /// RemovePermission API operations: Call GetPolicy to retrieve the latest RevisionId
@@ -815,21 +910,78 @@ impl Default for PolicyRecord {
     fn default() -> Self {
         Self {
             statements: Vec::new(),
+            document: None,
             revision_id: mint_revision_id(),
         }
     }
 }
 
 impl PolicyRecord {
-    /// Whether this policy already holds a statement with `sid`.
+    /// The policy a caller supplied as a whole document, at a fresh revision.
     #[must_use]
-    pub fn holds(&self, sid: &str) -> bool {
-        self.statements.iter().any(|statement| statement.sid == sid)
+    pub fn of_document(document: String) -> Self {
+        Self {
+            statements: Vec::new(),
+            document: Some(document),
+            revision_id: mint_revision_id(),
+        }
     }
 
-    /// The whole policy document, which is what `GetPolicy`'s `Policy` member carries.
+    /// Whether this policy already holds a statement with `sid` — among the statements
+    /// `AddPermission` added, or among those the stored document carries.
+    #[must_use]
+    pub fn holds(&self, sid: &str) -> bool {
+        if self.statements.iter().any(|statement| statement.sid == sid) {
+            return true;
+        }
+        let Some(document) = &self.document else {
+            return false;
+        };
+        let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(document) else {
+            return false;
+        };
+        match parsed.get(POLICY_STATEMENT_MEMBER) {
+            Some(::serde_json::Value::Array(statements)) => statements
+                .iter()
+                .any(|statement| statement_id_of(statement) == Some(sid)),
+            Some(single) => statement_id_of(single) == Some(sid),
+            None => false,
+        }
+    }
+
+    /// Add `statement` to this policy, which is what `AddPermission` appends to it.
+    ///
+    /// A policy held as a caller-supplied document keeps being that document, so the
+    /// statement joins the statements that document carries; otherwise it joins the
+    /// statements this record holds.
+    ///
+    /// A statement merged into a document is part of the document from then on, so
+    /// `RemovePermission` — which retains over the statements this record holds
+    /// structured — cannot take it back out again, and refuses with the statement id it
+    /// cannot find rather than reporting a removal it did not make. Removing from a
+    /// stored document is the remaining half of that operation's own slice.
+    pub fn add_statement(&mut self, statement: PolicyStatement) {
+        // The document is taken out first, so a value that cannot carry the statement at
+        // all (one that is somehow not the JSON object a stored document was accepted as)
+        // leaves this record holding the statement structured rather than reporting a
+        // grant it stored nowhere.
+        match self
+            .document
+            .take()
+            .and_then(|document| document_with_statement(&document, &statement.to_json()))
+        {
+            Some(merged) => self.document = Some(merged),
+            None => self.statements.push(statement),
+        }
+    }
+
+    /// The whole policy document, which is what `GetPolicy`'s and
+    /// `GetResourcePolicy`'s `Policy` member carries.
     #[must_use]
     pub fn to_json(&self) -> String {
+        if let Some(document) = &self.document {
+            return document.clone();
+        }
         let statements: Vec<String> = self
             .statements
             .iter()
@@ -838,7 +990,10 @@ impl PolicyRecord {
         json_object(&[
             ("Version", json_string(POLICY_LANGUAGE_VERSION)),
             ("Id", json_string(POLICY_ID)),
-            ("Statement", format!("[{}]", statements.join(","))),
+            (
+                POLICY_STATEMENT_MEMBER,
+                format!("[{}]", statements.join(",")),
+            ),
         ])
     }
 }
@@ -915,22 +1070,42 @@ pub fn pattern_violation_message(path: &str, value: &str, pattern: &str) -> Stri
     )
 }
 
-/// `ResourceNotFoundException`'s own wording, naming no resource: the one fixed sentence
-/// an operation refuses with when the resource the request NAMES resolves but the thing it
-/// asked about — the resource policy it reads or edits, the function URL it addresses — is
-/// not held there.
+/// Lambda's canonical `ResourceNotFoundException` sentence: the fixed wording the service
+/// answers for a resource that does not exist, naming NOTHING of the request.
 ///
-/// It carries nothing from the request because the request already names what it asked
-/// about; the resource-identifying forms ([`resolve_function`]'s `Function not found:
-/// <arn>`, [`resolve_layer_version_ref`]'s `Layer version <name>:<n> does not exist`) are
-/// reserved for a request whose own resource does not resolve. Keeping the two apart is
-/// what lets a caller tell "no such function" from "that function holds no policy", which
-/// is the distinction a permission-bootstrapping loop branches on.
+/// It is the whole message — no `Resource: <arn>` clause, no resource kind, no identifier
+/// — because the request already names what it asked about, so the sentence is the same
+/// one for every resource and a caller can compare it exactly. Only the resource kinds
+/// AWS gives their OWN fixed sentence to depart from it: a function, version or alias the
+/// request named ([`resolve_function`]'s `Function not found: <arn>`), an alias looked up
+/// by name ([`alias_not_found_message`]), a layer version addressed by the operations on
+/// its POLICY ([`resolve_layer_version`], where the version is the operation's own
+/// resource) and the configuration-shaped refusals below. Every other 404 in this service
+/// — a function URL, a layer version READ, an event source mapping, a code signing
+/// configuration, a function carrying no resource-based policy — answers this.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The resource you requested does not exist.";
 
-/// The message a function-URL operation refuses with when the qualifier it resolved
-/// holds no function URL: [`RESOURCE_NOT_FOUND_MESSAGE`], by the same rule.
-pub const FUNCTION_URL_NOT_FOUND_MESSAGE: &str = RESOURCE_NOT_FOUND_MESSAGE;
+/// The refusal a `RevisionId` precondition that did not hold gets on `AddPermission` and
+/// `RemovePermission`.
+///
+/// `PreconditionFailedException` documents the whole rule
+/// (`smithy_query(query="doc", shape="PreconditionFailedException")`): the revision
+/// supplied is not the latest one, and the caller is told which API reports the latest —
+/// "For AddPermission and RemovePermission API operations: Call `GetPolicy`"; "For all
+/// other API operations: Call `GetFunction` or `GetAlias`". So there are exactly TWO fixed
+/// sentences, one per branch of that rule, and neither carries anything of the request:
+/// not the id the caller supplied, not the resource it addressed. This is the first
+/// branch; [`CONFIGURATION_REVISION_PRECONDITION_MESSAGE`] is the second.
+pub const POLICY_REVISION_PRECONDITION_MESSAGE: &str =
+    "The Revision Id provided does not match the latest Revision Id. Call the GetPolicy \
+     API to retrieve the latest Revision Id";
+
+/// The second branch of the rule [`POLICY_REVISION_PRECONDITION_MESSAGE`] states: the
+/// refusal every OTHER operation taking a `RevisionId` precondition gets, naming the two
+/// APIs that report the latest revision of a function version and of an alias.
+pub const CONFIGURATION_REVISION_PRECONDITION_MESSAGE: &str =
+    "The Revision Id provided does not match the latest Revision Id. Call the \
+     GetFunction/GetAlias API to retrieve the latest Revision Id";
 
 /// The qualifier a `FunctionName`/`Qualifier` pair NAMES, as opposed to the
 /// [`VERSION_LATEST`] an unqualified request resolves to. It may come from either, and
@@ -2141,7 +2316,7 @@ impl LayerVersionRecord {
     #[must_use]
     pub fn policy_read_absence_message(&self, layer_version_arn: &str) -> Option<String> {
         match &self.policy {
-            None => Some(LAYER_VERSION_NO_POLICY_MESSAGE.to_string()),
+            None => Some(NO_POLICY_MESSAGE.to_string()),
             Some(policy) if policy.statements.is_empty() => Some(
                 layer_version_without_policy_message(layer_version_arn),
             ),
@@ -3361,7 +3536,8 @@ pub fn resolve_capacity_provider<'a>(
         .retain(|_, provider| !provider.is_removed_by(now));
     let Some(record) = store.capacity_providers.get_mut(&name) else {
         return Err(ResolveFailure::NotFound(format!(
-            "Capacity provider not found: {}",
+            "Capacity provider not found: {}. Check that the ARN is correct and the capacity \
+             provider exists in this Region.",
             capacity_provider_arn(region, &name)
         )));
     };
@@ -3778,19 +3954,22 @@ pub fn duplicate_event_source_mapping_message(
     )
 }
 
-/// What a call on a layer version's resource-based policy answers when there is no
-/// statement for it to act on: a REMOVAL always, and a READ of a version that has no
-/// policy record at all — one nobody has ever granted anything on.
-pub const LAYER_VERSION_NO_POLICY_MESSAGE: &str =
-    "No policy is associated with the given resource.";
+/// What a call on a resource-based policy answers when there is no statement for it to
+/// act on: a REMOVAL always, and a READ of a layer version that has no policy record at
+/// all — one nobody has ever granted anything on.
+///
+/// It is the POLICY that is reported missing rather than the resource, so a removal
+/// addressed at a function or a layer version that exists but carries no policy answers
+/// this rather than [`RESOURCE_NOT_FOUND_MESSAGE`] — which is what `GetPolicy` answers,
+/// because a read reports on the resource it was asked about.
+pub const NO_POLICY_MESSAGE: &str = "No policy is associated with the given resource.";
 
 /// What a READ of a layer version answers when its policy record holds no statement:
 /// every statement it had has been removed, so the version it names is the one that has
 /// no policy left.
 ///
-/// The layer version EXISTS in both this case and
-/// [`LAYER_VERSION_NO_POLICY_MESSAGE`]'s, so neither is the refusal for a layer version
-/// this account does not hold.
+/// The layer version EXISTS in both this case and [`NO_POLICY_MESSAGE`]'s, so neither is
+/// the refusal for a layer version this account does not hold.
 #[must_use]
 pub fn layer_version_without_policy_message(layer_version_arn: &str) -> String {
     format!("Layer version {layer_version_arn} does not have any resource policy.")
@@ -3823,6 +4002,37 @@ pub fn iso8601(at: SystemTime) -> String {
 pub fn code_sha256(bytes: &[u8]) -> String {
     let digest = sha2::Sha256::digest(bytes);
     base64::engine::general_purpose::STANDARD.encode(digest)
+}
+
+/// Lambda's sentence for a `CodeSha256` precondition that did not hold.
+///
+/// `PublishVersion` takes "Only publish a version if the hash value matches the value
+/// that's specified", and the refusal reports BOTH digests — the one the caller supplied
+/// and the one the unpublished version currently carries — under the member's own
+/// `CodeSHA256` spelling, and tells the caller to retry with the current one. Both values
+/// come from the request and from stored state.
+#[must_use]
+pub fn code_sha256_precondition_message(supplied: &str, current: &str) -> String {
+    format!(
+        "CodeSHA256 ({supplied}) is different from current CodeSHA256 in {VERSION_LATEST} \
+         ({current}). Please try again with the CodeSHA256 in {VERSION_LATEST}."
+    )
+}
+
+/// The refusal the same precondition gets when the function's package is one this
+/// emulator holds no bytes for (an S3 object or a container image), so no `CodeSha256` was
+/// ever computed for it.
+///
+/// AWS always holds a digest, so it has no sentence for this state and
+/// [`code_sha256_precondition_message`]'s would have an empty slot where the current
+/// digest goes. This says instead what is true: there is no digest to compare against, so
+/// nothing is reported for the function that was not computed.
+#[must_use]
+pub fn code_sha256_without_package_message(supplied: &str) -> String {
+    format!(
+        "CodeSHA256 ({supplied}) cannot be matched: this function's deployment package is \
+         held by reference, so no CodeSHA256 is computed for {VERSION_LATEST}."
+    )
 }
 
 /// A fresh revision id. Lambda's `RevisionId` is a UUID, and a new one is minted on
@@ -4054,6 +4264,14 @@ pub fn parse_taggable_resource(value: &str) -> Option<TaggableResourceRef> {
 /// so the resource keeps the tag set it had.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// Lambda's sentence for a tag write that would push a resource past
+/// [`MAX_TAGS_PER_RESOURCE`].
+///
+/// It states the quota that was hit and nothing of the request: not the resource, not the
+/// count the merge would have left behind. The restriction is a published quota, so the
+/// sentence is the same for every resource that hits it.
+pub const TAG_LIMIT_EXCEEDED_MESSAGE: &str = "Number of tags exceeds resource tag limit.";
+
 /// Why a `TaggableResource` — the `Resource` label of the `/2017-03-31/tags/{Resource}`
 /// operations — names no tag set.
 ///
@@ -4123,12 +4341,10 @@ pub fn resolve_resource_tags<'a>(
             )))
         }
         TaggableResourceRef::CapacityProvider(provider) => {
-            let record = store.capacity_providers.get_mut(&provider).ok_or_else(|| {
-                TagResolveFailure::NotFound(format!(
-                    "The resource you requested does not exist: no capacity provider is held \
-                     for '{resource}'"
-                ))
-            })?;
+            let record = store
+                .capacity_providers
+                .get_mut(&provider)
+                .ok_or_else(no_such_taggable_resource)?;
             record.materialize(now);
             Ok(&mut record.tags)
         }
@@ -4136,28 +4352,31 @@ pub fn resolve_resource_tags<'a>(
             // A mapping whose removal the clock already made due is gone, so it holds no
             // tag set either: what the clock owes is applied in ONE place.
             store.materialize_all(now);
-            let record = store.event_source_mappings.get_mut(&uuid).ok_or_else(|| {
-                TagResolveFailure::NotFound(format!(
-                    "The resource you requested does not exist: no event source mapping is \
-                     held for '{resource}'"
-                ))
-            })?;
+            let record = store
+                .event_source_mappings
+                .get_mut(&uuid)
+                .ok_or_else(no_such_taggable_resource)?;
             Ok(&mut record.tags)
         }
         TaggableResourceRef::CodeSigningConfig(arn) => {
-            let record = store.code_signing_configs.get_mut(&arn).ok_or_else(|| {
-                TagResolveFailure::NotFound(format!(
-                    "The resource you requested does not exist: no code signing \
-                     configuration is held for '{resource}'"
-                ))
-            })?;
+            let record = store
+                .code_signing_configs
+                .get_mut(&arn)
+                .ok_or_else(no_such_taggable_resource)?;
             Ok(&mut record.tags)
         }
-        TaggableResourceRef::Other(resource_type) => Err(TagResolveFailure::NotFound(format!(
-            "The resource you requested does not exist: no {resource_type} is held for \
-             '{resource}'"
-        ))),
+        TaggableResourceRef::Other(_) => Err(no_such_taggable_resource()),
     }
+}
+
+/// The refusal a well-formed `TaggableResource` ARN this account holds no resource for
+/// gets: the canonical [`RESOURCE_NOT_FOUND_MESSAGE`], naming neither the resource kind
+/// nor the ARN the request addressed.
+///
+/// A FUNCTION is the exception, because AWS gives it its own sentence; that branch above
+/// carries [`resolve_function`]'s refusal through unchanged.
+fn no_such_taggable_resource() -> TagResolveFailure {
+    TagResolveFailure::NotFound(RESOURCE_NOT_FOUND_MESSAGE.to_string())
 }
 
 /// Why a `FunctionName`/`Qualifier` pair names no record.
@@ -4219,6 +4438,31 @@ pub fn resolve_function<'a>(
     Ok((record, version))
 }
 
+/// Resolve a `PolicyResourceArn` — the `{ResourceArn}` label the resource-policy
+/// operations bind — to the record that holds that resource's policy, and the qualifier
+/// the policy is keyed by.
+///
+/// The member's own pattern admits two kinds of Lambda resource
+/// (`smithy_query(query="operation", operation="PutResourcePolicy")`): a function,
+/// optionally qualified by a version or an alias, and a runtime (`runtime/<id>`). A
+/// function ARN is resolved exactly as every other operation on this service resolves a
+/// `FunctionName`, so one resource has one policy however it is addressed; a runtime is
+/// a resource this store holds no records of, so an ARN naming one names no resource
+/// here.
+pub fn resolve_policy_resource<'a>(
+    store: &'a mut ComAmazonawsLambdaAwsgirapiserviceState,
+    resource_arn: &str,
+    region: &str,
+    now: SystemTime,
+) -> Result<(&'a mut FunctionRecord, String), ResolveFailure> {
+    if parse_function_reference(resource_arn).is_none_or(|reference| !reference.was_arn) {
+        return Err(ResolveFailure::NotFound(
+            NO_RESOURCE_POLICY_MESSAGE.to_string(),
+        ));
+    }
+    resolve_function(store, resource_arn, None, region, now)
+}
+
 /// One layer version a `LayerName`/`VersionNumber` pair resolved to: the ARN that pair
 /// names, and the stored version itself.
 ///
@@ -4257,7 +4501,14 @@ fn layer_name_of(layer_name: &str) -> Result<String, ResolveFailure> {
     })
 }
 
-/// The refusal a `LayerName`/`VersionNumber` pair naming no stored version gets.
+/// The refusal a `LayerName`/`VersionNumber` pair naming no stored version gets on the
+/// POLICY operations that share these resolvers.
+///
+/// Here the layer version is the operation's OWN resource, so the refusal identifies it:
+/// that is what lets a caller tell "no such version" from "that version holds no policy",
+/// which is the state every layer-sharing bootstrap starts from. The READ of the version
+/// itself (`GetLayerVersion`, `GetLayerVersionByArn`) answers the canonical
+/// [`RESOURCE_NOT_FOUND_MESSAGE`] instead, as AWS does for it.
 fn no_such_layer_version(name: &str, version_number: i64) -> ResolveFailure {
     ResolveFailure::NotFound(format!(
         "Layer version {name}:{version_number} does not exist"

@@ -149,6 +149,11 @@ enum StoreVerdict {
 /// replay, the Environment, its state, the bandwidth it offers, the identifying
 /// information it asks for, the tag set, and the `arn` attach point.
 ///
+/// `region` is the Region the request addressed, which is the scope every connection
+/// this judgement resolves is looked up in: a connection belongs to the Region it was
+/// created in, so neither a `clientToken` nor an attach-point ARN of another Region
+/// resolves here.
+///
 /// Called under the lock BOTH before the cross-service resolution and again at the
 /// instant the connection is minted, so a verdict is never acted on from a store that
 /// has since moved: check and insert happen under one lock. Running the whole
@@ -157,14 +162,22 @@ enum StoreVerdict {
 fn judge_against_store(
     store: &crate::state::ComAmazonawsInterconnectInterconnectState,
     input: &CreateConnectionInput,
+    region: &str,
 ) -> Result<StoreVerdict, CreateConnectionError> {
     // @idempotencyToken: a retry carrying a client token that already created a
     // connection replays THAT connection instead of allocating a second one —
     // but only when it is the SAME request. A token reused with different
     // parameters names a different connection than the one it created, so it is
     // refused, naming the token, rather than answered with an unrelated record.
+    //
+    // The token is held under the Region the request addressed: the connection it
+    // created belongs to that Region, so the same token sent to another Region's
+    // endpoint is one that endpoint has never seen.
     if let Some(token) = input.client_token.as_deref() {
-        if let Some(created) = store.idempotency_tokens.get(token) {
+        if let Some(created) = store
+            .idempotency_tokens
+            .get(&crate::state::idempotency_key(region, token))
+        {
             if !created.matches(
                 &input.environment_id,
                 &input.bandwidth,
@@ -182,7 +195,7 @@ fn judge_against_store(
                 )
                 .into());
             }
-            if let Some(stored) = store.connections.get(&created.connection_id) {
+            if let Some(stored) = store.connection_in(region, &created.connection_id) {
                 return Ok(StoreVerdict::Replay(stored.connection.clone()));
             }
         }
@@ -327,7 +340,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let environment = {
             let mut store = state.lock();
             store.materialise_due_transitions(::std::time::Instant::now());
-            match judge_against_store(&store, &input)? {
+            match judge_against_store(&store, &input, &region)? {
                 StoreVerdict::Replay(connection) => {
                     return Ok(CreateConnectionOutput {
                         connection: Some(connection),
@@ -380,7 +393,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::Instant::now();
         let mut store = state.lock();
         store.materialise_due_transitions(now);
-        let environment = match judge_against_store(&store, &input)? {
+        let environment = match judge_against_store(&store, &input, &region)? {
             StoreVerdict::Replay(connection) => {
                 return Ok(CreateConnectionOutput {
                     connection: Some(connection),
@@ -476,6 +489,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             id.clone(),
             crate::state::StoredConnection {
                 connection: connection.clone(),
+                // The Region this record belongs to from now on: only a request
+                // signed for it resolves this connection.
+                region: region.clone(),
                 remote_account: input.remote_account.clone(),
                 // A connection is returned in a non-terminal state, so the clock
                 // owes it the rest of the documented progression: accepted
@@ -491,7 +507,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .insert(activation_key, id.clone());
         if let Some(token) = input.client_token.clone() {
             store.idempotency_tokens.insert(
-                token,
+                crate::state::idempotency_key(&region, &token),
                 crate::state::IdempotentCreate {
                     connection_id: id,
                     environment_id: input.environment_id.clone(),

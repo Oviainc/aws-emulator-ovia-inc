@@ -185,6 +185,11 @@ pub mod hook_results;
 /// starts and `DescribeGeneratedTemplate` reads the progress of.
 pub mod generated_template;
 
+/// The wait conditions of one stack operation: the barrier an
+/// `AWS::CloudFormation::WaitCondition` puts in a create or an update, and the signals
+/// `SignalResource` releases it with.
+pub mod wait_conditions;
+
 /// How long after the call that starts it a stack's terminal status becomes due.
 ///
 /// Chosen (CloudFormation's real stack operations take as long as the resources do, so
@@ -478,8 +483,9 @@ pub mod status {
 /// ([`provisioning::ResourceTransition`]).
 pub mod resource_status {
     /// The status a resource the stack's create is still working on reports: the one that
-    /// OPENS its create — and the one a signal it receives while that create is in flight
-    /// is recorded under.
+    /// OPENS its create — the one a signal it receives while that create is in flight is
+    /// recorded under, and the one a wait condition the operation is waiting AT is in
+    /// ([`wait_conditions`](super::wait_conditions)).
     pub const CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
     pub const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
     /// The status of a resource whose creation the service that owns it refused, or a
@@ -661,6 +667,14 @@ pub struct DeployedResource {
     /// `StackResource$Timestamp`: "Time the status was updated" — the instant the stack
     /// operation that left this resource in `status` completed.
     pub status_timestamp: SystemTime,
+    /// `StackResource$ResourceStatusReason`: "Success/failure message associated with the
+    /// resource."
+    ///
+    /// `None` for a resource whose status speaks for itself, which a completed create or
+    /// update is. A resource whose operation has been STARTED and not finished carries the
+    /// message CloudFormation reports for one — see [`initiated_reason`] — since that is
+    /// what says the work on it is under way rather than done.
+    pub status_reason: Option<String>,
     /// `StackResourceDriftInformation$StackResourceDriftStatus`: this resource's own drift
     /// result, as the last drift detection that COMPLETED over it left it
     /// ([`drift`]). [`resource_drift_status::NOT_CHECKED`] until one has.
@@ -682,6 +696,7 @@ impl DeployedResource {
             resource,
             status: status.to_string(),
             status_timestamp: at,
+            status_reason: None,
             drift_status: resource_drift_status::NOT_CHECKED.to_string(),
             drift_checked_at: None,
         }
@@ -795,6 +810,12 @@ pub struct PendingStatus {
 pub struct PendingDeployment {
     pub resources: Vec<StoredResource>,
     pub outputs: Vec<StoredOutput>,
+    /// The wait conditions the template being deployed declares
+    /// ([`wait_conditions::declared`]), each with the resources whose creation waits on
+    /// it. Computed where the template is READ, outside the store lock;
+    /// [`StoredStack::begin_transition`] is what opens a barrier for each one the
+    /// operation has to wait at.
+    pub wait_conditions: Vec<wait_conditions::DeclaredWaitCondition>,
 }
 
 /// One stack, as this emulator persists it.
@@ -864,6 +885,15 @@ pub struct StoredStack {
     /// What the create or update currently in flight will leave the two fields above
     /// with when it completes.
     pub pending_deployment: Option<PendingDeployment>,
+    /// The wait conditions the operation in flight is waiting at, each with the signals
+    /// that have arrived ([`wait_conditions`]).
+    ///
+    /// Non-empty means the operation's completion is NOT owed by the clock yet:
+    /// CloudFormation "doesn't proceed with a stack creation or update until resources
+    /// receive the required number of signals or the timeout period is exceeded", so
+    /// [`Self::settle`] holds the pending transition back while one of these is
+    /// unsatisfied, and `SignalResource` is what satisfies one.
+    pub wait_conditions: Vec<wait_conditions::WaitConditionBarrier>,
     /// The most recent stack operation, as `Stack$LastOperations` reports it. Recorded by
     /// [`StoredStack::begin_transition`], so every call that opens an operation records
     /// exactly one.
@@ -929,6 +959,7 @@ impl StoredStack {
             resources: Vec::new(),
             outputs: Vec::new(),
             pending_deployment: None,
+            wait_conditions: Vec::new(),
             last_operation: None,
             creation_time: now,
             last_updated_time: None,
@@ -1095,7 +1126,16 @@ impl StoredStack {
         // is after the carry-forward above: a resource whose id the owning service assigned
         // carries the one it minted, and an output naming that resource must report THAT.
         let outputs = self.evaluated_outputs(&declared, scope, &resources, &mut budget);
-        self.pending_deployment = Some(PendingDeployment { resources, outputs });
+        // The wait conditions the template declares, with the resources whose creation
+        // waits on each: computed HERE, where the template is already parsed and the store
+        // is not locked, and charged to the SAME budget as every other evaluation of this
+        // deployment, so what one request can ask for stays bounded in total.
+        let wait_conditions = wait_conditions::declared(&declared, &resources, &mut budget);
+        self.pending_deployment = Some(PendingDeployment {
+            resources,
+            outputs,
+            wait_conditions,
+        });
     }
 
     /// The stack's declared outputs, evaluated against `resources`.
@@ -1350,10 +1390,25 @@ impl StoredStack {
     /// Only ever applies a transition whose due instant has passed, so it reports what
     /// was owed at `now` even if nobody had called — it never advances a stack because
     /// it was read.
+    ///
+    /// An operation waiting at a wait condition has no transition owed at all until the
+    /// signals arrive, so the barriers are consulted FIRST: one whose `Timeout` has run
+    /// out fails the operation (which the clock does owe at that instant), and one still
+    /// waiting holds the pending transition back however long ago it was opened.
     pub fn settle(&mut self, now: SystemTime) {
+        self.settle_wait_conditions(now);
+        if self.waiting_for_signals() {
+            // The operation is still waiting for its signals: nothing is due.
+            return;
+        }
         if self.pending.as_ref().is_none_or(|p| p.due_at > now) {
             return;
         }
+        // The operation is completing, so its barriers belong to nothing from here on.
+        // They are kept until exactly this point, so what the operation had created stays
+        // reported for the whole of it rather than disappearing between the releasing
+        // signal and the completion it makes due.
+        self.wait_conditions.clear();
         let pending = self.pending.take().expect("checked just above");
         self.status = pending.status;
         self.status_reason = pending.status_reason.clone();
@@ -1398,6 +1453,10 @@ impl StoredStack {
     /// Start a stack operation: move the stack to its `*_IN_PROGRESS` status, record the
     /// opening event, and make the terminal status due one [`STATUS_TRANSITION_DELAY`]
     /// from now.
+    ///
+    /// A create or update whose template declares a wait condition is due its terminal
+    /// status only once the signals arrive: [`Self::opening_barriers`] is what records
+    /// that, and [`Self::settle`] holds the transition back while one is unsatisfied.
     pub fn begin_transition(
         &mut self,
         now: SystemTime,
@@ -1435,6 +1494,219 @@ impl StoredStack {
             operation_id,
             client_request_token,
         });
+        self.wait_conditions = self.opening_barriers(now, in_progress);
+    }
+
+    /// The wait conditions the operation now opening has to wait at.
+    ///
+    /// Only a CREATE or an UPDATE waits: those are the operations CloudFormation "doesn't
+    /// proceed with … until resources receive the required number of signals"
+    /// (`SignalResource`), while a delete or a rollback removes what is there and waits
+    /// for nothing. A wait condition the stack has ALREADY deployed and that this
+    /// deployment declares unchanged is not waited at a second time — it is the same
+    /// satisfied wait condition ("you can't update a wait condition that has already been
+    /// satisfied unless you also change the handle").
+    fn opening_barriers(
+        &self,
+        now: SystemTime,
+        in_progress: &str,
+    ) -> Vec<wait_conditions::WaitConditionBarrier> {
+        if !matches!(
+            in_progress,
+            status::CREATE_IN_PROGRESS | status::UPDATE_IN_PROGRESS
+        ) {
+            return Vec::new();
+        }
+        let Some(deployment) = &self.pending_deployment else {
+            return Vec::new();
+        };
+        deployment
+            .wait_conditions
+            .iter()
+            .filter(|declared| !self.already_satisfied(&declared.logical_id))
+            .cloned()
+            .map(|declared| wait_conditions::WaitConditionBarrier::open(declared, now))
+            .collect()
+    }
+
+    /// Whether the wait condition under this logical id is one the stack already has,
+    /// declared again exactly as it stands: such a wait condition got its signals when it
+    /// was created and is not waited at again.
+    fn already_satisfied(&self, logical_id: &str) -> bool {
+        let Some(deployment) = &self.pending_deployment else {
+            return false;
+        };
+        let declared = deployment
+            .resources
+            .iter()
+            .find(|resource| resource.logical_id == logical_id);
+        let installed = self
+            .resources
+            .iter()
+            .find(|deployed| deployed.resource.logical_id == logical_id);
+        match (declared, installed) {
+            (Some(declared), Some(installed)) => {
+                installed.resource.resource_type == declared.resource_type
+                    && installed.resource.properties == declared.properties
+            }
+            _ => false,
+        }
+    }
+
+    /// How many DISTINCT success signals this stack has received for `logical_id`.
+    ///
+    /// Counted off the stack's signal log, which `SignalResource` keys by the signalled
+    /// resource and the signal's `UniqueId` ([`Self::record_signal`]): "if you send
+    /// multiple signals to a single resource (such as signaling a wait condition), each
+    /// signal requires a different unique ID", so two signals under one id are one signal
+    /// and this is the count a wait condition's `Count` is compared against.
+    pub fn successful_signals(&self, logical_id: &str) -> usize {
+        self.signals
+            .iter()
+            .filter(|signal| {
+                signal.logical_resource_id == logical_id
+                    && signal.status == resource_signal_status::SUCCESS
+            })
+            .count()
+    }
+
+    /// Whether this barrier has the signals it waits for, so the operation may proceed.
+    pub fn barrier_satisfied(&self, barrier: &wait_conditions::WaitConditionBarrier) -> bool {
+        self.successful_signals(barrier.logical_id()) >= barrier.count()
+    }
+
+    /// Whether the operation in flight is still waiting at one of its wait conditions.
+    fn waiting_for_signals(&self) -> bool {
+        self.wait_conditions
+            .iter()
+            .any(|barrier| !self.barrier_satisfied(barrier))
+    }
+
+    /// Make the operation's terminal status due where every wait condition it is waiting
+    /// at now has the signals it waits for, and say whether this released it.
+    ///
+    /// Called by `SignalResource` once it has recorded a signal: "when the wait condition
+    /// receives the requisite number of success signals, CloudFormation resumes the
+    /// creation of the stack". The operation is then owed its terminal status from the
+    /// signal that released it rather than from the call that started it, so a caller
+    /// reading straight after the signal still sees the operation in progress — and the
+    /// barriers stay on the stack until [`Self::settle`] completes it, so the resources it
+    /// had created go on being reported while it finishes.
+    pub fn release_wait_conditions(&mut self, now: SystemTime) -> bool {
+        if self.wait_conditions.is_empty() || self.waiting_for_signals() {
+            return false;
+        }
+        if let Some(pending) = &mut self.pending {
+            pending.due_at = now + STATUS_TRANSITION_DELAY;
+        }
+        true
+    }
+
+    /// Materialise what the wait conditions of the operation in flight owe at `now`.
+    ///
+    /// The clock owes exactly one thing here, and only to a wait condition whose
+    /// `Timeout` has run out: "if the wait condition doesn't receive the specified number
+    /// of success signals before the `Timeout` period expires, CloudFormation assumes that
+    /// the wait condition has failed", so the operation takes the failed status carrying
+    /// that reason — which was owed at that instant even if nobody had called. The
+    /// resources the failed operation had already made stay recorded on the stack, and
+    /// removing them is its DELETION: that calls the services that own them, which a read
+    /// cannot do.
+    ///
+    /// Nothing else about a barrier moves here: a SIGNAL is what satisfies one
+    /// ([`Self::release_wait_conditions`]), and a barrier left behind by an operation that
+    /// has already concluded belongs to no operation and is dropped.
+    fn settle_wait_conditions(&mut self, now: SystemTime) {
+        if self.wait_conditions.is_empty() {
+            return;
+        }
+        if self.pending.is_none() {
+            self.wait_conditions.clear();
+            return;
+        }
+        let Some(reason) = self
+            .wait_conditions
+            .iter()
+            .find(|barrier| barrier.has_expired(now) && !self.barrier_satisfied(barrier))
+            .map(|barrier| {
+                barrier.timed_out_reason(self.successful_signals(barrier.logical_id()))
+            })
+        else {
+            return;
+        };
+        let failed_status = failed_status_of(&self.status);
+        self.wait_conditions.clear();
+        self.fail_transition(now, failed_status, reason);
+    }
+
+    /// The resources a read of this stack reports RIGHT NOW.
+    ///
+    /// For a stack with no operation waiting at a wait condition that is what its last
+    /// completed operation installed, which is what CloudFormation reports for a stack
+    /// whose operation is still in flight: the resources of the template that finished
+    /// deploying.
+    ///
+    /// For one that IS waiting — or that has been signalled and is completing — the
+    /// operation has got as far as the wait condition: the resources it has already
+    /// created are reported with the status that operation left them in, a wait condition
+    /// still waiting is reported `*_IN_PROGRESS` (it is created and not finished), and the
+    /// resources whose creation waits on one still waiting
+    /// ([`wait_conditions::DeclaredWaitCondition::blocks`]) are not reported at all —
+    /// CloudFormation reports a resource once its creation has STARTED, and these have
+    /// not. A wait condition that HAS its signals, and what was waiting behind it, are
+    /// reported as created, which is what the operation went on to do. An update's
+    /// resources in force that the operation has not reached are reported as they stand,
+    /// since it has not touched them.
+    pub fn reported_resources(&self) -> Vec<DeployedResource> {
+        let Some(opened_at) = self
+            .wait_conditions
+            .iter()
+            .map(|barrier| barrier.opened_at)
+            .min()
+        else {
+            return self.resources.clone();
+        };
+        let Some(deployment) = self.pending_deployment.as_ref() else {
+            return self.resources.clone();
+        };
+        let unsatisfied: Vec<&wait_conditions::WaitConditionBarrier> = self
+            .wait_conditions
+            .iter()
+            .filter(|barrier| !self.barrier_satisfied(barrier))
+            .collect();
+        let started: Vec<StoredResource> = deployment
+            .resources
+            .iter()
+            .filter(|resource| {
+                !unsatisfied
+                    .iter()
+                    .any(|barrier| barrier.blocks(&resource.logical_id))
+            })
+            .cloned()
+            .collect();
+        let mut reported = installed_resources(&self.resources, started, opened_at);
+        for deployed in &mut reported {
+            if let Some(barrier) = unsatisfied
+                .iter()
+                .find(|barrier| barrier.logical_id() == deployed.resource.logical_id)
+            {
+                let in_progress = in_progress_resource_status(&self.status);
+                deployed.status = in_progress.to_string();
+                deployed.status_reason = Some(initiated_reason(in_progress).to_string());
+                deployed.status_timestamp = barrier.opened_at;
+            }
+        }
+        // What the stack already had and this operation has not reached keeps the status
+        // it carries: the operation has not touched it.
+        for deployed in &self.resources {
+            if !reported
+                .iter()
+                .any(|shown| shown.resource.logical_id == deployed.resource.logical_id)
+            {
+                reported.push(deployed.clone());
+            }
+        }
+        reported
     }
 
     /// The resources the stack has RIGHT NOW: the ones the operation in flight is about to
@@ -1530,6 +1802,9 @@ impl StoredStack {
     /// does not stay pending and no terminal status it never reached is reported.
     pub fn fail_transition(&mut self, now: SystemTime, failed_status: &str, reason: String) {
         let pending = self.pending.take();
+        // An operation that failed waits for nothing: whatever it was waiting at, it is
+        // not going to proceed on a signal.
+        self.wait_conditions.clear();
         self.status = failed_status.to_string();
         self.status_reason = Some(reason.clone());
         self.record_event(
@@ -1605,6 +1880,39 @@ fn declared_name(resource: &StoredResource) -> Option<String> {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         })
+}
+
+/// The status an operation that cannot be carried out leaves the stack in, by the
+/// `*_IN_PROGRESS` status it is in.
+///
+/// A wait condition is waited at by a create or an update only
+/// ([`StoredStack::opening_barriers`]), which are the two this answers for; anything else
+/// is a create, the status a stack that never completed one reports.
+fn failed_status_of(in_progress: &str) -> &'static str {
+    match in_progress {
+        status::UPDATE_IN_PROGRESS => status::UPDATE_FAILED,
+        _ => status::CREATE_FAILED,
+    }
+}
+
+/// The resource-level status of a resource the operation in `stack_status` has STARTED and
+/// not finished — what a wait condition the operation is waiting at reports.
+fn in_progress_resource_status(stack_status: &str) -> &'static str {
+    match stack_status {
+        status::UPDATE_IN_PROGRESS => resource_status::UPDATE_IN_PROGRESS,
+        _ => resource_status::CREATE_IN_PROGRESS,
+    }
+}
+
+/// The `ResourceStatusReason` CloudFormation reports for a resource whose work has been
+/// STARTED and has not finished: it records that the resource's creation — or, for an
+/// update, its update — was initiated, which is what distinguishes a resource being worked
+/// on from one merely queued behind another.
+fn initiated_reason(in_progress_status: &str) -> &'static str {
+    match in_progress_status {
+        resource_status::UPDATE_IN_PROGRESS => "Resource update Initiated",
+        _ => "Resource creation Initiated",
+    }
 }
 
 /// The resources a completed create or update leaves the stack with, each carrying the

@@ -303,15 +303,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Phase 2, OUTSIDE the lock: the continuation is INTERPRETED here, from the
-        // state the task was scheduled at. The walk has no side effects and the states
-        // this emulator executes are deterministic, so it places the worker's reply
-        // against the raw input that state was entered with and runs on from its
-        // `Next`; the outcome it computes is owed to the clock, so the execution
-        // reports `RUNNING` until then.
+        // state the task was scheduled at. It places the worker's reply against the
+        // raw input that state was entered with and runs on from its `Next`; the
+        // states after the reply may themselves be service integrations, so their
+        // calls are made from this request's own task exactly as a start's are
+        // (`state::integration::interpret`), in the state machine's own Region. The
+        // outcome the walk computes is owed to the clock, so the execution reports
+        // `RUNNING` until then.
         let interpreted = {
             let definition = definition.clone();
             let execution_input = execution_input.clone();
-            tokio::task::spawn_blocking(move || {
+            let region = crate::state::arn_region(&machine_arn);
+            crate::state::integration::interpret(ctx, &region, move |tasks| {
                 crate::state::plan_reply(
                     &definition,
                     &execution_input,
@@ -320,6 +323,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &context,
                     &reply,
                     previous_event_id,
+                    tasks,
                 )
             })
             .await

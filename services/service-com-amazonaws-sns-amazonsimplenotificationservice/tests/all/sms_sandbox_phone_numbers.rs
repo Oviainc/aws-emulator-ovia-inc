@@ -21,30 +21,16 @@ use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_sns_amazonsimplenotificationservice::ops::types::S_M_S_SANDBOX_PHONE_NUMBER_VERIFICATION_STATUS_VALUES;
 use service_com_amazonaws_sns_amazonsimplenotificationservice::state::{
-    SandboxPhoneNumberRecord, MAX_RECORDS_PER_STORE, PAGE_SIZE, RESOURCE_DOES_NOT_EXIST,
-    SANDBOX_NUMBER_PENDING,
+    SandboxPhoneNumberRecord, INVALID_NEXT_TOKEN_REFUSAL, MAX_RECORDS_PER_STORE, PAGE_SIZE,
+    RESOURCE_DOES_NOT_EXIST, SANDBOX_NUMBER_PENDING,
 };
 
-use super::topics_subscriptions_publish::{xml_unescape, Answer, Sns};
+use super::topics_subscriptions_publish::{text_of, Answer, Sns};
 
 /// The page `MaxResults` bounds: `smithy_query(query="shape", shape="MaxItems")`
 /// reports `range {min: 1, max: 100}` for the member's target shape.
 const MIN_MAX_RESULTS: i64 = 1;
 const MAX_MAX_RESULTS: i64 = 100;
-
-/// The text of the first `<tag>…</tag>` element inside `block`, or `""` when the
-/// element is absent or empty.
-fn text_of(block: &str, tag: &str) -> String {
-    let open = format!("<{tag}>");
-    let Some(start) = block.find(&open) else {
-        return String::new();
-    };
-    let rest = &block[start + open.len()..];
-    match rest.find(&format!("</{tag}>")) {
-        Some(end) => xml_unescape(&rest[..end]),
-        None => String::new(),
-    }
-}
 
 /// The body of the response's `<PhoneNumbers>` element, or `None` when the response
 /// carries no such member at all — the member is modelled `required`, so an answered
@@ -62,7 +48,10 @@ fn phone_numbers_block(body: &str) -> Option<&str> {
 ///
 /// A list member's open tag carries the envelope's default namespace, so the opening
 /// is matched up to its first `>` rather than as a bare `<member>`.
-fn reported_numbers(answer: &Answer) -> Vec<(String, String)> {
+///
+/// `pub(crate)` so the sibling verification suite reads a number's status back
+/// through the SAME listing parse rather than writing a second one.
+pub(crate) fn reported_numbers(answer: &Answer) -> Vec<(String, String)> {
     let block = phone_numbers_block(&answer.body)
         .unwrap_or_else(|| panic!("no PhoneNumbers member in {}", answer.body));
     let mut found = Vec::new();
@@ -87,7 +76,9 @@ async fn list(sns: &Sns, params: &[(&str, &str)]) -> Answer {
 }
 
 /// Add `number` to the sandbox, asserting the call was served.
-async fn add(sns: &Sns, case: &str, number: &str) -> Answer {
+///
+/// `pub(crate)` so the sibling verification suite adds a number the same way.
+pub(crate) async fn add(sns: &Sns, case: &str, number: &str) -> Answer {
     let answer = sns
         .call("CreateSMSSandboxPhoneNumber", &[("PhoneNumber", number)])
         .await;
@@ -104,7 +95,10 @@ async fn add(sns: &Sns, case: &str, number: &str) -> Answer {
 /// `^(\+[0-9]{8,}|[0-9]{0,9})$` — an E.164 number of at least eight digits, or a bare
 /// short code of up to nine digits. The rows cover both branches and both published
 /// length bounds of the E.164 branch.
-fn accepted_number_forms() -> Vec<(&'static str, String)> {
+///
+/// `pub(crate)` so the sibling verification suite drives the same accepted forms
+/// rather than keeping a second catalog of them.
+pub(crate) fn accepted_number_forms() -> Vec<(&'static str, String)> {
     vec![
         ("e164 north american", "+12065550100".to_string()),
         ("e164 international", "+447700900123".to_string()),
@@ -422,6 +416,14 @@ async fn a_next_token_the_listing_did_not_mint_is_refused() {
             "case {case:?}: expected the InvalidParameter code, got {}",
             answer.body
         );
+        // The sentence is per error class, not per listing: every paginated SNS list
+        // refuses a token it did not mint with the same one.
+        assert_eq!(
+            answer.element("Message").as_deref(),
+            Some(INVALID_NEXT_TOKEN_REFUSAL),
+            "case {case:?}: expected the member's refusal sentence, got {}",
+            answer.body
+        );
     }
 
     assert_eq!(
@@ -450,6 +452,7 @@ async fn a_number_past_the_record_ceiling_is_refused() {
                 SandboxPhoneNumberRecord {
                     phone_number: number.clone(),
                     status: SANDBOX_NUMBER_PENDING.to_string(),
+                    one_time_password: format!("{at:06}"),
                     created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(at as u64 + 1),
                 },
             );
@@ -513,6 +516,7 @@ async fn the_listing_reports_the_status_each_record_holds() {
                 SandboxPhoneNumberRecord {
                     phone_number: number.clone(),
                     status: (*status).to_string(),
+                    one_time_password: format!("{at:06}"),
                     created_at: SystemTime::UNIX_EPOCH
                         + Duration::from_secs(at as u64 + 1),
                 },

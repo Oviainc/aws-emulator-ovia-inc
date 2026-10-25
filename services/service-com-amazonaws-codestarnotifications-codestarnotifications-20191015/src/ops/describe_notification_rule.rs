@@ -156,10 +156,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeNotificationRuleErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "No notification rule matches the ARN {}",
-                            input.arn
-                        )),
+                        message: Some(st::no_rule_with_id(&input.arn)),
                     },
                 )
                 .into(),

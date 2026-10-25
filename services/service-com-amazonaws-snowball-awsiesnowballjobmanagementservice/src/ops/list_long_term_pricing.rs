@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLongTermPricing
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLongTermPricing`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLongTermPricing::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the long-term pricing contracts this store holds in creation order, one
+//! `LongTermPricingListEntry` per contract: the term and device type it was created for, the
+//! window it runs for, the status the clock puts it in, and the jobs ordered under it.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +140,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLongTermPricing` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLongTermPricingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLongTermPricing"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STATE_UNAVAILABLE,
+            ));
+        };
+
+        // The page size and the cursor codec are the ones every list operation of this
+        // service shares (`state::page_size`, `state::page_of_long_term_pricing`), so this
+        // listing cannot drift from the job and cluster listings on how `MaxResults` — and
+        // the 0 the member admits — is read, or on what a token means.
+        let page_size = crate::state::page_size(input.max_results);
+
+        // A read: this operation "Lists all long-term pricing types", so it reports what the
+        // store holds and writes nothing. The status and the jobs each entry carries are
+        // derived from that state at the instant of the call.
+        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let records = store.long_term_pricing_in_creation_order();
+
+        let Some((page, next_token)) = crate::state::page_of_long_term_pricing(
+            &records,
+            input.next_token.as_deref(),
+            page_size,
+            now,
+            |long_term_pricing_id| store.jobs_billed_to_long_term_pricing(long_term_pricing_id),
+        ) else {
+            return Err(ListLongTermPricingErrorModeled::InvalidNextTokenException(
+                InvalidNextTokenException {
+                    message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(ListLongTermPricingOutput {
+            long_term_pricing_entries: Some(page),
+            next_token,
+        })
     }
 }

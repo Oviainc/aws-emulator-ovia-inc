@@ -55,6 +55,8 @@ mod open_id_connect_providers;
 mod policy_listing;
 #[path = "all/policy_simulation.rs"]
 mod policy_simulation;
+#[path = "all/policy_tags.rs"]
+mod policy_tags;
 #[path = "all/policy_version_listing.rs"]
 mod policy_version_listing;
 #[path = "all/principal_policy_context_keys.rs"]
@@ -107,5 +109,7 @@ mod user_attached_policy_listing;
 mod user_lifecycle;
 #[path = "all/user_permissions_boundary.rs"]
 mod user_permissions_boundary;
+#[path = "all/user_tag_listing.rs"]
+mod user_tag_listing;
 #[path = "all/user_tags.rs"]
 mod user_tags;

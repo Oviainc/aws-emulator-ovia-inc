@@ -24,6 +24,13 @@
 //! values `CertificateTransparencyLoggingPreference` admits and its absence, and whether
 //! the request names a `PrimaryDomainName` at all.
 //!
+//! A validation token host of `cloudfront` asks CloudFront to serve the token at the
+//! domain itself, which the create admits only for a domain this service resolves to a
+//! CloudFront resource, so those rows claim MINTED routing endpoints
+//! ([`crate::managed_certificate_domain_ownership::resolvable_domains`]); that admission
+//! rule is what [`crate::managed_certificate_domain_ownership`] is about, and the rows here
+//! are about what the certificate then reports.
+//!
 //! The wire harness (the router, the request helpers and the element scanner) is the one
 //! [`crate::distribution_lifecycle`] already builds; the tenant helpers are
 //! [`crate::distribution_tenant_lifecycle`]'s.
@@ -38,7 +45,7 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::ops::types::{
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     CERTIFICATE_REGION, CERTIFICATE_STATUS_ISSUED, CERTIFICATE_STATUS_PENDING_VALIDATION,
     CERTIFICATE_VALIDATION_DELAY, MAX_DOMAINS_PER_TENANT, VALIDATION_HOST_SUFFIX,
-    VALIDATION_TOKEN_PATH,
+    VALIDATION_TOKEN_HOST_CLOUDFRONT, VALIDATION_TOKEN_PATH,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -47,13 +54,17 @@ use crate::distribution_lifecycle::{call, emulator, is_minted_uuid, Answer, Node
 use crate::distribution_tenant_lifecycle::{
     create_distribution_tenant, encode_label, escape, multi_tenant_distribution,
 };
+use crate::managed_certificate_domain_ownership::resolvable_domains;
 
 // ---------------------------------------------------------------------------
 // Calling the certificate surface
 // ---------------------------------------------------------------------------
 
 /// `GET /2020-05-31/managed-certificate/{Identifier}`.
-async fn get_managed_certificate_details(
+///
+/// `pub(crate)` so a sibling suite that asserts which certificate a create minted reads it
+/// over this one wire path rather than growing a copy of it.
+pub(crate) async fn get_managed_certificate_details(
     router: &MultiServiceRouter,
     identifier: &str,
 ) -> Answer {
@@ -134,6 +145,25 @@ impl Request {
     }
 }
 
+/// The domains one row claims: a MINTED routing endpoint per domain when the row asks
+/// CloudFront to serve the validation token — the create admits that mode only for a
+/// domain this service resolves to a CloudFront resource — and customer names `label`
+/// seeds otherwise.
+async fn domains_for(
+    router: &MultiServiceRouter,
+    host: &str,
+    label: &str,
+    count: usize,
+) -> Vec<String> {
+    if host == VALIDATION_TOKEN_HOST_CLOUDFRONT {
+        resolvable_domains(router, label, count).await
+    } else {
+        (0..count)
+            .map(|slot| format!("{label}{slot}.example.com"))
+            .collect()
+    }
+}
+
 /// The table every rule below is asserted over.
 ///
 /// `ValidationTokenHost` draws from the model's own catalog
@@ -144,7 +174,26 @@ impl Request {
 /// way. The rows span one domain, several, and the published per-tenant domain bound
 /// (`MAX_DOMAINS_PER_TENANT`), an uppercase domain, and a request that names no primary
 /// domain and no transparency preference at all.
-fn request_table() -> Vec<Request> {
+async fn request_table(router: &MultiServiceRouter) -> Vec<Request> {
+    let mut rows = base_rows();
+    // A create asking CLOUDFRONT to serve the validation token is admitted only for a
+    // domain this service resolves to a CloudFront resource, so each such row claims one
+    // minted routing endpoint per domain instead of a customer name.
+    for row in rows
+        .iter_mut()
+        .filter(|row| row.validation_token_host == VALIDATION_TOKEN_HOST_CLOUDFRONT)
+    {
+        row.domains = resolvable_domains(router, &row.name, row.domains.len()).await;
+        if row.primary_domain_name.is_some() {
+            row.primary_domain_name = Some(row.domains[0].clone());
+        }
+    }
+    rows
+}
+
+/// The rows as they are written, before the ones that ask CloudFront to serve the
+/// validation token are given domains this service resolves.
+fn base_rows() -> Vec<Request> {
     let mut rows = Vec::new();
     for (index, host) in VALIDATION_TOKEN_HOST_VALUES.iter().enumerate() {
         let tag = host.replace('-', "");
@@ -324,7 +373,7 @@ async fn a_request_mints_the_certificate_the_read_reports() {
     let mut arns = BTreeSet::new();
     let mut tokens = BTreeSet::new();
 
-    for request in request_table() {
+    for request in request_table(&router).await {
         let case = request.case;
         let created = create_distribution_tenant(&router, &request.xml(&distribution_id)).await;
         assert_eq!(
@@ -379,11 +428,12 @@ async fn a_request_mints_the_certificate_the_read_reports() {
 async fn every_tenant_identifier_form_reaches_the_one_certificate() {
     let router = emulator();
     let distribution_id = multi_tenant_distribution(&router, "ref-certificate-identifier").await;
+    let host = VALIDATION_TOKEN_HOST_VALUES[0];
     let request = Request {
         case: "addressed three ways",
         name: "cert-identifier".to_string(),
-        domains: vec!["identifier.example.com".to_string()],
-        validation_token_host: VALIDATION_TOKEN_HOST_VALUES[0],
+        domains: domains_for(&router, host, "cert-identifier", 1).await,
+        validation_token_host: host,
         primary_domain_name: None,
         transparency_logging: None,
     };
@@ -458,13 +508,11 @@ async fn the_clock_settles_a_certificate_to_issued() {
     let distribution_id = multi_tenant_distribution(&router, "ref-certificate-clock").await;
 
     for host in VALIDATION_TOKEN_HOST_VALUES {
+        let label = format!("clock-{}", host.replace('-', ""));
         let request = Request {
             case: "validation settles",
             name: format!("cert-clock-{}", host.replace('-', "")),
-            domains: vec![
-                format!("clock-{}.example.com", host.replace('-', "")),
-                format!("clock2-{}.example.com", host.replace('-', "")),
-            ],
+            domains: domains_for(&router, host, &label, 2).await,
             validation_token_host: host,
             primary_domain_name: None,
             transparency_logging: None,

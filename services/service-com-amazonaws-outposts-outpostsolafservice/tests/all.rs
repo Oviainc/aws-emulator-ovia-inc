@@ -37,6 +37,8 @@ mod error_message_rules;
 mod get_order_reporting;
 #[path = "all/get_site_address_reporting.rs"]
 mod get_site_address_reporting;
+#[path = "all/order_cancellation.rs"]
+mod order_cancellation;
 #[path = "all/order_lifecycle.rs"]
 mod order_lifecycle;
 #[path = "all/orderable_instance_types.rs"]
@@ -45,6 +47,8 @@ mod orderable_instance_types;
 mod outpost_assets;
 #[path = "all/outpost_decommission.rs"]
 mod outpost_decommission;
+#[path = "all/outpost_hardware_installation.rs"]
+mod outpost_hardware_installation;
 #[path = "all/outpost_server_connection.rs"]
 mod outpost_server_connection;
 #[path = "all/private_connectivity.rs"]

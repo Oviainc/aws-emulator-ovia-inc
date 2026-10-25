@@ -58,14 +58,18 @@ const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 /// shape="Grant")`), which is the `xsi` prefix every S3 client declares on `<Grantee>`.
 const XSI: &str = "http://www.w3.org/2001/XMLSchema-instance";
 
-/// Every value the `BucketCannedACL` enum publishes, in the model's own order
-/// (`smithy_query(query="shape",shape="BucketCannedACL")` reports
-/// `values: [private, public-read, public-read-write, authenticated-read]`).
-const BUCKET_CANNED_ACL_VALUES: [&str; 4] = [
+/// Every canned ACL a bucket may be given, in the model's own order
+/// (`smithy_query(query="shape",shape="BucketCannedACL")`).
+///
+/// `log-delivery-write` is one of them: the Amazon S3 User Guide's canned ACL table
+/// documents it for buckets — it is the ACL S3 server access logging requires on a target
+/// bucket — and S3 accepts it on `x-amz-acl`.
+const BUCKET_CANNED_ACL_VALUES: [&str; 5] = [
     "private",
     "public-read",
     "public-read-write",
     "authenticated-read",
+    "log-delivery-write",
 ];
 
 /// One grant as `GetBucketAcl` reports it: who, named how, and what they may do.
@@ -182,6 +186,32 @@ async fn put_acl(
 /// `GET /<bucket>?acl` — `GetBucketAcl`.
 async fn get_acl(router: &MultiServiceRouter, bucket: &str) -> Answer {
     send(router, "GET", &format!("/{bucket}?acl"), &[], "").await
+}
+
+/// Create `bucket` with its ACLs ENABLED, reporting what the create answered.
+///
+/// A bucket is created with the Object Ownership setting that DISABLES ACLs — "by
+/// default, `ObjectOwnership` is set to `BucketOwnerEnforced` and ACLs are disabled"
+/// (`smithy_query(query="shape",shape="ObjectOwnership")`) — so every ACL write on a
+/// fresh bucket is refused `AccessControlListNotSupported`. The suites below are about
+/// what an ACL write DOES, so each of their buckets is switched to `ObjectWriter`, the
+/// setting under which ACLs affect permissions. The one test that is about the disabled
+/// posture uses the plain create.
+async fn create_bucket_with_acls_enabled(
+    router: &MultiServiceRouter,
+    bucket: &str,
+    constraint: Option<&str>,
+) -> Answer {
+    let created = create_bucket(router, bucket, constraint, None).await;
+    let enabled = put_ownership_controls(router, bucket, &["ObjectWriter"]).await;
+    assert_eq!(
+        enabled.status, 200,
+        "the bucket {bucket:?} must take the ObjectWriter ownership setting that enables \
+         ACLs, got {} with body {:?}",
+        enabled.status,
+        String::from_utf8_lossy(&enabled.body)
+    );
+    created
 }
 
 /// The owner id and the grants a `GetBucketAcl` body reports, in document order.
@@ -402,7 +432,7 @@ async fn putting_an_acl_stores_it_and_reads_back_through_get() {
 
     for (index, (case, headers, body, expected)) in round_trip_rows().into_iter().enumerate() {
         let bucket = format!("acl-round-trip-{index}");
-        let created = create_bucket(&router, &bucket, None, None).await;
+        let created = create_bucket_with_acls_enabled(&router, &bucket, None).await;
         assert_eq!(
             created.status, 200,
             "case {case:?}: the bucket must be created first, got {} with body {:?}",
@@ -486,7 +516,7 @@ async fn a_bucket_with_no_acl_reports_the_private_canned_acl() {
             Some("eu-central-1"),
         ),
     ] {
-        let created = create_bucket(&router, bucket, constraint, None).await;
+        let created = create_bucket_with_acls_enabled(&router, bucket, constraint).await;
         assert_eq!(
             created.status, 200,
             "case {case:?}: the bucket must be created first, got {}",
@@ -545,7 +575,7 @@ type RefusalRow = (&'static str, Vec<(&'static str, String)>, String, &'static s
 async fn a_refused_acl_changes_nothing() {
     let router = router();
     let bucket = "acl-refusals";
-    create_bucket(&router, bucket, None, None).await;
+    create_bucket_with_acls_enabled(&router, bucket, None).await;
     let owner = canonical_user_id();
 
     // The ACL the bucket holds throughout: every refusal below must leave it exactly as
@@ -720,19 +750,12 @@ async fn a_refused_acl_changes_nothing() {
 
     // A canned ACL outside the published value set is refused by the BOUNDARY — `ACL`
     // targets the `BucketCannedACL` enum, so a value outside it never reaches the handler
-    // — and the refusal goes out through the framework's own code rather than one of S3's.
+    // — with the code S3 answers a bad header value, `InvalidArgument`.
     //
-    // `log-delivery-write` is among them deliberately: the Amazon S3 User Guide's canned
-    // ACL table documents it for buckets, but this service's model does NOT publish it
-    // (`smithy_query(query="shape",shape="BucketCannedACL")` reports exactly the four
-    // values in `BUCKET_CANNED_ACL_VALUES`), and the model is the contract this emulator
-    // serves.
-    for canned in [
-        "bucket-owner-full-control",
-        "log-delivery-write",
-        "PRIVATE",
-        "public",
-    ] {
+    // The rows differ along HOW a value misses the set: an OBJECT canned ACL (published
+    // for objects, not for buckets), a published value differing only in case, and a
+    // prefix of a published one.
+    for canned in ["bucket-owner-full-control", "PRIVATE", "public"] {
         let refused = put_acl(&router, bucket, &[("x-amz-acl", canned)], "").await;
         assert_eq!(
             refused.status, 400,
@@ -807,7 +830,7 @@ async fn an_email_grantee_is_refused_by_region() {
         let bucket = format!("acl-email-{index}");
         // `us-east-1` is the default Region, named by carrying no location constraint.
         let constraint = (region != "us-east-1").then_some(region);
-        let created = create_bucket(&router, &bucket, constraint, None).await;
+        let created = create_bucket_with_acls_enabled(&router, &bucket, constraint).await;
         assert_eq!(
             created.status, 200,
             "case {case:?}: the bucket must be created first, got {} with body {:?}",
@@ -865,25 +888,9 @@ async fn an_email_grantee_is_refused_by_region() {
 async fn a_bucket_whose_object_ownership_disables_acls_refuses_the_put_and_still_reads() {
     let router = router();
     let bucket = "acl-disabled";
+    // The plain create: a bucket is created with the setting that DISABLES ACLs, so no
+    // call is needed to put it in that posture.
     create_bucket(&router, bucket, None, None).await;
-
-    // An ACL that is set BEFORE ACLs are disabled, so the read below reports the
-    // bucket-owner-full-control ACL rather than merely whatever was stored.
-    let put = put_acl(&router, bucket, &[("x-amz-acl", "public-read")], "").await;
-    assert_eq!(
-        put.status, 200,
-        "the setup put must succeed, got {} with body {:?}",
-        put.status,
-        String::from_utf8_lossy(&put.body)
-    );
-
-    let disabled = put_ownership_controls(&router, bucket, &["BucketOwnerEnforced"]).await;
-    assert_eq!(
-        disabled.status, 200,
-        "the ownership controls must be set, got {} with body {:?}",
-        disabled.status,
-        String::from_utf8_lossy(&disabled.body)
-    );
 
     // Every way of naming an ACL is refused the same way while ACLs are disabled.
     for (form, headers, body) in [
@@ -938,13 +945,66 @@ async fn a_bucket_whose_object_ownership_disables_acls_refuses_the_put_and_still
         "a bucket with ACLs disabled reports the bucket-owner-full-control ACL, got {:?}",
         reported_grants(&read)
     );
+
+    // The other side of the same rule: a bucket cannot end up with BOTH an ACL that
+    // grants something and the setting that disables ACLs, so switching to
+    // `BucketOwnerEnforced` while such an ACL stands is refused — "Bucket cannot have
+    // ACLs set with ObjectOwnership's BucketOwnerEnforced setting".
+    let enabled = put_ownership_controls(&router, bucket, &["ObjectWriter"]).await;
+    assert_eq!(
+        enabled.status, 200,
+        "the bucket must take the setting that enables ACLs, got {} with body {:?}",
+        enabled.status,
+        String::from_utf8_lossy(&enabled.body)
+    );
+    for canned in ["public-read", "log-delivery-write"] {
+        let put = put_acl(&router, bucket, &[("x-amz-acl", canned)], "").await;
+        assert_eq!(
+            put.status, 200,
+            "case {canned:?}: the canned ACL must be accepted while ACLs are enabled, got \
+             {} with body {:?}",
+            put.status,
+            String::from_utf8_lossy(&put.body)
+        );
+        let refused = put_ownership_controls(&router, bucket, &["BucketOwnerEnforced"]).await;
+        assert_eq!(
+            refused.error_code(),
+            "InvalidBucketAclWithObjectOwnership",
+            "case {canned:?}: the switch to BucketOwnerEnforced must be refused while the \
+             bucket ACL grants more than the owner's FULL_CONTROL, got {:?} with status {}",
+            refused.error_code(),
+            refused.status
+        );
+        assert_eq!(
+            refused.status, 400,
+            "case {canned:?}: expected HTTP 400, got {}",
+            refused.status
+        );
+    }
+
+    // And with the ACL put back to the owner's own FULL_CONTROL, the switch is accepted:
+    // the refusal above is about what the ACL grants, not about there being one.
+    let private = put_acl(&router, bucket, &[("x-amz-acl", "private")], "").await;
+    assert_eq!(
+        private.status, 200,
+        "the private canned ACL must be accepted while ACLs are enabled, got {}",
+        private.status
+    );
+    let switched = put_ownership_controls(&router, bucket, &["BucketOwnerEnforced"]).await;
+    assert_eq!(
+        switched.status, 200,
+        "the switch must be accepted once the ACL grants only the owner's FULL_CONTROL, \
+         got {} with body {:?}",
+        switched.status,
+        String::from_utf8_lossy(&switched.body)
+    );
 }
 
 #[tokio::test]
 async fn the_grantee_type_travels_as_the_xml_attribute_the_api_publishes() {
     let router = router();
     let bucket = "acl-grantee-type-wire";
-    create_bucket(&router, bucket, None, None).await;
+    create_bucket_with_acls_enabled(&router, bucket, None).await;
 
     // The request spells the grantee's `Type` the way every S3 client does: an ATTRIBUTE
     // of `<Grantee>`, in the namespace `Grant$Grantee` declares. Each row is one grantee
@@ -1020,7 +1080,7 @@ async fn the_grantee_type_travels_as_the_xml_attribute_the_api_publishes() {
 #[tokio::test]
 async fn an_acl_call_on_a_bucket_this_emulator_does_not_hold_is_no_such_bucket() {
     let router = router();
-    create_bucket(&router, "held-acl-bucket", None, None).await;
+    create_bucket_with_acls_enabled(&router, "held-acl-bucket", None).await;
 
     // Names that are NOT the one bucket created above: a different name, a prefix of it,
     // an extension of it, and one differing only in case (bucket names are
@@ -1069,7 +1129,7 @@ async fn an_acl_call_on_a_bucket_this_emulator_does_not_hold_is_no_such_bucket()
 async fn an_acl_call_naming_another_expected_bucket_owner_is_access_denied() {
     let router = router();
     let bucket = "acl-expected-owner";
-    create_bucket(&router, bucket, None, None).await;
+    create_bucket_with_acls_enabled(&router, bucket, None).await;
 
     // Account ids that are NOT the one account this emulator serves, including one
     // differing from it in a single digit and the canonical user id (which is not an

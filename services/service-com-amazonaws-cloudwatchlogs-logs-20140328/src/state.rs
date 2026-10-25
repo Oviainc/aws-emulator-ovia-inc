@@ -124,6 +124,13 @@
 
 use std::collections::BTreeMap;
 
+/// Compiling a CloudWatch Logs Insights QL query string, which is what decides whether
+/// `StartQuery` accepts one.
+pub mod query_compile;
+
+/// Metric extraction from an ingested Embedded Metric Format log event.
+pub mod emf;
+
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
 /// scope names one. Generated emulators default to `us-east-1`.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -591,6 +598,48 @@ pub const IMPORT_STATUS_FAILED: &str = "FAILED";
 /// state rules that go with it.
 pub const IMPORT_COMPLETION_DELAY_MS: i64 = 500;
 
+/// An export task that has been accepted but has not started moving data yet, from the
+/// model's `ExportTaskStatusCode` enum (`CANCELLED` | `COMPLETED` | `FAILED` | `PENDING` |
+/// `PENDING_CANCEL` | `RUNNING`). `CreateExportTask` "is an asynchronous call. If all the
+/// required information is provided, this operation initiates an export task and responds
+/// with the ID of the task", so an accepted task starts here.
+pub const EXPORT_TASK_STATUS_PENDING: &str = "PENDING";
+
+/// An export task that is moving data, from the model's `ExportTaskStatusCode` enum. One of
+/// the two statuses `CreateExportTask` calls active ("Each account can only have one active
+/// (RUNNING or PENDING) export task at a time").
+pub const EXPORT_TASK_STATUS_RUNNING: &str = "RUNNING";
+
+/// An export task that finished exporting, from the model's `ExportTaskStatusCode` enum.
+pub const EXPORT_TASK_STATUS_COMPLETED: &str = "COMPLETED";
+
+/// An export task a caller cancelled, from the model's `ExportTaskStatusCode` enum.
+pub const EXPORT_TASK_STATUS_CANCELLED: &str = "CANCELLED";
+
+/// How long after it is created an export task moves `PENDING` -> `RUNNING`, and how long
+/// after that it reaches `COMPLETED`.
+///
+/// AWS documents no duration for an export, only that the call "is an asynchronous call",
+/// so these spans are THE EMULATOR'S OWN CHOICE: each is deliberately not zero, so a caller
+/// that reads or cancels the task straight after creating it still observes `PENDING` and
+/// the state rules that go with it. The instants both fall due at are stored on the record
+/// and never slept on.
+pub const EXPORT_TASK_RUNNING_DELAY_MS: i64 = 250;
+
+/// See [`EXPORT_TASK_RUNNING_DELAY_MS`]: the further span a `RUNNING` export task takes to
+/// reach `COMPLETED`.
+pub const EXPORT_TASK_COMPLETION_DELAY_MS: i64 = 250;
+
+/// The `destinationPrefix` an export task gets when the create names none: "If you don't
+/// specify a value, the default is exportedlogs" (`CreateExportTask$destinationPrefix`).
+pub const DEFAULT_EXPORT_DESTINATION_PREFIX: &str = "exportedlogs";
+
+/// THE EMULATOR'S OWN CEILING on the export tasks one account's store holds, not a quota
+/// cited from AWS: a task stays in memory for as long as the process runs and nothing
+/// expires one, so the oldest completed tasks are dropped once the store holds this many
+/// rather than growing without bound on request.
+pub const MAX_EXPORT_TASKS: usize = 1_000;
+
 /// The status a log anomaly detector is created in, from the model's
 /// `AnomalyDetectorStatus` enum: it has to initialize before it can train on a log group's
 /// events, so a create hands back a detector that is not analyzing anything yet.
@@ -806,6 +855,22 @@ pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
     /// `DescribeImportTasks` enumerates in import-id order without re-sorting, which is
     /// also what makes its pagination cursor stable.
     pub import_tasks: BTreeMap<String, ImportTaskRecord>,
+    /// Every export task of this account — the resource `CreateExportTask` starts and
+    /// `DescribeExportTasks` reports — keyed by `ExportTask$taskId`. A `BTreeMap` so
+    /// `DescribeExportTasks` enumerates in task-id order without re-sorting, which is also
+    /// what makes its pagination cursor stable.
+    pub export_tasks: BTreeMap<String, ExportTaskRecord>,
+    /// Every CloudWatch Logs Insights query of this account — the one `StartQuery` starts
+    /// and `DescribeQueries` reports — keyed by `QueryInfo$queryId`. A `BTreeMap` so
+    /// `DescribeQueries` enumerates in query-id order without re-sorting, which is also what
+    /// makes its pagination cursor stable.
+    pub queries: BTreeMap<String, QueryRecord>,
+    /// Monotonic counter behind the `queryId`s `StartQuery` mints, so every query it starts
+    /// gets an id no earlier one used. See [`mint_query_id`].
+    pub next_query_seq: u64,
+    /// Monotonic counter behind the `taskId`s `CreateExportTask` mints, so every task it
+    /// creates gets an id no earlier create used. See [`mint_export_task_id`].
+    pub next_export_task_seq: u64,
     /// Every delivery of this account — the resource `CreateDelivery` creates and
     /// `DescribeDeliveries` reports — keyed by `Delivery$id`. A `BTreeMap` so
     /// `DescribeDeliveries` enumerates in delivery-id order without re-sorting, which is
@@ -815,6 +880,10 @@ pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
     /// its destination are both named by their own resources, so it lives here and not on
     /// [`LogGroupRecord`].
     pub deliveries: BTreeMap<String, DeliveryRecord>,
+    /// Monotonic counter behind the `Delivery$id`s `CreateDelivery` mints, so every delivery
+    /// it creates gets an id no earlier create used — including after the delivery holding an
+    /// id has been deleted. See [`mint_delivery_id`].
+    pub next_delivery_seq: u64,
     /// The account's storage tier policy — what `PutStorageTierPolicy` sets and
     /// `GetStorageTierPolicy` reports. `None` until a put sets one, which is why
     /// `GetStorageTierPolicy` reports [`DEFAULT_STORAGE_TIER`] with no
@@ -900,6 +969,25 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
         seq
     }
 
+    /// Whether `candidate` is a revision id this service has ever ISSUED for a
+    /// resource-scoped policy.
+    ///
+    /// A revision id is minted from the store's monotonic counter
+    /// ([`mint_revision_id`]), so the ids that exist are exactly the renderings of the
+    /// counter values already taken: a value in another form, or one past the counter, is
+    /// not a revision this service handed to anybody. That is what separates the two
+    /// conditions a resource-policy write models — a value the service never issued is a
+    /// bad PARAMETER, while a value it did issue and has since superseded is an
+    /// optimistic-lock CONFLICT the caller is to re-read and retry.
+    pub fn issued_revision_id(&self, candidate: &str) -> bool {
+        candidate.len() == REVISION_ID_LEN
+            && candidate
+                .chars()
+                .all(|digit| digit.is_ascii_digit() || matches!(digit, 'a'..='f'))
+            && u128::from_str_radix(candidate, 16)
+                .is_ok_and(|seq| seq < u128::from(self.next_policy_revision))
+    }
+
     /// Take the next anomaly-detector sequence number, advancing the counter.
     pub fn take_anomaly_detector_seq(&mut self) -> u64 {
         let seq = self.next_anomaly_detector_seq;
@@ -918,6 +1006,27 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
     pub fn take_query_definition_seq(&mut self) -> u64 {
         let seq = self.next_query_definition_seq;
         self.next_query_definition_seq = self.next_query_definition_seq.saturating_add(1);
+        seq
+    }
+
+    /// Take the next delivery sequence number, advancing the counter.
+    pub fn take_delivery_seq(&mut self) -> u64 {
+        let seq = self.next_delivery_seq;
+        self.next_delivery_seq = self.next_delivery_seq.saturating_add(1);
+        seq
+    }
+
+    /// Take the next export-task sequence number, advancing the counter.
+    pub fn take_export_task_seq(&mut self) -> u64 {
+        let seq = self.next_export_task_seq;
+        self.next_export_task_seq = self.next_export_task_seq.saturating_add(1);
+        seq
+    }
+
+    /// Take the next query sequence number, advancing the counter.
+    pub fn take_query_seq(&mut self) -> u64 {
+        let seq = self.next_query_seq;
+        self.next_query_seq = self.next_query_seq.saturating_add(1);
         seq
     }
 
@@ -944,6 +1053,17 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
                 .get(name)
                 .map(|destination| &destination.tags),
         }
+    }
+
+    /// The delivery destination this account holds under `arn`, if any.
+    ///
+    /// A destination is keyed by the name that identifies one, but a delivery names its
+    /// destination by ARN (`CreateDelivery$deliveryDestinationArn`), so the lookup a delivery
+    /// needs is by the ARN each stored destination carries.
+    pub fn delivery_destination_by_arn(&self, arn: &str) -> Option<&DeliveryDestinationRecord> {
+        self.delivery_destinations
+            .values()
+            .find(|destination| destination.arn == arn)
     }
 
     /// The same tag set, to write. See [`Self::resource_tags`].
@@ -974,6 +1094,64 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
         }
     }
 
+    /// Whether an ingested log event of `group` has the metrics its Embedded Metric Format
+    /// document declares extracted into CloudWatch metric data.
+    ///
+    /// "By default, EMF metric creation is enabled for all log groups. You can use metric
+    /// extraction policies to disable EMF metric creation for your entire account or specific
+    /// log groups" — and a `METRIC_EXTRACTION_POLICY` document is accepted only when it says
+    /// the format is disabled ([`check_account_policy_document`]), so extraction is on for
+    /// every group no such policy SELECTS ([`account_policy_selects_log_group`]) and off for
+    /// the groups one selects.
+    pub fn emf_extraction_enabled_for(&self, group: &LogGroupRecord) -> bool {
+        !self
+            .account_policies
+            .values()
+            .filter(|policy| policy.policy_type == POLICY_TYPE_METRIC_EXTRACTION)
+            .any(|policy| account_policy_selects_log_group(policy, group))
+    }
+
+    /// Materialise every CloudWatch Logs Insights query status change the clock has ALREADY
+    /// made due, as of `now_ms`.
+    ///
+    /// A query runs asynchronously — `StartQuery` hands back a `queryId` and the results are
+    /// fetched later — so the status it is in is owed by the clock rather than by a call
+    /// ([`QueryRecord::running_due_ms`], [`QueryRecord::complete_due_ms`]). A reporting
+    /// operation calls this before it reads, so what it reports is what the clock already
+    /// decided — never a status moved on because something was polled.
+    pub fn materialize_due_query_transitions(&mut self, now_ms: i64) {
+        for query in self.queries.values_mut() {
+            query.materialize_due_transitions(now_ms);
+        }
+    }
+
+    /// How many queries of this account are still in flight, which is what
+    /// [`MAX_CONCURRENT_QUERIES`] bounds.
+    ///
+    /// Read AFTER [`Self::materialize_due_query_transitions`], so a query the clock has
+    /// already completed does not hold a slot.
+    pub fn active_queries(&self) -> usize {
+        self.queries.values().filter(|query| query.is_active()).count()
+    }
+
+    /// Drop the oldest finished queries the store holds beyond [`MAX_QUERIES`], so repeated
+    /// starts cannot grow it without bound. An ACTIVE query is never dropped: it has not run
+    /// yet.
+    pub fn enforce_query_ceiling(&mut self) {
+        while self.queries.len() > MAX_QUERIES {
+            let Some(oldest) = self
+                .queries
+                .values()
+                .filter(|query| !query.is_active())
+                .min_by_key(|query| (query.create_time_ms, query.query_id.clone()))
+                .map(|query| query.query_id.clone())
+            else {
+                return;
+            };
+            self.queries.remove(&oldest);
+        }
+    }
+
     /// Materialise every import-task status change the clock has ALREADY made due, as of
     /// `now_ms`.
     ///
@@ -985,6 +1163,49 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
     pub fn materialize_due_import_transitions(&mut self, now_ms: i64) {
         for task in self.import_tasks.values_mut() {
             task.materialize_due_transitions(now_ms);
+        }
+    }
+
+    /// Materialise every export-task status change the clock has ALREADY made due, as of
+    /// `now_ms`.
+    ///
+    /// `CreateExportTask` "is an asynchronous call", so an export task's statuses are owed by
+    /// the clock rather than by a call: each change was due at the instant the record stores
+    /// for it ([`ExportTaskRecord::running_due_ms`], [`ExportTaskRecord::completion_due_ms`])
+    /// even if nobody asked. A reporting operation calls this before it reads, so what it
+    /// reports is what the clock already decided — never a status moved on because something
+    /// was polled.
+    pub fn materialize_due_export_transitions(&mut self, now_ms: i64) {
+        for task in self.export_tasks.values_mut() {
+            task.materialize_due_transitions(now_ms);
+        }
+    }
+
+    /// Whether this account already has an export task in one of the two statuses
+    /// `CreateExportTask` counts as active ("Each account can only have one active (RUNNING
+    /// or PENDING) export task at a time").
+    ///
+    /// Read AFTER [`Self::materialize_due_export_transitions`], so a task the clock has
+    /// already completed does not count as active.
+    pub fn active_export_task(&self) -> Option<&ExportTaskRecord> {
+        self.export_tasks.values().find(|task| task.is_active())
+    }
+
+    /// Drop the oldest export tasks the store holds beyond [`MAX_EXPORT_TASKS`], so repeated
+    /// creates cannot grow it without bound. An ACTIVE task is never dropped: it is still
+    /// running, and only one of those can exist at a time.
+    pub fn enforce_export_task_ceiling(&mut self) {
+        while self.export_tasks.len() > MAX_EXPORT_TASKS {
+            let Some(oldest) = self
+                .export_tasks
+                .values()
+                .filter(|task| !task.is_active())
+                .min_by_key(|task| (task.creation_time_ms, task.task_id.clone()))
+                .map(|task| task.task_id.clone())
+            else {
+                return;
+            };
+            self.export_tasks.remove(&oldest);
         }
     }
 
@@ -1235,6 +1456,337 @@ impl ImportTaskRecord {
     }
 }
 
+/// One CloudWatch Logs Insights query — what `StartQuery` starts and `DescribeQueries`
+/// reports — as it is stored. Every member of the model's `QueryInfo` shape is reported from
+/// this record, so `DescribeQueries` answers from state alone.
+#[derive(Debug, Clone)]
+pub struct QueryRecord {
+    /// `QueryInfo$queryId` — "The unique ID number of this query." Also the key the store
+    /// enumerates by.
+    pub query_id: String,
+    /// `QueryInfo$queryLanguage` — "The query language used for this query",
+    /// [`DEFAULT_QUERY_LANGUAGE`] when the start named none.
+    pub query_language: String,
+    /// `QueryInfo$queryString` — "The query string used in this query."
+    pub query_string: String,
+    /// `QueryInfo$logGroupName` — "The name of the log group scanned by this query", for a
+    /// query that named exactly one. A query over several log groups, or one whose `SOURCE`
+    /// command selects them, carries the whole list in [`Self::log_group_names`] and reports
+    /// no single name.
+    pub log_group_name: Option<String>,
+    /// Every log group this query reads, resolved to log group NAMES from whichever member
+    /// the start named them by. Empty for a query whose `SOURCE` command selects its own.
+    pub log_group_names: Vec<String>,
+    /// `StartQuery$startTime` — the beginning of the time range queried, in epoch SECONDS,
+    /// the unit that member documents ("Specified as epoch time, the number of seconds since
+    /// January 1, 1970, 00:00:00 UTC").
+    pub start_time_secs: i64,
+    /// `StartQuery$endTime` — the end of that range, in epoch seconds. See
+    /// [`Self::start_time_secs`].
+    pub end_time_secs: i64,
+    /// `StartQuery$limit` — "The maximum number of log events to return from the query",
+    /// when the start named one.
+    pub limit: Option<i32>,
+    /// `QueryInfo$status`, one of the [`QUERY_STATUS_SCHEDULED`] family.
+    pub status: String,
+    /// `QueryInfo$createTime` — "The date and time that this query was created", in epoch
+    /// milliseconds.
+    pub create_time_ms: i64,
+    /// The instant this query is due to start running, stored rather than waited for: a
+    /// reporting operation materialises the transition once the clock is past it
+    /// ([`materialize_due_query_transitions`]). `None` once it has left `Scheduled`.
+    ///
+    /// [`materialize_due_query_transitions`]:
+    ///     ComAmazonawsCloudwatchlogsLogs20140328State::materialize_due_query_transitions
+    pub running_due_ms: Option<i64>,
+    /// The instant this query is due to reach `Complete`, on the same terms as
+    /// [`Self::running_due_ms`]. `None` once it is in a terminal status, which owes no
+    /// further transition.
+    pub complete_due_ms: Option<i64>,
+}
+
+impl QueryRecord {
+    /// A brand-new query: accepted, not running yet, and due to run
+    /// [`QUERY_RUNNING_DELAY_MS`] after it was started and to complete
+    /// [`QUERY_COMPLETION_DELAY_MS`] after that.
+    pub fn new(
+        query_id: &str,
+        query_language: &str,
+        query_string: &str,
+        log_group_names: Vec<String>,
+        start_time_secs: i64,
+        end_time_secs: i64,
+        create_time_ms: i64,
+    ) -> Self {
+        let running_due_ms = create_time_ms.saturating_add(QUERY_RUNNING_DELAY_MS);
+        Self {
+            query_id: query_id.to_string(),
+            query_language: query_language.to_string(),
+            query_string: query_string.to_string(),
+            // "The name of the log group scanned by this query" is one name, so it is
+            // reported only for a query that reads exactly one log group.
+            log_group_name: match log_group_names.as_slice() {
+                [only] => Some(only.clone()),
+                _ => None,
+            },
+            log_group_names,
+            start_time_secs,
+            end_time_secs,
+            limit: None,
+            status: QUERY_STATUS_SCHEDULED.to_string(),
+            create_time_ms,
+            running_due_ms: Some(running_due_ms),
+            complete_due_ms: Some(running_due_ms.saturating_add(QUERY_COMPLETION_DELAY_MS)),
+        }
+    }
+
+    /// Whether this query is still one of the statuses a concurrent-query quota counts: a
+    /// query that has finished, failed or been cancelled holds no slot.
+    pub fn is_active(&self) -> bool {
+        self.status == QUERY_STATUS_SCHEDULED || self.status == QUERY_STATUS_RUNNING
+    }
+
+    /// Materialise the status changes the clock owes this query: a scheduled query whose
+    /// start instant has passed is `Running`, and a running one whose completion instant has
+    /// passed is `Complete` — each decided AT that instant and not at the time something
+    /// happened to look.
+    pub fn materialize_due_transitions(&mut self, now_ms: i64) {
+        if let Some(due) = self.running_due_ms {
+            if due <= now_ms {
+                self.status = QUERY_STATUS_RUNNING.to_string();
+                self.running_due_ms = None;
+            }
+        }
+        if self.running_due_ms.is_some() {
+            return;
+        }
+        if let Some(due) = self.complete_due_ms {
+            if due <= now_ms {
+                self.status = QUERY_STATUS_COMPLETE.to_string();
+                self.complete_due_ms = None;
+            }
+        }
+    }
+
+    /// This query as the model's `QueryInfo` structure, which is what `DescribeQueries`
+    /// reports.
+    pub fn reported(&self) -> crate::ops::types::QueryInfo {
+        crate::ops::types::QueryInfo {
+            query_language: Some(self.query_language.clone()),
+            query_id: Some(self.query_id.clone()),
+            query_string: Some(self.query_string.clone()),
+            status: Some(self.status.clone()),
+            create_time: Some(self.create_time_ms),
+            log_group_name: self.log_group_name.clone(),
+            // "The duration in milliseconds that the query took to execute", "The total
+            // number of bytes scanned by the query" and "The ARN of the user who ran the
+            // query" are facts about an EXECUTION and an identity this emulator does not
+            // hold: nothing it stores can report any of them, so none is reported rather
+            // than filled with a number nothing measured.
+            query_duration: None,
+            bytes_scanned: None,
+            user_identity: None,
+        }
+    }
+}
+
+/// A query that has been accepted but has not started running, from the model's
+/// `QueryStatus` enum (`Scheduled` | `Running` | `Complete` | `Failed` | `Cancelled` |
+/// `Timeout` | `Unknown`). `StartQuery` hands back a `queryId` and the results are fetched
+/// later, so an accepted query starts here.
+pub const QUERY_STATUS_SCHEDULED: &str = "Scheduled";
+
+/// A query that is running, from the model's `QueryStatus` enum.
+pub const QUERY_STATUS_RUNNING: &str = "Running";
+
+/// A query that finished running, from the model's `QueryStatus` enum.
+pub const QUERY_STATUS_COMPLETE: &str = "Complete";
+
+/// A query a caller stopped, from the model's `QueryStatus` enum.
+pub const QUERY_STATUS_CANCELLED: &str = "Cancelled";
+
+/// How long after it is started a query moves `Scheduled` -> `Running`, and how long after
+/// that it reaches `Complete`.
+///
+/// AWS documents no duration for a query, only the timeout it cannot exceed ("Queries time
+/// out after 60 minutes of runtime"), so these spans are THE EMULATOR'S OWN CHOICE: each is
+/// deliberately not zero, so a caller that reads the query straight after starting it still
+/// observes it scheduled. The instants both fall due at are stored on the record and never
+/// slept on.
+pub const QUERY_RUNNING_DELAY_MS: i64 = 250;
+
+/// See [`QUERY_RUNNING_DELAY_MS`]: the further span a running query takes to complete.
+pub const QUERY_COMPLETION_DELAY_MS: i64 = 250;
+
+/// How many queries one account may have in flight: "You can have up to 100 concurrent
+/// CloudWatch Logs insights queries, including queries that have been added to dashboards"
+/// (`StartQuery`).
+pub const MAX_CONCURRENT_QUERIES: usize = 100;
+
+/// The most log groups one query may read: "You can include up to 50 log groups"
+/// (`StartQuery$logGroupNames`, `StartQuery$logGroupIdentifiers`).
+pub const MAX_QUERY_LOG_GROUPS: usize = 50;
+
+/// THE EMULATOR'S OWN CEILING on the queries one account's store holds, not a quota cited
+/// from AWS: `DescribeQueries` reports "queries that are scheduled, running, or have been run
+/// recently", so a finished query stays readable for a while — and the oldest finished ones
+/// are dropped once the store holds this many rather than growing without bound on request.
+pub const MAX_QUERIES: usize = 1_000;
+
+/// The largest page `DescribeQueries` hands back, which is also the page a request that
+/// names no `maxResults` gets: `maxResults` "limits the number of returned queries to the
+/// specified number" and documents no default, and the member's own
+/// `DescribeQueriesMaxResults` range (`range 1..1000`) is the most the API admits in one
+/// page.
+pub const MAX_QUERIES_PER_PAGE: i32 = 1_000;
+
+/// One export task — "an export task so that you can efficiently export data from a log
+/// group to an Amazon S3 bucket" — as it is stored. Every member of the model's `ExportTask`
+/// shape is reported from this record, so `DescribeExportTasks` answers from state alone.
+#[derive(Debug, Clone)]
+pub struct ExportTaskRecord {
+    /// `ExportTask$taskId` — "The ID of the export task." Also the key the store enumerates
+    /// by.
+    pub task_id: String,
+    /// `ExportTask$taskName` — "The name of the export task", when the create named one.
+    pub task_name: Option<String>,
+    /// `ExportTask$logGroupName` — "The name of the log group from which logs data was
+    /// exported."
+    pub log_group_name: String,
+    /// `ExportTask$from` — "Events with a timestamp before this time are not exported."
+    pub from_ms: i64,
+    /// `ExportTask$to` — "Events with a timestamp later than this time are not exported."
+    pub to_ms: i64,
+    /// `ExportTask$destination` — "The name of the S3 bucket to which the log data was
+    /// exported."
+    pub destination: String,
+    /// `ExportTask$destinationPrefix` — "The prefix that was used as the start of Amazon S3
+    /// key for every object exported", [`DEFAULT_EXPORT_DESTINATION_PREFIX`] when the create
+    /// named none.
+    pub destination_prefix: String,
+    /// `CreateExportTask$logStreamNamePrefix` — "Export only log streams that match the
+    /// provided prefix." No `ExportTask` member reports it, but the task is the only record
+    /// of which streams it exports, so it is stored with the task.
+    pub log_stream_name_prefix: Option<String>,
+    /// `ExportTaskStatus$code`, one of the [`EXPORT_TASK_STATUS_PENDING`] family.
+    pub status_code: String,
+    /// `ExportTaskExecutionInfo$creationTime`, in epoch milliseconds.
+    pub creation_time_ms: i64,
+    /// `ExportTaskExecutionInfo$completionTime`, in epoch milliseconds — set only once the
+    /// task has reached a terminal status.
+    pub completion_time_ms: Option<i64>,
+    /// The instant this task's export is due to start moving data, stored rather than waited
+    /// for: a reporting operation materialises the transition once the clock is past it
+    /// ([`materialize_due_export_transitions`]). `None` once the task has left `PENDING`.
+    ///
+    /// [`materialize_due_export_transitions`]:
+    ///     ComAmazonawsCloudwatchlogsLogs20140328State::materialize_due_export_transitions
+    pub running_due_ms: Option<i64>,
+    /// The instant this task's export is due to reach `COMPLETED`, on the same terms as
+    /// [`Self::running_due_ms`]. `None` once the task is in a terminal status, which owes no
+    /// further transition.
+    pub completion_due_ms: Option<i64>,
+}
+
+impl ExportTaskRecord {
+    /// A brand-new export task: accepted, not started yet, and due to start
+    /// [`EXPORT_TASK_RUNNING_DELAY_MS`] after it was created and to complete
+    /// [`EXPORT_TASK_COMPLETION_DELAY_MS`] after that.
+    ///
+    /// The optional members a create may name — `taskName`, `destinationPrefix`,
+    /// `logStreamNamePrefix` — are taken here because every one of them is a property of the
+    /// export the task IS.
+    pub fn new(
+        task_id: &str,
+        log_group_name: &str,
+        from_ms: i64,
+        to_ms: i64,
+        destination: &str,
+        creation_time_ms: i64,
+    ) -> Self {
+        let running_due_ms = creation_time_ms.saturating_add(EXPORT_TASK_RUNNING_DELAY_MS);
+        Self {
+            task_id: task_id.to_string(),
+            task_name: None,
+            log_group_name: log_group_name.to_string(),
+            from_ms,
+            to_ms,
+            destination: destination.to_string(),
+            destination_prefix: DEFAULT_EXPORT_DESTINATION_PREFIX.to_string(),
+            log_stream_name_prefix: None,
+            status_code: EXPORT_TASK_STATUS_PENDING.to_string(),
+            creation_time_ms,
+            completion_time_ms: None,
+            running_due_ms: Some(running_due_ms),
+            completion_due_ms: Some(
+                running_due_ms.saturating_add(EXPORT_TASK_COMPLETION_DELAY_MS),
+            ),
+        }
+    }
+
+    /// Whether this task is one of the two statuses `CreateExportTask` counts as active:
+    /// "Each account can only have one active (RUNNING or PENDING) export task at a time."
+    pub fn is_active(&self) -> bool {
+        self.status_code == EXPORT_TASK_STATUS_PENDING
+            || self.status_code == EXPORT_TASK_STATUS_RUNNING
+    }
+
+    /// Materialise the status changes the clock owes this task: a pending export whose start
+    /// instant has passed is `RUNNING`, and a running one whose completion instant has passed
+    /// is `COMPLETED` — each stamped AT that instant and not at the time something happened
+    /// to look.
+    pub fn materialize_due_transitions(&mut self, now_ms: i64) {
+        if let Some(due) = self.running_due_ms {
+            if due <= now_ms {
+                self.status_code = EXPORT_TASK_STATUS_RUNNING.to_string();
+                self.running_due_ms = None;
+            }
+        }
+        if self.running_due_ms.is_some() {
+            return;
+        }
+        if let Some(due) = self.completion_due_ms {
+            if due <= now_ms {
+                self.status_code = EXPORT_TASK_STATUS_COMPLETED.to_string();
+                self.completion_time_ms = Some(due);
+                self.completion_due_ms = None;
+            }
+        }
+    }
+
+    /// This task as the model's `ExportTask` structure, which is what `DescribeExportTasks`
+    /// reports.
+    pub fn reported(&self) -> crate::ops::types::ExportTask {
+        crate::ops::types::ExportTask {
+            task_id: Some(self.task_id.clone()),
+            task_name: self.task_name.clone(),
+            log_group_name: Some(self.log_group_name.clone()),
+            from: Some(self.from_ms),
+            to: Some(self.to_ms),
+            destination: Some(self.destination.clone()),
+            destination_prefix: Some(self.destination_prefix.clone()),
+            status: Some(crate::ops::types::ExportTaskStatus {
+                code: Some(self.status_code.clone()),
+                message: None,
+            }),
+            execution_info: Some(crate::ops::types::ExportTaskExecutionInfo {
+                creation_time: Some(self.creation_time_ms),
+                completion_time: self.completion_time_ms,
+            }),
+        }
+    }
+}
+
+/// The id `CreateExportTask` gives the task it creates — "The ID of the export task" —
+/// minted from the store's monotonic export-task counter so it is unique for the life of the
+/// store and DERIVED FROM STORED STATE.
+///
+/// CloudWatch Logs renders one as a canonical hyphenated UUID, so it is minted through the
+/// shared [`mint_uuid_from_seq`] every UUID-shaped id of this service comes from.
+pub fn mint_export_task_id(seq: u64) -> String {
+    mint_uuid_from_seq(seq)
+}
+
 /// One delivery — "a connection between a logical delivery source and a logical delivery
 /// destination" — as it is stored. Every member of the model's `Delivery` shape is
 /// reported from this record, so `DescribeDeliveries` answers from state alone.
@@ -1331,6 +1883,39 @@ impl DeliveryRecord {
 pub fn delivery_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn("logs", region, &format!("delivery:{id}"))
 }
+
+/// The id `CreateDelivery` gives the delivery it creates — "The unique ID that identifies
+/// this delivery in your account" — minted from the store's monotonic delivery counter so it
+/// is unique for the life of the store and DERIVED FROM STORED STATE, including after the
+/// delivery holding an id has been deleted.
+///
+/// AWS documents no format for `Delivery$id` beyond its own constraints (len 1..64, pattern
+/// `^[0-9A-Za-z]+$`), so the counter is rendered as a fixed-width hex string, the way
+/// [`mint_revision_id`] renders the revision counter.
+pub fn mint_delivery_id(seq: u64) -> String {
+    format!("{seq:016x}")
+}
+
+/// THE EMULATOR'S OWN CEILING on the deliveries one account holds, not a quota cited from
+/// AWS: each delivery keeps its configuration and tag set in memory for as long as the
+/// process runs and nothing expires one, so `CreateDelivery` refuses to create more than this
+/// many with the `ServiceQuotaExceededException` it models ("This request exceeds a service
+/// quota") rather than growing without bound on request.
+pub const MAX_DELIVERIES: usize = 1_000;
+
+/// The refusal CloudWatch Logs answers a delivery operation with when the `id` it names is
+/// not one this account holds. Like [`DELIVERY_SOURCE_NOT_FOUND_MESSAGE`], the sentence states
+/// that the requested delivery is not in the account and interpolates no id, so every id the
+/// account does not hold is refused identically.
+pub const DELIVERY_NOT_FOUND_MESSAGE: &str = "Requested Delivery does not exist in this account.";
+
+/// The refusal CloudWatch Logs answers a delivery operation with when the
+/// `deliverySourceName` it names is not one this account holds. Like
+/// [`DELIVERY_DESTINATION_NOT_FOUND_MESSAGE`], the sentence states that the requested delivery
+/// source is not in the account and interpolates no name, so every name the account does not
+/// hold is refused identically.
+pub const DELIVERY_SOURCE_NOT_FOUND_MESSAGE: &str =
+    "Requested Delivery Source does not exist in this account.";
 
 /// The ARN service namespace of each vendor a delivery destination can be, paired with the
 /// `DeliveryDestinationType` the model spells it as.
@@ -5395,6 +5980,22 @@ pub fn resolve_kms_key_target(
     }
 }
 
+/// How many milliseconds one second holds, which is what a `StartQuery` time range — "epoch
+/// time, the number of SECONDS since January 1, 1970" — has to be scaled by to be compared
+/// with the epoch MILLISECONDS every other timestamp of this service carries.
+pub const MILLIS_PER_SECOND: i64 = 1_000;
+
+/// The refusal CloudWatch Logs answers when a request's time range runs backwards — its end
+/// before its start — which includes no instant at all. The text is fixed for the condition:
+/// it names the two ends of the range and interpolates neither of their values.
+pub const REVERSED_TIME_RANGE_MESSAGE: &str = "End time should not be before start time.";
+
+/// The refusal `CreateExportTask` answers for the same condition, which names the two
+/// members that bound an export's window (`from` and `to`) rather than the start and the end
+/// of a query's.
+pub const EXPORT_REVERSED_TIME_RANGE_MESSAGE: &str =
+    "The parameter to must be greater than the parameter from.";
+
 /// The revision id a resource-scoped policy carries, minted from the monotonic policy
 /// revision counter so it is unique and derived from stored state. AWS documents no
 /// format for it — only that a put must present the revision the policy is currently
@@ -5402,6 +6003,19 @@ pub fn resolve_kms_key_target(
 pub fn mint_revision_id(seq: u64) -> String {
     format!("{seq:032x}")
 }
+
+/// How many characters a minted revision id has, which is the width
+/// [`mint_revision_id`] renders the counter at. A presented `expectedRevisionId` of any
+/// other length is in no form this service ever issued
+/// ([`ComAmazonawsCloudwatchlogsLogs20140328State::issued_revision_id`]).
+pub const REVISION_ID_LEN: usize = 32;
+
+/// The refusal CloudWatch Logs answers a resource-policy write or delete with when the
+/// `expectedRevisionId` it presents is not a revision id the service ever issued — a value
+/// in another form, or one no update has reached. That is a bad PARAMETER and not the
+/// optimistic-lock conflict [`POLICY_REVISION_CONFLICT_MESSAGE`] reports: retrying it can
+/// never succeed, so the text names the member at fault and interpolates nothing.
+pub const INVALID_EXPECTED_REVISION_ID_MESSAGE: &str = "Invalid ExpectedRevisionId";
 
 /// The sequence token a `PutLogEvents` call hands back, minted from the monotonic
 /// ingestion counter so it is unique and derived from stored state. Rendered the way
@@ -5428,6 +6042,16 @@ pub fn mint_uuid_from_seq(seq: u64) -> String {
 /// CloudWatch Logs renders one as a canonical hyphenated UUID, so it is minted through the
 /// shared [`mint_uuid_from_seq`] from the store's monotonic query-definition counter.
 pub fn mint_query_definition_id(seq: u64) -> String {
+    mint_uuid_from_seq(seq)
+}
+
+/// The id `StartQuery` hands back for the query it starts: "The unique ID of the query",
+/// minted from the store's monotonic query counter so it is unique for the life of the store
+/// and DERIVED FROM STORED STATE.
+///
+/// CloudWatch Logs renders one as a canonical hyphenated UUID, so it is minted through the
+/// shared [`mint_uuid_from_seq`] every UUID-shaped id of this service comes from.
+pub fn mint_query_id(seq: u64) -> String {
     mint_uuid_from_seq(seq)
 }
 

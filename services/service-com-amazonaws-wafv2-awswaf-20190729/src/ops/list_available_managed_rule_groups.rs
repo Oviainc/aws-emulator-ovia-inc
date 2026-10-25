@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAvailableManagedRuleGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAvailableManagedRuleGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers the managed rule groups that are available to use, one page at a time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAvailableManagedRuleGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A managed rule group is published by its VENDOR and identified by its
+//! `(VendorName, Name)` pair; it is not a resource of this account, so the groups
+//! on offer come from the service's own managed-rule-group catalogue
+//! ([`crate::state::MANAGED_RULE_GROUP_CATALOGUE`]) — the same catalogue that
+//! decides whether a `ManagedRuleGroupStatement` names a group that exists, what
+//! running it costs, which versions `ListAvailableManagedRuleGroupVersions` offers
+//! of it and what a managed-product describe reports for it. So a pair listed here
+//! is exactly a pair a web ACL may reference: "you can retrieve the required names
+//! by calling ListAvailableManagedRuleGroups" (`ManagedRuleGroupStatement`'s own
+//! doc).
+//!
+//! Nothing here writes: the response is a reading of published data, so two
+//! identical calls answer identically and a call changes nothing a later caller
+//! sees.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +171,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAvailableManagedRuleGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAvailableManagedRuleGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAvailableManagedRuleGroups"))
+        // A read of PUBLISHED data: `ctx` carries only request metadata, which this
+        // operation does not need, and a vendor's rule groups are not state this
+        // account owns — nothing creates, updates or deletes one — so the engine's
+        // store holds none of them and nothing here writes.
+        let _ = (ctx, &self.engine);
+
+        // `Scope` names the namespace the request is made in, and WAF recognises
+        // only the two values the enum declares. It narrows nothing below: a managed
+        // rule group is identified by its `(VendorName, Name)` pair alone ("you use
+        // this, along with the vendor name, to identify the rule group", the pair's
+        // own docs, which name no scope), so a vendor offers the same groups in
+        // either namespace — unlike every resource this ACCOUNT owns, which a scope
+        // does namespace.
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(
+                ListAvailableManagedRuleGroupsErrorModeled::WAFInvalidParameterException(
+                    crate::state::invalid_parameter_exception(
+                        crate::state::FIELD_SCOPE_VALUE,
+                        &input.scope,
+                        "the scope names the namespace the request is made in, and is one of \
+                         CLOUDFRONT or REGIONAL",
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // Absent `Limit`, a page holds as many as the model's `PaginationLimit`
+        // range allows; a `Limit` outside that range is refused rather than clamped,
+        // so no caller gets a silently empty terminal page. That reading of the
+        // range is `crate::state::page_size`, shared with every other paginated
+        // operation of this service.
+        let page_size = crate::state::page_size(input.limit, "summaries")
+            .map_err(ListAvailableManagedRuleGroupsErrorModeled::WAFInvalidParameterException)?;
+
+        // `NextMarker` is "the marker from the prior call", which is the name of the
+        // last summary of the previous page, so this page starts at the group after
+        // it IN THE PUBLISHED ORDER — the order the catalogue lists its groups in,
+        // which is stable per call, so a marker names the same position on every
+        // call. The position is found by name rather than by comparing names,
+        // because the published order is the vendor's listing order and not a
+        // lexical one. A marker naming no published group names a position the
+        // catalogue does not hold, so nothing follows it.
+        let catalogue = crate::state::MANAGED_RULE_GROUP_CATALOGUE;
+        let remaining: &[crate::state::ManagedRuleGroupDescriptor] =
+            match input.next_marker.as_deref() {
+                None => catalogue,
+                Some(marker) => catalogue
+                    .iter()
+                    .position(|group| group.name == marker)
+                    .map_or(&[], |at| &catalogue[at + 1..]),
+            };
+        let page = &remaining[..remaining.len().min(page_size)];
+
+        // Every non-empty page answers a `NextMarker` — the name of its LAST summary,
+        // whether or not the page is full — and only the empty page that follows the
+        // last one carries none (`NextMarker` is `length 1..256`, and a page with no
+        // last name has no marker), which is what ends a paginator's loop.
+        let next_marker = page.last().map(|group| group.name.to_string());
+        let managed_rule_groups = page
+            .iter()
+            .map(|group| ManagedRuleGroupSummary {
+                vendor_name: Some(group.vendor_name.to_string()),
+                name: Some(group.name.to_string()),
+                // "Indicates whether the managed rule group is versioned. If it is,
+                // you can retrieve the versions list by calling
+                // ListAvailableManagedRuleGroupVersions"
+                // (`ManagedRuleGroupSummary$VersioningSupported`) — the same
+                // property a managed-product describe reports as
+                // `IsVersioningSupported`, read off the one catalogue entry so the
+                // two calls cannot disagree.
+                versioning_supported: group.is_versioning_supported,
+                // "The description of the managed rule group, provided by Amazon Web
+                // Services Managed Rules or the Amazon Web Services Marketplace
+                // seller who manages it" — the group's published description, the
+                // same one `ManagedProductDescriptor$ProductDescription` carries.
+                description: Some(group.product_description.to_string()),
+            })
+            .collect();
+
+        Ok(ListAvailableManagedRuleGroupsOutput {
+            next_marker,
+            managed_rule_groups: Some(managed_rule_groups),
+        })
     }
 }

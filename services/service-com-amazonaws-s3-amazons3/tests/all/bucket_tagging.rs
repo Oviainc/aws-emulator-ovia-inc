@@ -202,8 +202,8 @@ fn round_trip_rows() -> Vec<(&'static str, Vec<(String, String)>)> {
             vec![tag("プロジェクト", "Grüße-日本語")],
         ),
         (
-            "a value with XML metacharacters survives the round trip",
-            vec![tag("expression", "a < b & c > d \"quoted\" 'it'")],
+            "a value carrying every punctuation character a tag may hold",
+            vec![tag("expression", "a + b = c.d_e:f/g@h")],
         ),
         (
             "the per-bucket tag count bound",
@@ -374,6 +374,10 @@ async fn removing_a_tag_set_leaves_the_bucket_with_none() {
     );
 }
 
+/// One row of the refusal table: the case name, the tag set it sends, and the code S3
+/// refuses it with.
+type RefusedTagSet = (&'static str, Vec<(String, String)>, &'static str);
+
 #[tokio::test]
 async fn a_tag_set_past_a_published_limit_is_refused_and_changes_nothing() {
     let router = router();
@@ -391,26 +395,33 @@ async fn a_tag_set_past_a_published_limit_is_refused_and_changes_nothing() {
         String::from_utf8_lossy(&put.body)
     );
 
-    // (case, the refused tag set). One row per published bound, each ONE past it, plus the
-    // key-uniqueness the set itself has.
-    let rows: Vec<(&str, Vec<(String, String)>)> = vec![
+    // (case, the refused tag set, the code S3 refuses it with). One row per published
+    // bound, each ONE past it, plus the key-uniqueness the set itself has and the
+    // character class every tag shares. The code says WHICH class of restriction broke: a
+    // set bigger than the resource may hold is `BadRequest`, and an individual tag that
+    // does not pass input validation is `InvalidTag`.
+    let rows: Vec<RefusedTagSet> = vec![
         (
             "one tag past the per-bucket count bound",
             (0..=MAX_TAGS_PER_BUCKET)
                 .map(|index| tag(&format!("key-{index}"), "v"))
                 .collect(),
+            "BadRequest",
         ),
         (
             "a key one character past its bound",
             vec![tag(&"k".repeat(MAX_TAG_KEY_CHARS + 1), "v")],
+            "InvalidTag",
         ),
         (
             "a value one character past its bound",
             vec![tag("key", &"v".repeat(MAX_TAG_VALUE_CHARS + 1))],
+            "InvalidTag",
         ),
         (
             "the same key twice",
             vec![tag("duplicate", "first"), tag("duplicate", "second")],
+            "InvalidTag",
         ),
         (
             "the same key twice among tags that are fine",
@@ -419,10 +430,26 @@ async fn a_tag_set_past_a_published_limit_is_refused_and_changes_nothing() {
                 tag("beta", "2"),
                 tag("alpha", "3"),
             ],
+            "InvalidTag",
+        ),
+        (
+            "a value carrying an astral-plane symbol",
+            vec![tag("mood", "\u{1f600}")],
+            "InvalidTag",
+        ),
+        (
+            "a value carrying an XML metacharacter",
+            vec![tag("expression", "a < b")],
+            "InvalidTag",
+        ),
+        (
+            "a KEY carrying a character outside the class",
+            vec![tag("br(acket)", "v")],
+            "InvalidTag",
         ),
     ];
 
-    for (case, tags) in rows {
+    for (case, tags, code) in rows {
         let refused = put_bucket_tagging(&router, bucket, &tags).await;
         assert_eq!(
             refused.status, 400,
@@ -433,9 +460,8 @@ async fn a_tag_set_past_a_published_limit_is_refused_and_changes_nothing() {
         );
         assert_eq!(
             refused.error_code(),
-            "ValidationException",
-            "case {case:?}: expected the framework's refusal code for AWS's unmodelled \
-             InvalidTag, got {:?}",
+            code,
+            "case {case:?}: expected the code S3 refuses this restriction with, got {:?}",
             refused.error_code()
         );
 

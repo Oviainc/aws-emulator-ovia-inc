@@ -40,6 +40,8 @@ mod recovery_group_lifecycle;
 mod recovery_group_readiness_summary;
 #[path = "all/resource_set_type_catalog.rs"]
 mod resource_set_type_catalog;
+#[path = "all/resource_set_update.rs"]
+mod resource_set_update;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_limits.rs"]

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetShardIterator
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetShardIterator`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: hands out the opaque iterator that names a position in one shard of one
+//! stream, computed from the stored shard map and the request's `ShardIteratorType`. This
+//! is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`GetShardIterator::handle`] with real behaviour and
@@ -185,6 +185,164 @@ pub struct GetShardIterator<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// Refuse the request with the error this operation models for a parameter that "exceeds
+/// its restrictions, is not supported, or can't be used".
+fn invalid_argument(message: String) -> GetShardIteratorError {
+    GetShardIteratorErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled refusal for a resource this account and region do not hold: "The requested
+/// resource could not be found. The stream might not be specified correctly."
+fn not_found(message: String) -> GetShardIteratorError {
+    GetShardIteratorErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled refusal for a request whose `StreamName` / `StreamARN` pair names no stream
+/// of this account and region: the rule the operation's own doc publishes for a request that
+/// names neither ("you must use either the StreamARN or the StreamName parameter, or both"),
+/// and `ResourceNotFoundException` for one that names a stream nothing created.
+fn lookup_refusal(
+    failure: crate::state::StreamLookupFailure,
+    input: &GetShardIteratorInput,
+) -> GetShardIteratorError {
+    match failure {
+        crate::state::StreamLookupFailure::Unspecified => {
+            invalid_argument(crate::state::STREAM_IDENTIFIER_REQUIRED_MESSAGE.to_string())
+        }
+        crate::state::StreamLookupFailure::Mismatch => {
+            invalid_argument(crate::state::STREAM_IDENTIFIER_MISMATCH_MESSAGE.to_string())
+        }
+        crate::state::StreamLookupFailure::NotFound => not_found(
+            crate::state::stream_not_found_message(
+                input
+                    .stream_name
+                    .as_deref()
+                    .or(input.stream_arn.as_deref())
+                    .unwrap_or_default(),
+            ),
+        ),
+    }
+}
+
+/// Whether `left` is a sequence number no larger than `right`.
+///
+/// `SequenceNumber` is a decimal integer without leading zeros (`^(0|([1-9]\d{0,128}))$`),
+/// which is wider than any integer type this crate holds — so the comparison is by digit
+/// COUNT first and then lexicographic, which for that form is the numeric order.
+fn sequence_number_le(left: &str, right: &str) -> bool {
+    (left.len(), left) <= (right.len(), right)
+}
+
+/// Where in the shard the request asks to start, refusing a request whose members its own
+/// `ShardIteratorType` does not admit.
+///
+/// Each type documents which member supplies its position — "AT_SEQUENCE_NUMBER - Start
+/// reading from the position denoted by a specific sequence number, provided in the value
+/// StartingSequenceNumber", the same for AFTER_SEQUENCE_NUMBER, and "AT_TIMESTAMP - Start
+/// reading from the position denoted by a specific time stamp, provided in the value
+/// Timestamp" — so a request that omits that member names no position, and one that carries
+/// a member its type does not read is refused rather than answered with a position it did
+/// not ask for.
+fn requested_position(
+    input: &GetShardIteratorInput,
+    shard: &crate::state::ShardRecord,
+    trim_horizon_millis: u128,
+) -> Result<crate::state::ShardPosition, GetShardIteratorError> {
+    let iterator_type = input.shard_iterator_type.as_str();
+    // `ShardIteratorType` is a modelled enum, so the request walk refuses an unknown value
+    // before this handler runs; this states the same refusal for a caller that reaches the
+    // handler another way.
+    if !SHARD_ITERATOR_TYPE_VALUES.contains(&iterator_type) {
+        return Err(invalid_argument(format!(
+            "ShardIteratorType {iterator_type} is not supported; the supported values are {}",
+            SHARD_ITERATOR_TYPE_VALUES.join(" | ")
+        )));
+    }
+    let takes_sequence_number = iterator_type
+        == crate::state::SHARD_ITERATOR_TYPE_AT_SEQUENCE_NUMBER
+        || iterator_type == crate::state::SHARD_ITERATOR_TYPE_AFTER_SEQUENCE_NUMBER;
+    let takes_timestamp = iterator_type == crate::state::SHARD_ITERATOR_TYPE_AT_TIMESTAMP;
+    if input.starting_sequence_number.is_some() && !takes_sequence_number {
+        return Err(invalid_argument(format!(
+            "StartingSequenceNumber can only be used with the {} or {} shard iterator \
+             types, not with {iterator_type}",
+            crate::state::SHARD_ITERATOR_TYPE_AT_SEQUENCE_NUMBER,
+            crate::state::SHARD_ITERATOR_TYPE_AFTER_SEQUENCE_NUMBER
+        )));
+    }
+    if input.timestamp.is_some() && !takes_timestamp {
+        return Err(invalid_argument(format!(
+            "Timestamp can only be used with the {} shard iterator type, not with \
+             {iterator_type}",
+            crate::state::SHARD_ITERATOR_TYPE_AT_TIMESTAMP
+        )));
+    }
+    if takes_sequence_number {
+        let Some(sequence_number) = input.starting_sequence_number.as_deref() else {
+            return Err(invalid_argument(format!(
+                "StartingSequenceNumber is required with the {iterator_type} shard iterator \
+                 type"
+            )));
+        };
+        // A sequence number is "the identifier associated with every record ingested in the
+        // stream", and every one a shard can hold lies inside the range the shard publishes
+        // (`Shard$SequenceNumberRange`): a value outside it names a position in no shard.
+        let inside = sequence_number_le(&shard.starting_sequence_number, sequence_number)
+            && shard
+                .ending_sequence_number
+                .as_deref()
+                .is_none_or(|ending| sequence_number_le(sequence_number, ending));
+        if !inside {
+            return Err(invalid_argument(format!(
+                "StartingSequenceNumber {sequence_number} is not a sequence number of shard \
+                 {}",
+                shard.shard_id
+            )));
+        }
+        return Ok(
+            if iterator_type == crate::state::SHARD_ITERATOR_TYPE_AT_SEQUENCE_NUMBER {
+                crate::state::ShardPosition::AtSequenceNumber(sequence_number.to_string())
+            } else {
+                crate::state::ShardPosition::AfterSequenceNumber(sequence_number.to_string())
+            },
+        );
+    }
+    if takes_timestamp {
+        let Some(at) = input.timestamp else {
+            return Err(invalid_argument(format!(
+                "Timestamp is required with the {iterator_type} shard iterator type"
+            )));
+        };
+        let Ok(millis) = at.to_millis() else {
+            return Err(invalid_argument(
+                "Timestamp must be a Unix epoch date with precision in milliseconds"
+                    .to_string(),
+            ));
+        };
+        let millis = u128::try_from(millis).unwrap_or_default();
+        // "If the time stamp is older than the current trim horizon, the iterator returned
+        // is for the oldest untrimmed data record (TRIM_HORIZON)."
+        return Ok(if millis < trim_horizon_millis {
+            crate::state::ShardPosition::TrimHorizon
+        } else {
+            crate::state::ShardPosition::AtTimestamp(millis)
+        });
+    }
+    Ok(
+        if iterator_type == crate::state::SHARD_ITERATOR_TYPE_TRIM_HORIZON {
+            crate::state::ShardPosition::TrimHorizon
+        } else {
+            crate::state::ShardPosition::Latest
+        },
+    )
+}
+
 impl<Eng> GetShardIterator<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -211,18 +369,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetShardIterator` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetShardIteratorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetShardIterator"))
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetShardIteratorError::from(GetShardIteratorErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the stream store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+
+        // `StreamId` is documented "Not Implemented. Reserved for future use", so no stream
+        // carries one and a request naming only that member names no stream.
+        let stream = store
+            .resolve_stream(
+                &region,
+                input.stream_name.as_deref(),
+                input.stream_arn.as_deref(),
+            )
+            .map_err(|failure| lookup_refusal(failure, &input))?;
+        let identifier = input
+            .stream_name
+            .as_deref()
+            .or(input.stream_arn.as_deref())
+            .unwrap_or(&stream.name);
+
+        // A stream whose creation has not fallen due yet has no readable shard, and this
+        // operation models no "the resource is not available yet" error: the position a
+        // reader asked for is in no shard this account holds yet, which is the modelled
+        // not-found refusal, stating the status the stream is actually in.
+        let status = stream.status(now);
+        if status != crate::state::STREAM_ACTIVE {
+            return Err(not_found(crate::state::stream_not_active_message(
+                identifier, status,
+            )));
+        }
+
+        let Some(shard) = stream
+            .shards
+            .iter()
+            .find(|shard| shard.shard_id == input.shard_id)
+        else {
+            return Err(not_found(crate::state::shard_not_found_message(
+                &input.shard_id,
+                identifier,
+            )));
+        };
+
+        let trim_horizon_millis = crate::state::epoch_millis(stream.trim_horizon(now));
+        let position = requested_position(&input, shard, trim_horizon_millis)?;
+
+        // "Checks if your request will succeed. DryRun is an optional parameter"
+        // (`GetShardIteratorInput$DryRun`): the request is judged in full above and then
+        // refused with the error the model declares for it ("The request was rejected
+        // because the DryRun parameter was specified"), so a dry run hands out no iterator.
+        if input.dry_run.unwrap_or(false) {
+            return Err(GetShardIteratorErrorModeled::DryRunOperationException(
+                DryRunOperationException {
+                    message: Some(
+                        "The request was rejected because the DryRun parameter was specified."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Every part of the position travels inside the iterator, so handing one out writes
+        // nothing a later caller could see.
+        Ok(GetShardIteratorOutput {
+            shard_iterator: Some(
+                crate::state::ShardIteratorToken::new(stream, &shard.shard_id, position, now)
+                    .encode(),
+            ),
+        })
     }
 }

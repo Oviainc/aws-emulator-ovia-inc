@@ -58,7 +58,10 @@ struct Case {
 
 /// A tax registration certificate document, as `VerificationDetails` carries
 /// one.
-fn certificate_document() -> Value {
+///
+/// `pub(crate)` because `tests/all/derived_registration_members.rs` needs the
+/// same document for the Mexican rows of its own table.
+pub(crate) fn certificate_document() -> Value {
     json!({
         "taxRegistrationDocuments": [
             { "file": { "fileName": "certificate.pdf", "fileContent": "aGVsbG8=" } },

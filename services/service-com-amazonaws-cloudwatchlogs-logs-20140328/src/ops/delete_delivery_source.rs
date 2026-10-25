@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDeliverySource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDeliverySource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: removes the one stored delivery source the request's `name` names, unless a
+//! delivery is still associated with it. This is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DeleteDeliverySource::handle`] with real behaviour and
@@ -165,18 +164,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDeliverySource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDeliverySourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDeliverySource"))
+        // `ctx` carries only request metadata; a delivery source is identified by its own
+        // name and by nothing about the request.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteDeliverySourceError::from(
+                DeleteDeliverySourceErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // A name this account holds no delivery source under names no source, which is the
+        // modelled not-found refusal — so deleting the same source twice refuses the second
+        // time.
+        if !store.delivery_sources.contains_key(&input.name) {
+            return Err(
+                DeleteDeliverySourceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::DELIVERY_SOURCE_NOT_FOUND_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "You can't delete a delivery source if any current deliveries are associated with
+        // it": a delivery names its source by the name it is stored under, so the deliveries
+        // the store holds are what answers that.
+        if let Some(delivery) = store
+            .deliveries
+            .values()
+            .find(|delivery| delivery.delivery_source_name == input.name)
+        {
+            return Err(DeleteDeliverySourceErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "The delivery source {} cannot be deleted while delivery {} is \
+                         associated with it.",
+                        input.name, delivery.id
+                    )),
+                },
+            )
+            .into());
+        }
+        store.delivery_sources.remove(&input.name);
+
+        Ok(DeleteDeliverySourceOutput)
     }
 }

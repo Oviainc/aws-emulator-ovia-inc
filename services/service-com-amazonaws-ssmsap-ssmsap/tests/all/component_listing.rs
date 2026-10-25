@@ -2,8 +2,9 @@
 
 //! `ListComponents`: the components of the registered applications, read back from state.
 //!
-//! The rule pinned here: every component a registration described
-//! (`RegisterApplication$ComponentsInfo`) is reported once by `ListComponents` as a
+//! The rule pinned here: every component a registration describes — one per
+//! `ComponentsInfo` entry, plus the SAP HANA component of the SAP system its own `Sid`
+//! names — is reported once by `ListComponents` as a
 //! `ComponentSummary` carrying its application's id, the `ComponentId` the SID and type
 //! it was declared with identify it by, that type, and its own ARN; the listing is scoped
 //! to the Region the request was signed for and to the application it names when it names
@@ -26,10 +27,11 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_ssmsap_ssmsap::ops::types::COMPONENT_TYPE_VALUES;
 use service_com_amazonaws_ssmsap_ssmsap::state::{
-    MAX_COMPONENTS_PER_APPLICATION, MAX_PAGE_SIZE,
+    conditionally_required_members, ConditionalMember, MAX_COMPONENTS_PER_APPLICATION,
+    MAX_DECLARED_COMPONENTS, MAX_PAGE_SIZE,
 };
 
-use crate::application_lifecycle::{valid_registration, Emulator, Reply};
+use crate::application_lifecycle::{conditional_value, valid_registration, Emulator, Reply};
 use crate::validation_message_rendering::{message, VALIDATION_EXCEPTION};
 
 /// The regional endpoint most rows sign for.
@@ -50,10 +52,33 @@ const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 /// `ResourceNotFoundException`, `@httpError 404`).
 const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 
-/// The most components one registration may declare: the model gives `ComponentInfoList`
+/// The most components one registration may DECLARE: the model gives `ComponentInfoList`
 /// `@length(min: 0, max: 5)` (`smithy_query(query="shape", shape="ComponentInfoList")`),
-/// which the crate re-states as `MAX_COMPONENTS_PER_APPLICATION`.
-const MAX_COMPONENTS_PER_REGISTRATION: usize = MAX_COMPONENTS_PER_APPLICATION;
+/// which the crate re-states as `MAX_DECLARED_COMPONENTS`.
+const MAX_COMPONENTS_PER_REGISTRATION: usize = MAX_DECLARED_COMPONENTS;
+
+/// The `ComponentType` of the SAP HANA component of an application's own SAP system: one
+/// of the model's `ComponentType` values (`smithy_query(query="shape",
+/// shape="ComponentType")`).
+const HANA: &str = "HANA";
+
+/// The `Sid` a [`valid_registration`] of `app_type` carries, when that type requires one.
+///
+/// The builder carries every member the type conditionally requires
+/// (`CONDITIONALLY_REQUIRED_MEMBERS`), so this is read off the same table rather than
+/// written out again: a registration carrying a System ID describes the SAP HANA
+/// component of that SAP system.
+fn registration_sid(app_type: &str) -> Option<String> {
+    conditionally_required_members(app_type)
+        .iter()
+        .any(|member| matches!(member, ConditionalMember::Sid))
+        .then(|| {
+            conditional_value(ConditionalMember::Sid)
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+}
 
 /// One `ComponentSummary` a listing reported, reduced to the members the model gives it
 /// (`smithy_query(query="shape", shape="ComponentSummary")`). `Tags` is read separately,
@@ -243,8 +268,8 @@ struct Case {
 /// catalogue (`COMPONENT_TYPE_VALUES`) rather than from one cited type — including the
 /// entries at the end of it, which no issue cites.
 const CASES: &[Case] = &[
-    // Nothing declared: the emulator discovers nothing of its own, so there is nothing
-    // to list.
+    // Nothing declared: the only component is the SAP HANA component the System ID of a
+    // HANA registration names, the emulator discovering nothing of its own.
     Case {
         id: "HDB-TEST",
         app_type: "HANA",
@@ -293,12 +318,20 @@ impl Case {
                 expected.push(summary);
             }
         }
+        // The SAP HANA component of the application's own SAP system, which a
+        // registration naming a System ID describes without declaring it.
+        if let Some(sid) = registration_sid(self.app_type) {
+            let summary = expected_summary(region, self.id, HANA, &sid);
+            if !expected.contains(&summary) {
+                expected.push(summary);
+            }
+        }
         expected.sort();
         expected
     }
 }
 
-/// RULE: every component a registration declared is listed once for its application, with
+/// RULE: every component a registration describes is listed once for its application, with
 /// the id, type and ARN it was registered with — and the component ids `GetApplication`
 /// reports are exactly the components the listing reports.
 #[tokio::test]
@@ -316,9 +349,9 @@ async fn every_declared_component_is_listed_for_its_application() {
         .await;
         let expected = case.expected(REGION);
         assert!(
-            expected.len() <= MAX_COMPONENTS_PER_REGISTRATION,
-            "case {case:?}: a registration declares at most \
-             {MAX_COMPONENTS_PER_REGISTRATION} components, the row expects {}",
+            expected.len() <= MAX_COMPONENTS_PER_APPLICATION,
+            "case {case:?}: a registration leaves an application with at most \
+             {MAX_COMPONENTS_PER_APPLICATION} components, the row expects {}",
             expected.len()
         );
 
@@ -601,8 +634,8 @@ async fn a_token_of_another_listing_is_refused_rather_than_resumed_from() {
     }
 }
 
-/// RULE: an application holds at most [`MAX_COMPONENTS_PER_REGISTRATION`] components, so a
-/// registration declaring more is refused as a 400 `ValidationException` and stores
+/// RULE: a registration declares at most [`MAX_COMPONENTS_PER_REGISTRATION`] components,
+/// so one declaring more is refused as a 400 `ValidationException` and stores
 /// nothing — while one declaring exactly that many is accepted.
 ///
 /// Either refusal satisfies the rule: the bound is the MODEL's (`ComponentInfoList`

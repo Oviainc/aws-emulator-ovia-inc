@@ -589,7 +589,7 @@ async fn create_state_machine_checks_the_definition_structure() {
     // execution instead.
     let accepted: Vec<(&str, &str)> = vec![
         (
-            "a Task state, which is not executed",
+            "a Task state whose Resource names no integration call",
             r#"{"StartAt":"A","States":{"A":{"Type":"Task","Resource":"arn:aws:lambda:us-west-2:000000000000:function:f","End":true}}}"#,
         ),
         (
@@ -1141,7 +1141,7 @@ async fn an_execution_runs_the_definition_to_its_own_outcome() {
             error: Some("Downstream"),
         },
         RunCase {
-            case: "a Task state, which this emulator does not execute",
+            case: "a Task state whose Resource names no integration call",
             definition: r#"{"StartAt":"T","States":{"T":{"Type":"Task","Resource":"arn:aws:lambda:us-west-2:000000000000:function:f","End":true}}}"#,
             input: "{}",
             status: "FAILED",

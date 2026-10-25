@@ -17,7 +17,11 @@
 //!   BEFORE the store lock is taken, so no request's length decides how long the store is
 //!   held or how large the stored record is;
 //! * a tenant that names no `ConnectionGroupId` is routed through the account's DEFAULT
-//!   connection group, which this call mints the first time one is needed.
+//!   connection group, which this call mints the first time one is needed;
+//! * a `ManagedCertificateRequest` that asks CloudFront itself to serve the HTTP validation
+//!   token is admitted only for domains this service resolves to a CloudFront resource:
+//!   CloudFront can serve that token at the domain only once the domain points at it, so
+//!   the check is made synchronously, here, rather than deferred to the certificate.
 //!
 //! Every refusal is decided BEFORE anything is minted, so a refused create leaves the
 //! store exactly as it was.
@@ -353,6 +357,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if store.domain_in_use(domain, None) {
                 return Err(CreateDistributionTenantErrorModeled::CNAMEAlreadyExists(
                     crate::state::cname_already_exists(domain),
+                )
+                .into());
+            }
+        }
+
+        // "The configuration for the CloudFront managed ACM certificate request": a request
+        // that asks CLOUDFRONT to serve the HTTP validation token can only be satisfied
+        // once the domain resolves to a CloudFront resource, so every domain the
+        // certificate would cover is checked against this service's DNS view HERE —
+        // synchronously, before anything is minted — and one whose ownership cannot be
+        // verified is refused with the sentence CloudFront answers that condition with. The
+        // other validation-token host leaves the token to the caller's own infrastructure
+        // and so demands nothing of DNS.
+        if let Some(request) = &input.managed_certificate_request {
+            if store
+                .unverifiable_certificate_domain(request, &domains)
+                .is_some()
+            {
+                return Err(CreateDistributionTenantErrorModeled::InvalidArgument(
+                    crate::state::domain_ownership_unverified(),
                 )
                 .into());
             }

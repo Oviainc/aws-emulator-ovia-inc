@@ -136,6 +136,8 @@ mod es_opensearch_and_elasticsearch_signing_name_routing;
 mod events_signing_name_routing;
 #[path = "all/events_store_ownership.rs"]
 mod events_store_ownership;
+#[path = "all/events_to_sfn_to_dynamodb_chain.rs"]
+mod events_to_sfn_to_dynamodb_chain;
 // In the sorted list rather than appended at the end of the file: every new suite appends
 // there, so that is the contended region now and the sorted position this file's header
 // asks for is the quiet one.
@@ -312,3 +314,5 @@ mod cloudformation_provisions_sfn_activities;
 mod cloudformation_provisions_s3vectors_resources;
 #[path = "all/cloudformation_provisions_msk_clusters.rs"]
 mod cloudformation_provisions_msk_clusters;
+#[path = "all/logs_emf_metric_extraction.rs"]
+mod logs_emf_metric_extraction;

@@ -37,6 +37,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 use service_com_amazonaws_lightsail_lightsail_20161128::ops::types::REGION_NAME_VALUES;
 
+use crate::distribution_certificate_attachment::{create_certificate, wait_for_issued_certificate};
 use crate::instance_lifecycle::{error_code, is_uuid_shaped, Emulator};
 use crate::paging::{names, walk_pages};
 
@@ -515,6 +516,25 @@ const ROWS: &[Row] = &[
     },
 ];
 
+/// Request every certificate the rows name and wait until the certificate
+/// authority has issued each one.
+///
+/// A distribution's `certificateName` names an SSL/TLS certificate of the
+/// account that has been ISSUED, so a row that names one needs that certificate
+/// to exist and be issued before its create is made. The names come from the
+/// rows themselves, so this cannot drift from the table, and the stand-up and
+/// the issuance wait are this test target's own, shared with the suites that
+/// pin the attachment.
+async fn create_row_certificates(emulator: &Emulator) {
+    let names: BTreeSet<&str> = ROWS.iter().filter_map(|row| row.certificate_name).collect();
+    for name in &names {
+        create_certificate(emulator, name, &format!("{name}.example.com"), &[]).await;
+    }
+    for name in &names {
+        wait_for_issued_certificate(emulator, name).await;
+    }
+}
+
 /// Every tag the record reports, as `(key, value)` pairs in the store's order.
 fn reported_tags(distribution: &Value) -> Vec<(String, String)> {
     distribution["tags"]
@@ -808,6 +828,7 @@ async fn read(emulator: &Emulator, name: &str) -> Value {
 async fn create_distribution_stores_the_requested_record() {
     let emulator = Emulator::new();
     let balancer_dns = create_origins(&emulator).await;
+    create_row_certificates(&emulator).await;
 
     // Nothing has been created yet, so a listing is an empty list rather than an
     // absent member.

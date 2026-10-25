@@ -315,7 +315,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Update the policy only if the revision ID matches the ID that's specified."
         // The id to match is the policy's own, which is the one `GetPolicy` reports; a
-        // function with no policy yet is at no revision, so any expectation fails.
+        // function with no policy yet is at no revision, so any expectation fails. The
+        // refusal is the one fixed sentence naming that reader.
         if let Some(expected) = &input.revision_id {
             let current = record
                 .policies
@@ -325,11 +326,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(AddPermissionErrorModeled::PreconditionFailedException(
                     PreconditionFailedException {
                         r#type: None,
-                        message: Some(format!(
-                            "The RevisionId ({expected}) provided does not match the latest \
-                             RevisionId for the resource {resource}. Call GetPolicy to retrieve \
-                             the latest RevisionId for your resource."
-                        )),
+                        message: Some(
+                            crate::state::POLICY_REVISION_PRECONDITION_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into());
@@ -351,7 +350,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The permission statement that's added to the function policy" is what this
         // call answers with, so it is rendered once and both stored and reported.
         let added = statement.to_json();
-        policy.statements.push(statement);
+        policy.add_statement(statement);
 
         let size = policy.to_json().len();
         if size > crate::state::MAX_POLICY_SIZE_BYTES {

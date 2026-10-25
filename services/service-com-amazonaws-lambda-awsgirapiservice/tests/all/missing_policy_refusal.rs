@@ -12,11 +12,13 @@
 //! holds no policy yet" is not "this function does not exist", and the first is the state
 //! every add-permission/get-policy bootstrap starts from.
 //!
-//! For a function's policy and its URL that message is one fixed sentence repeating
-//! nothing from the request, asserted here exactly. The layer-version family words its
-//! own two no-policy states (a version nobody granted anything on, and one whose
-//! statements have all been removed), owned by those handlers and their suite, so what the
-//! rows below pin for a layer version is the distinction itself rather than the wording.
+//! For a function's policy READ and its URL that message is one fixed sentence repeating
+//! nothing from the request, asserted here exactly; a function-policy REMOVAL with no
+//! policy to act on reports the missing POLICY in its own fixed sentence, also repeating
+//! nothing from the request. The layer-version family words its own two no-policy states
+//! (a version nobody granted anything on, and one whose statements have all been removed),
+//! owned by those handlers and their suite, so what the rows below pin for a layer version
+//! is the distinction itself rather than the wording.
 //!
 //! The rows differ along what the rule generalises over: the operation (reading a policy,
 //! revoking a statement from one, reading a function URL), the resource kind (a function's
@@ -41,6 +43,13 @@ use crate::function_lifecycle::{
 /// wording, repeating nothing from the request. Spelled out here rather than read from
 /// `state::RESOURCE_NOT_FOUND_MESSAGE`, so a change to that constant fails this suite.
 const MISSING_SUBRESOURCE_MESSAGE: &str = "The resource you requested does not exist.";
+
+/// The one sentence a REMOVAL carries when the resource resolves but holds no policy for
+/// it to act on: AWS reports the missing POLICY there, while the READ of that policy
+/// reports the missing resource ([`MISSING_SUBRESOURCE_MESSAGE`]). Spelled out here rather
+/// than read from `state::NO_POLICY_MESSAGE`, so a change to that constant fails this
+/// suite.
+const NO_POLICY_MESSAGE: &str = "No policy is associated with the given resource.";
 
 /// The error code every row expects, and the status it is bound to.
 const NOT_FOUND_CODE: &str = "ResourceNotFoundException";
@@ -206,6 +215,10 @@ enum Refusal {
     /// The resource resolves and holds neither the policy nor the URL asked about, and the
     /// refusal is the function family's fixed sentence, exactly.
     MissingSubresource,
+    /// The resource resolves and holds no policy, and the call is a REMOVAL, so what it
+    /// reports missing is the POLICY it was asked to change: AWS's own sentence for that,
+    /// [`NO_POLICY_MESSAGE`], which is not the one the READ of that policy answers.
+    MissingPolicyOnRemoval,
     /// The resource resolves and holds no policy, and the wording is the layer-version
     /// family's own: the row pins only that it differs from the refusal an absent layer
     /// version gets, which is the distinction the rule is about.
@@ -297,7 +310,7 @@ fn cases() -> Vec<Case> {
             uri: format!("/2015-03-31/functions/{POLICY_FREE}/policy/never-granted"),
             kind: FUNCTION_POLICY,
             identifier: function_arn(POLICY_FREE),
-            refusal: Refusal::MissingSubresource,
+            refusal: Refusal::MissingPolicyOnRemoval,
         },
         Case {
             name: "RemovePermission on a published version that holds no policy",
@@ -307,7 +320,7 @@ fn cases() -> Vec<Case> {
             ),
             kind: FUNCTION_POLICY,
             identifier: version_arn.clone(),
-            refusal: Refusal::MissingSubresource,
+            refusal: Refusal::MissingPolicyOnRemoval,
         },
         Case {
             name: "GetLayerVersionPolicy on a layer version that holds no policy",
@@ -449,6 +462,21 @@ async fn a_missing_policy_is_refused_differently_from_a_missing_resource() {
                 );
                 missing.entry(case.kind).or_insert(message);
             }
+            Refusal::MissingPolicyOnRemoval => {
+                assert_eq!(
+                    message, NO_POLICY_MESSAGE,
+                    "case {:?}: expected the fixed sentence {NO_POLICY_MESSAGE:?}, got {message:?}",
+                    case.name
+                );
+                assert!(
+                    !message.contains(&case.identifier),
+                    "case {:?}: the refusal must repeat nothing from the request, but it names \
+                     {:?}: {message:?}",
+                    case.name,
+                    case.identifier
+                );
+                missing.entry(case.kind).or_insert(message);
+            }
             Refusal::MissingSubresourceWorded => {
                 assert!(
                     !message.is_empty(),
@@ -558,8 +586,13 @@ async fn a_functions_policy_refusal_follows_whether_it_holds_a_policy() {
     );
 
     // The statement was the only one, so the function holds no policy again — and the
-    // refusal is the one for a resource that resolves, not the one for a missing function.
-    for case in ["after the revocation", "revoking it a second time"] {
+    // refusal is the one for a resource that resolves, not the one for a missing function:
+    // the READ reports the resource it was asked about, the REMOVAL reports the policy it
+    // was asked to change.
+    for (case, expected) in [
+        ("after the revocation", MISSING_SUBRESOURCE_MESSAGE),
+        ("revoking it a second time", NO_POLICY_MESSAGE),
+    ] {
         let answer = if case == "after the revocation" {
             get_policy(&router, "reconciled", None).await
         } else {
@@ -567,9 +600,14 @@ async fn a_functions_policy_refusal_follows_whether_it_holds_a_policy() {
         };
         assert_eq!(
             (answer.status, message_of(&answer)),
-            (NOT_FOUND_STATUS, MISSING_SUBRESOURCE_MESSAGE.to_string()),
-            "case {case:?}: expected HTTP {NOT_FOUND_STATUS} and the fixed sentence, got {} {}",
+            (NOT_FOUND_STATUS, expected.to_string()),
+            "case {case:?}: expected HTTP {NOT_FOUND_STATUS} and {expected:?}, got {} {}",
             answer.status,
+            body_text(&answer)
+        );
+        assert!(
+            !message_of(&answer).contains(&function_arn("reconciled")),
+            "case {case:?}: the refusal must repeat nothing from the request, got {}",
             body_text(&answer)
         );
     }

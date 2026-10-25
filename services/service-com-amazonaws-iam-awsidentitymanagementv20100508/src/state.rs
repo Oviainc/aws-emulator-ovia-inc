@@ -1052,6 +1052,20 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
         (held.policy.arn.as_deref() == Some(arn)).then_some(held)
     }
 
+    /// The managed policy `arn` names, if the account holds it, for a caller that
+    /// is going to CHANGE it.
+    ///
+    /// The same lookup and the same identity test as
+    /// [`policy_by_arn`](Self::policy_by_arn) — an ARN carrying another path,
+    /// another account or another casing of the name names no policy — so a write
+    /// addressed by ARN reaches exactly the record a read of that ARN reports, and
+    /// the account's policies are never found under two different rules.
+    pub fn policy_by_arn_mut(&mut self, arn: &str) -> Option<&mut ManagedPolicy> {
+        let parsed = parse_policy_arn(arn)?;
+        let held = self.policies.get_mut(&name_key(&parsed.policy_name))?;
+        (held.policy.arn.as_deref() == Some(arn)).then_some(held)
+    }
+
     /// How many entities the managed policy `arn` names is attached to —
     /// `Policy$AttachmentCount`, "the number of entities (users, groups, and roles)
     /// that the policy is attached to".

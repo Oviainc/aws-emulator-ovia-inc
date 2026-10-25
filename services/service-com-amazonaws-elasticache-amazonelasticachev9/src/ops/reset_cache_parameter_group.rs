@@ -214,7 +214,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ResetCacheParameterGroupErrorModeled::CacheParameterGroupNotFoundFault(
                     CacheParameterGroupNotFoundFault {
-                        message: Some(format!("CacheParameterGroup {requested_name} not found.")),
+                        message: Some(crate::state::parameter_writer_group_not_found_message(
+                            &requested_name,
+                        )),
                     },
                 )
                 .into(),
@@ -237,10 +239,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // its values ARE the engine defaults, so no parameter of it can be put
         // back to one.
         if name.starts_with(crate::state::DEFAULT_PARAMETER_GROUP_PREFIX) {
-            return Err(invalid_parameter_value(format!(
-                "Invalid value {name} for CacheParameterGroupName: a cache parameter group \
-                 family's default group cannot be reset."
-            )));
+            return Err(invalid_parameter_value(
+                crate::state::DEFAULT_PARAMETER_GROUP_IMMUTABLE.to_string(),
+            ));
         }
         // The same window `ModifyCacheParameterGroup` documents for the list it
         // shares with this operation ("A maximum of 20 parameters may be

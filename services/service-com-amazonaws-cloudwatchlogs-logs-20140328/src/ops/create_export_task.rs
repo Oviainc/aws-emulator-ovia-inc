@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateExportTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateExportTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: starts an export of one stored log group's events to an S3 bucket,
+//! minting the task `DescribeExportTasks` then reports. This is the ONLY file to touch
+//! for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`CreateExportTask::handle`] with real behaviour and
@@ -183,18 +183,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateExportTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateExportTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateExportTask"))
+        // `ctx` carries only request metadata; an export task is identified by the id this
+        // call mints and by nothing about the request.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateExportTaskError::from(
+                CreateExportTaskErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        let invalid = |message: String| {
+            CreateExportTaskError::from(
+                CreateExportTaskErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                ),
+            )
+        };
+
+        // The log group the export reads is resolved FIRST: a group this account does not
+        // hold is the more specific client error, and resolution must not mint a task id.
+        let Some(group_created_at_ms) = store
+            .log_groups
+            .get(&input.log_group_name)
+            .map(|group| group.creation_time_ms)
+        else {
+            return Err(CreateExportTaskErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message("log group")),
+                },
+            )
+            .into());
+        };
+
+        // The window is `[from, to]` over event timestamps ("Events with a timestamp earlier
+        // than this time are not exported" / "later than this time are not exported"), so a
+        // window whose end precedes its start spans nothing and is refused rather than
+        // exported as empty. The sentence names the two members that bound it and
+        // interpolates neither of their values.
+        if input.to < input.from {
+            return Err(invalid(
+                crate::state::EXPORT_REVERSED_TIME_RANGE_MESSAGE.to_string(),
+            ));
+        }
+        // "You must specify a time that is not earlier than when this log group was created"
+        // (`CreateExportTask$to`).
+        if input.to < group_created_at_ms {
+            return Err(invalid(
+                "The parameter to must not be earlier than when the log group was created."
+                    .to_string(),
+            ));
+        }
+
+        // "Each account can only have one active (RUNNING or PENDING) export task at a
+        // time": the statuses the clock already owed are materialised first, so a task it has
+        // since completed does not block a new one.
+        let now = crate::state::now_ms();
+        store.materialize_due_export_transitions(now);
+        if let Some(active) = store.active_export_task() {
+            return Err(CreateExportTaskErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "An account can only have one active export task at a time. Task {} is \
+                         {}.",
+                        active.task_id, active.status_code
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let task_id = crate::state::mint_export_task_id(store.take_export_task_seq());
+        let mut record = crate::state::ExportTaskRecord::new(
+            &task_id,
+            &input.log_group_name,
+            input.from,
+            input.to,
+            &input.destination,
+            now,
+        );
+        record.task_name = input.task_name.clone();
+        // "If you don't specify a value, the default is exportedlogs", which the record's
+        // constructor already set.
+        if let Some(prefix) = input.destination_prefix.clone() {
+            record.destination_prefix = prefix;
+        }
+        record.log_stream_name_prefix = input.log_stream_name_prefix.clone();
+        store.export_tasks.insert(task_id.clone(), record);
+        store.enforce_export_task_ceiling();
+
+        Ok(CreateExportTaskOutput {
+            // "This operation initiates an export task and responds with the ID of the
+            // task", which is the id the store now holds it under.
+            task_id: Some(task_id),
+        })
     }
 }

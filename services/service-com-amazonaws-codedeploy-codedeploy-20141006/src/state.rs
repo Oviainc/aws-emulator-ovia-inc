@@ -180,15 +180,29 @@ pub fn deployment_not_started(deployment_id: &str) -> String {
     format!("The deployment {deployment_id} has not started")
 }
 
-/// `DeploymentTargetDoesNotExistException` (HTTP 400): the target id the request
-/// asked for and the deployment it does not belong to, which is what the shape's
-/// own sentence says ("The provided target ID does not belong to the attempted
-/// deployment"). The id is bounded by [`echoed`], like every other refusal that
-/// quotes a caller-supplied value back.
-pub fn deployment_target_not_found(deployment_id: &str, target_id: &str) -> String {
+/// `DeploymentTargetDoesNotExistException` (HTTP 400): the deployment the target
+/// does not belong to, which is what the shape's own sentence says ("The
+/// provided target ID does not belong to the attempted deployment"), and the
+/// target itself identified by its ARN.
+///
+/// A refusal about a deployment TARGET names the target the way a target is
+/// identified as a resource — by its ARN ([`deployment_target_arn`]) — rather
+/// than by the id the request carried: the ARN is what lets a caller correlate
+/// the rejection with the resource it asked about (its partition, region,
+/// account and resource type) and match it against the ARNs the on-premises and
+/// target readers hand it. An id no ARN follows from is quoted as it was sent,
+/// bounded by [`echoed`], so the refusal still names what the caller asked for.
+pub fn deployment_target_not_found(
+    state: &ComAmazonawsCodedeployCodedeploy20141006State,
+    deployment: &Deployment,
+    region: &str,
+    target_id: &str,
+) -> String {
+    let target = deployment_target_arn(state, &deployment.compute_platform, region, target_id)
+        .unwrap_or_else(|| echoed(target_id));
     format!(
-        "The deployment target {} does not belong to the deployment {deployment_id}",
-        echoed(target_id)
+        "The target {target} is not part of deployment {}",
+        deployment.deployment_id
     )
 }
 
@@ -749,29 +763,43 @@ pub fn validate_alarm_configuration(
         ));
     }
     let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    for alarm in alarms {
+    for (index, alarm) in alarms.iter().enumerate() {
+        // WHICH entry of the submitted list is at fault, as the caller numbers
+        // them: a refusal about one entry of a list names its 1-based position,
+        // which is the only thing that says which entry to fix when several
+        // carry the same name or several names collide.
+        let position = index + 1;
         let name = alarm.name.as_deref().unwrap_or_default();
         if name.is_empty() {
             return Err(AlarmConfigurationRejection::Malformed(
-                invalid_alarm_configuration("an alarm was specified with no name"),
+                invalid_alarm_configuration(&format!(
+                    "alarm {position} was specified with no name"
+                )),
             ));
         }
         if name.chars().count() > MAX_ALARM_NAME_LENGTH {
             return Err(AlarmConfigurationRejection::Malformed(
                 invalid_alarm_configuration(&format!(
-                    "an alarm name exceeds the maximum length of {MAX_ALARM_NAME_LENGTH} characters"
+                    "the name of alarm {position} exceeds the maximum length of \
+                     {MAX_ALARM_NAME_LENGTH} characters"
                 )),
             ));
         }
         if !seen.insert(name) {
-            return Err(AlarmConfigurationRejection::Malformed(
-                invalid_alarm_configuration(&format!(
-                    "the alarm name {name} was specified more than once"
-                )),
-            ));
+            return Err(AlarmConfigurationRejection::Malformed(duplicate_alarm_name(
+                name, position,
+            )));
         }
     }
     Ok(())
+}
+
+/// `InvalidAlarmConfigException` (HTTP 400) for the case the shape documents as
+/// "Two alarms with the same name have been specified": the repeated NAME and
+/// the 1-based POSITION, in the alarm list the request submitted, of the entry
+/// that repeats it — the entry a caller has to drop.
+fn duplicate_alarm_name(name: &str, position: usize) -> String {
+    format!("Name {name} of Alarm {position} already exists.")
 }
 
 /// `InvalidAlarmConfigException` (HTTP 400): the fixed sentence for an alarm
@@ -782,9 +810,10 @@ pub const ALARM_CONFIGURATION_WITHOUT_ALARMS: &str =
     "Deployment Groups need to have at least one alarms attached if they are monitored.";
 
 /// `InvalidAlarmConfigException` (HTTP 400) for every OTHER way the shape
-/// documents an alarm configuration as malformed (a nameless alarm, an
-/// over-long name, a repeated one): the error's own clause with `detail` saying
-/// which, so the caller can fix the request from the message.
+/// documents an alarm configuration as malformed (a nameless alarm, an over-long
+/// name): the error's own clause with `detail` saying which, so the caller can
+/// fix the request from the message. `detail` names the 1-based position of the
+/// offending entry, as [`duplicate_alarm_name`] does.
 fn invalid_alarm_configuration(detail: &str) -> String {
     format!("The alarm configuration is invalid: {detail}")
 }
@@ -2551,11 +2580,104 @@ fn instance_target_arn(
     state: &ComAmazonawsCodedeployCodedeploy20141006State,
     target: &DeploymentTargetSnapshot,
 ) -> Option<String> {
-    let target_id = target.target_id.as_deref()?;
+    on_premises_instance_arn(state, target.target_id.as_deref()?)
+}
+
+/// The ARN the on-premises registry holds for `instance_name`, if it holds a
+/// record of that name at all.
+///
+/// The ONE place a stored instance's ARN is read from, so every answer that
+/// names an on-premises instance by ARN — a target's `targetArn`, the
+/// `instanceArn` the on-premises readers report, the refusal that names a target
+/// — carries the string the registry MINTED ([`instance_arn`]) rather than one
+/// rebuilt from the name. A deregistered record keeps its ARN, which is why this
+/// does not filter on registration: the registration it names happened.
+fn on_premises_instance_arn(
+    state: &ComAmazonawsCodedeployCodedeploy20141006State,
+    instance_name: &str,
+) -> Option<String> {
     state
         .on_premises_instances
-        .get(target_id)
+        .get(instance_name)
         .map(|instance| instance.instance_arn.clone())
+}
+
+/// The ARN of the deployment target `target_id` names on `compute_platform`.
+///
+/// A deployment target is a resource of ANOTHER service — an instance, a
+/// function, an Amazon ECS service — and CodeDeploy identifies it by its ARN
+/// wherever it names it as a resource, so this is the identifier form a refusal
+/// about a target uses. The ARN follows from the id and the platform whose FORM
+/// that id is in ([`check_deployment_target_id`], which gates the form before
+/// anything calls this), in the region the request was signed for
+/// ([`request_region`]) and the emulator's own account:
+///
+/// * an on-premises instance this service holds a registration for: the ARN that
+///   registration minted ([`on_premises_instance_arn`]), so the refusal and the
+///   `instanceArn` every on-premises reader answers are the same string;
+/// * an Amazon EC2 instance, which is what a `Server` target id in the form the
+///   service reserves for an instance id names
+///   ([`check_on_premises_instance_name`]): `ec2`'s documented instance ARN,
+///   `arn:<partition>:ec2:<region>:<account>:instance/<instance-id>`;
+/// * a Lambda function, which a `Lambda` target id names:
+///   `arn:<partition>:lambda:<region>:<account>:function:<function-name>`;
+/// * an Amazon ECS service, which an `ECS` target id names as the
+///   `<clustername>:<servicename>` pair:
+///   `arn:<partition>:ecs:<region>:<account>:service/<clustername>/<servicename>`.
+///
+/// This is a rendering of the identifier the CALLER sent, not a claim that the
+/// resource exists — which is why it needs no record and why it is NOT what a
+/// target's `targetArn` is reported from: that member says which resource a
+/// deployment deployed to, so it is answered from the record this service holds
+/// (see [`instance_target_arn`]) and left absent where it holds none.
+///
+/// `None` where no ARN follows from the id alone: an on-premises host name no
+/// registration exists for, because that ARN names a REGISTRATION (see
+/// [`instance_arn`]) and this service mints none for a host it never registered.
+pub fn deployment_target_arn(
+    state: &ComAmazonawsCodedeployCodedeploy20141006State,
+    compute_platform: &str,
+    region: &str,
+    target_id: &str,
+) -> Option<String> {
+    match compute_platform {
+        // The platform whose targets are named by a PAIR; see
+        // `check_deployment_target_id`.
+        "ECS" => {
+            let (cluster, service) = target_id.split_once(':')?;
+            if cluster.is_empty() || service.is_empty() {
+                return None;
+            }
+            Some(::engine::emulator_arn(
+                "ecs",
+                region,
+                &format!("service/{cluster}/{service}"),
+            ))
+        }
+        "Lambda" => Some(::engine::emulator_arn(
+            "lambda",
+            region,
+            &format!("function:{target_id}"),
+        )),
+        // Server (EC2/on-premises), as everywhere else in this module: the
+        // platform `compute_platform` holds when it is neither of the two above.
+        // An id in the RESERVED form is an Amazon EC2 instance id — no
+        // on-premises host can hold that form — and any other id is an
+        // on-premises host name, whose ARN only the registry has.
+        _ => {
+            if matches!(
+                check_on_premises_instance_name(target_id),
+                Err(NameRefusal::Reserved)
+            ) {
+                return Some(::engine::emulator_arn(
+                    "ec2",
+                    region,
+                    &format!("instance/{target_id}"),
+                ));
+            }
+            on_premises_instance_arn(state, target_id)
+        }
+    }
 }
 
 /// Whether a deployment group selects an on-premises instance carrying `tags`.

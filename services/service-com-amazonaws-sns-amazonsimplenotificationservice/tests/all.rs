@@ -20,6 +20,9 @@ mod error_envelope;
 #[path = "all/phone_number_opt_in.rs"]
 mod phone_number_opt_in;
 
+#[path = "all/platform_applications.rs"]
+mod platform_applications;
+
 #[path = "all/platform_endpoint_deletion.rs"]
 mod platform_endpoint_deletion;
 
@@ -37,6 +40,9 @@ mod set_subscription_attributes;
 
 #[path = "all/sms_sandbox_phone_numbers.rs"]
 mod sms_sandbox_phone_numbers;
+
+#[path = "all/sms_sandbox_verification.rs"]
+mod sms_sandbox_verification;
 
 #[path = "all/sqs_delivery_authorization.rs"]
 mod sqs_delivery_authorization;

@@ -182,9 +182,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // maximum the rule's `Targets` list carries.
         let arn = input.arn.clone();
         if store.rule_in_region(&region, &arn).is_none() {
+            // This operation names the missing rule by the whole ARN it was given.
             return Err(SubscribeErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("No notification rule matches the ARN {arn}")),
+                    message: Some(st::no_rule_with_identifier(&arn)),
                 },
             )
             .into());
@@ -193,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(rule) = store.rules.get_mut(&arn) else {
                 return Err(SubscribeErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!("No notification rule matches the ARN {arn}")),
+                        message: Some(st::no_rule_with_identifier(&arn)),
                     },
                 )
                 .into());

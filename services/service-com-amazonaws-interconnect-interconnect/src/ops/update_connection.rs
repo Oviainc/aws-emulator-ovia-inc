@@ -141,7 +141,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateConnectionErrorModeled::InterconnectServerException(
                 InterconnectServerException {
@@ -151,6 +150,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::Instant::now();
 
         let mut guard = state.lock();
@@ -163,7 +163,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An identifier that names no stored connection is a 404: an update never
         // brings a connection into existence. The message is built from the request's
         // own identifier, in this operation's own construction.
-        let Some(stored) = store.connections.get_mut(&input.identifier) else {
+        //
+        // The same Region scope every connection lookup applies, spelled with the
+        // store's own predicate so this disjoint-field borrow keeps one rule: a
+        // connection created through another Region's endpoint is not one this
+        // endpoint can update.
+        let Some(stored) = store
+            .connections
+            .get_mut(&input.identifier)
+            .filter(|stored| crate::state::visible_in(stored, &region))
+        else {
             return Err(UpdateConnectionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::connection_absent_message(&input.identifier)),

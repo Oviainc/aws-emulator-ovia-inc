@@ -250,8 +250,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // constraint takes: the member that cannot hold, and what it must satisfy.
             return Err(UpdateRuleErrorModeled::ValidationException(
                 crate::state::member_validation_failed(
-                    "excludeResourceTags",
-                    "Member must not be specified for a tag-level retention rule",
+                    crate::state::EXCLUDE_RESOURCE_TAGS_MEMBER,
+                    crate::state::EXCLUDE_RESOURCE_TAGS_REQUIREMENT,
                 ),
             )
             .into());
