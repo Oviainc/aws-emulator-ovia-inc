@@ -7,6 +7,11 @@
 //! the value an earlier call persisted. The mutation is read-your-write visible: the
 //! response and the next `GetQueue` project the same stored record.
 //!
+//! Two members are not free to take any value the wire accepts: a reservation plan's slot
+//! count is one-way (it may be raised or restated, never lowered), and a concurrency the
+//! request states is an allocation out of the Region's pool. Each is refused before the
+//! first write, so a refused update leaves the stored queue exactly as it was.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -187,6 +192,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // had already made due at `now` rather than stale ones.
         state.settle(now);
 
+        // How much of the Region's concurrency pool is free for THIS queue, read before
+        // the record is borrowed for writing: a queue re-stating its own concurrency is
+        // measured against the pool once, not against what it already holds as well.
+        let available = state.concurrency_available_to(&name);
+
         let Some(record) = state.queues.get_mut(&name) else {
             return Err(UpdateQueueErrorModeled::NotFoundException(NotFoundException {
                 // The refusal names the request member the lookup read, `Name`.
@@ -205,11 +215,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // EVERY refusal below is decided before the first write, so an update this
+        // handler rejects leaves the stored queue exactly as it was.
+        //
         // `ReservationPlanSettings` is "the new details of your pricing plan for your
         // RESERVED queue", and `ReservationPlanSettings` itself is "required for reserved
         // queues and not applicable to on-demand queues" — so sending one for an
         // on-demand queue is a problem in the request, the same refusal `CreateQueue`
-        // gives. Checked before anything is written, so a refused update changes nothing.
+        // gives.
         if let Some(settings) = input.reservation_plan_settings.as_ref() {
             if record.pricing_plan != crate::state::PRICING_PLAN_RESERVED {
                 return Err(UpdateQueueErrorModeled::BadRequestException(BadRequestException {
@@ -219,8 +232,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into());
             }
-            // "When you set up a new pricing plan to replace an expired one, you enter
-            // into another 12-month commitment": the term restarts from this call.
+            // A plan reserves a number of slots, and the smallest one reserves one — the
+            // same floor `CreateQueue` holds a new plan to.
+            if settings.reserved_slots < crate::state::MIN_RESERVED_SLOTS {
+                return Err(UpdateQueueErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(crate::state::reserved_slots_below_minimum_message(
+                        settings.reserved_slots,
+                    )),
+                })
+                .into());
+            }
+            // `ReservedSlots` is one-way: "You can't decrease the number of RTS in your
+            // reserved queue. You can increase the number of RTS by extending your
+            // existing commitment with a new 12-month commitment for the larger number."
+            // So a plan stating fewer slots than the stored one reserves is a problem in
+            // the request, and the stored plan is left as it was.
+            if let Some(stored_slots) = record.reserved_slots() {
+                if settings.reserved_slots < stored_slots {
+                    return Err(UpdateQueueErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(crate::state::reserved_slots_decrease_message(
+                                stored_slots,
+                                settings.reserved_slots,
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+
+        // "For on-demand queues, the value you enter is constrained by your service quotas
+        // for Maximum concurrent jobs, per on-demand queue and Maximum concurrent jobs,
+        // per account": a concurrency the request ENTERS is an allocation out of the
+        // Region's pool, so a negative one is a problem in the request and one past what
+        // the pool has left for this queue is capacity the account does not have.
+        // `MaximumConcurrentFeeds` needs no test here: it targets `__integerMin0`, whose
+        // range the framework's validator enforces before this handler runs.
+        if let Some(requested) = input.concurrent_jobs {
+            if let Err(refusal) =
+                crate::state::check_concurrent_jobs(&record.pricing_plan, requested, available)
+            {
+                let message = Some(refusal.message());
+                return Err(match refusal {
+                    crate::state::ConcurrencyRefusal::Negative(_) => {
+                        UpdateQueueErrorModeled::BadRequestException(BadRequestException {
+                            message,
+                        })
+                    }
+                    crate::state::ConcurrencyRefusal::Unavailable { .. } => {
+                        UpdateQueueErrorModeled::ServiceQuotaExceededException(
+                            ServiceQuotaExceededException { message },
+                        )
+                    }
+                }
+                .into());
+            }
+        }
+
+        if let Some(settings) = input.reservation_plan_settings.as_ref() {
+            // "When you add capacity to your queue by increasing the number of RTS, you
+            // extend the term of your commitment to 12 months from when you add capacity":
+            // the term restarts from this call.
             record.reservation_plan = Some(crate::state::reservation_plan(settings, now));
         }
 

@@ -215,11 +215,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             _ => {}
         }
+        // A plan reserves a number of slots, and the smallest one reserves one: a plan
+        // stating less than that is a problem in the request, exactly as it is on
+        // `UpdateQueue`. Checked here too because a reserved queue's concurrency is its
+        // slot count, so a plan below the floor would store a queue that can run nothing.
+        if let Some(settings) = input.reservation_plan_settings.as_ref() {
+            if settings.reserved_slots < crate::state::MIN_RESERVED_SLOTS {
+                return Err(CreateQueueErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(crate::state::reserved_slots_below_minimum_message(
+                        settings.reserved_slots,
+                    )),
+                })
+                .into());
+            }
+        }
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
         state.settle(now);
+
+        // "For on-demand queues, the value you enter is constrained by your service quotas
+        // for Maximum concurrent jobs, per on-demand queue and Maximum concurrent jobs,
+        // per account": a concurrency the request ENTERS is an allocation out of the
+        // Region's pool, so a negative one is a problem in the request and one past what
+        // the pool has left is capacity the account does not have. Decided before
+        // anything is stored, so a refused create leaves no queue behind. The value the
+        // SERVICE fills in below is not a value a caller entered, and is not held to the
+        // pool. `MaximumConcurrentFeeds` targets `__integerMin0`, whose range the
+        // framework's validator enforces before this handler runs.
+        if let Some(requested) = input.concurrent_jobs {
+            let available = state.concurrency_available_to(&name);
+            if let Err(refusal) =
+                crate::state::check_concurrent_jobs(&pricing_plan, requested, available)
+            {
+                let message = Some(refusal.message());
+                return Err(match refusal {
+                    crate::state::ConcurrencyRefusal::Negative(_) => {
+                        CreateQueueErrorModeled::BadRequestException(BadRequestException {
+                            message,
+                        })
+                    }
+                    crate::state::ConcurrencyRefusal::Unavailable { .. } => {
+                        CreateQueueErrorModeled::ServiceQuotaExceededException(
+                            ServiceQuotaExceededException { message },
+                        )
+                    }
+                }
+                .into());
+            }
+        }
 
         let record = crate::state::QueueRecord {
             name,
