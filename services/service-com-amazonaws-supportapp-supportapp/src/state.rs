@@ -4,8 +4,9 @@
 //!
 //! Besides the state struct itself this module holds the few rules the Support App
 //! handlers share — the stored-record-to-modelled-shape conversion, the listing
-//! pagination rule, the documented `notifyOnCaseSeverity` consistency rule and the
-//! wording of the failures several operations can answer with — so the operation files
+//! pagination rule, the documented `notifyOnCaseSeverity` consistency rule, the account
+//! a caller-supplied `channelRoleArn` must name, and the wording of the failures
+//! several operations can answer with — so the operation files
 //! agree on one implementation of each instead of carrying copies that can drift apart.
 
 use std::collections::BTreeMap;
@@ -260,6 +261,39 @@ pub fn workspace_quota_exceeded_message(operation: &str) -> String {
              account."
         ),
     )
+}
+
+/// Why the `channelRoleArn` a write carried cannot be used, as the message the
+/// refusal carries, or `None` when the value names a role this account can pass.
+///
+/// The member's `@pattern` (`^arn:aws:iam::[0-9]{12}:role/(.+)$`,
+/// `smithy_query(query="operation",operation="CreateSlackChannelConfiguration")`)
+/// settles the FORM of the value before a handler runs, and it admits ANY twelve-digit
+/// account id — so what is left for the handler is whose account the ARN names. The
+/// member documents the role as one "that you want to use to perform operations on
+/// Amazon Web Services" for the calling account, and a service acting for one account
+/// cannot be handed a role another account owns: a value naming any account other than
+/// the one this emulator presents ([`::engine::emulator_account_id`]) is refused with
+/// the modelled `AccessDeniedException` by EVERY operation that takes the member,
+/// rather than persisted. It is a fact about the REQUEST, so it is answered before the
+/// account's store is consulted, and nothing is written when it holds.
+///
+/// The test is the one the member's own form states: the value has to be an IAM role
+/// ARN of the caller's account, which is that form with the account field filled in
+/// from [`::engine::emulator_account_id`] — so it needs no ARN reading of its own, and
+/// it fails CLOSED, refusing anything else the member could carry rather than letting
+/// an unreadable value through. The message is built from the request — the value
+/// submitted, against the account the caller is in — and names the parameter the way
+/// this service's prose names one, in the API's PascalCase spelling.
+pub fn channel_role_account_refusal(role_arn: &str) -> Option<String> {
+    let caller = ::engine::emulator_account_id();
+    let own_account_role = format!("arn:aws:iam::{caller}:role/");
+    (!role_arn.starts_with(&own_account_role)).then(|| {
+        format!(
+            "ChannelRoleArn {role_arn} must name an IAM role in account {caller}, which is the \
+             only account the Amazon Web Services Support App can use a role in."
+        )
+    })
 }
 
 /// Why `severity` cannot hold together with the three notification flags, as the

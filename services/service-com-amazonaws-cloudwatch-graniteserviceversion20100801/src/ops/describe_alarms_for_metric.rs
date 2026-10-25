@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAlarmsForMetric
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAlarmsForMetric`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAlarmsForMetric::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the metric alarms configured on ONE metric. Implemented here — this is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -90,12 +83,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatch-graniteservi
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `DescribeAlarmsForMetricError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#DescribeAlarmsForMetric")]
+// here — hence the `DescribeAlarmsForMetricError` alias below.
+//
+// `InternalServiceFault` is widened in: it is THIS service's own server fault (every other
+// alarm operation declares it), and it is the only honest answer when the shared store
+// cannot be reached. Reporting that as a 4xx would tell the caller to fix its request.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#DescribeAlarmsForMetric",
+    extra_errors = ["InternalServiceFault"]
+)]
 #[derive(Debug)]
 pub enum DescribeAlarmsForMetricErrorModeled {
+    InternalServiceFault(InternalServiceFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -149,18 +148,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAlarmsForMetric` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAlarmsForMetricErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAlarmsForMetric"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeAlarmsForMetricErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch alarm store is unavailable".into()),
+            })
+        })?;
+
+        // An alarm's state is EVALUATED from the datapoints the metric store holds, and each
+        // evaluation is due a span after the write that configured it. This read reports an
+        // alarm, so it materialises what the clock has already made due — and executes the
+        // actions those transitions owe — exactly as `DescribeAlarms` does: which call a
+        // client happens to read an alarm through cannot change the state it is told.
+        crate::state::alarm_actions::settle_alarms(&*self.engine, ctx).await;
+        let store = state.lock();
+
+        // "The dimensions associated with the metric. If the metric has any associated
+        // dimensions, you must specify them in order for the call to succeed." — the
+        // dimension SET identifies the metric, so it is compared normalised: the order a
+        // request lists it in names the same metric.
+        let wanted_dimensions = crate::state::dimension_set(input.dimensions.as_deref());
+
+        let mut metric_alarms: Vec<MetricAlarm> = store
+            .alarms
+            .values()
+            .map(|stored| &stored.alarm)
+            .filter(|alarm| {
+                // "This operation retrieves only standard alarms that are based on the
+                // specified metric. It does not return alarms based on math expressions that
+                // use the specified metric" — an alarm carrying a `Metrics` query array is
+                // one of those, whatever metric the array happens to retrieve.
+                if alarm.metrics.is_some() {
+                    return false;
+                }
+                alarm.namespace.as_deref() == Some(input.namespace.as_str())
+                    && alarm.metric_name.as_deref() == Some(input.metric_name.as_str())
+                    && crate::state::dimension_set(alarm.dimensions.as_deref())
+                        == wanted_dimensions
+            })
+            // "To filter the results, specify a statistic, period, or unit." — each one given
+            // narrows the answer to the alarms configured with it, and one left out filters
+            // nothing.
+            .filter(|alarm| {
+                matches(input.statistic.as_deref(), alarm.statistic.as_deref())
+                    && matches(
+                        input.extended_statistic.as_deref(),
+                        alarm.extended_statistic.as_deref(),
+                    )
+                    && matches(input.unit.as_deref(), alarm.unit.as_deref())
+                    && input.period.is_none_or(|period| alarm.period == Some(period))
+            })
+            .cloned()
+            .collect();
+        // The alarm NAME is an alarm's identity, so it is the order this answer reports in:
+        // the same metric's alarms are listed the same way for every caller.
+        metric_alarms.sort_by(|left, right| left.alarm_name.cmp(&right.alarm_name));
+
+        Ok(DescribeAlarmsForMetricOutput {
+            metric_alarms: Some(metric_alarms),
+        })
     }
+}
+
+/// Whether an alarm's member satisfies a filter the request carried: a filter the request
+/// left out matches every alarm, and one it carried matches only an alarm configured with
+/// exactly that value.
+fn matches(wanted: Option<&str>, configured: Option<&str>) -> bool {
+    wanted.is_none_or(|wanted| configured == Some(wanted))
 }

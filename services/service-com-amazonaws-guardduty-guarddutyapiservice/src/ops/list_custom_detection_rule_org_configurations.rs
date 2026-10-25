@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCustomDetectionRuleOrgConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCustomDetectionRuleOrgConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCustomDetectionRuleOrgConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the organization configurations
+//! `CreateCustomDetectionRuleOrgConfiguration` recorded through this Region's endpoint,
+//! in `(RuleId, Mode)` order, optionally narrowed to one `Status`. A pure report: each
+//! summary's `Status` is DERIVED from the instant the create stored
+//! (`crate::state::DetectionRuleOrgConfigurationRecord::status`), so nothing is written
+//! and no number of lists or pages changes what a later caller sees. Paginated over
+//! that same total order with the shared `crate::state::paginate_window`, so a
+//! `nextToken` this service never issued is refused under the service's 400 class
+//! rather than answered with a silent empty page.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +148,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCustomDetectionRuleOrgConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCustomDetectionRuleOrgConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListCustomDetectionRuleOrgConfigurationsErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+
+        // `@readonly`, and read-only in fact: every member below is read off a
+        // stored record or derived from the clock, so this takes the lock
+        // immutably. `now` is the WALL clock rather than the mutation clock, which
+        // a report must not advance.
+        let state = state.lock();
+        let now = crate::state::now_millis();
+
+        // "You can filter the results by status"
+        // (`smithy_query(query="doc",shape="ListCustomDetectionRuleOrgConfigurations")`):
+        // the filter selects on the `Status` the summary REPORTS, which is the
+        // derivation of the stored due instant and not a second stored field — so
+        // a configuration still rolling out is selected by `PROCESSING`, and the
+        // same configuration read after the clock owed it the move by `ACTIVE`.
+        // `Status` targets `DetectionRuleConfigurationStatus`, a modelled enum, so
+        // a value outside it never reaches here; a member the store never produces
+        // selects nothing, which is an empty page and not a refusal.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCustomDetectionRuleOrgConfigurations"))
+        // The records come out in the store's own key order, `(RuleId, Mode)`
+        // within one Region — a TOTAL order, which is what makes the page token
+        // below mean the same thing on the call that handed it back. Regional for
+        // the same reason `crate::state::ComAmazonawsGuarddutyGuarddutyapiserviceState::detection_rule_org_configuration`
+        // is: a configuration created through another Region's endpoint is not
+        // served here.
+        let matched: Vec<&crate::state::DetectionRuleOrgConfigurationRecord> = state
+            .custom_detection_rule_org_configurations
+            .iter()
+            .filter(|((record_region, _, _), _)| record_region == &region)
+            .map(|(_, record)| record)
+            .filter(|record| {
+                input
+                    .status
+                    .as_deref()
+                    .is_none_or(|wanted| record.status(now) == wanted)
+            })
+            .collect();
+
+        // The page is a WINDOW of that order, taken through the shared helper made
+        // for a caller that already holds the ordered records — so no record is
+        // looked up again by key and the token this issues is the token every other
+        // paginated report on this service issues.
+        let (window, next_token) = crate::state::paginate_window(
+            matched.len(),
+            input.max_results,
+            input.next_token.as_deref(),
+            CONFIGURATIONS_PAGE_MAX,
+        )
+        .map_err(|_| {
+            // Under the error CLASS this service's 400s use, naming the parameter
+            // at fault and not quoting the token back.
+            bad_request(crate::state::invalid_parameter_message(
+                crate::state::NEXT_TOKEN_MEMBER,
+            ))
+        })?;
+
+        // `paginate_window` is handed `matched.len()`, so the range it returns is in
+        // bounds — read through the checked accessor anyway, so a change to that
+        // shared helper surfaces as this operation's modelled 500 rather than a panic
+        // in the request path. A window the helper got wrong is not something the
+        // caller asked for, so it is a server fault and not the 400 above.
+        let configurations = matched
+            .get(window)
+            .ok_or_else(|| -> ListCustomDetectionRuleOrgConfigurationsError {
+                ListCustomDetectionRuleOrgConfigurationsErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: Some(
+                            "the page of organization configurations could not be read".to_string(),
+                        ),
+                        r#type: Some("InternalServerErrorException".to_string()),
+                    },
+                )
+                .into()
+            })?
+            .iter()
+            .map(|record| summary(record, now))
+            .collect();
+
+        Ok(ListCustomDetectionRuleOrgConfigurationsOutput {
+            configurations,
+            next_token,
+        })
     }
+}
+
+/// One page's ceiling. `MaxResults` is "The maximum number of results to return in a
+/// single page. Minimum value of 1, maximum value of 100" and targets
+/// `DetectionRuleMaxResults` (`range 1..100` —
+/// `smithy_query(operation="ListCustomDetectionRuleOrgConfigurations")`), so a request
+/// that names no page size is served the largest page that member can ask for.
+const CONFIGURATIONS_PAGE_MAX: usize = 100;
+
+/// The `DetectionRuleOrgConfigurationSummary` projection of a stored configuration, as
+/// of `now`.
+///
+/// Every member is read off the record; only `Status` is derived, through the record's
+/// own [`crate::state::DetectionRuleOrgConfigurationRecord::status`], so this listing
+/// and `GetCustomDetectionRuleOrgConfiguration` cannot report different statuses for
+/// the same configuration. `StatusReason` is "the reason for the current configuration
+/// status" and a configuration proceeding normally has none; `ExpiresAt` is absent
+/// because GuardDuty documents no lifetime for an organization configuration — the
+/// same two absences `crate::state::detection_rule_org_configuration_view` reports.
+fn summary(
+    record: &crate::state::DetectionRuleOrgConfigurationRecord,
+    now: i64,
+) -> DetectionRuleOrgConfigurationSummary {
+    DetectionRuleOrgConfigurationSummary {
+        rule_id: record.rule_id.clone(),
+        mode: record.mode.clone(),
+        status: record.status(now).to_string(),
+        status_reason: None,
+        created_at: ::aws_smithy_types::DateTime::from_millis(record.created_at_millis),
+        updated_at: ::aws_smithy_types::DateTime::from_millis(record.updated_at_millis),
+        expires_at: None,
+    }
+}
+
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` and its `type` member.
+/// Named as the sibling operations name the same wrapper.
+fn bad_request(message: impl Into<String>) -> ListCustomDetectionRuleOrgConfigurationsError {
+    crate::scaffolded::Scaffolded::invalid_input(message)
 }

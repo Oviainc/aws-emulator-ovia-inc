@@ -41,6 +41,7 @@
 //! instant whether or not anybody called, so applying it on a read never changes what a
 //! later caller sees.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
@@ -1987,6 +1988,301 @@ impl StoredCachePolicy {
     }
 }
 
+/// The `CachePolicyType` a policy this ACCOUNT created carries — "custom – Returns only
+/// the custom policies created in your Amazon Web Services account". One of the two values
+/// the model's `CachePolicyType` enum admits (`CACHE_POLICY_TYPE_VALUES`).
+pub const CACHE_POLICY_TYPE_CUSTOM: &str = "custom";
+
+/// The `CachePolicyType` a policy AWS created carries — "managed – Returns only the managed
+/// policies created by Amazon Web Services". The other value the model's `CachePolicyType`
+/// enum admits.
+pub const CACHE_POLICY_TYPE_MANAGED: &str = "managed";
+
+/// One entry of the catalog of AWS-MANAGED cache policies.
+///
+/// A managed cache policy is created by AWS rather than by this account: every account has
+/// the same ones, under the identifier and name AWS publishes for each, which is what
+/// `ListCachePolicies`'s filter separates from the account's own policies ("managed –
+/// Returns only the managed policies created by Amazon Web Services"). Nothing a caller
+/// does creates, changes or removes one, so the catalog is STATIC data read beside the
+/// mutable store rather than a slice of it — it consumes none of the account's cache policy
+/// allowance and no call can take an entry out of it.
+///
+/// The entries in [`MANAGED_CACHE_POLICIES`] are the ones Amazon publishes in the
+/// CloudFront Developer Guide ("Using the managed cache policies"), which lists each
+/// policy's name, its identifier and its cache key and TTL settings; the model itself
+/// carries no list of them (`smithy_query(query="shape",shape="CachePolicyType")` admits
+/// only the two type values), so the catalog is written out here.
+#[derive(Debug, Clone)]
+pub struct ManagedCachePolicy {
+    /// `CachePolicy$Id` — the identifier AWS publishes for this policy, the same in every
+    /// account.
+    pub id: &'static str,
+    /// `CachePolicyConfig$Name` — the name AWS publishes for this policy.
+    pub name: &'static str,
+    /// `CachePolicyConfig$Comment` — what the policy is for.
+    pub comment: &'static str,
+    /// `CachePolicyConfig$MinTTL`, in seconds.
+    pub min_ttl: i64,
+    /// `CachePolicyConfig$DefaultTTL`, in seconds.
+    pub default_ttl: i64,
+    /// `CachePolicyConfig$MaxTTL`, in seconds.
+    pub max_ttl: i64,
+    /// `ParametersInCacheKeyAndForwardedToOrigin$EnableAcceptEncodingGzip`.
+    pub gzip: bool,
+    /// `ParametersInCacheKeyAndForwardedToOrigin$EnableAcceptEncodingBrotli`.
+    pub brotli: bool,
+    /// A value of `CachePolicyHeaderBehavior`.
+    pub header_behavior: &'static str,
+    /// The headers the cache key includes, when the behaviour names a list.
+    pub headers: &'static [&'static str],
+    /// A value of `CachePolicyCookieBehavior`.
+    pub cookie_behavior: &'static str,
+    /// The cookies the cache key includes, when the behaviour names a list.
+    pub cookies: &'static [&'static str],
+    /// A value of `CachePolicyQueryStringBehavior`.
+    pub query_string_behavior: &'static str,
+    /// The query strings the cache key includes, when the behaviour names a list.
+    pub query_strings: &'static [&'static str],
+}
+
+impl ManagedCachePolicy {
+    /// The `CachePolicy` projection a read of this managed policy reports: its published
+    /// identity beside the configuration AWS gave it.
+    pub fn to_cache_policy(&self) -> CachePolicy {
+        self.to_stored().to_cache_policy()
+    }
+
+    /// This catalog entry as a cache policy RECORD, so every read of a cache policy answers
+    /// a published policy exactly as it answers one this account created — the two are the
+    /// same resource kind, differing only in who created them.
+    pub fn to_stored(&self) -> StoredCachePolicy {
+        StoredCachePolicy {
+            id: self.id.to_string(),
+            config: self.to_config(),
+            last_modified_time: managed_cache_policy_last_modified(),
+            etag: self.etag(),
+        }
+    }
+
+    /// The version token a read of this managed policy reports.
+    ///
+    /// DERIVED from the published id rather than minted: nothing changes a managed policy,
+    /// so its version is the same on every read and in every process, which a drawn token
+    /// could not be. It takes the shape every version token of this service takes
+    /// ([`is_version_token`]): `E` followed by [`ID_BODY_LEN`] characters of the id
+    /// alphabet, here the leading hex digits of the id.
+    pub fn etag(&self) -> String {
+        let body: String = self
+            .id
+            .chars()
+            .filter(char::is_ascii_hexdigit)
+            .map(|digit| digit.to_ascii_uppercase())
+            .take(ID_BODY_LEN)
+            .collect();
+        format!("E{body}")
+    }
+
+    /// The configuration AWS published for this policy.
+    fn to_config(&self) -> CachePolicyConfig {
+        CachePolicyConfig {
+            comment: Some(self.comment.to_string()),
+            name: self.name.to_string(),
+            default_ttl: Some(self.default_ttl),
+            max_ttl: Some(self.max_ttl),
+            min_ttl: self.min_ttl,
+            parameters_in_cache_key_and_forwarded_to_origin: Some(
+                crate::ops::types::ParametersInCacheKeyAndForwardedToOrigin {
+                    enable_accept_encoding_gzip: self.gzip,
+                    enable_accept_encoding_brotli: Some(self.brotli),
+                    headers_config: crate::ops::types::CachePolicyHeadersConfig {
+                        header_behavior: self.header_behavior.to_string(),
+                        headers: name_list(self.headers)
+                            .map(|(quantity, items)| crate::ops::types::Headers { quantity, items }),
+                    },
+                    cookies_config: crate::ops::types::CachePolicyCookiesConfig {
+                        cookie_behavior: self.cookie_behavior.to_string(),
+                        cookies: name_list(self.cookies).map(|(quantity, items)| {
+                            crate::ops::types::CookieNames { quantity, items }
+                        }),
+                    },
+                    query_strings_config: crate::ops::types::CachePolicyQueryStringsConfig {
+                        query_string_behavior: self.query_string_behavior.to_string(),
+                        query_strings: name_list(self.query_strings).map(|(quantity, items)| {
+                            crate::ops::types::QueryStringNames { quantity, items }
+                        }),
+                    },
+                },
+            ),
+        }
+    }
+}
+
+/// The `(Quantity, Items)` wrapper a name list travels in, or `None` when the behaviour
+/// names no list at all — a behaviour of `none`, `all` or `allExcept` nothing is listed
+/// under carries no wrapper rather than an empty one.
+fn name_list(names: &'static [&'static str]) -> Option<(i32, Option<Vec<String>>)> {
+    if names.is_empty() {
+        return None;
+    }
+    Some((
+        i32::try_from(names.len()).unwrap_or(i32::MAX),
+        Some(names.iter().map(|name| (*name).to_string()).collect()),
+    ))
+}
+
+/// The instant every managed cache policy reports as its `LastModifiedTime`.
+///
+/// A managed policy belongs to AWS and no call in this account changes one, so the instant
+/// is FIXED rather than drawn from the clock: every read of the catalog, in any process,
+/// reports the same one. It is this service's own API version date
+/// (`2020-05-31T00:00:00Z`), the earliest instant any policy of this API could have been
+/// published at.
+pub fn managed_cache_policy_last_modified() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(MANAGED_CACHE_POLICY_LAST_MODIFIED_UNIX_SECONDS)
+}
+
+/// `2020-05-31T00:00:00Z` in seconds since the Unix epoch.
+const MANAGED_CACHE_POLICY_LAST_MODIFIED_UNIX_SECONDS: u64 = 1_590_883_200;
+
+/// The AWS-managed cache policies, in the order their ids sort in — the same total order
+/// every listing of this service pages through, so the catalog can be merged with the
+/// account's own policies without re-sorting it.
+///
+/// Each entry's identifier, name and settings are the ones Amazon publishes for it (see
+/// [`ManagedCachePolicy`] for the source).
+pub const MANAGED_CACHE_POLICIES: &[ManagedCachePolicy] = &[
+    ManagedCachePolicy {
+        id: "08627262-05a9-4f76-9ded-b50ca2e3a84f",
+        name: "Managed-Elemental-MediaPackage",
+        comment: "Policy for an AWS Elemental MediaPackage origin",
+        min_ttl: 0,
+        default_ttl: 86_400,
+        max_ttl: 31_536_000,
+        gzip: true,
+        brotli: false,
+        header_behavior: "whitelist",
+        headers: &["Origin"],
+        cookie_behavior: "none",
+        cookies: &[],
+        query_string_behavior: "whitelist",
+        query_strings: &["aws.manifestfilter", "start", "end", "m"],
+    },
+    ManagedCachePolicy {
+        id: "2e54312d-136d-493c-8eb9-b001f22f67d2",
+        name: "Managed-Amplify",
+        comment: "Policy for an AWS Amplify web application origin",
+        min_ttl: 2,
+        default_ttl: 2,
+        max_ttl: 600,
+        gzip: true,
+        brotli: true,
+        header_behavior: "whitelist",
+        headers: &["Authorization", "Host"],
+        cookie_behavior: "none",
+        cookies: &[],
+        query_string_behavior: "all",
+        query_strings: &[],
+    },
+    ManagedCachePolicy {
+        id: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
+        name: "Managed-CachingDisabled",
+        comment: "Policy with caching disabled",
+        min_ttl: 0,
+        default_ttl: 0,
+        max_ttl: 0,
+        gzip: false,
+        brotli: false,
+        header_behavior: "none",
+        headers: &[],
+        cookie_behavior: "none",
+        cookies: &[],
+        query_string_behavior: "none",
+        query_strings: &[],
+    },
+    ManagedCachePolicy {
+        id: "4cc15a8a-d715-48a4-82b8-cc0b614638fe",
+        name: "Managed-UseOriginCacheControlHeaders-QueryStrings",
+        comment: "Policy for an origin that returns Cache-Control headers and serves \
+                  different objects for different query strings",
+        min_ttl: 0,
+        default_ttl: 0,
+        max_ttl: 31_536_000,
+        gzip: true,
+        brotli: true,
+        header_behavior: "whitelist",
+        headers: &[
+            "Origin",
+            "Access-Control-Request-Headers",
+            "Access-Control-Request-Method",
+        ],
+        cookie_behavior: "none",
+        cookies: &[],
+        query_string_behavior: "all",
+        query_strings: &[],
+    },
+    ManagedCachePolicy {
+        id: "658327ea-f89d-4fab-a63d-7e88639e58f6",
+        name: "Managed-CachingOptimized",
+        comment: "Policy with caching enabled. Supports Gzip and Brotli compression.",
+        min_ttl: 1,
+        default_ttl: 86_400,
+        max_ttl: 31_536_000,
+        gzip: true,
+        brotli: true,
+        header_behavior: "none",
+        headers: &[],
+        cookie_behavior: "none",
+        cookies: &[],
+        query_string_behavior: "none",
+        query_strings: &[],
+    },
+    ManagedCachePolicy {
+        id: "83da9c7e-98b4-4e11-a168-04f0df8e2c65",
+        name: "Managed-UseOriginCacheControlHeaders",
+        comment: "Policy for an origin that returns Cache-Control headers",
+        min_ttl: 0,
+        default_ttl: 0,
+        max_ttl: 31_536_000,
+        gzip: true,
+        brotli: true,
+        header_behavior: "whitelist",
+        headers: &[
+            "Origin",
+            "Access-Control-Request-Headers",
+            "Access-Control-Request-Method",
+        ],
+        cookie_behavior: "none",
+        cookies: &[],
+        query_string_behavior: "none",
+        query_strings: &[],
+    },
+    ManagedCachePolicy {
+        id: "b2884449-e4de-46a7-ac36-70bc7f1ddd6d",
+        name: "Managed-CachingOptimizedForUncompressedObjects",
+        comment: "Policy with caching enabled that does not support compression",
+        min_ttl: 1,
+        default_ttl: 86_400,
+        max_ttl: 31_536_000,
+        gzip: false,
+        brotli: false,
+        header_behavior: "none",
+        headers: &[],
+        cookie_behavior: "none",
+        cookies: &[],
+        query_string_behavior: "none",
+        query_strings: &[],
+    },
+];
+
+/// The managed cache policy `id` names, or `None` when the catalog holds none — what tells
+/// an id AWS published from one this account minted.
+pub fn managed_cache_policy(id: &str) -> Option<&'static ManagedCachePolicy> {
+    MANAGED_CACHE_POLICIES
+        .iter()
+        .find(|managed| managed.id == id)
+}
+
 /// One CloudFront public key, as this emulator persists it.
 ///
 /// The record is the single source of truth for the key's id, the configuration it was
@@ -2432,8 +2728,26 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     }
 
     /// The cache policy `id` names, or `None` when the store holds none.
+    ///
+    /// The ACCOUNT's own policies only — what a mutation addresses, since nothing in this
+    /// account changes a policy AWS published. A READ addresses both, through
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::readable_cache_policy`].
     pub fn cache_policy(&self, id: &str) -> Option<&StoredCachePolicy> {
         self.cache_policies.get(id)
+    }
+
+    /// The cache policy `id` names wherever it came from: one this account created with
+    /// `CreateCachePolicy`, or one AWS published ([`MANAGED_CACHE_POLICIES`]).
+    ///
+    /// A cache policy id addresses ONE policy whichever of the two created it — "The unique
+    /// identifier for the cache policy" — so every read of a policy by id resolves both,
+    /// and an id outside both names no policy at all. The account's store is consulted
+    /// first, so a record it holds is always what answers.
+    pub fn readable_cache_policy(&self, id: &str) -> Option<Cow<'_, StoredCachePolicy>> {
+        match self.cache_policies.get(id) {
+            Some(stored) => Some(Cow::Borrowed(stored)),
+            None => managed_cache_policy(id).map(|managed| Cow::Owned(managed.to_stored())),
+        }
     }
 
     /// The distribution that attaches the cache policy `id` to one of its cache
@@ -5755,6 +6069,24 @@ pub fn no_such_cache_policy() -> NoSuchCachePolicy {
 /// the cache policy surface holds it to — and the shape's own documentation states it in its
 /// shorter form.
 pub const NO_SUCH_CACHE_POLICY_MESSAGE: &str = "The specified cache policy does not exist.";
+
+/// The modelled `InvalidArgument` (HTTP 400) for a `ListCachePolicies` `Marker` that is no
+/// resume point this service handed out.
+///
+/// ONE CONSTANT for the condition, for the same reason [`invalid_public_key_marker`] is one:
+/// what the refusal states is the CONSTRAINT on the parameter — a marker is a cache policy
+/// id — which is a property of the parameter rather than of the value submitted, so nothing
+/// from the request belongs in the text.
+pub fn invalid_cache_policy_marker() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(INVALID_CACHE_POLICY_MARKER_MESSAGE.to_string()),
+    }
+}
+
+/// The message `ListCachePolicies` refuses an unusable `Marker` with: the constraint on the
+/// parameter, worded as [`INVALID_PUBLIC_KEY_MARKER_MESSAGE`] words the same constraint on
+/// the other listing's marker.
+pub const INVALID_CACHE_POLICY_MARKER_MESSAGE: &str = "Marker must be a valid CF cache policy Id";
 
 /// The modelled `CachePolicyInUse` (HTTP 409) for a delete of a policy a cache behaviour
 /// still attaches.

@@ -194,7 +194,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The listing is about ONE cache policy, so an id the store holds no policy for is
         // the modelled 404 rather than a page of nothing: an empty page would claim the
         // policy exists and has no distributions.
-        if store.cache_policy(&input.cache_policy_id).is_none() {
+        // A distribution can attach a policy AWS published as readily as one this account
+        // created, so the id is resolved against both.
+        if store
+            .readable_cache_policy(&input.cache_policy_id)
+            .is_none()
+        {
             return Err(ListDistributionsByCachePolicyIdErrorModeled::NoSuchCachePolicy(
                 crate::state::no_such_cache_policy(),
             )
