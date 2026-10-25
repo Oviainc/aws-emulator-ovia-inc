@@ -101,7 +101,7 @@ const RACK_PROPERTY_VALUES: &[(&str, &[&str])] = &[
 /// What the rule says the resource must look like after one update: the record as it
 /// was, with every member the request carried written over it and every member it
 /// omitted left alone.
-fn overlay(base: &Value, patch: &Value) -> Value {
+pub(crate) fn overlay(base: &Value, patch: &Value) -> Value {
     let mut merged = base.as_object().cloned().unwrap_or_default();
     for (member, value) in patch.as_object().into_iter().flatten() {
         merged.insert(member.clone(), value.clone());

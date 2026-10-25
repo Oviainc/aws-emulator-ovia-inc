@@ -994,7 +994,11 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
 /// group in this account" — as it is stored.
 #[derive(Debug, Clone)]
 pub struct ResourcePolicyRecord {
-    pub policy_name: String,
+    /// `ResourcePolicy$policyName` — "The name of the resource policy." The name is the
+    /// whole identity of an account-scoped policy, so one always carries it; a
+    /// resource-scoped policy is identified by the resource it is attached to, so its
+    /// name is whatever the request supplied and `None` when it supplied none.
+    pub policy_name: Option<String>,
     pub policy_document: String,
     pub last_updated_time_ms: i64,
     /// The ARN this policy is attached to, for a resource-scoped policy; `None` for an

@@ -43,6 +43,8 @@ mod integration_deletion;
 mod integration_lifecycle;
 #[path = "all/integration_pagination.rs"]
 mod integration_pagination;
+#[path = "all/integration_response_lifecycle.rs"]
+mod integration_response_lifecycle;
 #[path = "all/integration_update.rs"]
 mod integration_update;
 #[path = "all/integration_validation.rs"]

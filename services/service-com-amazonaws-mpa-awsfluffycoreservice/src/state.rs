@@ -45,20 +45,36 @@
 //!   session's expiration ([`SESSION_EXPIRATION`]): a session is `CREATING` until its
 //!   activation comes due, `PENDING` while it waits on its approvers, and `FAILED` with
 //!   status code `EXPIRED` once its expiration has passed with no answer.
+//! * The approval of a change an active team was asked for ([`UPDATE_APPROVAL_DELAY`])
+//!   and, after it, that change's activation ([`UPDATE_ACTIVATION_DELAY`]): the team
+//!   reports `UPDATE_PENDING_APPROVAL`, then `UPDATE_PENDING_ACTIVATION`, and the
+//!   requested configuration becomes the live one when the activation comes due.
 //!
 //! # Sessions
 //!
 //! A session is an approval request put to ONE team's approvers.
-//! `StartApprovalTeamBaseline` is the only operation of this model that starts one, so a
-//! baseline session ([`SessionKind`]) is the only kind this store records, and
-//! `GetSession` reports it out of that one record
+//! `StartApprovalTeamBaseline` starts a baseline session and `UpdateApprovalTeam` puts
+//! the change it was asked for to the team that has to approve it ([`SessionKind`]), and
+//! `GetSession` reports either out of its one record
 //! ([`ComAmazonawsMpaAwsfluffycoreserviceState::session`]). No operation of this model
-//! records an approver's vote, so a session waits in `PENDING` until either its expiration
-//! comes due or `CancelSession` ends it ([`Session::cancel`]), and no response is ever
-//! reported as anything but `NO_RESPONSE`. A team's
+//! records an approver's vote, so a baseline session waits in `PENDING` until either its
+//! expiration comes due or `CancelSession` ends it ([`Session::cancel`]); the one answer
+//! this store records is the one the CLOCK owes, the approval of a requested team update
+//! ([`UPDATE_APPROVAL_DELAY`]). A team's
 //! outstanding baseline session is also what `GetApprovalTeam` reports for each approver
 //! ([`ComAmazonawsMpaAwsfluffycoreserviceState::pending_baseline_session_arn`]), so the
 //! two reads cannot disagree.
+//!
+//! # An update an active team has to approve
+//!
+//! A change to the configuration an ACTIVE team's approvers approved is not applied where
+//! it is asked for: `UpdateApprovalTeam` records it as a REQUESTED version
+//! ([`PendingTeamUpdate`], [`ApprovalTeam::request_update`]) and puts it to the team in an
+//! update session, so the team keeps its description, strategy, approvers and version id
+//! until that change is approved and activated
+//! ([`ApprovalTeam::activate_pending_update`]). A team whose configuration has never been
+//! activated takes the change in place ([`ApprovalTeam::bump_version`]): it has no
+//! approved configuration to protect.
 //!
 //! # Approver MFA devices
 //!
@@ -158,6 +174,26 @@ pub const SYNCHRONIZE_MFA_DEVICES_ACTION: &str = "SYNCHRONIZE_MFA_DEVICES";
 /// clock-owed transition, so a caller that reads the team back immediately still
 /// observes the transient `PENDING` state and the errors that go with it.
 pub const INVITATION_RESPONSE_DELAY: Duration = Duration::from_millis(500);
+
+/// How long after an update is requested the team reports its approvers' approval of
+/// that update (and therefore how long the team waits in `UPDATE_PENDING_APPROVAL`).
+///
+/// CHOSEN, not documented: a real approver answers an approval request whenever they
+/// answer it, and this model carries no operation that records a vote — the approvers'
+/// answer is modelled by the clock, exactly as their answer to an invitation is
+/// ([`INVITATION_RESPONSE_DELAY`]). It sits inside the 250–750 ms window this project
+/// fixes for a clock-owed transition, so a caller that reads the team back immediately
+/// still observes the requested change waiting on its approval.
+pub const UPDATE_APPROVAL_DELAY: Duration = Duration::from_millis(500);
+
+/// How long after an update is approved the configuration it carries becomes the team's
+/// live one (and therefore how long the team waits in `UPDATE_PENDING_ACTIVATION`).
+///
+/// CHOSEN, not documented: AWS publishes no duration for an approved team version to be
+/// activated. It sits inside the 250–750 ms window this project fixes for a clock-owed
+/// transition, so a caller that polls the team straight after the approval still observes
+/// the transient `UPDATE_PENDING_ACTIVATION` state the model declares a token for.
+pub const UPDATE_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
 
 /// How long after `CreateIdentitySource` the emulator reports the new source as
 /// `ACTIVE` (and therefore how long it stays `CREATING`).
@@ -343,6 +379,9 @@ impl TeamStatus {
 pub enum TeamStatusCode {
     PendingActivation,
     DeletePendingApproval,
+    UpdatePendingApproval,
+    UpdatePendingActivation,
+    UpdateFailedApproval,
 }
 
 impl TeamStatusCode {
@@ -352,6 +391,9 @@ impl TeamStatusCode {
         match self {
             Self::PendingActivation => "PENDING_ACTIVATION",
             Self::DeletePendingApproval => "DELETE_PENDING_APPROVAL",
+            Self::UpdatePendingApproval => "UPDATE_PENDING_APPROVAL",
+            Self::UpdatePendingActivation => "UPDATE_PENDING_ACTIVATION",
+            Self::UpdateFailedApproval => "UPDATE_FAILED_APPROVAL",
         }
     }
 }
@@ -529,6 +571,87 @@ impl Approver {
     }
 }
 
+/// A change to a team's configuration that its approvers have been asked to approve: the
+/// VERSION the team will carry once the change is approved and activated, which is what
+/// `GetApprovalTeam` reports in `PendingUpdate` beside the live configuration.
+///
+/// The requested configuration lives HERE, not on the team, so a reader of the team sees
+/// the configuration the approvers already approved until this one takes its place
+/// ([`ApprovalTeam::activate_pending_update`]).
+#[derive(Debug, Clone)]
+pub struct PendingTeamUpdate {
+    /// Wire version id of the requested version: the decimal rendering of
+    /// [`PendingTeamUpdate::version`]. Never one a live version of this team has carried.
+    pub version_id: String,
+    pub version: u64,
+    pub description: String,
+    pub approval_strategy: StoredApprovalStrategy,
+    /// The approver set the requested change produces: an approver the change keeps
+    /// carries the id it already had, one it adds was invited when the change was
+    /// requested.
+    pub approvers: Vec<Approver>,
+    /// Status of the requested VERSION, as `PendingUpdate$Status` reports it: `PENDING`
+    /// while it waits, `INACTIVE` once it is a version the team will never move to.
+    pub status: TeamStatus,
+    pub status_code: Option<TeamStatusCode>,
+    pub status_message: Option<String>,
+    pub update_initiation_time: SystemTime,
+    /// The approval session this change was put to the team's approvers in, as
+    /// `GetApprovalTeamResponse$UpdateSessionArn` names it.
+    pub update_session_arn: String,
+    /// Instant at which the approvers' answer to that session comes due
+    /// ([`UPDATE_APPROVAL_DELAY`]). `None` once it has been materialised — and only
+    /// then: `UpdateApprovalTeam` refuses a request whose approval instant it cannot
+    /// compute before it writes anything, so a recorded change always starts with one.
+    pub approval_due: Option<SystemTime>,
+    /// Instant at which the approved change's activation comes due
+    /// ([`UPDATE_ACTIVATION_DELAY`]). `None` until the change is approved.
+    pub activation_due: Option<SystemTime>,
+}
+
+impl PendingTeamUpdate {
+    /// A freshly requested change: `PENDING` with `UPDATE_PENDING_APPROVAL` until the
+    /// team's answer to `update_session_arn` comes due.
+    #[must_use]
+    pub fn requested(
+        version: u64,
+        description: String,
+        approval_strategy: StoredApprovalStrategy,
+        approvers: Vec<Approver>,
+        update_session_arn: String,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            version_id: version.to_string(),
+            version,
+            description,
+            approval_strategy,
+            approvers,
+            status: TeamStatus::Pending,
+            status_code: Some(TeamStatusCode::UpdatePendingApproval),
+            status_message: None,
+            update_initiation_time: now,
+            update_session_arn,
+            approval_due: now.checked_add(UPDATE_APPROVAL_DELAY),
+            activation_due: None,
+        }
+    }
+
+    /// Whether this change is still on its way to becoming the team's live
+    /// configuration — waiting on the approvers, or on the activation they approved.
+    #[must_use]
+    pub fn is_outstanding(&self) -> bool {
+        self.status == TeamStatus::Pending
+    }
+
+    /// Total number of approvers (N) the requested change produces, as
+    /// `PendingUpdate$NumberOfApprovers` reports it.
+    #[must_use]
+    pub fn number_of_approvers(&self) -> i32 {
+        i32::try_from(self.approvers.len()).unwrap_or(i32::MAX)
+    }
+}
+
 /// A stored approval team: everything the lifecycle operations report.
 #[derive(Debug, Clone)]
 pub struct ApprovalTeam {
@@ -541,8 +664,12 @@ pub struct ApprovalTeam {
     pub policies: Vec<String>,
     /// Wire version id: the decimal rendering of [`ApprovalTeam::version`].
     pub version_id: String,
-    /// Monotonic version counter, bumped by every applied update.
+    /// Version the team's LIVE configuration carries.
     pub version: u64,
+    /// Highest version number this team has ever minted, live or requested. A version id
+    /// is never reused, so a requested change that was not approved does not hand its id
+    /// to the next one ([`ApprovalTeam::mint_version`]).
+    pub version_seq: u64,
     pub status: TeamStatus,
     pub status_code: Option<TeamStatusCode>,
     pub status_message: Option<String>,
@@ -551,23 +678,133 @@ pub struct ApprovalTeam {
     pub deletion_start_time: Option<SystemTime>,
     /// Instant at which the pending deletion window ends and the team is removed.
     pub deletion_completion_time: Option<SystemTime>,
+    /// The change the team's approvers were last asked to approve, if any. It is the
+    /// requested version `GetApprovalTeam` reports in `PendingUpdate`, and it is cleared
+    /// once that version becomes the team's live one.
+    pub pending_update: Option<PendingTeamUpdate>,
     pub tags: BTreeMap<String, String>,
     /// Creation order, the stable ordering `ListApprovalTeams` pages over.
     pub seq: u64,
 }
 
 impl ApprovalTeam {
-    /// Record a new version of the team: bump the version id and the update time.
+    /// A fresh, never-reused version number for this team.
+    pub fn mint_version(&mut self) -> u64 {
+        self.version_seq = self.version_seq.max(self.version) + 1;
+        self.version_seq
+    }
+
+    /// Record a new version of the team IN PLACE: bump the version id and the update
+    /// time.
+    ///
+    /// This is the change a team whose configuration no approver has approved yet takes —
+    /// a team still waiting on its activation, or one no longer active. A change to the
+    /// configuration an ACTIVE team's approvers approved goes through
+    /// [`ApprovalTeam::request_update`] instead.
     pub fn bump_version(&mut self, now: SystemTime) {
-        self.version += 1;
+        self.version = self.mint_version();
         self.version_id = self.version.to_string();
         self.last_update_time = Some(now);
+    }
+
+    /// Put a requested change to the team's approvers: the team keeps the configuration
+    /// and the version it has, and reports that it is waiting on their approval.
+    pub fn request_update(&mut self, requested: PendingTeamUpdate) {
+        self.status = TeamStatus::Pending;
+        self.status_code = requested.status_code;
+        self.pending_update = Some(requested);
+    }
+
+    /// The requested change that is still on its way to becoming this team's live
+    /// configuration, if there is one.
+    #[must_use]
+    pub fn outstanding_update(&self) -> Option<&PendingTeamUpdate> {
+        self.pending_update
+            .as_ref()
+            .filter(|update| update.is_outstanding())
+    }
+
+    /// Record the approvers' approval of the requested change: from here the change waits
+    /// only on its activation ([`UPDATE_ACTIVATION_DELAY`]), and each approver who
+    /// answered has voting as their last activity.
+    pub fn record_update_approval(&mut self, at: SystemTime, answered: &[String]) {
+        let Some(update) = self.pending_update.as_mut() else {
+            return;
+        };
+        update.approval_due = None;
+        update.status_code = Some(TeamStatusCode::UpdatePendingActivation);
+        update.activation_due = at.checked_add(UPDATE_ACTIVATION_DELAY);
+        self.status_code = Some(TeamStatusCode::UpdatePendingActivation);
+        for approver in &mut self.approvers {
+            if answered.iter().any(|id| id == &approver.approver_id) {
+                approver.last_activity = Some(ApproverLastActivity::Voted);
+                approver.last_activity_time = Some(at);
+            }
+        }
+    }
+
+    /// Record that the requested change was NOT approved: the session it was put in ended
+    /// without the team's approval, so the team keeps the configuration and the version it
+    /// has, and the requested version is one it will never move to.
+    pub fn record_update_failure(&mut self) {
+        let Some(update) = self.pending_update.as_mut() else {
+            return;
+        };
+        update.approval_due = None;
+        update.activation_due = None;
+        update.status = TeamStatus::Inactive;
+        update.status_code = Some(TeamStatusCode::UpdateFailedApproval);
+        self.status = TeamStatus::Active;
+        self.status_code = Some(TeamStatusCode::UpdateFailedApproval);
+    }
+
+    /// The approved change becomes the team's LIVE configuration: the version it carried
+    /// is now the team's, and the team is active again with nothing pending.
+    ///
+    /// An approver the change keeps is carried over with the record the LIVE team holds,
+    /// so an answer the clock materialised while the change waited is not lost; one the
+    /// change adds joins with the record minted when it was requested.
+    pub fn activate_pending_update(&mut self, at: SystemTime) {
+        let Some(update) = self.pending_update.take() else {
+            return;
+        };
+        let mut live: BTreeMap<String, Approver> = self
+            .approvers
+            .drain(..)
+            .map(|approver| (approver.approver_id.clone(), approver))
+            .collect();
+        self.approvers = update
+            .approvers
+            .into_iter()
+            .map(|requested| {
+                live.remove(&requested.approver_id)
+                    .unwrap_or(requested)
+            })
+            .collect();
+        self.description = update.description;
+        self.approval_strategy = update.approval_strategy;
+        self.version = update.version;
+        self.version_seq = self.version_seq.max(update.version);
+        self.version_id = update.version_id;
+        self.last_update_time = Some(at);
+        self.status = TeamStatus::Active;
+        self.status_code = None;
     }
 
     /// Total number of approvers (N), as `NumberOfApprovers` reports it.
     #[must_use]
     pub fn number_of_approvers(&self) -> i32 {
         i32::try_from(self.approvers.len()).unwrap_or(i32::MAX)
+    }
+
+    /// Drop the requested version this team reports, which is what a caller asking for an
+    /// inactive version or a draft to be deleted asks for. The team keeps its live
+    /// configuration, and stops reporting the outcome of a change whose version is gone.
+    pub fn remove_pending_update(&mut self) {
+        self.pending_update = None;
+        if self.status_code == Some(TeamStatusCode::UpdateFailedApproval) {
+            self.status_code = None;
+        }
     }
 
     /// Synchronize the MFA devices of EVERY approver on the team — the effect the
@@ -708,10 +945,9 @@ impl IdentitySource {
 /// `PENDING` the one it waits for its approvers in
 /// ([`ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`] owes that transition).
 /// `FAILED` is what a session that was never answered reaches when its expiration comes
-/// due, and `CANCELLED` is what `CancelSession` records ([`Session::cancel`]). `APPROVED`
-/// is the one terminal status nothing constructs today — no operation of this model
-/// records an approver's vote — and is carried here so the enum is the model's whole
-/// token catalog rather than the subset one operation reaches.
+/// due, `CANCELLED` is what `CancelSession` records ([`Session::cancel`]) and `APPROVED`
+/// is what a session the clock owes an answer to reaches once the approvers give it
+/// ([`Session::approve`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionStatus {
     Creating,
@@ -800,8 +1036,11 @@ impl SessionExecutionStatus {
 /// One approver's answer in a session, in the tokens `SessionResponse` declares
 /// (`APPROVED | REJECTED | NO_RESPONSE`).
 ///
-/// `NO_RESPONSE` is where every approver starts and stays: no operation in this model
-/// records a vote, so nothing in this emulator may claim an approver answered.
+/// `NO_RESPONSE` is where every approver starts. No operation of this model records a
+/// vote, so the one answer this emulator records is the one the CLOCK owes: the approval
+/// an approver gives the change `UpdateApprovalTeam` put to them
+/// ([`UPDATE_APPROVAL_DELAY`], [`Session::approve`]), the same way the clock owes their
+/// answer to an invitation. `REJECTED` stands for a refusal nothing here produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionResponse {
     Approved,
@@ -858,8 +1097,9 @@ impl AdditionalSecurityRequirement {
 
 /// What a session was started FOR, which is what fixes the action it reports.
 ///
-/// `StartApprovalTeamBaseline` is the one operation of this model that starts a session,
-/// so a baseline session is the only kind this store records; a session a protected
+/// Two operations of this model put a request to a team's approvers:
+/// `StartApprovalTeamBaseline` starts a baseline session, and `UpdateApprovalTeam` puts
+/// the change it was asked for to the team that has to approve it; a session a protected
 /// operation of another service starts is not reachable from this API at all. The kind
 /// is what [`SessionKind::action_name`] reports as `ActionName` and what tells a team's
 /// outstanding BASELINE session from any other session of the same team
@@ -867,6 +1107,7 @@ impl AdditionalSecurityRequirement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionKind {
     Baseline,
+    Update,
 }
 
 impl SessionKind {
@@ -876,6 +1117,7 @@ impl SessionKind {
     pub fn action_name(self) -> &'static str {
         match self {
             Self::Baseline => "StartApprovalTeamBaseline",
+            Self::Update => "UpdateApprovalTeam",
         }
     }
 }
@@ -934,6 +1176,76 @@ pub struct Session {
 }
 
 impl Session {
+    /// A session a team's approvers are asked to answer, in the shape every session this
+    /// store records starts in: `CREATING` until its activation comes due
+    /// ([`SESSION_ACTIVATION_DELAY`]), nothing executed, and an expiration
+    /// [`SESSION_EXPIRATION`] from `now`.
+    ///
+    /// The ONE place a session record is built, so the baseline session
+    /// `StartApprovalTeamBaseline` starts and the update session `UpdateApprovalTeam`
+    /// puts a requested change in cannot drift apart in any member but the two that
+    /// differ: the [`SessionKind`] and the approvers the session asks. A session is
+    /// minted FOR the team, so it takes the region off the team's own ARN rather than off
+    /// the request; a team whose ARN carries no region segment the ARN grammar accepts
+    /// falls back to `requester_region`, the region the request was signed for.
+    ///
+    /// Each caller keeps its own refusals, which the model fixes per operation: the
+    /// store's session ceiling ([`MAX_SESSIONS`]) is reported with the error the calling
+    /// operation declares for it, and `None` here says only that `now` names no instant
+    /// this service could record the session's expiration at.
+    #[must_use]
+    pub fn for_team(
+        kind: SessionKind,
+        team: &ApprovalTeam,
+        approvers: Vec<SessionApprover>,
+        requester_region: String,
+        now: SystemTime,
+        seq: u64,
+    ) -> Option<Self> {
+        let region =
+            arn_region(&team.arn).map_or_else(|| requester_region.clone(), ToString::to_string);
+        Some(Self {
+            arn: session_arn(&region, &team.name, seq),
+            kind,
+            approval_team_arn: team.arn.clone(),
+            approval_team_name: team.name.clone(),
+            // The threshold a session is judged against is the team's as it stood when
+            // the session started, so it does not move under the session.
+            approval_strategy: team.approval_strategy,
+            approvers,
+            // The resource the approved action acts on is the approval team itself.
+            protected_resource_arn: team.arn.clone(),
+            // A session is reported `CREATING` until its activation comes due, the
+            // non-terminal status `SessionStatus` declares for one.
+            status: SessionStatus::Creating,
+            status_code: None,
+            status_message: None,
+            // This emulator executes no protected operation, so nothing has run and
+            // nothing has failed: the execution is `PENDING` for as long as the session
+            // exists.
+            execution_status: SessionExecutionStatus::Pending,
+            // The only strategy `ActionCompletionStrategy` declares.
+            action_completion_strategy: ActionCompletionStrategy::AutoCompletionUponApproval,
+            // No request that starts a session in this model names an additional security
+            // requirement, so a session applies none.
+            additional_security_requirements: Vec::new(),
+            requester_service_principal: SERVICE_PRINCIPAL.to_string(),
+            requester_principal_arn: caller_identity_arn(),
+            requester_account_id: caller_account_id().to_string(),
+            requester_region,
+            // `RequesterComment` and `Description` are what a requester supplies, and no
+            // input that starts a session in this model carries either.
+            requester_comment: None,
+            description: None,
+            metadata: BTreeMap::new(),
+            initiation_time: now,
+            expiration_time: now.checked_add(SESSION_EXPIRATION)?,
+            completion_time: None,
+            activation_due: now.checked_add(SESSION_ACTIVATION_DELAY),
+            seq,
+        })
+    }
+
     /// Total number of approvers in the session, as `NumberOfApprovers` reports it.
     #[must_use]
     pub fn number_of_approvers(&self) -> i32 {
@@ -967,6 +1279,39 @@ impl Session {
         self.approvers
             .iter()
             .any(|approver| approver.approver_id == approver_id)
+    }
+
+    /// End this session in the terminal `APPROVED` status, completed at `at`, and answer
+    /// with the `ApproverId` of every approver whose approval it carries.
+    ///
+    /// The threshold the session was judged against is its own
+    /// ([`Session::approval_strategy`]), so exactly the minimum number of approvals that
+    /// strategy requires is recorded, in the order the session lists its approvers: the
+    /// rest of the approvers were not needed and are not claimed to have answered.
+    ///
+    /// IDEMPOTENT: a session already `APPROVED` keeps the answers and the completion
+    /// instant the first call recorded.
+    pub fn approve(&mut self, at: SystemTime) -> Vec<String> {
+        if self.status != SessionStatus::Approved {
+            let required = usize::try_from(self.approval_strategy.min_approvals_required())
+                .unwrap_or(0)
+                .min(self.approvers.len());
+            for approver in self.approvers.iter_mut().take(required) {
+                approver.response = SessionResponse::Approved;
+                approver.response_time = Some(at);
+            }
+            self.status = SessionStatus::Approved;
+            self.status_code = None;
+            self.completion_time = Some(at);
+            // An approved session is over, so the activation the clock still owed one that
+            // was `CREATING` is dropped: nothing may move it out of a terminal status.
+            self.activation_due = None;
+        }
+        self.approvers
+            .iter()
+            .filter(|approver| approver.response == SessionResponse::Approved)
+            .map(|approver| approver.approver_id.clone())
+            .collect()
     }
 }
 
@@ -1450,8 +1795,9 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
     /// Apply every change the clock already owes at `now`, so each handler reads a
     /// store that is current. Idempotent, and a no-op when nothing is due.
     ///
-    /// Only clock-owed changes happen here: a deletion window that has run out, and
-    /// an invitation response that has come due. Nothing a caller has to ask for.
+    /// Only clock-owed changes happen here: a deletion window that has run out, an
+    /// invitation response that has come due, and the approval and activation of a change
+    /// a team was asked for. Nothing a caller has to ask for.
     pub fn materialize_due(&mut self, now: SystemTime) {
         // A team whose pending deletion window has elapsed is gone.
         let elapsed: Vec<String> = self
@@ -1468,7 +1814,15 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
         }
 
         for team in self.approval_teams.values_mut() {
-            for approver in &mut team.approvers {
+            // The approvers of the team AND of the change it has been asked to approve:
+            // an approver that change ADDS is invited when the change is requested, so
+            // its response comes due while the change is still waiting.
+            let requested_approvers = team
+                .pending_update
+                .as_mut()
+                .map(|update| update.approvers.as_mut_slice())
+                .unwrap_or_default();
+            for approver in team.approvers.iter_mut().chain(requested_approvers) {
                 if approver.primary_identity_status != ApproverIdentityStatus::Pending {
                     continue;
                 }
@@ -1489,8 +1843,11 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
 
             // A team is active once every approver has accepted their invitation. A team
             // with NO approvers never activates: `Approvers` is `length(1..20)`, so such
-            // a team cannot be created, and a vacuous `all()` must not promote one.
+            // a team cannot be created, and a vacuous `all()` must not promote one. A team
+            // that is `PENDING` because a change is waiting on its approvers is not
+            // waiting on an invitation, so its activation is the change's, below.
             if team.status == TeamStatus::Pending
+                && team.outstanding_update().is_none()
                 && !team.approvers.is_empty()
                 && team
                     .approvers
@@ -1553,6 +1910,83 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
                 session.status_code = Some(SessionStatusCode::Expired);
                 session.completion_time = Some(session.expiration_time);
                 session.activation_due = None;
+            }
+        }
+
+        // The change a team's approvers were asked to approve: their approval comes due
+        // first, then the activation of the configuration it carries. A session that ended
+        // without an approval — cancelled, or expired unanswered — is a change the team
+        // never approved, so the team keeps the configuration it has.
+        let requested: Vec<String> = self
+            .approval_teams
+            .values()
+            .filter(|team| team.outstanding_update().is_some())
+            .map(|team| team.arn.clone())
+            .collect();
+        for team_arn in requested {
+            let Some((session_arn, approval_due)) = self
+                .approval_teams
+                .get(&team_arn)
+                .and_then(ApprovalTeam::outstanding_update)
+                .map(|update| (update.update_session_arn.clone(), update.approval_due))
+            else {
+                continue;
+            };
+            if let Some(due) = approval_due {
+                match self
+                    .sessions
+                    .get(&session_arn)
+                    .map(|session| (session.status, session.completion_time))
+                {
+                    // Still outstanding: the approvers' answer is owed at `due`, and the
+                    // answer is stamped with that instant rather than with `now`, so a
+                    // materialised value does not move between reads.
+                    Some((status, _)) if status.is_outstanding() => {
+                        if due <= now {
+                            let answered = self
+                                .sessions
+                                .get_mut(&session_arn)
+                                .map_or_else(Vec::new, |session| session.approve(due));
+                            if let Some(team) = self.approval_teams.get_mut(&team_arn) {
+                                team.record_update_approval(due, &answered);
+                            }
+                        }
+                    }
+                    // The session already carries the team's approval, which is only ever
+                    // recorded at the instant it was DUE, so it is read back under the
+                    // same gate rather than on trust.
+                    Some((SessionStatus::Approved, completed)) if due <= now => {
+                        let answered = self
+                            .sessions
+                            .get_mut(&session_arn)
+                            .map_or_else(Vec::new, |session| session.approve(due));
+                        if let Some(team) = self.approval_teams.get_mut(&team_arn) {
+                            team.record_update_approval(completed.unwrap_or(due), &answered);
+                        }
+                    }
+                    // Nothing is owed yet: an approval that has not come due.
+                    Some((SessionStatus::Approved, _)) => {}
+                    // The session ended without an approval, or no longer exists: the
+                    // requested version is one this team will never move to.
+                    _ => {
+                        if let Some(team) = self.approval_teams.get_mut(&team_arn) {
+                            team.record_update_failure();
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            // The approved configuration becomes the live one once its activation is due.
+            let activation_due = self
+                .approval_teams
+                .get(&team_arn)
+                .and_then(ApprovalTeam::outstanding_update)
+                .and_then(|update| update.activation_due);
+            if let Some(due) = activation_due.filter(|due| *due <= now) {
+                if let Some(team) = self.approval_teams.get_mut(&team_arn) {
+                    team.activate_pending_update(due);
+                }
             }
         }
     }

@@ -1159,11 +1159,13 @@ async fn records_list_in_reversed_label_dns_order() {
         .map(|(name, rr_type)| ((*name).to_string(), rr_type.to_string()))
         .collect();
     // com.example. < com.example.* < com.example.a. < com.example.a.b. <
-    // com.example.zz., and NS sorts before SOA at the shared apex name.
+    // com.example.zz., and NS sorts before SOA at the shared apex name. The
+    // wildcard label is PRESENTED as its octal escape code (see
+    // `record_name_canonical_form`) while still sorting by the `*` it stands for.
     let expected = vec![
         ("example.com.".to_string(), "NS".to_string()),
         ("example.com.".to_string(), "SOA".to_string()),
-        ("*.example.com.".to_string(), "A".to_string()),
+        ("\\052.example.com.".to_string(), "A".to_string()),
         ("a.example.com.".to_string(), "A".to_string()),
         ("b.a.example.com.".to_string(), "A".to_string()),
         ("zz.example.com.".to_string(), "A".to_string()),
@@ -1704,12 +1706,13 @@ async fn a_private_zone_must_be_created_with_a_complete_vpc() {
 
 #[tokio::test]
 async fn the_zones_own_delegation_records_cannot_be_deleted() {
-    // The rule: the apex NS and SOA records are the hosted zone's own default
-    // records, so a change batch cannot remove them (which would also let
-    // DeleteHostedZone's "only the default SOA and NS records" rule pass on a
-    // zone that no longer has them). The rows are the two record types at the
-    // apex, against a record of the same type one label down, which IS the
-    // caller's to delete.
+    // The rule: a hosted zone holds exactly one SOA record and at least one NS
+    // record for the zone itself, so a change batch cannot leave it without
+    // them (which would also let DeleteHostedZone's "only the default SOA and
+    // NS records" rule pass on a zone that no longer has them). The exact
+    // refusals are asserted in `record_name_canonical_form`. The rows are the
+    // two record types at the apex, against a record of the same type one label
+    // down, which IS the caller's to delete.
     let router = router();
     let zone_id = create_zone_ok(&router, "example.com", "ref-apex-guard").await;
 

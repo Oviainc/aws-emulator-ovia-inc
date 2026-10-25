@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestartConnector
-//! Records the asynchronous restart of a stored connector: the connector moves to
-//! `RESTARTING` and the clock returns it to `RUNNING`, and a `RESTART_CONNECTOR`
+//! Records the asynchronous restart of a stored connector: a `RESTART_CONNECTOR`
 //! connector operation is stored, starting `PENDING` and walking the model's restart
-//! states on the clock. The answer carries the connector's ARN and the new operation's
-//! ARN, which `DescribeConnectorOperation` and `ListConnectorOperations` report from.
+//! states on the clock, and the connector moves to `RESTARTING` for exactly as long as
+//! that operation runs — the clock returns it to `RUNNING` at the instant the operation
+//! reaches its terminal state. The answer carries the connector's ARN and the new
+//! operation's ARN, which `DescribeConnectorOperation` and `ListConnectorOperations`
+//! report from.
 //!
 //! ## Shape of an operation
 //!
@@ -226,21 +228,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         });
 
-        // The connector itself is restarting until the clock brings it back:
-        // `settle_due` moves it to `RUNNING` once that is due, so a caller that
-        // reads it straight away still sees the transient state.
-        if let Some(connector) = state.connectors.get_mut(&connector_arn) {
-            connector.state = crate::state::CONNECTOR_RESTARTING.to_string();
-            connector.pending = Some(crate::state::PendingChange::in_a_moment(
-                crate::state::PendingKind::Settle,
-            ));
-        }
-
         let operation = crate::state::ConnectorOperationRecord::restart(
             arn.clone(),
             connector_arn.clone(),
             input.only_failed_tasks,
         );
+
+        // The connector is restarting for exactly as long as the restart it is
+        // running: the change the clock owes it is the one that operation hands
+        // out, so `settle_due` moves it to `RUNNING` at the instant the restart
+        // reaches its terminal state and not before. A caller that reads it
+        // meanwhile still sees the transient state, and a further call against
+        // it is refused while that restart is still running.
+        if let Some(connector) = state.connectors.get_mut(&connector_arn) {
+            connector.state = crate::state::CONNECTOR_RESTARTING.to_string();
+            connector.pending = Some(operation.connector_settle());
+        }
         let output = RestartConnectorOutput {
             connector_arn: Some(connector_arn),
             connector_operation_arn: Some(operation.arn.clone()),

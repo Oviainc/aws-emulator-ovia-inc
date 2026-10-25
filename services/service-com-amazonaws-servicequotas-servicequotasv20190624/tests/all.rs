@@ -41,5 +41,7 @@ mod support_case_and_templates;
 mod support_cases;
 #[path = "all/tags.rs"]
 mod tags;
+#[path = "all/unasked_page_size.rs"]
+mod unasked_page_size;
 #[path = "all/utilization_report.rs"]
 mod utilization_report;

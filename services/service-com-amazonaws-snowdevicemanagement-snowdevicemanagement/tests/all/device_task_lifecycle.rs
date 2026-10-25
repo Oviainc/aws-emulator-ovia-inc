@@ -163,6 +163,35 @@ pub(crate) async fn describe_task(router: &MultiServiceRouter, task_id: &str) ->
     call(router, "POST", &format!("/task/{task_id}"), None).await
 }
 
+/// The `/tags/{resourceArn}` URI for one resource ARN.
+///
+/// `resourceArn` is bound as an `@httpLabel`, and a non-greedy label is ONE path
+/// segment, so the `/` inside an ARN's resource field is percent-encoded or it would
+/// split the segment.
+pub(crate) fn tags_uri(resource_arn: &str) -> String {
+    format!("/tags/{}", resource_arn.replace('/', "%2F"))
+}
+
+/// `ListTagsForResource` for one resource ARN.
+pub(crate) async fn list_tags(router: &MultiServiceRouter, resource_arn: &str) -> Answer {
+    call(router, "GET", &tags_uri(resource_arn), None).await
+}
+
+/// `TagResource` writing `tags` onto one resource ARN.
+pub(crate) async fn tag_resource(
+    router: &MultiServiceRouter,
+    resource_arn: &str,
+    tags: Value,
+) -> Answer {
+    call(
+        router,
+        "POST",
+        &tags_uri(resource_arn),
+        Some(json!({ "tags": tags })),
+    )
+    .await
+}
+
 async fn cancel_task(router: &MultiServiceRouter, task_id: &str) -> Answer {
     call(router, "POST", &format!("/task/{task_id}/cancel"), None).await
 }

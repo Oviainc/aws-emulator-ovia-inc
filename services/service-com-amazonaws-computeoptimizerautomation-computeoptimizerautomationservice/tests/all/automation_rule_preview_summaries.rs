@@ -1079,7 +1079,11 @@ async fn an_unenrolled_account_is_refused() {
     );
 
     // Opting in over the wire opens the gate, and the summary then reports the
-    // inventory that was there all along.
+    // inventory that was there all along. Opting in is also what records the
+    // account's OWN analysed inventory (see
+    // `crate::recommended_action_inventory`), so the request names the volumes
+    // this suite seeded — every one of them, and nothing else — to summarise
+    // exactly the rows the expectation below is written over.
     call_ok(
         &router,
         "UpdateEnrollmentConfiguration",
@@ -1093,6 +1097,10 @@ async fn an_unenrolled_account_is_refused() {
         &json!({
             "ruleType": "AccountRule",
             "recommendedActionTypes": [UPGRADE, SNAPSHOT_AND_DELETE],
+            "criteria": {"resourceArn": [{
+                "comparison": "StringLike",
+                "values": ["arn:aws:ec2:*:*:volume/vol-sa*"],
+            }]},
         }),
         "opted in",
     )
