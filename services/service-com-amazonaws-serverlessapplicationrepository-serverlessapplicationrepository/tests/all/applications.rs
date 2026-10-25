@@ -1884,11 +1884,6 @@ async fn the_operations_this_slice_leaves_alone_still_answer_501() {
             format!("/applications/{label}/unshare"),
         ),
         (
-            "CreateCloudFormationChangeSet",
-            "POST",
-            format!("/applications/{label}/changesets"),
-        ),
-        (
             "ListApplicationDependencies",
             "GET",
             format!("/applications/{label}/dependencies"),
@@ -1897,7 +1892,6 @@ async fn the_operations_this_slice_leaves_alone_still_answer_501() {
     for (operation, method, path) in &cases {
         let body = match *operation {
             "UnshareApplication" => Some(json!({ "organizationId": "o-abc123" })),
-            "CreateCloudFormationChangeSet" => Some(json!({ "stackName": "a-stack" })),
             _ => Some(json!({})),
         };
         let answer = repo.call(method, path, body).await;

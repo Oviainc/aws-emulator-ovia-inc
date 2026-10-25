@@ -24,6 +24,12 @@ tracing = { workspace = true }
 # Encodes a list operation's `nextToken`, so the opaque token is URL-safe whatever
 # the key it names contains, and renders the bytes of a minted `StatementId`.
 hex = { workspace = true }
+# The AWS SDK for CloudFormation, driven over the in-process callback
+# (`OperationContext::callback`): CreateCloudFormationChangeSet creates the change set
+# it answers with in CloudFormation, which is where AWS puts it too. Only the generated
+# client is needed — the emulator supplies the transport — plus the two features the
+# client itself uses, so this crate builds on its own.
+aws-sdk-cloudformation = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 # Digests the entropy behind the uuid-shaped `StatementId` PutApplicationPolicy mints
 # for a statement the request did not name one for, and the uuid `TemplateId`
 # CreateCloudFormationTemplate mints (`state::new_uuid`).
@@ -31,6 +37,15 @@ sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# The change-set tests mount the CloudFormation service beside this one on a single
+# engine, because CreateCloudFormationChangeSet creates its change set by calling it.
+service-com-amazonaws-cloudformation-cloudformation = { workspace = true }
+# Executing one of those change sets makes CloudFormation provision the template's
+# `AWS::SQS::Queue` in the service that OWNS it, so Amazon SQS is mounted beside the two
+# as `core/router/src/lib.rs` mounts them.
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 
 [lints]
 workspace = true
