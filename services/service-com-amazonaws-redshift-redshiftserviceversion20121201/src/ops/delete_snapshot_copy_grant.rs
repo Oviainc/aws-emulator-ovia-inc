@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSnapshotCopyGrant
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSnapshotCopyGrant`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSnapshotCopyGrant::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a snapshot copy grant from this service's store, so a later
+//! `DescribeSnapshotCopyGrants` naming it answers
+//! `SnapshotCopyGrantNotFoundFault` — the deletion being observable is the whole
+//! of what this operation does. The key the grant named and the tags it carried
+//! leave the store with it.
+//!
+//! A grant the account cannot drop is refused instead: a grant a cluster's
+//! `ClusterSnapshotCopyStatus` names is still what Amazon Redshift encrypts that
+//! cluster's copied snapshots with, so it answers the modelled
+//! `InvalidSnapshotCopyGrantStateFault` and stays in the store.
 //!
 //! ## Shape of an operation
 //!
@@ -97,11 +99,18 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteSnapshotCopyGrantO
 // here — hence the `DeleteSnapshotCopyGrantError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DeleteSnapshotCopyGrant")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DeleteSnapshotCopyGrant",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DeleteSnapshotCopyGrantErrorModeled {
     InvalidSnapshotCopyGrantStateFault(InvalidSnapshotCopyGrantStateFault),
     SnapshotCopyGrantNotFoundFault(SnapshotCopyGrantNotFoundFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -153,20 +162,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSnapshotCopyGrant` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSnapshotCopyGrantErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSnapshotCopyGrant"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DeleteSnapshotCopyGrantErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+
+        // The name is resolved exactly as the create stored it and as the read
+        // resolves it, so the two can never disagree on which names identify a
+        // grant. One that identifies none is a refusal, worded as this service
+        // words this fault: the resource, then the name the request carried.
+        let Some(position) = store.snapshot_copy_grant_position(&input.snapshot_copy_grant_name)
+        else {
+            return Err(
+                DeleteSnapshotCopyGrantErrorModeled::SnapshotCopyGrantNotFoundFault(
+                    SnapshotCopyGrantNotFoundFault {
+                        message: Some(format!(
+                            "Snapshot copy grant not found: {}",
+                            input.snapshot_copy_grant_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "used by one or more clusters": a cluster whose snapshot copy is
+        // configured with this grant still encrypts its copied snapshots under
+        // the key the grant permits, so dropping the grant under it is refused
+        // and nothing is removed.
+        let in_use_by = store.clusters_using_snapshot_copy_grant(&input.snapshot_copy_grant_name);
+        if !in_use_by.is_empty() {
+            return Err(
+                DeleteSnapshotCopyGrantErrorModeled::InvalidSnapshotCopyGrantStateFault(
+                    InvalidSnapshotCopyGrantStateFault {
+                        message: Some(format!(
+                            "Snapshot copy grant {} can't be deleted because it is used by cluster(s) {}.",
+                            input.snapshot_copy_grant_name,
+                            in_use_by.join(", ")
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The record leaves the store, which is what makes the deletion
+        // observable: every later read of this name reports it absent, and the
+        // key it named and the tags it carried are gone with it. `remove` keeps
+        // the insertion order the `Marker` cursor pages over.
+        store.snapshot_copy_grants.remove(position);
+
+        Ok(DeleteSnapshotCopyGrantOutput)
     }
 }

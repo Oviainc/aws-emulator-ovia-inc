@@ -27,6 +27,8 @@ mod indexing_configuration;
 mod job_execution_read;
 #[path = "all/job_targeting.rs"]
 mod job_targeting;
+#[path = "all/ota_update_deployment.rs"]
+mod ota_update_deployment;
 #[path = "all/package_catalog.rs"]
 mod package_catalog;
 #[path = "all/package_version_update.rs"]

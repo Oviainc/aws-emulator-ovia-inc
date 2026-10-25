@@ -290,6 +290,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .asset_models
             .get_mut(&asset_model_id)
             .ok_or_else(internal_failure)?;
+        // The definition this call supersedes, read before its writes land: it
+        // stays the model's ACTIVE version until the new one settles.
+        let superseded = record.definition();
         record.composite_models.retain(|composite| {
             composite
                 .id
@@ -306,7 +309,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // record follows, kept on the record itself. The status reported here is
         // therefore the asset model's own (`UPDATING` until that transition
         // falls due), not a state for the composite model, which is simply gone.
-        record.begin_update(now);
+        record.begin_update(superseded, now);
         let asset_model_status = record.status(now);
 
         Ok(DeleteAssetModelCompositeModelOutput {

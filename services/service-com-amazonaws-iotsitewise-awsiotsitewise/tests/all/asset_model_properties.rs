@@ -18,6 +18,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_iotsitewise_awsiotsitewise::EmulatedService;
 
+// The wait every suite in this crate uses for an owed CREATING/UPDATING ->
+// ACTIVE transition, reused rather than kept a second time here.
+use crate::asset_model_composite_model::PAST_THE_OWED_TRANSITION;
+
 /// The region the test signs for.
 const REGION: &str = "us-west-2";
 
@@ -499,6 +503,10 @@ async fn a_label_or_token_that_names_nothing_stored_is_a_modelled_refusal() {
 async fn an_external_id_label_and_either_version_alias_list_the_same_properties() {
     let router = router();
     let model_id = create_fixture_model(&router, "Boiler").await;
+    // Waited out, so the model's single stored version is both its LATEST and its
+    // ACTIVE one: the two aliases name one definition only once the transition the
+    // create owes has fallen due.
+    tokio::time::sleep(PAST_THE_OWED_TRANSITION).await;
 
     let (status, by_id) = call(
         &router,
@@ -510,7 +518,7 @@ async fn an_external_id_label_and_either_version_alias_list_the_same_properties(
     assert_eq!(status, 200, "by raw id: got {status} {by_id}");
 
     // Rows: the other ways to name the SAME stored version of the same model. The
-    // store keeps one version per asset model, so LATEST and ACTIVE select it too.
+    // model has had no write since it settled, so LATEST and ACTIVE select it too.
     let cases: [(&str, String); 3] = [
         (
             "externalId label",

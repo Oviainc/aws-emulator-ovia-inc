@@ -225,6 +225,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused a second time for the defect it was never told about. The documents
         // are walked in request order, and the first document that fails a rule is the
         // one reported.
+        //
+        // All three refusals are worded under the ONE policy this crate states for a
+        // refusal of a handler-enforced constraint (see `crate::state`): the sentence
+        // names where the offending value was and what it had to satisfy, and renders
+        // nothing of the caller's values — here the model member names of the pair the
+        // document had to choose between, never the document's own `Id`.
         for document in &input.documents {
             if document.body.is_none() && document.tokenized_body.is_none() {
                 return Err(RescoreErrorModeled::ValidationException(ValidationException {
@@ -233,21 +239,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
             if document.body.is_some() && document.tokenized_body.is_some() {
-                return Err(RescoreErrorModeled::ValidationException(ValidationException {
-                    message: Some(format!(
-                        "Document {} provides both Body and TokenizedBody; provide one.",
-                        document.id
-                    )),
-                })
+                return Err(RescoreErrorModeled::ValidationException(
+                    crate::state::document_member_choice(BODY_MEMBER, TOKENIZED_BODY_MEMBER),
+                )
                 .into());
             }
             if document.title.is_some() && document.tokenized_title.is_some() {
-                return Err(RescoreErrorModeled::ValidationException(ValidationException {
-                    message: Some(format!(
-                        "Document {} provides both Title and TokenizedTitle; provide one.",
-                        document.id
-                    )),
-                })
+                return Err(RescoreErrorModeled::ValidationException(
+                    crate::state::document_member_choice(TITLE_MEMBER, TOKENIZED_TITLE_MEMBER),
+                )
                 .into());
             }
         }
@@ -336,6 +336,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// a member in lowerCamel, which is the report's casing convention applied to the
 /// Smithy member name, not a fact of the model.
 const DOCUMENTS_MEMBER: &str = "documents";
+
+/// The model member names of the two forms a submitted document's body text may be
+/// given in (`Document$Body` / `Document$TokenizedBody`). A refusal of the rule that
+/// binds them names the members, so it names them as the model spells them.
+const BODY_MEMBER: &str = "Body";
+/// See [`BODY_MEMBER`].
+const TOKENIZED_BODY_MEMBER: &str = "TokenizedBody";
+/// The model member names of the two forms a submitted document's title may be given in
+/// (`Document$Title` / `Document$TokenizedTitle`), like [`BODY_MEMBER`].
+const TITLE_MEMBER: &str = "Title";
+/// See [`TITLE_MEMBER`].
+const TOKENIZED_TITLE_MEMBER: &str = "TokenizedTitle";
 
 /// How much of the blended score the document's own original score contributes.
 /// Emulator-chosen: see the caveat in this module's documentation.
