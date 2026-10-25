@@ -84,8 +84,9 @@ pub(crate) fn error_code(body: &Value) -> String {
         .to_string()
 }
 
-/// The modelled `Message` member, or `"<none>"`.
-fn message(body: &Value) -> String {
+/// The modelled `Message` member, or `"<none>"`. `pub(crate)` like [`error_code`], so
+/// the sibling suites of this one test target read an error's message the same way.
+pub(crate) fn message(body: &Value) -> String {
     body.get("Message")
         .and_then(Value::as_str)
         .unwrap_or("<none>")
@@ -93,8 +94,9 @@ fn message(body: &Value) -> String {
 }
 
 /// One validation clause in this service's envelope: the member path, then the
-/// requirement the model declares for it.
-fn one_validation_error(member_path: &str, requirement: &str) -> String {
+/// requirement the model declares for it. `pub(crate)` for the same reason as
+/// [`message`]: one copy of the envelope format cannot drift from another.
+pub(crate) fn one_validation_error(member_path: &str, requirement: &str) -> String {
     format!(
         "1 validation error detected: Value at '{member_path}' failed to satisfy constraint: \
          {requirement}"
