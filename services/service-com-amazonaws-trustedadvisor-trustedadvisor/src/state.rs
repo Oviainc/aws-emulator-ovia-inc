@@ -51,12 +51,15 @@
 //! Beside the four maps the store holds the calling account's
 //! [`SupportPlan`] — the whole input to the support-level authorization stage
 //! [`support_level_refusal`], which every operation applies before it resolves
-//! an identifier or writes anything. The seeded plan is
-//! [`SEEDED_SUPPORT_PLAN`], a plan whose entitlement includes the API, because
-//! the account this emulator presents is the account the API answers (see that
-//! constant). An operation whose input names an AWS resource in ANOTHER account
-//! answers for that resource first ([`foreign_resource_refusal`]): no support
-//! plan grants an account access to another account's resources.
+//! an identifier or writes anything. A plan arrives from OUTSIDE this API, which
+//! models no operation that reads, buys or changes one, so the store starts on
+//! the plan an account holds until it subscribes to another
+//! ([`UNSUBSCRIBED_SUPPORT_PLAN`]) unless the operator names the one the account
+//! it wants emulated holds ([`SUPPORT_PLAN_VAR`], resolved by
+//! [`seeded_support_plan`]). An operation whose input names an AWS resource in
+//! ANOTHER account answers for that resource first
+//! ([`foreign_resource_refusal`]): no support plan grants an account access to
+//! another account's resources.
 
 use std::collections::BTreeMap;
 
@@ -119,30 +122,75 @@ impl SupportPlan {
             Self::Business | Self::EnterpriseOnRamp | Self::Enterprise
         )
     }
+
+    /// The plan AWS publishes under `name`, or `None` for a name that is not one
+    /// of the five plans.
+    ///
+    /// The names are the ones AWS prints for the plans (AWS Support plans:
+    /// Basic, Developer, Business, Enterprise On-Ramp, Enterprise), compared
+    /// without regard to case or to how the one two-word name is spelled —
+    /// `enterprise-on-ramp`, `enterprise_on_ramp` and `EnterpriseOnRamp` are the
+    /// same plan.
+    pub fn parse(name: &str) -> Option<Self> {
+        let folded: String = name
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .map(|character| character.to_ascii_lowercase())
+            .collect();
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|plan| plan.folded_name() == folded)
+    }
+
+    /// This plan's published name, lowercased with every separator removed —
+    /// the one form [`Self::parse`] compares in.
+    fn folded_name(self) -> &'static str {
+        match self {
+            Self::Basic => "basic",
+            Self::Developer => "developer",
+            Self::Business => "business",
+            Self::EnterpriseOnRamp => "enterpriseonramp",
+            Self::Enterprise => "enterprise",
+        }
+    }
 }
 
-/// The support plan the emulated account holds until something outside the API
-/// records another one — [`SupportPlan::Enterprise`].
+/// The plan an AWS account holds until it subscribes to another one —
+/// [`SupportPlan::Basic`], which every account includes and whose entitlement
+/// does NOT cover the Trusted Advisor API.
 ///
-/// The Trusted Advisor API answers only an account whose plan includes it
-/// ([`SupportPlan::includes_trusted_advisor_api`]), and the account this
-/// emulator presents is that account: a client pointed at a freshly booted
-/// emulator is the entitled caller every real request to this API comes from, so
-/// it gets the 2xx AWS answers it rather than a 403 it has no modelled operation
-/// to clear (the API declares none that reads, buys or changes a plan).
+/// This is what the store starts on, because a support subscription is a
+/// property of the ACCOUNT rather than a resource of this API: no modelled
+/// operation reads, buys or changes a plan, so nothing a caller does can bring a
+/// subscription into existence, and an emulator that assumed one would answer
+/// every unsubscribed account as though it had bought the API. The operator says
+/// otherwise with [`SUPPORT_PLAN_VAR`].
+pub const UNSUBSCRIBED_SUPPORT_PLAN: SupportPlan = SupportPlan::Basic;
+
+/// The environment variable the operator names the emulated account's support
+/// plan in, as AWS prints it (`basic`, `developer`, `business`,
+/// `enterprise-on-ramp`, `enterprise` — see [`SupportPlan::parse`]).
 ///
-/// Enterprise rather than the lowest entitled plan because the seeded catalog
-/// includes what the top plan unlocks — `priority` recommendations, whose
-/// lifecycle `UpdateRecommendationLifecycle` moves (Trusted Advisor Priority),
-/// and organization-level recommendations (the organizational view) — so the
-/// seeded surface is what AWS would report for the plan the account holds.
+/// A subscription arrives from outside this API, so the emulator takes it from
+/// outside too: this is the one input that records the plan the account being
+/// emulated holds, and it is what makes the entitled surface of the service
+/// reachable by a black-box client, which no request could ask for.
+pub const SUPPORT_PLAN_VAR: &str = "EMULATOR_TRUSTEDADVISOR_SUPPORT_PLAN";
+
+/// The support plan the store starts on: the one [`SUPPORT_PLAN_VAR`] names, or
+/// [`UNSUBSCRIBED_SUPPORT_PLAN`] when it names nothing this service recognizes.
 ///
-/// The gate stays fully observable: an in-process caller holding the engine
-/// moves the plan with
+/// Read once, when the engine builds this state. An in-process caller holding the
+/// engine moves the plan afterwards with
 /// [`set_support_plan`](ComAmazonawsTrustedadvisorTrustedadvisorState::set_support_plan),
-/// which is also how an unentitled account is modelled, since nothing on the
-/// wire changes a support subscription.
-pub const SEEDED_SUPPORT_PLAN: SupportPlan = SupportPlan::Enterprise;
+/// since nothing on the wire changes a support subscription.
+pub fn seeded_support_plan() -> SupportPlan {
+    std::env::var(SUPPORT_PLAN_VAR)
+        .ok()
+        .and_then(|name| SupportPlan::parse(name.trim()))
+        .unwrap_or(UNSUBSCRIBED_SUPPORT_PLAN)
+}
 
 /// The `ExclusionStatus` value a resource carries unless a caller excluded it.
 /// `RecommendationResourceSummary$exclusionStatus` declares
@@ -523,12 +571,13 @@ pub struct ComAmazonawsTrustedadvisorTrustedadvisorState {
     /// support-level gate [`support_level_refusal`] applies ahead of every
     /// operation.
     ///
-    /// [`SEEDED_SUPPORT_PLAN`] at state init: a support subscription is a
+    /// [`seeded_support_plan`] at state init: a support subscription is a
     /// property of the account, not a resource of this API (which models no
-    /// operation that reads, buys or changes a plan), and the account this
-    /// emulator presents holds a plan the API answers. Something outside the API
-    /// — in this emulator an in-process caller holding the engine — moves it,
-    /// which is both how an unentitled account is modelled and how the gate is
+    /// operation that reads, buys or changes a plan), so the store starts on the
+    /// plan every account includes unless the operator named another one.
+    /// Something outside the API — in this emulator the operator's
+    /// [`SUPPORT_PLAN_VAR`], or an in-process caller holding the engine — records
+    /// it, which is both how a subscribed account is modelled and how the gate is
     /// observed.
     support_plan: SupportPlan,
 }
@@ -545,9 +594,10 @@ impl ComAmazonawsTrustedadvisorTrustedadvisorState {
     ///
     /// No modelled operation reaches this: the Trusted Advisor API has none that
     /// subscribes an account to a support plan, so a plan arrives from OUTSIDE
-    /// the API — which in this emulator means an in-process caller holding the
-    /// shared engine (a test standing in for a subscribed account). Nothing on
-    /// the wire can grant itself the entitlement.
+    /// the API — which in this emulator means the operator's [`SUPPORT_PLAN_VAR`]
+    /// at state init, or an in-process caller holding the shared engine (a test
+    /// standing in for a subscribed account). Nothing on the wire can grant
+    /// itself the entitlement.
     pub fn set_support_plan(&mut self, plan: SupportPlan) {
         self.support_plan = plan;
     }
@@ -1439,7 +1489,7 @@ impl Default for ComAmazonawsTrustedadvisorTrustedadvisorState {
             recommendations: BTreeMap::new(),
             recommendation_resources: BTreeMap::new(),
             organization_recommendations: BTreeMap::new(),
-            support_plan: SEEDED_SUPPORT_PLAN,
+            support_plan: seeded_support_plan(),
         };
         for (index, row) in SEED.iter().enumerate() {
             let recommendation_id = format!("{}-recommendation", row.check_id);
