@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDataset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDataset`'s real behaviour. Implement it here — this is
+//! Reports the default dataset of the account and Region this request was signed for, with
+//! the customer managed KMS key this service's store holds for it. Implemented here — this is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDataset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +79,9 @@
 //! ## Errors
 //!
 //! * `ResourceNotFoundException` (HTTP 404) — The named resource does not exist.
+//! * `InternalServiceFault` (HTTP 500) — widened in through `extra_errors` (see below): an
+//!   unreachable shared store is a server-side condition, and this is the server failure
+//!   every sibling reader in this crate reports it as.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -100,9 +97,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatch-graniteservi
 // here — hence the `GetDatasetError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#GetDataset")]
+// `InternalServiceFault` is widened in through `extra_errors`: this SERVICE models it
+// (`GetMetricStream`, `ListMetrics` and the other readers declare it) while this operation's
+// own `errors` list omits it, so an unreachable store has a modelled server failure to
+// answer with instead of a 404 that would claim the dataset does not exist.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#GetDataset",
+    extra_errors = ["InternalServiceFault"]
+)]
 #[derive(Debug)]
 pub enum GetDatasetErrorModeled {
+    InternalServiceFault(InternalServiceFault),
     ResourceNotFoundException(ResourceNotFoundException),
 }
 
@@ -157,18 +162,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDataset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDatasetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDataset"))
+        // `@readonly`: "Returns information about the specified dataset", so the dataset is
+        // reported as the association operations last left it and nothing is written. The
+        // dataset is never created either: "The default dataset is implicit for every
+        // account in every Region", so its identity comes from the request's own
+        // credential scope rather than from a stored record.
+        let region = crate::state::request_region(ctx.parts());
+        if !crate::state::names_default_dataset(&input.dataset_identifier, &region) {
+            return Err(GetDatasetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    resource_type: Some("Dataset".to_string()),
+                    resource_id: Some(input.dataset_identifier.clone()),
+                    message: Some(format!(
+                        "the dataset {} does not exist",
+                        input.dataset_identifier
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetDatasetErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch dataset store is unavailable".into()),
+            })
+        })?;
+        // An absent entry is the documented default: "If no customer managed KMS key has
+        // been associated with the dataset, the response omits the KmsKeyArn field".
+        let kms_key_arn = state.lock().dataset_kms_keys.get(&region).cloned();
+
+        Ok(GetDatasetOutput {
+            dataset_id: crate::state::DEFAULT_DATASET_ID.to_string(),
+            arn: crate::state::dataset_arn(&region, crate::state::DEFAULT_DATASET_ID),
+            kms_key_arn,
+        })
     }
 }

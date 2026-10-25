@@ -1213,9 +1213,9 @@ impl IdentityProviderConfigRecord {
 /// the catalogue is identical for every account and Region and is held here, as
 /// the service's own data, rather than in the per-account store — and it is the
 /// single source of truth for every operation that names a policy
-/// (`ListAccessPolicies` reports it; `AssociateAccessPolicy` and
-/// `DisassociateAccessPolicy`, still scaffolded, will check a `policyArn` against
-/// it).
+/// (`ListAccessPolicies` reports it, and `AssociateAccessPolicy` checks the
+/// `policyArn` it is handed against it, so it is also what BOUNDS the records an
+/// access entry can accumulate).
 ///
 /// Source for the rows: the EKS "Access policy permissions" reference, whose table
 /// of Amazon EKS access policies lists the whole managed catalogue — the four

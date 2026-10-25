@@ -177,6 +177,81 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The wire error code this endpoint words a request it will not READ with: a request
+/// whose input is outside what the service accepts, refused before the operation's own
+/// rules are reached.
+///
+/// It is NOT a modelled error — this model declares no `BadRequestException` shape
+/// (`smithy_query(query="shape",shape="BadRequestException")` finds none) — because it
+/// belongs to the boundary that reads a request into an input shape, not to any one
+/// operation. This constant is the single owner of the code: `src/service.rs` words the
+/// value-outside-an-enumeration class with it from here, and a handler reaches the same
+/// class through [`Scaffolded::bad_request`].
+pub const BAD_REQUEST_CODE: &str = "BadRequestException";
+
+/// The HTTP status that boundary refusal carries: a client error, as the recorded wire
+/// answers of this endpoint carry it.
+pub const BAD_REQUEST_STATUS: u16 = 400;
+
+/// The `message` member of the synthetic bad-request error shape.
+static BAD_REQUEST_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#WisdomBadRequest$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic bad-request error shape.
+///
+/// In the `smithy.framework` namespace, under a name no model declares, for the same
+/// reason as [`NOT_IMPLEMENTED_SCHEMA`]: it must not collide with a modeled shape. It
+/// shapes only the BODY; the wire error code and the status travel beside it, from
+/// [`BAD_REQUEST_CODE`] and [`BAD_REQUEST_STATUS`].
+pub static BAD_REQUEST_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#WisdomBadRequest",
+        "smithy.framework",
+        "WisdomBadRequest",
+    ),
+    ShapeType::Structure,
+    &[&BAD_REQUEST_MESSAGE],
+);
+
+/// The payload of a bad-request answer: why the request was not read.
+#[derive(Debug, Clone)]
+pub struct BadRequest {
+    pub message: String,
+}
+
+impl BadRequest {
+    /// A bad-request answer worded by `message`.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for BadRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{BAD_REQUEST_CODE}: {}", self.message)
+    }
+}
+
+impl std::error::Error for BadRequest {}
+
+impl SerializableStruct for BadRequest {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&BAD_REQUEST_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -185,6 +260,12 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
+    /// The request carries input this endpoint will not read, so it is refused where a
+    /// request is read rather than by the operation's own rules. Renders as
+    /// [`BAD_REQUEST_STATUS`] with the error code [`BAD_REQUEST_CODE`] — the same answer
+    /// `src/service.rs` gives the class the boundary itself catches, so one logical
+    /// failure does not get two codes depending on which layer noticed it.
+    BadRequest(BadRequest),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -202,6 +283,17 @@ impl<E> Scaffolded<E> {
     /// The scaffold signal for `operation`.
     pub fn not_implemented(operation: &str) -> Self {
         Self::NotImplemented(NotImplemented::new(operation))
+    }
+
+    /// Refuse a request this endpoint will not read, with [`BAD_REQUEST_STATUS`] and the
+    /// error code [`BAD_REQUEST_CODE`].
+    ///
+    /// Reach for this ONLY where the recorded wire answers of this endpoint show that
+    /// code: an input the service rejects where it reads the request, before any of the
+    /// operation's own rules run. A rule the OPERATION enforces has its own modelled
+    /// error; use that.
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self::BadRequest(BadRequest::new(message))
     }
 
     /// Refuse the request as invalid, with HTTP 400 `ValidationException`.
@@ -228,6 +320,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
+            Self::BadRequest(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -240,6 +333,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
+            Self::BadRequest(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -254,6 +348,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
+            Self::BadRequest(e) => e,
             Self::ValidationException(e) => e,
         }
     }
@@ -262,6 +357,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
+            Self::BadRequest(_) => &BAD_REQUEST_SCHEMA,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
@@ -274,6 +370,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
+            Self::BadRequest(_) => BAD_REQUEST_CODE,
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -286,6 +383,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
+            Self::BadRequest(_) => BAD_REQUEST_STATUS,
             Self::ValidationException(_) => 400,
         }
     }
@@ -297,6 +395,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
+            // Same reason: the synthetic shape carries no `awsQueryError` trait.
+            Self::BadRequest(_) => None,
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
         }

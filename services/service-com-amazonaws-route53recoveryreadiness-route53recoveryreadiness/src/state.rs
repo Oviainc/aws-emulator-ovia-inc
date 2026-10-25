@@ -11,7 +11,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::ops::types::{
-    CellOutput, ReadinessCheckOutput, RecoveryGroupOutput, Resource, ResourceSetOutput,
+    CellOutput, ReadinessCheckOutput, ReadinessCheckSummary, RecoveryGroupOutput, Resource,
+    ResourceSetOutput,
 };
 
 /// The `arnNamespace` this service's ARNs carry, from the model's `aws.api#service`
@@ -389,6 +390,19 @@ fn modeled_tags(tags: &BTreeMap<String, String>) -> Option<HashMap<String, Strin
     Some(tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
 }
 
+/// One page of a container's readiness summary: the aggregate readiness of the checks
+/// that watch it, the per-check summaries on this page, and the cursor the next page
+/// resumes from (`None` on the last page).
+///
+/// The shape a cell's and a recovery group's summary both answer with, so the two
+/// handlers assemble their output from one computation rather than a copy apiece.
+#[derive(Debug)]
+pub struct ReadinessSummary {
+    pub readiness: String,
+    pub readiness_checks: Vec<ReadinessCheckSummary>,
+    pub next_token: Option<String>,
+}
+
 /// Per-service state for com-amazonaws-route53recoveryreadiness-route53recoveryreadiness. A handler reaches it through [`service_state`].
 ///
 /// `BTreeMap` everywhere, so list order — and therefore pagination — is the same on
@@ -635,17 +649,73 @@ impl ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState {
         scopes
     }
 
-    /// The names of the readiness checks that watch a resource scoped to the cell named
-    /// `cell_name` — the checks a cell's readiness summary aggregates.
-    pub fn readiness_check_names_in_cell(&self, cell_name: &str) -> BTreeSet<String> {
-        self.readiness_check_names_in_scopes(&self.cell_scope_arns(cell_name))
+    /// The readiness summary of the cell named `cell_name` — the checks that watch a
+    /// resource scoped to it, aggregated and paged by [`Self::readiness_summary_in_scopes`].
+    pub fn cell_readiness_summary(
+        &self,
+        cell_name: &str,
+        max_results: Option<i32>,
+        next_token: Option<&str>,
+    ) -> Result<ReadinessSummary, String> {
+        self.readiness_summary_in_scopes(&self.cell_scope_arns(cell_name), max_results, next_token)
     }
 
-    /// The names of the readiness checks that watch a resource scoped to the recovery
-    /// group named `group_name` — the checks a recovery group's readiness summary
-    /// aggregates.
-    pub fn readiness_check_names_in_recovery_group(&self, group_name: &str) -> BTreeSet<String> {
-        self.readiness_check_names_in_scopes(&self.recovery_group_scope_arns(group_name))
+    /// The readiness summary of the recovery group named `group_name` — the checks that
+    /// watch a resource scoped to it, aggregated and paged by
+    /// [`Self::readiness_summary_in_scopes`].
+    pub fn recovery_group_readiness_summary(
+        &self,
+        group_name: &str,
+        max_results: Option<i32>,
+        next_token: Option<&str>,
+    ) -> Result<ReadinessSummary, String> {
+        self.readiness_summary_in_scopes(
+            &self.recovery_group_scope_arns(group_name),
+            max_results,
+            next_token,
+        )
+    }
+
+    /// The readiness summary a container covering `scopes` reports: one summary per
+    /// readiness check that watches a resource carrying one of those scopes, the page of
+    /// them the caller asked for, and the aggregate readiness of the whole set.
+    ///
+    /// The rule a cell's and a recovery group's summary both follow — the same per-check
+    /// readiness, the same cursor key and the same aggregate — which is why they share
+    /// this one implementation and differ only in the scope set. `Err` carries
+    /// [`INVALID_PAGINATION_TOKEN_MESSAGE`] for a token this service did not mint; each
+    /// summary answers it as its own modelled `ValidationException` (HTTP 400).
+    fn readiness_summary_in_scopes(
+        &self,
+        scopes: &BTreeSet<String>,
+        max_results: Option<i32>,
+        next_token: Option<&str>,
+    ) -> Result<ReadinessSummary, String> {
+        // One summary per readiness check in scope, keyed by check name so the page
+        // order — and therefore the cursor — is the same on every call.
+        let summaries: BTreeMap<String, ReadinessCheckSummary> = self
+            .readiness_check_names_in_scopes(scopes)
+            .into_iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    ReadinessCheckSummary {
+                        readiness: Some(READINESS_UNKNOWN.to_string()),
+                        readiness_check_name: Some(name),
+                    },
+                )
+            })
+            .collect();
+
+        let page = page(&summaries, max_results, next_token)?;
+
+        Ok(ReadinessSummary {
+            // The aggregate of parts that are all UNKNOWN is UNKNOWN — as it is for a
+            // container no check watches yet.
+            readiness: READINESS_UNKNOWN.to_string(),
+            readiness_checks: page.records.into_iter().cloned().collect(),
+            next_token: page.next_token,
+        })
     }
 
     /// The names of the readiness checks that watch a resource carrying one of `scopes`.

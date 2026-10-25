@@ -44,6 +44,25 @@
 //! service accepted put the device in rather than a characteristic of the video
 //! a connected unit is producing.
 //!
+//! A device's CONFIGURATION is the part of its settings the CALLER chooses:
+//! `UpdateInputDevice` "[u]pdates the parameters for the input device", and the
+//! members its `InputDeviceConfigurableSettings` carries (the source to
+//! activate, the maximum bitrate, the buffer size, and for a UHD device the
+//! codec, the input resolution, the audio pair profiles and the MediaConnect
+//! flow the device is attached to) are stored on the record
+//! ([`InputDeviceConfiguration`]) and reported in the settings of the device's
+//! own type. They are the only members of those settings this service knows
+//! beside the run state: every other one is measured off the video a connected
+//! unit is producing. The NAME and the AVAILABILITY ZONE an update sets are
+//! MediaLive's own record of the device rather than device settings, so they sit
+//! beside the configuration rather than in it.
+//!
+//! A configuration change is SENT to the device, which is the second thing the
+//! clock owes a device here: `DeviceSettingsSyncState` is "SYNCED means the
+//! device has updated its configuration. SYNCING means that it has not updated
+//! its configuration", so a device an update has just configured reports
+//! `SYNCING` until the stored instant comes due and `SYNCED` again afterwards.
+//!
 //! A device's MAINTENANCE WINDOW is one stored instant on the record: the
 //! moment the window the clock owes closes. `StartInputDeviceMaintenanceWindow`
 //! opens it, which is what puts the device's `DeviceUpdateStatus` in `UPDATING`,
@@ -81,7 +100,8 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    InputDeviceHdSettings, InputDeviceSummary, InputDeviceUhdSettings,
+    InputDeviceConfigurableSettings, InputDeviceHdSettings, InputDeviceMediaConnectSettings,
+    InputDeviceSummary, InputDeviceUhdAudioChannelPairConfig, InputDeviceUhdSettings,
     TransferringInputDeviceSummary, CONTENT_TYPE_VALUES,
 };
 
@@ -111,9 +131,12 @@ pub mod input_device_connection_state {
 /// the model declares them (`smithy_query(query="shape",
 /// shape="DeviceSettingsSyncState")`: SYNCED | SYNCING). `SYNCED` means "the
 /// device has updated its configuration", which is the state of a device this
-/// store holds no pending configuration change for.
+/// store holds no pending configuration change for; `SYNCING` means "it has not
+/// updated its configuration", which is the state of one an update has just
+/// configured, until the clock makes the sync due.
 pub mod device_settings_sync_state {
     pub const SYNCED: &str = "SYNCED";
+    pub const SYNCING: &str = "SYNCING";
 }
 
 /// The `InputDeviceState` values, spelled exactly as the model declares them
@@ -155,13 +178,37 @@ pub mod input_device_transfer_type {
 /// The `InputDeviceOutputType` values this slice derives, spelled exactly as the
 /// model declares them (`smithy_query(query="shape",
 /// shape="InputDeviceOutputType")`: NONE | MEDIALIVE_INPUT |
-/// MEDIACONNECT_FLOW). `MEDIACONNECT_FLOW` is not among them: it reports a
-/// MediaConnect flow the real service provisions for a UHD device, which this
-/// emulator does not provision.
+/// MEDIACONNECT_FLOW). All three are derived from the rest of the device's
+/// state: `MEDIACONNECT_FLOW` "if this device is the source for a MediaConnect
+/// flow", which is a flow an update attached to it; `MEDIALIVE_INPUT` "if this
+/// device is the source for a MediaLive input", which is an input of this store
+/// that ingests from it; and `NONE` for a device attached to neither.
 pub mod input_device_output_type {
     pub const NONE: &str = "NONE";
     pub const MEDIALIVE_INPUT: &str = "MEDIALIVE_INPUT";
+    pub const MEDIACONNECT_FLOW: &str = "MEDIACONNECT_FLOW";
 }
+
+/// The resolutions a Link device's source can be configured to, spelled as the
+/// `InputResolution` member documents them: "Choose the resolution of the Link
+/// device's source (HD or UHD)". The member is a `__string` rather than an enum,
+/// so the SERVICE is what refuses a value outside it — hence one list, which
+/// both the refusal's wording and the check read.
+pub mod input_resolution {
+    pub const ALL: [&str; 2] = ["HD", "UHD"];
+}
+
+/// How many audio configurations a device's `AudioChannelPairs` carries: "An
+/// array of eight audio configurations, one for each audio pair in the source".
+pub const MAX_AUDIO_CHANNEL_PAIRS: usize = 8;
+
+/// The lowest audio pair id a configuration may name: "The ID for one audio pair
+/// configuration, a value from 1 to 8".
+pub const FIRST_AUDIO_CHANNEL_PAIR_ID: i32 = 1;
+
+/// The highest audio pair id a configuration may name. See
+/// [`FIRST_AUDIO_CHANNEL_PAIR_ID`].
+pub const LAST_AUDIO_CHANNEL_PAIR_ID: i32 = 8;
 
 /// The id prefix of an HD Link device. Every operation that names a device
 /// documents the id's form by example — `InputDeviceId` is "The unique ID of the
@@ -341,6 +388,170 @@ impl InputDeviceThumbnailRecord {
     }
 }
 
+/// The configuration an update has applied to one input device: the members of
+/// `InputDeviceConfigurableSettings` a caller chooses, as they stand.
+///
+/// They are held in the shapes a READ reports them in
+/// (`InputDeviceMediaConnectSettings`, `InputDeviceUhdAudioChannelPairConfig`) —
+/// the configurable shapes carry the same members under the same names — so the
+/// projection reports what was stored rather than re-deriving it per reader.
+#[derive(Debug, Clone, Default)]
+pub struct InputDeviceConfiguration {
+    /// "The input source that you want to use", reported as the settings'
+    /// `ConfiguredInput`.
+    pub configured_input: Option<String>,
+    /// "The maximum bitrate in bits per second".
+    pub max_bitrate: Option<i32>,
+    /// "The Link device's buffer size (latency) in milliseconds (ms)".
+    pub latency_ms: Option<i32>,
+    /// "Choose the codec for the video that the device produces" — UHD only.
+    pub codec: Option<String>,
+    /// The MediaConnect flow the device is attached to, or `None` while it is
+    /// attached to none — UHD only.
+    pub mediaconnect: Option<InputDeviceMediaConnectSettings>,
+    /// The audio pair configurations the device produces as output — UHD only.
+    pub audio_channel_pairs: Option<Vec<InputDeviceUhdAudioChannelPairConfig>>,
+    /// "Choose the resolution of the Link device's source (HD or UHD)" — UHD
+    /// only.
+    pub input_resolution: Option<String>,
+}
+
+impl InputDeviceConfiguration {
+    /// Apply the settings one update carried.
+    ///
+    /// Member by member: a member the request omits leaves the stored value
+    /// alone, because an update names what it changes. The MediaConnect
+    /// attachment is the one member whose documentation makes a PRESENT value a
+    /// wholesale replacement — "To attach this device to a MediaConnect flow,
+    /// specify these parameters. To detach an existing flow, enter {} for the
+    /// value of mediaconnectSettings" — so settings carrying the member with
+    /// none of its own members detach the flow.
+    fn apply(&mut self, settings: InputDeviceConfigurableSettings) {
+        if let Some(configured_input) = settings.configured_input {
+            self.configured_input = Some(configured_input);
+        }
+        if let Some(max_bitrate) = settings.max_bitrate {
+            self.max_bitrate = Some(max_bitrate);
+        }
+        if let Some(latency_ms) = settings.latency_ms {
+            self.latency_ms = Some(latency_ms);
+        }
+        if let Some(codec) = settings.codec {
+            self.codec = Some(codec);
+        }
+        if let Some(mediaconnect) = settings.mediaconnect_settings {
+            let attached = mediaconnect.flow_arn.is_some()
+                || mediaconnect.role_arn.is_some()
+                || mediaconnect.secret_arn.is_some()
+                || mediaconnect.source_name.is_some();
+            self.mediaconnect = attached.then_some(InputDeviceMediaConnectSettings {
+                flow_arn: mediaconnect.flow_arn,
+                role_arn: mediaconnect.role_arn,
+                secret_arn: mediaconnect.secret_arn,
+                source_name: mediaconnect.source_name,
+            });
+        }
+        if let Some(pairs) = settings.audio_channel_pairs {
+            self.audio_channel_pairs = Some(
+                pairs
+                    .into_iter()
+                    .map(|pair| InputDeviceUhdAudioChannelPairConfig {
+                        id: pair.id,
+                        profile: pair.profile,
+                    })
+                    .collect(),
+            );
+        }
+        if let Some(input_resolution) = settings.input_resolution {
+            self.input_resolution = Some(input_resolution);
+        }
+    }
+}
+
+/// The member of `InputDeviceConfigurableSettings` only a UHD device can be
+/// configured with that `settings` names, or `None` when it names none.
+///
+/// Each member's own documentation is what puts it here: `Codec`,
+/// `InputResolution` and `MediaconnectSettings` are each "Only UHD devices can
+/// specify this parameter", and `AudioChannelPairs` "applies only to UHD
+/// devices" ("For an HD device, you configure the audio by setting up audio
+/// selectors in the channel configuration"). They are spelled as the members
+/// are, because the refusal names what the caller must drop.
+fn uhd_only_member(settings: &InputDeviceConfigurableSettings) -> Option<&'static str> {
+    [
+        ("Codec", settings.codec.is_some()),
+        (
+            "MediaconnectSettings",
+            settings.mediaconnect_settings.is_some(),
+        ),
+        ("AudioChannelPairs", settings.audio_channel_pairs.is_some()),
+        ("InputResolution", settings.input_resolution.is_some()),
+    ]
+    .into_iter()
+    .find_map(|(member, named)| named.then_some(member))
+}
+
+/// Why `settings` cannot configure a device of type `device_type`, worded for a
+/// refusal to report, or `None` when they can.
+///
+/// The rule lives in the slice rather than in the handler, so the bounds the
+/// settings' own documentation states are checked in one place: the members only
+/// a UHD device has ([`uhd_only_member`]), the audio pairs a source has
+/// ([`MAX_AUDIO_CHANNEL_PAIRS`], [`FIRST_AUDIO_CHANNEL_PAIR_ID`]) and the
+/// resolutions a Link source can be set to ([`input_resolution`]). Built from
+/// the request, so each message names what the caller must change.
+pub fn configurable_settings_error(
+    device_type: &str,
+    settings: &InputDeviceConfigurableSettings,
+) -> Option<String> {
+    if device_type != input_device_type::UHD {
+        if let Some(member) = uhd_only_member(settings) {
+            return Some(format!(
+                "{member} applies only to an input device whose Type is {}",
+                input_device_type::UHD
+            ));
+        }
+    }
+    if let Some(pairs) = &settings.audio_channel_pairs {
+        if pairs.len() > MAX_AUDIO_CHANNEL_PAIRS {
+            return Some(format!(
+                "AudioChannelPairs carries {} configurations; a source has {MAX_AUDIO_CHANNEL_PAIRS} audio pairs",
+                pairs.len()
+            ));
+        }
+        for id in pairs.iter().filter_map(|pair| pair.id) {
+            if !(FIRST_AUDIO_CHANNEL_PAIR_ID..=LAST_AUDIO_CHANNEL_PAIR_ID).contains(&id) {
+                return Some(format!(
+                    "AudioChannelPairs names audio pair {id}; an audio pair id is a value from \
+                     {FIRST_AUDIO_CHANNEL_PAIR_ID} to {LAST_AUDIO_CHANNEL_PAIR_ID}"
+                ));
+            }
+        }
+    }
+    if let Some(resolution) = &settings.input_resolution {
+        if !input_resolution::ALL.contains(&resolution.as_str()) {
+            return Some(format!(
+                "InputResolution is one of {}, got {resolution}",
+                input_resolution::ALL.join(", ")
+            ));
+        }
+    }
+    None
+}
+
+/// The message an update refused for naming the settings of a device type the
+/// device is not carries: the member the request named, the device and the type
+/// it actually is. Built from the request, so it names what the caller must
+/// change.
+///
+/// Each settings member names the type it configures — `HdDeviceSettings` is
+/// "The settings that you want to apply to the HD input device" and
+/// `UhdDeviceSettings` "to the UHD input device" — so the other member names no
+/// settings this device has.
+pub fn settings_member_mismatch_message(member: &str, id: &str, device_type: &str) -> String {
+    format!("{member} does not apply to input device {id}, whose Type is {device_type}")
+}
+
 /// One claimed input device.
 ///
 /// The members mirror the model's `InputDeviceSummary` shape minus the ones that
@@ -355,13 +566,32 @@ pub struct InputDeviceRecord {
     /// The name an update gives the device ("A name that you specify for the
     /// input device"), absent until one does.
     pub name: Option<String>,
+    /// The Availability Zone an update associates with the device ("The
+    /// Availability Zone you want associated with this input device"), absent
+    /// until one does. MediaLive's own record of where the device's attachment
+    /// lives rather than something read off the unit, which is why an update is
+    /// what sets it.
+    pub availability_zone: Option<String>,
     /// The device's `InputDeviceType`, from the id it was claimed with
     /// ([`input_device_type_for_id`]).
     pub r#type: String,
     /// The device's `InputDeviceConnectionState`.
     pub connection_state: String,
-    /// The device's `DeviceSettingsSyncState`.
-    pub device_settings_sync_state: String,
+    /// The configuration an update has applied to the device, which is what its
+    /// own type's settings report beside the run state.
+    ///
+    /// PRIVATE, so the only way in is
+    /// [`InputDeviceRecord::apply_configuration`] and the only way to read it is
+    /// [`InputDeviceRecord::configuration`].
+    configuration: InputDeviceConfiguration,
+    /// The instant the device has taken the configuration an update sent it, or
+    /// `None` while it holds no unsynchronised change. Stored, never slept on.
+    ///
+    /// PRIVATE, so the only way in is
+    /// [`InputDeviceRecord::apply_configuration`] and
+    /// [`InputDeviceRecord::settle`], and the only way to read it is
+    /// [`InputDeviceRecord::device_settings_sync_state`].
+    settings_sync_due: Option<SystemTime>,
     /// The device's own tag map, which is the one the tag operations reach
     /// through [`ComAmazonawsMedialiveMedialiveState::resource_tags`]: there is
     /// no second copy for a read to drift from.
@@ -416,6 +646,73 @@ impl InputDeviceRecord {
         }
     }
 
+    /// The configuration an update has applied to this device.
+    pub fn configuration(&self) -> &InputDeviceConfiguration {
+        &self.configuration
+    }
+
+    /// Of the two settings members an `UpdateInputDevice` request carries, the
+    /// one that names THIS device's settings, beside the name of the other one
+    /// when the request named it too.
+    ///
+    /// Each member names the type it configures — `HdDeviceSettings` is "The
+    /// settings that you want to apply to the HD input device" and
+    /// `UhdDeviceSettings` "to the UHD input device" — so the member for the
+    /// other type names no settings this device has, and the caller refuses it.
+    /// The choice lives here, with the type the device was claimed with, so no
+    /// operation decides it a second way.
+    pub fn settings_of_this_type(
+        &self,
+        hd_device_settings: Option<InputDeviceConfigurableSettings>,
+        uhd_device_settings: Option<InputDeviceConfigurableSettings>,
+    ) -> (Option<InputDeviceConfigurableSettings>, Option<&'static str>) {
+        if self.r#type == input_device_type::UHD {
+            (
+                uhd_device_settings,
+                hd_device_settings.map(|_| "HdDeviceSettings"),
+            )
+        } else {
+            (
+                hd_device_settings,
+                uhd_device_settings.map(|_| "UhdDeviceSettings"),
+            )
+        }
+    }
+
+    /// The device's `DeviceSettingsSyncState` ("The status of the action to
+    /// synchronize the device configuration"): `SYNCING` while the device has
+    /// not taken the configuration an update sent it — "If you change the
+    /// configuration of the input device (for example, the maximum bitrate),
+    /// MediaLive sends the new data to the device. The device might not update
+    /// itself immediately" — and `SYNCED` once it has, which is also the state
+    /// of a device no update has configured.
+    pub fn device_settings_sync_state(&self) -> &'static str {
+        if self.settings_sync_due.is_some() {
+            device_settings_sync_state::SYNCING
+        } else {
+            device_settings_sync_state::SYNCED
+        }
+    }
+
+    /// Apply the configuration one update carried to this device, which is then
+    /// `SYNCING` until the clock makes the synchronisation due
+    /// ([`TRANSIENT_STATE_SPAN`], the emulator's own span for the same reason as
+    /// every other transient state here: AWS documents no duration for a device
+    /// taking a configuration). The instant is stored and never slept on, and it
+    /// is deliberately non-zero, so a caller that reads the device straight
+    /// after the update still observes the `SYNCING` the change put it in.
+    ///
+    /// A later update restarts it: each change is sent to the device when it is
+    /// made, so the device is synchronised a span after the LATEST one.
+    pub fn apply_configuration(
+        &mut self,
+        settings: InputDeviceConfigurableSettings,
+        now: SystemTime,
+    ) {
+        self.configuration.apply(settings);
+        self.settings_sync_due = Some(now + TRANSIENT_STATE_SPAN);
+    }
+
     /// Open a maintenance window on this device, which the clock closes once
     /// [`TRANSIENT_STATE_SPAN`] has passed.
     ///
@@ -436,8 +733,9 @@ impl InputDeviceRecord {
         self.maintenance_window_close = Some(now + TRANSIENT_STATE_SPAN);
     }
 
-    /// Close the maintenance window the clock has already made due. Owed at the
-    /// stored instant whether or not anybody called, so applying it in a
+    /// Close the maintenance window, and complete the configuration
+    /// synchronisation, the clock has already made due. Both are owed at their
+    /// stored instant whether or not anybody called, so applying them in a
     /// reporting operation changes nothing a later caller would have seen.
     fn settle(&mut self, now: SystemTime) {
         if self
@@ -445,6 +743,9 @@ impl InputDeviceRecord {
             .is_some_and(|close| now >= close)
         {
             self.maintenance_window_close = None;
+        }
+        if self.settings_sync_due.is_some_and(|due| now >= due) {
+            self.settings_sync_due = None;
         }
     }
 
@@ -543,9 +844,13 @@ pub fn new_input_device(id: String, arn: String, device_type: &str) -> InputDevi
         id,
         arn,
         name: None,
+        availability_zone: None,
         r#type: device_type.to_string(),
         connection_state: input_device_connection_state::DISCONNECTED.to_string(),
-        device_settings_sync_state: device_settings_sync_state::SYNCED.to_string(),
+        // Nothing has configured a freshly claimed device, so it holds no
+        // unsynchronised change either.
+        configuration: InputDeviceConfiguration::default(),
+        settings_sync_due: None,
         tags: HashMap::new(),
         maintenance_window_close: None,
         transfer: None,
@@ -790,10 +1095,16 @@ impl ComAmazonawsMedialiveMedialiveState {
     pub fn input_device_summary_of(&self, device: &InputDeviceRecord) -> InputDeviceSummary {
         let id = device.id.as_str();
         let medialive_input_arns = self.inputs_using_input_device(id);
-        // "The output attachment type of the input device": a device some input
-        // ingests from is that input's source, and one nothing ingests from is
-        // attached to nothing.
-        let output_type = if medialive_input_arns.is_empty() {
+        let configuration = device.configuration();
+        // "The output attachment type of the input device. Specifies
+        // MEDIACONNECT_FLOW if this device is the source for a MediaConnect
+        // flow. Specifies MEDIALIVE_INPUT if this device is the source for a
+        // MediaLive input": a device an update attached to a flow is that
+        // flow's source, a device some input ingests from is that input's
+        // source, and one attached to neither is attached to nothing.
+        let output_type = if configuration.mediaconnect.is_some() {
+            input_device_output_type::MEDIACONNECT_FLOW
+        } else if medialive_input_arns.is_empty() {
             input_device_output_type::NONE
         } else {
             input_device_output_type::MEDIALIVE_INPUT
@@ -804,21 +1115,34 @@ impl ComAmazonawsMedialiveMedialiveState {
         // characteristic of the video a connected unit is producing. It is
         // reported in the settings of the device's own TYPE, which is what each
         // member documents ("Settings that describe an input device that is type
-        // HD" / "... type UHD"); every other member of those settings is read
-        // off the unit, and no unit is connected to this emulator.
+        // HD" / "... type UHD"), beside the configuration an update applied;
+        // every remaining member is measured off the unit, and no unit is
+        // connected to this emulator.
         let device_state = Some(device.device_state().to_string());
         let is_hd = device.r#type == input_device_type::HD;
         InputDeviceSummary {
             arn: Some(device.arn.clone()),
             connection_state: Some(device.connection_state.clone()),
-            device_settings_sync_state: Some(device.device_settings_sync_state.clone()),
+            device_settings_sync_state: Some(device.device_settings_sync_state().to_string()),
             device_update_status: Some(device.device_update_status().to_string()),
             hd_device_settings: is_hd.then(|| InputDeviceHdSettings {
+                configured_input: configuration.configured_input.clone(),
                 device_state: device_state.clone(),
+                max_bitrate: configuration.max_bitrate,
+                latency_ms: configuration.latency_ms,
                 ..InputDeviceHdSettings::default()
             }),
             uhd_device_settings: (!is_hd).then(|| InputDeviceUhdSettings {
+                configured_input: configuration.configured_input.clone(),
                 device_state,
+                max_bitrate: configuration.max_bitrate,
+                latency_ms: configuration.latency_ms,
+                codec: configuration.codec.clone(),
+                // "Returned only if the outputType is MEDIACONNECT_FLOW", which
+                // is exactly when a flow is attached.
+                mediaconnect_settings: configuration.mediaconnect.clone(),
+                audio_channel_pairs: configuration.audio_channel_pairs.clone(),
+                input_resolution: configuration.input_resolution.clone(),
                 ..InputDeviceUhdSettings::default()
             }),
             id: Some(device.id.clone()),
@@ -826,12 +1150,12 @@ impl ComAmazonawsMedialiveMedialiveState {
             mac_address: None,
             serial_number: None,
             network_settings: None,
-            availability_zone: None,
+            availability_zone: device.availability_zone.clone(),
             name: device.name.clone(),
             r#type: Some(device.r#type.clone()),
             tags: Some(device.tags.clone()),
             // "Returned only if the outputType is MEDIALIVE_INPUT."
-            medialive_input_arns: (!medialive_input_arns.is_empty())
+            medialive_input_arns: (output_type == input_device_output_type::MEDIALIVE_INPUT)
                 .then_some(medialive_input_arns),
             output_type: Some(output_type.to_string()),
         }
@@ -840,7 +1164,7 @@ impl ComAmazonawsMedialiveMedialiveState {
 
 /// Project an `InputDeviceSummary` onto one of the structurally identical
 /// per-operation FLAT input-device output shapes (`DescribeInputDeviceOutput`
-/// today; `UpdateInputDeviceOutput` and the rest when their own issues land).
+/// and `UpdateInputDeviceOutput`; the rest when their own issues land).
 ///
 /// One macro rather than a hand-written copy of the same 16-member move per
 /// operation, so the operations that report a device cannot drift from each

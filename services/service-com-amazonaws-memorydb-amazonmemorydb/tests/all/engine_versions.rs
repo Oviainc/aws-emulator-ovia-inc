@@ -24,10 +24,15 @@
 //! * describing engine versions is a READ: it changes nothing a later caller sees.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_memorydb_amazonmemorydb::state::{MAX_MAX_RESULTS, MIN_MAX_RESULTS};
+use service_com_amazonaws_memorydb_amazonmemorydb::state::CLUSTER_PAGE_SIZE_WINDOW;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cluster_lifecycle::{call, error_code, ok, router};
+
+/// The page sizes this listing serves: `DescribeEngineVersions` reads the cluster-side
+/// surface, so its window is that surface's own.
+const WINDOW_MIN: i32 = CLUSTER_PAGE_SIZE_WINDOW.min;
+const WINDOW_MAX: i32 = CLUSTER_PAGE_SIZE_WINDOW.max;
 
 /// The engines MemoryDB offers, from the AWS MemoryDB *Supported engine versions*
 /// documentation: it runs Redis OSS and Valkey. The per-version numbers are NOT pinned
@@ -359,10 +364,10 @@ async fn the_listing_pages_over_the_whole_catalog() {
     // smaller than the smallest page the service serves, so every one of them is a page
     // that holds it whole — which is the rule under test.
     for max_results in [
-        MIN_MAX_RESULTS,
-        MIN_MAX_RESULTS + 1,
-        (MIN_MAX_RESULTS + MAX_MAX_RESULTS) / 2,
-        MAX_MAX_RESULTS,
+        WINDOW_MIN,
+        WINDOW_MIN + 1,
+        (WINDOW_MIN + WINDOW_MAX) / 2,
+        WINDOW_MAX,
     ] {
         let case = format!("MaxResults {max_results}");
         let mut collected: Vec<Reported> = Vec::new();
@@ -402,8 +407,8 @@ async fn the_listing_pages_over_the_whole_catalog() {
 
     let refused: [Value; 4] = [
         // Outside the page-size window, on each side of it.
-        json!({ "MaxResults": MIN_MAX_RESULTS - 1 }),
-        json!({ "MaxResults": MAX_MAX_RESULTS + 1 }),
+        json!({ "MaxResults": WINDOW_MIN - 1 }),
+        json!({ "MaxResults": WINDOW_MAX + 1 }),
         json!({ "MaxResults": -1 }),
         // A token no page of this listing ever handed out.
         json!({ "NextToken": "zzz-no-such-position" }),

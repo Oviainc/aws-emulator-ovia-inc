@@ -7,14 +7,15 @@
 //! under an id the bucket already carries replaces THAT configuration and leaves the rest
 //! in place, and a put that would add one past the ceiling answers
 //! `TooManyConfigurations`. Refused before anything is written when the payload is not a
-//! configuration S3 can apply: an `Id` that is not the one the request identifies, a
-//! `Status` or a tiering `AccessTier` outside its enum, or a tiering `Days` outside the
-//! range that tier's documentation publishes (`InvalidArgument`).
+//! configuration S3 can apply: an `Id` that is not the one the request identifies or a
+//! `Status` outside its enum (`InvalidArgument`), an `Id` longer than
+//! [`crate::state::MAX_CONFIGURATION_ID_CHARS`] characters (`InvalidConfigId`), or a
+//! tiering whose `Days` is outside the range the `AccessTier` it names publishes
+//! (`InvalidAccessTier`).
 //!
-//! The read side is `ListBucketIntelligentTieringConfigurations`, implemented in the same
-//! change so a put can be read back; `GetBucketIntelligentTieringConfiguration` and
-//! `DeleteBucketIntelligentTieringConfiguration` are still the scaffold's 501 and are
-//! their own stub issues.
+//! The read sides are `GetBucketIntelligentTieringConfiguration` and
+//! `ListBucketIntelligentTieringConfigurations`, and
+//! `DeleteBucketIntelligentTieringConfiguration` drops one by its id.
 //!
 //! ## Shape of an operation
 //!
@@ -266,6 +267,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The id is the configuration's KEY on the bucket, and AWS bounds its length: an id
+        // S3 records is non-empty and at most
+        // [`crate::state::MAX_CONFIGURATION_ID_CHARS`] characters, which is what the
+        // refusal's published wording states. The model carries no `@length` for
+        // `IntelligentTieringId`, so the boundary validator lets any length through and
+        // this is where one outside the bound is refused — before anything is written, so
+        // an id S3 would never record cannot become a key in this bucket's map.
+        let id_length = input.id.chars().count();
+        if id_length == 0 || id_length > crate::state::MAX_CONFIGURATION_ID_CHARS {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_CONFIG_ID_CODE,
+                crate::state::INVALID_CONFIG_ID_STATUS,
+                crate::state::INVALID_CONFIG_ID_MESSAGE,
+            ));
+        }
+
         // `IntelligentTieringStatus` is an enum of exactly two values
         // (`smithy_query(query="shape",shape="IntelligentTieringStatus")`). The boundary
         // validator refuses a value outside it before this handler runs, so this is what
@@ -299,14 +316,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             };
             if tiering.days < floor || tiering.days > MAX_TIERING_DAYS {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::state::INVALID_ARGUMENT_CODE,
-                    crate::state::INVALID_ARGUMENT_STATUS,
+                // The range is the ACCESS TIER's own — 90 days for one tier, 180 for the
+                // other, up to the same published maximum — so a pair outside it is
+                // refused against the tier it names, and the refusal states the bound that
+                // tier publishes and which end of it the request missed.
+                let message = if tiering.days > MAX_TIERING_DAYS {
                     format!(
-                        "Tiering.Days for access tier {:?} must be between {floor} and \
-                         {MAX_TIERING_DAYS}, got {}",
-                        tiering.access_tier, tiering.days
-                    ),
+                        "Days specified in {} tier should not be more than {MAX_TIERING_DAYS}.",
+                        tiering.access_tier
+                    )
+                } else {
+                    format!(
+                        "Days specified in {} tier should not be less than {floor}.",
+                        tiering.access_tier
+                    )
+                };
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ACCESS_TIER_CODE,
+                    crate::state::INVALID_ACCESS_TIER_STATUS,
+                    message,
                 ));
             }
         }

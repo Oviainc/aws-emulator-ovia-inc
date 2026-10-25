@@ -359,7 +359,11 @@ pub(crate) async fn assert_tagging_not_found(em: &Emulator, case: &str, arn: &st
 
 /// A deterministic string of `length` ASCII letters, for exercising a declared length
 /// bound rather than one hand-picked spelling.
-fn filler(length: usize) -> String {
+///
+/// `pub(crate)` with the rest of this harness: the sibling suite
+/// `tests/all/untag_created_tags.rs` exercises the same `TagKey` bound, and the spelling
+/// has one home.
+pub(crate) fn filler(length: usize) -> String {
     (0..length)
         .map(|index| char::from(b'a' + u8::try_from(index % 26).unwrap_or(0)))
         .collect()

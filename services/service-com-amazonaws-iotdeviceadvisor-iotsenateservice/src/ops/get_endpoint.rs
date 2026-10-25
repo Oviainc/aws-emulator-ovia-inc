@@ -184,23 +184,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Every ARN the request carries has to BE one, and one of the service the member
-        // that carries it names: the thing and the certificate are IoT resources, and the
-        // device role is the IAM role the device assumes. The modelled length bounds are
-        // already enforced before this handler runs; the ARN form is not modelled, so it
-        // is refused here with the operation's own client-input error.
-        for (member, value, service) in [
-            ("thingArn", device.thing_arn, "iot"),
-            ("certificateArn", device.certificate_arn, "iot"),
-            ("deviceRoleArn", device.device_role_arn, "iam"),
-        ] {
-            if let Some(value) = value {
-                if !crate::state::is_arn_of_service(value, service) {
-                    return Err(validation(format!(
-                        "{member} must be an Amazon Resource Name of the form \
-                         arn:<partition>:{service}:<region>:<account>:<resource>, got {value:?}"
-                    )));
-                }
-            }
+        // that carries it names, by the single rule in [`crate::state::device_violation`]
+        // every operation accepting a device identity shares. Naming NO device is legal
+        // here — that request asks for the account-level endpoint — so this member's
+        // naming requirement is the optional one.
+        if let Some(violation) =
+            crate::state::device_violation("", &device, crate::state::DeviceNaming::Optional)
+        {
+            return Err(validation(violation));
         }
 
         // A device-level endpoint is asked for by naming the device the way the

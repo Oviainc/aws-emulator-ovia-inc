@@ -77,6 +77,8 @@ mod reserved_tag_keys;
 mod state_roundtrip;
 #[path = "all/tagging_surface.rs"]
 mod tagging_surface;
+#[path = "all/untag_created_tags.rs"]
+mod untag_created_tags;
 #[path = "all/update_billing_group.rs"]
 mod update_billing_group;
 #[path = "all/update_custom_line_item.rs"]

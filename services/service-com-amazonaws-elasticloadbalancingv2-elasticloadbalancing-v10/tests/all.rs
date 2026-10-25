@@ -41,6 +41,8 @@ mod target_group_attributes_and_modification;
 mod target_group_health_check_port;
 #[path = "all/target_group_health_checks.rs"]
 mod target_group_health_checks;
+#[path = "all/target_group_in_use_refusal.rs"]
+mod target_group_in_use_refusal;
 #[path = "all/target_validation_and_quotas.rs"]
 mod target_validation_and_quotas;
 #[path = "all/trust_stores.rs"]

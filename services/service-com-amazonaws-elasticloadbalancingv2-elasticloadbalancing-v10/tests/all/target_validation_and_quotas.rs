@@ -869,7 +869,7 @@ async fn a_target_group_is_deleted_unless_a_listener_forwards_to_it() {
         again.status, again.body
     );
 
-    // One a listener forwards to stays, and the refusal names the listener.
+    // One a listener forwards to stays, and the refusal says so without naming it.
     let referenced = crate::provisioning_loop::create_http_target_group(&router, "in-use-tg").await;
     let mut form = action("CreateLoadBalancer");
     form.push(p("Name", "delete-alb"));
@@ -899,12 +899,15 @@ async fn a_target_group_is_deleted_unless_a_listener_forwards_to_it() {
         reply.status,
         reply.body
     );
+    // The refusal is built from the REQUEST — the ARN the caller sent — and names no
+    // holding listener or rule. The whole message is pinned, over the forms a reference
+    // can take, in `all/target_group_in_use_refusal.rs`.
     assert!(
         reply
             .text("Message")
             .map(|text| unescaped(&text))
-            .is_some_and(|message| message.contains(&listener_arn)),
-        "case a referenced target group: the refusal must name the listener, got {}",
+            .is_some_and(|message| !message.contains(&listener_arn)),
+        "case a referenced target group: the refusal must not name the listener, got {}",
         reply.body
     );
     let still_there = describe(&router, &referenced).await;

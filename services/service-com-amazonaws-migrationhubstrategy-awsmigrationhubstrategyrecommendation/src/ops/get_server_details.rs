@@ -273,11 +273,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.server_id,
         )?;
 
-        // A read: the store is only looked at here, so running GetServerDetails changes
-        // nothing a later caller sees. The server is looked up in the inventory of the
-        // Region this request was signed for.
+        // A read: the only write it makes is materialising what the clock already owed
+        // this portfolio — an assessment whose completion was due at this same instant
+        // even if nobody had called, and the per-server status that completion gives the
+        // servers it covered. The server is looked up in the inventory of the Region this
+        // request was signed for.
         let region = crate::state::request_region(ctx.parts());
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        if let Some(portfolio) = store.region_mut(&region) {
+            portfolio.settle_all(now);
+        }
         let Some(server) = store.region(&region).servers.get(&input.server_id) else {
             return Err(
                 GetServerDetailsErrorModeled::ResourceNotFoundException(server_not_found()).into(),

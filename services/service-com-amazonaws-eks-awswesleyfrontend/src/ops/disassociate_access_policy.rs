@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateAccessPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateAccessPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateAccessPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -70,6 +61,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -82,9 +75,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eks-awswesleyfrontend.j
 // here — hence the `DisassociateAccessPolicyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eks#DisassociateAccessPolicy")]
+//
+// `ClientException` is widened in through `extra_errors`: this SERVICE models that
+// shape and many of its operations declare it, but this one does not list it — and it
+// is the class every operation of the Amazon EKS-managed plane refuses a cluster this
+// service does not manage with ([`crate::state::connected_cluster_refusal`]).
+#[smithy_macros::operation_error(
+    "com.amazonaws.eks#DisassociateAccessPolicy",
+    extra_errors = ["ClientException"]
+)]
 #[derive(Debug)]
 pub enum DisassociateAccessPolicyErrorModeled {
+    ClientException(ClientException),
     InvalidRequestException(InvalidRequestException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServerException(ServerException),
@@ -141,18 +143,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateAccessPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateAccessPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let store = state::service_state(&*self.engine).ok_or_else(|| {
+            DisassociateAccessPolicyError::from(
+                DisassociateAccessPolicyErrorModeled::ServerException(ServerException {
+                    cluster_name: Some(input.cluster_name.clone()),
+                    message: Some("the eks emulator store is unavailable".to_string()),
+                    ..Default::default()
+                }),
+            )
+        })?;
+
+        // This operation addresses ONE resource — the `(cluster, access entry)` pair
+        // the association hangs off — so a miss of either half reports the same
+        // generic, memberless payload ([`state::resource_not_found`]) that
+        // `DescribeAccessEntry` and `ListAssociatedAccessPolicies` answer for it.
+        let not_found = || {
+            DisassociateAccessPolicyError::from(
+                DisassociateAccessPolicyErrorModeled::ResourceNotFoundException(
+                    state::resource_not_found(),
+                ),
+            )
+        };
+
+        let region = state::request_region(ctx.parts());
+        let mut guard = store.lock();
+        guard.materialize_due_transitions(SystemTime::now());
+
+        // An association is addressed THROUGH its cluster and its access entry, so
+        // both are resolved before anything is removed: a request naming a resource
+        // that does not exist is answered `ResourceNotFoundException` however its
+        // policy ARN reads. A cluster name identifies a cluster only within one
+        // region, so this is the cluster in the region the request is signed for.
+        let Some(cluster) = guard
+            .clusters
+            .get_mut(&(region, input.cluster_name.clone()))
+        else {
+            return Err(not_found());
+        };
+        // Access entries, and the policies associated to them, are part of the Amazon
+        // EKS-managed plane, which a cluster `RegisterCluster` connected has none of:
+        // EKS grants no Kubernetes access on it, so this operation does not apply to
+        // it. The gate is a fact about the CLUSTER, so it precedes resolving the entry.
+        if cluster.is_connected() {
+            return Err(DisassociateAccessPolicyErrorModeled::ClientException(
+                state::connected_cluster_refusal(&input.cluster_name),
+            )
+            .into());
+        }
+        let Some(entry) = cluster.access_entries.get_mut(&input.principal_arn) else {
+            return Err(not_found());
+        };
+
+        // Removing an association is idempotent: the request asks for this policy NOT
+        // to be associated to the entry any more, and that is already true when no
+        // record is keyed by the ARN — including when the ARN names no published
+        // policy at all, since such a policy can never have been associated. So the
+        // outcome is the same empty success either way, and the operation models no
+        // error for a `policyArn` that is simply not associated. Only the resources
+        // the request is addressed THROUGH — the cluster and the access entry — can
+        // make it a 404.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateAccessPolicy"))
+        // The entry's own `modifiedAt` is untouched, as it is by the association that
+        // put the record there: it tracks the access entry's own configuration
+        // (`kubernetesGroups`, `username`, `type`, tags), not the set of policies
+        // associated to it, which carry their own `associatedAt`/`modifiedAt`.
+        entry.associated_policies.remove(&input.policy_arn);
+
+        Ok(DisassociateAccessPolicyOutput {})
     }
 }

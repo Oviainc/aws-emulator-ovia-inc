@@ -145,17 +145,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // listener that forwards to it — through its default actions or through one of
         // its rules — still needs it, so the delete is refused before anything is
         // removed.
-        let referenced_by = guard.listeners_in_order().iter().find_map(|listener| {
+        let referenced = guard.listeners_in_order().iter().any(|listener| {
             listener
                 .forwarded_target_group_arns()
                 .contains(&input.target_group_arn)
-                .then(|| listener.arn.clone())
         });
-        if let Some(listener_arn) = referenced_by {
+        if referenced {
+            // The refusal is a function of the REQUEST alone: the constant text and the
+            // target group ARN the caller sent. Which reference holds the group — a
+            // listener's default actions or one of its rules — is not named, so no
+            // server-generated id of the holder reaches the caller.
             return Err(DeleteTargetGroupErrorModeled::ResourceInUseException(
                 ResourceInUseException {
                     message: Some(format!(
-                        "Target group '{}' is currently in use by listener '{listener_arn}'",
+                        "Target group '{}' is currently in use by a listener or a rule",
                         input.target_group_arn
                     )),
                 },

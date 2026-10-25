@@ -218,8 +218,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let framework = network.framework.clone();
         let network_status = network.status.clone();
+        // A member whose removal has started is not one of the network's members any
+        // more ("The member can no longer participate on the network",
+        // `Member$Status`'s `DELETED`), so its name is free again even while its record
+        // is still readable.
         let name_taken = network
-            .members_in(&region)
+            .participating_members(&region)
             .any(|member| member.name == input.member_configuration.name);
 
         // This operation "Applies only to Hyperledger Fabric", and a network of any other
@@ -326,6 +330,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             log_publishing_configuration: member_configuration.log_publishing_configuration,
             status: crate::state::STATUS_CREATING.to_string(),
             available_at: now + crate::state::TRANSITION_SPAN,
+            // Nothing is deleting this member: the instant `DELETED` falls due is set
+            // when a delete starts its removal.
+            deleted_at: None,
             creation_date: now,
             tags: crate::state::map_in(member_configuration.tags),
             arn: crate::state::member_arn(&region, &member_id),

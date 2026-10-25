@@ -65,6 +65,11 @@ pub const CREATE_APP_MONITOR: &str = "rum:CreateAppMonitor";
 /// `rum:GetAppMonitor`.
 pub const GET_APP_MONITOR: &str = "rum:GetAppMonitor";
 
+/// `rum:GetAppMonitorData`, the action a caller must hold to read back the performance
+/// events a monitor collected — a different action from `rum:GetAppMonitor`, which reads
+/// the monitor's configuration, so a policy granting one does not grant the other.
+pub const GET_APP_MONITOR_DATA: &str = "rum:GetAppMonitorData";
+
 /// `rum:UpdateAppMonitor`.
 pub const UPDATE_APP_MONITOR: &str = "rum:UpdateAppMonitor";
 
