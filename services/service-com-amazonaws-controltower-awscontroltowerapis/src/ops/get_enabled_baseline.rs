@@ -12,9 +12,19 @@
 //! applying, a torn-down enablement disappearing) and would hold at the same instant
 //! whether or not anybody called.
 //!
-//! `driftStatusSummary` and `parentIdentifier` are ABSENT: this emulator assesses no
-//! inheritance drift and models no parent/child enablement, and the model makes both
-//! members optional.
+//! `driftStatusSummary` reports the INHERITANCE drift of the enablement, which is the one
+//! drift type the model declares for a baseline: Control Tower "detects inheritance drift
+//! on the enabled baselines that target OUs" and "does not detect drift on the baselines
+//! that apply to your landing zone", so the summary is present for an enablement of a
+//! drift-assessed baseline whose deployment the clock has made due and absent otherwise —
+//! the status is stored on the enablement and materialised by `settle`, never computed
+//! here.
+//!
+//! `parentIdentifier` is ABSENT: it "represents the parent EnabledBaseline at the
+//! Organizational Unit (OU) level, from which the CHILD EnabledBaseline inherits its
+//! configuration", and every enablement this service holds is itself an OU-level one —
+//! `EnableBaseline` refuses any target that is not an organizational unit — so none is a
+//! child of another and there is no parent to name.
 //!
 //! AUTHORIZATION and THROTTLING are NOT emulated here, so the modelled
 //! `AccessDeniedException` (403) and `ThrottlingException` (429) are deliberately
@@ -195,10 +205,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 arn: enabled_baseline.arn.clone(),
                 baseline_identifier: enabled_baseline.baseline_identifier.clone(),
                 baseline_version: Some(enabled_baseline.baseline_version.clone()),
-                // No drift is assessed and no parent enablement is modelled, so both
-                // optional members are absent rather than invented.
-                drift_status_summary: None,
+                // Absent for an enablement whose inheritance drift is not assessed — a
+                // baseline AWS detects no drift on, or a deployment the clock has not made
+                // due yet — rather than reported as a status the model does not declare.
+                drift_status_summary: enabled_baseline.inheritance_drift_status.map(|status| {
+                    EnabledBaselineDriftStatusSummary {
+                        types: Some(EnabledBaselineDriftTypes {
+                            inheritance: Some(EnabledBaselineInheritanceDrift {
+                                status: Some(status.as_wire().to_string()),
+                            }),
+                        }),
+                    }
+                }),
                 target_identifier: enabled_baseline.target_identifier.clone(),
+                // Every enablement here is an OU-level one, so none inherits from a parent.
                 parent_identifier: None,
                 status_summary: EnablementStatusSummary {
                     status: Some(enabled_baseline.status.as_wire().to_string()),

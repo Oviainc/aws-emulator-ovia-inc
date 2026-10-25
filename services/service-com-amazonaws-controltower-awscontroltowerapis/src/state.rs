@@ -560,6 +560,30 @@ impl DriftStatus {
     }
 }
 
+/// `EnabledBaselineDriftStatus`: whether every account in the target organizational unit
+/// still matches the baseline configuration that unit's enablement defines.
+///
+/// Wire values from the model's `EnabledBaselineDriftStatus` enum, reported through
+/// `EnabledBaselineInheritanceDrift$status` (`IN_SYNC` | `DRIFTED`). It is a DIFFERENT enum
+/// from the [`DriftStatus`] an enabled control carries: a baseline's drift is only ever
+/// in-sync or drifted, with no "unknown" or "not checking" value, so an enablement whose
+/// drift is not assessed reports no drift summary at all rather than a third status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnabledBaselineDriftStatus {
+    InSync,
+    Drifted,
+}
+
+impl EnabledBaselineDriftStatus {
+    /// The value this status serializes as.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::InSync => "IN_SYNC",
+            Self::Drifted => "DRIFTED",
+        }
+    }
+}
+
 /// A persisted enabled control: one control applied to one target.
 ///
 /// Everything `ListEnabledControls` and `GetEnabledControl` report about a control is
@@ -753,6 +777,20 @@ pub struct EnabledBaseline {
     /// started against this resource.
     pub last_operation_identifier: String,
     pub created_at: SystemTime,
+    /// `EnabledBaselineDriftStatusSummary` -> `EnabledBaselineDriftTypes$inheritance` ->
+    /// `EnabledBaselineInheritanceDrift$status`, or `None` when no inheritance drift is
+    /// assessed for this enablement.
+    ///
+    /// Two things decide whether drift is assessed at all. Control Tower "detects
+    /// inheritance drift on the enabled baselines that target OUs" and "does not detect
+    /// drift on the baselines that apply to your landing zone" (model docs), which is the
+    /// [`CatalogBaseline::detects_inheritance_drift`] flag; and drift is a property of a
+    /// DEPLOYED configuration, so it is assessed only once the enablement's operation has
+    /// become due — [`settle`] materialises it then, the same way it materialises an
+    /// enabled control's drift statuses.
+    ///
+    /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
+    pub inheritance_drift_status: Option<EnabledBaselineDriftStatus>,
     /// The change an `UPDATE_ENABLED_BASELINE` still in flight will apply, or `None`
     /// when nothing is pending. `settle` applies it once that operation is due, so the
     /// applied version and parameters change when the asynchronous update completes and
@@ -1079,6 +1117,19 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             } else {
                 EnablementStatus::Succeeded
             };
+            // Inheritance drift is only assessable once the baseline configuration is
+            // deployed, and only for the baselines Control Tower assesses it on; the
+            // deployment that has become due here is of the configuration the enablement
+            // defines for the whole target organizational unit, so no account under it has
+            // diverged from that configuration yet. Assessed once and then left alone, so
+            // a later reader cannot reset a drift status already reported.
+            if enabled_baseline.status == EnablementStatus::Succeeded
+                && enabled_baseline.inheritance_drift_status.is_none()
+                && assesses_inheritance_drift(&enabled_baseline.baseline_identifier)
+            {
+                enabled_baseline.inheritance_drift_status =
+                    Some(EnabledBaselineDriftStatus::InSync);
+            }
         }
     }
 
@@ -1458,6 +1509,10 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
                 status: EnablementStatus::UnderChange,
                 last_operation_identifier: operation_identifier.clone(),
                 created_at: now,
+                // Drift is a property of a DEPLOYED configuration, so nothing is assessed
+                // while the ENABLE_BASELINE operation is still in flight; `settle`
+                // materialises it once that operation is due.
+                inheritance_drift_status: None,
                 pending_update: None,
             },
         );
@@ -1802,6 +1857,18 @@ pub struct CatalogBaseline {
     /// baseline that declares none carries an EMPTY set, and any `parameters` entry at
     /// all is then refused for it.
     pub parameters: &'static [&'static str],
+    /// Whether AWS Control Tower assesses INHERITANCE DRIFT on this baseline.
+    ///
+    /// `EnabledBaselineDriftTypes` names the set exactly: Control Tower "detects
+    /// inheritance drift on the enabled baselines that target OUs:
+    /// `AWSControlTowerBaseline` and `BackupBaseline`" and "does not detect drift on the
+    /// baselines that apply to your landing zone: `IdentityCenterBaseline`,
+    /// `AuditBaseline`, `LogArchiveBaseline`, `BackupCentralVaultBaseline`, or
+    /// `BackupAdminBaseline`" (model docs). It is a property of the BASELINE, not of one
+    /// enablement, which is why it lives in the catalog beside the versions and parameters
+    /// a baseline publishes; an enablement of a baseline this is `false` for reports no
+    /// `driftStatusSummary` at all.
+    pub detects_inheritance_drift: bool,
 }
 
 impl CatalogBaseline {
@@ -1841,6 +1908,7 @@ pub const BASELINE_CATALOG: &[CatalogBaseline] = &[
                       to govern the accounts of a target organizational unit.",
         versions: &["1.0", "2.0", "3.0", "4.0"],
         parameters: &["IdentityCenterEnabledForBaseline"],
+        detects_inheritance_drift: true,
     },
     CatalogBaseline {
         id: "4T4HA1KMO10S6311",
@@ -1849,6 +1917,7 @@ pub const BASELINE_CATALOG: &[CatalogBaseline] = &[
                       requires in the audit account.",
         versions: &["1.0"],
         parameters: &[],
+        detects_inheritance_drift: false,
     },
     CatalogBaseline {
         id: "TR7NC4VPG9DH2KLM",
@@ -1857,6 +1926,7 @@ pub const BASELINE_CATALOG: &[CatalogBaseline] = &[
                       requires in the backup administration account.",
         versions: &["1.0"],
         parameters: &[],
+        detects_inheritance_drift: false,
     },
     CatalogBaseline {
         id: "QXK3R9ZB7PN5TD2H",
@@ -1865,6 +1935,7 @@ pub const BASELINE_CATALOG: &[CatalogBaseline] = &[
                       the accounts of a target organizational unit.",
         versions: &["1.0"],
         parameters: &[],
+        detects_inheritance_drift: true,
     },
     CatalogBaseline {
         id: "WM8FJ6YHL3QS5XKB",
@@ -1873,6 +1944,7 @@ pub const BASELINE_CATALOG: &[CatalogBaseline] = &[
                       the backup central vault account.",
         versions: &["1.0"],
         parameters: &[],
+        detects_inheritance_drift: false,
     },
     CatalogBaseline {
         id: "LN25R72TTG6IGPTQ",
@@ -1881,6 +1953,7 @@ pub const BASELINE_CATALOG: &[CatalogBaseline] = &[
                       prerequisite for the AWSControlTowerBaseline.",
         versions: &["1.0", "4.0"],
         parameters: &[],
+        detects_inheritance_drift: false,
     },
     CatalogBaseline {
         id: "2V6DZ8QKR4JT7MWN",
@@ -1889,6 +1962,7 @@ pub const BASELINE_CATALOG: &[CatalogBaseline] = &[
                       the log archive account.",
         versions: &["1.0"],
         parameters: &[],
+        detects_inheritance_drift: false,
     },
 ];
 
@@ -1926,6 +2000,18 @@ pub fn resolve_baseline(baseline_identifier: &str) -> Option<&'static CatalogBas
     BASELINE_CATALOG
         .iter()
         .find(|baseline| baseline.id == baseline_id)
+}
+
+/// Whether AWS Control Tower assesses inheritance drift on the baseline
+/// `baseline_identifier` names, read off the catalog
+/// ([`CatalogBaseline::detects_inheritance_drift`]).
+///
+/// The one place that question is asked of a stored enablement, so `settle` and every
+/// reporting call agree on which enablements carry a `driftStatusSummary`. An identifier
+/// naming no catalog baseline assesses nothing — no enablement can hold one, since
+/// `EnableBaseline` refuses an unpublished baseline before anything is persisted.
+pub fn assesses_inheritance_drift(baseline_identifier: &str) -> bool {
+    resolve_baseline(baseline_identifier).is_some_and(|baseline| baseline.detects_inheritance_drift)
 }
 
 /// Whether `identifier` is a baseline ARN at all.

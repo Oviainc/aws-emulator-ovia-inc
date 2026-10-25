@@ -23,8 +23,15 @@ mod config_connectors;
 mod config_delivery_channel_status;
 #[path = "all/config_discovered_resource_counts.rs"]
 mod config_discovered_resource_counts;
+// Declared HERE, inside the sorted list, rather than after it: the tail of this file is
+// where concurrent suites append, so a line added there conflicts with every other one
+// landing in the same window, while this span is untouched by those appends.
+#[path = "all/config_external_evaluation_compliance.rs"]
+mod config_external_evaluation_compliance;
 #[path = "all/config_read_shape_and_compliance.rs"]
 mod config_read_shape_and_compliance;
+#[path = "all/config_recorded_resource_compliance.rs"]
+mod config_recorded_resource_compliance;
 #[path = "all/config_remediation_configurations.rs"]
 mod config_remediation_configurations;
 #[path = "all/config_retention_configuration_lifecycle.rs"]

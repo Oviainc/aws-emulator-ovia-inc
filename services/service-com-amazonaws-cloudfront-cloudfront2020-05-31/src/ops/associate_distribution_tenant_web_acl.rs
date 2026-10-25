@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateDistributionTenantWebACL
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateDistributionTenantWebACL`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateDistributionTenantWebACL::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores the WAF web ACL customization on ONE distribution tenant.
+//!
+//! `Customizations$WebAcl` is "the WAF web ACL" the tenant overrides, so the association is
+//! that one member of the tenant's record: the ARN the request names becomes the tenant's
+//! web ACL customization in `override` form, every later read answers with it, and the call
+//! versions the tenant the way any other change to its configuration does. A second
+//! association replaces the first — the member holds ONE web ACL.
+//!
+//! The tenant's current version is a REQUIRED precondition here, as it is on the matching
+//! disassociation: a request that states no `If-Match` is refused with
+//! `InvalidIfMatchVersion` (HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +81,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
+
+use crate::state::IfMatch;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -152,18 +159,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateDistributionTenantWebACL` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateDistributionTenantWebACLErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes this service's state before the call
+        // reads it, so the version this precondition is evaluated against is the one a read
+        // at this instant reports.
+        store.settle(now);
+
+        // The association is a change to ONE stored tenant, so the record has to be there:
+        // `EntityNotFound` is the error this operation models for an entity it cannot find.
+        // `Id` is "the ID of the distribution tenant", so the id is what resolves it.
+        let Some(current_etag) = store
+            .distribution_tenants
+            .get(&input.id)
+            .map(|tenant| tenant.etag.clone())
+        else {
+            return Err(AssociateDistributionTenantWebACLErrorModeled::EntityNotFound(
+                crate::state::distribution_tenant_not_found(),
+            )
+            .into());
+        };
+
+        // The tenant's current version is the precondition this call runs under, and it is
+        // REQUIRED: an absent header is "the `If-Match` version is missing", the same
+        // refusal as a value that is no version token at all, while a well-formed token that
+        // is not the stored one is a failed precondition.
+        match crate::state::check_if_match(&current_etag, input.if_match.as_deref()) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => {
+                return Err(
+                    AssociateDistributionTenantWebACLErrorModeled::InvalidIfMatchVersion(
+                        crate::state::invalid_if_match_version(),
+                    )
+                    .into(),
+                );
+            }
+            IfMatch::Stale => {
+                return Err(
+                    AssociateDistributionTenantWebACLErrorModeled::PreconditionFailed(
+                        crate::state::precondition_failed(),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "The Amazon Resource Name (ARN) of the WAF web ACL to associate" is what this
+        // member carries, and a web ACL is a WAF resource this store cannot resolve — so the
+        // one thing decidable here is whether the request named a web ACL at all. A blank
+        // value names none, which is the modelled `InvalidArgument` rather than an
+        // association of nothing.
+        let web_acl_arn = input.web_acl_arn.trim();
+        if web_acl_arn.is_empty() {
+            return Err(AssociateDistributionTenantWebACLErrorModeled::InvalidArgument(
+                InvalidArgument {
+                    message: Some(
+                        "WebACLArn must name the WAF web ACL to associate; it cannot be empty"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The association IS the tenant's web ACL customization: `override` is the action
+        // that "specif[ies] a separate WAF web ACL for the distribution tenant", which is
+        // what associating one with it does, and the ARN is the one the request named.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateDistributionTenantWebACL"))
+        // The record was read above under this same held lock, so the store still holds it;
+        // the `None` arm answers the modelled not-found rather than panicking if it ever
+        // does not.
+        let customization = WebAclCustomization {
+            action: crate::state::CUSTOMIZATION_ACTION_OVERRIDE.to_string(),
+            arn: Some(web_acl_arn.to_string()),
+        };
+        let Some(tenant) = store.apply_tenant_web_acl(&input.id, Some(customization), now) else {
+            return Err(AssociateDistributionTenantWebACLErrorModeled::EntityNotFound(
+                crate::state::distribution_tenant_not_found(),
+            )
+            .into());
+        };
+
+        Ok(AssociateDistributionTenantWebACLOutput {
+            // "The ID of the distribution tenant" — read from the record that was written.
+            id: Some(tenant.id.clone()),
+            // "The ARN of the WAF web ACL that you associated with the distribution
+            // tenant", read back out of the record, so what this call reports is what the
+            // tenant now runs under.
+            web_acl_arn: tenant
+                .customizations
+                .as_ref()
+                .and_then(|customizations| customizations.web_acl.as_ref())
+                .and_then(|web_acl| web_acl.arn.clone()),
+            // "The current version of the distribution tenant": the token this mutation
+            // just minted, so the version from before it no longer satisfies an `If-Match`.
+            e_tag: Some(tenant.etag.clone()),
+        })
     }
 }

@@ -171,11 +171,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // to the name the store is keyed by.
         let log_group_name =
             crate::state::log_group_name_from_identifier(&input.log_group_identifier).to_string();
-        let not_found = |resource_kind: &str| {
+        let not_found = |message: &str| {
             DeleteDataProtectionPolicyError::from(
                 DeleteDataProtectionPolicyErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::resource_not_found_message(resource_kind)),
+                        message: Some(message.to_string()),
                     },
                 ),
             )
@@ -184,11 +184,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let group = store
             .log_groups
             .get_mut(&log_group_name)
-            .ok_or_else(|| not_found("log group"))?;
+            .ok_or_else(|| not_found(&crate::state::resource_not_found_message("log group")))?;
         // The resource this operation deletes is the policy, so a group holding none has
-        // nothing to delete.
+        // nothing to delete. The request identifies that policy by nothing of its own —
+        // only by the group it is attached to — so the refusal states nothing about it
+        // beyond that the resource is not there.
         if group.data_protection_policy.take().is_none() {
-            return Err(not_found("data protection policy"));
+            return Err(not_found(
+                crate::state::UNIDENTIFIED_RESOURCE_NOT_FOUND_MESSAGE,
+            ));
         }
 
         Ok(DeleteDataProtectionPolicyOutput)

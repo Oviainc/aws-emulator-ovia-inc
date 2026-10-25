@@ -1,0 +1,1010 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! What a RUNNING configuration recorder does between calls: it observes the
+//! resources of the types it records, writes a configuration item for each one into
+//! the inventory, and re-evaluates the Config rules whose scope covers them —
+//! recording the verdict each rule places a resource at, and reporting a verdict that
+//! CHANGED as a compliance change.
+//!
+//! Neither half needs a call from the caller: a recorder that is recording keeps
+//! recording, and "when you create a rule, Config evaluates your resources against
+//! the rule automatically" (`PutConfigRule`). So a pass is OWED at an instant
+//! ([`RECORDING_PASS_DUE_AFTER`] after the call that made it due) and is run by the
+//! in-process pump [`drive_recorder_clock`] starts — which is what lets a client that
+//! consumes only the resulting compliance-change events make no further Config call
+//! at all. A caller reading before that instant still sees the state from before the
+//! pass, and the pass writes nothing a read could have written.
+//!
+//! What Config OBSERVES, it observes through the owning service's own API, reached
+//! over the in-process callback
+//! ([`smithy_server_runtime::OperationContext::callback`]) exactly as the event
+//! publication is, so this crate names no other service crate. A resource type no
+//! service of this emulator reports is simply not recorded ([`OBSERVABLE_RESOURCE_TYPES`]),
+//! and a rule whose implementation this emulator does not have records no verdict at
+//! all rather than a synthesised one ([`MANAGED_RULES`]).
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, SystemTime};
+
+use super::{
+    compliance_change_detail, publish_service_event_via, service_state,
+    ComAmazonawsConfigserviceStarlingdoveserviceState, DiscoveredResourceEntry,
+    EvaluationResultEntry, COMPLIANCE_CHANGE_DETAIL_TYPE, COMPLIANCE_TYPE_COMPLIANT,
+    COMPLIANCE_TYPE_NON_COMPLIANT, CONFIG_RULE_STATE_ACTIVE, EVALUATION_MODE_DETECTIVE, OWNER_AWS,
+};
+use crate::ops::types::{Scope, Source};
+
+/// The resource type Config records an Amazon S3 general purpose bucket under, a
+/// `com.amazonaws.configservice#ResourceType` value.
+pub const S3_BUCKET_RESOURCE_TYPE: &str = "AWS::S3::Bucket";
+
+/// The resource types this emulator's configuration recorder can OBSERVE: the ones
+/// whose service it serves and whose configuration that service's own API reports.
+/// A recorder records the intersection of these and the resource types its recording
+/// group names, so a recording group of `allSupported` records exactly these.
+pub const OBSERVABLE_RESOURCE_TYPES: [&str; 1] = [S3_BUCKET_RESOURCE_TYPE];
+
+/// How long after the call that makes one due Config runs the next
+/// recording-and-evaluation pass.
+///
+/// No sentence of the model or of the service's documentation states how long Config
+/// takes to record a resource change or to evaluate a rule against it, so this span is
+/// CHOSEN: it sits inside the 250–750 ms window this project uses for a transition the
+/// clock owes, which keeps the state from before the pass observable to a caller that
+/// reads straight after the call that made the pass due.
+pub const RECORDING_PASS_DUE_AFTER: Duration = Duration::from_millis(500);
+
+/// The shortest a pump waits before a pass, so a due instant already past still hands
+/// the runtime back rather than spinning.
+const MIN_PASS_WAIT: Duration = Duration::from_millis(1);
+
+/// How many passes one pump runs before it releases its claim.
+///
+/// Continuous recording owes a pass for as long as a recorder is recording, so the
+/// loop has no natural end; this cap guarantees termination, and the next operation
+/// that makes a pass due starts a fresh pump.
+const MAX_RECORDING_PASSES: usize = 10_000;
+
+/// The most verdict CHANGES one pass records and publishes.
+///
+/// A pass re-evaluates every rule over every recorded resource in its scope, so the
+/// work it can produce is the product of two quotas; this bounds what one pass does,
+/// and because a pass that stops early leaves the remaining pairs UNevaluated, the
+/// next pass continues where this one stopped rather than losing a verdict.
+const MAX_CHANGES_PER_PASS: usize = 200;
+
+/// The versioning status an S3 bucket carries while versioning is ON
+/// (`com.amazonaws.s3#BucketVersioningStatus`, whose values are `Enabled` and
+/// `Suspended`).
+const VERSIONING_STATUS_ENABLED: &str = "Enabled";
+
+/// One AWS managed Config rule this emulator evaluates.
+///
+/// `identifier` is the `SourceIdentifier` Config knows the managed rule by
+/// (`Source$SourceIdentifier`: "For Config Managed rules, a predefined identifier from
+/// a list"), `resource_type` the type of resource it evaluates, and `verdict` the
+/// `ComplianceType` it places a resource at — computed from the CONFIGURATION ITEM the
+/// recorder wrote for that resource, never from a request.
+pub struct ManagedRule {
+    /// See [`ManagedRule`].
+    pub identifier: &'static str,
+    /// See [`ManagedRule`].
+    pub resource_type: &'static str,
+    /// See [`ManagedRule`].
+    pub verdict: fn(&RecordedConfiguration) -> &'static str,
+}
+
+/// The AWS managed rules this emulator evaluates, each one paired with the member of
+/// the recorded configuration item its verdict reads.
+///
+/// Source: the Config managed-rule list (the `SourceIdentifier` values
+/// `Source$SourceIdentifier` refers to), which is also where each rule's own
+/// description comes from; the per-entry functions below quote it. A managed rule NOT
+/// listed here is left unevaluated — Config records no verdict for it rather than a
+/// made-up one — which is why this table is the single statement of what this emulator
+/// can judge.
+pub const MANAGED_RULES: [ManagedRule; 2] = [
+    ManagedRule {
+        identifier: "S3_BUCKET_VERSIONING_ENABLED",
+        resource_type: S3_BUCKET_RESOURCE_TYPE,
+        verdict: bucket_versioning_verdict,
+    },
+    ManagedRule {
+        identifier: "S3_BUCKET_SERVER_SIDE_ENCRYPTION_ENABLED",
+        resource_type: S3_BUCKET_RESOURCE_TYPE,
+        verdict: bucket_encryption_verdict,
+    },
+];
+
+/// The managed rule `source` names, when this emulator evaluates it.
+///
+/// Only a rule OWNED by Amazon Web Services is a managed rule; a Custom Lambda or
+/// Custom Policy rule carries the caller's own implementation, which this emulator
+/// does not run.
+pub fn managed_rule_of(source: &Source) -> Option<&'static ManagedRule> {
+    if source.owner != OWNER_AWS {
+        return None;
+    }
+    let identifier = source.source_identifier.as_deref().map(str::trim)?;
+    MANAGED_RULES
+        .iter()
+        .find(|managed| managed.identifier == identifier)
+}
+
+/// The `ManagedRule` whose verdict reads a configuration item: its `configuration`
+/// document and its `supplementaryConfiguration` blocks, each parsed.
+///
+/// Config "returns [`supplementaryConfiguration`] for certain resource types to
+/// supplement the information returned for the `configuration` field"
+/// (`ConfigurationItem$supplementaryConfiguration`), and for an S3 bucket it is where
+/// the per-feature configuration a rule checks lives — so a verdict reads the item as
+/// a whole rather than one member of it.
+pub struct RecordedConfiguration {
+    /// The item's `Configuration` document.
+    pub configuration: ::serde_json::Value,
+    /// The item's `supplementaryConfiguration` blocks, keyed as Config keys them.
+    pub supplementary: BTreeMap<String, ::serde_json::Value>,
+}
+
+impl RecordedConfiguration {
+    /// The supplementary block `name`, or `Null` when the item carries none.
+    fn block(&self, name: &str) -> &::serde_json::Value {
+        self.supplementary.get(name).unwrap_or(&::serde_json::Value::Null)
+    }
+}
+
+/// The `supplementaryConfiguration` block Config records an S3 bucket's versioning
+/// configuration under, and the member of it that carries the status — the
+/// `GetBucketVersioning` answer, recorded as the configuration item carries it.
+const BUCKET_VERSIONING_BLOCK: &str = "BucketVersioningConfiguration";
+/// The block Config records an S3 bucket's default encryption configuration under — the
+/// `GetBucketEncryption` answer.
+const BUCKET_ENCRYPTION_BLOCK: &str = "ServerSideEncryptionConfiguration";
+
+/// `S3_BUCKET_VERSIONING_ENABLED` — "Checks if versioning is enabled for your S3
+/// buckets": COMPLIANT exactly while the bucket's versioning configuration is
+/// `Enabled`, which the recorder records in the [`BUCKET_VERSIONING_BLOCK`] block from
+/// `GetBucketVersioning`. A bucket whose versioning has never been set carries no
+/// status at all, and one whose versioning was suspended carries `Suspended`; neither
+/// has versioning enabled.
+fn bucket_versioning_verdict(recorded: &RecordedConfiguration) -> &'static str {
+    verdict(
+        recorded.block(BUCKET_VERSIONING_BLOCK)["status"].as_str()
+            == Some(VERSIONING_STATUS_ENABLED),
+    )
+}
+
+/// `S3_BUCKET_SERVER_SIDE_ENCRYPTION_ENABLED` — "Checks whether the S3 buckets have
+/// default encryption enabled": COMPLIANT exactly while a default server-side
+/// encryption algorithm is in force for the bucket, which the recorder records in the
+/// [`BUCKET_ENCRYPTION_BLOCK`] block from `GetBucketEncryption`.
+fn bucket_encryption_verdict(recorded: &RecordedConfiguration) -> &'static str {
+    verdict(
+        recorded.block(BUCKET_ENCRYPTION_BLOCK)["rules"]
+            .as_array()
+            .is_some_and(|rules| {
+                rules.iter().any(|rule| {
+                    rule["applyServerSideEncryptionByDefault"]["sseAlgorithm"]
+                        .as_str()
+                        .is_some_and(|algorithm| !algorithm.is_empty())
+                })
+            }),
+    )
+}
+
+/// The `ComplianceType` a managed rule's check places a resource at: a check the
+/// resource satisfies is `COMPLIANT`, one it does not is `NON_COMPLIANT`.
+fn verdict(satisfied: bool) -> &'static str {
+    if satisfied {
+        COMPLIANCE_TYPE_COMPLIANT
+    } else {
+        COMPLIANCE_TYPE_NON_COMPLIANT
+    }
+}
+
+/// One verdict change a pass produced: the rule whose verdict moved, the result that
+/// now holds and the one it replaced (absent when this is the rule's first verdict for
+/// the resource).
+#[derive(Debug, Clone)]
+pub struct ComplianceChange {
+    /// The rule whose verdict changed.
+    pub rule_name: String,
+    /// That rule's ARN, which the notification carries.
+    pub rule_arn: String,
+    /// The verdict that now holds.
+    pub new_result: EvaluationResultEntry,
+    /// The verdict it replaced, where there was one.
+    pub old_result: Option<EvaluationResultEntry>,
+}
+
+/// What the evaluation step needs about one recorded resource, copied out of the
+/// inventory so the rules can be walked mutably while it is read.
+struct RecordedResource {
+    resource_type: String,
+    resource_id: String,
+    /// The configuration item a rule's check reads.
+    recorded: RecordedConfiguration,
+    /// When the configuration item was captured, which is the instant the evaluation a
+    /// rule runs over it is ABOUT (`EvaluationResultIdentifier$OrderingTimestamp`: "the
+    /// time of the event that triggered the evaluation").
+    captured_at: SystemTime,
+    /// The tags recorded with the configuration item, which a rule's scope can narrow
+    /// by.
+    tags: BTreeMap<String, String>,
+}
+
+/// Whether a rule with `scope` covers the RECORDED resource `resource`: the rules
+/// that can place THIS resource at a verdict.
+///
+/// A rule with no scope covers every recorded resource; a scope narrows by resource
+/// type, by resource id and by the TAGS the configuration item was recorded with
+/// (`Scope$TagKey`: "The tag key that is applied to only those Amazon Web Services
+/// resources that you want to trigger an evaluation for the rule", with `TagValue`
+/// narrowing further and only "if you also specify a tag key"). `ServicePrincipals`
+/// narrows nothing: it is "populated only if the service-linked rule is created by a
+/// service" and names the services the rule is FOR, not the resources it evaluates.
+fn scope_covers_recorded(scope: Option<&Scope>, resource: &RecordedResource) -> bool {
+    let Some(scope) = scope else {
+        return true;
+    };
+    let covers_type = scope
+        .compliance_resource_types
+        .as_deref()
+        .filter(|types| !types.is_empty())
+        .is_none_or(|types| types.iter().any(|scoped| scoped == &resource.resource_type));
+    let covers_id = scope
+        .compliance_resource_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .is_none_or(|id| id == resource.resource_id);
+    let covers_tag = scope
+        .tag_key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+        .is_none_or(|key| {
+            resource.tags.get(key).is_some_and(|held| {
+                scope
+                    .tag_value
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .is_none_or(|value| value == held)
+            })
+        });
+    covers_type && covers_id && covers_tag
+}
+
+impl ComAmazonawsConfigserviceStarlingdoveserviceState {
+    /// Note the recording-and-evaluation pass this account owes next, due
+    /// [`RECORDING_PASS_DUE_AFTER`] from `now`.
+    ///
+    /// Only a recorder that is RECORDING owes one — Config observes nothing while every
+    /// recorder is stopped — so an account whose recorders are all stopped owes none,
+    /// which is also what ends the pump.
+    pub fn owe_recording_pass(&mut self, now: SystemTime) {
+        self.recording_pass_due = self
+            .recording_recorder()
+            .is_some()
+            .then(|| now + RECORDING_PASS_DUE_AFTER);
+    }
+
+    /// Claim the right to run this store's passes, answering `false` when a pump
+    /// already holds it — so one store has at most one pump.
+    pub fn claim_recording_pump(&mut self) -> bool {
+        if self.recording_pump {
+            return false;
+        }
+        self.recording_pump = true;
+        true
+    }
+
+    /// Give up the claim [`Self::claim_recording_pump`] took.
+    pub fn release_recording_pump(&mut self) {
+        self.recording_pump = false;
+    }
+
+    /// The instant this store's next pass falls due, releasing the pump's claim in the
+    /// same critical section when nothing is owed — so no pass can be owed while no
+    /// pump is running.
+    pub fn next_recording_pass_due_or_release_pump(&mut self) -> Option<SystemTime> {
+        let due = self.recording_pass_due;
+        if due.is_none() {
+            self.release_recording_pump();
+        }
+        due
+    }
+
+    /// Take the pass the clock has made due as of `now`, as the resource types the
+    /// recording recorder records and this emulator can observe; `None` when no pass is
+    /// due yet or no recorder is recording.
+    ///
+    /// Taking it clears the due instant, so one due pass runs once however many pumps
+    /// ask for it.
+    pub fn take_due_recording_pass(&mut self, now: SystemTime) -> Option<Vec<&'static str>> {
+        if self.recording_pass_due.is_none_or(|due| now < due) {
+            return None;
+        }
+        let recorder = self.recording_recorder()?;
+        let group = recorder.recording_group.clone();
+        self.recording_pass_due = None;
+        Some(
+            OBSERVABLE_RESOURCE_TYPES
+                .into_iter()
+                .filter(|resource_type| match group.as_ref() {
+                    // A recorder stored without a recording group records every
+                    // supported resource type, as a group of `allSupported` does.
+                    None => true,
+                    Some(group) => super::group_records_resource_type(group, resource_type),
+                })
+                .collect(),
+        )
+    }
+
+    /// Record what a pass OBSERVED for one resource type: a configuration item per
+    /// resource the owning service reported, and the DELETION of a resource of that
+    /// type the inventory holds and the pass did not see.
+    ///
+    /// Every item goes in through [`Self::record_discovered_resource`], so a resource
+    /// keeps the instant Config FIRST recorded it and the states it has already left,
+    /// and a deleted resource keeps its entry carrying the instant it went away — a
+    /// discovered-resource read can be asked to include deleted resources.
+    pub fn record_observed(
+        &mut self,
+        resource_type: &str,
+        observed: Vec<DiscoveredResourceEntry>,
+        now: SystemTime,
+    ) {
+        let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+        for entry in observed {
+            seen.insert((entry.resource_type.clone(), entry.resource_id.clone()));
+            self.record_discovered_resource(entry);
+        }
+        let gone: Vec<DiscoveredResourceEntry> = self
+            .discovered_resources
+            .iter()
+            .filter(|(key, entry)| {
+                key.0 == resource_type && !seen.contains(*key) && entry.deleted_at.is_none()
+            })
+            .map(|(_, entry)| DiscoveredResourceEntry {
+                deleted_at: Some(now),
+                last_recorded_at: Some(now),
+                ..entry.clone()
+            })
+            .collect();
+        for entry in gone {
+            self.record_discovered_resource(entry);
+        }
+    }
+
+    /// Evaluate the account's rules over the recorded resources in their scope as of
+    /// `now`, recording one result per rule and resource, and answer the verdicts that
+    /// CHANGED.
+    ///
+    /// A rule is evaluated when it is `ACTIVE`, when the pass it is owed has fallen due
+    /// ([`super::RuleEvaluationEntry::in_progress`]) and when this emulator has its
+    /// implementation ([`MANAGED_RULES`]); anything else records nothing, so a rule
+    /// whose logic is not here keeps reporting `INSUFFICIENT_DATA` rather than a
+    /// synthesised verdict.
+    pub fn evaluate_recorded_resources(&mut self, now: SystemTime) -> Vec<ComplianceChange> {
+        // The configuration items the recorder has captured, copied out so the rules
+        // below can be walked mutably. A resource whose deletion is recorded is no
+        // longer there to evaluate, and one no configuration item has been recorded for
+        // has nothing to evaluate against.
+        let recorded: Vec<RecordedResource> = self
+            .discovered_resources
+            .values()
+            .filter(|entry| entry.deleted_at.is_none())
+            .filter_map(|entry| {
+                Some(RecordedResource {
+                    resource_type: entry.resource_type.clone(),
+                    resource_id: entry.resource_id.clone(),
+                    recorded: RecordedConfiguration {
+                        configuration: ::serde_json::from_str(entry.configuration.as_deref()?)
+                            .ok()?,
+                        supplementary: entry
+                            .supplementary_configuration
+                            .iter()
+                            .filter_map(|(block, value)| {
+                                Some((block.clone(), ::serde_json::from_str(value).ok()?))
+                            })
+                            .collect(),
+                    },
+                    captured_at: entry.last_recorded_at?,
+                    tags: entry.tags.clone(),
+                })
+            })
+            .collect();
+
+        let mut changes: Vec<ComplianceChange> = Vec::new();
+        for rule in self.config_rules.values_mut() {
+            if rule.state != CONFIG_RULE_STATE_ACTIVE || rule.evaluation.in_progress(now) {
+                continue;
+            }
+            let Some(managed) = managed_rule_of(&rule.source) else {
+                continue;
+            };
+            // The instant Config invoked the pass this rule is owed, which the result
+            // reports as the rule's invocation time; a pass no write asked for is
+            // invoked at the instant it runs.
+            let invoked_at = rule.evaluation.invoked_at.unwrap_or(now);
+            for resource in &recorded {
+                if resource.resource_type != managed.resource_type
+                    || !scope_covers_recorded(rule.scope.as_ref(), resource)
+                {
+                    continue;
+                }
+                if changes.len() >= MAX_CHANGES_PER_PASS {
+                    // What is left stays UNevaluated, so the next pass evaluates it.
+                    return changes;
+                }
+                let result = EvaluationResultEntry {
+                    config_rule_invoked_time: invoked_at,
+                    result_recorded_time: now,
+                    ..EvaluationResultEntry::new(
+                        &resource.resource_type,
+                        &resource.resource_id,
+                        EVALUATION_MODE_DETECTIVE,
+                        (managed.verdict)(&resource.recorded),
+                        resource.captured_at,
+                    )
+                };
+                // The rule's own writer records it, which is what keeps a rule's results
+                // bounded; the verdict it REPLACES is read first, because that is what
+                // the notification reports the resource changed FROM.
+                let replaced = rule.evaluation_results.get(&result.key()).cloned();
+                rule.record_evaluation_result(result.clone());
+                // A verdict that did not change is not a compliance change: the
+                // evaluation is recorded again, and nobody is notified.
+                let changed = replaced
+                    .as_ref()
+                    .is_none_or(|previous| previous.compliance_type != result.compliance_type);
+                if changed {
+                    changes.push(ComplianceChange {
+                        rule_name: rule.name.clone(),
+                        rule_arn: rule.arn.clone(),
+                        new_result: result,
+                        old_result: replaced,
+                    });
+                }
+            }
+            // The pass this rule was owed has now evaluated the resources in its scope.
+            rule.evaluation.settle(now);
+        }
+        changes
+    }
+}
+
+/// Run the recording-and-evaluation pass the clock has made due as of `now`, and
+/// publish every compliance change it produced.
+///
+/// Takes the callback rather than an `OperationContext`, because the pump that calls it
+/// outlives the request that started it; a handler reaches it through
+/// [`drive_recorder_clock`]. No lock is held across an await: the pass takes the store's
+/// guard to decide what is due, releases it to read the resources from their own
+/// services, takes it again to record and evaluate, and releases it before publishing.
+pub async fn run_due_recording_pass<Eng: Send + Sync + 'static>(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    engine: &Eng,
+    region: &str,
+    now: SystemTime,
+) {
+    let Some(state) = service_state(engine) else {
+        return;
+    };
+    let Some(resource_types) = state.lock().take_due_recording_pass(now) else {
+        return;
+    };
+
+    let mut observed: Vec<(&'static str, Vec<DiscoveredResourceEntry>)> = Vec::new();
+    for resource_type in resource_types {
+        // Only a type whose resources were actually READ is recorded: a read that
+        // failed says nothing about what the account holds, and recording it as empty
+        // would record every resource of that type as deleted.
+        if resource_type == S3_BUCKET_RESOURCE_TYPE {
+            if let Some(buckets) = observed_s3_buckets(callback, region, now).await {
+                observed.push((resource_type, buckets));
+            }
+        }
+    }
+
+    let changes = {
+        let mut store = state.lock();
+        for (resource_type, entries) in observed {
+            store.record_observed(resource_type, entries, now);
+        }
+        store.evaluate_recorded_resources(now)
+    };
+
+    for change in changes {
+        let detail = compliance_change_detail(
+            &change.rule_name,
+            &change.rule_arn,
+            region,
+            &change.new_result,
+            change.old_result.as_ref(),
+            now,
+        );
+        publish_service_event_via(callback, region, COMPLIANCE_CHANGE_DETAIL_TYPE, &detail).await;
+    }
+}
+
+/// Start the in-process pump that runs the passes this store owes, after noting that
+/// one is owed.
+///
+/// Called by an operation that makes a pass due — one that starts a recorder, or one
+/// that writes a rule Config then evaluates — AFTER it has released the store's lock.
+/// It does not change WHEN a pass happens: the pass runs at the due instant the store
+/// holds, so a caller reading before it still sees the state from before the pass. At
+/// most one pump runs per store, it is bounded by [`MAX_RECORDING_PASSES`] passes, and
+/// it ends as soon as the store owes nothing — which is what stopping every recorder
+/// does. With no async runtime to spawn onto there is no pump, and the pass is simply
+/// not run: nothing a caller is told depends on it.
+pub fn drive_recorder_clock<Eng: Send + Sync + 'static>(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    engine: &::std::sync::Arc<Eng>,
+    region: &str,
+) {
+    let Some(state) = service_state(&**engine) else {
+        return;
+    };
+    let owed = {
+        let mut store = state.lock();
+        store.owe_recording_pass(SystemTime::now());
+        store.recording_pass_due.is_some()
+    };
+    if !owed {
+        return;
+    }
+    let Ok(runtime) = ::tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    if !state.lock().claim_recording_pump() {
+        return;
+    }
+
+    let callback = ctx.callback().clone();
+    let engine = ::std::sync::Arc::clone(engine);
+    let region = region.to_string();
+    let pumped = ::engine::ServiceState::clone(&state);
+    runtime.spawn(async move {
+        // `true` only if the pass cap below is what ended the loop; a pump that ran out
+        // of work has already released its claim inside the one critical section that
+        // observed it.
+        let mut capped = true;
+        for _ in 0..MAX_RECORDING_PASSES {
+            let Some(due) = pumped.lock().next_recording_pass_due_or_release_pump() else {
+                capped = false;
+                break;
+            };
+            // Every wake-up waits, even for an instant already past, so the cap above
+            // can never cost a CPU-bound spin and the runtime is handed back between
+            // passes.
+            let wait = due
+                .duration_since(SystemTime::now())
+                .unwrap_or(MIN_PASS_WAIT)
+                .clamp(MIN_PASS_WAIT, RECORDING_PASS_DUE_AFTER);
+            ::tokio::time::sleep(wait).await;
+            run_due_recording_pass(&callback, &*engine, &region, SystemTime::now()).await;
+            // Continuous recording owes the next pass as soon as this one is done; an
+            // account whose recorders are all stopped owes none, which ends the pump.
+            pumped.lock().owe_recording_pass(SystemTime::now());
+        }
+        if capped {
+            pumped.lock().release_recording_pump();
+        }
+    });
+}
+
+/// The configuration items the recorder observes for this Region's Amazon S3 buckets,
+/// or `None` when S3 could not be read at all — which is not the same as an account
+/// with no buckets.
+///
+/// Every member of the recorded configuration document comes from an S3 read named on
+/// it; nothing else is recorded, because nothing else is observed.
+async fn observed_s3_buckets(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    now: SystemTime,
+) -> Option<Vec<DiscoveredResourceEntry>> {
+    let client = s3_client(callback, region);
+    // "Limits the response to buckets that are located in the specified Amazon Web
+    // Services Region" (`ListBucketsRequest$BucketRegion`): a configuration recorder
+    // records the resources of ONE Region, the one its own account and Region stand for.
+    let listed = match client.list_buckets().bucket_region(region).send().await {
+        Ok(listed) => listed,
+        Err(error) => {
+            ::tracing::warn!(
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the configuration recorder could not read this account's S3 buckets"
+            );
+            return None;
+        }
+    };
+
+    let mut observed = Vec::new();
+    for bucket in listed.buckets() {
+        let Some(name) = bucket.name() else {
+            continue;
+        };
+        // `GetBucketVersioning`'s `Status`, absent for a bucket whose versioning has
+        // never been set.
+        let versioning = client
+            .get_bucket_versioning()
+            .bucket(name)
+            .send()
+            .await
+            .ok()
+            .and_then(|answer| answer.status().map(|status| status.as_str().to_string()));
+        // `GetBucketEncryption`'s `ServerSideEncryptionConfiguration`, as the default
+        // algorithm each of its rules applies.
+        let encryption_algorithms: Vec<String> = client
+            .get_bucket_encryption()
+            .bucket(name)
+            .send()
+            .await
+            .ok()
+            .and_then(|answer| answer.server_side_encryption_configuration)
+            .map(|configuration| {
+                configuration
+                    .rules
+                    .iter()
+                    .filter_map(|rule| {
+                        rule.apply_server_side_encryption_by_default
+                            .as_ref()
+                            .map(|default| default.sse_algorithm.as_str().to_string())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // `GetBucketTagging`'s `TagSet`: the tags a rule's scope can narrow by.
+        let tags: BTreeMap<String, String> = client
+            .get_bucket_tagging()
+            .bucket(name)
+            .send()
+            .await
+            .ok()
+            .map(|answer| {
+                answer
+                    .tag_set
+                    .into_iter()
+                    .map(|tag| (tag.key, tag.value))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // The configuration item Config records for a bucket: the bucket's own
+        // identity in `configuration`, and each feature's configuration as a
+        // `supplementaryConfiguration` block, which is "a string to string map ...
+        // Config returns ... for certain resource types to supplement the information
+        // returned for the configuration field", each value a JSON document.
+        let configuration = ::serde_json::json!({
+            "name": name,
+            // "Date the bucket was created" (`Bucket$CreationDate`, from `ListBuckets`).
+            "creationDate": bucket
+                .creation_date()
+                .and_then(|at| at.fmt(::aws_smithy_types::date_time::Format::DateTime).ok()),
+        });
+        let mut supplementary: BTreeMap<String, String> = BTreeMap::new();
+        supplementary.insert(
+            BUCKET_VERSIONING_BLOCK.to_string(),
+            ::serde_json::json!({ "status": versioning }).to_string(),
+        );
+        supplementary.insert(
+            BUCKET_ENCRYPTION_BLOCK.to_string(),
+            ::serde_json::json!({
+                "rules": encryption_algorithms
+                    .iter()
+                    .map(|algorithm| ::serde_json::json!({
+                        "applyServerSideEncryptionByDefault": { "sseAlgorithm": algorithm },
+                    }))
+                    .collect::<Vec<::serde_json::Value>>(),
+            })
+            .to_string(),
+        );
+
+        observed.push(DiscoveredResourceEntry {
+            resource_type: S3_BUCKET_RESOURCE_TYPE.to_string(),
+            // Config identifies a bucket by its name, which is both the resource id and
+            // the resource name of its configuration item.
+            resource_id: name.to_string(),
+            resource_name: Some(name.to_string()),
+            deleted_at: None,
+            // The schema version of a configuration item Config itself recorded is not
+            // one a caller supplied, and this emulator has no catalogue of them, so none
+            // is reported rather than an invented one.
+            schema_version_id: None,
+            configuration: Some(configuration.to_string()),
+            supplementary_configuration: supplementary,
+            tags,
+            first_recorded_at: Some(now),
+            last_recorded_at: Some(now),
+            // The states this bucket has already left are kept by the store's own write
+            // path, which carries them over from the item this one replaces.
+            history: Vec::new(),
+        });
+    }
+    Some(observed)
+}
+
+/// An S3 client over the in-process callback.
+///
+/// The callback is the framework's seam for calling another emulated service: it routes
+/// in process and signs with the emulator's own credentials, so no network client is
+/// configured here. Path-style addressing is what the emulated S3 service routes on
+/// (its operations are bound under a `{Bucket}` path label), and the host is built from
+/// the fixed service label and [`super::DEFAULT_REGION`], never from anything a caller
+/// sent.
+fn s3_client(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+) -> ::aws_sdk_s3::Client {
+    let config = ::aws_sdk_s3::Config::builder()
+        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
+        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://s3.{}.amazonaws.com", super::DEFAULT_REGION))
+        .force_path_style(true)
+        .credentials_provider(callback.aws_credentials_provider())
+        .http_client(callback.http_client())
+        // The transport is in-process: nothing to retry, time out or watch for a stalled
+        // stream, and each would need a sleep implementation this client is not given.
+        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
+        .stalled_stream_protection(::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
+        .build();
+    ::aws_sdk_s3::Client::from_conf(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ops::types::Scope;
+
+    /// A recorded S3 bucket whose configuration item carries `versioning` as its
+    /// versioning status and `algorithms` as the default encryption algorithms in force,
+    /// each in the `supplementaryConfiguration` block Config records it in.
+    fn bucket(
+        name: &str,
+        versioning: Option<&str>,
+        algorithms: &[&str],
+        tags: &[(&str, &str)],
+    ) -> RecordedResource {
+        let supplementary = BTreeMap::from([
+            (
+                BUCKET_VERSIONING_BLOCK.to_string(),
+                ::serde_json::json!({ "status": versioning }),
+            ),
+            (
+                BUCKET_ENCRYPTION_BLOCK.to_string(),
+                ::serde_json::json!({
+                    "rules": algorithms
+                        .iter()
+                        .map(|algorithm| ::serde_json::json!({
+                            "applyServerSideEncryptionByDefault": {
+                                "sseAlgorithm": algorithm,
+                            },
+                        }))
+                        .collect::<Vec<::serde_json::Value>>(),
+                }),
+            ),
+        ]);
+        RecordedResource {
+            resource_type: S3_BUCKET_RESOURCE_TYPE.to_string(),
+            resource_id: name.to_string(),
+            recorded: RecordedConfiguration {
+                configuration: ::serde_json::json!({ "name": name }),
+                supplementary,
+            },
+            captured_at: SystemTime::UNIX_EPOCH,
+            tags: tags
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        }
+    }
+
+    /// One row of the verdict table: what it is called, the managed rule's identifier,
+    /// the bucket's recorded versioning status, its default encryption algorithms and
+    /// the verdict the rule must place it at.
+    type VerdictCase = (
+        &'static str,
+        &'static str,
+        Option<&'static str>,
+        &'static [&'static str],
+        &'static str,
+    );
+
+    /// Each managed rule's verdict comes from the configuration item's own members, so
+    /// the rows differ along what the recorder recorded: the versioning status (never
+    /// set, suspended, enabled) and the default encryption algorithms (none, one).
+    ///
+    /// `S3_BUCKET_SERVER_SIDE_ENCRYPTION_ENABLED` is the entry this issue did not cite.
+    #[test]
+    fn a_managed_rule_places_a_recorded_resource_from_its_configuration_item() {
+        let cases: [VerdictCase; 8] = [
+            (
+                "versioning never set",
+                "S3_BUCKET_VERSIONING_ENABLED",
+                None,
+                &[],
+                COMPLIANCE_TYPE_NON_COMPLIANT,
+            ),
+            (
+                "versioning suspended",
+                "S3_BUCKET_VERSIONING_ENABLED",
+                Some("Suspended"),
+                &[],
+                COMPLIANCE_TYPE_NON_COMPLIANT,
+            ),
+            (
+                "versioning enabled",
+                "S3_BUCKET_VERSIONING_ENABLED",
+                Some("Enabled"),
+                &[],
+                COMPLIANCE_TYPE_COMPLIANT,
+            ),
+            (
+                "versioning enabled and the bucket encrypted",
+                "S3_BUCKET_VERSIONING_ENABLED",
+                Some("Enabled"),
+                &["AES256"],
+                COMPLIANCE_TYPE_COMPLIANT,
+            ),
+            (
+                "no default encryption",
+                "S3_BUCKET_SERVER_SIDE_ENCRYPTION_ENABLED",
+                None,
+                &[],
+                COMPLIANCE_TYPE_NON_COMPLIANT,
+            ),
+            (
+                "SSE-S3 default encryption",
+                "S3_BUCKET_SERVER_SIDE_ENCRYPTION_ENABLED",
+                None,
+                &["AES256"],
+                COMPLIANCE_TYPE_COMPLIANT,
+            ),
+            (
+                "SSE-KMS default encryption",
+                "S3_BUCKET_SERVER_SIDE_ENCRYPTION_ENABLED",
+                Some("Enabled"),
+                &["aws:kms"],
+                COMPLIANCE_TYPE_COMPLIANT,
+            ),
+            (
+                "an encryption rule naming no algorithm",
+                "S3_BUCKET_SERVER_SIDE_ENCRYPTION_ENABLED",
+                None,
+                &[""],
+                COMPLIANCE_TYPE_NON_COMPLIANT,
+            ),
+        ];
+
+        for (case, identifier, versioning, algorithms, expected) in cases {
+            let managed = MANAGED_RULES
+                .iter()
+                .find(|managed| managed.identifier == identifier)
+                .unwrap_or_else(|| panic!("case {case:?}: {identifier} is not in the catalogue"));
+            let recorded = bucket("a-bucket", versioning, algorithms, &[]);
+            let placed = (managed.verdict)(&recorded.recorded);
+            assert_eq!(
+                placed, expected,
+                "case {case:?}: expected {identifier} to place the bucket at {expected}, \
+                 got {placed:?}"
+            );
+        }
+    }
+
+    /// Only a rule Amazon Web Services owns and whose implementation is in the
+    /// catalogue is evaluated; the rows differ along the owner and the identifier.
+    #[test]
+    fn a_rule_this_emulator_cannot_evaluate_has_no_managed_implementation() {
+        let cases: [(&str, &str, Option<&str>, bool); 5] = [
+            ("a managed rule in the catalogue", OWNER_AWS, Some("S3_BUCKET_VERSIONING_ENABLED"), true),
+            (
+                "the same identifier, whitespace padded",
+                OWNER_AWS,
+                Some(" S3_BUCKET_VERSIONING_ENABLED "),
+                true,
+            ),
+            (
+                "a managed rule this emulator cannot evaluate",
+                OWNER_AWS,
+                Some("IAM_PASSWORD_POLICY"),
+                false,
+            ),
+            (
+                "a custom Lambda rule",
+                "CUSTOM_LAMBDA",
+                Some("arn:aws:lambda:us-east-1:000000000000:function:judge"),
+                false,
+            ),
+            ("a rule with no source identifier", OWNER_AWS, None, false),
+        ];
+
+        for (case, owner, identifier, expected) in cases {
+            let source = Source {
+                owner: owner.to_string(),
+                source_identifier: identifier.map(ToString::to_string),
+                source_details: None,
+                custom_policy_details: None,
+            };
+            let found = managed_rule_of(&source).is_some();
+            assert_eq!(
+                found, expected,
+                "case {case:?}: expected an implementation to be found: {expected}, got {found}"
+            );
+        }
+    }
+
+    /// A rule's scope is what decides WHICH recorded resources it places; the rows
+    /// differ along which member of the scope narrows and whether the resource matches.
+    #[test]
+    fn a_scope_covers_the_recorded_resources_it_narrows_to() {
+        let recorded = bucket(
+            "the-bucket",
+            Some("Enabled"),
+            &["AES256"],
+            &[("stage", "prod")],
+        );
+        let scope = |types: Option<&[&str]>, id: Option<&str>, tag: Option<(&str, &str)>| Scope {
+            compliance_resource_types: types
+                .map(|types| types.iter().map(ToString::to_string).collect()),
+            compliance_resource_id: id.map(ToString::to_string),
+            tag_key: tag.map(|(key, _)| key.to_string()),
+            tag_value: tag.map(|(_, value)| value.to_string()),
+            // Narrows nothing: see [`scope_covers_recorded`].
+            service_principals: None,
+        };
+        let cases: [(&str, Option<Scope>, bool); 8] = [
+            ("no scope at all", None, true),
+            (
+                "the resource type it records",
+                Some(scope(Some(&[S3_BUCKET_RESOURCE_TYPE]), None, None)),
+                true,
+            ),
+            (
+                "another resource type",
+                Some(scope(Some(&["AWS::SQS::Queue"]), None, None)),
+                false,
+            ),
+            (
+                "the resource type and this resource's id",
+                Some(scope(Some(&[S3_BUCKET_RESOURCE_TYPE]), Some("the-bucket"), None)),
+                true,
+            ),
+            (
+                "the resource type and another resource's id",
+                Some(scope(
+                    Some(&[S3_BUCKET_RESOURCE_TYPE]),
+                    Some("another-bucket"),
+                    None,
+                )),
+                false,
+            ),
+            (
+                "a tag the resource carries, with its value",
+                Some(scope(None, None, Some(("stage", "prod")))),
+                true,
+            ),
+            (
+                "a tag the resource carries, with another value",
+                Some(scope(None, None, Some(("stage", "dev")))),
+                false,
+            ),
+            (
+                "a tag the resource does not carry",
+                Some(scope(None, None, Some(("owner", "platform")))),
+                false,
+            ),
+        ];
+
+        for (case, scope, expected) in cases {
+            let covers = scope_covers_recorded(scope.as_ref(), &recorded);
+            assert_eq!(
+                covers, expected,
+                "case {case:?}: expected the scope to cover the recorded bucket: \
+                 {expected}, got {covers}"
+            );
+        }
+    }
+}

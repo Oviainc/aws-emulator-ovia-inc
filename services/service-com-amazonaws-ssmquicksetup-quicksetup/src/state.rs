@@ -397,8 +397,48 @@ pub fn comma_separated(value: Option<&str>) -> Vec<String> {
     entries
 }
 
-/// Where a configuration definition whose parameters name `target_regions` and
-/// `target_accounts` is deployed: ONE target per targeted account and Region pair.
+/// A configuration definition's `Parameters`, whichever map holds them.
+///
+/// `ConfigurationParametersMap` reaches a handler as a `HashMap` on the modelled input
+/// and is stored as a [`BTreeMap`] on the record, and what a parameter MEANS is the
+/// same either way, so the rules below read a definition's parameters through this one
+/// accessor rather than through whichever map the caller happens to hold.
+pub trait ConfigurationParameters {
+    /// The value the parameter `key` carries, or `None` when the definition names no
+    /// such parameter.
+    fn parameter(&self, key: &str) -> Option<&str>;
+}
+
+impl ConfigurationParameters for HashMap<String, String> {
+    fn parameter(&self, key: &str) -> Option<&str> {
+        self.get(key).map(String::as_str)
+    }
+}
+
+impl ConfigurationParameters for BTreeMap<String, String> {
+    fn parameter(&self, key: &str) -> Option<&str> {
+        self.get(key).map(String::as_str)
+    }
+}
+
+/// The deployment-target parameters `parameters` names: the [`PARAMETER_TARGET_REGIONS`]
+/// value and the [`PARAMETER_TARGET_ACCOUNTS`] value, each `None` when the definition
+/// carries no such parameter.
+///
+/// The one place the extraction lives, so the refusal and the fan-out below take a
+/// definition's targets from the same parameter keys: which keys name a target is a
+/// change here, not in each handler that writes a definition.
+fn deployment_target_parameters<P: ConfigurationParameters + ?Sized>(
+    parameters: &P,
+) -> (Option<&str>, Option<&str>) {
+    (
+        parameters.parameter(PARAMETER_TARGET_REGIONS),
+        parameters.parameter(PARAMETER_TARGET_ACCOUNTS),
+    )
+}
+
+/// Where a configuration definition carrying `parameters` is deployed: ONE target per
+/// targeted account and Region pair.
 ///
 /// A Quick Setup configuration definition names where it is deployed through its
 /// parameters, and the service deploys one configuration per targeted account and
@@ -407,12 +447,12 @@ pub fn comma_separated(value: Option<&str>) -> Vec<String> {
 /// manager that owns it, and one naming no account is deployed in `local_account` —
 /// the single account this emulator serves, which is also the only account the
 /// organizational units a definition may target instead could resolve to here.
-pub fn deployment_targets(
-    target_regions: Option<&str>,
-    target_accounts: Option<&str>,
+pub fn deployment_targets<P: ConfigurationParameters + ?Sized>(
+    parameters: &P,
     local_account: &str,
     local_region: &str,
 ) -> Vec<DeploymentTarget> {
+    let (target_regions, target_accounts) = deployment_target_parameters(parameters);
     let mut regions = comma_separated(target_regions);
     if regions.is_empty() {
         regions.push(local_region.to_string());
@@ -432,19 +472,22 @@ pub fn deployment_targets(
         .collect()
 }
 
-/// Why the deployment targets a configuration definition's parameters name cannot be
+/// Why the deployment targets a configuration definition's `parameters` name cannot be
 /// served, or `None` when they can.
 ///
 /// `ConfigurationParametersMap` bounds each key and value but says nothing about what
 /// a value means, so both rules live here: a targeted account is named by its account
 /// id, and the number of account-and-Region deployments one definition fans out to is
 /// bounded by [`MAX_DEPLOYMENT_TARGETS`]. The one place the rule lives, so a create
-/// and an update refuse the same target sets.
-pub fn deployment_targets_rejection(
+/// and an update refuse the same target sets — and, reading the same parameters
+/// [`deployment_targets`] deploys from, refuse exactly the sets that cannot be
+/// deployed. `member` labels the request member the parameters arrived on, so the
+/// refusal names what the caller sent.
+pub fn deployment_targets_rejection<P: ConfigurationParameters + ?Sized>(
     member: &str,
-    target_regions: Option<&str>,
-    target_accounts: Option<&str>,
+    parameters: &P,
 ) -> Option<String> {
+    let (target_regions, target_accounts) = deployment_target_parameters(parameters);
     let accounts = comma_separated(target_accounts);
     if let Some(malformed) = accounts.iter().find(|account| {
         account.len() != ACCOUNT_ID_DIGITS || !account.bytes().all(|b| b.is_ascii_digit())

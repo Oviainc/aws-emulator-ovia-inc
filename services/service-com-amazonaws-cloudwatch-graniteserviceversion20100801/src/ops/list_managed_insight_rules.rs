@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListManagedInsightRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListManagedInsightRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListManagedInsightRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the managed Contributor Insights rules this account holds for one Amazon Web
+//! Services resource, page by page. Implemented here, and the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -91,9 +85,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatch-graniteservi
 // here — hence the `ListManagedInsightRulesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#ListManagedInsightRules")]
+//
+// `InternalServiceFault` — "Request processing has failed due to some unknown error,
+// exception, or failure." — is widened in through `extra_errors`: this SERVICE models the
+// shape (and other operations declare it), but this operation's own `errors` list omits it,
+// and an unreachable shared store has to be reportable as the server failure it is rather
+// than as a parameter fault the caller could act on.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#ListManagedInsightRules",
+    extra_errors = ["InternalServiceFault"]
+)]
 #[derive(Debug)]
 pub enum ListManagedInsightRulesErrorModeled {
+    InternalServiceFault(InternalServiceFault),
     InvalidNextToken(InvalidNextToken),
     InvalidParameterValueException(InvalidParameterValueException),
     MissingRequiredParameterException(MissingRequiredParameterException),
@@ -150,18 +154,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListManagedInsightRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListManagedInsightRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListManagedInsightRules"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListManagedInsightRulesErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some(
+                    "the CloudWatch Contributor Insights rule store is unavailable".into(),
+                ),
+            })
+        })?;
+
+        // "The ARN of an Amazon Web Services resource that has managed Contributor Insights
+        // rules." (`ListManagedInsightRulesInput$ResourceARN`) — the model constrains the
+        // member only as a 1..1024 string, so what makes it an ARN is read here. A value that
+        // is not one names no resource a managed rule could belong to.
+        if let Some(message) = crate::state::resource_arn_error(&input.resource_arn) {
+            return Err(
+                ListManagedInsightRulesErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The maximum number of results to return in one operation. If you omit this
+        // parameter, the default number is used. The default number is 100."
+        // (`ListManagedInsightRulesInput$MaxResults`) — the member's modelled 1..500 range is
+        // enforced by the boundary validator before this handler runs, so a value that somehow
+        // arrives outside it is read at the nearest modelled bound rather than at the default:
+        // a zero can never make the page empty and the paging non-terminating.
+        let page_size = match input.max_results {
+            None => DEFAULT_MAX_RESULTS,
+            Some(requested) => usize::try_from(requested)
+                .unwrap_or(MIN_MAX_RESULTS)
+                .clamp(MIN_MAX_RESULTS, MAX_MAX_RESULTS),
+        };
+
+        // "Include this value to get the next set of rules if the value was returned by the
+        // previous operation." (`ListManagedInsightRulesInput$NextToken`) — a token this
+        // service did not issue is the `InvalidNextToken` this operation models.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListManagedInsightRulesErrorModeled::InvalidNextToken(InvalidNextToken {
+                    message: Some("NextToken is not a token this service issued".into()),
+                })
+            })?),
+        };
+
+        let store = state.lock();
+        let rules = store.managed_insight_rules_for(&input.resource_arn);
+        // The cursor names the (template, rule) pair the next page starts at, so a page
+        // follows the previous one under the total order the store reports the rules in.
+        let cursors: Vec<String> = rules
+            .iter()
+            .map(|(name, stored)| page_cursor(crate::state::template_name_of(stored), name))
+            .collect();
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => cursors.partition_point(|at| at.as_str() < cursor),
+        };
+        let next_token = cursors
+            .get(from.saturating_add(page_size))
+            .map(|cursor| crate::state::encode_page_token(cursor));
+
+        let managed_rules: Vec<ManagedRuleDescription> = rules
+            .get(from..)
+            .unwrap_or_default()
+            .iter()
+            .take(page_size)
+            .map(|(name, stored)| {
+                let origin = stored.managed.as_ref();
+                ManagedRuleDescription {
+                    // "The template name for the managed rule. Used to enable managed rules
+                    // using PutManagedInsightRules." (`ManagedRuleDescription$TemplateName`)
+                    template_name: origin.map(|origin| origin.template_name.clone()),
+                    // "If a managed rule is enabled, this is the ARN for the related Amazon
+                    // Web Services resource." (`ManagedRuleDescription$ResourceARN`)
+                    resource_arn: origin.map(|origin| origin.resource_arn.clone()),
+                    // "Describes the state of a managed rule. If present, it contains
+                    // information about the Contributor Insights rule that contains
+                    // information about the related Amazon Web Services resource."
+                    // (`ManagedRuleDescription$RuleState`) — the rule exists, so what is
+                    // reported is the rule's own name and the state the store holds it in,
+                    // whichever operation last moved that state.
+                    rule_state: Some(ManagedRuleState {
+                        rule_name: (*name).clone(),
+                        state: stored.rule.state.clone(),
+                    }),
+                }
+            })
+            .collect();
+
+        Ok(ListManagedInsightRulesOutput {
+            managed_rules: Some(managed_rules),
+            next_token,
+        })
     }
+}
+
+/// "If you omit this parameter, the default number is used. The default number is 100."
+/// (`ListManagedInsightRulesInput$MaxResults`)
+const DEFAULT_MAX_RESULTS: usize = 100;
+
+/// `MaxResults`'s modelled minimum (range 1..500).
+const MIN_MAX_RESULTS: usize = 1;
+
+/// `MaxResults`'s modelled maximum (range 1..500).
+const MAX_MAX_RESULTS: usize = 500;
+
+/// The pagination cursor of one reported rule: its template name and its rule name, joined by
+/// a space.
+///
+/// A space cannot appear in a `TemplateName`
+/// (`^[0-9A-Za-z][\-\.\_0-9A-Za-z]{0,126}[0-9A-Za-z]$`) and sorts below every character that
+/// can, so ordering the joined cursors is exactly ordering the (template name, rule name)
+/// pairs — which is what lets the next page start at the first cursor at or above the one the
+/// token carries.
+fn page_cursor(template_name: &str, rule_name: &str) -> String {
+    format!("{template_name} {rule_name}")
 }

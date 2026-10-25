@@ -19,6 +19,8 @@ mod asset_instances;
 mod availability_zone_identity;
 #[path = "all/blocking_instances.rs"]
 mod blocking_instances;
+#[path = "all/capacity_task_dry_run.rs"]
+mod capacity_task_dry_run;
 #[path = "all/capacity_task_lifecycle.rs"]
 mod capacity_task_lifecycle;
 #[path = "all/catalog_items.rs"]

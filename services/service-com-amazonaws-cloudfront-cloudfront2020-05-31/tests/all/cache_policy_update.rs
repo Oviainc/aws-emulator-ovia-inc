@@ -51,7 +51,10 @@ use crate::response_headers_policy_lifecycle::text;
 
 /// `PUT /2020-05-31/cache-policy/{Id}` with the `CachePolicyConfig` document `body` and the
 /// `If-Match` header `if_match` (left off entirely when `None`).
-async fn update_policy(
+///
+/// `pub(crate)` so a sibling suite that updates a cache policy goes over the same wire path
+/// rather than growing a copy of this.
+pub(crate) async fn update_policy(
     router: &MultiServiceRouter,
     id: &str,
     body: &str,

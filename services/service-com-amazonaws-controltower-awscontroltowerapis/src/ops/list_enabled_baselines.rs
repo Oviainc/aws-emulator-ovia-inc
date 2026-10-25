@@ -8,14 +8,18 @@
 //! one the call that applied it persisted, and an enablement the clock has torn down is
 //! gone from it.
 //!
-//! Two filter members select by something this service holds no value for. An
+//! One filter member selects by something this service holds no value for. An
 //! `EnabledBaseline` here is applied directly to its target and this service records no
 //! organizational hierarchy, so no enablement is the child of another one
 //! (`parentIdentifier` absent) and `includeChildren` — which asks for the enablements the
-//! target's member accounts inherited — widens the listing by nothing. No drift is
-//! assessed either, which is why `GetEnabledBaseline` reports no `driftStatusSummary` for
-//! one. An absent value is selected only by an absent filter, so filtering on either
-//! member selects nothing rather than inventing a parent or a drift status to match it.
+//! target's member accounts inherited — widens the listing by nothing. An absent value is
+//! selected only by an absent filter, so filtering on `parentIdentifiers` selects nothing
+//! rather than inventing a parent to match it.
+//!
+//! `inheritanceDriftStatuses` DOES select, on the drift status the enablement carries —
+//! the same one `GetEnabledBaseline` reports — so an enablement of a baseline AWS assesses
+//! no inheritance drift on, or one whose deployment is not due yet, carries no status and
+//! is selected only when that filter is absent.
 //!
 //! Implemented: this operation no longer answers HTTP 501.
 //!
@@ -232,12 +236,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 selected(&target_identifiers, &enabled_baseline.target_identifier)
                     && selected(&baseline_identifiers, &enabled_baseline.baseline_identifier)
                     && selected(&statuses, enabled_baseline.status.as_wire())
-                    // Neither a parent enablement nor an inheritance drift status is
-                    // recorded for an enablement here, so a filter on one selects nothing:
-                    // see the module header, and `includeChildren`, which adds nothing to
-                    // this set because there is no hierarchy to widen it with.
+                    // An enablement whose inheritance drift is not assessed has no status
+                    // for this filter to match, so only an absent filter selects it; see
+                    // the module header, and `parentIdentifiers`, which no enablement here
+                    // has a value for at all — nor does `includeChildren` widen this set,
+                    // because there is no hierarchy to widen it with.
+                    && match enabled_baseline.inheritance_drift_status {
+                        Some(status) => {
+                            selected(&inheritance_drift_statuses, status.as_wire())
+                        }
+                        None => selects_an_absent_value(&inheritance_drift_statuses),
+                    }
                     && selects_an_absent_value(&parent_identifiers)
-                    && selects_an_absent_value(&inheritance_drift_statuses)
             })
             .collect();
         enabled.sort_by(|left, right| left.arn.cmp(&right.arn));
@@ -280,11 +290,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 arn: enabled_baseline.arn.clone(),
                 baseline_identifier: enabled_baseline.baseline_identifier.clone(),
                 baseline_version: Some(enabled_baseline.baseline_version.clone()),
-                // No drift is assessed and no parent enablement is recorded, so both
-                // optional members are absent rather than invented — the same two members
-                // `GetEnabledBaseline` leaves absent for the same resource.
-                drift_status_summary: None,
+                // The drift summary `GetEnabledBaseline` reports for the same resource,
+                // read from the same stored status: absent when no inheritance drift is
+                // assessed for the enablement.
+                drift_status_summary: enabled_baseline.inheritance_drift_status.map(|status| {
+                    EnabledBaselineDriftStatusSummary {
+                        types: Some(EnabledBaselineDriftTypes {
+                            inheritance: Some(EnabledBaselineInheritanceDrift {
+                                status: Some(status.as_wire().to_string()),
+                            }),
+                        }),
+                    }
+                }),
                 target_identifier: enabled_baseline.target_identifier.clone(),
+                // Every enablement here is an OU-level one, so none inherits from a parent.
                 parent_identifier: None,
                 status_summary: EnablementStatusSummary {
                     status: Some(enabled_baseline.status.as_wire().to_string()),

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDashboard
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDashboard`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDashboard::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: rewrites the stored IoT SiteWise Monitor dashboard the request
+//! names with the name, description and definition it states;
+//! `DescribeDashboard` reads the result back.
 //!
 //! ## Shape of an operation
 //!
@@ -157,20 +151,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDashboard` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDashboardErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDashboard"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateDashboardError::Modeled(UpdateDashboardErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // `clientToken` is NOT honoured for idempotent replay: this change stores no
+        // token -> answer mapping, so a retry with the same token writes the
+        // dashboard a second time rather than replaying the first answer. Left to the
+        // idempotency issue, exactly as `UpdateAccessPolicy` leaves it.
+        let mut store = state.lock();
+
+        let dashboard = store
+            .dashboards
+            .get_mut(&input.dashboard_id)
+            .ok_or_else(|| not_found(&input.dashboard_id))?;
+
+        // The request describes the dashboard's NEW state: its name and definition
+        // are required and its description is the one optional member, so an omitted
+        // description clears the stored one rather than keeping it. What the request
+        // does not carry — the dashboard's id, ARN, project, tags and creation date —
+        // is not this call's to change.
+        dashboard.apply_update(
+            input.dashboard_name,
+            input.dashboard_description,
+            input.dashboard_definition,
+            now,
+        );
+
+        Ok(UpdateDashboardOutput {})
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the id that resolved to nothing, in
+/// the one wording every not-found refusal in this service carries.
+fn not_found(dashboard_id: &str) -> UpdateDashboardError {
+    UpdateDashboardError::Modeled(UpdateDashboardErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(
+                crate::state::RESOURCE_DASHBOARD,
+                dashboard_id,
+            ),
+        },
+    ))
 }

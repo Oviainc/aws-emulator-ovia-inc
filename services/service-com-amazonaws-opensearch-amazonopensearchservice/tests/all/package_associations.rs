@@ -44,11 +44,12 @@ use super::domain_lifecycle::{create_baseline, error_code, Answer, Emulator, PRE
 
 /// A role ARN for the key-store configuration: `RoleArn` is `@length(min: 20, max:
 /// 2048)` with pattern `^arn:(aws|aws\-cn|aws\-us\-gov|aws\-iso|aws\-iso\-b):iam::[0-9]+:role\/`.
-const KEY_ACCESS_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/opensearch-key-store";
+pub(crate) const KEY_ACCESS_ROLE_ARN: &str =
+    "arn:aws:iam::000000000000:role/opensearch-key-store";
 
 /// A `PackageID` of the form the model's pattern admits
 /// (`^([FG][0-9]+)$|^(pkg-[a-f0-9]+)$`) that no create in these tests minted.
-const UNKNOWN_PACKAGE_ID: &str = "pkg-00000000000000000000000000000000";
+pub(crate) const UNKNOWN_PACKAGE_ID: &str = "pkg-00000000000000000000000000000000";
 
 /// `AssociatePackages`: `POST /2021-01-01/packages/associateMultiple`.
 async fn associate(emulator: &Emulator, body: Value) -> Answer {
@@ -63,7 +64,7 @@ async fn associate(emulator: &Emulator, body: Value) -> Answer {
 
 /// `CreatePackage` for `name` with type `package_type`, answering with the
 /// `PackageID` it minted.
-async fn create_package(emulator: &Emulator, name: &str, package_type: &str) -> String {
+pub(crate) async fn create_package(emulator: &Emulator, name: &str, package_type: &str) -> String {
     let case = format!("CreatePackage({name:?}, {package_type:?})");
     let answer = emulator
         .call(
@@ -111,7 +112,7 @@ fn associated(answer: &Answer, case: &str) -> Vec<Value> {
 
 /// A required string member of a `DomainPackageDetails`, with the case named on
 /// failure.
-fn member(details: &Value, name: &str, case: &str) -> String {
+pub(crate) fn member(details: &Value, name: &str, case: &str) -> String {
     details[name]
         .as_str()
         .unwrap_or_else(|| panic!("case {case}: expected a string {name}, got {details:?}"))
@@ -125,7 +126,7 @@ fn member(details: &Value, name: &str, case: &str) -> String {
 /// `ListPackagesForDomain` is still a stub, so this is how a case asserts what was
 /// persisted. It passes the current instant, so a status move the clock already owed
 /// is materialised by the read exactly as a handler's read of it would be.
-fn stored_status(emulator: &Emulator, domain: &str, package_id: &str) -> Option<String> {
+pub(crate) fn stored_status(emulator: &Emulator, domain: &str, package_id: &str) -> Option<String> {
     let store = emulator.store();
     let mut guard = store.lock();
     let now = SystemTime::now();
@@ -166,7 +167,7 @@ fn plain(package: usize) -> Entry {
 /// every type a package can have. The value set is this service's Smithy model's
 /// (`smithy_query(query="shape",shape="PackageType")`), and
 /// [`every_package_type_is_covered`] pins it against `PACKAGE_TYPE_VALUES`.
-const PACKAGE_TYPES: [&str; 4] = [
+pub(crate) const PACKAGE_TYPES: [&str; 4] = [
     "TXT-DICTIONARY",
     "ZIP-PLUGIN",
     "PACKAGE-CONFIG",
@@ -179,7 +180,7 @@ const PACKAGE_TYPES: [&str; 4] = [
 /// The wait is the copy span `CreatePackage` leaves a package in `COPYING` for: a
 /// package can be put on a domain only once its content is in place, which
 /// [`a_package_whose_content_is_not_in_place_yet_cannot_be_associated`] asserts.
-async fn available_packages(emulator: &Emulator) -> Vec<String> {
+pub(crate) async fn available_packages(emulator: &Emulator) -> Vec<String> {
     let mut ids = Vec::with_capacity(PACKAGE_TYPES.len());
     for (index, package_type) in PACKAGE_TYPES.iter().enumerate() {
         ids.push(create_package(emulator, &format!("package-{index}"), package_type).await);
@@ -703,6 +704,12 @@ async fn a_request_that_cannot_be_served_associates_nothing() {
             }),
             400,
             "ValidationException",
+        ),
+        (
+            "a domain nothing created, naming no package at all",
+            json!({ "DomainName": "assoc-no-such-domain", "PackageList": [] }),
+            409,
+            "ResourceNotFoundException",
         ),
     ];
 

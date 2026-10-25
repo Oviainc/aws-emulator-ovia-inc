@@ -105,7 +105,10 @@ async fn a_refused_input_of_any_operation_is_named_by_its_reason() {
         Rejection {
             case: "a page size under its minimum, on the search",
             operation: "SearchAgreements",
-            body: json!({"maxResults": 0}),
+            body: json!({
+                "maxResults": 0,
+                "filters": [{"name": "AgreementType", "values": ["PurchaseAgreement"]}],
+            }),
             reason: "INVALID_MAX_RESULTS",
             message: "Provided max results is invalid.",
         },
@@ -187,8 +190,17 @@ async fn a_refused_input_of_any_operation_is_named_by_its_reason() {
 async fn the_published_page_size_bounds_are_served() {
     let router = emulator();
     for operation in ["SearchAgreements", "ListBillingAdjustmentRequests"] {
+        // `SearchAgreements` requires the agreement-type filter of every
+        // search, so each row carries it: the rule under test is the page size.
+        let required = |page_size: i64| match operation {
+            "SearchAgreements" => json!({
+                "maxResults": page_size,
+                "filters": [{"name": "AgreementType", "values": ["PurchaseAgreement"]}],
+            }),
+            _ => json!({"maxResults": page_size}),
+        };
         for accepted in [1, 25, 50] {
-            let answer = call(&router, operation, json!({"maxResults": accepted})).await;
+            let answer = call(&router, operation, required(accepted)).await;
             if operation == "SearchAgreements" {
                 // An implemented report: a served bound answers the report
                 // itself, so anything but 200 is a failure.
@@ -210,7 +222,7 @@ async fn the_published_page_size_bounds_are_served() {
             }
         }
         for refused in [0, 51] {
-            let answer = call(&router, operation, json!({"maxResults": refused})).await;
+            let answer = call(&router, operation, required(refused)).await;
             assert_eq!(
                 answer.status, 400,
                 "case {operation} with maxResults {refused}: expected HTTP 400, got {} with {:?}",
