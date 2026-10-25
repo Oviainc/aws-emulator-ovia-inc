@@ -6,6 +6,11 @@
 //! narrowed by `ShardFilter`. An ARN no stream is registered under is
 //! `ResourceNotFoundException`, never a success with an empty description.
 //!
+//! The shards reported are the ones the stream SERVES at this instant: a stream whose
+//! asynchronous enable has not fallen due yet reports `ENABLING` and lists no shard,
+//! so a consumer that waits for shards before it reads is never handed a stream that
+//! still reports itself as being enabled.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -177,6 +182,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // The shards are the ones the stream SERVES at this instant
+        // (`StoredStream::shards_at`): a stream whose asynchronous enable is not due
+        // yet reports `ENABLING` and lists none, so the status a consumer gates on
+        // and the shards it would read cannot disagree.
+        //
         // `ShardFilter` currently has exactly one type, `CHILD_SHARDS`: "Contains the
         // shardId of the parent shard for which you are requesting child shards."
         // Neither member is `@required`, so a filter missing one is refused here.
@@ -200,12 +210,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ));
                 };
                 stream
-                    .shards
+                    .shards_at(now)
                     .iter()
                     .filter(|shard| shard.parent_shard_id.as_deref() == Some(parent_shard_id))
                     .collect()
             }
-            None => stream.shards.iter().collect(),
+            None => stream.shards_at(now).iter().collect(),
         };
 
         let start_at = match &input.exclusive_start_shard_id {

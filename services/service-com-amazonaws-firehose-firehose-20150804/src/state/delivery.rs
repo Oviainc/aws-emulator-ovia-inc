@@ -1217,6 +1217,9 @@ fn write_objects<Eng: Send + Sync + 'static>(engine: &Eng, objects: Vec<Delivere
             // A delivered object carries no Object Lock retention: a retention is placed
             // on a stored version afterwards, by S3's own `PutObjectRetention`.
             retention: None,
+            // And no restore: a delivered object is stored in a non-archive storage class,
+            // so there is nothing to restore; S3's own `RestoreObject` is what asks for one.
+            restore: None,
         };
         match store.put_object(&object.bucket, &object.key, stored) {
             Some(

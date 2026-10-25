@@ -182,7 +182,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A pure read: nothing is written, so two calls report the same provider. The
         // provider is keyed by the ARN `CreateOpenIDConnectProvider` derived from its URL,
-        // which is the handle this request names it by.
+        // which is the handle this request names it by. "The error message describes the
+        // resource" (`NoSuchEntityException`): IAM describes a missing OIDC provider by the
+        // ARN the request named it with.
         let store = state.lock();
         let Some(provider) = store
             .open_id_connect_providers
@@ -191,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(GetOpenIDConnectProviderErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(format!(
-                        "OpenIDConnectProvider with arn {} does not exist.",
+                        "OpenIDConnect Provider not found for arn {}",
                         input.open_id_connect_provider_arn
                     )),
                 },

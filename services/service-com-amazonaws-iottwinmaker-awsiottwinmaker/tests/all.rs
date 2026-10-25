@@ -62,6 +62,9 @@ mod metadata_transfer_job_listing;
 #[path = "all/metadata_transfer_job_read.rs"]
 mod metadata_transfer_job_read;
 
+#[path = "all/not_found_constructions.rs"]
+mod not_found_constructions;
+
 #[path = "all/page_size_rule.rs"]
 mod page_size_rule;
 
@@ -113,6 +116,9 @@ mod sync_job_delete;
 #[path = "all/sync_job_listing.rs"]
 mod sync_job_listing;
 
+#[path = "all/sync_job_role_trust.rs"]
+mod sync_job_role_trust;
+
 #[path = "all/workspace_built_in_component_types.rs"]
 mod workspace_built_in_component_types;
 
@@ -121,3 +127,6 @@ mod workspace_entity_lifecycle;
 
 #[path = "all/workspace_listing.rs"]
 mod workspace_listing;
+
+#[path = "all/workspace_update.rs"]
+mod workspace_update;

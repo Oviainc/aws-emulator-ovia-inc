@@ -310,3 +310,8 @@ mod list_asset_properties;
 #[path = "all/list_tasks.rs"]
 mod list_tasks;
 
+// Declared last, for the same reason the suites above it are. Fold it into the
+// sorted list once the churn settles.
+#[path = "all/gateway_delete.rs"]
+mod gateway_delete;
+

@@ -46,7 +46,10 @@ use crate::vpc_associations::{
 
 /// Send one `DisassociateVPCFromHostedZone` request carrying `vpc` (a
 /// [`vpc_block`]) and, when given, a `Comment`.
-async fn disassociate(
+///
+/// `pub(crate)` so a sibling suite drives the same request rather than growing
+/// a second copy of its body.
+pub(crate) async fn disassociate(
     router: &MultiServiceRouter,
     zone_id: &str,
     vpc: &str,
@@ -70,7 +73,14 @@ async fn disassociate(
 }
 
 /// Associate `vpc_id` in `region` with `zone_id` and assert it was accepted.
-async fn associate_ok(router: &MultiServiceRouter, zone_id: &str, vpc_id: &str, region: &str) {
+///
+/// `pub(crate)` for the same reason [`disassociate`] is.
+pub(crate) async fn associate_ok(
+    router: &MultiServiceRouter,
+    zone_id: &str,
+    vpc_id: &str,
+    region: &str,
+) {
     let reply = associate(
         router,
         zone_id,

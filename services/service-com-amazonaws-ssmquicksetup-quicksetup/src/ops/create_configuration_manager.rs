@@ -197,6 +197,21 @@ fn definitions_rejection(input: &CreateConfigurationManagerInput) -> Option<Stri
         )
     })
     .or_else(|| {
+        // `TagsMap`'s key pattern admits `:`, so it admits a key under the
+        // AWS-reserved prefix as well — a tag that is not the caller's to assign.
+        // `crate::state::reserved_tag_key_rejection` is the one place that rule
+        // lives, shared with every other member of this service that takes tag keys
+        // from the caller.
+        crate::state::reserved_tag_key_rejection(
+            "Tags",
+            input
+                .tags
+                .iter()
+                .flat_map(std::collections::HashMap::keys)
+                .map(String::as_str),
+        )
+    })
+    .or_else(|| {
         // `LocalDeploymentAdministrationRoleArn` is an `IAMRoleArn`, whose
         // `@arnReference` to `AWS::IAM::Role` the model states with no `@pattern` to
         // enforce it; `crate::state::iam_role_arn_rejection` is the one place that

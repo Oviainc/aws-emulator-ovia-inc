@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestoreObject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestoreObject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestoreObject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Initiates the restore of a temporary copy of an ARCHIVED object version — the one
+//! `versionId` names, or the key's current object — and answers 200. The copy is not there
+//! when the call returns: a reader of the object reports `ongoing-request="true"` through
+//! `x-amz-restore` until the retrieval falls due, and then the date the copy is scheduled
+//! to be deleted on, which is `RestoreRequest.Days` days out.
+//!
+//! The STATE the version is in decides whether a restore may be initiated at all: an object
+//! whose storage class is not an archive one has nothing to restore and is refused with
+//! HTTP 403 `InvalidObjectState`, and a version whose retrieval is still running is refused
+//! with HTTP 409 `RestoreAlreadyInProgress`. A restore over one that has already fallen due
+//! is served: it states the lifetime of the copy afresh.
 //!
 //! ## Shape of an operation
 //!
@@ -152,6 +155,12 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 #[smithy_macros::operation_error("com.amazonaws.s3#RestoreObject")]
 #[derive(Debug)]
 pub enum RestoreObjectErrorModeled {
+    // The one error the model declares for this operation. S3's own API reference lists it
+    // for a restore "against this storage tier", but a real restore of an object whose
+    // storage class holds nothing to restore is answered `InvalidObjectState` with the
+    // storage-class wording (`crate::state::RESTORE_NOT_ALLOWED_MESSAGE`) — which is what
+    // the handler answers, since a client branches on the code and the message. The variant
+    // stays as the model declares it.
     ObjectAlreadyInActiveTierError(ObjectAlreadyInActiveTierError),
 }
 
@@ -207,17 +216,265 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestoreObject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestoreObjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestoreObject"))
+        // request metadata only, and this write needs nothing from it.
+        let _ = ctx;
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // bucket, the request fails with the HTTP status code 403 Forbidden (access
+        // denied)" — `RestoreObjectRequest$ExpectedBucketOwner`, judged the way every other
+        // handler here judges it: this emulator serves one account, so the owner of every
+        // bucket it holds is that account.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                ACCESS_DENIED_MESSAGE,
+            ));
+        }
+
+        // The members that ask for the OTHER kind of request this operation serves — a
+        // restore whose output is a SELECT over the object's bytes, written to another
+        // location ("Amazon S3 Select is no longer available to new customers",
+        // `RestoreRequest$Type`). Each of them needs a query engine and a second write this
+        // emulator performs nothing of, and a 200 would claim a job nothing ran, so the
+        // request is refused as unwritten rather than quietly answered as a plain restore.
+        if let Some(request) = input.restore_request.as_ref() {
+            for (member, present) in [
+                ("Type", request.r#type.is_some()),
+                ("SelectParameters", request.select_parameters.is_some()),
+                ("OutputLocation", request.output_location.is_some()),
+            ] {
+                if present {
+                    return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                        "RestoreObject with RestoreRequest.{member}"
+                    )));
+                }
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Without the store nothing can be restored and nothing can be reported about
+            // the object, and the one modelled error here would be a false statement about
+            // it, so the code S3 answers a request it could not carry out at all goes out
+            // instead.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INTERNAL_ERROR_CODE,
+                crate::state::INTERNAL_ERROR_STATUS,
+                "the shared store is unreachable, so no restore could be initiated",
+            ));
+        };
+
+        let mut store = state.lock();
+        let version_id = input.version_id.as_deref();
+
+        // The ADDRESS is resolved first, so a request naming a bucket, a key or a version
+        // this emulator does not hold answers that — the way every other object-level
+        // handler here orders its refusals — rather than reporting anything about an object
+        // no version could be.
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NO_SUCH_BUCKET_CODE,
+                404,
+                crate::state::NO_SUCH_BUCKET_MESSAGE,
+            ));
+        };
+        // A delete marker is a version with no object behind it, so there is nothing to
+        // restore: 405, the status S3 answers an object-level call on a marker with, as
+        // `HeadObject` and `PutObjectRetention` already answer it for the same cause.
+        if version_id.is_some_and(|named| {
+            bucket
+                .stored_version(&input.key, named)
+                .is_some_and(|held| held.as_delete_marker().is_some())
+        }) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::METHOD_NOT_ALLOWED_CODE,
+                crate::state::METHOD_NOT_ALLOWED_STATUS,
+                crate::state::METHOD_NOT_ALLOWED_MESSAGE,
+            ));
+        }
+        let Some(object) = bucket.addressed_object(&input.key, version_id) else {
+            let (code, message) = match version_id {
+                Some(_) => (
+                    crate::state::NO_SUCH_VERSION_CODE,
+                    crate::state::NO_SUCH_VERSION_MESSAGE,
+                ),
+                None => (
+                    crate::state::NO_SUCH_KEY_CODE,
+                    crate::state::NO_SUCH_KEY_MESSAGE,
+                ),
+            };
+            return Err(crate::scaffolded::Scaffolded::unmodeled(code, 404, message));
+        };
+
+        // "Restores an archived copy of an object back into Amazon S3": only an object
+        // that IS archived has a copy to restore, so a version in any other storage class
+        // is refused — the state the object is in bars the call, which is what
+        // `InvalidObjectState` reports. The message is the one S3 words for THIS cause (the
+        // same code reports an archived object to a reader with different wording), so it
+        // travels on the unmodelled channel beside its code and the shape's own 403 rather
+        // than through the modelled one, which would word it as the read-time refusal.
+        if !crate::state::ARCHIVED_STORAGE_CLASSES.contains(&object.storage_class.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_OBJECT_STATE_CODE,
+                crate::state::INVALID_OBJECT_STATE_STATUS,
+                crate::state::RESTORE_NOT_ALLOWED_MESSAGE,
+            ));
+        }
+
+        // The restore IN PROGRESS on the addressed version, judged against the clock: a
+        // retrieval that has fallen due is not in progress, and one whose temporary copy has
+        // since expired left the version archived again — both are versions a fresh restore
+        // may be initiated on.
+        let now = ::std::time::SystemTime::now();
+        if object
+            .restore
+            .as_ref()
+            .is_some_and(|restore| restore.in_progress_at(now))
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::RESTORE_ALREADY_IN_PROGRESS_CODE,
+                crate::state::RESTORE_ALREADY_IN_PROGRESS_STATUS,
+                crate::state::RESTORE_ALREADY_IN_PROGRESS_MESSAGE,
+            ));
+        }
+
+        // "The Days element is required for regular restores"
+        // (`RestoreRequest$Days`) — a regular restore is one that names no
+        // `OutputLocation`, which is every restore that reaches here, and without a lifetime
+        // the request describes no job. A document the API's published schema rejects is
+        // `MalformedXML`, the code and 400 this service already answers a schema refusal
+        // with.
+        let Some(days) = input
+            .restore_request
+            .as_ref()
+            .and_then(|request| request.days)
+        else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::MALFORMED_XML_CODE,
+                400,
+                crate::state::MALFORMED_XML_MESSAGE,
+            ));
+        };
+        // `Days` is a plain integer in the model (`RestoreRequest$Days` carries no `@range`,
+        // `smithy_query(query="shape",shape="RestoreRequest")`), so nothing before this
+        // handler refuses a lifetime of zero or fewer days — which is not a lifetime, and
+        // is a value that is not valid for the parameter carrying it.
+        if days < 1 {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_ARGUMENT_CODE,
+                crate::state::INVALID_ARGUMENT_STATUS,
+                format!("Days must be a positive number of days, got {days}"),
+            ));
+        }
+
+        // "When restoring an archived object, you can specify one of the following data
+        // access tier options in the Tier element of the request body", and
+        // `GlacierJobParameters$Tier` names the same tier for a Glacier job — so either
+        // container may carry it, and a request that names neither takes the documented
+        // default. Both target the `Tier` enum, so the boundary validator has already
+        // refused anything outside its values.
+        let tier = input
+            .restore_request
+            .as_ref()
+            .and_then(|request| {
+                request.tier.clone().or_else(|| {
+                    request
+                        .glacier_job_parameters
+                        .as_ref()
+                        .map(|parameters| parameters.tier.clone())
+                })
+            })
+            .unwrap_or_else(|| crate::state::DEFAULT_RESTORE_TIER.to_string());
+
+        // The retrieval starts now and falls due a span later: "you must first initiate a
+        // restore request, and then wait until a temporary copy of the object is available",
+        // so the instant it becomes available is recorded and nothing waits for it here.
+        let restore = crate::state::ObjectRestore {
+            tier,
+            days,
+            available_at: now + crate::state::RESTORE_COMPLETION_DELAY,
+        };
+        // A lifetime so long that the expiry of the copy falls on no date a reader could
+        // report is a value that is not valid for the parameter carrying it: every reader
+        // reports that date, so a restore that cannot be dated is one no reader could
+        // report. Refused here rather than recorded, through the same renderer a reader
+        // uses, so an accepted restore is always reportable.
+        if restore.expiry_date().is_none() {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_ARGUMENT_CODE,
+                crate::state::INVALID_ARGUMENT_STATUS,
+                format!("Days must be a number of days a temporary copy can live for, got {days}"),
+            ));
+        }
+
+        // Recorded through the one place a restore is ever recorded, so it is bounded by
+        // the same byte budgets every other record kept beside an object is — nothing is
+        // written unless the write was taken.
+        match store.restore_object_version(&input.bucket, &input.key, version_id, restore) {
+            Some(crate::state::ObjectRestoreWrite::Applied) => {}
+            // Unreachable through this handler (the address was just resolved under the
+            // same lock), and answered rather than asserted so a future caller of this
+            // state seam cannot turn a vanished address into a panic.
+            None => {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::NO_SUCH_BUCKET_CODE,
+                    404,
+                    crate::state::NO_SUCH_BUCKET_MESSAGE,
+                ))
+            }
+            Some(crate::state::ObjectRestoreWrite::NoSuchObject) => {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::NO_SUCH_KEY_CODE,
+                    404,
+                    crate::state::NO_SUCH_KEY_MESSAGE,
+                ))
+            }
+            // The emulator's own ceilings, not AWS limits, so no AWS error code describes
+            // them: they go out through the framework's 400 refusal channel, the same
+            // channel `PutObjectRetention` uses for the same two budgets.
+            Some(crate::state::ObjectRestoreWrite::ByteBudgetReached { would_hold }) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "restoring {:?} would leave the bucket {:?} holding {would_hold} bytes \
+                     of objects, past the {} bytes this emulator keeps per bucket",
+                    input.key,
+                    input.bucket,
+                    crate::state::MAX_OBJECT_BYTES_PER_BUCKET
+                )));
+            }
+            Some(crate::state::ObjectRestoreWrite::TotalByteBudgetReached { would_hold }) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "restoring {:?} would leave this emulator holding {would_hold} bytes of \
+                     objects across every bucket, past the {} bytes it keeps in total",
+                    input.key,
+                    crate::state::MAX_OBJECT_BYTES_TOTAL
+                )));
+            }
+        }
+
+        Ok(RestoreObjectOutput {
+            // "If present, indicates that the requester was successfully charged for the
+            // request" (`RestoreObjectOutput$RequestCharged`) — Requester Pays is not
+            // emulated, so nobody was charged and nothing is reported.
+            request_charged: None,
+            // "Indicates the path in the provided S3 output location where Select results
+            // will be restored to" (`RestoreObjectOutput$RestoreOutputPath`): only a select
+            // restore has one, and those are refused above, so there is no path to report.
+            restore_output_path: None,
+        })
     }
 }
+
+/// The code S3 answers a request whose `x-amz-expected-bucket-owner` is not the owner of
+/// the bucket it names: "the request fails with the HTTP status code 403 Forbidden (access
+/// denied)" (`RestoreObjectRequest$ExpectedBucketOwner`). Not a shape in this model, so it
+/// goes out through the unmodelled channel — the way `PutObjectRetention` answers the same
+/// header.
+const ACCESS_DENIED_CODE: &str = "AccessDenied";
+/// See [`ACCESS_DENIED_CODE`] — the status that sentence publishes.
+const ACCESS_DENIED_STATUS: u16 = 403;
+/// See [`ACCESS_DENIED_CODE`] — the text Amazon S3 "Error responses" publishes for it.
+const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
