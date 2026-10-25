@@ -21,6 +21,8 @@ mod compositions;
 mod create_ingest_configuration_inputs;
 #[path = "all/delete_ingest_configuration.rs"]
 mod delete_ingest_configuration;
+#[path = "all/delete_stage_associations.rs"]
+mod delete_stage_associations;
 #[path = "all/disconnect_participant.rs"]
 mod disconnect_participant;
 #[path = "all/empty_response_framing.rs"]

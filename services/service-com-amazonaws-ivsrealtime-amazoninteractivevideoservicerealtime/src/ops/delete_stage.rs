@@ -178,6 +178,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store
             .compositions
             .retain(|_, composition| composition.stage_arn != input.arn);
+        // And so does every ingest configuration's association with it: "This operation
+        // also removes the stageArn from the associated IngestConfiguration". The
+        // configuration itself survives — it keeps its ingest key, and a later update can
+        // associate it with another stage — but the association cannot name a stage this
+        // store no longer holds, so it is left at the modelled "no stage" value through
+        // the one place that reading is written.
+        crate::state::disassociate_stage_from_ingest_configurations(&mut store, &input.arn);
         Ok(DeleteStageOutput {})
     }
 }

@@ -363,14 +363,14 @@ fn rows() -> Vec<Row> {
             expect: Expect::Outside("Member must have length less than or equal to 25"),
         },
         Row {
-            // Inside the bound, so the request reaches the operation — which is still a
-            // scaffold stub and answers 501, its own issue and not this constraint's.
+            // Inside the bound, so the request reaches the operation, which writes all
+            // 25 entries and reports no per-entry error.
             case: "BatchWriteRecord with exactly the maximum number of entries",
             method: "POST",
             uri: "/BatchWriteRecord".to_string(),
             body: Some(json!({ "Entries": vec![write_entry(); 25] })),
             path: "entries",
-            expect: Expect::Inside(501, "NotImplemented"),
+            expect: Expect::Inside(200, ""),
         },
         Row {
             case: "BatchWriteRecord with no entries at all",

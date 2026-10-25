@@ -169,8 +169,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A key in the reserved `aws:` namespace names a tag AWS generates, not one a
-        // caller may set. The request is refused before the store is reached, so it
-        // neither replays an idempotency token nor creates an instance.
+        // caller may set, whichever member of the request carried it: the top-level
+        // `Tags` list and the `TagList` of every `ManagedInstance.TagSpecifications`
+        // entry are both caller-supplied tags. The request is refused before the store
+        // is reached, so it neither replays an idempotency token nor creates an
+        // instance.
         crate::state::reject_reserved_tag_keys(
             "Tags",
             input
@@ -180,6 +183,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter_map(|tag| tag.key.as_deref()),
         )
         .map_err(CreateWorkspaceInstanceErrorModeled::ValidationException)?;
+        crate::state::reject_reserved_tag_keys(
+            "TagSpecifications",
+            crate::state::specification_tag_keys(
+                input.managed_instance.tag_specifications.iter().flatten(),
+            ),
+        )
+        .map_err(CreateWorkspaceInstanceErrorModeled::ValidationException)?;
+
+        // Both members that carry caller tags for the resource this call creates are
+        // read: `ManagedInstance.TagSpecifications`, each of whose specifications tags
+        // the new instance when it names `instance` or names no resource type at all,
+        // and the top-level `Tags` list, which names the WorkSpace Instance directly.
+        // The direct member is merged LAST, so where both carry a key its value is the
+        // one stored; within either member a repeated key keeps the last value, which
+        // is what merging onto a map gives.
+        let mut tags = crate::state::tags_in_specifications(
+            crate::state::INSTANCE_TAG_SPECIFICATION_RESOURCE_TYPE,
+            input.managed_instance.tag_specifications.iter().flatten(),
+        );
+        for tag in input.tags.iter().flatten() {
+            if let Some(key) = tag.key.as_deref() {
+                tags.insert(key.to_string(), tag.value.clone().unwrap_or_default());
+            }
+        }
+        // One request's `Tags` is `TagList len 0..50` (the same bound as
+        // `state::MAX_TAGS_PER_INSTANCE`, enforced at the boundary before this runs),
+        // but `TagSpecifications` is a list of up to 30 specifications each carrying
+        // its own `TagList`, so the two members together can name more distinct keys
+        // than the modelled `TagList` `ListTagsForResource` reports them in could
+        // carry. Such a request is refused rather than storing a tag set this service
+        // could not report, exactly as `TagResource` refuses a merge that would grow
+        // the set past the bound — and refused HERE, before the store is reached, so it
+        // neither retires its token nor mints an id. The refusal names the member and
+        // the constraint, and none of what the caller sent.
+        if tags.len() > crate::state::MAX_TAGS_PER_INSTANCE {
+            let why = format!(
+                "the request would leave the WorkSpace Instance holding more than the {} tags a resource can hold",
+                crate::state::MAX_TAGS_PER_INSTANCE
+            );
+            return Err(CreateWorkspaceInstanceErrorModeled::ValidationException(
+                crate::state::field_validation_failed("TagSpecifications", why),
+            )
+            .into());
+        }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateWorkspaceInstanceErrorModeled::InternalServerException(
@@ -250,18 +297,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let (instance_id, ec2_instance_id) = state.mint_ids();
-        // Tags arrive as a list of `Tag{Key, Value}`, both optional in the model; a
-        // repeated key keeps the last value, which is what merging onto a map gives.
-        // One request's list is `TagList len 0..50` (the same bound as
-        // `state::MAX_TAGS_PER_INSTANCE`, enforced at the boundary before this runs), so
-        // the set this builds is already inside what `ListTagsForResource` can report;
-        // `TagResource` is the only path that can grow it and checks the bound itself.
-        let mut tags = std::collections::BTreeMap::new();
-        for tag in input.tags.unwrap_or_default() {
-            if let Some(key) = tag.key {
-                tags.insert(key, tag.value.unwrap_or_default());
-            }
-        }
 
         let record = crate::state::WorkspaceInstanceRecord {
             id: instance_id.clone(),

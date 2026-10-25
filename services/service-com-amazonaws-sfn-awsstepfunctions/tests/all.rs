@@ -41,6 +41,8 @@ mod map_runs;
 mod nested_type_discriminator;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/send_task_failure.rs"]
+mod send_task_failure;
 #[path = "all/state_machine_aliases.rs"]
 mod state_machine_aliases;
 #[path = "all/state_machine_create_options.rs"]

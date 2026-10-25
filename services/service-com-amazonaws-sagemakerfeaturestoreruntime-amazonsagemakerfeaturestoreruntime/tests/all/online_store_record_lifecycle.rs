@@ -1403,12 +1403,12 @@ async fn the_online_store_refuses_a_write_past_its_capacity_bound() {
 }
 
 #[tokio::test]
-async fn the_operations_this_slice_does_not_implement_still_answer_501() {
+async fn every_operation_of_this_slice_answers_from_the_store() {
     let emulator = Emulator::new();
 
-    // BatchWriteRecord is left to its own issue: a stub answers 501, never an empty 200.
-    // (`UpdateRecord` is implemented — see `tests/all/update_record_partial_update.rs`
-    // and `tests/all/update_record_semantics.rs`.)
+    // Every operation of this data plane is implemented, so none of them answers the
+    // stub's 501 any more — `BatchWriteRecord` last (see
+    // `tests/all/batch_write_record_bulk_ingestion.rs` for its own rules).
     let (status, body) = emulator
         .send(
             "POST",
@@ -1420,12 +1420,24 @@ async fn the_operations_this_slice_does_not_implement_still_answer_501() {
         )
         .await;
     assert_eq!(
-        status, 501,
-        "case \"BatchWriteRecord\": expected 501, got {status}"
+        (status, error_code(&body).as_str()),
+        (200, ""),
+        "case \"BatchWriteRecord\": expected HTTP 200, got {status} with body {body:?}"
     );
-    let code = error_code(&body);
     assert_eq!(
-        code, "NotImplemented",
-        "case \"BatchWriteRecord\": expected the NotImplemented error code, got {code:?}"
+        body["Errors"],
+        json!([]),
+        "case \"BatchWriteRecord\": expected no per-entry error, got {body:?}"
+    );
+
+    // And what it wrote reads back through `GetRecord`.
+    let (status, body) = emulator
+        .get_record("customers", "RecordIdentifierValueAsString=C1")
+        .await;
+    assert_eq!(
+        (status, record_pairs(&body)),
+        (200, vec![("customer_id".to_owned(), json!("C1"))]),
+        "case \"GetRecord after BatchWriteRecord\": expected the written record, got {status} \
+         with body {body:?}"
     );
 }

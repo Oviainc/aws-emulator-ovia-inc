@@ -97,7 +97,7 @@ const MAX_SAMPLE_RATE: u64 = 100;
 /// (`HTTPSuccessFeedbackSampleRate`, `SQSSuccessFeedbackSampleRate`, …).
 const SAMPLE_RATE_SUFFIX: &str = "SampleRate";
 
-/// The reason the named attribute does not accept `value`, or `None` when it does.
+/// The message the named attribute refuses `value` with, or `None` when it accepts it.
 ///
 /// The documented constraints of the attributes this emulator gives a meaning to
 /// (`SetTopicAttributesInput$AttributeName` doc): `Policy` is an access policy
@@ -106,22 +106,24 @@ const SAMPLE_RATE_SUFFIX: &str = "SampleRate";
 /// every `…SampleRate` a percentage. An attribute whose value SNS documents no
 /// constraint for (a role ARN, a display name, an encryption key id) is stored as the
 /// caller wrote it.
-fn invalid_value(name: &str, value: &str) -> Option<String> {
-    let one_of = |allowed: &[&str]| {
-        (!allowed.contains(&value)).then(|| format!("the value must be one of {allowed:?}"))
-    };
+///
+/// Each message is the whole sentence SNS states for that condition — the attribute as
+/// the service names it, and the value and the bounds only where that sentence carries
+/// them — rather than a diagnostic a caller wraps.
+fn attribute_value_refusal(name: &str, value: &str) -> Option<String> {
     match name {
+        // SNS reports a `Policy` it cannot read as a policy document by naming the
+        // attribute and the parse that failed, not the document the caller sent.
         state::POLICY_ATTRIBUTE => serde_json::from_str::<state::TopicPolicyDocument>(value)
             .err()
-            .map(|_| {
-                "the value must be an access policy document with a Statement list".to_string()
-            }),
+            .map(|_| format!("Invalid parameter: {name} Error: null")),
         state::DELIVERY_POLICY_ATTRIBUTE => {
             // A delivery policy is a JSON DOCUMENT whose members the effective policy
             // is computed from, so the value is refused unless THAT read can honour it:
             // a bare scalar names no member, and a member of the wrong type would be
             // stored only to be left out of the effective policy.
             state::delivery_policy_refusal(value)
+                .map(|reason| format!("Invalid parameter: AttributeValue Reason: {name} - {reason}"))
         }
         state::MAXIMUM_MESSAGE_SIZE_ATTRIBUTE => match value.parse::<u64>() {
             Ok(size)
@@ -131,17 +133,21 @@ fn invalid_value(name: &str, value: &str) -> Option<String> {
                 None
             }
             _ => Some(format!(
-                "the value must be a byte count between {} and {}",
+                "Invalid parameter: {name}: {value} is not an integer between {} and {} bytes",
                 state::MIN_MAXIMUM_MESSAGE_SIZE,
                 state::MAX_MAXIMUM_MESSAGE_SIZE
             )),
         },
-        "TracingConfig" => one_of(TRACING_CONFIG_VALUES),
-        "SignatureVersion" => one_of(SIGNATURE_VERSION_VALUES),
+        "TracingConfig" => (!TRACING_CONFIG_VALUES.contains(&value))
+            .then(|| format!("Invalid parameter: Invalid tracing config value: {value}")),
+        "SignatureVersion" => (!SIGNATURE_VERSION_VALUES.contains(&value)).then(|| {
+            format!("Invalid parameter: {name}: Invalid value '[{value}]'. Must be 1 or 2.")
+        }),
         name if name.ends_with(SAMPLE_RATE_SUFFIX) => match value.parse::<u64>() {
             Ok(rate) if (MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&rate) => None,
             _ => Some(format!(
-                "the value must be a percentage between {MIN_SAMPLE_RATE} and {MAX_SAMPLE_RATE}"
+                "Invalid parameter: {name}: {value} value provided is not an integer \
+                 between {MIN_SAMPLE_RATE}-{MAX_SAMPLE_RATE}"
             )),
         },
         _ => None,
@@ -250,18 +256,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state::is_topic_attribute(&input.attribute_name)
             || CREATE_ONLY_ATTRIBUTES.contains(&input.attribute_name.as_str())
         {
-            return Err(invalid_parameter(format!(
-                "Invalid parameter: AttributeName Reason: {} is not a topic attribute this \
-                 operation sets",
-                input.attribute_name
-            )));
+            return Err(invalid_parameter(
+                state::INVALID_ATTRIBUTE_NAME_REFUSAL.to_string(),
+            ));
         }
         if let Some(value) = input.attribute_value.as_deref() {
-            if let Some(reason) = invalid_value(&input.attribute_name, value) {
-                return Err(invalid_parameter(format!(
-                    "Invalid parameter: AttributeValue Reason: {} - {reason}",
-                    input.attribute_name
-                )));
+            if let Some(message) = attribute_value_refusal(&input.attribute_name, value) {
+                return Err(invalid_parameter(message));
             }
         }
 

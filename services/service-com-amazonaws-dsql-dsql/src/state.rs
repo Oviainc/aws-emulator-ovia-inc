@@ -5,7 +5,7 @@
 //! The service's primary resource is the Aurora DSQL cluster, so the store is a
 //! map of clusters keyed by their 26-character identifier, plus the two
 //! bookkeeping maps the cluster lifecycle needs: the retired (deleted) clusters
-//! a repeated `@idempotent` `DeleteCluster` must still answer from, and the
+//! whose identifiers must never be minted again, and the
 //! `clientToken` ledgers that make every `@idempotencyToken`-carrying operation
 //! idempotent.
 //!
@@ -188,9 +188,6 @@ pub struct Cluster {
     pub streams: BTreeMap<String, Stream>,
     /// The status change the clock owes this cluster, if any.
     pub pending: Option<PendingTransition>,
-    /// The `clientToken` of the `DeleteCluster` call that retired this cluster,
-    /// so a retry of that exact call answers from the tombstone.
-    pub delete_client_token: Option<String>,
 }
 
 impl Cluster {
@@ -218,13 +215,13 @@ impl Cluster {
 /// once the store is full.
 pub const MAX_CLUSTERS: usize = 100;
 
-/// The most retired (deleted) clusters kept as delete-idempotency tombstones.
+/// The most retired (deleted) clusters kept as tombstones.
 ///
-/// A tombstone exists only so a retry of the `@idempotent` `DeleteCluster` that
-/// retired the cluster answers with the same result; it is never read for anything
-/// else. The cap is enforced by evicting the oldest tombstone, so a create/delete
-/// loop cannot accumulate records forever even while never holding more than one
-/// live cluster.
+/// A tombstone exists only so an identifier this service has already handed out
+/// is never minted again; it is never read for anything else. The cap is
+/// enforced by evicting the oldest tombstone, so a create/delete loop cannot
+/// accumulate records forever even while never holding more than one live
+/// cluster.
 pub const MAX_RETIRED_CLUSTERS: usize = MAX_CLUSTERS;
 
 /// The most tags one resource holds.
@@ -265,6 +262,8 @@ pub enum TokenScope {
     CreateCluster,
     /// `UpdateCluster.clientToken`.
     UpdateCluster,
+    /// `DeleteCluster.clientToken`.
+    DeleteCluster,
     /// `CreateStream.clientToken`.
     CreateStream,
     /// `PutClusterPolicy.clientToken`.
@@ -276,9 +275,10 @@ pub enum TokenScope {
 impl TokenScope {
     /// Every scope, in ledger order. The array the state holds is indexed by
     /// this order, so the two cannot drift.
-    pub const ALL: [TokenScope; 5] = [
+    pub const ALL: [TokenScope; 6] = [
         TokenScope::CreateCluster,
         TokenScope::UpdateCluster,
+        TokenScope::DeleteCluster,
         TokenScope::CreateStream,
         TokenScope::PutClusterPolicy,
         TokenScope::DeleteClusterPolicy,
@@ -289,10 +289,23 @@ impl TokenScope {
         match self {
             TokenScope::CreateCluster => 0,
             TokenScope::UpdateCluster => 1,
-            TokenScope::CreateStream => 2,
-            TokenScope::PutClusterPolicy => 3,
-            TokenScope::DeleteClusterPolicy => 4,
+            TokenScope::DeleteCluster => 2,
+            TokenScope::CreateStream => 3,
+            TokenScope::PutClusterPolicy => 4,
+            TokenScope::DeleteClusterPolicy => 5,
         }
+    }
+
+    /// Whether a token of this scope stays in its ledger after the resource it
+    /// names is gone.
+    ///
+    /// Every other scope records a call ON a live resource, so the token goes
+    /// when the resource goes; the scope of the call that REMOVES the resource
+    /// records the removal itself, and a retry of it arrives precisely when the
+    /// resource no longer exists, so its record has to outlive it. Such a
+    /// ledger is still bounded by [`MAX_CLIENT_TOKENS`].
+    fn outlives_its_resource(self) -> bool {
+        matches!(self, TokenScope::DeleteCluster)
     }
 }
 
@@ -510,10 +523,10 @@ pub struct ComAmazonawsDsqlDsqlState {
     /// page for the cursor to resume where the previous page stopped. Bounded by
     /// [`MAX_CLUSTERS`], which `CreateCluster` checks before it inserts.
     pub clusters: BTreeMap<String, Cluster>,
-    /// Clusters whose deletion has completed. Kept so a retried
-    /// `DeleteCluster` (an `@idempotent` operation) answers with the same
-    /// result instead of a 404. Bounded by [`MAX_RETIRED_CLUSTERS`]; written only
-    /// by [`Self::settle`], never directly.
+    /// Clusters whose deletion has completed, so an identifier this service has
+    /// already handed out is never minted again ([`Self::mint_cluster_identifier`]).
+    /// Bounded by [`MAX_RETIRED_CLUSTERS`]; written only by [`Self::settle`],
+    /// never directly.
     pub retired_clusters: BTreeMap<String, Cluster>,
     /// The order [`Self::retired_clusters`] was written in, so the cap evicts the
     /// oldest tombstone rather than an arbitrary one.
@@ -612,10 +625,15 @@ impl ComAmazonawsDsqlDsqlState {
         }
     }
 
-    /// Drop every idempotency token recorded against `resource` in every ledger,
-    /// so a token never outlives the resource it names.
+    /// Drop every idempotency token recorded against `resource` in the ledgers
+    /// whose record is about a resource that is still there, so such a token
+    /// never outlives the resource it names. The ledger of the call that removes
+    /// the resource keeps its record ([`TokenScope::outlives_its_resource`]).
     fn forget_tokens_for(&mut self, resource: &str) {
         for scope in TokenScope::ALL {
+            if scope.outlives_its_resource() {
+                continue;
+            }
             self.tokens(scope).forget(resource);
         }
     }
@@ -689,7 +707,7 @@ impl ComAmazonawsDsqlDsqlState {
         }
     }
 
-    /// Keep `cluster` as a delete-idempotency tombstone, evicting the oldest one
+    /// Keep `cluster` as a retired-identifier tombstone, evicting the oldest one
     /// first if that would push the map past [`MAX_RETIRED_CLUSTERS`].
     fn retire(&mut self, identifier: String, cluster: Cluster) {
         while self.retired_clusters.len() >= MAX_RETIRED_CLUSTERS {
@@ -1206,6 +1224,42 @@ pub const STATUS_MEMBER: &str = "status";
 /// `policyVersion`), and so the key a recorded call keeps that answer under
 /// ([`RecordedCall::answering`]).
 pub const POLICY_VERSION_MEMBER: &str = "policyVersion";
+
+/// The name a cluster's ARN member carries on the wire
+/// (`smithy_query(query="operation", operation="DeleteCluster")`: a `@required`
+/// `arn`), and so the key a recorded call keeps that answer under
+/// ([`RecordedCall::answering`]).
+pub const ARN_MEMBER: &str = "arn";
+
+/// The name a cluster's creation-time member carries on the wire
+/// (`smithy_query(query="operation", operation="DeleteCluster")`: a `@required`
+/// `creationTime`), and so the key a recorded call keeps that answer under
+/// ([`RecordedCall::answering`], through [`encode_instant`]).
+pub const CREATION_TIME_MEMBER: &str = "creationTime";
+
+/// How a [`RecordedCall`] keeps an instant it answered: whole nanoseconds since
+/// the Unix epoch.
+///
+/// A recorded answer is a string, and a retry has to report the very same
+/// timestamp the original call did, so the encoding is exact rather than
+/// rounded to a second or to a float's precision. An instant before the epoch
+/// cannot arise here — every stored instant is a `SystemTime::now()` this
+/// process read — and encodes as `0`.
+pub fn encode_instant(at: SystemTime) -> String {
+    at.duration_since(UNIX_EPOCH)
+        .map(|since| since.as_nanos())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Read back an instant [`encode_instant`] wrote, or `None` for a string it did
+/// not write.
+pub fn decode_instant(recorded: &str) -> Option<SystemTime> {
+    let nanos: u128 = recorded.parse().ok()?;
+    let seconds = u64::try_from(nanos / 1_000_000_000).ok()?;
+    let subsec = (nanos % 1_000_000_000) as u32;
+    UNIX_EPOCH.checked_add(Duration::new(seconds, subsec))
+}
 
 /// The modelled `ResourceNotFoundException` for a cluster this service does not
 /// hold: [`resource_not_found`] over the ARN the addressed identifier has in the

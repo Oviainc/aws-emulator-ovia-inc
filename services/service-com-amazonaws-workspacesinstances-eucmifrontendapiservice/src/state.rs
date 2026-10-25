@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{
     BillingConfiguration, ConflictException, InstanceTypeInfo, ManagedInstanceRequest,
     ResourceNotFoundException, ServiceQuotaExceededException, SupportedInstanceConfiguration, Tag,
-    ValidationException, ValidationExceptionField, BILLING_MODE_VALUES,
+    TagSpecification, ValidationException, ValidationExceptionField, BILLING_MODE_VALUES,
     INSTANCE_CONFIGURATION_TENANCY_ENUM_VALUES, PLATFORM_TYPE_ENUM_VALUES,
 };
 
@@ -67,6 +67,11 @@ pub const VOLUME_RESOURCE_TYPE: &str = "EBS_VOLUME";
 /// `ResourceTypeEnum` member (`crate::ops::types::RESOURCE_TYPE_ENUM_VALUES`), which
 /// is what `CreateVolume` matches a tag specification against.
 pub const VOLUME_TAG_SPECIFICATION_RESOURCE_TYPE: &str = "volume";
+
+/// The `ResourceType` token a `TagSpecification` names for a WorkSpace Instance: the
+/// `ResourceTypeEnum` member (`crate::ops::types::RESOURCE_TYPE_ENUM_VALUES`), which
+/// is what `CreateWorkspaceInstance` matches a tag specification against.
+pub const INSTANCE_TAG_SPECIFICATION_RESOURCE_TYPE: &str = "instance";
 
 /// The `ServiceCode` this service reports in its quota errors: the service's own
 /// code, which is also its sigv4 signing name and ARN namespace.
@@ -1993,6 +1998,59 @@ pub fn reject_reserved_tag_keys<'a>(
         ));
     }
     Ok(())
+}
+
+/// Every tag key the `TagSpecification` list of a create request carries, whichever
+/// resource type each specification names.
+///
+/// The reserved-namespace rule applies to a key the caller supplied anywhere in the
+/// request, so the keys of EVERY specification are checked through
+/// [`reject_reserved_tag_keys`] — not only the ones that go on to tag the resource
+/// being created.
+pub fn specification_tag_keys<'a>(
+    specifications: impl IntoIterator<Item = &'a TagSpecification>,
+) -> impl Iterator<Item = &'a str> {
+    specifications
+        .into_iter()
+        .flat_map(|specification| specification.tags.iter().flatten())
+        .filter_map(|tag| tag.key.as_deref())
+}
+
+/// The tags a create request's `TagSpecification` list applies to the ONE resource
+/// the call creates, whose `ResourceTypeEnum` token is `resource_type`.
+///
+/// Each `TagSpecification` carries a `ResourceTypeEnum` and a `TagList`, so a
+/// specification that names ANOTHER resource type tags nothing on this call; one that
+/// names none, or names this call's own resource type, tags the resource it creates.
+/// `Tag.Key` and `Tag.Value` are both optional in the model: an entry with no key
+/// names no tag, and an absent value is the empty value its `len 0..256` allows. A
+/// repeated key keeps the last value, which is what merging onto a map gives.
+///
+/// Shared by every create that models a `TagSpecifications` member, so the member is
+/// read the same way whichever resource the call creates.
+pub fn tags_in_specifications<'a>(
+    resource_type: &str,
+    specifications: impl IntoIterator<Item = &'a TagSpecification>,
+) -> BTreeMap<String, String> {
+    let mut tags = BTreeMap::new();
+    for specification in specifications {
+        let targets_resource = specification
+            .resource_type
+            .as_deref()
+            .is_none_or(|kind| kind == resource_type);
+        if !targets_resource {
+            continue;
+        }
+        for tag in specification.tags.iter().flatten() {
+            if let Some(key) = tag.key.as_deref() {
+                tags.insert(
+                    key.to_string(),
+                    tag.value.clone().unwrap_or_default(),
+                );
+            }
+        }
+    }
+    tags
 }
 
 /// [`resource_not_found`] lifted into an operation's error channel, answered with

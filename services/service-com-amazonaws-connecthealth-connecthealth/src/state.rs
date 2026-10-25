@@ -149,6 +149,18 @@ pub const MAX_TAG_KEY_LEN: usize = 128;
 pub const MIN_TAG_VALUE_LEN: usize = 0;
 pub const MAX_TAG_VALUE_LEN: usize = 256;
 
+/// The tag-key prefix AWS keeps for the tags IT sets, which a caller may therefore
+/// neither create nor overwrite: a request whose `tags` map carries a key starting with
+/// it is refused, so no caller-set entry can pass for an AWS-managed one. `TagKey`
+/// carries no `@pattern` (`smithy_query(query="shape",shape="TagKey")`), so this is a
+/// SERVICE-side rule, stated here and enforced — like the lengths above — in
+/// [`crate::service::tag_bounds`], the one check every operation that accepts a `TagMap`
+/// runs.
+///
+/// Matched without regard to ASCII case, the way the reserved namespace is defined: the
+/// prefix is reserved whatever case the caller spells it in.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
 /// A `Domain`'s lifecycle, as the model's `DomainStatus` enum declares it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DomainStatus {

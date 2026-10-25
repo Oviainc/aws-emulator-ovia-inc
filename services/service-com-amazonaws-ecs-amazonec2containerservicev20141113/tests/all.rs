@@ -45,6 +45,8 @@ mod list_task_definition_families;
 mod list_task_definitions;
 #[path = "all/load_balancer_target_groups.rs"]
 mod load_balancer_target_groups;
+#[path = "all/reserved_tag_prefix.rs"]
+mod reserved_tag_prefix;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/service_derived_members.rs"]
@@ -65,6 +67,8 @@ mod tagging_writes;
 mod task_definition_deregistration;
 #[path = "all/task_definition_projection.rs"]
 mod task_definition_projection;
+#[path = "all/task_definition_reference_refusals.rs"]
+mod task_definition_reference_refusals;
 #[path = "all/task_definition_rendering.rs"]
 mod task_definition_rendering;
 #[path = "all/task_lifecycle.rs"]

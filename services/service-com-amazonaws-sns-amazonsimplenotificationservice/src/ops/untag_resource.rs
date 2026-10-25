@@ -185,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(topic) = store.topics.get_mut(&input.resource_arn) else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(state::TOPIC_DOES_NOT_EXIST.to_string()),
+                    message: Some(state::RESOURCE_DOES_NOT_EXIST.to_string()),
                 },
             )
             .into());

@@ -64,6 +64,8 @@ mod reserved_tag_keys;
 mod state_roundtrip;
 #[path = "all/tagging_not_found.rs"]
 mod tagging_not_found;
+#[path = "all/tagging_resource_arn_resolution.rs"]
+mod tagging_resource_arn_resolution;
 #[path = "all/validation_message_rendering.rs"]
 mod validation_message_rendering;
 #[path = "all/versions_catalog.rs"]

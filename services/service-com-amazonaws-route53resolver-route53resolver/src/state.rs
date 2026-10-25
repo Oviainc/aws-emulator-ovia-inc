@@ -16,8 +16,9 @@ use std::time::{Duration, Instant, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    FirewallDomainList, IpAddressResponse, OutpostResolver, ResolverEndpoint, ResolverRule,
-    ResolverRuleAssociation, ResourceNotFoundException, Tag, TargetAddress,
+    FirewallDomainList, FirewallDomainListMetadata, IpAddressResponse, OutpostResolver,
+    ResolverEndpoint, ResolverRule, ResolverRuleAssociation, ResourceNotFoundException, Tag,
+    TargetAddress,
 };
 
 /// The region an ARN carries when the request's SigV4 scope names none.
@@ -398,6 +399,141 @@ pub fn firewall_domain_list_not_found(
     }
 }
 
+/// The `ManagedOwnerName` of every domain list DNS Firewall itself publishes.
+///
+/// `FirewallDomainList$ManagedOwnerName`'s doc states it: "the managed domain
+/// list `AWSManagedDomainsMalwareDomainList` has the managed owner name
+/// `Route 53 Resolver DNS Firewall`". It fits `ServicePrinciple` (length
+/// 1..512).
+pub const MANAGED_FIREWALL_DOMAIN_LIST_OWNER: &str = "Route 53 Resolver DNS Firewall";
+
+/// `DomainListType` values, the model's whole enum
+/// (`smithy_query(query="shape",shape="DomainListType")`).
+pub const DOMAIN_LIST_TYPE_THREAT: &str = "THREAT";
+pub const DOMAIN_LIST_TYPE_CONTENT: &str = "CONTENT";
+
+/// One domain list DNS Firewall publishes itself, rather than one this account
+/// created.
+///
+/// A managed list belongs to the service, not to the account that reads it: it
+/// is visible to every account in every region, no request created it, and
+/// nothing an account does changes it. So it is NOT a stored record — it is a
+/// published catalog entry, and every member a response reports for it is
+/// computed from this entry plus the region the request was signed for.
+#[derive(Debug, Clone, Copy)]
+pub struct ManagedFirewallDomainList {
+    /// The list's `Name`, which is also how AWS publishes it.
+    pub name: &'static str,
+    /// The `ManagedListType` this list reports: "the type of the managed domain
+    /// list, for example `THREAT`".
+    pub managed_list_type: &'static str,
+}
+
+/// The domain lists DNS Firewall publishes to every account, in the order
+/// `ListFirewallDomainLists` reports them.
+///
+/// The names are the ones AWS publishes for DNS Firewall's managed domain
+/// lists, the first of which the model itself names in
+/// `FirewallDomainList$ManagedOwnerName`'s doc. All three are threat lists, so
+/// each reports [`DOMAIN_LIST_TYPE_THREAT`]; `CONTENT`
+/// ([`DOMAIN_LIST_TYPE_CONTENT`]) is the other value the model's enum carries,
+/// which no published list of this service uses. The GuardDuty threat list is
+/// deliberately absent: it appears only for an account with GuardDuty enabled,
+/// and this emulator holds no GuardDuty state to decide that from.
+pub const MANAGED_FIREWALL_DOMAIN_LISTS: &[ManagedFirewallDomainList] = &[
+    ManagedFirewallDomainList {
+        name: "AWSManagedDomainsMalwareDomainList",
+        managed_list_type: DOMAIN_LIST_TYPE_THREAT,
+    },
+    ManagedFirewallDomainList {
+        name: "AWSManagedDomainsBotnetCommandandControl",
+        managed_list_type: DOMAIN_LIST_TYPE_THREAT,
+    },
+    ManagedFirewallDomainList {
+        name: "AWSManagedDomainsAggregateThreatList",
+        managed_list_type: DOMAIN_LIST_TYPE_THREAT,
+    },
+];
+
+impl ManagedFirewallDomainList {
+    /// This list's `Id`, derived from its name so that every read of it — in any
+    /// process, in any region — reports the same id, exactly as a published
+    /// resource must. The form is [`mint_firewall_domain_list_id`]'s
+    /// (`rslvr-fdl-<hex>`), so an id is recognisable as a domain list's and fits
+    /// `ResourceId` (length 1..64).
+    pub fn id(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"managed-firewall-domain-list/v1");
+        feed_field(&mut hasher, self.name.as_bytes());
+        format!("rslvr-fdl-{}", hex::encode(&hasher.finalize()[..8]))
+    }
+
+    /// This list's `Arn`, rooted in the region the request was signed for, as
+    /// every ARN this service reports is.
+    pub fn arn(&self, region: &str) -> String {
+        ::engine::emulator_arn(
+            ARN_NAMESPACE,
+            region,
+            &format!("firewall-domain-list/{}", self.id()),
+        )
+    }
+
+    /// Project the catalog entry onto the modelled `FirewallDomainListMetadata`
+    /// `ListFirewallDomainLists` reports.
+    pub fn to_metadata(&self, region: &str) -> FirewallDomainListMetadata {
+        FirewallDomainListMetadata {
+            id: Some(self.id()),
+            arn: Some(self.arn(region)),
+            name: Some(self.name.to_string()),
+            // `CreatorRequestId` is "a unique string defined by YOU to identify
+            // the request": no request of this account created a published list,
+            // so there is none to report. `Category` is "the category of the
+            // domain list", for which neither the model nor the published list
+            // states a value, so no value is invented for it.
+            creator_request_id: None,
+            managed_owner_name: Some(MANAGED_FIREWALL_DOMAIN_LIST_OWNER.to_string()),
+            managed_list_type: Some(self.managed_list_type.to_string()),
+            category: None,
+        }
+    }
+
+    /// Project the catalog entry onto the modelled `FirewallDomainList`
+    /// `GetFirewallDomainList` reports, so a read of an id
+    /// `ListFirewallDomainLists` reported resolves to the same list.
+    pub fn to_domain_list(&self, region: &str) -> FirewallDomainList {
+        FirewallDomainList {
+            id: Some(self.id()),
+            arn: Some(self.arn(region)),
+            name: Some(self.name.to_string()),
+            // The domains of a managed list are the service's, not this
+            // account's: nothing here holds them, so no count is claimed for
+            // them. `CreationTime`/`ModificationTime` are equally unknown — no
+            // call of this account created or last changed the list.
+            domain_count: None,
+            status: Some(FIREWALL_DOMAIN_LIST_STATUS_COMPLETE.to_string()),
+            status_message: None,
+            managed_owner_name: Some(MANAGED_FIREWALL_DOMAIN_LIST_OWNER.to_string()),
+            creator_request_id: None,
+            creation_time: None,
+            modification_time: None,
+            category: None,
+            managed_list_type: Some(self.managed_list_type.to_string()),
+        }
+    }
+}
+
+/// The published domain list this `FirewallDomainListId` names, or `None` for an
+/// id that names none.
+///
+/// Every operation that resolves a `FirewallDomainListId` consults this after
+/// the store, so one id means one list throughout the service rather than
+/// resolving in the operation that lists them and nowhere else.
+pub fn managed_firewall_domain_list(id: &str) -> Option<&'static ManagedFirewallDomainList> {
+    MANAGED_FIREWALL_DOMAIN_LISTS
+        .iter()
+        .find(|managed| managed.id() == id)
+}
+
 /// A firewall domain list, as stored.
 ///
 /// `DomainCount` is DERIVED from [`Self::domains`] and never held separately, so
@@ -454,6 +590,31 @@ impl FirewallDomainListRecord {
             modification_time: Some(self.modification_time.clone()),
             category: None,
             managed_list_type: None,
+        }
+    }
+
+    /// Project the record onto the modelled `FirewallDomainListMetadata`, the
+    /// "minimal high-level information for a firewall domain list"
+    /// `ListFirewallDomainLists` reports.
+    ///
+    /// It is the same record [`Self::to_domain_list`] projects, narrowed to the
+    /// members `FirewallDomainListMetadata` declares — the metadata shape
+    /// carries no `DomainCount`, `Status`, `StatusMessage` or timestamps, which
+    /// is why the doc says to "call GetFirewallDomainList and
+    /// ListFirewallDomains" for the full information.
+    pub fn to_metadata(&self) -> FirewallDomainListMetadata {
+        FirewallDomainListMetadata {
+            id: Some(self.id.clone()),
+            arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            creator_request_id: Some(self.creator_request_id.clone()),
+            // `ManagedOwnerName` is "used only for lists that are NOT managed by
+            // you", and `Category`/`ManagedListType` describe such a list, so
+            // all three stay unset for a list this account created — exactly as
+            // in [`Self::to_domain_list`].
+            managed_owner_name: None,
+            managed_list_type: None,
+            category: None,
         }
     }
 }
@@ -933,6 +1094,17 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
         all.sort_by_key(|record| record.seq);
         all
     }
+
+    /// Every stored firewall domain list in creation order — the order
+    /// `ListFirewallDomainLists`' pages and its cursor are defined over, for the
+    /// same reason as [`Self::endpoints_in_creation_order`]: a page is cut at an
+    /// offset into this sequence, so the sequence must not depend on the hash
+    /// order of the map that holds the records.
+    pub fn firewall_domain_lists_in_creation_order(&self) -> Vec<&FirewallDomainListRecord> {
+        let mut all: Vec<&FirewallDomainListRecord> = self.firewall_domain_lists.values().collect();
+        all.sort_by_key(|record| record.seq);
+        all
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -1101,6 +1273,15 @@ pub fn outpost_resolver_list_scope(outpost_arn: Option<&str>) -> String {
         hex::encode(&hasher.finalize()[..8])
     )
 }
+
+/// The cursor scope of one `ListFirewallDomainLists` query.
+///
+/// `ListFirewallDomainLists` models no filter at all — only `MaxResults` and
+/// `NextToken` — so every query of it pages ONE collection and the scope is a
+/// constant. It still names the operation, so a cursor minted by another list
+/// operation is not read as an offset into this one (see
+/// [`endpoint_list_scope`]).
+pub const FIREWALL_DOMAIN_LIST_LIST_SCOPE: &str = "ListFirewallDomainLists/all/v1";
 
 /// One page of a `@paginated` list operation.
 #[derive(Debug)]

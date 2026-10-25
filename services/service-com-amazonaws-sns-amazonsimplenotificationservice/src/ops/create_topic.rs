@@ -109,6 +109,15 @@ const FIFO_SUFFIX: &str = state::FIFO_SUFFIX;
 /// with `TagResource`, which holds a topic's tag map to the same count.
 const MAX_TAGS_PER_TOPIC: usize = state::MAX_TAGS_PER_TOPIC;
 
+/// The sentence SNS refuses a re-create that asks for a topic the account already
+/// holds under different attributes with: the member that conflicts and the condition,
+/// with neither the attribute's name nor either value in it. A re-create that asks for
+/// what the topic already is is idempotent instead ("if the requester already owns a
+/// topic with the specified name, that topic's ARN is returned without creating a new
+/// topic" — the `CreateTopic` doc).
+const TOPIC_ALREADY_EXISTS_REFUSAL: &str =
+    "Invalid parameter: Attributes Reason: Topic already exists with different attributes";
+
 /// The refusal for a topic record whose attribute or tag map would cross the
 /// per-record byte ceiling, or `None` when it fits.
 fn oversized(
@@ -229,15 +238,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let attributes = input.attributes.unwrap_or_default();
         // SNS defines a closed set of topic attribute names and refuses any other; the
         // closed set is also what keeps one topic record from growing for ever.
-        if let Some(unknown) = attributes
+        if attributes
             .keys()
-            .find(|name| !state::is_topic_attribute(name))
+            .any(|name| !state::is_topic_attribute(name))
         {
             return Err(CreateTopicErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(format!(
-                        "Invalid parameter: Attributes Reason: unknown attribute name: {unknown}"
-                    )),
+                    message: Some(state::INVALID_ATTRIBUTE_NAME_REFUSAL.to_string()),
                 },
             )
             .into());
@@ -273,9 +280,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if tags.len() > MAX_TAGS_PER_TOPIC {
             return Err(CreateTopicErrorModeled::TagLimitExceededException(
                 TagLimitExceededException {
-                    message: Some(format!(
-                        "Can't add more than {MAX_TAGS_PER_TOPIC} tags to a topic"
-                    )),
+                    message: Some(state::TAG_QUOTA_EXCEEDED_REFUSAL.to_string()),
                 },
             )
             .into());
@@ -300,18 +305,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already is: a re-create that asks for a DIFFERENT value of an attribute the
         // topic holds is not idempotent, and is refused rather than silently ignored.
         if let Some(existing) = store.topics.get(&arn) {
-            if let Some((name, _)) = attributes.iter().find(|(name, requested)| {
+            if attributes.iter().any(|(name, requested)| {
                 existing
                     .attributes
-                    .get(*name)
-                    .is_some_and(|held| held != *requested)
+                    .get(name)
+                    .is_some_and(|held| held != requested)
             }) {
                 return Err(CreateTopicErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(format!(
-                            "Invalid parameter: Attributes Reason: a topic with this name \
-                             already exists with a different {name}"
-                        )),
+                        message: Some(TOPIC_ALREADY_EXISTS_REFUSAL.to_string()),
                     },
                 )
                 .into());
@@ -334,9 +336,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if merged_tags.len() > MAX_TAGS_PER_TOPIC {
                 return Err(CreateTopicErrorModeled::TagLimitExceededException(
                     TagLimitExceededException {
-                        message: Some(format!(
-                            "Can't add more than {MAX_TAGS_PER_TOPIC} tags to a topic"
-                        )),
+                        message: Some(state::TAG_QUOTA_EXCEEDED_REFUSAL.to_string()),
                     },
                 )
                 .into());

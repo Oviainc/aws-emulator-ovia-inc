@@ -1608,6 +1608,30 @@ pub fn parse_tagged_resource(resource_arn: &str) -> Option<TaggedResource> {
     }
 }
 
+/// The resource PORTION of the ARN of the resource a [`TaggedResource`] names — the
+/// inverse of [`parse_tagged_resource`], so an ARN this service hands out is one that
+/// same function reads back into the record it came from.
+///
+/// It is the read URI of the resource's own `Get*` operation, which is what the section
+/// comment above cites the `smithy_query` calls for.
+pub fn tagged_resource_path(resource: &TaggedResource) -> String {
+    match resource {
+        TaggedResource::RestApi { rest_api_id } => format!("/restapis/{rest_api_id}"),
+        TaggedResource::Stage {
+            rest_api_id,
+            stage_name,
+        } => format!("/restapis/{rest_api_id}/stages/{stage_name}"),
+        TaggedResource::ApiKey { api_key_id } => format!("/apikeys/{api_key_id}"),
+        TaggedResource::VpcLink { vpc_link_id } => format!("/vpclinks/{vpc_link_id}"),
+        TaggedResource::UsagePlan { usage_plan_id } => format!("/usageplans/{usage_plan_id}"),
+        TaggedResource::DomainName { domain_name_key } => format!("/domainnames/{domain_name_key}"),
+        TaggedResource::DomainNameAccessAssociation {
+            access_association_id,
+        } => format!("/domainnameaccessassociations/{access_association_id}"),
+        TaggedResource::Unstored { kind, id } => format!("/{kind}/{id}"),
+    }
+}
+
 /// Emulator resource guard, NOT an AWS quota: the most entries this emulator will store
 /// for a caller-sized list or map whose size the service publishes no limit for.
 pub const MAX_COLLECTION_ENTRIES: usize = 50;
@@ -2832,7 +2856,22 @@ pub fn service_arn(region: &str, resource_path: &str) -> String {
 
 /// The ARN of the stored custom domain name addressed by `key` (a [`domain_name_key`]).
 pub fn domain_name_arn(region: &str, key: &str) -> String {
-    service_arn(region, &format!("/domainnames/{key}"))
+    tagged_resource_arn(
+        region,
+        &TaggedResource::DomainName {
+            domain_name_key: key.to_string(),
+        },
+    )
+}
+
+/// The ARN, in `region`, of the resource a [`TaggedResource`] names.
+///
+/// The inverse of [`parse_tagged_resource`]: the resource portion comes from
+/// [`tagged_resource_path`] and the other five fields from [`service_arn`], so every ARN
+/// this service reports — in a response member, or to a cross-service reader of the
+/// taggable records below — parses back to the record it was built from.
+pub fn tagged_resource_arn(region: &str, resource: &TaggedResource) -> String {
+    service_arn(region, &tagged_resource_path(resource))
 }
 
 /// The ARN of the stored domain name access association addressed by `id`.
@@ -2841,7 +2880,12 @@ pub fn domain_name_arn(region: &str, key: &str) -> String {
 /// service REPORTS from a create is the ARN its readers, its tag operations and
 /// `RejectDomainNameAccessAssociation` resolve again.
 pub fn domain_name_access_association_arn(region: &str, id: &str) -> String {
-    service_arn(region, &format!("/domainnameaccessassociations/{id}"))
+    tagged_resource_arn(
+        region,
+        &TaggedResource::DomainNameAccessAssociation {
+            access_association_id: id.to_string(),
+        },
+    )
 }
 
 /// The length of an API Gateway-minted API key value: 40 characters, as observed from
@@ -2914,3 +2958,8 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsApigatewayBackplanecontrolserviceState>)
 }
+
+/// What a cross-service reader of this account's tagged resources reads this service by.
+/// Declared here, at the end of the file, because it is the one surface another crate
+/// uses and nothing in this module depends on it.
+pub mod tag_index;

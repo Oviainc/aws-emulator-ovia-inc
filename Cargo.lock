@@ -12824,6 +12824,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-apigateway-backplanecontrolservice",
  "service-com-amazonaws-ecs-amazonec2containerservicev20141113",
  "service-com-amazonaws-eventbridge-awsevents",
  "service-com-amazonaws-glue-awsglue",

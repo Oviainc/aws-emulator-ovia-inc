@@ -7,9 +7,10 @@
 //! instance (the instance of a single standalone account, which is what `CreateInstance`
 //! creates) every operation of the permission-set / account-assignment surface is refused
 //! with the modelled `ValidationException` (HTTP 400), BEFORE any resource-existence
-//! check; on the organization instance the account discovers through `ListInstances` the
-//! same requests are served, and an `InstanceArn` the account holds no instance under
-//! remains a missing resource rather than this refusal.
+//! check — and the instance an account DISCOVERS through `ListInstances` is one of those,
+//! which `discovered_instance_surface.rs` pins. On an organization instance the same
+//! requests are served, and an `InstanceArn` the account holds no instance under remains a
+//! missing resource rather than this refusal.
 //!
 //! The account instance is reached the way a client reaches one — a `CreateInstance` on an
 //! account whose Identity Center is not enabled yet — not by writing a record into the
@@ -28,13 +29,13 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ssoadmin_permission_sets::{
-    account_instance_router, call, error_code, router, seeded_instance_arn, UNKNOWN_INSTANCE_ARN,
+    account_instance_router, call, error_code, organization_router, UNKNOWN_INSTANCE_ARN,
 };
 
 /// One call of the withdrawn surface.
-struct SurfaceCall {
-    label: String,
-    operation: &'static str,
+pub(crate) struct SurfaceCall {
+    pub(crate) label: String,
+    pub(crate) operation: &'static str,
     /// What the operation answers for an `InstanceArn` the account holds no instance
     /// under: 400 `ResourceNotFoundException` for the operations that resolve the instance
     /// themselves (every refusal of a request on this awsJson1_1 surface is 400, so the
@@ -42,13 +43,13 @@ struct SurfaceCall {
     /// resolves the instance itself now, so no row answers 501 any more — a 501 would mean
     /// the operation models the account-instance refusal and nothing else, which is
     /// exactly why an unknown ARN would then not be refused as one.
-    unknown_instance_status: u16,
-    body: Value,
+    pub(crate) unknown_instance_status: u16,
+    pub(crate) body: Value,
 }
 
 /// One row of the table: the inputs the refusal must NOT depend on.
-struct Variant {
-    label: &'static str,
+pub(crate) struct Variant {
+    pub(crate) label: &'static str,
     /// A pattern-valid `PermissionSetArn` under the instance
     /// (`ps-` + 16 of `[a-zA-Z0-9-./]`).
     permission_set_suffix: &'static str,
@@ -59,13 +60,17 @@ struct Variant {
     request_id: &'static str,
     /// `MaxResults` for the paginated reads: modelled `range(min: 1, max: 100)`.
     max_results: Option<i64>,
+    /// `AccessControlAttribute$Key` for the ABAC rows: `length(min: 1, max: 128)`,
+    /// `^[\p{L}\p{Z}\p{N}_.:\/=+\-@]+$`.
+    pub(crate) attribute_key: &'static str,
 }
 
 /// The rows differ along every axis of the surface's inputs: both `PrincipalType` enum
 /// values, both forms the `PrincipalId` pattern admits, the published bounds of
-/// `TargetId` (`^\d{12}$`) and of `MaxResults` (1..100), and distinct permission-set
-/// ARNs and request ids — none of which can change the answer on an account instance.
-const VARIANTS: &[Variant] = &[
+/// `TargetId` (`^\d{12}$`) and of `MaxResults` (1..100), the key charset of an ABAC
+/// attribute, and distinct permission-set ARNs and request ids — none of which can change
+/// the answer on an account instance.
+pub(crate) const VARIANTS: &[Variant] = &[
     Variant {
         label: "a GROUP principal, the recorded shape of the request",
         permission_set_suffix: "ps-0123456789abcdef",
@@ -74,6 +79,7 @@ const VARIANTS: &[Variant] = &[
         principal_id: "f81d4fae-7dec-11d0-a765-00a0c91e6bf6",
         request_id: "11111111-2222-4333-8444-555555555555",
         max_results: None,
+        attribute_key: "department",
     },
     Variant {
         label: "a USER principal with the store-prefixed id, lowest account id",
@@ -83,6 +89,7 @@ const VARIANTS: &[Variant] = &[
         principal_id: "9067f3a1c2-f81d4fae-7dec-11d0-a765-00a0c91e6bf7",
         request_id: "66666666-7777-4888-9999-000000000000",
         max_results: Some(1),
+        attribute_key: "A",
     },
     Variant {
         label: "a permission-set ARN using the full id charset, highest account id",
@@ -92,17 +99,21 @@ const VARIANTS: &[Variant] = &[
         principal_id: "1b2d3c4f-5a6b-7c8d-9e0f-1a2b3c4d5e6f",
         request_id: "abcdefab-cdef-4bcd-abcd-efabcdefabcd",
         max_results: Some(100),
+        attribute_key: "cost-center.id:eu/west=1+x@acme",
     },
 ];
 
 /// The instance id an `InstanceArn` carries.
-fn instance_id_of(instance_arn: &str) -> &str {
+pub(crate) fn instance_id_of(instance_arn: &str) -> &str {
     instance_arn.rsplit('/').next().unwrap_or_default()
 }
 
-/// Every operation of the permission-set / account-assignment surface, as the one
+/// Every operation of the permission-set / account-assignment / ABAC surface, as the one
 /// request each takes for `variant` under `instance_arn`.
-fn surface_calls(instance_arn: &str, variant: &Variant) -> Vec<SurfaceCall> {
+///
+/// `DeleteInlinePolicyFromPermissionSet` is the one operation of the surface still
+/// scaffolded, so it is not a row here: it answers 501 for every instance.
+pub(crate) fn surface_calls(instance_arn: &str, variant: &Variant) -> Vec<SurfaceCall> {
     let permission_set_arn = format!(
         "arn:aws:sso:::permissionSet/{}/{}",
         instance_id_of(instance_arn),
@@ -114,9 +125,18 @@ fn surface_calls(instance_arn: &str, variant: &Variant) -> Vec<SurfaceCall> {
         "AccountId": variant.account_id,
         "PermissionSetArn": permission_set_arn,
     });
+    let mut list_managed_policies = json!({
+        "InstanceArn": instance_arn,
+        "PermissionSetArn": permission_set_arn,
+    });
+    let mut list_customer_references = list_managed_policies.clone();
+    let mut list_provisioned_accounts = list_managed_policies.clone();
     if let Some(max_results) = variant.max_results {
         list_permission_sets["MaxResults"] = json!(max_results);
         list_account_assignments["MaxResults"] = json!(max_results);
+        list_managed_policies["MaxResults"] = json!(max_results);
+        list_customer_references["MaxResults"] = json!(max_results);
+        list_provisioned_accounts["MaxResults"] = json!(max_results);
     }
     let assignment = json!({
         "InstanceArn": instance_arn,
@@ -125,6 +145,34 @@ fn surface_calls(instance_arn: &str, variant: &Variant) -> Vec<SurfaceCall> {
         "PermissionSetArn": permission_set_arn,
         "PrincipalType": variant.principal_type,
         "PrincipalId": variant.principal_id,
+    });
+    let on_set = json!({
+        "InstanceArn": instance_arn,
+        "PermissionSetArn": permission_set_arn,
+    });
+    // `ManagedPolicyArn` (`^arn:aws(-[a-z]{1,5}){0,3}:iam::aws:policy/[\p{L}\p{M}\p{Z}\p{S}\p{N}\p{P}]+$`)
+    // and `CustomerManagedPolicyReference` (`Name` `^[\w+=,.@-]+$`, `Path`
+    // `^((/[A-Za-z0-9\.,\+@=_-]+)*)/$`) as the model constrains them.
+    let managed_policy = json!({
+        "InstanceArn": instance_arn,
+        "PermissionSetArn": permission_set_arn,
+        "ManagedPolicyArn": "arn:aws:iam::aws:policy/ReadOnlyAccess",
+    });
+    let customer_reference = json!({
+        "InstanceArn": instance_arn,
+        "PermissionSetArn": permission_set_arn,
+        "CustomerManagedPolicyReference": {"Name": "ReadOnlyPolicy", "Path": "/"},
+    });
+    // One attribute mapping, the shape `AccessControlAttribute` takes: a key and the
+    // identity-source list its `Value` carries.
+    let abac_configuration = json!({
+        "InstanceArn": instance_arn,
+        "InstanceAccessControlAttributeConfiguration": {
+            "AccessControlAttributes": [{
+                "Key": variant.attribute_key,
+                "Value": {"Source": ["${path:enterprise.department}"]},
+            }],
+        },
     });
     vec![
         SurfaceCall {
@@ -137,10 +185,7 @@ fn surface_calls(instance_arn: &str, variant: &Variant) -> Vec<SurfaceCall> {
             label: format!("{}: DescribePermissionSet", variant.label),
             operation: "DescribePermissionSet",
             unknown_instance_status: 400,
-            body: json!({
-                "InstanceArn": instance_arn,
-                "PermissionSetArn": permission_set_arn,
-            }),
+            body: on_set.clone(),
         },
         SurfaceCall {
             label: format!("{}: ListPermissionSets", variant.label),
@@ -149,13 +194,21 @@ fn surface_calls(instance_arn: &str, variant: &Variant) -> Vec<SurfaceCall> {
             body: list_permission_sets,
         },
         SurfaceCall {
-            label: format!("{}: DeletePermissionSet", variant.label),
-            operation: "DeletePermissionSet",
+            label: format!("{}: UpdatePermissionSet", variant.label),
+            operation: "UpdatePermissionSet",
             unknown_instance_status: 400,
             body: json!({
                 "InstanceArn": instance_arn,
                 "PermissionSetArn": permission_set_arn,
+                "Description": "a set no account instance can hold",
+                "SessionDuration": "PT1H",
             }),
+        },
+        SurfaceCall {
+            label: format!("{}: DeletePermissionSet", variant.label),
+            operation: "DeletePermissionSet",
+            unknown_instance_status: 400,
+            body: on_set.clone(),
         },
         SurfaceCall {
             label: format!("{}: CreateAccountAssignment", variant.label),
@@ -192,6 +245,139 @@ fn surface_calls(instance_arn: &str, variant: &Variant) -> Vec<SurfaceCall> {
                 "InstanceArn": instance_arn,
                 "AccountAssignmentDeletionRequestId": variant.request_id,
             }),
+        },
+        SurfaceCall {
+            label: format!(
+                "{}: ListAccountsForProvisionedPermissionSet",
+                variant.label
+            ),
+            operation: "ListAccountsForProvisionedPermissionSet",
+            unknown_instance_status: 400,
+            body: list_provisioned_accounts,
+        },
+        SurfaceCall {
+            label: format!("{}: PutInlinePolicyToPermissionSet", variant.label),
+            operation: "PutInlinePolicyToPermissionSet",
+            unknown_instance_status: 400,
+            body: json!({
+                "InstanceArn": instance_arn,
+                "PermissionSetArn": permission_set_arn,
+                "InlinePolicy": "{\"Version\":\"2012-10-17\",\"Statement\":[]}",
+            }),
+        },
+        SurfaceCall {
+            label: format!("{}: GetInlinePolicyForPermissionSet", variant.label),
+            operation: "GetInlinePolicyForPermissionSet",
+            unknown_instance_status: 400,
+            body: on_set.clone(),
+        },
+        SurfaceCall {
+            label: format!("{}: AttachManagedPolicyToPermissionSet", variant.label),
+            operation: "AttachManagedPolicyToPermissionSet",
+            unknown_instance_status: 400,
+            body: managed_policy.clone(),
+        },
+        SurfaceCall {
+            label: format!("{}: DetachManagedPolicyFromPermissionSet", variant.label),
+            operation: "DetachManagedPolicyFromPermissionSet",
+            unknown_instance_status: 400,
+            body: managed_policy,
+        },
+        SurfaceCall {
+            label: format!("{}: ListManagedPoliciesInPermissionSet", variant.label),
+            operation: "ListManagedPoliciesInPermissionSet",
+            unknown_instance_status: 400,
+            body: list_managed_policies,
+        },
+        SurfaceCall {
+            label: format!(
+                "{}: AttachCustomerManagedPolicyReferenceToPermissionSet",
+                variant.label
+            ),
+            operation: "AttachCustomerManagedPolicyReferenceToPermissionSet",
+            unknown_instance_status: 400,
+            body: customer_reference.clone(),
+        },
+        SurfaceCall {
+            label: format!(
+                "{}: DetachCustomerManagedPolicyReferenceFromPermissionSet",
+                variant.label
+            ),
+            operation: "DetachCustomerManagedPolicyReferenceFromPermissionSet",
+            unknown_instance_status: 400,
+            body: customer_reference,
+        },
+        SurfaceCall {
+            label: format!(
+                "{}: ListCustomerManagedPolicyReferencesInPermissionSet",
+                variant.label
+            ),
+            operation: "ListCustomerManagedPolicyReferencesInPermissionSet",
+            unknown_instance_status: 400,
+            body: list_customer_references,
+        },
+        SurfaceCall {
+            label: format!("{}: PutPermissionsBoundaryToPermissionSet", variant.label),
+            operation: "PutPermissionsBoundaryToPermissionSet",
+            unknown_instance_status: 400,
+            body: json!({
+                "InstanceArn": instance_arn,
+                "PermissionSetArn": permission_set_arn,
+                "PermissionsBoundary": {
+                    "ManagedPolicyArn": "arn:aws:iam::aws:policy/PowerUserAccess",
+                },
+            }),
+        },
+        SurfaceCall {
+            label: format!("{}: GetPermissionsBoundaryForPermissionSet", variant.label),
+            operation: "GetPermissionsBoundaryForPermissionSet",
+            unknown_instance_status: 400,
+            body: on_set.clone(),
+        },
+        SurfaceCall {
+            label: format!(
+                "{}: DeletePermissionsBoundaryFromPermissionSet",
+                variant.label
+            ),
+            operation: "DeletePermissionsBoundaryFromPermissionSet",
+            unknown_instance_status: 400,
+            body: on_set,
+        },
+        SurfaceCall {
+            label: format!(
+                "{}: CreateInstanceAccessControlAttributeConfiguration",
+                variant.label
+            ),
+            operation: "CreateInstanceAccessControlAttributeConfiguration",
+            unknown_instance_status: 400,
+            body: abac_configuration.clone(),
+        },
+        SurfaceCall {
+            label: format!(
+                "{}: DescribeInstanceAccessControlAttributeConfiguration",
+                variant.label
+            ),
+            operation: "DescribeInstanceAccessControlAttributeConfiguration",
+            unknown_instance_status: 400,
+            body: json!({"InstanceArn": instance_arn}),
+        },
+        SurfaceCall {
+            label: format!(
+                "{}: UpdateInstanceAccessControlAttributeConfiguration",
+                variant.label
+            ),
+            operation: "UpdateInstanceAccessControlAttributeConfiguration",
+            unknown_instance_status: 400,
+            body: abac_configuration,
+        },
+        SurfaceCall {
+            label: format!(
+                "{}: DeleteInstanceAccessControlAttributeConfiguration",
+                variant.label
+            ),
+            operation: "DeleteInstanceAccessControlAttributeConfiguration",
+            unknown_instance_status: 400,
+            body: json!({"InstanceArn": instance_arn}),
         },
     ]
 }
@@ -296,14 +482,12 @@ async fn the_restriction_precedes_the_existence_checks() {
     }
 }
 
-/// The same surface on the ORGANIZATION instance the account discovers through
-/// `ListInstances`: it is SERVED. This is what makes the refusal above a property of the
-/// instance type rather than of the operations — and an operation whose target resource is
-/// absent answers a not-found here, not the restriction.
+/// The same surface on an ORGANIZATION instance: it is SERVED. This is what makes the
+/// refusal above a property of the instance type rather than of the operations — and an
+/// operation whose target resource is absent answers a not-found here, not the restriction.
 #[tokio::test]
 async fn the_same_surface_is_served_on_an_organization_instance() {
-    let router = router();
-    let instance_arn = seeded_instance_arn(&router).await;
+    let (router, instance_arn) = organization_router();
     assert_eq!(
         permission_sets_enabled(&router, &instance_arn).await,
         Value::Bool(true),

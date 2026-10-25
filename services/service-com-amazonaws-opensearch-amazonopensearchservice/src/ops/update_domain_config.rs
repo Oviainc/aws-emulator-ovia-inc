@@ -429,6 +429,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let touched = merge(&mut merged, input, now);
         let deployment = deployment_type(&merged, &touched);
 
+        // The storage a domain runs on has to be storage the service publishes for the
+        // instance type it runs on, and the update is judged on the MERGED record: a
+        // request that resizes the volume is checked against the instance type the
+        // domain keeps, and one that changes the instance type against the volume it
+        // keeps. A dry run is refused too — it reports what applying the change would
+        // do, and this change cannot be applied.
+        if let Some(refusal) = crate::state::ebs_volume_size_refusal(
+            merged.ebs_options.as_ref(),
+            merged.cluster_config.instance_type.as_deref(),
+        ) {
+            return Err(UpdateDomainConfigErrorModeled::ValidationException(refusal).into());
+        }
+
         if dry_run {
             // "This flag, when set to True, specifies whether the UpdateDomain request
             // should return the results of a dry run analysis without actually

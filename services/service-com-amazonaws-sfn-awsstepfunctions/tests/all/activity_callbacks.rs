@@ -24,7 +24,9 @@
 //! The harness (`Emulator`, `string`, `create_machine`, `start_execution`,
 //! `describe_execution`) is the one `state_machine_lifecycle` builds; `tests/all.rs`
 //! is this binary's crate root, so it is reached through
-//! `crate::state_machine_lifecycle`.
+//! `crate::state_machine_lifecycle`. The helpers below that are `pub(crate)` are the
+//! ones `send_task_failure` — the OTHER reply to a task — drives the same situations
+//! through, rather than carrying a second copy of them.
 
 use serde_json::{json, Value};
 
@@ -37,17 +39,17 @@ use crate::state_machine_lifecycle::{
 
 /// An id of the form this service mints its own ids in, for a token no task was ever
 /// scheduled under.
-const MINTED_ID: &str = "7f1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d";
+pub(crate) const MINTED_ID: &str = "7f1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d";
 
 /// Create an activity that must succeed, and return its ARN.
-async fn create_activity(emulator: &Emulator, name: &str) -> String {
+pub(crate) async fn create_activity(emulator: &Emulator, name: &str) -> String {
     let created = emulator.ok("CreateActivity", &json!({ "name": name })).await;
     string(&created, "activityArn")
 }
 
 /// A one-`Task` definition whose state polls `activity_arn`, plus whatever other
 /// members `extra` declares for that state.
-fn activity_definition(activity_arn: &str, extra: Value) -> String {
+pub(crate) fn activity_definition(activity_arn: &str, extra: Value) -> String {
     definition_with_states(activity_arn, extra, json!({}))
 }
 
@@ -75,7 +77,7 @@ fn definition_with_states(activity_arn: &str, extra: Value, rest: Value) -> Stri
 }
 
 /// Claim the one task of `activity_arn`, and report `(taskToken, input)`.
-async fn claim(emulator: &Emulator, case: &str, activity_arn: &str) -> (String, Value) {
+pub(crate) async fn claim(emulator: &Emulator, case: &str, activity_arn: &str) -> (String, Value) {
     let answer = emulator
         .ok(
             "GetActivityTask",
@@ -125,7 +127,7 @@ async fn settled(emulator: &Emulator, execution_arn: &str) -> (String, Option<Va
 /// Read from the STORE because `GetExecutionHistory` is still a scaffold of its own:
 /// the rule under test is that a reply APPENDS its events to the ones the states before
 /// the task left, which is what the record holds either way.
-fn history(emulator: &Emulator, execution_arn: &str) -> Vec<String> {
+pub(crate) fn history(emulator: &Emulator, execution_arn: &str) -> Vec<String> {
     let state = emulator.store();
     let store = state.lock();
     store
@@ -142,7 +144,7 @@ fn history(emulator: &Emulator, execution_arn: &str) -> Vec<String> {
 }
 
 /// How many tasks the store holds for `activity_arn`.
-fn held_tasks(emulator: &Emulator, activity_arn: &str) -> usize {
+pub(crate) fn held_tasks(emulator: &Emulator, activity_arn: &str) -> usize {
     let state = emulator.store();
     let store = state.lock();
     store
@@ -719,3 +721,4 @@ async fn a_reply_that_is_not_json_is_refused_and_changes_nothing() {
         "expected the corrected reply to complete the task, got {status} with {reported:?}"
     );
 }
+

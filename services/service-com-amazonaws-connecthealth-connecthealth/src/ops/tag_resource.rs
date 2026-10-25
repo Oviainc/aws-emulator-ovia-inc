@@ -67,11 +67,13 @@
 //!   [`crate::state::MAX_TAGS_PER_RESOURCE`], the same condition and the same channel
 //!   `CreateDomain` uses for a create carrying more tags than a resource may hold.
 //!
-//! A tag key or value outside its modelled length is refused as a 400
-//! `ValidationException` (`crate::scaffolded::Scaffolded::validation`): the model bounds
-//! `TagKey` at 1..128 and `TagValue` at 0..256 and declares no error shape for a bad
-//! input, so that is the only channel for it. The check itself is
-//! [`crate::service::tag_bounds::violation`], shared with `CreateDomain`.
+//! A tag entry this service does not accept — a key or value outside its modelled length,
+//! or a key in the reserved `crate::state::RESERVED_TAG_KEY_PREFIX` namespace — is refused
+//! as a 400 `ValidationException` (`crate::scaffolded::Scaffolded::validation`): the model
+//! bounds `TagKey` at 1..128 and `TagValue` at 0..256, states the reserved namespace
+//! nowhere, and declares no error shape for a bad input, so that is the only channel for
+//! it. The check itself is [`crate::service::tag_bounds::violation`], shared with
+//! `CreateDomain`.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -210,10 +212,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The model bounds a tag key at 1..128 characters and a value at 0..256
-        // (`smithy_query(query="shape",shape="TagMap")`); checked here as well because a
-        // constraint on a MAP's key or value is not one the boundary walk can refuse
-        // through the member it was bound to. The SAME check `CreateDomain` applies to
-        // the tags a create carries, so neither can enforce half a bound.
+        // (`smithy_query(query="shape",shape="TagMap")`) and the service reserves a key
+        // namespace of its own; checked here as well because a constraint on a MAP's key
+        // or value is not one the boundary walk can refuse through the member it was bound
+        // to, and a rule the model does not state is not one it knows at all. The SAME
+        // check `CreateDomain` applies to the tags a create carries, so neither can
+        // enforce half the rule — and a refusal is raised before the merge below, so it
+        // writes nothing.
         if let Some(violation) = crate::service::tag_bounds::violation(input.tags.iter()) {
             return Err(crate::scaffolded::Scaffolded::validation(violation));
         }

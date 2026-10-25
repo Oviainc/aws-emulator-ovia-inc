@@ -26,7 +26,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AIMLOptionsInput, AIMLOptionsOutput, AIMLOptionsStatus, AWSDomainInformation,
-    AccessPoliciesStatus,
+    AccessPoliciesStatus, AdditionalLimit,
     AdvancedOptionsStatus, AdvancedSecurityOptions, AdvancedSecurityOptionsInput,
     AdvancedSecurityOptionsStatus, AutoTuneOptions, AutoTuneOptionsInput, AutoTuneOptionsOutput,
     AutoTuneOptionsStatus, AutoTuneStatus, AutomatedSnapshotPauseOptions,
@@ -41,8 +41,9 @@ use crate::ops::types::{
     EBSOptionsStatus,
     EncryptionAtRestOptions, EncryptionAtRestOptionsStatus, EngineModeStatus,
     IAMFederationOptionsOutput, IPAddressTypeStatus, IdentityCenterOptions,
-    IdentityCenterOptionsInput, IdentityCenterOptionsStatus, InstanceTypeDetails,
-    InvalidPaginationTokenException, JWTOptionsOutput, LogPublishingOption,
+    IdentityCenterOptionsInput, IdentityCenterOptionsStatus, InstanceCountLimits, InstanceLimits,
+    InstanceTypeDetails,
+    InvalidPaginationTokenException, JWTOptionsOutput, Limits, LogPublishingOption,
     LogPublishingOptionsStatus, NaturalLanguageQueryGenerationOptionsOutput,
     NodeToNodeEncryptionOptions, NodeToNodeEncryptionOptionsStatus, OffPeakWindowOptions,
     OffPeakWindowOptionsStatus, OptionStatus, OutboundConnection, OutboundConnectionStatus,
@@ -53,9 +54,11 @@ use crate::ops::types::{
     ReservedInstanceOffering, ResourceAlreadyExistsException, ResourceNotFoundException,
     RollbackServiceSoftwareOptions, SAMLOptionsOutput, ScheduledAction, ServiceSoftwareOptions,
     SnapshotOptions,
-    SnapshotOptionsStatus, SoftwareUpdateOptions, SoftwareUpdateOptionsStatus, Tag, UseCaseStatus,
+    SnapshotOptionsStatus, SoftwareUpdateOptions, SoftwareUpdateOptionsStatus, StorageType,
+    StorageTypeLimit, Tag, UseCaseStatus,
     VPCDerivedInfo, VPCDerivedInfoStatus, VPCOptions, ValidationException, VersionStatus,
     OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES, RESERVED_INSTANCE_PAYMENT_OPTION_VALUES,
+    VOLUME_TYPE_VALUES,
 };
 
 /// Every engine version this emulator publishes as supported, in UPGRADE ORDER
@@ -1742,19 +1745,28 @@ const NO_UPFRONT_DISCOUNT: f64 = 1.0;
 /// instance class — which no value of `OpenSearchPartitionInstanceType` is, so the
 /// catalog spans the whole enum.
 fn on_demand_hourly_price(instance_type: &str) -> Option<f64> {
-    let mut parts = instance_type.split('.');
-    let family = parts.next()?;
-    let size = parts.next()?;
-    let factor = SIZE_NORMALIZATION_FACTORS
-        .iter()
-        .find(|(token, _)| *token == size)
-        .map(|(_, factor)| *factor)?;
-    let class = family.chars().next()?;
+    let factor = size_normalization_factor(instance_type)?;
+    let class = instance_family(instance_type)?.chars().next()?;
     let rate = CLASS_HOURLY_RATE_PER_UNIT
         .iter()
         .find(|(letter, _)| *letter == class)
         .map(|(_, rate)| *rate)?;
     Some(rate * factor)
+}
+
+/// The size normalization factor of one instance type, from
+/// [`SIZE_NORMALIZATION_FACTORS`]: how many units of its instance class one instance of
+/// that size is. It is the ONE scale this crate expresses a per-size quantity against,
+/// so a bigger size of a family is bigger by the same factor wherever the size matters.
+///
+/// `None` for a value that is not `<family>.<size>.search` with a published size token,
+/// which no value of `OpenSearchPartitionInstanceType` is.
+pub fn size_normalization_factor(instance_type: &str) -> Option<f64> {
+    let size = instance_type.split('.').nth(1)?;
+    SIZE_NORMALIZATION_FACTORS
+        .iter()
+        .find(|(token, _)| *token == size)
+        .map(|(_, factor)| *factor)
 }
 
 /// The fraction of the on-demand rate a reservation of this term and payment option
@@ -2070,6 +2082,24 @@ pub fn offered_instance_types(version: EngineVersion) -> Vec<&'static str> {
         .collect()
 }
 
+/// The roles an instance of `instance_type` can serve, in catalog order.
+///
+/// The roles come from the family: the UltraWarm family serves the warm tier, an
+/// OpenSearch-optimized instance is a data node only, and every other family is both a
+/// data node and master-eligible. This is the ONE derivation of them, so the roles the
+/// instance-type catalog reports for a type are exactly the roles the limit catalog
+/// below publishes limits for.
+pub fn instance_roles(instance_type: &str) -> Vec<&'static str> {
+    let family = instance_family(instance_type).unwrap_or(instance_type);
+    if family == ULTRAWARM_FAMILY {
+        vec![INSTANCE_ROLE_ULTRAWARM]
+    } else if OPENSEARCH_OPTIMIZED_FAMILIES.contains(&family) {
+        vec![INSTANCE_ROLE_DATA]
+    } else {
+        vec![INSTANCE_ROLE_DATA, INSTANCE_ROLE_MASTER]
+    }
+}
+
 /// What `instance_type` supports on `version`, as `InstanceTypeDetails`.
 ///
 /// Each feature member is a conjunction of two things: the engine release the feature
@@ -2088,16 +2118,10 @@ pub fn instance_type_details(
     let family = instance_family(instance_type).unwrap_or(instance_type);
     let encryption = !UNENCRYPTED_FAMILIES.contains(&family)
         && version.since_elasticsearch(ENCRYPTION_SINCE_ELASTICSEARCH);
-    let instance_role = if family == ULTRAWARM_FAMILY {
-        vec![INSTANCE_ROLE_ULTRAWARM.to_string()]
-    } else if OPENSEARCH_OPTIMIZED_FAMILIES.contains(&family) {
-        vec![INSTANCE_ROLE_DATA.to_string()]
-    } else {
-        vec![
-            INSTANCE_ROLE_DATA.to_string(),
-            INSTANCE_ROLE_MASTER.to_string(),
-        ]
-    };
+    let instance_role = instance_roles(instance_type)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
     InstanceTypeDetails {
         instance_type: Some(instance_type.to_string()),
         encryption_enabled: Some(encryption),
@@ -2115,6 +2139,372 @@ pub fn instance_type_details(
         instance_role: Some(instance_role),
         availability_zones,
     }
+}
+
+// ---------------------------------------------------------------------------
+// The instance-type LIMIT catalog
+//
+// What an instance type can be scaled to — how many of it a domain holds in each
+// role, and what storage attaches to it — is published BY the service alongside
+// the instance-type catalog above, so it is DERIVED from the instance type and
+// the role rather than stored per account: two reads of one instance type report
+// the same limits, and the roles it is reported for are the roles
+// [`instance_roles`] gives that type.
+// ---------------------------------------------------------------------------
+
+/// `StorageTypeName`'s `ebs`: Elastic Block Store storage attached to the instance. It
+/// is the storage type that carries a sub-type and volume limits.
+pub const STORAGE_TYPE_EBS: &str = "ebs";
+
+/// `StorageTypeName`'s `instance`: "built-in storage available for the instance", which
+/// has no sub-type and no volume limits, because there is no volume to size.
+pub const STORAGE_TYPE_INSTANCE: &str = "instance";
+
+/// The key `LimitsByRole` publishes the UltraWarm tier's limits under. That map's own
+/// documentation names its three roles `data`, `master` and `ultra_warm`, so the warm
+/// key here is NOT [`INSTANCE_ROLE_ULTRAWARM`], which is the value
+/// `InstanceTypeDetails$InstanceRole` reports.
+pub const LIMITS_ROLE_ULTRAWARM: &str = "ultra_warm";
+
+/// `VolumeType`'s `standard`: a magnetic volume, the one sub-type with its own size cap
+/// ([`MAXIMUM_STANDARD_VOLUME_SIZE_GIB`]).
+pub const VOLUME_TYPE_STANDARD: &str = "standard";
+
+/// `VolumeType`'s `gp2`: a general-purpose SSD volume whose performance is not
+/// provisioned per volume.
+pub const VOLUME_TYPE_GP2: &str = "gp2";
+
+/// `VolumeType`'s `gp3`: the general-purpose SSD volume whose IOPS and throughput are
+/// provisioned (`EBSOptions$Iops`, `EBSOptions$Throughput`).
+pub const VOLUME_TYPE_GP3: &str = "gp3";
+
+/// `VolumeType`'s `io1`: a provisioned-IOPS SSD volume.
+pub const VOLUME_TYPE_IO1: &str = "io1";
+
+/// `StorageTypeLimit$LimitName`'s `MinimumVolumeSize`: "minimum volume size that is
+/// available for the given storage type".
+pub const LIMIT_MINIMUM_VOLUME_SIZE: &str = "MinimumVolumeSize";
+
+/// `StorageTypeLimit$LimitName`'s `MaximumVolumeSize`: "maximum volume size that is
+/// available for the given storage type".
+pub const LIMIT_MAXIMUM_VOLUME_SIZE: &str = "MaximumVolumeSize";
+
+/// `StorageTypeLimit$LimitName`'s `MinimumIops`.
+pub const LIMIT_MINIMUM_IOPS: &str = "MinimumIops";
+
+/// `StorageTypeLimit$LimitName`'s `MaximumIops`.
+pub const LIMIT_MAXIMUM_IOPS: &str = "MaximumIops";
+
+/// `StorageTypeLimit$LimitName`'s `MinimumThroughput`.
+pub const LIMIT_MINIMUM_THROUGHPUT: &str = "MinimumThroughput";
+
+/// `StorageTypeLimit$LimitName`'s `MaximumThroughput`.
+pub const LIMIT_MAXIMUM_THROUGHPUT: &str = "MaximumThroughput";
+
+/// `AdditionalLimit$LimitName`'s `MaximumNumberOfDataNodesSupported`, which "only
+/// applies to master nodes and specifies the maximum number of data nodes of a given
+/// instance type a master node can support".
+pub const LIMIT_DATA_NODES_SUPPORTED: &str = "MaximumNumberOfDataNodesSupported";
+
+/// `AdditionalLimit$LimitName`'s `MaximumNumberOfDataNodesWithoutMasterNode`, which
+/// "only applies to data nodes and specifies the maximum number of data nodes of a
+/// given instance type can exist without a master node governing them".
+pub const LIMIT_DATA_NODES_WITHOUT_MASTER: &str = "MaximumNumberOfDataNodesWithoutMasterNode";
+
+/// The instance families whose data sits on storage built into the instance rather than
+/// on an attached volume, so the only storage type they publish is
+/// [`STORAGE_TYPE_INSTANCE`].
+const INSTANCE_STORAGE_FAMILIES: [&str; 5] = ["d2", "i2", "i3", "r3", "r6gd"];
+
+/// The smallest EBS volume, in GiB, every sub-type publishes — the floor a volume size
+/// is below rather than simply smaller than, whatever the instance type.
+pub const MINIMUM_VOLUME_SIZE_GIB: i64 = 10;
+
+/// The largest magnetic ([`VOLUME_TYPE_STANDARD`]) volume, in GiB: the one sub-type
+/// whose maximum is a flat figure rather than one that scales with the instance.
+pub const MAXIMUM_STANDARD_VOLUME_SIZE_GIB: i64 = 100;
+
+/// How many GiB of EBS volume ONE instance-size normalization unit carries, which is
+/// what makes the maximum volume size scale with the instance: a `large` (four units of
+/// [`SIZE_NORMALIZATION_FACTORS`]) publishes 512 GiB, an `xlarge` 1 TiB, and the
+/// largest published size, `24xlarge`, 24 TiB.
+///
+/// Like [`CLASS_HOURLY_RATE_PER_UNIT`] this is the emulator's OWN figure: AWS publishes
+/// a table per instance type, which is not part of the API and not in the Smithy model.
+/// What it guarantees is the RELATION — the maximum is monotonic in the instance's size
+/// and never below [`SMALLEST_MAXIMUM_VOLUME_SIZE_GIB`].
+const VOLUME_SIZE_GIB_PER_UNIT: f64 = 128.0;
+
+/// The smallest maximum any instance type publishes, in GiB: a volume of this size
+/// attaches to every published instance type, whatever its size, and only above it does
+/// the scale differentiate one instance from another. It is what keeps the published
+/// maximum of a SMALL instance from being the narrower of the two bounds a caller is
+/// held to — the service's own maximum for a small type is not below this — so the
+/// catalog never reports a volume as unavailable that the service would attach.
+const SMALLEST_MAXIMUM_VOLUME_SIZE_GIB: i64 = 512;
+
+/// The IOPS range a [`VOLUME_TYPE_GP3`] volume publishes: its 3,000 IOPS baseline is
+/// the floor, and 16,000 the most one volume can be provisioned with.
+const GP3_IOPS_RANGE: (i64, i64) = (3_000, 16_000);
+
+/// The same for a [`VOLUME_TYPE_IO1`] volume, which is provisioned from 1,000 IOPS.
+const IO1_IOPS_RANGE: (i64, i64) = (1_000, 16_000);
+
+/// The throughput range, in MiB/s, a [`VOLUME_TYPE_GP3`] volume publishes: a 125 MiB/s
+/// baseline up to 1,000 MiB/s.
+const GP3_THROUGHPUT_RANGE_MIB: (i64, i64) = (125, 1_000);
+
+/// The fewest data nodes a domain runs: a single node is a whole domain.
+pub const MINIMUM_DATA_NODE_COUNT: i32 = 1;
+
+/// The most data nodes a domain runs. Like [`DOMAIN_QUOTA`] this is the emulator's OWN
+/// bound rather than one the model carries; what it fixes is that the data-node count
+/// is bounded and that the bound is above the master and warm ones.
+pub const MAXIMUM_DATA_NODE_COUNT: i32 = 80;
+
+/// The dedicated-master count a domain runs: a master quorum needs more than one node,
+/// and an odd count above five buys nothing, so five is the top.
+pub const MASTER_NODE_COUNT_RANGE: ::std::ops::RangeInclusive<i32> = 2..=5;
+
+/// The UltraWarm node count a domain runs: the warm tier is attached in a pair or more,
+/// and like [`MAXIMUM_DATA_NODE_COUNT`] its top is the emulator's own bound.
+pub const WARM_NODE_COUNT_RANGE: ::std::ops::RangeInclusive<i32> = 2..=150;
+
+/// How many data nodes a domain runs before a dedicated master node is needed to govern
+/// them — `MaximumNumberOfDataNodesWithoutMasterNode`.
+pub const DATA_NODES_WITHOUT_MASTER: i32 = 10;
+
+/// How many data nodes a dedicated master supports, by the size of the master instance:
+/// each row is the largest [`SIZE_NORMALIZATION_FACTORS`] factor it covers, with the
+/// count. A bigger master governs more data nodes, which is the relation this table
+/// fixes; the counts themselves are the emulator's own published figures.
+const DATA_NODES_SUPPORTED_BY_MASTER: [(f64, i32); 4] = [
+    // Up to and including `large`.
+    (4.0, 10),
+    // `xlarge`.
+    (8.0, 30),
+    // `2xlarge`.
+    (16.0, 75),
+    // Every larger size.
+    (f64::INFINITY, 125),
+];
+
+/// The IOPS range `sub_type` publishes, and `None` for a sub-type whose performance is
+/// not provisioned per volume: `MinimumIops`/`MaximumIops` "can be empty if not
+/// applicable", and `EBSOptions$Iops` is "applicable only for the gp3 and provisioned
+/// IOPS EBS volume types".
+fn iops_range(sub_type: &str) -> Option<(i64, i64)> {
+    match sub_type {
+        VOLUME_TYPE_GP3 => Some(GP3_IOPS_RANGE),
+        VOLUME_TYPE_IO1 => Some(IO1_IOPS_RANGE),
+        _ => None,
+    }
+}
+
+/// The throughput range `sub_type` publishes. `EBSOptions$Throughput` is "applicable
+/// only for the gp3 volume type", so every other sub-type publishes none.
+fn throughput_range(sub_type: &str) -> Option<(i64, i64)> {
+    match sub_type {
+        VOLUME_TYPE_GP3 => Some(GP3_THROUGHPUT_RANGE_MIB),
+        _ => None,
+    }
+}
+
+/// The largest EBS volume, in GiB, `instance_type` publishes for `sub_type`: the
+/// instance's size scaled by [`VOLUME_SIZE_GIB_PER_UNIT`], never below
+/// [`SMALLEST_MAXIMUM_VOLUME_SIZE_GIB`], and capped for a magnetic volume at
+/// [`MAXIMUM_STANDARD_VOLUME_SIZE_GIB`].
+pub fn maximum_volume_size(instance_type: &str, sub_type: &str) -> i64 {
+    let scaled = size_normalization_factor(instance_type)
+        .map_or(SMALLEST_MAXIMUM_VOLUME_SIZE_GIB, |factor| {
+            (factor * VOLUME_SIZE_GIB_PER_UNIT).round() as i64
+        })
+        .max(SMALLEST_MAXIMUM_VOLUME_SIZE_GIB);
+    if sub_type == VOLUME_TYPE_STANDARD {
+        scaled.min(MAXIMUM_STANDARD_VOLUME_SIZE_GIB)
+    } else {
+        scaled
+    }
+}
+
+/// One `StorageTypeLimit`. Every limit value is a string on the wire
+/// (`StorageTypeLimit$LimitValues`), so a published number is rendered here, once.
+fn storage_type_limit(name: &str, value: i64) -> StorageTypeLimit {
+    StorageTypeLimit {
+        limit_name: Some(name.to_string()),
+        limit_values: Some(vec![value.to_string()]),
+    }
+}
+
+/// One `AdditionalLimit`, rendered the same way.
+fn additional_limit(name: &str, value: i32) -> AdditionalLimit {
+    AdditionalLimit {
+        limit_name: Some(name.to_string()),
+        limit_values: Some(vec![value.to_string()]),
+    }
+}
+
+/// The `ebs` storage type `instance_type` publishes for one volume sub-type: the size
+/// range every sub-type has, plus the IOPS and throughput ranges of the sub-types those
+/// are provisioned for.
+fn ebs_storage_type(instance_type: &str, sub_type: &str) -> StorageType {
+    let mut limits = vec![
+        storage_type_limit(LIMIT_MINIMUM_VOLUME_SIZE, MINIMUM_VOLUME_SIZE_GIB),
+        storage_type_limit(
+            LIMIT_MAXIMUM_VOLUME_SIZE,
+            maximum_volume_size(instance_type, sub_type),
+        ),
+    ];
+    if let Some((minimum, maximum)) = iops_range(sub_type) {
+        limits.push(storage_type_limit(LIMIT_MINIMUM_IOPS, minimum));
+        limits.push(storage_type_limit(LIMIT_MAXIMUM_IOPS, maximum));
+    }
+    if let Some((minimum, maximum)) = throughput_range(sub_type) {
+        limits.push(storage_type_limit(LIMIT_MINIMUM_THROUGHPUT, minimum));
+        limits.push(storage_type_limit(LIMIT_MAXIMUM_THROUGHPUT, maximum));
+    }
+    StorageType {
+        storage_type_name: Some(STORAGE_TYPE_EBS.to_string()),
+        storage_sub_type_name: Some(sub_type.to_string()),
+        storage_type_limits: Some(limits),
+    }
+}
+
+/// The storage types `instance_type` publishes.
+///
+/// A family whose data sits on instance storage publishes that one type and no volume
+/// limits; every other family publishes one `ebs` entry per `VolumeType` the model
+/// declares, in that enum's order. The warm tier's storage is not attached to the node
+/// at all, so an UltraWarm instance type publishes no storage type rather than an empty
+/// list of them.
+fn storage_types(instance_type: &str) -> Option<Vec<StorageType>> {
+    let family = instance_family(instance_type).unwrap_or(instance_type);
+    if family == ULTRAWARM_FAMILY {
+        return None;
+    }
+    if INSTANCE_STORAGE_FAMILIES.contains(&family) {
+        return Some(vec![StorageType {
+            storage_type_name: Some(STORAGE_TYPE_INSTANCE.to_string()),
+            storage_sub_type_name: None,
+            storage_type_limits: None,
+        }]);
+    }
+    Some(
+        VOLUME_TYPE_VALUES
+            .iter()
+            .map(|sub_type| ebs_storage_type(instance_type, sub_type))
+            .collect(),
+    )
+}
+
+/// How many data nodes a dedicated master of `instance_type` supports, from
+/// [`DATA_NODES_SUPPORTED_BY_MASTER`] — whose last row covers every size, so the
+/// fallback is reached only by a value carrying no size token at all.
+fn data_nodes_supported_by_master(instance_type: &str) -> i32 {
+    let factor = size_normalization_factor(instance_type).unwrap_or_default();
+    DATA_NODES_SUPPORTED_BY_MASTER
+        .iter()
+        .find(|(largest, _)| factor <= *largest)
+        .map_or(DATA_NODES_WITHOUT_MASTER, |(_, nodes)| *nodes)
+}
+
+/// The limits `instance_type` publishes for ONE of its roles: how many instances of it
+/// a domain holds in that role, the storage it can attach, and the additional limit
+/// that applies to that role.
+fn role_limits(instance_type: &str, role: &str) -> Limits {
+    let (minimum, maximum, additional) = match role {
+        INSTANCE_ROLE_MASTER => (
+            *MASTER_NODE_COUNT_RANGE.start(),
+            *MASTER_NODE_COUNT_RANGE.end(),
+            vec![additional_limit(
+                LIMIT_DATA_NODES_SUPPORTED,
+                data_nodes_supported_by_master(instance_type),
+            )],
+        ),
+        INSTANCE_ROLE_ULTRAWARM => (
+            *WARM_NODE_COUNT_RANGE.start(),
+            *WARM_NODE_COUNT_RANGE.end(),
+            // Neither published additional limit applies to a warm node: one is a
+            // master-node limit and the other a data-node one.
+            Vec::new(),
+        ),
+        _ => (
+            MINIMUM_DATA_NODE_COUNT,
+            MAXIMUM_DATA_NODE_COUNT,
+            vec![additional_limit(
+                LIMIT_DATA_NODES_WITHOUT_MASTER,
+                DATA_NODES_WITHOUT_MASTER,
+            )],
+        ),
+    };
+    Limits {
+        storage_types: storage_types(instance_type),
+        instance_limits: Some(InstanceLimits {
+            instance_count_limits: Some(InstanceCountLimits {
+                minimum_instance_count: minimum,
+                maximum_instance_count: maximum,
+            }),
+        }),
+        // A role no published additional limit applies to carries no `AdditionalLimits`
+        // member rather than an empty list.
+        additional_limits: (!additional.is_empty()).then_some(additional),
+    }
+}
+
+/// Every limit `instance_type` publishes, keyed by the role it applies to: the
+/// `LimitsByRole` map of `DescribeInstanceTypeLimits`.
+pub fn instance_type_limits(
+    instance_type: &str,
+) -> ::std::collections::HashMap<String, Limits> {
+    instance_roles(instance_type)
+        .into_iter()
+        .map(|role| {
+            let key = if role == INSTANCE_ROLE_ULTRAWARM {
+                LIMITS_ROLE_ULTRAWARM
+            } else {
+                role
+            };
+            (key.to_string(), role_limits(instance_type, role))
+        })
+        .collect()
+}
+
+/// Whether `ebs` sizes a volume the instance type publishes, and the refusal naming
+/// the member and the bound otherwise.
+///
+/// A volume size is one the SERVICE publishes for that instance type and volume
+/// sub-type — [`MINIMUM_VOLUME_SIZE_GIB`] up to [`maximum_volume_size`], the same range
+/// the limit catalog reports — so a configuration outside it describes storage the
+/// service cannot provision and is refused rather than stored. Options with no volume
+/// (EBS not enabled) and options carrying no size at all size nothing, so there is
+/// nothing to check; without an instance type there is no instance to size the volume
+/// against, and only the floor every instance type publishes applies.
+pub fn ebs_volume_size_refusal(
+    ebs: Option<&EBSOptions>,
+    instance_type: Option<&str>,
+) -> Option<ValidationException> {
+    let ebs = ebs?;
+    if !ebs.ebs_enabled.unwrap_or(false) {
+        return None;
+    }
+    let size = i64::from(ebs.volume_size?);
+    // `EBSOptions$VolumeType` "specifies the type of EBS volumes attached to data
+    // nodes"; the general-purpose SSD type is what a request that names none gets, and
+    // it is not the magnetic type, whose cap is its own.
+    let sub_type = ebs.volume_type.as_deref().unwrap_or(VOLUME_TYPE_GP2);
+    let maximum = instance_type.map(|instance_type| maximum_volume_size(instance_type, sub_type));
+    if size >= MINIMUM_VOLUME_SIZE_GIB && maximum.is_none_or(|maximum| size <= maximum) {
+        return None;
+    }
+    let bound = match maximum {
+        Some(maximum) => format!("between {MINIMUM_VOLUME_SIZE_GIB} and {maximum}"),
+        None => format!("at least {MINIMUM_VOLUME_SIZE_GIB}"),
+    };
+    Some(ValidationException {
+        message: Some(format!(
+            "EBSOptions.VolumeSize must be {bound} GiB for volume type {sub_type}: {size}"
+        )),
+    })
 }
 
 /// How many Availability Zones of a Region the instance-type catalog reports an

@@ -2,9 +2,11 @@
 
 //! @op GetFirewallDomainList
 //! SCAFFOLD REPLACED: implemented. The DNS Firewall domain-list slice
-//! (`CreateFirewallDomainList`, `GetFirewallDomainList`) computes every response
-//! from the records in [`crate::state`]. This is the ONLY file to touch for this
-//! operation.
+//! (`CreateFirewallDomainList`, `GetFirewallDomainList`,
+//! `ListFirewallDomainLists`) computes every response from the records in
+//! [`crate::state`] and the published catalog beside them
+//! ([`crate::state::MANAGED_FIREWALL_DOMAIN_LISTS`]). This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -140,9 +142,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata, which a pure read of the store does not need.
-        let _ = ctx;
+        // The engine is reachable from `&self` (constructor-injected); `ctx`
+        // carries the request metadata the ARNs are rooted in.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 GetFirewallDomainListErrorModeled::InternalServiceErrorException(
@@ -156,16 +157,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Retrieves the specified firewall domain list": a pure read, so the
         // store is only locked for the lookup and nothing is written.
-        let store = state.lock();
-        let Some(record) = store.firewall_domain_lists.get(&input.firewall_domain_list_id) else {
-            return Err(GetFirewallDomainListErrorModeled::ResourceNotFoundException(
-                crate::state::firewall_domain_list_not_found(&input.firewall_domain_list_id),
-            )
-            .into());
-        };
+        let stored = state
+            .lock()
+            .firewall_domain_lists
+            .get(&input.firewall_domain_list_id)
+            .map(crate::state::FirewallDomainListRecord::to_domain_list);
+        if let Some(domain_list) = stored {
+            return Ok(GetFirewallDomainListOutput {
+                firewall_domain_list: Some(domain_list),
+            });
+        }
 
-        Ok(GetFirewallDomainListOutput {
-            firewall_domain_list: Some(record.to_domain_list()),
-        })
+        // A domain list DNS Firewall publishes itself is visible to every
+        // account, so an id `ListFirewallDomainLists` reported for one resolves
+        // here too rather than being reported as missing.
+        if let Some(managed) = crate::state::managed_firewall_domain_list(&input.firewall_domain_list_id)
+        {
+            let region = crate::state::request_region(&ctx.parts().headers);
+            return Ok(GetFirewallDomainListOutput {
+                firewall_domain_list: Some(managed.to_domain_list(&region)),
+            });
+        }
+
+        Err(GetFirewallDomainListErrorModeled::ResourceNotFoundException(
+            crate::state::firewall_domain_list_not_found(&input.firewall_domain_list_id),
+        )
+        .into())
     }
 }

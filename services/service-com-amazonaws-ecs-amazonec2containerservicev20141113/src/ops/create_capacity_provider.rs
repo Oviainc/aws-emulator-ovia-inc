@@ -262,6 +262,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .map(|provider| provider.auto_scaling_group_arn.clone());
 
+        // A caller-supplied tag may not write into the namespace Amazon Web Services keeps
+        // for its own tags, whichever operation carries the `tags` list.
+        if let Some(message) =
+            crate::state::reserved_tag_prefix_violation(input.tags.as_deref().unwrap_or_default())
+        {
+            return Err(
+                CreateCapacityProviderErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
 

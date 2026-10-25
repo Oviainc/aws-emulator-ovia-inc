@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBucketMetricData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBucketMetricData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers the storage series of a Lightsail bucket: the bucket's own contents,
+//! measured in the object store that serves them, reported over the window and at
+//! the granularity the request asks for.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBucketMetricData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A bucket's two metrics are not telemetry of a running workload — they are a
+//! COUNT and a SIZE of what the bucket holds ("calculated by summing the size of
+//! all objects in the bucket (including object versions)" / "calculated by
+//! counting all objects in the bucket (including object versions)") — and this
+//! emulator holds those objects, so the series is computed from them rather than
+//! answered empty.
+//!
+//! A reporting read: it looks up the bucket, refuses a request whose values cannot
+//! hold together, and measures the object store — it writes nothing, so a later
+//! caller sees exactly what it would have seen had this call never happened.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -118,6 +125,58 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// `BucketSizeBytes`: "The amount of data in bytes stored in a bucket. This value
+/// is calculated by summing the size of all objects in the bucket (including
+/// object versions), including the size of all parts for all incomplete multipart
+/// uploads to the bucket."
+pub const METRIC_BUCKET_SIZE_BYTES: &str = "BucketSizeBytes";
+
+/// `NumberOfObjects`: "The total number of objects stored in a bucket. This value
+/// is calculated by counting all objects in the bucket (including object versions)
+/// and the total number of parts for all incomplete multipart uploads to the
+/// bucket."
+pub const METRIC_NUMBER_OF_OBJECTS: &str = "NumberOfObjects";
+
+/// Every metric a bucket publishes, each with the `unit` its data is published
+/// in.
+///
+/// The list is the modelled `GetBucketMetricDataRequest$metricName` documentation
+/// — "Valid bucket metric names are listed below, along with the most useful
+/// `statistics` to include in your request, and the published `unit` value" — and
+/// the `unit` of each row is the "published unit" that entry states. Source:
+/// `smithy_query(query="doc",shape="GetBucketMetricDataRequest",member="metricName")`.
+///
+/// It covers every member of the modelled `BucketMetricName` enum, which is what
+/// this operation's boundary walk admits. It lives beside the one operation that
+/// reads it, the way `DISTRIBUTION_METRIC_UNITS` lives beside
+/// `GetDistributionMetricData`.
+pub const BUCKET_METRIC_UNITS: &[(&str, &str)] = &[
+    (METRIC_BUCKET_SIZE_BYTES, "Bytes"),
+    (METRIC_NUMBER_OF_OBJECTS, "Count"),
+];
+
+/// The unit the bucket metric `metric_name` is published in, or `None` when this
+/// catalog does not know the metric.
+pub fn bucket_metric_unit(metric_name: &str) -> Option<&'static str> {
+    BUCKET_METRIC_UNITS
+        .iter()
+        .find(|(name, _)| *name == metric_name)
+        .map(|(_, unit)| *unit)
+}
+
+/// The members of the modelled `MetricStatistic` enum, as a request names them in
+/// `statistics` — each selecting one member OF a datapoint.
+/// Source: `smithy_query(query="shape",shape="MetricStatistic")`.
+const STATISTIC_MINIMUM: &str = "Minimum";
+/// See [`STATISTIC_MINIMUM`].
+const STATISTIC_MAXIMUM: &str = "Maximum";
+/// See [`STATISTIC_MINIMUM`].
+const STATISTIC_SUM: &str = "Sum";
+/// See [`STATISTIC_MINIMUM`].
+const STATISTIC_AVERAGE: &str = "Average";
+/// See [`STATISTIC_MINIMUM`].
+const STATISTIC_SAMPLE_COUNT: &str = "SampleCount";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -191,18 +250,239 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBucketMetricData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBucketMetricDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Reporting only: the answer is the stored bucket record plus a
+        // measurement of the object store that serves the bucket's objects, and
+        // the one write behind this call is the clock materialising transitions it
+        // already owed (see `crate::state::with_state`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBucketMetricData"))
+        // A bucket is a REGIONAL resource whose name is unique within one region
+        // of the account, so the region the request is signed for is what scopes
+        // the lookup — exactly as it does for `GetBuckets` and `CreateBucket`.
+        // Nothing else this operation reports comes from the request metadata.
+        let region = crate::state::request_region(ctx.parts());
+
+        // `bucketName`, `metricName`, `period`, `startTime`, `endTime`, `unit` and
+        // `statistics` are modelled `@required` members; the name's length and
+        // pattern, the `MetricPeriod` range (60..=86400) and every enum this input
+        // reaches (`BucketMetricName`, `MetricUnit` and the `MetricStatistic`
+        // entries of `statistics`) are modelled constraints, so the centralized
+        // walk refused anything outside them before this body ran. What is left is
+        // what the model cannot express: the window has to be a window, the unit
+        // has to be the one the metric is published in, and the request has to ask
+        // for at least one statistic.
+
+        // "The timestamp indicating the earliest data to be returned" / "the
+        // latest data to be returned": a window whose end does not follow its
+        // start spans no instant, so no data of it could be returned.
+        let start = crate::state::timestamp_key(input.start_time);
+        let end = crate::state::timestamp_key(input.end_time);
+        if start >= end {
+            return Err(invalid(format!(
+                "startTime must be earlier than endTime, got startTime {} and endTime {} \
+                 (seconds since the epoch)",
+                // The INSTANT each member names, sub-second part included and
+                // signed, so a window inverted inside one second — or one that
+                // lies before the epoch — is reported as what it is rather than as
+                // two equal whole seconds.
+                input.start_time.as_secs_f64(),
+                input.end_time.as_secs_f64()
+            )));
+        }
+
+        // `unit` is "The unit for the metric data request. Valid units depend on
+        // the metric data being requested. For the valid units with each available
+        // metric, see the metricName parameter" — and each bucket metric's own
+        // entry states the ONE unit it is published in ([`BUCKET_METRIC_UNITS`]).
+        // A request asking for a metric in a unit it is not published in names no
+        // series, so it is refused as the invalid input it is rather than answered
+        // as if the series existed.
+        let Some(published_unit) = bucket_metric_unit(&input.metric_name) else {
+            // Unreachable while the catalog covers the modelled
+            // `BucketMetricName` enum, which the boundary walk restricts
+            // `metricName` to. A metric the model gains and the catalog does not
+            // know yet has no published unit here, so it is honestly "not written
+            // yet" rather than refused or answered.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "GetBucketMetricData for the bucket metric {}",
+                input.metric_name
+            )));
+        };
+        if input.unit != published_unit {
+            return Err(invalid(format!(
+                "unit '{}' is not a valid unit for the bucket metric {}: its published unit \
+                 is {published_unit}",
+                input.unit, input.metric_name
+            )));
+        }
+
+        // `statistics` is "The statistic for the metric": a request that names none
+        // asks for no statistic of the metric, so there is nothing it could be
+        // answered with.
+        if input.statistics.is_empty() {
+            return Err(invalid(
+                "statistics must name at least one statistic of the metric to return".to_string(),
+            ));
+        }
+
+        // Metrics are reported for a bucket this account HOLDS in the region the
+        // request is made in: a name no bucket record of that region answers to
+        // earns the service's `DoesNotExist` envelope, not an
+        // authoritative-looking series.
+        //
+        // This step only READS, and hands back an owned value rather than a guard,
+        // so the object store below is reached with no guard of this service's
+        // store held (the lock order `crate::state::bucket_object_storage`
+        // documents).
+        let bucket_name = input.bucket_name;
+        crate::state::with_state(&*self.engine, |store| {
+            if store.bucket(&region, &bucket_name).is_none() {
+                return Err(not_found(&bucket_name));
+            }
+            Ok(())
+        })
+        .ok_or_else(unavailable)??;
+
+        // What the bucket holds, measured in the one object store its objects live
+        // in — the only place that knows. Both metrics are computed from this one
+        // measurement: "all objects in the bucket (including object versions)" is
+        // the set each of them is over, counted for `NumberOfObjects` and summed
+        // for `BucketSizeBytes`.
+        let measured = crate::state::bucket_object_storage(&*self.engine, &bucket_name)
+            .ok_or_else(unavailable)?;
+        let value = match input.metric_name.as_str() {
+            METRIC_BUCKET_SIZE_BYTES => measured.bytes,
+            METRIC_NUMBER_OF_OBJECTS => measured.objects,
+            // Unreachable for the same reason the unit lookup above is: the
+            // boundary walk restricts `metricName` to the modelled
+            // `BucketMetricName` enum, which [`BUCKET_METRIC_UNITS`] covers. A
+            // metric the model gains and this measurement does not know how to
+            // compute is honestly "not written yet" rather than answered with
+            // another metric's number.
+            other => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "GetBucketMetricData for the bucket metric {other}"
+                )));
+            }
+        };
+
+        // The series: ONE observation, the one this call just took, placed in the
+        // period window it falls in.
+        //
+        // These metrics are published once per day ("These bucket metrics are
+        // reported once per day"), and this store keeps no history of a bucket's
+        // contents — a bucket holds what it holds NOW. So the only window any
+        // observation belongs to is the one the measuring instant falls in, and
+        // every earlier window holds nothing: no measurement of the bucket was
+        // taken then. Reporting the current count or size in a window that ended
+        // before this call would be invented history a client could not tell from
+        // a recorded one.
+        //
+        // `period` is "The granularity, in seconds, of the returned data points",
+        // so it is what divides the time line into windows, and a datapoint's
+        // `timestamp` is the start of its own window — which is why an
+        // `@range(60..86400)` granularity moves the timestamp this answer carries.
+        let observed_ms = crate::state::now_ms();
+        // At least one millisecond, so the division below is total whatever the
+        // granularity: the modelled `MetricPeriod` range starts at 60 seconds, and
+        // a window of no width would place no observation.
+        let period_ms = i64::from(input.period).saturating_mul(1_000).max(1);
+        let window_start_ms = observed_ms.div_euclid(period_ms).saturating_mul(period_ms);
+        let window_end_ms = window_start_ms.saturating_add(period_ms);
+        let requested_start_ms = epoch_millis(input.start_time, "startTime")?;
+        let requested_end_ms = epoch_millis(input.end_time, "endTime")?;
+        // The requested window is half-open: `startTime` is "the earliest data to
+        // be returned" and `endTime` "the latest", so a datapoint is returned when
+        // its own window shares an instant with it.
+        let within_request =
+            window_start_ms < requested_end_ms && window_end_ms > requested_start_ms;
+
+        let metric_data = if within_request {
+            // Each `MetricStatistic` the request named selects one member OF the
+            // datapoint, so only those are filled: a statistic nobody asked for is
+            // left out rather than reported. Over a window holding a SINGLE
+            // observation the extremes, the total and the mean are all that
+            // observation ("Minimum - The lowest value observed during the
+            // specified period", "Sum - The sum of all values submitted for the
+            // matching metric", "Average - The value of Sum / SampleCount"), and
+            // the sample count is one.
+            let requested = |statistic: &str| {
+                input
+                    .statistics
+                    .iter()
+                    .any(|asked| asked.as_str() == statistic)
+            };
+            // The measurement as the `double` every modelled datapoint member
+            // carries. A count of this store's objects, or their bytes, stays far
+            // below the 2^53 an f64 holds exactly.
+            let observation = value as f64;
+            vec![MetricDatapoint {
+                minimum: requested(STATISTIC_MINIMUM).then_some(observation),
+                maximum: requested(STATISTIC_MAXIMUM).then_some(observation),
+                sum: requested(STATISTIC_SUM).then_some(observation),
+                average: requested(STATISTIC_AVERAGE).then_some(observation),
+                sample_count: requested(STATISTIC_SAMPLE_COUNT).then_some(1.0),
+                timestamp: Some(crate::state::timestamp(window_start_ms)),
+                // "The unit": the one the metric is published in, which the
+                // request had to name to be served at all.
+                unit: Some(published_unit.to_string()),
+            }]
+        } else {
+            // A window that ended before this call, or one that has not begun:
+            // nothing measured the bucket then, so the series is empty — what the
+            // service itself answers for a window it holds no data for.
+            Vec::new()
+        };
+
+        Ok(GetBucketMetricDataOutput {
+            // "The name of the metric returned" — the metric whose series this
+            // answer is, which is the one the request named.
+            metric_name: Some(input.metric_name),
+            metric_data: Some(metric_data),
+        })
     }
+}
+
+/// `at` in epoch milliseconds — the unit this store's clock reads
+/// (`crate::state::now_ms`), so a request's window and the instant a measurement
+/// was taken are compared in one unit — or this operation's refusal when `at`
+/// names an instant too far from the epoch to be one.
+fn epoch_millis(
+    at: ::aws_smithy_types::DateTime,
+    member: &str,
+) -> Result<i64, GetBucketMetricDataError> {
+    at.to_millis().map_err(|_| {
+        invalid(format!(
+            "{member} must name an instant within the range of epoch milliseconds"
+        ))
+    })
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the rule it broke.
+fn invalid(message: String) -> GetBucketMetricDataError {
+    GetBucketMetricDataErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// No bucket of that name is stored in that region: Lightsail's `DoesNotExist`
+/// rejection — HTTP 400, wire error `NotFoundException`, body `code`
+/// `DoesNotExist` and a message naming the resource type and the requested name.
+/// The region scopes the LOOKUP, but it is not part of the message: the identifier
+/// the message names is the one the request carried.
+fn not_found(name: &str) -> GetBucketMetricDataError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(crate::state::RESOURCE_TYPE_BUCKET, name)
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetBucketMetricDataError {
+    GetBucketMetricDataErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail bucket store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

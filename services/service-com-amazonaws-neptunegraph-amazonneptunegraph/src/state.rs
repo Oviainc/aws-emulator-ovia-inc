@@ -2199,6 +2199,31 @@ pub fn caller_account_id() -> &'static str {
     ::engine::emulator_account_id()
 }
 
+/// The one wording of "this account holds no such resource" that every account-scoped
+/// lookup in this service reports.
+///
+/// The service words such a failure as the resource kind it looked for, the account the
+/// lookup was resolved in, and then the SAME resource kind again in front of the kind of
+/// identifier the request carried and the value it sent — so a caller reading only the
+/// message can tell which namespace was searched. `resource` is the kind as the service
+/// names it ("graph", "export task"), spelled identically in both clauses, and
+/// `identifier_kind` is what the request addressed it by ("id", "arn"). Written once
+/// here so no resource kind can drift into a shorter or longer clause than its
+/// neighbours.
+fn resource_not_found_for_caller(
+    resource: &str,
+    identifier_kind: &str,
+    identifier: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!(
+            "No {resource} found for customer [{}] with {resource} {identifier_kind} \
+             [{identifier}]",
+            caller_account_id()
+        ),
+    }
+}
+
 /// The modelled `ResourceNotFoundException` for a `graphIdentifier` that names no
 /// stored graph.
 ///
@@ -2210,12 +2235,7 @@ pub fn caller_account_id() -> &'static str {
 /// (`smithy_query(query="shape",shape="ResourceNotFoundException")`), so the message is
 /// the only place either fact can go.
 pub fn graph_not_found(graph_identifier: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: format!(
-            "No graph found for customer [{}] with graph id [{graph_identifier}]",
-            caller_account_id()
-        ),
-    }
+    resource_not_found_for_caller("graph", "id", graph_identifier)
 }
 
 /// The modelled `ResourceNotFoundException` for a `snapshotIdentifier` that names no
@@ -2226,12 +2246,7 @@ pub fn graph_not_found(graph_identifier: &str) -> ResourceNotFoundException {
 /// asked for — the same two facts [`graph_not_found`] reports, and for the same
 /// reason.
 pub fn snapshot_not_found(snapshot_identifier: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: format!(
-            "No snapshot found for customer [{}] with snapshot id [{snapshot_identifier}]",
-            caller_account_id()
-        ),
-    }
+    resource_not_found_for_caller("snapshot", "id", snapshot_identifier)
 }
 
 /// The modelled `ResourceNotFoundException` for a `taskIdentifier` that names no
@@ -2242,12 +2257,7 @@ pub fn snapshot_not_found(snapshot_identifier: &str) -> ResourceNotFoundExceptio
 /// request asked for — the same two facts [`graph_not_found`] reports, and for the
 /// same reason.
 pub fn import_task_not_found(task_identifier: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: format!(
-            "No import task found for customer [{}] with task id [{task_identifier}]",
-            caller_account_id()
-        ),
-    }
+    resource_not_found_for_caller("import task", "id", task_identifier)
 }
 
 /// The modelled `ResourceNotFoundException` for a `queryId` that names no query in
@@ -2273,12 +2283,7 @@ pub fn query_not_found(graph_identifier: &str, query_id: &str) -> ResourceNotFou
 /// request asked for — the same two facts [`graph_not_found`] reports, and for the same
 /// reason.
 pub fn export_task_not_found(task_identifier: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: format!(
-            "No export task found for customer [{}] with task id [{task_identifier}]",
-            caller_account_id()
-        ),
-    }
+    resource_not_found_for_caller("export task", "id", task_identifier)
 }
 
 /// The modelled `ResourceNotFoundException` for a `(graphIdentifier, vpcId)` pair that
@@ -2311,12 +2316,7 @@ pub fn private_endpoint_not_found(graph_identifier: &str, vpc_id: &str) -> Resou
 /// (`smithy_query(query="shape",shape="ResourceNotFoundException")`), so the message is
 /// the only place either fact can go.
 pub fn resource_not_found(resource_arn: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: format!(
-            "No resource found for customer [{}] with resource arn [{resource_arn}]",
-            caller_account_id()
-        ),
-    }
+    resource_not_found_for_caller("resource", "arn", resource_arn)
 }
 
 /// Refuse more tag entries on one resource than it may hold ([`MAX_TAGS`]).
@@ -3285,6 +3285,115 @@ mod tests {
             assert_eq!(
                 actual, expected,
                 "case {id:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// Every account-scoped namespace words its miss the same way, and names the kind of
+    /// resource it searched for in BOTH clauses of that wording.
+    #[test]
+    fn a_missing_resource_names_its_own_kind_in_the_identifier_clause() {
+        // (the resource kind it reports, the kind of identifier it is addressed by, the
+        // wording function, identifiers that name nothing)
+        type Case = (
+            &'static str,
+            &'static str,
+            fn(&str) -> ResourceNotFoundException,
+            Vec<&'static str>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "graph",
+                "id",
+                graph_not_found,
+                vec!["g-0000000000", "g-a1b2c3d4e5", "g-zzzzzzzzzz"],
+            ),
+            (
+                "snapshot",
+                "id",
+                snapshot_not_found,
+                vec!["gs-0000000000", "gs-a1b2c3d4e5", "gs-zzzzzzzzzz"],
+            ),
+            (
+                "import task",
+                "id",
+                import_task_not_found,
+                vec!["t-0000000000", "t-a1b2c3d4e5", "t-zzzzzzzzzz"],
+            ),
+            (
+                "export task",
+                "id",
+                export_task_not_found,
+                vec!["t-0000000000", "t-a1b2c3d4e5", "t-zzzzzzzzzz"],
+            ),
+            (
+                "resource",
+                "arn",
+                resource_not_found,
+                vec![
+                    "arn:aws:neptune-graph:us-east-1:000000000000:graph/g-0000000000",
+                    "arn:aws-cn:neptune-graph:cn-north-1:000000000000:graph-snapshot/gs-0123456789",
+                ],
+            ),
+        ];
+
+        for (resource, identifier_kind, word_it, identifiers) in cases {
+            for identifier in identifiers {
+                let actual = word_it(identifier).message;
+                let expected = format!(
+                    "No {resource} found for customer [{}] with {resource} {identifier_kind} \
+                     [{identifier}]",
+                    caller_account_id()
+                );
+                assert_eq!(
+                    actual, expected,
+                    "case {resource}/{identifier}: expected {expected:?}, got {actual:?}"
+                );
+            }
+        }
+
+        // One message per kind written out in full, so the clause text itself is pinned
+        // and not only its parameterisation. Only the account segment is read from the
+        // framework, because that is the one part no test may hard-code.
+        let account = caller_account_id();
+        let literal = [
+            (
+                graph_not_found("g-0123456789").message,
+                format!("No graph found for customer [{account}] with graph id [g-0123456789]"),
+            ),
+            (
+                snapshot_not_found("gs-0123456789").message,
+                format!(
+                    "No snapshot found for customer [{account}] with snapshot id [gs-0123456789]"
+                ),
+            ),
+            (
+                import_task_not_found("t-0123456789").message,
+                format!(
+                    "No import task found for customer [{account}] with import task id \
+                     [t-0123456789]"
+                ),
+            ),
+            (
+                export_task_not_found("t-0123456789").message,
+                format!(
+                    "No export task found for customer [{account}] with export task id \
+                     [t-0123456789]"
+                ),
+            ),
+            (
+                resource_not_found("arn:aws:neptune-graph:us-east-1:000000000000:graph/g-0123456789")
+                    .message,
+                format!(
+                    "No resource found for customer [{account}] with resource arn \
+                     [arn:aws:neptune-graph:us-east-1:000000000000:graph/g-0123456789]"
+                ),
+            ),
+        ];
+        for (actual, expected) in literal {
+            assert_eq!(
+                actual, expected,
+                "case the whole message: expected {expected:?}, got {actual:?}"
             );
         }
     }
