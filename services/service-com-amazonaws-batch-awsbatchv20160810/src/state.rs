@@ -494,6 +494,16 @@ pub const MIN_LIST_CONSUMABLE_RESOURCES_RESULTS: i32 = 1;
 /// returns up to 100 results and a `nextToken` value if applicable."
 pub const MAX_LIST_CONSUMABLE_RESOURCES_RESULTS: i32 = 100;
 
+/// The fewest results `ListSchedulingPolicies$maxResults` accepts, from the member's doc:
+/// "This value can be between 1 and 100." The model types it as a plain `Integer`, so the
+/// bound is applied in the handler.
+pub const MIN_LIST_SCHEDULING_POLICIES_RESULTS: i32 = 1;
+/// The most results `ListSchedulingPolicies$maxResults` accepts; see
+/// [`MIN_LIST_SCHEDULING_POLICIES_RESULTS`]. Also the page size of a request that names
+/// none, from the same doc: "If this parameter isn't used, `ListSchedulingPolicies`
+/// returns up to 100 results and a `nextToken` value if applicable."
+pub const MAX_LIST_SCHEDULING_POLICIES_RESULTS: i32 = 100;
+
 /// The longest scheduling policy `name` the service accepts, from the member's doc: "The
 /// name of the fair-share scheduling policy. It can be up to 128 letters long. It can
 /// contain uppercase and lowercase letters, numbers, hyphens (-), and underscores (_)."

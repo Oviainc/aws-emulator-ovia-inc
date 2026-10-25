@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SignalResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SignalResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SignalResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: records the signal against the stack this service persisted, under the
+//! signalled logical id and the signal's `UniqueId`, and acts on it where something is
+//! WAITING for it — while the stack's create or update is in flight and the signalled
+//! resource's declaration waits on resource signals, the signal is reported as an event on
+//! that resource and a `FAILURE` signal fails the operation at once (a failed create then
+//! rolls back, as `CreateStack`'s own `OnFailure` default says). Every other signal is
+//! accepted and recorded and changes nothing; only a `StackName` that names no live stack
+//! in the request's Region is refused, with `ValidationError`.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +75,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{resource_signal_status, resource_status, status};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -163,18 +163,171 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SignalResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SignalResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SignalResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no stack a signal could be
+            // recorded against, and nothing was written.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("SignalResource"));
+        };
+        // A stack name or id names a stack only in the Region the request was signed for.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // What the signal left for this call to carry out with the store UNLOCKED: the
+        // resources a rollback has to remove again, where a FAILURE signal failed the
+        // create that was in flight.
+        let (stack_id, unwind) = {
+            let mut store = state.lock();
+            store.settle(now);
+            // "The stack name or unique stack ID that includes the resource that you want
+            // to signal": a signal to a stack that is not there is refused, which is the
+            // ONE thing this operation refuses.
+            let stack = store
+                .resolve_mut(&region, &input.stack_name)
+                .filter(|stack| stack.is_live())
+                .ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::stack_does_not_exist(&input.stack_name),
+                    )
+                })?;
+
+            // The signal itself is recorded whatever the stack was doing and whatever the
+            // logical id names: "Sends a signal to the specified resource with a success or
+            // failure status." A unique id already recorded is the same signal again.
+            let first_time = stack.record_signal(
+                &input.logical_resource_id,
+                &input.unique_id,
+                &input.status,
+                now,
+            );
+
+            // Something only WAITS for a signal while the operation that waits is in
+            // flight and the resource's own declaration asks it to
+            // ("CloudFormation doesn't proceed with a stack creation or update until
+            // resources receive the required number of signals"). Any other signal is
+            // accepted and recorded, and nothing about the stack turns on it.
+            let in_flight = stack.pending.is_some()
+                && matches!(
+                    stack.status.as_str(),
+                    status::CREATE_IN_PROGRESS | status::UPDATE_IN_PROGRESS
+                );
+            let updating = stack.status == status::UPDATE_IN_PROGRESS;
+            // The TYPE the template declares the signalled resource as, where that
+            // declaration is one the operation in flight waits for signals on — and `None`
+            // for every other logical id, which is what says nothing is waiting.
+            let awaited_type = stack
+                .template_body
+                .as_deref()
+                .and_then(crate::state::template::parse)
+                .and_then(|template| {
+                    template
+                        .resources
+                        .iter()
+                        .find(|declared| {
+                            declared.logical_id == input.logical_resource_id
+                                && crate::state::template::waits_for_resource_signals(
+                                    declared, updating,
+                                )
+                        })
+                        .map(|declared| declared.resource_type.clone())
+                });
+            match awaited_type.filter(|_| in_flight && first_time) {
+                None => (stack.stack_id.clone(), None),
+                Some(resource_type) => {
+                    // The physical id the operation in flight gave that resource, where it
+                    // has one: an event reports the resource as the stack holds it.
+                    let physical_resource_id = stack
+                        .current_resources()
+                        .into_iter()
+                        .find(|resource| resource.logical_id == input.logical_resource_id)
+                        .map(|resource| resource.physical_resource_id)
+                        .filter(|physical| !physical.is_empty());
+                    let failing = input.status == resource_signal_status::FAILURE;
+                    let resource_status = match (updating, failing) {
+                        (false, false) => resource_status::CREATE_IN_PROGRESS,
+                        (false, true) => resource_status::CREATE_FAILED,
+                        (true, false) => resource_status::UPDATE_IN_PROGRESS,
+                        (true, true) => resource_status::UPDATE_FAILED,
+                    };
+                    let operation_id = stack
+                        .last_operation
+                        .as_ref()
+                        .map(|operation| operation.operation_id.clone());
+                    let client_request_token = stack.client_request_token.clone();
+                    stack.record_resource_event(
+                        now,
+                        &input.logical_resource_id,
+                        physical_resource_id,
+                        &resource_type,
+                        resource_status,
+                        Some(signal_received(&input.status, &input.unique_id)),
+                        operation_id,
+                        client_request_token,
+                    );
+                    if !failing {
+                        // A success signal is what the operation was waiting for: it carries
+                        // on to the terminal status its own clock already owes.
+                        (stack.stack_id.clone(), None)
+                    } else {
+                        // "A failure signal causes CloudFormation to immediately fail the
+                        // stack creation or update": the operation does not reach the
+                        // terminal status it was headed for, and the reason names the
+                        // resource that failed and the signal that failed it.
+                        let reason = format!(
+                            "The following resource(s) failed to {}: [{}]. {}",
+                            if updating { "update" } else { "create" },
+                            input.logical_resource_id,
+                            signal_received(&input.status, &input.unique_id)
+                        );
+                        let failed_status = if updating {
+                            status::UPDATE_FAILED
+                        } else {
+                            status::CREATE_FAILED
+                        };
+                        stack.fail_transition(now, failed_status, reason.clone());
+                        // A failed CREATE is rolled back unless the request that started it
+                        // asked for the failed state to be kept ("DO_NOTHING: Do nothing if
+                        // stack creation fails", which `DisableRollback` also spells), and
+                        // the rollback removes what the create had already made. A failed
+                        // UPDATE stops at its failed status, as this service's own update
+                        // does.
+                        if updating || stack.disable_rollback {
+                            (stack.stack_id.clone(), None)
+                        } else {
+                            stack.begin_rollback(now, reason);
+                            (stack.stack_id.clone(), Some(stack.current_resources()))
+                        }
+                    }
+                }
+            }
+        };
+
+        // The resources the failed create had made are removed again in the services that
+        // own them, with the store UNLOCKED: each delete reaches another service's own
+        // handler, exactly as the create's did.
+        if let Some(resources) = unwind {
+            let deleted = crate::state::provisioning::unwind(ctx, &region, &resources).await;
+            let mut store = state.lock();
+            if let Some(stack) = store.resolve_mut(&region, &stack_id) {
+                stack.record_materialised_resources(deleted.resources);
+                if let Some(failure) = deleted.failure {
+                    // A resource an owning service would not let go: the rollback cannot be
+                    // reported as one that removed what it did not.
+                    stack.fail_transition(
+                        ::std::time::SystemTime::now(),
+                        status::ROLLBACK_FAILED,
+                        failure,
+                    );
+                }
+            }
+        }
+
+        Ok(SignalResourceOutput)
     }
+}
+
+/// The reason CloudFormation records on the event for a signal it received, naming the
+/// signal's status and the unique id it arrived under — the two things
+/// `SignalResource` carries about one signal.
+fn signal_received(status: &str, unique_id: &str) -> String {
+    format!("Received {status} signal with UniqueId {unique_id}")
 }

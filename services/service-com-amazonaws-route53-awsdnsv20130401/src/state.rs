@@ -4,13 +4,14 @@
 //!
 //! Route 53 is a control plane over the hosted zone and, inside it, the
 //! resource record set, plus the traffic policy a record set can be generated
-//! from and the health check a record set can be routed by. They all live here,
+//! from, the health check a record set can be routed by, and the reusable
+//! delegation set a zone's name servers can come from. They all live here,
 //! in ONE store, so every operation reads the records
 //! another operation wrote. The helpers in this module are the
 //! shared vocabulary the handlers in `src/ops/` use for them — DNS name
 //! normalization, the sort key `ListResourceRecordSets` orders by, the
-//! `/hostedzone/` and `/change/` id prefixes the API wraps ids in, and the id
-//! minting every create needs.
+//! `/hostedzone/`, `/change/` and `/delegationset/` id prefixes the API wraps
+//! ids in, and the id minting every create needs.
 //!
 //! Beside those caller-owned resources this store also holds the one
 //! SERVICE-owned record the API reports: the CIDR blocks Route 53's health
@@ -22,7 +23,7 @@
 //! reporting operation: it reads the record and writes nothing, so a read can
 //! never change what a later caller sees.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,8 +32,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::ops::types::get_change_types::NoSuchChange;
 use crate::ops::types::shared_types::{
     ChangeInfo, DelegationSet, HealthCheck, HealthCheckConfig, HostedZone, HostedZoneConfig,
-    KeySigningKey, NoSuchHealthCheck, NoSuchHostedZone, NoSuchTrafficPolicy, ResourceRecordSet, Tag,
-    TrafficPolicy, VPC, R_R_TYPE_VALUES, V_P_C_REGION_VALUES,
+    KeySigningKey, NoSuchDelegationSet, NoSuchHealthCheck, NoSuchHostedZone, NoSuchTrafficPolicy,
+    ResourceRecordSet, Tag, TrafficPolicy, VPC, R_R_TYPE_VALUES, V_P_C_REGION_VALUES,
 };
 
 /// How long after a change is submitted it reaches `INSYNC`.
@@ -213,6 +214,15 @@ pub const MAX_VPC_AUTHORIZATIONS_PER_PAGE: i32 = 50;
 /// account"), which the model's `LimitsExceeded` refusal reports.
 pub const MAX_REUSABLE_DELEGATION_SETS: usize = 100;
 
+/// The most hosted zones one reusable delegation set may carry.
+///
+/// Route 53's documented per-set quota ("Hosted zones that can use the same
+/// reusable delegation set: 100"), which is the limit `CreateHostedZone`'s own
+/// `TooManyHostedZones` names beside the account one ("because you've reached
+/// the limit on the number of hosted zones that can be associated with a
+/// reusable delegation set"), so one set cannot take on zones without end.
+pub const MAX_HOSTED_ZONES_PER_DELEGATION_SET: usize = 100;
+
 /// The most traffic policies the account may hold.
 ///
 /// Route 53's documented account quota ("Traffic policies: 50 per account"),
@@ -259,6 +269,30 @@ pub const TAG_RESOURCE_TYPE_HEALTH_CHECK: &str = "healthcheck";
 /// where `ListHostedZones` reads it.
 pub const HOSTED_ZONE_ALREADY_EXISTS_MESSAGE: &str =
     "A hosted zone has already been created with the specified caller reference.";
+
+/// The refusal text `CreateReusableDelegationSet` answers a `CallerReference`
+/// that already names a reusable delegation set with
+/// (`DelegationSetAlreadyCreated`).
+///
+/// A CONSTANT, naming neither the caller reference nor the set the reference
+/// already names, for the same reason [`HOSTED_ZONE_ALREADY_EXISTS_MESSAGE`] is
+/// one: the shape's own documentation states the rule without either ("A
+/// delegation set with the same owner and caller reference combination has
+/// already been created"), and the set's id is server-generated. The set the
+/// reference names is in state, where a delegation-set read reports it.
+pub const DELEGATION_SET_ALREADY_CREATED_MESSAGE: &str =
+    "A delegation set with the same owner and caller reference combination has already been \
+     created.";
+
+/// The refusal text `CreateReusableDelegationSet` answers a hosted zone whose
+/// name servers already belong to a reusable delegation set with
+/// (`DelegationSetAlreadyReusable`).
+///
+/// The shape's own documentation, which states the rule naming nothing of the
+/// request's: "The specified delegation set has already been marked as
+/// reusable."
+pub const DELEGATION_SET_ALREADY_REUSABLE_MESSAGE: &str =
+    "The specified delegation set has already been marked as reusable.";
 
 /// The refusal text `DeleteHostedZone` answers a zone that still holds records
 /// of the caller's with (`HostedZoneNotEmpty`, HTTP 400).
@@ -355,6 +389,39 @@ fn cidr_sort_key(cidr: &str) -> (u32, u8) {
 pub const HOSTED_ZONE_PREFIX: &str = "/hostedzone/";
 /// The `/change/` prefix the API wraps a change id in.
 pub const CHANGE_PREFIX: &str = "/change/";
+/// The `/delegationset/` prefix the API wraps a reusable delegation set's id
+/// in, the same way it wraps a hosted zone's in [`HOSTED_ZONE_PREFIX`].
+pub const DELEGATION_SET_PREFIX: &str = "/delegationset/";
+
+/// A reusable delegation set, as `CreateReusableDelegationSet` persists it and
+/// every delegation-set read reports it.
+///
+/// The id is stored BARE (`N…`); [`StoredDelegationSet::to_delegation_set`]
+/// adds the `/delegationset/` prefix the wire carries, exactly as
+/// [`StoredZone::to_hosted_zone`] adds `/hostedzone/`.
+#[derive(Debug, Clone)]
+pub struct StoredDelegationSet {
+    /// The bare delegation set id, which is also this set's key in
+    /// [`ComAmazonawsRoute53Awsdnsv20130401State::delegation_sets`].
+    pub id: String,
+    /// The `CallerReference` the set was created with.
+    pub caller_reference: String,
+    /// The four name servers the set delegates to — minted for the set, or
+    /// taken from the hosted zone whose delegation set was marked reusable.
+    pub name_servers: Vec<String>,
+}
+
+impl StoredDelegationSet {
+    /// The modelled `DelegationSet` for this set: its prefixed `Id`, the
+    /// `CallerReference` it was created with, and its name servers.
+    pub fn to_delegation_set(&self) -> DelegationSet {
+        DelegationSet {
+            id: Some(format!("{DELEGATION_SET_PREFIX}{}", self.id)),
+            caller_reference: Some(self.caller_reference.clone()),
+            name_servers: self.name_servers.clone(),
+        }
+    }
+}
 
 /// A change request, as `GetChange` reports it.
 ///
@@ -508,6 +575,15 @@ pub struct StoredZone {
     /// the read, so the day an operation can set it, the read already reports
     /// what was set.
     pub deletion_protection_enabled: bool,
+    /// The bare id of the reusable delegation set this zone's name servers come
+    /// from, when it was created in one (`CreateHostedZone$DelegationSetId`).
+    ///
+    /// The ASSOCIATION, and nothing else: the set's own caller reference and
+    /// name servers are read off the set in
+    /// [`ComAmazonawsRoute53Awsdnsv20130401State::delegation_sets`], so the two
+    /// records cannot disagree about them. `None` for a zone Route 53 minted
+    /// name servers of its own for.
+    pub delegation_set_id: Option<String>,
 }
 
 impl StoredZone {
@@ -537,10 +613,12 @@ impl StoredZone {
         }
     }
 
-    /// The zone's name servers as a `DelegationSet`.
+    /// The zone's own name servers as a `DelegationSet`.
     ///
     /// `Id` and `CallerReference` are absent: they belong to a REUSABLE
-    /// delegation set (`CreateReusableDelegationSet`), and this zone has none.
+    /// delegation set, so a zone created in one is reported through
+    /// [`ComAmazonawsRoute53Awsdnsv20130401State::zone_delegation_set`], which
+    /// reads the set the zone names.
     pub fn to_delegation_set(&self) -> DelegationSet {
         DelegationSet {
             id: None,
@@ -877,6 +955,14 @@ pub struct ComAmazonawsRoute53Awsdnsv20130401State {
     /// `CallerReference` -> health-check id, the index `CreateHealthCheck`
     /// recognises a repeated request by.
     pub health_check_by_caller_reference: HashMap<String, String>,
+    /// Every reusable delegation set of the account's, keyed by its bare id. A
+    /// `BTreeMap` so a listing pages over a stable total order of set ids.
+    /// Bounded by [`MAX_REUSABLE_DELEGATION_SETS`].
+    pub delegation_sets: BTreeMap<String, StoredDelegationSet>,
+    /// `CallerReference` -> delegation set id, the index
+    /// `CreateReusableDelegationSet` answers `DelegationSetAlreadyCreated`
+    /// from.
+    pub delegation_set_by_caller_reference: HashMap<String, String>,
     /// The id generator, kept here so ids stay unique across calls.
     ids: IdMinter,
     /// The health-checker CIDR blocks `GetCheckerIpRanges` reports, in the order
@@ -898,6 +984,8 @@ impl Default for ComAmazonawsRoute53Awsdnsv20130401State {
             traffic_policies: BTreeMap::new(),
             health_checks: BTreeMap::new(),
             health_check_by_caller_reference: HashMap::new(),
+            delegation_sets: BTreeMap::new(),
+            delegation_set_by_caller_reference: HashMap::new(),
             ids: IdMinter::default(),
             checker_ip_ranges: checker_ip_ranges(),
         }
@@ -937,6 +1025,72 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
                 return id;
             }
         }
+    }
+
+    /// Mint a reusable delegation set id: `N` plus 14 uppercase alphanumerics,
+    /// the shape Route 53 returns (`N1PA6795SAMPLE`). Retried until it is
+    /// unused.
+    pub fn mint_delegation_set_id(&mut self) -> String {
+        loop {
+            let id = self.ids.mint('N', ID_BODY_LEN);
+            if !self.delegation_sets.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// The reusable delegation set whose name servers are exactly
+    /// `name_servers`, if the account holds one.
+    ///
+    /// A delegation set IS its four name servers, so a set already delegating
+    /// to them is the set those name servers are reusable as — which is what
+    /// `DelegationSetAlreadyReusable` ("The specified delegation set has
+    /// already been marked as reusable") is about. Searched off the store
+    /// rather than tracked beside it, so a set that is deleted stops answering
+    /// by itself. The comparison is order-insensitive: the four name servers
+    /// are a SET, and the order a response lists them in is not part of which
+    /// delegation they are.
+    pub fn delegation_set_delegating_to(
+        &self,
+        name_servers: &[String],
+    ) -> Option<&StoredDelegationSet> {
+        let wanted: BTreeSet<&str> = name_servers.iter().map(String::as_str).collect();
+        self.delegation_sets.values().find(|set| {
+            set.name_servers
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<&str>>()
+                == wanted
+        })
+    }
+
+    /// The `DelegationSet` a hosted-zone read reports for `zone`: the reusable
+    /// set the zone was created in when it names one, and the zone's own name
+    /// servers otherwise.
+    ///
+    /// Read off the SET, so the `Id` and `CallerReference` a zone reports are
+    /// the ones the delegation set itself reports.
+    pub fn zone_delegation_set(&self, zone: &StoredZone) -> DelegationSet {
+        zone.delegation_set_id
+            .as_ref()
+            .and_then(|id| self.delegation_sets.get(id))
+            .map_or_else(
+                || zone.to_delegation_set(),
+                StoredDelegationSet::to_delegation_set,
+            )
+    }
+
+    /// How many hosted zones were created in the reusable delegation set `id`.
+    ///
+    /// COUNTED off the zones, so a zone that is deleted releases the set by
+    /// itself: this is what makes a set still carrying zones the one
+    /// `DeleteReusableDelegationSet` refuses, and what
+    /// `ListHostedZones$DelegationSetId` filters on.
+    pub fn zones_in_delegation_set(&self, id: &str) -> usize {
+        self.zones
+            .values()
+            .filter(|zone| zone.delegation_set_id.as_deref() == Some(id))
+            .count()
     }
 
     /// The first `ChildHealthChecks` entry of `config` that names no health
@@ -1032,12 +1186,13 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
                 (MAX_TRAFFIC_POLICIES, self.traffic_policies.len())
             }
             ACCOUNT_LIMIT_MAX_HEALTH_CHECKS => (MAX_HEALTH_CHECKS, self.health_checks.len()),
-            // The entity kinds below have no collection in this store yet —
-            // `CreateReusableDelegationSet` and `CreateTrafficPolicyInstance`
-            // are both still scaffolds, so nothing can bring one into being and
-            // the account holds none of them. Each gets its count from the
-            // collection this struct grows when its create is implemented.
-            ACCOUNT_LIMIT_MAX_REUSABLE_DELEGATION_SETS => (MAX_REUSABLE_DELEGATION_SETS, 0),
+            ACCOUNT_LIMIT_MAX_REUSABLE_DELEGATION_SETS => {
+                (MAX_REUSABLE_DELEGATION_SETS, self.delegation_sets.len())
+            }
+            // `CreateTrafficPolicyInstance` is still a scaffold, so nothing can
+            // bring a traffic policy instance into being and the account holds
+            // none; the count comes from the collection this struct grows when
+            // that create is implemented.
             ACCOUNT_LIMIT_MAX_TRAFFIC_POLICY_INSTANCES => (MAX_TRAFFIC_POLICY_INSTANCES, 0),
             _ => return None,
         };
@@ -1600,6 +1755,22 @@ pub fn no_such_hosted_zone(requested_id: &str) -> NoSuchHostedZone {
     }
 }
 
+/// The modelled `NoSuchDelegationSet` for an id that names no reusable
+/// delegation set in this store.
+///
+/// The ONE place this service words that refusal, beside
+/// [`no_such_hosted_zone`], so every operation that takes a delegation set id —
+/// the delegation-set reads and the hosted-zone operations that name one —
+/// answers a missing set identically. REQUEST-DERIVED, like the wording beside
+/// it: it names the id the request asked about, as the request wrote it.
+pub fn no_such_delegation_set(requested_id: &str) -> NoSuchDelegationSet {
+    NoSuchDelegationSet {
+        message: Some(format!(
+            "no reusable delegation set exists with the ID {requested_id}"
+        )),
+    }
+}
+
 /// The modelled `NoSuchChange` (HTTP 404) for a change id that names no change
 /// in this store.
 ///
@@ -1710,6 +1881,12 @@ pub fn normalize_zone_id(id: &str) -> &str {
 /// [`normalize_zone_id`] strips `/hostedzone/`.
 pub fn normalize_change_id(id: &str) -> &str {
     strip_id_prefix(id, "change")
+}
+
+/// A reusable delegation set id with the `/delegationset/` prefix stripped, for
+/// the same reason [`normalize_zone_id`] strips `/hostedzone/`.
+pub fn normalize_delegation_set_id(id: &str) -> &str {
+    strip_id_prefix(id, "delegationset")
 }
 
 /// Strip a leading `/`, then a leading `<collection>/`, from a resource id.

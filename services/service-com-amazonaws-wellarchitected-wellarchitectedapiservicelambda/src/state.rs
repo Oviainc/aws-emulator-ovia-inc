@@ -6727,6 +6727,33 @@ pub fn undefined_choice_refusal(
     None
 }
 
+/// Whether an answer-recording request asks for a change to the answer at all.
+///
+/// Every member of such a request that writes the answer is optional, so one that supplies
+/// NONE of them asks for nothing: recording an answer is what takes a question out of
+/// `UNANSWERED` ([`WorkloadRecord::risk_counts`],
+/// [`ReviewTemplateRecord::question_counts`]), so an answer comes into existence only for a
+/// request that answers, and nothing — not even the reviewed resource's `UpdatedAt` — is
+/// written for one that does not. A member the request DOES carry is a write however empty
+/// the value it carries, because the member is the answer's new value.
+///
+/// Shared by both operations that record an answer (a workload's and a review template's),
+/// which take the same five members, so the rule lives here once rather than in each of
+/// them.
+pub fn answer_write_requested(
+    selected_choices: Option<&[String]>,
+    choice_updates: Option<&HashMap<String, crate::ops::types::ChoiceUpdate>>,
+    is_applicable: Option<bool>,
+    reason: Option<&str>,
+    notes: Option<&str>,
+) -> bool {
+    selected_choices.is_some()
+        || choice_updates.is_some()
+        || is_applicable.is_some()
+        || reason.is_some()
+        || notes.is_some()
+}
+
 /// The member a refused `PillarNotes` key is reported under, in either operation that
 /// records the notes of a lens review (`UpdateLensReviewInput$PillarNotes`,
 /// `UpdateReviewTemplateLensReviewInput$PillarNotes`).

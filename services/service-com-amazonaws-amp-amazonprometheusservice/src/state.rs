@@ -816,15 +816,23 @@ pub struct AnomalyDetector {
     pub configuration: crate::ops::types::AnomalyDetectorConfiguration,
     /// Sorted, so a describe reports the labels in one stable order.
     pub labels: BTreeMap<String, String>,
-    /// One of [`STATUS_CREATING`], [`STATUS_ACTIVE`], [`STATUS_DELETING`].
+    /// One of [`STATUS_CREATING`], [`STATUS_ACTIVE`], [`STATUS_UPDATING`],
+    /// [`STATUS_DELETING`].
     pub status_code: String,
     pub created_at: SystemTime,
     pub modified_at: SystemTime,
     /// Sorted so a describe reports the tags in one stable order.
     pub tags: BTreeMap<String, String>,
     /// When the clock owes this detector's next lifecycle transition, if one is
-    /// pending: `CREATING` becomes `ACTIVE`, `DELETING` is removed.
+    /// pending: `CREATING` becomes `ACTIVE`, `UPDATING` becomes `ACTIVE`, `DELETING`
+    /// is removed.
     pub transition_due: Option<SystemTime>,
+    /// The `clientToken` of the update STILL PENDING on this detector, for the same
+    /// reason [`Scraper::update_token`] records a scraper's: replaying that exact call
+    /// is the SAME request, so it answers from the record that call wrote instead of
+    /// applying the change twice. Cleared once the update settles, since the token then
+    /// stands for no pending change.
+    pub update_token: Option<String>,
 }
 
 /// Per-service state for com-amazonaws-amp-amazonprometheusservice. A handler reaches it through [`service_state`].
@@ -888,6 +896,9 @@ impl ComAmazonawsAmpAmazonprometheusserviceState {
                     // Only the lifecycle status moves here — which `status` reports —
                     // so `modifiedAt` keeps the instant the record itself last changed.
                     detector.status_code = STATUS_ACTIVE.to_string();
+                    // The token identified the update that just settled, so it stops
+                    // standing for one: a later call carrying it is a new request.
+                    detector.update_token = None;
                 }
             }
             for detector_id in deleted_detectors {
@@ -1542,6 +1553,33 @@ pub fn leading_call_operator(expression: &str) -> Option<&str> {
                 .is_some_and(|tail| tail.starts_with('(') || tail.starts_with(char::is_whitespace))
         });
     applies.then_some(identifier)
+}
+
+/// Refuse an anomaly detector configuration the model accepts but the service does not.
+///
+/// `AnomalyDetectorConfiguration` is a union whose only member is `randomCutForest`, and
+/// `RandomCutForestConfiguration$query` requires the query be "wrapped by a supported
+/// PromQL aggregation operator" — so the whole expression must BE a call to one of
+/// [`RANDOM_CUT_FOREST_AGGREGATION_OPERATORS`]. Shared, because the rule is the
+/// configuration's own and every operation that stores one applies it.
+pub fn check_random_cut_forest_configuration(
+    configuration: &crate::ops::types::AnomalyDetectorConfiguration,
+) -> Result<(), crate::ops::types::ValidationException> {
+    let crate::ops::types::AnomalyDetectorConfiguration::randomCutForest(random_cut_forest) =
+        configuration;
+    let operators = RANDOM_CUT_FOREST_AGGREGATION_OPERATORS;
+    let wrapping = leading_call_operator(&random_cut_forest.query);
+    if wrapping.is_some_and(|operator| operators.contains(&operator)) {
+        return Ok(());
+    }
+    Err(member_validation_failed(
+        "configuration.randomCutForest.query",
+        &format!(
+            "Member must be wrapped by one of the supported PromQL aggregation operators \
+             ({})",
+            operators.join(", ")
+        ),
+    ))
 }
 
 /// The query logging destinations to STORE for a request's `destinations` member: the

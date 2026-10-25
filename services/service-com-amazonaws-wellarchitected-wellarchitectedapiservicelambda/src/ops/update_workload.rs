@@ -303,6 +303,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Only the members the request carries are applied; every `None` leaves the stored
         // value alone.
+        //
+        // Every member a request can write here is optional, so a request that supplies
+        // NONE of them asks for no change: it reports the workload as it stands and leaves
+        // its `UpdatedAt` where it was, rather than recording an update nothing wrote.
+        let writes_a_member = input.workload_name.is_some()
+            || input.description.is_some()
+            || input.environment.is_some()
+            || input.account_ids.is_some()
+            || input.aws_regions.is_some()
+            || input.non_aws_regions.is_some()
+            || input.pillar_priorities.is_some()
+            || input.architectural_design.is_some()
+            || input.review_owner.is_some()
+            || input.is_review_owner_update_acknowledged.is_some()
+            || input.industry_type.is_some()
+            || input.industry.is_some()
+            || input.notes.is_some()
+            || input.improvement_status.is_some()
+            || input.discovery_config.is_some()
+            || input.applications.is_some()
+            || input.jira_configuration.is_some();
+
         if let Some(workload_name) = input.workload_name {
             record.workload_name = workload_name;
         }
@@ -354,7 +376,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(jira_configuration) = input.jira_configuration {
             record.jira_configuration = Some(jira_configuration);
         }
-        record.updated_at = std::time::SystemTime::now();
+        // A write to any member is what the workload reports as the instant it was last
+        // updated, so a request that wrote none leaves that instant where it was.
+        if writes_a_member {
+            record.updated_at = std::time::SystemTime::now();
+        }
 
         Ok(UpdateWorkloadOutput {
             workload: Some(record.to_workload()),

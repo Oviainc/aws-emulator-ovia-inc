@@ -33,6 +33,8 @@ mod contact_version_listing;
 mod contact_versions;
 #[path = "all/contact_window_rules.rs"]
 mod contact_window_rules;
+#[path = "all/dataflow_edge_rules.rs"]
+mod dataflow_edge_rules;
 #[path = "all/dataflow_endpoint_group_deletion.rs"]
 mod dataflow_endpoint_group_deletion;
 #[path = "all/dataflow_endpoint_group_listing.rs"]

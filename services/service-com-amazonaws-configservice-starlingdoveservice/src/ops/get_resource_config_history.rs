@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourceConfigHistory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourceConfigHistory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the configuration items Config's recorder captured for ONE resource — each
+//! state the resource went through, newest first, within the requested time window.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourceConfigHistory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The items come from the inventory the recorder writes
+//! (`crate::state::recording`), so a resource the recorder never observed is answered
+//! `ResourceNotDiscoveredException` rather than with an empty history.
 //!
 //! ## Shape of an operation
 //!
@@ -193,18 +190,181 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourceConfigHistory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourceConfigHistoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourceConfigHistory"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+        let region = crate::state::request_region(ctx);
+
+        // "The maximum number of configuration items returned on each page. The default
+        // is 10. You cannot specify a number greater than 100. If you specify 0, Config
+        // uses the default." The modelled range refuses a limit outside 0..100 before
+        // this handler runs; the check stands so the condition answers this operation's
+        // own modelled error either way.
+        if !(0..=MAX_PAGE_SIZE).contains(&input.limit) {
+            return Err(GetResourceConfigHistoryErrorModeled::InvalidLimitException(
+                InvalidLimitException {
+                    message: Some(format!(
+                        "limit {} is outside the allowable range 0..{MAX_PAGE_SIZE}",
+                        input.limit,
+                    )),
+                },
+            )
+            .into());
+        }
+        let page_size = if input.limit == 0 {
+            DEFAULT_PAGE_SIZE
+        } else {
+            input.limit
+        } as usize;
+
+        // "The chronologically latest time in the time range for which the history
+        // requested. If not specified, current time is taken", and the earliest time
+        // bounds the other end — so a range whose earlier time is not before its later
+        // time names no interval at all.
+        let later_time = input.later_time.unwrap_or_else(|| {
+            crate::state::timestamp(::std::time::SystemTime::now())
+        });
+        if input
+            .earlier_time
+            .is_some_and(|earlier| crate::state::epoch_nanos(earlier) > crate::state::epoch_nanos(later_time))
+        {
+            return Err(
+                GetResourceConfigHistoryErrorModeled::InvalidTimeRangeException(
+                    InvalidTimeRangeException {
+                        message: Some(
+                            "the specified time range is not valid: earlierTime is not \
+                             chronologically before laterTime"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The instant the next page resumes AFTER: a token names the capture instant of
+        // the last item the previous page reported, not a position in a list, so an item
+        // the recorder captures between two pages neither shifts a page boundary nor is
+        // reported twice. The token is opaque: anything this operation did not issue is
+        // malformed.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token)
+                .and_then(|resume_after| resume_after.parse::<i128>().ok())
+            {
+                Some(resume_after) => Some(resume_after),
+                None => {
+                    return Err(
+                        GetResourceConfigHistoryErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    "the specified nextToken is not valid; use the nextToken a \
+                                     previous GetResourceConfigHistory response returned"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // Read-only: the guard is taken, the configuration items are projected out of
+        // the inventory, and nothing is written.
+        let store = state.lock();
+
+        // The configuration items of a resource are what a CUSTOMER MANAGED
+        // configuration recorder captured, so reporting them needs one to exist: a
+        // service-linked recorder records for the service it is linked to and does not
+        // stand in for one.
+        if !store.has_customer_managed_recorder() {
+            return Err(
+                GetResourceConfigHistoryErrorModeled::NoAvailableConfigurationRecorderException(
+                    NoAvailableConfigurationRecorderException {
+                        message: Some(
+                            crate::state::NO_AVAILABLE_CONFIGURATION_RECORDER_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let key = (input.resource_type.clone(), input.resource_id.clone());
+        let Some(entry) = store.discovered_resources.get(&key) else {
+            return Err(
+                GetResourceConfigHistoryErrorModeled::ResourceNotDiscoveredException(
+                    ResourceNotDiscoveredException {
+                        message: Some(format!(
+                            "Resource of type {} with id {} has not been discovered",
+                            input.resource_type, input.resource_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every item recorded for the resource, newest first — which is the order this
+        // operation reports by default ("By default, the results are listed in reverse
+        // chronological order") — reversed when the request asks to go `Forward`.
+        let forward = input.chronological_order.as_deref() == Some(CHRONOLOGICAL_ORDER_FORWARD);
+        let mut items =
+            entry.configuration_items(&region, store.recording_frequency_of(&input.resource_type));
+        if forward {
+            items.reverse();
+        }
+
+        // "The list contains details about each state of the resource during the
+        // specified time interval": an item captured outside the requested window is
+        // not a state of the resource during it. A continuation reports the items that
+        // come AFTER the one its token names, in the order this request asks for.
+        let later = crate::state::epoch_nanos(later_time);
+        let earlier = input.earlier_time.map(crate::state::epoch_nanos);
+        items.retain(|item| {
+            item.configuration_item_capture_time.is_none_or(|at| {
+                let at = crate::state::epoch_nanos(at);
+                let in_window = at <= later && earlier.is_none_or(|earlier| at >= earlier);
+                let after_resume = resume_after.is_none_or(|resumed| {
+                    if forward {
+                        at > resumed
+                    } else {
+                        at < resumed
+                    }
+                });
+                in_window && after_resume
+            })
+        });
+
+        // One page, and the instant the NEXT page resumes after — absent exactly when
+        // this page reported the last item there is.
+        let more_to_report = items.len() > page_size;
+        let page: Vec<ConfigurationItem> = items.into_iter().take(page_size).collect();
+        let next_token = more_to_report
+            .then(|| {
+                page.last()
+                    .and_then(|item| item.configuration_item_capture_time)
+                    .map(|at| crate::state::encode_page_token(&crate::state::epoch_nanos(at).to_string()))
+            })
+            .flatten();
+
+        Ok(GetResourceConfigHistoryOutput {
+            configuration_items: Some(page),
+            next_token,
+        })
     }
 }
+
+/// How many configuration items a page carries when the request asks for no limit:
+/// "By default, Config returns a limit of 10 configuration items per page."
+const DEFAULT_PAGE_SIZE: i32 = 10;
+
+/// The largest page this operation serves: "You cannot specify a number greater than
+/// 100" (`GetResourceConfigHistoryRequest$limit`, whose modelled range is 0..100).
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// The `ChronologicalOrder` value that lists a resource's items OLDEST first
+/// (`com.amazonaws.configservice#ChronologicalOrder`, whose values are `Reverse` and
+/// `Forward`); `Reverse` is the default and needs no name here.
+const CHRONOLOGICAL_ORDER_FORWARD: &str = "Forward";

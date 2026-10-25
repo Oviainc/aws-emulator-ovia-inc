@@ -21,6 +21,8 @@ mod data_transformation_profile;
 mod datastore_encryption_and_preload;
 #[path = "all/datastore_state_conflict.rs"]
 mod datastore_state_conflict;
+#[path = "all/datastore_transition_conflict_sentence.rs"]
+mod datastore_transition_conflict_sentence;
 #[path = "all/datastore_update_not_active.rs"]
 mod datastore_update_not_active;
 #[path = "all/datastore_update_transition.rs"]

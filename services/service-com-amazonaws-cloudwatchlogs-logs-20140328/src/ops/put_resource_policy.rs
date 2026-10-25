@@ -270,12 +270,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     (Some(current), Some(expected))
                         if current.revision_id.as_deref() != Some(expected) =>
                     {
+                        // The revision the caller held was superseded, which the service
+                        // reports as a conflict against the resource rather than as a bad
+                        // parameter: the caller is to re-read the policy and retry. The
+                        // text is the error class's own, naming neither the revision
+                        // presented nor the stored one.
                         return Err(
                             PutResourcePolicyErrorModeled::OperationAbortedException(
                                 OperationAbortedException {
                                     message: Some(
-                                        "expectedRevisionId does not match the current revision of this resource policy"
-                                            .to_string(),
+                                        crate::state::POLICY_REVISION_CONFLICT_MESSAGE.to_string(),
                                     ),
                                 },
                             )

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateReusableDelegationSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateReusableDelegationSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateReusableDelegationSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a reusable delegation set — four name servers several hosted zones of the
+//! same account can be created in — and persists it in this service's store, where
+//! `GetReusableDelegationSet` reads it back and `CreateHostedZone` resolves a
+//! `DelegationSetId` through.
 //!
 //! ## Shape of an operation
 //!
@@ -112,6 +107,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    normalize_zone_id, resource_location, StoredDelegationSet,
+    DELEGATION_SET_ALREADY_CREATED_MESSAGE, DELEGATION_SET_ALREADY_REUSABLE_MESSAGE,
+    MAX_REUSABLE_DELEGATION_SETS,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -186,18 +187,135 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateReusableDelegationSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateReusableDelegationSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateReusableDelegationSet"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`; `InvalidInput` is the only error this
+            // operation models that can carry the reason at all.
+            CreateReusableDelegationSetErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        // `HostedZoneId` is optional, and an empty one names no zone: the set is
+        // then minted its own four name servers rather than taking a zone's.
+        let requested_zone = input
+            .hosted_zone_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+
+        let mut store = state.lock();
+
+        // The account's own quota: a caller chooses `CallerReference` freely, so
+        // without this the store would grow for every distinct one it sends.
+        if store.delegation_sets.len() >= MAX_REUSABLE_DELEGATION_SETS {
+            return Err(CreateReusableDelegationSetErrorModeled::LimitsExceeded(LimitsExceeded {
+                message: Some(format!(
+                    "the current account has reached the limit of \
+                     {MAX_REUSABLE_DELEGATION_SETS} reusable delegation sets"
+                )),
+            })
+            .into());
+        }
+
+        // CallerReference is the idempotency token: "You must use a unique
+        // CallerReference string every time you submit a
+        // CreateReusableDelegationSet request." A repeat is refused rather than
+        // served, in the service's own constant wording; the set the reference
+        // already names is in state, not in the refusal text.
+        if store
+            .delegation_set_by_caller_reference
+            .contains_key(&input.caller_reference)
+        {
+            return Err(CreateReusableDelegationSetErrorModeled::DelegationSetAlreadyCreated(
+                DelegationSetAlreadyCreated {
+                    message: Some(DELEGATION_SET_ALREADY_CREATED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Naming a hosted zone marks THAT zone's delegation set reusable, so the
+        // new set delegates to the zone's own four name servers; naming none
+        // mints four of its own.
+        let name_servers = match requested_zone.as_deref() {
+            None => store.mint_name_servers(),
+            Some(requested) => {
+                // The caller may pass the bare id or the `/hostedzone/`-prefixed
+                // `Id` a hosted-zone response handed it back; both name the same
+                // zone.
+                let zone = store.zones.get(normalize_zone_id(requested)).ok_or_else(|| {
+                    CreateReusableDelegationSetErrorModeled::HostedZoneNotFound(
+                        HostedZoneNotFound {
+                            message: Some(format!("No hosted zone found with ID: {requested}")),
+                        },
+                    )
+                })?;
+                // "You can't associate a reusable delegation set with a private
+                // hosted zone", so a private zone's delegation set is not one
+                // this parameter can name.
+                if zone.private_zone {
+                    return Err(CreateReusableDelegationSetErrorModeled::InvalidArgument(
+                        InvalidArgument {
+                            message: Some(format!(
+                                "Invalid parameter: HostedZoneId {requested} is a private hosted \
+                                 zone, whose delegation set cannot be made reusable"
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                let name_servers = zone.name_servers.clone();
+                // A delegation set IS its four name servers, so a zone whose
+                // name servers a set already delegates to has a delegation set
+                // that is already reusable — there is no second set to create
+                // for them.
+                if store.delegation_set_delegating_to(&name_servers).is_some() {
+                    return Err(
+                        CreateReusableDelegationSetErrorModeled::DelegationSetAlreadyReusable(
+                            DelegationSetAlreadyReusable {
+                                message: Some(DELEGATION_SET_ALREADY_REUSABLE_MESSAGE.to_string()),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                name_servers
+            }
+        };
+
+        let id = store.mint_delegation_set_id();
+        store.delegation_sets.insert(
+            id.clone(),
+            StoredDelegationSet {
+                id: id.clone(),
+                caller_reference: input.caller_reference.clone(),
+                name_servers,
+            },
+        );
+        store
+            .delegation_set_by_caller_reference
+            .insert(input.caller_reference, id.clone());
+        // A zone whose delegation set was just marked reusable is a zone created
+        // in that set from now on, so the association the set is reusable
+        // through is recorded on it.
+        if let Some(requested) = requested_zone.as_deref() {
+            let zone_id = normalize_zone_id(requested).to_string();
+            if let Some(zone) = store.zones.get_mut(&zone_id) {
+                zone.delegation_set_id = Some(id.clone());
+            }
+        }
+
+        // Read the response back out of the store, so what the caller is told is
+        // what a later GetReusableDelegationSet will tell it.
+        let delegation_set = store
+            .delegation_sets
+            .get(&id)
+            .map(StoredDelegationSet::to_delegation_set)
+            .expect("the delegation set just inserted must be present");
+        Ok(CreateReusableDelegationSetOutput {
+            delegation_set,
+            location: resource_location(ctx, &format!("delegationset/{id}")),
+        })
     }
 }

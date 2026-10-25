@@ -75,6 +75,20 @@ use crate::ops::types::{
     UserContext, VpcConfig,
 };
 
+/// The AI recommendation job slice — the record `CreateAIRecommendationJob` writes,
+/// `DescribeAIRecommendationJob` replays and `DeleteAIRecommendationJob` releases, with
+/// the ARN kind, quota, statuses, clock span and failure reason that belong to it. Kept
+/// in its own file (as the CloudFormation service keeps `state::template`) so this one
+/// resource kind reads as one unit instead of another block at the end of this module.
+pub mod ai_recommendation_job;
+
+pub use ai_recommendation_job::{
+    ai_recommendation_job_not_found, AIRecommendationJob, AI_RECOMMENDATION_JOB_ENDS_AFTER,
+    AI_RECOMMENDATION_JOB_KIND, AI_RECOMMENDATION_JOB_QUOTA,
+    AI_RECOMMENDATION_OPTIMIZE_MODEL_DEFAULT, AI_RECOMMENDATION_STATUS_FAILED,
+    AI_RECOMMENDATION_STATUS_IN_PROGRESS, NO_RECOMMENDATION_RUNTIME_REASON,
+};
+
 /// The model-customization job slice: the record `CreateJob` persists, the lookup every
 /// job operation performs and the constants that bound and word it. Re-exported below,
 /// so a handler names them as `crate::state::…` like every other slice.
@@ -2607,6 +2621,9 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     /// Keyed by `AIBenchmarkJobName`. See [`AIBenchmarkJob`], at the end of this module
     /// with the rest of the AI-benchmarking slice.
     pub ai_benchmark_jobs: BTreeMap<String, AIBenchmarkJob>,
+    /// Keyed by `AIRecommendationJobName`. See [`AIRecommendationJob`], which lives with
+    /// the rest of its slice in the [`ai_recommendation_job`] submodule.
+    pub ai_recommendation_jobs: BTreeMap<String, AIRecommendationJob>,
     /// Keyed by `HubName`. See [`Hub`].
     pub hubs: BTreeMap<String, Hub>,
     /// Every stored hub content VERSION, keyed by [`HubContentKey`].

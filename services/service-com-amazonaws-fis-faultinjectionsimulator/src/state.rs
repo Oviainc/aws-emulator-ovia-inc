@@ -3325,6 +3325,66 @@ pub fn actions_quota_refusal(
     })
 }
 
+/// Why a template record is not one this service admits, carrying the error FIS answers it
+/// with.
+///
+/// The two error CLASSES the admissibility sequence ([`template_refusal`]) produces. Which
+/// operation is being refused decides nothing here: a handler lifts the payload into its
+/// own operation's error enum, and that lift is the only per-operation part of the refusal.
+#[derive(Debug)]
+pub enum TemplateRefusal {
+    /// A 400 `ValidationException`: the record describes a template FIS would not run.
+    Invalid(ValidationException),
+    /// A 402 `ServiceQuotaExceededException`: the record is past a published quota.
+    QuotaExceeded(ServiceQuotaExceededException),
+}
+
+/// `None` when `template` is a record this service admits; otherwise the refusal it earns.
+///
+/// The ONE admissibility sequence of an experiment template, judged over the RECORD rather
+/// than over a request's shape — which is how FIS states these rules, about a template and
+/// not about one call. `CreateExperimentTemplate` judges the record it builds by this and
+/// `UpdateExperimentTemplate` the candidate it would commit, so the two cannot disagree
+/// about which templates are admissible and a rule added or reordered here is applied by
+/// both at once. Expressing it once is what makes that agreement hold rather than something
+/// each handler has to remember.
+///
+/// The ORDER is part of the rule: a record outside more than one of these earns the first
+/// refusal below, so one request always reports the same message.
+pub fn template_refusal(template: &ExperimentTemplateRecord) -> Option<TemplateRefusal> {
+    // What the model cannot express is that `roleArn` names an IAM ROLE, what FIS documents
+    // for a stop condition's `source`/`value` pair, which values the two `experimentOptions`
+    // enums admit, and the parameters FIS's built-in actions take. The modelled constraints
+    // — the required members, the lengths and patterns, the 50-entry tag map — were already
+    // refused at the boundary.
+    if let Some(refusal) = role_arn_refusal("roleArn", Some(template.role_arn.as_str())) {
+        return Some(TemplateRefusal::Invalid(refusal));
+    }
+    if let Some(refusal) = stop_conditions_refusal(&template.stop_conditions) {
+        return Some(TemplateRefusal::Invalid(refusal));
+    }
+    if let Some(refusal) = template_experiment_options_refusal(&template.experiment_options) {
+        return Some(TemplateRefusal::Invalid(refusal));
+    }
+    // A log configuration says WHERE the experiment's logs are delivered, so one that names
+    // no destination is refused rather than stored.
+    if let Some(refusal) = log_configuration_refusal(template.log_configuration.as_ref()) {
+        return Some(TemplateRefusal::Invalid(refusal));
+    }
+    // The action count is capped because it is a published quota, and because it is what
+    // bounds the work the action graph of this template costs every later
+    // `StartExperiment` — a quota, so FIS answers it with its own error class.
+    if let Some(refusal) = actions_quota_refusal(&template.actions) {
+        return Some(TemplateRefusal::QuotaExceeded(refusal));
+    }
+    // A wait beyond the documented bound is refused HERE rather than persisted: a template
+    // a call accepts is one the service would run.
+    if let Some(refusal) = actions_refusal(&template.actions) {
+        return Some(TemplateRefusal::Invalid(refusal));
+    }
+    None
+}
+
 /// What the experiment options make of a started experiment's actions — see [`RunActions`].
 ///
 /// `actions_mode` is the `actionsMode` `StartExperiment` resolved

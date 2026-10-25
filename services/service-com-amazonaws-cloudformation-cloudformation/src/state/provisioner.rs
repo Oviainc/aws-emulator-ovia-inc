@@ -117,6 +117,14 @@
 //!   member from the resource's physical id, and the DB instance's published endpoint,
 //!   ARN and resource id are replaced by the ones Amazon RDS answered with, since those
 //!   are the values a client reaches the database through.
+//! * `AWS::RDS::DBParameterGroup`'s and `AWS::RDS::DBClusterParameterGroup`'s are their
+//!   creates' own members read the same way ([`ParameterGroupCalls`]), with the one property
+//!   Amazon RDS spells differently renamed (`Family` is `DBParameterGroupFamily`) and the
+//!   name CloudFormation decides set on the way out — each type's `Ref` returns its group's
+//!   name. The two declare the same document under different member and action names, so one
+//!   arm serves both. Their `Parameters` MAP is no member of either create: a group's
+//!   parameter values are written by the modify a client makes next, so the arm makes that
+//!   second call ([`modify_parameters`]) in the batches that request's own bound admits.
 //! * `AWS::Events::Rule`'s are `PutRule`'s own members, spelled identically, with two
 //!   exceptions: `EventPattern` is a template DOCUMENT where the request takes the JSON
 //!   TEXT of one, and `Targets` is no `PutRule` member at all — a rule's targets are
@@ -216,6 +224,16 @@ const RDS_DB_INSTANCE: &str = "AWS::RDS::DBInstance";
 /// an instance in it.
 const RDS_DB_SUBNET_GROUP: &str = "AWS::RDS::DBSubnetGroup";
 
+/// `AWS::RDS::DBParameterGroup`: "Ref returns the DB parameter group name" — the group a DB
+/// instance's `DBParameterGroupName` names, and the one `DescribeDBParameters` reports the
+/// parameters of.
+const RDS_DB_PARAMETER_GROUP: &str = "AWS::RDS::DBParameterGroup";
+
+/// `AWS::RDS::DBClusterParameterGroup`: "Ref returns the DB cluster parameter group name" —
+/// the cluster-scoped sibling of the type above, which a DB cluster's
+/// `DBClusterParameterGroupName` names.
+const RDS_DB_CLUSTER_PARAMETER_GROUP: &str = "AWS::RDS::DBClusterParameterGroup";
+
 /// The code a refusal carries where the change a deployment asks for is one this emulator
 /// has not written the owning API call for. It is the same code the scaffold's own 501
 /// answers under (`smithy.framework#NotImplemented`), and not a code any AWS service
@@ -246,6 +264,8 @@ pub(super) enum Provisioner {
     GuardDutyDetector,
     RdsDbInstance,
     RdsDbSubnetGroup,
+    RdsDbParameterGroup,
+    RdsDbClusterParameterGroup,
     EventsRule,
     SsmParameter,
     StepFunctionsActivity,
@@ -280,6 +300,8 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         GUARDDUTY_DETECTOR => Some(Provisioner::GuardDutyDetector),
         RDS_DB_INSTANCE => Some(Provisioner::RdsDbInstance),
         RDS_DB_SUBNET_GROUP => Some(Provisioner::RdsDbSubnetGroup),
+        RDS_DB_PARAMETER_GROUP => Some(Provisioner::RdsDbParameterGroup),
+        RDS_DB_CLUSTER_PARAMETER_GROUP => Some(Provisioner::RdsDbClusterParameterGroup),
         EVENTS_RULE => Some(Provisioner::EventsRule),
         SSM_PARAMETER => Some(Provisioner::SsmParameter),
         STEP_FUNCTIONS_ACTIVITY => Some(Provisioner::StepFunctionsActivity),
@@ -366,6 +388,26 @@ impl Provisioner {
             }
             Self::RdsDbSubnetGroup => {
                 create_db_subnet_group(ctx, region, resource, propagated).await
+            }
+            Self::RdsDbParameterGroup => {
+                create_parameter_group(
+                    ctx,
+                    region,
+                    resource,
+                    propagated,
+                    DB_PARAMETER_GROUP_CALLS,
+                )
+                .await
+            }
+            Self::RdsDbClusterParameterGroup => {
+                create_parameter_group(
+                    ctx,
+                    region,
+                    resource,
+                    propagated,
+                    DB_CLUSTER_PARAMETER_GROUP_CALLS,
+                )
+                .await
             }
             // `AWS::Events::Rule` publishes `Description`, `EventBusName`, `EventPattern`,
             // `Name`, `RoleArn`, `ScheduleExpression`, `State` and `Targets` and no
@@ -547,6 +589,24 @@ impl Provisioner {
             Self::RdsDbSubnetGroup => {
                 delete_db_subnet_group(ctx, region, physical_resource_id).await
             }
+            Self::RdsDbParameterGroup => {
+                delete_parameter_group(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                    DB_PARAMETER_GROUP_CALLS,
+                )
+                .await
+            }
+            Self::RdsDbClusterParameterGroup => {
+                delete_parameter_group(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                    DB_CLUSTER_PARAMETER_GROUP_CALLS,
+                )
+                .await
+            }
             // A rule still carrying targets cannot be deleted, and only the rule's own
             // record says which bus it is on, so the delete takes the record.
             Self::EventsRule => delete_rule(ctx, region, resource).await,
@@ -629,6 +689,24 @@ impl Provisioner {
             }
             Self::RdsDbSubnetGroup => {
                 describe_db_subnet_group(ctx, region, physical_resource_id).await
+            }
+            Self::RdsDbParameterGroup => {
+                describe_parameter_group(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                    DB_PARAMETER_GROUP_CALLS,
+                )
+                .await
+            }
+            Self::RdsDbClusterParameterGroup => {
+                describe_parameter_group(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                    DB_CLUSTER_PARAMETER_GROUP_CALLS,
+                )
+                .await
             }
             // The read is addressed by the rule's name AND the bus it is bound to, which
             // only the resource's own record carries.
@@ -4524,7 +4602,8 @@ async fn delete_workspace(
 }
 
 // ---------------------------------------------------------------------------
-// Amazon RDS: AWS::RDS::DBInstance, AWS::RDS::DBSubnetGroup
+// Amazon RDS: AWS::RDS::DBInstance, AWS::RDS::DBSubnetGroup,
+// AWS::RDS::DBParameterGroup, AWS::RDS::DBClusterParameterGroup
 // ---------------------------------------------------------------------------
 
 /// Amazon RDS's signing name and API version, from its model (`sigv4Name: rds`, service
@@ -4538,6 +4617,12 @@ const RDS_API_VERSION: &str = "2014-10-31";
 /// codes, which is what an awsQuery client branches on.
 const DB_INSTANCE_NOT_FOUND: &str = "DBInstanceNotFound";
 const DB_SUBNET_GROUP_NOT_FOUND: &str = "DBSubnetGroupNotFoundFault";
+
+/// `DBParameterGroupNotFoundFault`'s own `awsQueryError` code
+/// (`smithy_query(query="operation", operation="DeleteDBParameterGroup")`), which is what
+/// an awsQuery client branches on for a parameter group Amazon RDS does not hold — one code
+/// for both group kinds, since both levels' operations model that same error shape.
+const DB_PARAMETER_GROUP_NOT_FOUND: &str = "DBParameterGroupNotFound";
 
 /// How one member of a create reaches an awsQuery form body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4680,6 +4765,95 @@ const CREATE_DB_SUBNET_GROUP_MEMBERS: &[(&str, QueryMember)] = &[
 /// the DB instance's are ([`DB_INSTANCE_PROPERTIES_NOT_SENT`]): the name CloudFormation
 /// decides, and the tag list it merges.
 const DB_SUBNET_GROUP_PROPERTIES_NOT_SENT: &[&str] = &["DBSubnetGroupName", "Tags"];
+
+/// One Amazon RDS parameter-group TYPE, as the calls that make a group of it exist, carry a
+/// caller's settings, stop existing and be read.
+///
+/// `AWS::RDS::DBParameterGroup` and `AWS::RDS::DBClusterParameterGroup` declare the same
+/// document — `Description`, `Family`, the `Parameters` map, the name and the tag list — and
+/// their owning APIs differ only in the member each addresses a group by and in the action
+/// names, so ONE arm serves both and the difference between them is this record.
+#[derive(Debug, Clone, Copy)]
+struct ParameterGroupCalls {
+    /// The resource type, which a property outside the create's catalogue is refused by
+    /// name ([`query_members`]).
+    resource_type: &'static str,
+    /// The member every one of these calls addresses the group by, which is also what this
+    /// type's `Ref` returns and so this resource's physical id.
+    name_member: &'static str,
+    /// The members the create takes, from Amazon RDS's own model, with each list's element
+    /// name from its list shape's member `@xmlName`
+    /// (`smithy_query(query="shape", shape="TagList")`).
+    create_members: &'static [(&'static str, QueryMember)],
+    create: &'static str,
+    modify: &'static str,
+    delete: &'static str,
+    describe: &'static str,
+    /// The element the describe reports one group as.
+    record: &'static str,
+}
+
+impl ParameterGroupCalls {
+    /// The declared properties the walk does NOT turn into a create member: the name
+    /// CloudFormation decides and the tag list it merges, as for the two types above, plus
+    /// the `Parameters` MAP, which is no member of the create at all — a group's parameter
+    /// values are written by the modify [`modify_parameters`] makes next.
+    fn properties_not_sent(&self) -> [&'static str; 3] {
+        [self.name_member, "Parameters", "Tags"]
+    }
+}
+
+/// `AWS::RDS::DBParameterGroup`, whose group is the one a DB instance's
+/// `DBParameterGroupName` names and `DescribeDBParameters` reports the parameters of
+/// (`smithy_query(query="operation", operation="CreateDBParameterGroup")`).
+const DB_PARAMETER_GROUP_CALLS: ParameterGroupCalls = ParameterGroupCalls {
+    resource_type: RDS_DB_PARAMETER_GROUP,
+    name_member: "DBParameterGroupName",
+    create_members: &[
+        ("DBParameterGroupFamily", QueryMember::Scalar),
+        ("DBParameterGroupName", QueryMember::Scalar),
+        ("Description", QueryMember::Scalar),
+        ("Tags", QueryMember::List("Tag")),
+    ],
+    create: "CreateDBParameterGroup",
+    modify: "ModifyDBParameterGroup",
+    delete: "DeleteDBParameterGroup",
+    describe: "DescribeDBParameterGroups",
+    record: "DBParameterGroup",
+};
+
+/// `AWS::RDS::DBClusterParameterGroup`, the cluster-scoped sibling: the group a DB cluster's
+/// `DBClusterParameterGroupName` names and `DescribeDBClusterParameters` reports the
+/// parameters of. Its create takes the family under the SAME member name as the
+/// instance-scoped one (`DBParameterGroupFamily`) and the group under its own
+/// (`smithy_query(query="operation", operation="CreateDBClusterParameterGroup")`).
+const DB_CLUSTER_PARAMETER_GROUP_CALLS: ParameterGroupCalls = ParameterGroupCalls {
+    resource_type: RDS_DB_CLUSTER_PARAMETER_GROUP,
+    name_member: "DBClusterParameterGroupName",
+    create_members: &[
+        ("DBClusterParameterGroupName", QueryMember::Scalar),
+        ("DBParameterGroupFamily", QueryMember::Scalar),
+        ("Description", QueryMember::Scalar),
+        ("Tags", QueryMember::List("Tag")),
+    ],
+    create: "CreateDBClusterParameterGroup",
+    modify: "ModifyDBClusterParameterGroup",
+    delete: "DeleteDBClusterParameterGroup",
+    describe: "DescribeDBClusterParameterGroups",
+    record: "DBClusterParameterGroup",
+};
+
+/// The one property of either parameter-group type whose create member is spelled
+/// differently: the types' `Family` is the API's `DBParameterGroupFamily` ("the DB parameter
+/// group family name"). Every other property is its member's own name.
+const PARAMETER_GROUP_RENAMED_PROPERTIES: &[(&str, &str)] =
+    &[("Family", "DBParameterGroupFamily")];
+
+/// How many parameters one modify carries: "A maximum of 20 parameters can be modified in a
+/// single request" (`ModifyDBParameterGroupMessage$Parameters`, and the cluster-level
+/// request's own `Parameters`), so a declaration carrying more reaches Amazon RDS as several
+/// calls rather than as one request that service would refuse.
+const PARAMETERS_PER_MODIFY: usize = 20;
 
 /// Create the DB instance an `AWS::RDS::DBInstance` declares.
 ///
@@ -5018,6 +5192,194 @@ async fn describe_db_subnet_group(
             "DBSubnetGroup",
         )))),
         Err(refusal) if refusal.code == DB_SUBNET_GROUP_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Create the parameter group a declaration of either RDS parameter-group type asks for.
+///
+/// The type's properties are its create's own members ([`ParameterGroupCalls`]) but for the
+/// one Amazon RDS spells differently ([`PARAMETER_GROUP_RENAMED_PROPERTIES`]), with the name
+/// CloudFormation decides — what this type's `Ref` returns, this resource's physical id —
+/// and the merged tag list pushed by this arm the way the two types above push theirs.
+///
+/// The declared `Parameters` are a SECOND call ([`modify_parameters`]), the same pair a
+/// client makes: a group is created carrying none of its own parameters, and the values a
+/// template declares are what the describe of the group's parameters then reports for it.
+async fn create_parameter_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+    calls: ParameterGroupCalls,
+) -> Result<Created, Refusal> {
+    let mut parameters = query_members(
+        &resource.properties,
+        calls.create_members,
+        PARAMETER_GROUP_RENAMED_PROPERTIES,
+        &calls.properties_not_sent(),
+        calls.resource_type,
+    )?;
+    parameters.push((
+        calls.name_member.to_string(),
+        resource.physical_resource_id.clone(),
+    ));
+    push_tag_list(
+        &mut parameters,
+        "Tags",
+        "Tag",
+        &tags_of(&resource.properties, propagated),
+    );
+    let answered = call_query(
+        ctx,
+        RDS_SIGNING_NAME,
+        region,
+        RDS_API_VERSION,
+        calls.create,
+        &parameters,
+    )
+    .await?;
+    modify_parameters(
+        ctx,
+        region,
+        &resource.physical_resource_id,
+        &resource.properties,
+        calls,
+    )
+    .await?;
+
+    let mut attributes = BTreeMap::new();
+    if let Some(arn) =
+        xml_element(&answered, &format!("{}Arn", calls.record)).filter(|arn| !arn.is_empty())
+    {
+        // The group's own ARN, which is the resource's: the conventional `Arn` attribute the
+        // type answers is re-pointed at the one Amazon RDS reports.
+        attributes.insert("Arn".to_string(), arn);
+    }
+    Ok(Created::attributes(attributes))
+}
+
+/// Write the parameter settings a declaration carries into the group named
+/// `physical_resource_id`, through the modify a client makes for them.
+///
+/// Either type's `Parameters` is a MAP of parameter name to value, where the modify takes
+/// the `Parameter` STRUCTURE list its `ParametersList` spells, so each entry is written as
+/// one element of that list. A declaration carrying more than one request admits
+/// ([`PARAMETERS_PER_MODIFY`]) is sent as several calls, since one request carrying them all
+/// is a request Amazon RDS refuses; a declaration carrying none makes no call at all.
+///
+/// How many calls that is is bounded by the declared map, which is bounded by the template
+/// body the stack was created from, and Amazon RDS's own cap on how many parameters one
+/// group carries refuses the rest — so neither this loop nor the group it writes grows with
+/// anything a caller can choose freely.
+async fn modify_parameters(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+    properties: &Value,
+    calls: ParameterGroupCalls,
+) -> Result<(), Refusal> {
+    let Some(declared) = properties.get("Parameters").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let settings: Vec<(&String, &Value)> = declared.iter().collect();
+    for batch in settings.chunks(PARAMETERS_PER_MODIFY) {
+        let mut parameters = vec![(
+            calls.name_member.to_string(),
+            physical_resource_id.to_string(),
+        )];
+        for (index, (name, value)) in batch.iter().enumerate() {
+            let position = index + 1;
+            parameters.push((
+                format!("Parameters.Parameter.{position}.ParameterName"),
+                (*name).clone(),
+            ));
+            parameters.push((
+                format!("Parameters.Parameter.{position}.ParameterValue"),
+                attribute_text(value),
+            ));
+        }
+        call_query(
+            ctx,
+            RDS_SIGNING_NAME,
+            region,
+            RDS_API_VERSION,
+            calls.modify,
+            &parameters,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Delete the parameter group a stack created, addressed by its name — this resource's
+/// physical id. A group Amazon RDS no longer has (`DBParameterGroupNotFound`) is already in
+/// the state the delete asks for.
+///
+/// Amazon RDS refuses the delete of a DB parameter group an instance is still a member of,
+/// so that deletion comes first: CloudFormation deletes a stack's resources in dependency
+/// order and waits for each deletion to finish, which is what
+/// [`confirm_db_instance_deleted`] is for.
+async fn delete_parameter_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+    calls: ParameterGroupCalls,
+) -> Result<(), Refusal> {
+    let parameters = vec![(
+        calls.name_member.to_string(),
+        physical_resource_id.to_string(),
+    )];
+    match call_query(
+        ctx,
+        RDS_SIGNING_NAME,
+        region,
+        RDS_API_VERSION,
+        calls.delete,
+        &parameters,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == DB_PARAMETER_GROUP_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The parameter group's configuration as Amazon RDS reports it, for drift detection. A
+/// group it no longer has (`DBParameterGroupNotFound`) was deleted.
+///
+/// Its scalar members are read the way the two types above read theirs, which covers the one
+/// property a declaration can drift in under the same name (`Description`); `Family` is
+/// reported under the API's own `DBParameterGroupFamily` and `Parameters` is not a member of
+/// this record at all, so neither takes part in the comparison — the position every arm
+/// whose property is spelled differently from its member is in, and what [`super::drift`]
+/// documents.
+async fn describe_parameter_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+    calls: ParameterGroupCalls,
+) -> Result<Option<Value>, Refusal> {
+    let parameters = vec![(
+        calls.name_member.to_string(),
+        physical_resource_id.to_string(),
+    )];
+    match call_query(
+        ctx,
+        RDS_SIGNING_NAME,
+        region,
+        RDS_API_VERSION,
+        calls.describe,
+        &parameters,
+    )
+    .await
+    {
+        Ok(answered) => Ok(Some(Value::Object(xml_scalar_children(
+            &answered,
+            calls.record,
+        )))),
+        Err(refusal) if refusal.code == DB_PARAMETER_GROUP_NOT_FOUND => Ok(None),
         Err(refusal) => Err(refusal),
     }
 }

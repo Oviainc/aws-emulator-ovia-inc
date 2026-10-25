@@ -180,6 +180,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // distributions as they stand at this instant.
         store.settle(::std::time::SystemTime::now());
 
+        // A policy AWS published is readable in this account but belongs to AWS: no call
+        // here creates, changes or removes one, so a delete aimed at one is refused for
+        // what the REQUEST asked for — deletion of a service-owned resource — rather than
+        // answered "does not exist", and the policy stays readable afterwards. Decided
+        // before the precondition, because no version of it can make the delete legal.
+        if crate::state::managed_cache_policy(&input.id).is_some() {
+            return Err(DeleteCachePolicyErrorModeled::IllegalDelete(
+                crate::state::illegal_delete_managed_policy(),
+            )
+            .into());
+        }
+
         let Some(current_etag) = store
             .cache_policy(&input.id)
             .map(|stored| stored.etag.clone())
