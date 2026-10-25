@@ -209,10 +209,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A delete is a MUTATION of the rule the request names, so its 404 names
+        // the ARN it was sent (`crate::state::rule_not_found_message`) rather
+        // than the fixed sentence a read answers with.
         let Some(rule) = guard.rules.get(&input.rule_arn) else {
             return Err(DeleteAutomationRuleErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                    message: Some(crate::state::rule_not_found_message(&input.rule_arn)),
                 },
             )
             .into());

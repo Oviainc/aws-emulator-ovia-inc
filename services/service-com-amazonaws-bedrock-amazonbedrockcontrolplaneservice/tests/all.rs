@@ -45,5 +45,7 @@ mod state_roundtrip;
 mod support;
 #[path = "all/tagging.rs"]
 mod tagging;
+#[path = "all/use_case_for_model_access.rs"]
+mod use_case_for_model_access;
 #[path = "all/validation_message_wording.rs"]
 mod validation_message_wording;
