@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDataCatalog
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDataCatalog`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDataCatalog::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: registers a data catalog under its name in this service's state, with the
+//! parameters the catalog's type requires checked, and refuses a name the registry
+//! already holds. `GetDataCatalog` answers out of the same record.
 //!
 //! ## Shape of an operation
 //!
@@ -177,20 +171,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDataCatalog` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDataCatalogErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDataCatalog"))
+        // Check the request on its own terms FIRST, before any lock is taken: a request
+        // that is going to be refused never walks the registry, and no other Athena
+        // request waits behind the work of measuring it.
+        let catalog_type = input.r#type;
+        if !DATA_CATALOG_TYPE_VALUES.contains(&catalog_type.as_str()) {
+            return Err(invalid_request(format!(
+                "Type {catalog_type} is not a supported data catalog type. Supported data \
+                 catalog types are {}.",
+                DATA_CATALOG_TYPE_VALUES.join(", ")
+            )));
+        }
+        // The name's documented length and character set, neither of which the model's
+        // `CatalogNameString` carries.
+        if let Some(message) = crate::state::data_catalog_name_error(&input.name, &catalog_type) {
+            return Err(invalid_request(message));
+        }
+
+        let parameters = input.parameters.unwrap_or_default();
+        let parameters_bytes = crate::state::parameters_bytes(&parameters);
+        if parameters_bytes > crate::state::MAX_DATA_CATALOG_PARAMETERS_BYTES {
+            return Err(invalid_request(format!(
+                "Parameters carries {parameters_bytes} bytes of keys and values, more than \
+                 the {} bytes a data catalog's parameters can hold.",
+                crate::state::MAX_DATA_CATALOG_PARAMETERS_BYTES
+            )));
+        }
+        // `Parameters` is "a mapping whose values depend on the catalog type", and each
+        // type documents the keys it requires.
+        if let Some(message) =
+            crate::state::data_catalog_parameters_error(&catalog_type, &parameters)
+        {
+            return Err(invalid_request(message));
+        }
+        let connection_type = crate::state::federated_connection_type(&catalog_type, &parameters)
+            .map_err(invalid_request)?;
+
+        let tags = input.tags.unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(invalid_request(format!(
+                "Tags carries {} tags, more than the {} tags one resource can hold.",
+                tags.len(),
+                crate::state::MAX_TAGS_PER_RESOURCE
+            )));
+        }
+        // `Tag$Key` is 1 to 128 characters and a tag with no key names nothing to tag.
+        if crate::state::tag_without_key(&tags) {
+            return Err(invalid_request(
+                "Tags contains a tag with no key; every tag must carry a Tag.Key of 1 to \
+                 128 characters."
+                    .to_string(),
+            ));
+        }
+        // `Tag$Key`: "Tag keys are case-sensitive and must be unique per resource."
+        if let Some(key) = crate::state::first_duplicate_tag_key(&tags) {
+            return Err(invalid_request(format!(
+                "Tag keys must be unique per resource, and the key '{key}' appears more \
+                 than once in Tags."
+            )));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateDataCatalogErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("Athena state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // `Name` is documented "unique for the Amazon Web Services account", so a create
+        // under a name the registry already holds would either overwrite a catalog this
+        // call never made or report success for one it did not create. Refused instead.
+        if store.data_catalogs.contains_key(&input.name) {
+            return Err(invalid_request(format!(
+                "DataCatalog {} already exists.",
+                input.name
+            )));
+        }
+
+        if store.data_catalogs.len() >= crate::state::MAX_DATA_CATALOGS {
+            return Err(invalid_request(format!(
+                "Cannot create another data catalog: this account already holds the \
+                 maximum of {} data catalogs.",
+                crate::state::MAX_DATA_CATALOGS
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let record = crate::state::DataCatalogRecord {
+            name: input.name.clone(),
+            // A federated catalog is created asynchronously, so its completion is a
+            // transition the clock owes; every other type is created synchronously and
+            // is complete as this call returns.
+            create_complete_at: crate::state::create_complete_at(&catalog_type, now),
+            catalog_type,
+            description: input.description,
+            parameters: parameters.into_iter().collect(),
+            connection_type,
+            tags,
+        };
+        // The response is the record the registry now holds, read through the same
+        // projection `GetDataCatalog` reads it through.
+        let data_catalog = record.to_data_catalog(now);
+        store.data_catalogs.insert(input.name, record);
+
+        Ok(CreateDataCatalogOutput {
+            data_catalog: Some(data_catalog),
+        })
     }
 }
+
+/// The operation's own client error (HTTP 400), carrying `message`.
+///
+/// Every refusal above is a bad request rather than an unwritten operation, and
+/// `InvalidRequestException` is the client error this operation models: "Indicates that
+/// something is wrong with the input to the request."
+fn invalid_request(message: String) -> CreateDataCatalogError {
+    CreateDataCatalogErrorModeled::InvalidRequestException(InvalidRequestException {
+        athena_error_code: None,
+        message: Some(message),
+    })
+    .into()
+}
+
