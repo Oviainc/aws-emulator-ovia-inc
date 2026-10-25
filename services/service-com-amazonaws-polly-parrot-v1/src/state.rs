@@ -200,6 +200,18 @@ pub fn settle_task_status(task: &mut StoredSynthesisTask, now: SystemTime) {
     }
 }
 
+/// An optional list member of a reported resource: `Some` only when the resource has
+/// values for it.
+///
+/// A resource that has none omits the member rather than carrying an empty array,
+/// because the absent member and `[]` are different documents: the first says the
+/// resource has no such values, the second says the service reports a list it did not
+/// have to send. Every optional list member of a reported shape goes through here, so
+/// no two of them can answer that differently.
+pub fn reported_list<T: ToString>(values: &[T]) -> Option<Vec<String>> {
+    (!values.is_empty()).then(|| values.iter().map(ToString::to_string).collect())
+}
+
 /// The `SynthesisTask` wire shape for a stored task.
 ///
 /// Shared by `GetSpeechSynthesisTask`, `ListSpeechSynthesisTasks` and
@@ -214,10 +226,10 @@ pub fn synthesis_task(stored: &StoredSynthesisTask) -> crate::ops::types::Synthe
         creation_time: Some(::aws_smithy_types::DateTime::from(stored.creation_time)),
         request_characters: stored.request_characters,
         sns_topic_arn: stored.sns_topic_arn.clone(),
-        lexicon_names: Some(stored.lexicon_names.clone()),
+        lexicon_names: reported_list(&stored.lexicon_names),
         output_format: Some(stored.output_format.clone()),
         sample_rate: stored.sample_rate.clone(),
-        speech_mark_types: Some(stored.speech_mark_types.clone()),
+        speech_mark_types: reported_list(&stored.speech_mark_types),
         text_type: Some(stored.text_type.clone()),
         voice_id: Some(stored.voice_id.clone()),
         language_code: stored.language_code.clone(),
@@ -430,9 +442,10 @@ pub fn decode_page_token(token: &str) -> Option<String> {
 /// language for Aditi is Indian English (en-IN) ... this parameter would show the
 /// code `hi-IN`".
 ///
-/// This is a subset of Amazon Polly's full voice list, not a fabrication of it: a
-/// voice named here is a real one with its real language and engines. Adding the
-/// remaining voices is additive and changes no behaviour around it.
+/// The catalog is COMPLETE: every value of the model's `VoiceId` enum has exactly one
+/// row here, because that enum is the enumeration of the voices the service offers —
+/// so the voices `DescribeVoices` reports and the voices `SynthesizeSpeech` accepts are
+/// one set, and no filtered query can hide a voice the service has.
 pub const VOICE_CATALOG: &[StoredVoice] = &[
     // ---- English ----
     voice("Danielle", "Female", "en-US", "US English", &[], &["neural", "generative", "long-form"]),
@@ -442,35 +455,45 @@ pub const VOICE_CATALOG: &[StoredVoice] = &[
     voice("Joey", "Male", "en-US", "US English", &[], &["neural", "standard"]),
     voice("Justin", "Male", "en-US", "US English", &[], &["neural", "standard"]),
     voice("Kendra", "Female", "en-US", "US English", &[], &["neural", "standard"]),
+    voice("Kenneth", "Male", "en-US", "US English", &[], &["generative"]),
     voice("Kevin", "Male", "en-US", "US English", &[], &["neural"]),
     voice("Kimberly", "Female", "en-US", "US English", &[], &["neural", "standard"]),
     voice("Matthew", "Male", "en-US", "US English", &[], &["neural", "standard", "generative"]),
     voice("Ruth", "Female", "en-US", "US English", &[], &["neural", "generative", "long-form"]),
     voice("Salli", "Female", "en-US", "US English", &[], &["neural", "standard"]),
     voice("Stephen", "Male", "en-US", "US English", &[], &["neural", "generative"]),
+    voice("Tina", "Female", "en-US", "US English", &[], &["generative"]),
     voice("Amy", "Female", "en-GB", "British English", &[], &["neural", "standard", "generative"]),
     voice("Arthur", "Male", "en-GB", "British English", &[], &["neural"]),
     voice("Brian", "Male", "en-GB", "British English", &[], &["neural", "standard"]),
+    voice("Curtis", "Male", "en-GB", "British English", &[], &["generative"]),
     voice("Emma", "Female", "en-GB", "British English", &[], &["neural", "standard"]),
+    voice("Tiffany", "Female", "en-GB", "British English", &[], &["generative"]),
     voice("Geraint", "Male", "en-GB-WLS", "Welsh English", &[], &["standard"]),
+    voice("Nate", "Male", "en-AU", "Australian English", &[], &["generative"]),
     voice("Nicole", "Female", "en-AU", "Australian English", &[], &["standard"]),
     voice("Olivia", "Female", "en-AU", "Australian English", &[], &["neural", "generative"]),
     voice("Russell", "Male", "en-AU", "Australian English", &[], &["standard"]),
     voice("Aditi", "Female", "en-IN", "Indian English", &["hi-IN"], &["standard"]),
+    voice("Kiara", "Female", "en-IN", "Indian English", &[], &["generative"]),
     voice("Raveena", "Female", "en-IN", "Indian English", &[], &["standard"]),
     voice("Aria", "Female", "en-NZ", "New Zealand English", &[], &["neural", "generative"]),
     voice("Ayanda", "Female", "en-ZA", "South African English", &[], &["neural"]),
     voice("Niamh", "Female", "en-IE", "Irish English", &[], &["neural"]),
     voice("Jasmine", "Female", "en-SG", "Singaporean English", &[], &["neural"]),
     // ---- Hindi ----
+    voice("Arjun", "Male", "hi-IN", "Hindi", &[], &["generative"]),
     voice("Kajal", "Female", "hi-IN", "Hindi", &["en-IN"], &["neural", "generative"]),
     // ---- German ----
     voice("Daniel", "Male", "de-DE", "German", &[], &["neural", "generative"]),
+    voice("Florian", "Male", "de-DE", "German", &[], &["generative"]),
     voice("Hans", "Male", "de-DE", "German", &[], &["standard"]),
     voice("Marlene", "Female", "de-DE", "German", &[], &["standard"]),
     voice("Vicki", "Female", "de-DE", "German", &[], &["neural", "standard", "generative"]),
     voice("Hannah", "Female", "de-AT", "Austrian German", &[], &["neural"]),
+    voice("Sabrina", "Female", "de-CH", "Swiss German", &[], &["neural"]),
     // ---- French ----
+    voice("Ambre", "Female", "fr-FR", "French", &[], &["generative"]),
     voice("Celine", "Female", "fr-FR", "French", &[], &["standard"]),
     voice("Lea", "Female", "fr-FR", "French", &[], &["neural", "standard"]),
     voice("Mathieu", "Male", "fr-FR", "French", &[], &["standard"]),
@@ -484,18 +507,24 @@ pub const VOICE_CATALOG: &[StoredVoice] = &[
     voice("Enrique", "Male", "es-ES", "Castilian Spanish", &[], &["standard"]),
     voice("Lucia", "Female", "es-ES", "Castilian Spanish", &[], &["neural", "standard"]),
     voice("Sergio", "Male", "es-ES", "Castilian Spanish", &[], &["neural", "generative"]),
+    voice("Andres", "Male", "es-MX", "Mexican Spanish", &[], &["neural", "generative"]),
+    voice("Carolina", "Female", "es-MX", "Mexican Spanish", &[], &["generative"]),
     voice("Mia", "Female", "es-MX", "Mexican Spanish", &[], &["neural", "standard"]),
+    voice("Carlos", "Male", "es-US", "US Spanish", &[], &["generative"]),
     voice("Lupe", "Female", "es-US", "US Spanish", &[], &["neural", "standard", "generative"]),
     voice("Miguel", "Male", "es-US", "US Spanish", &[], &["standard"]),
     voice("Pedro", "Male", "es-US", "US Spanish", &[], &["neural", "generative"]),
     voice("Penelope", "Female", "es-US", "US Spanish", &[], &["standard"]),
     // ---- Italian ----
     voice("Adriano", "Male", "it-IT", "Italian", &[], &["neural", "generative"]),
+    voice("Beatrice", "Female", "it-IT", "Italian", &[], &["generative"]),
     voice("Bianca", "Female", "it-IT", "Italian", &[], &["neural", "standard", "generative"]),
     voice("Carla", "Female", "it-IT", "Italian", &[], &["standard"]),
     voice("Giorgio", "Male", "it-IT", "Italian", &[], &["standard"]),
+    voice("Lorenzo", "Male", "it-IT", "Italian", &[], &["generative"]),
     // ---- Portuguese ----
     voice("Camila", "Female", "pt-BR", "Brazilian Portuguese", &[], &["neural", "standard", "generative"]),
+    voice("Leo", "Male", "pt-BR", "Brazilian Portuguese", &[], &["generative"]),
     voice("Ricardo", "Male", "pt-BR", "Brazilian Portuguese", &[], &["standard"]),
     voice("Thiago", "Male", "pt-BR", "Brazilian Portuguese", &[], &["neural"]),
     voice("Vitoria", "Female", "pt-BR", "Brazilian Portuguese", &[], &["neural", "standard"]),
@@ -506,6 +535,7 @@ pub const VOICE_CATALOG: &[StoredVoice] = &[
     voice("Mizuki", "Female", "ja-JP", "Japanese", &[], &["standard"]),
     voice("Takumi", "Male", "ja-JP", "Japanese", &[], &["neural", "standard"]),
     voice("Tomoko", "Female", "ja-JP", "Japanese", &[], &["neural"]),
+    voice("Hyunduk", "Male", "ko-KR", "Korean", &[], &["generative"]),
     voice("Jihye", "Female", "ko-KR", "Korean", &[], &["neural"]),
     voice("Seoyeon", "Female", "ko-KR", "Korean", &[], &["neural", "standard"]),
     voice("Zhiyu", "Female", "cmn-CN", "Chinese Mandarin", &[], &["neural", "standard"]),
@@ -517,6 +547,7 @@ pub const VOICE_CATALOG: &[StoredVoice] = &[
     // ---- Nordic ----
     voice("Astrid", "Female", "sv-SE", "Swedish", &[], &["standard"]),
     voice("Elin", "Female", "sv-SE", "Swedish", &[], &["neural"]),
+    voice("Lennart", "Male", "sv-SE", "Swedish", &[], &["neural"]),
     voice("Mads", "Male", "da-DK", "Danish", &[], &["standard"]),
     voice("Naja", "Female", "da-DK", "Danish", &[], &["standard"]),
     voice("Sofie", "Female", "da-DK", "Danish", &[], &["neural"]),

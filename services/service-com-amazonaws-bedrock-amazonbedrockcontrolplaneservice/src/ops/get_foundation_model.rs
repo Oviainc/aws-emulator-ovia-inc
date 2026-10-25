@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFoundationModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFoundationModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFoundationModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the ONE row of the published foundation model catalog
+//! ([`crate::state::FoundationModelCatalog`], the same catalog
+//! `ops/list_foundation_models.rs` lists) that `modelIdentifier` names, as the
+//! `FoundationModelDetails` the model declares — every member read off that row.
+//!
+//! `modelIdentifier` names a base model either by its `modelId` or by its
+//! `foundation-model` ARN (`GetFoundationModelIdentifier` admits both spellings), and both
+//! resolve to the same row through [`crate::state::base_model_id_of`]. The row is the one
+//! the catalog publishes under that exact `modelId`: a `:`-qualified variant the catalog
+//! publishes no row for is not a model this service offers, which is why this resolves
+//! exactly rather than through [`crate::state::FoundationModelCatalog::qualified_model`]
+//! (that one reads the base model out of an id embedded in a RESOURCE's ARN, where the
+//! caller names a resource rather than asking what the catalog publishes). An identifier
+//! the catalog has no row for names a model this service does not offer, which is
+//! `ResourceNotFoundException` (404) — the same refusal the inference plane answers for an
+//! identifier that resolves to no model it serves.
+//!
+//! The response is [`crate::state::foundation_model_details`], the one mapping of a
+//! catalog row that `ops/list_foundation_models.rs` also reports a model through, so a
+//! read and a listing cannot disagree about a model.
+//!
+//! A pure read: the catalog is published rather than created, so no call of this operation
+//! writes anything, and two reads of the same identifier answer alike.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +164,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFoundationModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFoundationModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFoundationModel"))
+        // The ARN of a foundation model carries the region the request addresses rather
+        // than an account, so that region is the one request-scoped value details need.
+        let region = crate::state::request_region(ctx.parts());
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetFoundationModelErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the foundation model catalog is not available on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        // Both spellings `GetFoundationModelIdentifier` admits — the bare `modelId` and
+        // the model's `foundation-model` ARN — name the same catalog row.
+        let Some(model) = store
+            .foundation_models
+            .model(crate::state::base_model_id_of(&input.model_identifier))
+        else {
+            return Err(GetFoundationModelErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Could not resolve the model from the provided model identifier: {}",
+                        input.model_identifier
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetFoundationModelOutput {
+            model_details: Some(crate::state::foundation_model_details(model, &region)),
+        })
     }
 }

@@ -51,3 +51,5 @@ mod session_cancellation;
 mod session_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/write_path_input_validation.rs"]
+mod write_path_input_validation;

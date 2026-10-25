@@ -2,18 +2,23 @@
 
 //! @op ListPermissions
 //!
-//! Projects the explicit grants held in
-//! [`crate::state::ComAmazonawsLakeformationAwslakeformationState`]'s `permission_grants`
-//! as `PrincipalResourcePermissions`, narrowed by the `Principal`, `Resource`,
-//! `ResourceType` and `CatalogId` filters and bounded by `MaxResults`, resuming from the
-//! grant key an opaque `NextToken` names. Reporting only — it writes nothing.
+//! Projects the grants held on the addressed resources as `PrincipalResourcePermissions`:
+//! the explicit records in
+//! [`crate::state::ComAmazonawsLakeformationAwslakeformationState`]'s `permission_grants`,
+//! plus the default grant each Data Catalog database was created carrying
+//! ([`crate::state::default_database_grants`]) until a revoke takes it away. The listing
+//! is narrowed by the `Principal`, `Resource`, `ResourceType` and `CatalogId` filters and
+//! bounded by `MaxResults`, resuming from the grant key an opaque `NextToken` names.
+//! Reporting only — it writes nothing.
 //!
-//! Two things a client should know: only EXPLICIT grants are held, so no entry is
-//! synthesised for a permission that was never granted ("This operation returns only
-//! those permissions that have been explicitly granted"), and a listing with no matching
-//! grant answers an EMPTY `PrincipalResourcePermissions` list —
-//! `PrincipalResourcePermissionsList` carries no length constraint, so "no permissions"
-//! is a list of none rather than an absent member.
+//! Two things a client should know. A listing that matches no grant answers an EMPTY
+//! `PrincipalResourcePermissions` list — `PrincipalResourcePermissionsList` carries no
+//! length constraint, so "no permissions" is a list of none rather than an absent member.
+//! And a listing that names BOTH a `Principal` and a `Resource` reports what that
+//! principal EFFECTIVELY holds ("If both Principal and Resource parameters are provided,
+//! the response returns effective permissions rather than the explicitly granted
+//! permissions"), which is its own grants together with the grants of the groups it
+//! belongs to, reported under the principal the request asked about.
 //!
 //! ## Shape of an operation
 //!
@@ -251,49 +256,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(crate::state::MAX_PERMISSIONS_PAGE)
             .clamp(1, crate::state::MAX_PERMISSIONS_PAGE) as usize;
 
-        let store = state.lock();
-        let mut selected: Vec<(&String, &crate::state::PermissionGrant)> = store
-            .permission_grants
-            .iter()
+        // The default grant each of the addressed databases was created carrying, read
+        // from the Data Catalog BEFORE this service's store is locked (the helper takes
+        // Glue's lock).
+        let default_grants = crate::state::default_database_grants(
+            &*self.engine,
+            &catalog_id,
+            resource_filter.as_ref(),
+        );
+
+        // "If both Principal and Resource parameters are provided, the response returns
+        // effective permissions rather than the explicitly granted permissions." — this
+        // operation's own documentation. Effective means what the principal holds through
+        // every group it belongs to as well as in its own name, so such a listing reports
+        // a group's grant under the principal it asked about.
+        let effective_for = principal_filter.filter(|_| resource_filter.is_some());
+
+        // Whether the request's filters select `grant`.
+        let selects = |grant: &crate::state::PermissionGrant| {
             // "The identifier for the Data Catalog. By default, the account ID.": a
             // listing reports the grants of the catalog it addresses.
-            .filter(|(_, grant)| grant.catalog_id == catalog_id)
-            // "Specifies a principal to filter the permissions returned."
-            .filter(|(_, grant)| principal_filter.is_none_or(|wanted| grant.principal == wanted))
-            // "Specifies a resource type to filter the permissions returned."
-            .filter(|(_, grant)| {
-                resource_type.is_none_or(|wanted| {
+            grant.catalog_id == catalog_id
+                // "Specifies a principal to filter the permissions returned."
+                && principal_filter.is_none_or(|wanted| match effective_for {
+                    Some(_) => crate::state::effective_principal_holds(wanted, &grant.principal),
+                    None => grant.principal == wanted,
+                })
+                // "Specifies a resource type to filter the permissions returned."
+                && resource_type.is_none_or(|wanted| {
                     crate::state::resource_types(&grant.resource).contains(&wanted)
                 })
-            })
-            // "A resource where you will get a list of the principal permissions."
-            .filter(|(_, grant)| {
-                resource_filter.as_ref().is_none_or(|filter| {
+                // "A resource where you will get a list of the principal permissions."
+                && resource_filter.as_ref().is_none_or(|filter| {
                     crate::state::resource_filter_matches(filter, &grant.resource, include_related)
                 })
-            })
-            .filter(|(key, _)| {
-                start_after
-                    .as_deref()
-                    .is_none_or(|start| key.as_str() > start)
-            })
-            // One past the page: its presence is what says another page follows.
-            .take(page_size + 1)
-            .collect();
+        };
 
-        let has_more = selected.len() > page_size;
-        selected.truncate(page_size);
+        let store = state.lock();
+
+        // Every grant the filters select, keyed by the identity it is REPORTED under, so
+        // the page below walks one entry per (principal, resource, condition) triple in a
+        // stable order a continuation token can resume from. The explicit records go in
+        // first, so an entry that carries both reports what was granted ahead of what the
+        // database was created holding.
+        //
+        // What this holds is bounded by the two stores it reads, neither of which a
+        // request can grow past its ceiling: `crate::state::MAX_PERMISSION_GRANTS` explicit
+        // records and the Data Catalog's own per-catalog database ceiling.
+        let mut reported: std::collections::BTreeMap<String, crate::state::PermissionGrant> =
+            std::collections::BTreeMap::new();
+        for grant in store.permission_grants.values().filter(|g| selects(g)) {
+            crate::state::merge_reported_grant(&mut reported, grant, effective_for);
+        }
+        for (key, grant) in &default_grants {
+            // A default a revoke took away is gone from both views: nothing was recorded
+            // for it, so this memory of the revoke is what answers for it.
+            if store.revoked_default_grants.contains(key) || !selects(grant) {
+                continue;
+            }
+            crate::state::merge_reported_grant(&mut reported, grant, effective_for);
+        }
+
+        let mut selected: Vec<&crate::state::PermissionGrant> = Vec::new();
+        let mut has_more = false;
+        let mut last_key: Option<&String> = None;
+        for (key, grant) in reported
+            .iter()
+            .filter(|(key, _)| start_after.as_deref().is_none_or(|start| key.as_str() > start))
+        {
+            // One past the page: its presence is what says another page follows.
+            if selected.len() == page_size {
+                has_more = true;
+                break;
+            }
+            selected.push(grant);
+            last_key = Some(key);
+        }
 
         let next_token = if has_more {
-            selected
-                .last()
-                .map(|(key, _)| crate::state::encode_permissions_page_token(key))
+            last_key.map(|key| crate::state::encode_permissions_page_token(key))
         } else {
             None
         };
 
-        let principal_resource_permissions: Vec<PrincipalResourcePermissions> =
-            selected.iter().map(|(_, grant)| grant.to_wire()).collect();
+        let principal_resource_permissions: Vec<PrincipalResourcePermissions> = selected
+            .iter()
+            .map(|grant| grant.to_wire())
+            .collect();
 
         Ok(ListPermissionsOutput {
             // `PrincipalResourcePermissionsList` carries no length constraint, so a

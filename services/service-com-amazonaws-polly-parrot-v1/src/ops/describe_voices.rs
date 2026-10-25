@@ -4,12 +4,18 @@
 //! Reports the voice catalog, narrowed by the query parameters.
 //!
 //! The catalog is state ([`crate::state::ComAmazonawsPollyParrotV1State::voices`]),
-//! seeded once and never written, so this is a pure read. `Engine` keeps only voices
+//! seeded once and never written, so this is a pure read. It carries every voice the
+//! model's `VoiceId` enum declares, so a client that discovers voices here sees the
+//! same set `SynthesizeSpeech` accepts. `Engine` keeps only voices
 //! whose `SupportedEngines` carry it; `LanguageCode` keeps only voices that speak it,
 //! counting a bilingual voice's `AdditionalLanguageCodes` only when
 //! `IncludeAdditionalLanguageCodes` is set — the rule that member documents. Both
 //! filters narrow, so a request naming an engine or language no seeded voice has gets
 //! an empty list, not the whole catalog.
+//!
+//! A reported voice carries `AdditionalLanguageCodes` only when it speaks a language
+//! beyond its default one ([`crate::state::reported_list`]): for a monolingual voice
+//! the key is absent, not an empty array.
 //!
 //! A page carries at most [`VOICE_PAGE_SIZE`] voices and the `NextToken` encodes both
 //! the position reached and the query it was reached under, so a token minted for one
@@ -276,20 +282,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 gender: Some(voice.gender.to_string()),
                 language_code: Some(voice.language_code.to_string()),
                 language_name: Some(voice.language_name.to_string()),
-                additional_language_codes: Some(
-                    voice
-                        .additional_language_codes
-                        .iter()
-                        .map(|code| (*code).to_string())
-                        .collect(),
+                // Both list members are reported only when the voice has values for
+                // them: a voice that speaks only its default language carries NO
+                // `AdditionalLanguageCodes` key, rather than an empty array.
+                additional_language_codes: crate::state::reported_list(
+                    voice.additional_language_codes,
                 ),
-                supported_engines: Some(
-                    voice
-                        .supported_engines
-                        .iter()
-                        .map(|engine| (*engine).to_string())
-                        .collect(),
-                ),
+                supported_engines: crate::state::reported_list(voice.supported_engines),
             })
             .collect();
 

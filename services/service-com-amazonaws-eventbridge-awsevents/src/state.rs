@@ -30,6 +30,14 @@
 //! state reaches its next one on its own, [`CONNECTION_TRANSITION`] later
 //! ([`ComAmazonawsEventbridgeAwseventsState::settle_connections`]).
 //!
+//! Two resources hang off those: the ARCHIVE ([`ArchiveRecord`]), bound to one
+//! event bus, which `CreateArchive` writes, `DescribeArchive` reports and
+//! `PutEvents` captures matching events into, and the API DESTINATION
+//! ([`ApiDestinationRecord`]), the HTTP endpoint `CreateApiDestination` writes
+//! and `DescribeApiDestination` reports, whose state follows the connection it
+//! invokes through
+//! ([`ComAmazonawsEventbridgeAwseventsState::api_destination_state`]).
+//!
 //! It also owns the PARTNER EVENT SOURCE ([`PartnerEventSourceRecord`]), the one
 //! resource two accounts share: an SaaS partner authors it in a namespace it is
 //! the registered partner of ([`not_entitled_to_namespace`] refuses any other
@@ -54,9 +62,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    ConnectionAuthResponseParameters, DeadLetterConfig, DescribeConnectionOutput, LogConfig,
-    PartnerEventSourceAccount, Rule as RuleSummary, Tag, Target, INCLUDE_DETAIL_VALUES,
-    LEVEL_VALUES, RULE_STATE_VALUES,
+    Connection, ConnectionAuthResponseParameters, DeadLetterConfig, DescribeApiDestinationOutput,
+    DescribeArchiveOutput, DescribeConnectionOutput, LogConfig, PartnerEventSourceAccount,
+    Rule as RuleSummary, Tag, Target, INCLUDE_DETAIL_VALUES, LEVEL_VALUES, RULE_STATE_VALUES,
 };
 
 /// The event bus a request lands on when it names none.
@@ -77,9 +85,17 @@ pub const ARN_NAMESPACE: &str = "events";
 /// encrypted with ([`kms_key_identifier`]).
 pub const KMS_ARN_NAMESPACE: &str = "kms";
 
+/// The `RuleState` of a rule EventBridge matches published events against.
+pub const RULE_STATE_ENABLED: &str = "ENABLED";
+
+/// The `RuleState` of a rule EventBridge matches no published event against:
+/// "DISABLED: ... EventBridge does not match any events against the rule"
+/// (`PutRule$State`).
+pub const RULE_STATE_DISABLED: &str = "DISABLED";
+
 /// The `RuleState` a rule takes when `PutRule` omits `State`: "Rules are
 /// enabled by default, or based on value of the state" (`PutRule`).
-pub const DEFAULT_RULE_STATE: &str = "ENABLED";
+pub const DEFAULT_RULE_STATE: &str = RULE_STATE_ENABLED;
 
 /// What a handler reports when the engine it was built on carries no store for
 /// this service — a server fault, never a bad request.
@@ -311,7 +327,7 @@ impl RuleRecord {
     /// rule" (`PutRule`'s `State`); a rule carrying only a `ScheduleExpression`
     /// self-triggers on its schedule and is never matched by a published event.
     pub fn matches_published_events(&self) -> bool {
-        self.state != "DISABLED" && self.event_pattern.is_some()
+        self.state != RULE_STATE_DISABLED && self.event_pattern.is_some()
     }
 
     /// The position of the target `id` names, for upsert and removal.
@@ -762,6 +778,10 @@ pub const CONNECTION_STATE_DEAUTHORIZING: &str = "DEAUTHORIZING";
 /// The `ConnectionState` a deauthorized connection settles in.
 pub const CONNECTION_STATE_DEAUTHORIZED: &str = "DEAUTHORIZED";
 
+/// The `ConnectionState` `UpdateConnection` moves a connection into while its
+/// new settings are being applied.
+pub const CONNECTION_STATE_UPDATING: &str = "UPDATING";
+
 /// The `ConnectionState` `DeleteConnection` moves a connection into while it is
 /// being removed.
 pub const CONNECTION_STATE_DELETING: &str = "DELETING";
@@ -863,6 +883,22 @@ impl ConnectionRecord {
         })
     }
 
+    /// The `Connection` summary `ListConnections` reports: the members of the
+    /// stored record the summary shape carries, read back from it — so a listing
+    /// and `DescribeConnection` cannot disagree about any of them.
+    pub fn to_summary(&self) -> Connection {
+        Connection {
+            connection_arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            connection_state: Some(self.state.clone()),
+            state_reason: self.state_reason.clone(),
+            authorization_type: Some(self.authorization_type.clone()),
+            creation_time: Some(to_wire_timestamp(self.created)),
+            last_modified_time: Some(to_wire_timestamp(self.last_modified)),
+            last_authorized_time: self.last_authorized.map(to_wire_timestamp),
+        }
+    }
+
     /// Every member `DescribeConnection` reports, read back from the stored
     /// record — so a read and the write that created the connection cannot
     /// disagree about any of them.
@@ -885,6 +921,303 @@ impl ConnectionRecord {
             last_authorized_time: self.last_authorized.map(to_wire_timestamp),
         }
     }
+}
+
+/// The `ArchiveState` an archive is created in: "CREATING".
+pub const ARCHIVE_STATE_CREATING: &str = "CREATING";
+
+/// The `ArchiveState` an archive that is capturing events is in.
+pub const ARCHIVE_STATE_ENABLED: &str = "ENABLED";
+
+/// How long after `CreateArchive` the archive's `ENABLED` state becomes due.
+///
+/// "When you create an archive, incoming events might not immediately start
+/// being sent to the archive. Allow a short period of time for changes to take
+/// effect" (`CreateArchive`), so an archive answered in `CREATING` reaches
+/// `ENABLED` a moment later rather than instantly. AWS publishes no duration for
+/// it; this is the emulator's own span, chosen inside the 250–750 ms window the
+/// project fixes for a clock-owed transition, and it is stored as a DUE INSTANT
+/// rather than waited for.
+pub const ARCHIVE_TRANSITION: Duration = Duration::from_millis(400);
+
+/// Largest number of archives this store holds.
+///
+/// This emulator's OWN bound, like [`MAX_CONNECTIONS`]: a `CreateArchive` past it
+/// answers the modelled `LimitExceededException` instead of growing memory
+/// without limit. It is far above any realistic fixture's needs.
+pub const MAX_ARCHIVES: usize = 100;
+
+/// How many captured events one archive keeps.
+///
+/// The emulator's OWN bound, for the reason [`MAX_DELIVERED_EVENTS`] gives: an
+/// archive is appended to by every matching `PutEvents` entry and nothing in the
+/// API deletes one event, so without a bound a caller could grow the process
+/// heap without end. The store is a ring, oldest evicted first.
+pub const MAX_ARCHIVED_EVENTS: usize = 10_000;
+
+/// How many bytes of captured event text one archive keeps, beside
+/// [`MAX_ARCHIVED_EVENTS`] — a record count alone does not bound memory, for the
+/// reason [`MAX_DELIVERED_BYTES`] gives.
+pub const MAX_ARCHIVED_BYTES: usize = 8_000_000;
+
+/// How many seconds a day of `RetentionDays` is.
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+
+/// One event an archive captured, as the archive holds it.
+///
+/// The whole envelope is kept, because that is what a replay of the archive
+/// re-publishes, and its byte length is what the archive reports as `SizeBytes`.
+#[derive(Debug, Clone)]
+pub struct ArchivedEvent {
+    /// The `EventId` `PutEvents` minted for the event.
+    pub event_id: String,
+    /// The event envelope, as it was routed.
+    pub envelope: String,
+    /// The event's own time, which is what retention is measured from.
+    pub time: SystemTime,
+}
+
+/// An archive as this emulator persists it.
+///
+/// "Creates an archive of events with the specified settings" (`CreateArchive`):
+/// the archive is bound to ONE event bus (`EventSourceArn`), optionally filters
+/// what it captures by `EventPattern` ("If you do not specify a pattern to filter
+/// events sent to the archive, all events are sent to the archive"), and holds
+/// what it captured so `DescribeArchive`'s `EventCount` and `SizeBytes` are read
+/// off the events themselves rather than asserted.
+#[derive(Debug, Clone)]
+pub struct ArchiveRecord {
+    pub name: String,
+    /// Minted ONCE, when the archive is created, and never recomputed.
+    pub arn: String,
+    /// The `EventBusArn` the request named, reported back as given.
+    pub event_source_arn: String,
+    /// The name of the bus that ARN named, which is what capture resolves on.
+    pub event_bus_name: String,
+    pub description: Option<String>,
+    pub event_pattern: Option<String>,
+    pub retention_days: Option<i32>,
+    pub kms_key_identifier: Option<String>,
+    /// One of `ArchiveState`'s values.
+    pub state: String,
+    pub state_reason: Option<String>,
+    pub created: SystemTime,
+    /// When the clock owes this archive its `ENABLED` state, or `None` once it
+    /// has settled.
+    pub enabled_due: Option<SystemTime>,
+    /// What the archive captured, oldest first. A ring bounded by
+    /// [`MAX_ARCHIVED_EVENTS`] and [`MAX_ARCHIVED_BYTES`] — see
+    /// [`Self::capture`], the one place it grows.
+    pub events: VecDeque<ArchivedEvent>,
+    /// How many bytes the captured envelopes hold, kept in step with the ring so
+    /// the byte bound costs nothing to check.
+    captured_bytes: usize,
+}
+
+impl ArchiveRecord {
+    /// A newly created archive on `event_bus_name`: in [`ARCHIVE_STATE_CREATING`]
+    /// and capturing nothing yet, with its [`ARCHIVE_STATE_ENABLED`] state due
+    /// [`ARCHIVE_TRANSITION`] later. The optional members the request carried
+    /// (`Description`, `EventPattern`, `RetentionDays`, `KmsKeyIdentifier`) are
+    /// written onto the record by its creator.
+    pub fn new(
+        name: &str,
+        arn: String,
+        event_source_arn: String,
+        event_bus_name: &str,
+        created: SystemTime,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            arn,
+            event_source_arn,
+            event_bus_name: event_bus_name.to_string(),
+            description: None,
+            event_pattern: None,
+            retention_days: None,
+            kms_key_identifier: None,
+            state: ARCHIVE_STATE_CREATING.to_string(),
+            state_reason: None,
+            created,
+            enabled_due: Some(created + ARCHIVE_TRANSITION),
+            events: VecDeque::new(),
+            captured_bytes: 0,
+        }
+    }
+
+    /// Whether this archive captures published events at all: only one that has
+    /// reached `ENABLED` does, which is what "incoming events might not
+    /// immediately start being sent to the archive" (`CreateArchive`) means.
+    pub fn captures_events(&self) -> bool {
+        self.state == ARCHIVE_STATE_ENABLED
+    }
+
+    /// Append one captured event, evicting the oldest first so the archive never
+    /// holds more than [`MAX_ARCHIVED_EVENTS`] events or [`MAX_ARCHIVED_BYTES`]
+    /// bytes of event text. The ONE place the ring grows.
+    pub fn capture(&mut self, event: ArchivedEvent) {
+        let size = event.envelope.len();
+        while self.events.len() >= MAX_ARCHIVED_EVENTS
+            || (!self.events.is_empty()
+                && self.captured_bytes.saturating_add(size) > MAX_ARCHIVED_BYTES)
+        {
+            let Some(evicted) = self.events.pop_front() else {
+                break;
+            };
+            self.captured_bytes = self.captured_bytes.saturating_sub(evicted.envelope.len());
+        }
+        self.captured_bytes = self.captured_bytes.saturating_add(size);
+        self.events.push_back(event);
+    }
+
+    /// Drop every captured event the archive's `RetentionDays` has already
+    /// expired at `now`, and answer how many were dropped.
+    ///
+    /// "The number of days to retain events for. Default value is 0. If set to 0,
+    /// events are retained indefinitely" (`CreateArchive$RetentionDays`), so a
+    /// retention of zero or none expires nothing.
+    pub fn expire_captured(&mut self, now: SystemTime) -> usize {
+        let days = self.retention_days.unwrap_or_default();
+        let Ok(days) = u64::try_from(days) else {
+            return 0;
+        };
+        if days == 0 {
+            return 0;
+        }
+        let retention = Duration::from_secs(days * SECONDS_PER_DAY);
+        let mut dropped = 0usize;
+        while let Some(oldest) = self.events.front() {
+            let expired = now
+                .duration_since(oldest.time)
+                .is_ok_and(|age| age > retention);
+            if !expired {
+                break;
+            }
+            let Some(evicted) = self.events.pop_front() else {
+                break;
+            };
+            self.captured_bytes = self.captured_bytes.saturating_sub(evicted.envelope.len());
+            dropped += 1;
+        }
+        dropped
+    }
+
+    /// Every member `DescribeArchive` reports, read back from the stored record —
+    /// `EventCount` and `SizeBytes` from the captured events themselves, so a
+    /// read and what the archive holds cannot disagree.
+    pub fn to_describe_output(&self) -> DescribeArchiveOutput {
+        DescribeArchiveOutput {
+            archive_arn: Some(self.arn.clone()),
+            archive_name: Some(self.name.clone()),
+            event_source_arn: Some(self.event_source_arn.clone()),
+            description: self.description.clone(),
+            event_pattern: self.event_pattern.clone(),
+            state: Some(self.state.clone()),
+            state_reason: self.state_reason.clone(),
+            kms_key_identifier: self.kms_key_identifier.clone(),
+            retention_days: self.retention_days,
+            size_bytes: i64::try_from(self.captured_bytes).unwrap_or(i64::MAX),
+            event_count: i64::try_from(self.events.len()).unwrap_or(i64::MAX),
+            creation_time: Some(to_wire_timestamp(self.created)),
+        }
+    }
+}
+
+/// The `ApiDestinationState` of a destination whose connection can authorize an
+/// invocation.
+pub const API_DESTINATION_STATE_ACTIVE: &str = "ACTIVE";
+
+/// The `ApiDestinationState` of a destination whose connection cannot.
+pub const API_DESTINATION_STATE_INACTIVE: &str = "INACTIVE";
+
+/// The `ConnectionState` of a connection that is in use and authorized.
+pub const CONNECTION_STATE_ACTIVE: &str = "ACTIVE";
+
+/// The `InvocationRateLimitPerSecond` an API destination takes when the request
+/// names none.
+///
+/// The EventBridge quota "Invocation rate limit per second" for an API
+/// destination (default 300), which is also the default
+/// `CreateApiDestination$InvocationRateLimitPerSecond` the service applies, so a
+/// read reports the rate the destination is actually invoked at.
+pub const DEFAULT_API_DESTINATION_RATE_LIMIT: i32 = 300;
+
+/// Largest `InvocationRateLimitPerSecond` an API destination may be created with.
+///
+/// The same EventBridge quota, which is an account LIMIT as well as the default:
+/// a create asking to be invoked faster than the account may invoke is refused
+/// with the modelled `LimitExceededException` rather than stored as a rate
+/// nothing would honour.
+pub const MAX_API_DESTINATION_RATE_LIMIT: i32 = DEFAULT_API_DESTINATION_RATE_LIMIT;
+
+/// Largest number of API destinations this store holds.
+///
+/// This emulator's OWN bound, like [`MAX_CONNECTIONS`]: a create past it answers
+/// the modelled `LimitExceededException` instead of growing memory without limit.
+pub const MAX_API_DESTINATIONS: usize = 100;
+
+/// An API destination as this emulator persists it.
+///
+/// "An API destination ... is an HTTP invocation endpoint configured as a target
+/// for events" (`CreateApiDestination`): the endpoint, the method and the
+/// connection EventBridge authorizes the invocation with. Its `ApiDestinationState`
+/// is NOT stored — it follows the connection
+/// ([`ComAmazonawsEventbridgeAwseventsState::api_destination_state`]), so a
+/// connection that is deauthorized, deleted or still being created is reported
+/// through the destination that uses it.
+#[derive(Debug, Clone)]
+pub struct ApiDestinationRecord {
+    pub name: String,
+    /// Minted ONCE, when the destination is created, and never recomputed.
+    pub arn: String,
+    pub description: Option<String>,
+    /// The `ConnectionArn` the request named, which is also what resolves the
+    /// connection the state follows.
+    pub connection_arn: String,
+    pub invocation_endpoint: String,
+    /// One of `ApiDestinationHttpMethod`'s values.
+    pub http_method: String,
+    /// The rate the destination is invoked at, defaulted to
+    /// [`DEFAULT_API_DESTINATION_RATE_LIMIT`] when the request named none.
+    pub invocation_rate_limit_per_second: i32,
+    pub created: SystemTime,
+    pub last_modified: SystemTime,
+}
+
+/// `arn:aws:events:<region>:<account>:archive/<name>`.
+///
+/// `ArchiveArn`'s modelled pattern is
+/// `^arn:aws([a-z]|\-)*:events:([a-z]|\d|\-)*:([0-9]{12})?:.+\/.+$`, so the
+/// resource is the archive's own name under this service's `archive/` type.
+pub fn archive_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("archive/{name}"))
+}
+
+/// `arn:aws:events:<region>:<account>:api-destination/<name>/<id>`.
+///
+/// `ApiDestinationArn`'s modelled pattern is
+/// `^arn:aws([a-z]|\-)*:events:([a-z]|\d|\-)*:([0-9]{12})?:api-destination\/[\.\-_A-Za-z0-9]+\/[\-A-Za-z0-9]+$`,
+/// so the resource carries the destination's NAME and then a unique id segment,
+/// exactly as a connection's ARN does ([`connection_arn`]).
+pub fn api_destination_arn(region: &str, name: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("api-destination/{name}/{id}"),
+    )
+}
+
+/// The name of the event bus an `EventBusArn` names, or `None` when the text is
+/// not an event-bus ARN at all.
+///
+/// Unlike [`effective_bus_name`], which accepts a NAME or an ARN and defaults to
+/// the account's `default` bus, this reads a member modelled as an `EventBusArn`
+/// — so text that names no event bus is a bad request rather than a silent read
+/// of the default bus. The name is the whole remainder after the `event-bus/`
+/// segment, for the reason [`effective_bus_name`] gives.
+pub fn event_bus_name_in_arn(arn: &str) -> Option<&str> {
+    let (prefix, name) = arn.split_once(":event-bus/")?;
+    (prefix.starts_with("arn:") && !name.is_empty()).then_some(name)
 }
 
 /// The prefix every partner event source name carries.
@@ -1076,6 +1409,12 @@ pub struct ComAmazonawsEventbridgeAwseventsState {
     /// Every connection, by name — the resource `CreateConnection` writes and
     /// `DescribeConnection` reports.
     pub connections: BTreeMap<String, ConnectionRecord>,
+    /// Every archive, by name — the resource `CreateArchive` writes,
+    /// `DescribeArchive` reports and `PutEvents` captures matching events into.
+    pub archives: BTreeMap<String, ArchiveRecord>,
+    /// Every API destination, by name — the resource `CreateApiDestination`
+    /// writes and `DescribeApiDestination` reports.
+    pub api_destinations: BTreeMap<String, ApiDestinationRecord>,
     /// Every partner event source, by name — the resource
     /// `CreatePartnerEventSource` writes, `DescribePartnerEventSource` and
     /// `DescribeEventSource` report, and `PutPartnerEvents` publishes to. Ordered
@@ -1125,6 +1464,8 @@ impl Default for ComAmazonawsEventbridgeAwseventsState {
         Self {
             buses,
             connections: BTreeMap::new(),
+            archives: BTreeMap::new(),
+            api_destinations: BTreeMap::new(),
             partner_sources: BTreeMap::new(),
             partner_namespaces: BTreeSet::new(),
             delivered: VecDeque::new(),
@@ -1267,6 +1608,125 @@ impl ComAmazonawsEventbridgeAwseventsState {
     /// comes into existence through `CreateConnection`.
     pub fn connection_mut(&mut self, name: &str) -> Option<&mut ConnectionRecord> {
         self.connections.get_mut(name)
+    }
+
+    /// The name of the rule the ARN a tagging call named resolves to, when that
+    /// rule is a MANAGED one — and `None` for every other resource.
+    ///
+    /// "You cannot modify these managed rules by using ... TagResource, or
+    /// UntagResource" (`ManagedRuleException`), and a tagging call reaches a rule
+    /// through an ARN ([`parse_tagged_resource`]), so the check both tag writes
+    /// make lives here rather than in each of them.
+    pub fn managed_rule_of(&self, resource: &TaggedResource) -> Option<String> {
+        let TaggedResource::Rule {
+            event_bus_name,
+            name,
+        } = resource
+        else {
+            return None;
+        };
+        self.rule(event_bus_name, name)
+            .filter(|rule| rule.managed_by.is_some())
+            .map(|rule| rule.name.clone())
+    }
+
+    /// The connection whose ARN is `arn`, for a REPORTING operation.
+    ///
+    /// A connection's ARN carries a unique id segment ([`connection_arn`]), so an
+    /// ARN resolves to the connection it was minted for and NOT to a later
+    /// connection of the same name — which is what makes an API destination
+    /// holding the ARN of a deleted connection resolve to nothing.
+    pub fn connection_by_arn(&self, arn: &str) -> Option<&ConnectionRecord> {
+        self.connections
+            .values()
+            .find(|connection| connection.arn == arn)
+    }
+
+    /// The archive `name` names, for a REPORTING operation.
+    pub fn archive(&self, name: &str) -> Option<&ArchiveRecord> {
+        self.archives.get(name)
+    }
+
+    /// The archive `name` names, mutably. Creates nothing: an archive comes into
+    /// existence through `CreateArchive`.
+    pub fn archive_mut(&mut self, name: &str) -> Option<&mut ArchiveRecord> {
+        self.archives.get_mut(name)
+    }
+
+    /// Materialise every archive change the clock has ALREADY made due at `now`,
+    /// and answer how many archives one was applied to.
+    ///
+    /// Two changes are owed by the clock alone: the `CREATING` -> `ENABLED`
+    /// transition [`ARCHIVE_TRANSITION`] after the create, and the expiry of a
+    /// captured event past the archive's `RetentionDays`
+    /// ([`ArchiveRecord::expire_captured`]). Both were owed at the same instant
+    /// even if nobody had called, which is why a reporting operation may finish
+    /// them.
+    pub fn settle_archives(&mut self, now: SystemTime) -> usize {
+        let mut settled = 0usize;
+        for archive in self.archives.values_mut() {
+            let mut changed = false;
+            if archive.enabled_due.is_some_and(|due| due <= now) {
+                // The state moves to the instant the transition fell DUE, not to
+                // the instant it was noticed, so two reads agree.
+                archive.enabled_due = None;
+                archive.state = ARCHIVE_STATE_ENABLED.to_string();
+                changed = true;
+            }
+            changed |= archive.expire_captured(now) > 0;
+            settled += usize::from(changed);
+        }
+        settled
+    }
+
+    /// The API destination `name` names, for a REPORTING operation.
+    pub fn api_destination(&self, name: &str) -> Option<&ApiDestinationRecord> {
+        self.api_destinations.get(name)
+    }
+
+    /// The `ApiDestinationState` of `destination`, derived from the connection it
+    /// invokes through.
+    ///
+    /// "The destination endpoint must support the authorization type specified
+    /// for the connection" (`CreateApiDestination$ConnectionArn`): a destination
+    /// can be invoked only while its connection can authorize the invocation, so
+    /// the state is computed from the connection on every read rather than stored
+    /// and left behind by a later `DeauthorizeConnection` or `DeleteConnection`.
+    pub fn api_destination_state(&self, destination: &ApiDestinationRecord) -> String {
+        let authorized = self
+            .connection_by_arn(&destination.connection_arn)
+            .is_some_and(|connection| {
+                matches!(
+                    connection.state.as_str(),
+                    CONNECTION_STATE_AUTHORIZED | CONNECTION_STATE_ACTIVE
+                )
+            });
+        if authorized {
+            API_DESTINATION_STATE_ACTIVE.to_string()
+        } else {
+            API_DESTINATION_STATE_INACTIVE.to_string()
+        }
+    }
+
+    /// Every member `DescribeApiDestination` reports, read back from the stored
+    /// record, with the state derived from the connection
+    /// ([`Self::api_destination_state`]).
+    pub fn to_api_destination_output(
+        &self,
+        destination: &ApiDestinationRecord,
+    ) -> DescribeApiDestinationOutput {
+        DescribeApiDestinationOutput {
+            api_destination_arn: Some(destination.arn.clone()),
+            name: Some(destination.name.clone()),
+            description: destination.description.clone(),
+            api_destination_state: Some(self.api_destination_state(destination)),
+            connection_arn: Some(destination.connection_arn.clone()),
+            invocation_endpoint: Some(destination.invocation_endpoint.clone()),
+            http_method: Some(destination.http_method.clone()),
+            invocation_rate_limit_per_second: Some(destination.invocation_rate_limit_per_second),
+            creation_time: Some(to_wire_timestamp(destination.created)),
+            last_modified_time: Some(to_wire_timestamp(destination.last_modified)),
+        }
     }
 
     /// Whether this account may author partner event sources in `namespace`,
@@ -1940,6 +2400,140 @@ pub fn no_such_rule(event_bus_name: &str, rule_name: &str) -> String {
     format!("Rule {rule_name} does not exist on EventBus {event_bus_name}.")
 }
 
+/// The name of the rule EventBridge provisions for an archive on its source bus:
+/// `Events-Archive-<archive name>`.
+///
+/// An archive is served by a MANAGED rule on the bus that feeds it — the rule
+/// that puts the bus's matching events into the archive — so the archive's
+/// dependency on its bus is a rule a client can see with `ListRules`, and the
+/// rule is protected from customer writes like every other managed rule
+/// ([`managed_rule_refusal`]).
+pub fn archive_rule_name(archive_name: &str) -> String {
+    format!("Events-Archive-{archive_name}")
+}
+
+/// The `EventPattern` the rule of an archive carries: what the archive matches,
+/// and never a replayed event.
+///
+/// "If you do not specify a pattern to filter events sent to the archive, all
+/// events are sent to the archive except replayed events. Replayed events are not
+/// sent to an archive" (`CreateArchive`) — the exclusion holds whether the archive
+/// filters or not, so the rule's pattern is the archive's own pattern with the
+/// `replay-name` clause added to it. An archive that filters nothing therefore
+/// carries the exclusion alone.
+pub fn archive_rule_pattern(event_pattern: Option<&str>) -> String {
+    let mut pattern = event_pattern
+        .and_then(|text| {
+            ::serde_json::from_str::<::serde_json::Map<String, ::serde_json::Value>>(text).ok()
+        })
+        .unwrap_or_default();
+    pattern.insert(
+        REPLAY_NAME_FIELD.to_string(),
+        ::serde_json::json!([{ "exists": false }]),
+    );
+    ::serde_json::Value::Object(pattern).to_string()
+}
+
+/// The envelope field a REPLAYED event carries, and an event published by a
+/// client does not: what tells the rule of an archive the two apart
+/// ([`archive_rule_pattern`]).
+pub const REPLAY_NAME_FIELD: &str = "replay-name";
+
+/// The rule that serves `archive`, as this service provisions it on the archive's
+/// source bus.
+///
+/// Its `EventPattern` MIRRORS the archive's ([`archive_rule_pattern`]), so what
+/// the rule selects and what the archive keeps are the same thing, and its one
+/// target is the archive the selected events go to.
+pub fn archive_rule(region: &str, archive: &ArchiveRecord) -> RuleRecord {
+    let name = archive_rule_name(&archive.name);
+    // The one target of the rule is the ARCHIVE itself: that is where the events
+    // the rule selects go. Its `Id` is the rule's own name, so the target a
+    // client sees on the rule names the archive that owns it.
+    let target = Target {
+        id: name.clone(),
+        arn: archive.arn.clone(),
+        ..Target::default()
+    };
+    RuleRecord {
+        arn: rule_arn(region, &archive.event_bus_name, &name),
+        event_pattern: Some(archive_rule_pattern(archive.event_pattern.as_deref())),
+        schedule_expression: None,
+        state: RULE_STATE_ENABLED.to_string(),
+        description: None,
+        role_arn: None,
+        // The rule belongs to this service, which created it on the account's
+        // behalf — which is what makes it a managed rule.
+        managed_by: Some(SERVICE_PRINCIPAL.to_string()),
+        created_by: Some(account_id().to_string()),
+        event_bus_name: archive.event_bus_name.clone(),
+        targets: vec![StoredTarget {
+            id: target.id.clone(),
+            arn: target.arn.clone(),
+            role_arn: None,
+            input: None,
+            input_path: None,
+            raw: target,
+        }],
+        tags: Vec::new(),
+        name,
+    }
+}
+
+/// What any writer of a rule reports for a rule another Amazon Web Services
+/// service owns.
+///
+/// "This rule was created by an Amazon Web Services service on behalf of your
+/// account. It is managed by that service ... You cannot modify these managed
+/// rules by using DisableRule, EnableRule, PutTargets, PutRule, TagResource, or
+/// UntagResource" (`ManagedRuleException`). The message is built from the
+/// request — the rule by name — and says what is true of it: it is a managed
+/// rule. Written once, so every writer refuses a managed rule in the same words.
+pub fn managed_rule_refusal(rule_name: &str) -> String {
+    format!("{rule_name} is a managed rule.")
+}
+
+/// The same refusal, from the TAGGING operations.
+///
+/// `TagResource` and `UntagResource` are not writes OF the rule but writes of the
+/// tags on it, and they say so: a tag operation on a managed rule is the thing
+/// that is not allowed.
+pub fn managed_rule_tag_refusal(rule_name: &str) -> String {
+    format!("Tag related operations on the managed rule {rule_name} is not allowed.")
+}
+
+/// The same refusal, from the two operations whose `Force` parameter overrides
+/// it.
+///
+/// "If you see this error in response to DeleteRule or RemoveTargets, you can use
+/// the Force parameter in those calls to delete the rule or remove targets from
+/// the rule" (`ManagedRuleException`), so those two name the way out; every other
+/// writer has none to name.
+pub fn managed_rule_refusal_force_overrides(rule_name: &str) -> String {
+    format!(
+        "{} Set 'force' parameter to true to override.",
+        managed_rule_refusal(rule_name)
+    )
+}
+
+/// What any reader of the connection slice reports for a name this store holds no
+/// connection for.
+///
+/// Written once, for the reason [`no_such_rule`] gives: every operation that
+/// resolves a connection — a read, an update, a destination that invokes through
+/// one — refuses a missing one in the same words.
+pub fn no_such_connection(name: &str) -> String {
+    format!("Connection '{name}' does not exist.")
+}
+
+/// The name of the connection a `ConnectionArn` names, or `None` when the text is
+/// not one of the ARNs this service mints ([`connection_arn`]).
+pub fn connection_name_in_arn(arn: &str) -> Option<&str> {
+    let (prefix, resource) = arn.split_once(":connection/")?;
+    let (name, id) = resource.split_once('/')?;
+    (prefix.starts_with("arn:") && !name.is_empty() && !id.is_empty()).then_some(name)
+}
+
 /// What any reader reports for a bus name that names no event bus: the missing
 /// BUS by name, built from the request. Written once, for the reason
 /// [`no_such_rule`] gives.
@@ -2470,6 +3064,58 @@ pub fn event_envelope(
     })
 }
 
+/// The fields an event a pattern is tested against must carry.
+///
+/// "The JSON must follow the format specified in Amazon Web Services Events, and
+/// the following fields are mandatory: id account source time region resources
+/// detail-type" (`TestEventPattern$Event`).
+pub const REQUIRED_EVENT_FIELDS: [&str; 7] = [
+    "id",
+    "account",
+    "source",
+    "time",
+    "region",
+    "resources",
+    "detail-type",
+];
+
+/// An event envelope a caller supplied, parsed, or `Err(reason)` when the text is
+/// not an event EventBridge matches a pattern against.
+///
+/// The reason is the message of the `InvalidEventPatternException` a caller
+/// answers with, so it names what the envelope was missing. Checked here rather
+/// than in a handler so every path that takes an envelope FROM A CALLER reads the
+/// same rules: the mandatory fields ([`REQUIRED_EVENT_FIELDS`]) have to be
+/// present, and `time` has to be an instant that parses — an envelope whose time
+/// does not would match a pattern's `time` clause by luck rather than by
+/// comparison.
+pub fn parse_event_envelope(event: &str) -> Result<::serde_json::Value, String> {
+    let parsed: ::serde_json::Value = ::serde_json::from_str(event)
+        .map_err(|error| format!("Event is not valid JSON: {error}"))?;
+    let Some(fields) = parsed.as_object() else {
+        return Err("Event must be a JSON object".to_string());
+    };
+    for field in REQUIRED_EVENT_FIELDS {
+        if !fields.contains_key(field) {
+            return Err(format!("Event is missing the required field {field}"));
+        }
+    }
+    let parses = fields
+        .get("time")
+        .and_then(::serde_json::Value::as_str)
+        .is_some_and(|text| {
+            ::aws_smithy_types::DateTime::from_str(
+                text,
+                ::aws_smithy_types::date_time::Format::DateTime,
+            )
+            .is_ok()
+        });
+    if !parses {
+        return Err("Event field time is not an instant that parses".to_string());
+    }
+    Ok(parsed)
+}
+
 /// EventBridge's event-pattern language: validate a pattern, and decide whether
 /// an event envelope matches one.
 ///
@@ -2504,11 +3150,25 @@ pub mod event_pattern {
     /// levels inside `detail`.
     const MAX_PATTERN_DEPTH: usize = 32;
 
+    /// What every refusal of a pattern opens with.
+    ///
+    /// EventBridge reports an unacceptable pattern as "Event pattern is not
+    /// valid. Reason: <what is wrong>", so the reason this module computes is
+    /// stated after it and the whole message is the one
+    /// `InvalidEventPatternException` carries, whichever operation was given the
+    /// pattern.
+    const INVALID_PATTERN: &str = "Event pattern is not valid. Reason:";
+
     /// Parse `pattern` as an event pattern, reporting why it is not one.
     ///
     /// The reason is the message of the `InvalidEventPatternException` a caller
     /// answers with, so it names the offending field path.
     pub fn parse(pattern: &str) -> Result<Map<String, Value>, String> {
+        parse_reason(pattern).map_err(|reason| format!("{INVALID_PATTERN} {reason}"))
+    }
+
+    /// The parse itself, reporting the bare reason the refusal states.
+    fn parse_reason(pattern: &str) -> Result<Map<String, Value>, String> {
         let value: Value = ::serde_json::from_str(pattern)
             .map_err(|error| format!("Event pattern is not valid JSON: {error}"))?;
         let Value::Object(map) = value else {
@@ -2634,7 +3294,7 @@ pub mod event_pattern {
             };
             if key == "$or" {
                 let Some(branches) = spec.as_array().filter(|list| !list.is_empty()) else {
-                    return Err(format!("{field} must be a non-empty array of patterns"));
+                    return Err(format!("\"{field}\" must be a non-empty array of patterns"));
                 };
                 for branch in branches {
                     let Some(object) = branch.as_object().filter(|map| !map.is_empty()) else {
@@ -2647,7 +3307,7 @@ pub mod event_pattern {
             match spec {
                 Value::Array(terms) => {
                     if terms.is_empty() {
-                        return Err(format!("{field} must list at least one value"));
+                        return Err("Empty arrays are not allowed".to_string());
                     }
                     for term in terms {
                         validate_term(term, &field)?;
@@ -2655,15 +3315,11 @@ pub mod event_pattern {
                 }
                 Value::Object(child) => {
                     if child.is_empty() {
-                        return Err(format!("{field} must name at least one field"));
+                        return Err(format!("\"{field}\" must name at least one field"));
                     }
                     validate_object(child, &field, depth + 1)?;
                 }
-                _ => {
-                    return Err(format!(
-                        "{field} must be an array of values or a nested pattern object"
-                    ))
-                }
+                _ => return Err(format!("\"{field}\" must be an object or an array")),
             }
         }
         Ok(())
@@ -2681,7 +3337,7 @@ pub mod event_pattern {
                 validate_operator(operator, argument, field)
             }
             _ => Err(format!(
-                "{field} admits literal values and single-operator objects only"
+                "\"{field}\" admits literal values and single-operator objects only"
             )),
         }
     }
@@ -2740,10 +3396,17 @@ pub mod event_pattern {
                         .iter()
                         .next()
                         .expect("a single-entry map has a first entry");
-                    if STRING_OPERATORS.contains(&nested.as_str()) {
-                        validate_operator(nested, nested_argument, field)
-                    } else {
-                        bad("a value, a list of values, or one nested string operator")
+                    if !STRING_OPERATORS.contains(&nested.as_str()) {
+                        return bad("a value, a list of values, or one nested string operator");
+                    }
+                    // A nested string operator may take a LIST of arguments,
+                    // any one of which excludes the value: `anything-but` is the
+                    // one place the pattern language admits that form.
+                    match nested_argument {
+                        Value::Array(arguments) if !arguments.is_empty() => arguments
+                            .iter()
+                            .try_for_each(|one| validate_operator(nested, one, field)),
+                        one => validate_operator(nested, one, field),
                     }
                 }
                 _ => bad("a value, a list of values, or one nested string operator"),
@@ -2763,9 +3426,64 @@ pub mod event_pattern {
                         return bad("an array of operator/value pairs");
                     }
                 }
+                // A range whose bottom is not below its top admits no number at
+                // all, so it is a pattern that can never match rather than a
+                // filter: refused instead of stored.
+                if let Some(reason) = degenerate_range(terms) {
+                    return Err(format!("{field}: {operator} {reason}"));
+                }
                 Ok(())
             }
-            _ => Err(format!("{field}: {operator} is not a supported operator")),
+            _ => Err(format!("Unrecognized match type {operator}")),
+        }
+    }
+
+    /// Why the bounds of a `numeric` term list admit no number, or `None` when at
+    /// least one number satisfies all of them.
+    ///
+    /// The bounds are reduced to the TIGHTEST lower and upper one, which is what
+    /// the conjunction of the pairs means, and the range is empty when the lower
+    /// one is above the upper one — or equal to it while either end is exclusive.
+    fn degenerate_range(terms: &[Value]) -> Option<&'static str> {
+        // (the bound, whether that end is exclusive)
+        let mut lower: Option<(f64, bool)> = None;
+        let mut upper: Option<(f64, bool)> = None;
+        for pair in terms.chunks(2) {
+            let (Some(operator), Some(bound)) = (pair[0].as_str(), pair[1].as_f64()) else {
+                continue;
+            };
+            let tighten = |held: Option<(f64, bool)>, bound: f64, exclusive: bool, upwards: bool| {
+                match held {
+                    Some((kept, kept_exclusive))
+                        if (upwards && kept > bound) || (!upwards && kept < bound) =>
+                    {
+                        Some((kept, kept_exclusive))
+                    }
+                    Some((kept, kept_exclusive)) if kept == bound => {
+                        Some((kept, kept_exclusive || exclusive))
+                    }
+                    _ => Some((bound, exclusive)),
+                }
+            };
+            match operator {
+                ">" => lower = tighten(lower, bound, true, true),
+                ">=" => lower = tighten(lower, bound, false, true),
+                "<" => upper = tighten(upper, bound, true, false),
+                "<=" => upper = tighten(upper, bound, false, false),
+                "=" => {
+                    lower = tighten(lower, bound, false, true);
+                    upper = tighten(upper, bound, false, false);
+                }
+                _ => {}
+            }
+        }
+        match (lower, upper) {
+            (Some((low, low_exclusive)), Some((high, high_exclusive)))
+                if low > high || (low == high && (low_exclusive || high_exclusive)) =>
+            {
+                Some("names a range whose bottom is not below its top")
+            }
+            _ => None,
         }
     }
 
@@ -2794,7 +3512,15 @@ pub mod event_pattern {
                         held
                     }
                     Value::Object(child) => {
-                        field.is_some_and(|value| match_object(child, value, budget))
+                        // "exists only works on leaf nodes": a sub-pattern whose
+                        // PARENT the event does not carry is evaluated against
+                        // absence rather than failed outright, so an
+                        // `exists: false` term holds when an intermediate parent
+                        // is missing — the leaf is absent either way.
+                        match field {
+                            Some(value) => match_object(child, value, budget),
+                            None => match_object(child, &Value::Null, budget),
+                        }
                     }
                     _ => false,
                 }
@@ -2831,7 +3557,7 @@ pub mod event_pattern {
                 return false;
             };
             return any_leaf(value, |leaf| {
-                budget.charge(leaf_cost(leaf) + argument_cost(term)) && leaf == term
+                budget.charge(leaf_cost(leaf) + argument_cost(term)) && same_value(leaf, term)
             });
         };
         let Some((operator, argument)) = map.iter().next().filter(|_| map.len() == 1) else {
@@ -2839,9 +3565,12 @@ pub mod event_pattern {
         };
         if operator == "exists" {
             // The only operator that is about PRESENCE, so it is the only one
-            // that can match an absent field.
+            // that can match an absent field. "exists only works on leaf nodes.
+            // It does not work on intermediate nodes": a field whose value is an
+            // object, or an array carrying no leaf at all, is therefore absent as
+            // far as this operator is concerned ([`leaf_exists`]).
             return budget.charge(1)
-                && argument.as_bool() == Some(field.is_some_and(|value| !value.is_null()));
+                && argument.as_bool() == Some(field.is_some_and(leaf_exists));
         }
         let Some(value) = field else {
             return false;
@@ -2853,6 +3582,35 @@ pub mod event_pattern {
             budget.charge(leaf_cost(leaf) + argument_cost(argument))
                 && match_operator(operator, argument, leaf)
         })
+    }
+
+    /// Whether `value` is a LEAF the `exists` operator sees: a string, a number or
+    /// a boolean, or an array carrying at least one such member.
+    ///
+    /// `null`, an object and an empty array carry no leaf, so a field holding one
+    /// of them is absent for `exists` — which is what "exists only works on leaf
+    /// nodes" means.
+    fn leaf_exists(value: &Value) -> bool {
+        match value {
+            Value::Null | Value::Object(_) => false,
+            Value::Array(members) => members.iter().any(leaf_exists),
+            _ => true,
+        }
+    }
+
+    /// Whether a pattern's literal term and an event's leaf are the same value.
+    ///
+    /// Type-sensitive, as EventBridge's exact matching is — a string never equals a
+    /// number — but two NUMBERS are compared numerically rather than by their JSON
+    /// spelling, so `1` and `1.0` are one value and a pattern does not depend on
+    /// how the publisher wrote it.
+    fn same_value(leaf: &Value, term: &Value) -> bool {
+        match (leaf, term) {
+            (Value::Number(found), Value::Number(wanted)) => {
+                found == wanted || found.as_f64() == wanted.as_f64()
+            }
+            (found, wanted) => found == wanted,
+        }
     }
 
     /// Apply `predicate` to `value`, or to any member of it when the event
@@ -2958,11 +3716,18 @@ pub mod event_pattern {
     /// one nested string operator.
     fn matches_anything_but(argument: &Value, leaf: &Value) -> bool {
         match argument {
-            Value::Array(values) => values.iter().any(|value| value == leaf),
+            Value::Array(values) => values.iter().any(|value| same_value(leaf, value)),
             Value::Object(map) => map.iter().next().is_some_and(|(nested, nested_argument)| {
-                match_operator(nested, nested_argument, leaf)
+                match nested_argument {
+                    // A nested string operator may list several arguments, any
+                    // one of which excludes the leaf.
+                    Value::Array(arguments) => arguments
+                        .iter()
+                        .any(|one| match_operator(nested, one, leaf)),
+                    one => match_operator(nested, one, leaf),
+                }
             }),
-            value => value == leaf,
+            value => same_value(leaf, value),
         }
     }
 
@@ -3026,13 +3791,39 @@ pub mod event_pattern {
     }
 
     /// Split `a.b.c.d/len` into its network address and prefix length,
-    /// rejecting a length wider than the address family admits.
+    /// rejecting a length wider than the address family admits and an address
+    /// carrying bits outside that prefix.
+    ///
+    /// A CIDR block names a NETWORK, so every bit beyond its prefix is zero;
+    /// text whose address sets one of them names a host inside a block rather
+    /// than the block, which is not a block to compare an address against.
     fn parse_cidr(block: &str) -> Option<(IpAddr, u8)> {
         let (address, length) = block.split_once('/')?;
         let network: IpAddr = address.parse().ok()?;
         let bits: u8 = length.parse().ok()?;
         let width = if network.is_ipv4() { 32 } else { 128 };
-        (bits <= width).then_some((network, bits))
+        if bits > width || !is_network_address(network, bits) {
+            return None;
+        }
+        Some((network, bits))
+    }
+
+    /// Whether every bit of `network` outside its first `bits` is zero.
+    fn is_network_address(network: IpAddr, bits: u8) -> bool {
+        let octets: Vec<u8> = match network {
+            IpAddr::V4(address) => address.octets().to_vec(),
+            IpAddr::V6(address) => address.octets().to_vec(),
+        };
+        let mut remaining = usize::from(bits);
+        for octet in octets {
+            let take = remaining.min(8);
+            remaining -= take;
+            let mask = u8::try_from(0xffu16 << (8 - take) & 0xff).unwrap_or(0xff);
+            if octet & !mask != 0 {
+                return false;
+            }
+        }
+        true
     }
 
     /// Whether `address` is inside the block `network/bits`.

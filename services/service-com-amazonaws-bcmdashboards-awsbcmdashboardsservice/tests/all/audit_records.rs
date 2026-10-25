@@ -438,6 +438,24 @@ async fn scheduled_report_executions_are_audited() {
         );
     }
 
+    // A second report swept under the SAME token is a different request: it executes,
+    // so it accounts for its own execution under its own ARN.
+    {
+        let (capture, _guard) = capture_events();
+        ok_call(
+            &router,
+            "ExecuteScheduledReport",
+            &json!({"arn": other, "clientToken": token}),
+        )
+        .await;
+        assert_record(
+            &capture.record_for("ExecuteScheduledReport"),
+            "ExecuteScheduledReport",
+            &other,
+            "SUCCESS",
+        );
+    }
+
     // Every refusal, with the modelled error as its outcome and the requested ARN as the
     // resource — including the ARN that resolves to no report at all.
     let absent = "arn:aws:bcm-dashboards::000000000000:scheduled-report/never-created";
@@ -447,12 +465,6 @@ async fn scheduled_report_executions_are_audited() {
             400,
             paused.as_str(),
             "ValidationException",
-        ),
-        (
-            json!({"arn": other, "clientToken": token}),
-            409,
-            other.as_str(),
-            "ConflictException",
         ),
         (
             json!({"arn": absent}),

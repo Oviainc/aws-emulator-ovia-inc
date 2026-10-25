@@ -2441,6 +2441,17 @@ impl Bucket {
         self.ownership_controls = Some(rules);
     }
 
+    /// Remove the bucket's ownership controls, leaving none associated with it.
+    ///
+    /// What `DeleteBucketOwnershipControls` does — "Removes OwnershipControls for an Amazon
+    /// S3 bucket" — which puts the bucket back in the state it was created in, so a later
+    /// `GetBucketOwnershipControls` reports no ownership controls again
+    /// ([`OWNERSHIP_CONTROLS_NOT_FOUND_CODE`]). Scoped to this one bucket's controls:
+    /// nothing else on the record is touched.
+    pub fn clear_ownership_controls(&mut self) {
+        self.ownership_controls = None;
+    }
+
     /// Whether ACLs are DISABLED on the bucket, i.e. its ownership controls name
     /// [`BUCKET_OWNER_ENFORCED`].
     ///

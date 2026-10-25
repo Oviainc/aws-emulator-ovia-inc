@@ -6,7 +6,7 @@
 //! that key, and every key the resource carries that the request does not name is left
 //! alone. A following `ListTagsForResource` reports exactly the merged set.
 //!
-//! Four rules this handler enforces beyond the modelled constraints:
+//! Five rules this handler enforces beyond the modelled constraints:
 //!
 //! * `ResourceArn` is a bare `String` with no modelled pattern, so a value that is not
 //!   an ARN at all reaches the handler; it names no resource and earns the modelled
@@ -21,6 +21,11 @@
 //!   [`crate::state::MAX_TAGS_PER_RESOURCE`] tags earns the modelled
 //!   `TooManyTagsException` (400) and writes NOTHING, so a refused call leaves the
 //!   stored tags exactly as they were.
+//! * `Tags` naming a key in the namespace AWS reserves for its own tags
+//!   ([`crate::state::RESERVED_TAG_KEY_PREFIX`]) earns the modelled
+//!   `ValidationException` (400) and writes nothing: such a key is AWS's, not the
+//!   caller's, so no path that writes tags — this one, `CreateApprovalTeam` or
+//!   `CreateIdentitySource` — writes one.
 //!
 //! ## Shape of an operation
 //!
@@ -195,6 +200,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A tag key in the namespace reserved for Amazon Web Services belongs to AWS,
+        // not to the caller, so this call cannot create or replace one: the request is
+        // refused with the modelled `ValidationException` (400) and writes nothing. The
+        // resource's existence is still decided first, so a resource that does not exist
+        // is never reported as naming a reserved key.
+        if crate::state::names_reserved_tag_key(input.tags.keys().map(String::as_str)) {
+            return Err(
+                TagResourceErrorModeled::ValidationException(crate::state::reserved_tag_key())
+                    .into(),
+            );
+        }
 
         // Whether the merged set fits is decided before anything is written, so a
         // refused call leaves the resource's tags exactly as they were. A key the

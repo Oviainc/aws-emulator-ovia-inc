@@ -5,7 +5,10 @@
 //! Reports the foundation models this service offers: one `FoundationModelSummary` per row
 //! of the published catalog this service's store is seeded with
 //! ([`crate::state::FoundationModelCatalog`]), in `modelId` order, narrowed to the rows
-//! that satisfy EVERY `by*` filter the request carries.
+//! that satisfy EVERY `by*` filter the request carries. A row is reported through
+//! [`crate::state::foundation_model_summary`], the one mapping of a catalog row that
+//! `ops/get_foundation_model.rs` also reports a model through, so a listing and a read
+//! cannot disagree about a model.
 //!
 //! A pure read: the catalog is published rather than created, so no call of this operation
 //! writes anything, and two listings of the same filters answer alike.
@@ -176,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .foundation_models
             .models()
             .filter(|model| admitted(model, &input))
-            .map(|model| summary(model, &region))
+            .map(|model| crate::state::foundation_model_summary(model, &region))
             .collect();
 
         Ok(ListFoundationModelsOutput {
@@ -215,32 +218,5 @@ fn admitted(model: &crate::state::FoundationModel, input: &ListFoundationModelsI
             .by_inference_type
             .as_deref()
             .is_none_or(|inference_type| carries(model.inference_types_supported, inference_type))
-}
-
-/// One catalog row as the `FoundationModelSummary` a response for `region` carries.
-///
-/// `modelLifecycle` reports the row's `status` and none of the four lifecycle instants:
-/// nothing publishes a launch, legacy or end-of-life date per model, and a date is not
-/// something to invent.
-fn summary(model: &crate::state::FoundationModel, region: &str) -> FoundationModelSummary {
-    let list = |values: &[&str]| values.iter().map(|value| (*value).to_string()).collect();
-    FoundationModelSummary {
-        model_arn: crate::state::foundation_model_arn(region, model.model_id),
-        model_id: model.model_id.to_string(),
-        model_name: Some(model.model_name.to_string()),
-        provider_name: Some(model.provider_name.to_string()),
-        input_modalities: Some(list(model.input_modalities)),
-        output_modalities: Some(list(model.output_modalities)),
-        response_streaming_supported: Some(model.response_streaming_supported),
-        customizations_supported: Some(list(model.customizations_supported)),
-        inference_types_supported: Some(list(model.inference_types_supported)),
-        model_lifecycle: Some(FoundationModelLifecycle {
-            status: model.lifecycle_status.to_string(),
-            start_of_life_time: None,
-            end_of_life_time: None,
-            legacy_time: None,
-            public_extended_access_time: None,
-        }),
-    }
 }
 

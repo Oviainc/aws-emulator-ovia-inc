@@ -211,9 +211,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the resolvers that act ON the queue (`UpdateJobQueue`), which name the ARN
             // they resolved it to.
             return Err(CreateQuotaShareErrorModeled::ClientException(
-                batch::client_exception_enveloped(format!(
-                    "{}.",
-                    batch::does_not_exist_message(&input.job_queue)
+                batch::client_exception_enveloped(batch::does_not_exist_sentence(
+                    &input.job_queue,
                 )),
             )
             .into());

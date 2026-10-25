@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBucketOwnershipControls
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBucketOwnershipControls`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBucketOwnershipControls::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the ownership controls `PutBucketOwnershipControls` associated with the named
+//! bucket, so a later `GetBucketOwnershipControls` reports none again. Idempotent, and
+//! scoped to the one bucket the request names: nothing else about that bucket, and no
+//! other bucket's record, is touched.
 //!
 //! ## Shape of an operation
 //!
@@ -99,14 +95,21 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteBucketOwnershipCon
     fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
 }
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `DeleteBucketOwnershipControlsError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#DeleteBucketOwnershipControls")]
+// The operation's MODELED errors, widened by `NoSuchBucket`.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="DeleteBucketOwnershipControls")` reports
+// `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket that does
+// not exist and AWS answers the service-wide `NoSuchBucket` ("The specified bucket does
+// not exist", `httpError 404`) — the same 404 the other two ownership-controls operations
+// answer.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#DeleteBucketOwnershipControls",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum DeleteBucketOwnershipControlsErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -160,18 +163,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBucketOwnershipControls` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBucketOwnershipControlsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A delete needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+
+        // "The account ID of the expected bucket owner. If the account ID that you provide
+        // does not match the actual owner of the bucket, the request fails with the HTTP
+        // status code 403 Forbidden (access denied)"
+        // (`DeleteBucketOwnershipControlsRequest$ExpectedBucketOwner`): this emulator
+        // serves one account, so that account owns every bucket it holds. Decided before
+        // the lookup, so a refused request reads nothing and writes nothing.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                ACCESS_DENIED_STATUS,
+                "Access Denied",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Nothing can be removed from a store the emulator cannot reach, and the one
+            // widened-in error says "no such bucket", which would be a false statement
+            // about the bucket, so the scaffold's 501 says what is true: this emulator
+            // cannot serve the request.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteBucketOwnershipControls",
+            ));
+        };
+
+        // The bucket is looked up FIRST, so a request naming a bucket this emulator does
+        // not hold answers that rather than succeeding on a record that cannot exist —
+        // the order `PutBucketOwnershipControls` keeps.
+        let mut store = state.lock();
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            return Err(
+                DeleteBucketOwnershipControlsErrorModeled::NoSuchBucket(NoSuchBucket {}).into(),
+            );
+        };
+
+        // "Removes OwnershipControls for an Amazon S3 bucket" (this operation's own
+        // documentation), which puts the bucket back in the state it was created in, so a
+        // later `GetBucketOwnershipControls` answers `OwnershipControlsNotFoundError`
+        // again — "You've manually deleted the bucket ownership control value using the
+        // DeleteBucketOwnershipControls API operation" (`GetBucketOwnershipControls`'s own
+        // documentation).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBucketOwnershipControls"))
+        // Idempotent: nothing in the contract distinguishes a bucket that carried
+        // ownership controls from one that did not — the operation models no not-found and
+        // its output is `Unit` — so both end in the same state and answer the modelled 204.
+        // Only this bucket's ownership controls are cleared; its objects and its other
+        // subresources are left alone, as is every other bucket's record.
+        bucket.clear_ownership_controls();
+
+        // `Unit` output: success is the modelled 204 and an empty body.
+        Ok(DeleteBucketOwnershipControlsOutput)
     }
 }
+
+/// The HTTP status AWS answers a bucket-owner mismatch with: 403, as
+/// `DeleteBucketOwnershipControlsRequest$ExpectedBucketOwner` documents.
+const ACCESS_DENIED_STATUS: u16 = 403;

@@ -884,6 +884,11 @@ pub struct ActivityTask {
     /// "The string that contains the JSON input data for the task": the effective
     /// input the scheduling state computed.
     pub input: String,
+    /// The RAW input of the state that scheduled it, before `InputPath` and the
+    /// `Parameters` template. The state's `ResultPath` combines a worker's reply with
+    /// its raw input, so answering the task needs the document the state was entered
+    /// with and not only the one the worker was handed.
+    pub state_input: String,
     /// When a poll may first claim it: the instant the execution's walk REACHED the
     /// state, which is its start plus every `Wait` before it. Nothing sleeps for
     /// those waits, so this is what makes them observable to a worker.
@@ -964,6 +969,7 @@ impl ActivityTask {
             + self.execution_arn.len()
             + self.state_name.len()
             + self.input.len()
+            + self.state_input.len()
             + WORKER_NAME_RESERVE_BYTES
     }
 }
@@ -986,6 +992,8 @@ pub struct PlannedActivityTask {
     pub activity_arn: String,
     pub state_name: String,
     pub input: String,
+    /// The raw input of the state that scheduled it; see [`ActivityTask::state_input`].
+    pub state_input: String,
     pub available_at: SystemTime,
     pub timeout_seconds: Option<u64>,
     pub heartbeat_seconds: Option<u64>,
@@ -1003,12 +1011,16 @@ impl PlannedActivityTask {
             + self.activity_arn.len()
             + self.state_name.len()
             + self.input.len()
+            + self.state_input.len()
     }
 }
 
-/// The characters a minted `taskToken` carries (one version-4 UUID), reserved by
-/// [`PlannedActivityTask::measure`] before the token itself is minted.
-const TASK_TOKEN_CHARS: usize = 36;
+/// The characters a minted `taskToken` carries, reserved by
+/// [`PlannedActivityTask::measure`] before the token itself is minted: the base64 of
+/// one version-4 UUID, the separator and an activity ARN (see [`task_token`]), whose
+/// own maximum is [`MAX_ARN_BYTES`]. Base64 carries three bytes in four characters,
+/// and pads to a multiple of four.
+const TASK_TOKEN_CHARS: usize = 4 * (36 + 1 + MAX_ARN_BYTES).div_ceil(3) + 4;
 
 /// What a scheduled task reserves for the history events its own life appends to the
 /// execution waiting on it: the `ActivityStarted` a claim writes, and the two a
@@ -1306,6 +1318,25 @@ impl Execution {
         }
         self.pending = pending;
     }
+
+    /// Record a worker's reply to the activity task this execution was suspended at:
+    /// the events the continuation has already produced are APPENDED to the history
+    /// its earlier states left, and the outcome that continuation computed is owed to
+    /// the clock exactly as a start's is.
+    ///
+    /// This CONTINUES the attempt rather than starting another, so nothing the
+    /// attempt already recorded is cleared and neither `redriveCount` nor
+    /// `redriveDate` moves: the execution has been `RUNNING` since its start and
+    /// still is.
+    fn apply_continuation(&mut self, events: Vec<HistoryEvent>, pending: Option<PendingOutcome>) {
+        for event in events {
+            if self.history.len() >= MAX_HISTORY_EVENTS {
+                break;
+            }
+            self.history.push(event);
+        }
+        self.pending = pending;
+    }
 }
 
 /// One stored Map Run: the resource a Distributed Map state starts, which
@@ -1575,13 +1606,18 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         execution_arn: &str,
         planned: PlannedActivityTask,
     ) -> String {
-        let token = self.fresh_uuid();
+        // The token NAMES the task: a minted id, and the activity it belongs to, so a
+        // reply to a token whose task has since been closed can still say which
+        // activity that task was of. See [`task_token`].
+        let id = self.fresh_uuid();
+        let token = task_token(&id, &planned.activity_arn);
         let mut task = ActivityTask {
             token: token.clone(),
             activity_arn: planned.activity_arn,
             execution_arn: execution_arn.to_string(),
             state_name: planned.state_name,
             input: planned.input,
+            state_input: planned.state_input,
             available_at: planned.available_at,
             worker_name: None,
             started_at: None,
@@ -1658,6 +1694,63 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             }
         }
         Some(task)
+    }
+
+    /// Record a worker's reply to the task `token` names: the task is CLOSED and the
+    /// execution waiting at it carries on with what the continuation produced.
+    ///
+    /// `events` and `pending` are what [`plan_reply`] computed for the walk that
+    /// continued from the reply, and `extra_bytes` what the next activity task that
+    /// walk stopped at — and the Map Runs it started — will retain, so a reply is
+    /// admitted against the store's ceiling exactly as a start is rather than growing
+    /// it past [`MAX_STORE_BYTES`].
+    ///
+    /// The task's record is dropped, giving back the bytes it held: a token answers
+    /// ONE task, so a later reply under the same token resolves nothing.
+    pub fn answer_activity_task(
+        &mut self,
+        token: &str,
+        events: Vec<HistoryEvent>,
+        pending: Option<PendingOutcome>,
+        extra_bytes: usize,
+    ) -> Result<(), TaskReplyRejection> {
+        let Some(task) = self.activity_tasks.get(token) else {
+            return Err(TaskReplyRejection::Gone);
+        };
+        let execution_arn = task.execution_arn.clone();
+        // A task whose execution is terminal — stopped, or failed when the clock
+        // closed an earlier bound — is answered by nobody: `settle` discards it, and
+        // one that is still here when this runs is in that same state.
+        let Some(execution) = self
+            .executions
+            .get(&execution_arn)
+            .filter(|execution| !execution.is_terminal())
+        else {
+            return Err(TaskReplyRejection::Gone);
+        };
+        let before = execution.retained_bytes;
+        let mut candidate = execution.clone();
+        candidate.apply_continuation(events, pending);
+        let after = candidate.measure();
+        if after + extra_bytes > before && !self.has_room_for(after + extra_bytes - before) {
+            return Err(TaskReplyRejection::NoRoom);
+        }
+        candidate.retained_bytes = after;
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(after)
+            .saturating_sub(before);
+        // The continuation's outcome is owed to the clock, so this execution joins the
+        // settle queue; one that stopped at ANOTHER activity task owes the clock
+        // nothing and does not.
+        self.pending_executions
+            .retain(|pending| pending != &execution_arn);
+        if candidate.pending.is_some() {
+            self.pending_executions.push(execution_arn.clone());
+        }
+        self.executions.insert(execution_arn, candidate);
+        self.discard_activity_task(token);
+        Ok(())
     }
 
     /// Close `token`'s task at `due`, the instant its own bound made it due, and fail
@@ -2655,49 +2748,8 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
                     map_run_arn(region, state_machine_name, &plan.label, &id)
                 }
             };
-            let (redrive_count, retained_before) = match self.map_runs.get(&arn) {
-                Some(map_run) => (
-                    map_run.redrive_count.saturating_add(1),
-                    map_run.retained_bytes,
-                ),
-                None => (0, 0),
-            };
-            let mut record = MapRun {
-                arn: arn.clone(),
-                execution_arn: execution_arn.to_string(),
-                state_machine_arn: state_machine_arn.to_string(),
-                label: plan.label,
-                // The items ran in the walk, but the Map Run reaches its terminal
-                // status when the clock says it did, exactly as its execution does:
-                // a caller reading straight after the start sees it RUNNING.
-                status: MAP_RUN_STATUS_RUNNING.to_string(),
-                start_date: plan.start_date,
-                stop_date: None,
-                pending: Some(PendingMapRunOutcome {
-                    due_at: plan.due_at,
-                    status: plan.status,
-                }),
-                max_concurrency: plan.max_concurrency,
-                tolerated_failure_count: plan.tolerated_failure_count,
-                tolerated_failure_percentage: plan.tolerated_failure_percentage,
-                total_items: plan.total_items,
-                succeeded_items: plan.succeeded_items,
-                failed_items: plan.failed_items,
-                redrive_count,
-                // "If you have not yet redriven [...] the redriveDate is null": the
-                // instant the re-run that produced this record began.
-                redrive_date: (redrive_count > 0).then_some(plan.start_date),
-                retained_bytes: 0,
-            };
-            record.retained_bytes = record.measure();
-            self.retained_bytes = self
-                .retained_bytes
-                .saturating_add(record.retained_bytes)
-                .saturating_sub(retained_before);
-            self.pending_map_runs.retain(|pending| pending != &arn);
-            self.pending_map_runs.push(arn.clone());
-            recorded.push(arn.clone());
-            self.map_runs.insert(arn, record);
+            self.put_map_run(arn.clone(), execution_arn, state_machine_arn, plan);
+            recorded.push(arn);
         }
         for arn in previous {
             if recorded.contains(&arn) {
@@ -2710,6 +2762,99 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         }
         self.map_runs_by_execution
             .insert(execution_arn.to_string(), recorded);
+    }
+
+    /// Record the Map Runs a CONTINUATION of `execution_arn` started — the states a
+    /// worker's reply to an activity task carried the walk on through — keeping the
+    /// ones the attempt's earlier states already started.
+    ///
+    /// A reply continues ONE attempt rather than starting another, so the records
+    /// already listed under this execution stand: they belong to states this walk
+    /// passed before the task, which happened once and are not re-entered. Each Map
+    /// Run here is therefore a position no earlier call reached, appended after them
+    /// with an ARN of its own.
+    pub fn append_map_runs(
+        &mut self,
+        execution_arn: &str,
+        state_machine_arn: &str,
+        state_machine_name: &str,
+        region: &str,
+        planned: Vec<PlannedMapRun>,
+    ) {
+        if planned.is_empty() {
+            return;
+        }
+        let mut recorded: Vec<String> = self
+            .map_runs_by_execution
+            .get(execution_arn)
+            .cloned()
+            .unwrap_or_default();
+        for plan in planned {
+            let id = self.fresh_uuid();
+            let arn = map_run_arn(region, state_machine_name, &plan.label, &id);
+            self.put_map_run(arn.clone(), execution_arn, state_machine_arn, plan);
+            recorded.push(arn);
+        }
+        self.map_runs_by_execution
+            .insert(execution_arn.to_string(), recorded);
+    }
+
+    /// Store one Map Run under `arn`, counting what it retains and queueing the
+    /// terminal status its items produced for the clock.
+    ///
+    /// A record already at that ARN is the SAME Map Run running again — which is what
+    /// a redrive of its execution does — so it keeps the ARN a client may be holding
+    /// and counts the redrive; the bytes it held are given back and the new record's
+    /// are counted.
+    fn put_map_run(
+        &mut self,
+        arn: String,
+        execution_arn: &str,
+        state_machine_arn: &str,
+        plan: PlannedMapRun,
+    ) {
+        let (redrive_count, retained_before) = match self.map_runs.get(&arn) {
+            Some(map_run) => (
+                map_run.redrive_count.saturating_add(1),
+                map_run.retained_bytes,
+            ),
+            None => (0, 0),
+        };
+        let mut record = MapRun {
+            arn: arn.clone(),
+            execution_arn: execution_arn.to_string(),
+            state_machine_arn: state_machine_arn.to_string(),
+            label: plan.label,
+            // The items ran in the walk, but the Map Run reaches its terminal
+            // status when the clock says it did, exactly as its execution does:
+            // a caller reading straight after the start sees it RUNNING.
+            status: MAP_RUN_STATUS_RUNNING.to_string(),
+            start_date: plan.start_date,
+            stop_date: None,
+            pending: Some(PendingMapRunOutcome {
+                due_at: plan.due_at,
+                status: plan.status,
+            }),
+            max_concurrency: plan.max_concurrency,
+            tolerated_failure_count: plan.tolerated_failure_count,
+            tolerated_failure_percentage: plan.tolerated_failure_percentage,
+            total_items: plan.total_items,
+            succeeded_items: plan.succeeded_items,
+            failed_items: plan.failed_items,
+            redrive_count,
+            // "If you have not yet redriven [...] the redriveDate is null": the
+            // instant the re-run that produced this record began.
+            redrive_date: (redrive_count > 0).then_some(plan.start_date),
+            retained_bytes: 0,
+        };
+        record.retained_bytes = record.measure();
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(record.retained_bytes)
+            .saturating_sub(retained_before);
+        self.pending_map_runs.retain(|pending| pending != &arn);
+        self.pending_map_runs.push(arn.clone());
+        self.map_runs.insert(arn, record);
     }
 
     /// One execution's Map Runs, in the order their `Map` states were entered.
@@ -3365,6 +3510,103 @@ pub fn invalid_token_message() -> String {
     resource_error_message(INVALID_TOKEN, INVALID_TOKEN_DETAIL)
 }
 
+/// `TaskTimedOut`'s own condition name, as its message spells it, for
+/// [`resource_error_message`]. RECORDED text.
+pub const TASK_TIMED_OUT: &str = "Task Timed Out";
+
+/// What every `SendTask*` operation answers for a token whose task is no longer
+/// outstanding: ONE construction, so no two of them word that refusal differently.
+///
+/// RECORDED text: the recorded service answers a reply to a token whose task has been
+/// closed with `Task Timed Out: '<the ARN of the activity that task belonged to>'`, so
+/// the quoted value is that activity — which the token itself names (see
+/// [`task_token`]) and not a value of the request.
+pub fn task_timed_out_message(activity_arn: &str) -> String {
+    resource_error_message(TASK_TIMED_OUT, activity_arn)
+}
+
+/// `InvalidOutput`'s, for [`resource_error_message`]. The error's own condition name
+/// under that rule: the shape documents "the provided JSON output data is not valid",
+/// and the value the message quotes is the document the caller sent, clipped by
+/// [`asl::echoed`] so one request cannot be amplified into a much larger response.
+pub const INVALID_OUTPUT: &str = "Invalid Output";
+
+/// What the modelled `InvalidOutput` says: the condition, then the `output` the
+/// request carried, and why it was refused.
+///
+/// Built from the REQUEST, like every other refusal here that is about a value the
+/// caller sent (see [`resource_error_message`]): it names the document that is not
+/// JSON, so a worker correcting its reply can see which one was rejected.
+pub fn invalid_output_message(output: &str) -> String {
+    format!(
+        "{}: '{}' is not valid JSON.",
+        INVALID_OUTPUT,
+        asl::echoed(output)
+    )
+}
+
+/// What separates a task token's id from the activity ARN it names.
+///
+/// A character [`FORBIDDEN_NAME_CHARS`] keeps out of an activity name, so the two
+/// parts of a decoded token are always told apart however the activity was named.
+const TASK_TOKEN_SEPARATOR: char = '|';
+
+/// The `taskToken` that names the task `id` identifies under `activity_arn`.
+///
+/// "Task tokens are generated by Step Functions when tasks are assigned to a worker":
+/// the token is the SERVICE's value, and it NAMES the task — the recorded service
+/// answers a reply to a token whose task has been closed with the ARN of the activity
+/// that task belonged to, which a store that no longer holds the task can only read
+/// from the token itself. So a token carries both: a minted id, which is what makes
+/// two tasks of one activity differ, and that ARN, encoded as base64 the way this
+/// service's own tokens are, well inside the modelled `TaskToken` length (1..2048)
+/// since an ARN is at most [`MAX_ARN_BYTES`].
+pub fn task_token(id: &str, activity_arn: &str) -> String {
+    ::aws_smithy_types::base64::encode(format!("{id}{TASK_TOKEN_SEPARATOR}{activity_arn}"))
+}
+
+/// The ACTIVITY the `taskToken` `token` names, or `None` for a value this service
+/// never issued — the modelled `InvalidToken`.
+///
+/// Read from the token itself, BEFORE the store is consulted, exactly as every ARN
+/// here is read before a lookup: a value that is not a token this service mints is a
+/// defect in the request, while a token of this form the store holds no task for names
+/// a task that has been closed.
+pub fn read_task_token(token: &str) -> Option<String> {
+    let decoded = ::aws_smithy_types::base64::decode(token).ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let (id, activity_arn) = decoded.split_once(TASK_TOKEN_SEPARATOR)?;
+    (is_minted_id(id) && names_an_activity(activity_arn)).then(|| activity_arn.to_string())
+}
+
+/// Whether `id` is one of the ids this store mints: a version-4 UUID as
+/// [`ComAmazonawsSfnAwsstepfunctionsState::fresh_execution_id`] renders it, 8-4-4-4-12
+/// in lowercase hexadecimal.
+fn is_minted_id(id: &str) -> bool {
+    /// The characters of each group of the 8-4-4-4-12 form a UUID is rendered in.
+    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+    let mut groups = id.split('-');
+    for width in GROUPS {
+        let Some(group) = groups.next() else {
+            return false;
+        };
+        let hexadecimal = group
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+        if group.len() != width || !hexadecimal {
+            return false;
+        }
+    }
+    groups.next().is_none()
+}
+
+/// What a reply to an activity task is refused with when the definition the execution
+/// now runs no longer reaches the state that task was scheduled at, so there is no
+/// continuation to record for it.
+pub const TASK_STATE_NOT_REACHED: &str =
+    "the state machine definition this execution runs no longer reaches the state its task was \
+     scheduled at, so the execution cannot be continued from it";
+
 /// The members of this service's model whose target shape is a FRACTIONAL number
 /// (Smithy `float`/`double`), named by their wire (lowerCamel) member name.
 ///
@@ -3399,6 +3641,19 @@ pub enum RedriveRejection {
     NotFound,
     /// The re-run would take the store past [`MAX_STORE_BYTES`] — the modelled
     /// `ExecutionLimitExceeded`.
+    NoRoom,
+}
+
+/// Why a worker's reply to an activity task was not recorded; see
+/// [`ComAmazonawsSfnAwsstepfunctionsState::answer_activity_task`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskReplyRejection {
+    /// The store holds no outstanding task under that token, or the execution
+    /// waiting at it has reached a terminal status — the modelled `TaskTimedOut`:
+    /// "the task token has either expired or the task associated with the token has
+    /// already been closed".
+    Gone,
+    /// Continuing the execution would take the store past [`MAX_STORE_BYTES`].
     NoRoom,
 }
 
@@ -4552,13 +4807,73 @@ pub fn plan_run_settling_after(
     settle: Duration,
 ) -> Planned {
     let run = asl::run(definition, input, start, context);
-    let started = HistoryEvent {
-        id: previous_event_id + 1,
+    plan_from_run(run, start, settle, Some(opening), previous_event_id)
+}
+
+/// Plan the CONTINUATION of an execution whose suspended activity task a worker has
+/// answered.
+///
+/// The definition is walked on FROM the state that scheduled the task, with the raw
+/// input that state was entered with and `reply` as its result (see [`asl::resume`]),
+/// so what this reports is what the execution does from that reply onward: the events
+/// it has produced since, and the terminal outcome it reached, owed to the clock one
+/// [`EXECUTION_SETTLE_DELAY`] after the reply just as a start's outcome is owed after
+/// the start.
+///
+/// `start` is the execution's own start, which the context object (`$$`) reports and a
+/// `Wait` state's `Timestamp` is measured against; `now` is the instant the reply
+/// arrived, which the continuation's own events are stamped from.
+///
+/// `None` when the definition no longer declares the state the task was scheduled at,
+/// so there is no continuation to record.
+pub fn plan_reply(
+    definition: &str,
+    input: &str,
+    start: SystemTime,
+    now: SystemTime,
+    context: &asl::Context,
+    reply: &asl::ActivityReply,
+    previous_event_id: i64,
+) -> Option<Planned> {
+    // What the execution has already spent, which a definition-level `TimeoutSeconds`
+    // counts: a task that stayed outstanding was part of this execution's run.
+    let elapsed = now.duration_since(start).unwrap_or_default();
+    let run = asl::resume(definition, input, start, context, reply, elapsed)?;
+    Some(plan_from_run(
+        run,
+        now,
+        EXECUTION_SETTLE_DELAY,
+        None,
         previous_event_id,
-        event_type: opening.to_string(),
-        timestamp: start,
-        state_name: None,
-    };
+    ))
+}
+
+/// What one walk left for the store to record: its events numbered after
+/// `previous_event_id`, its outcome owed `settle` after `start`, and the activity task
+/// or Map Runs it produced.
+///
+/// `opening` is the event the attempt OPENS with, for a walk that is an attempt of its
+/// own (`ExecutionStarted`, `ExecutionRedriven`); a walk that CONTINUES an attempt — a
+/// worker's reply to the task it was suspended at — opens with none, because the
+/// attempt it continues was already opened.
+fn plan_from_run(
+    run: asl::Run,
+    start: SystemTime,
+    settle: Duration,
+    opening: Option<&str>,
+    previous_event_id: i64,
+) -> Planned {
+    let opened: Vec<HistoryEvent> = opening
+        .map(|event_type| HistoryEvent {
+            id: previous_event_id + 1,
+            previous_event_id,
+            event_type: event_type.to_string(),
+            timestamp: start,
+            state_name: None,
+        })
+        .into_iter()
+        .collect();
+    let first_id = previous_event_id + 1 + i64::try_from(opened.len()).unwrap_or(0);
     // The offsets below are accumulated from the `Wait` states of a CALLER'S
     // definition, so every instant is computed with checked arithmetic: an
     // offset no instant can represent is held at the furthest instant this clock
@@ -4567,7 +4882,7 @@ pub fn plan_run_settling_after(
     let events: Vec<HistoryEvent> = run
         .steps
         .into_iter()
-        .zip(started.id + 1..)
+        .zip(first_id..)
         .map(|(step, id)| HistoryEvent {
             id,
             previous_event_id: id - 1,
@@ -4609,7 +4924,7 @@ pub fn plan_run_settling_after(
     // them. The events of the states it walked are history, so they are recorded now
     // rather than parked.
     if let Some(waiting) = run.waiting {
-        let mut history = vec![started];
+        let mut history = opened;
         history.extend(events);
         return Planned {
             opening: history,
@@ -4618,6 +4933,7 @@ pub fn plan_run_settling_after(
                 activity_arn: waiting.activity_arn,
                 state_name: waiting.state_name,
                 input: waiting.input.to_string(),
+                state_input: waiting.raw_input.to_string(),
                 available_at: after(start, waiting.at),
                 timeout_seconds: waiting.timeout_seconds,
                 heartbeat_seconds: waiting.heartbeat_seconds,
@@ -4626,7 +4942,7 @@ pub fn plan_run_settling_after(
         };
     }
     Planned {
-        opening: vec![started],
+        opening: opened,
         pending: Some(PendingOutcome {
             due_at,
             status: run.status.to_string(),

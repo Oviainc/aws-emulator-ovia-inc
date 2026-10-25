@@ -211,6 +211,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // "You cannot modify these managed rules by using DisableRule, EnableRule,
+        // PutTargets, PutRule, TagResource, or UntagResource"
+        // (`ManagedRuleException`).
+        if rule.managed_by.is_some() {
+            return Err(PutTargetsErrorModeled::ManagedRuleException(ManagedRuleException {
+                message: Some(crate::state::managed_rule_refusal(&input.rule)),
+            })
+            .into());
+        }
+
         // How many NEW ids this request would add, so the rule's own quota is
         // checked against the result of the upsert rather than the request's
         // list length (an upsert of ids the rule already holds adds nothing).

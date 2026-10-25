@@ -51,7 +51,8 @@
 //! change sets per stack and [`MAX_CHANGE_SETS`] across the store (past either
 //! `CreateChangeSet` answers the modelled `LimitExceededException`), [`PAGE_SIZE`]
 //! items per paginated response and [`MAX_DESCRIBED_STACK_RESOURCES`] resources per
-//! `DescribeStackResources` response (the documented cap on that unpaginated read).
+//! `DescribeStackResources` response (the documented cap on that unpaginated read), and
+//! [`hook_results::MAX_HOOK_RESULTS`] recorded Hook invocation results.
 //!
 //! Reading a stack's template body and evaluating what it declares is bounded by the
 //! [`template`] module's own caps (nodes, depth, the documented per-template quotas and
@@ -157,6 +158,10 @@ pub mod registry;
 /// The resource schema the registry holds for a resource type: the document that defines
 /// which properties the type has.
 pub mod resource_schema;
+
+/// The Hook invocation results this account and Region holds, which `ListHookResults`
+/// reports summaries of.
+pub mod hook_results;
 
 /// The generated templates this account and Region holds: what `CreateGeneratedTemplate`
 /// starts and `DescribeGeneratedTemplate` reads the progress of.
@@ -1694,6 +1699,12 @@ pub struct ComAmazonawsCloudformationCloudformationState {
     /// `DetectStackDrift` handed out. Bounded at [`MAX_DRIFT_DETECTIONS`], oldest
     /// reclaimed first.
     pub drift_detections: Vec<StoredDriftDetection>,
+    /// Every Hook invocation result this account and Region has recorded, in invocation
+    /// order, so `ListHookResults` pages over them deterministically (see
+    /// [`hook_results`]). An invocation result belongs to the account rather than to a
+    /// stack, so it is neither settled nor reclaimed with one; it is bounded at
+    /// [`hook_results::MAX_HOOK_RESULTS`], oldest reclaimed first.
+    pub hook_results: Vec<hook_results::StoredHookResult>,
     /// Every generated template, in creation order, so `DescribeGeneratedTemplate` reads
     /// back exactly what `CreateGeneratedTemplate` wrote (see [`generated_template`]). A
     /// generated template is a record of its own rather than a stack's, so it is neither
@@ -1839,6 +1850,18 @@ impl ComAmazonawsCloudformationCloudformationState {
             self.drift_detections.remove(0);
         }
         self.drift_detections.push(detection);
+    }
+
+    /// Record one Hook invocation result. The oldest record is reclaimed past
+    /// [`hook_results::MAX_HOOK_RESULTS`], so the store cannot grow without limit.
+    ///
+    /// This is the ONLY way a record enters the store: a Hook invocation is what produces
+    /// one, and [`hook_results`] is where what can and cannot produce one is written down.
+    pub fn record_hook_result(&mut self, result: hook_results::StoredHookResult) {
+        while self.hook_results.len() >= hook_results::MAX_HOOK_RESULTS {
+            self.hook_results.remove(0);
+        }
+        self.hook_results.push(result);
     }
 
     /// The drift detection with this `StackDriftDetectionId`, if this store still holds it.
@@ -2568,6 +2591,8 @@ pub enum PageOf {
     StackResourceSummaries,
     /// `DescribeChangeSet`'s `Changes`.
     Changes,
+    /// `ListHookResults`'s `HookResults`.
+    HookResults,
     /// `DescribeAccountLimits`'s `AccountLimits`.
     AccountLimits,
 }
@@ -2581,6 +2606,7 @@ impl PageOf {
             Self::StackEvents => "events",
             Self::StackResourceSummaries => "resources",
             Self::Changes => "changes",
+            Self::HookResults => "hookresults",
             Self::AccountLimits => "account-limits",
         }
     }

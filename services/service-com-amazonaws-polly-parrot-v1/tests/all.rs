@@ -34,3 +34,5 @@ mod support;
 mod synthesis_tasks;
 #[path = "all/task_id_validity.rs"]
 mod task_id_validity;
+#[path = "all/voice_catalog.rs"]
+mod voice_catalog;

@@ -37,7 +37,7 @@ use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
 use crate::flow_lifecycle::{Emulator, REGION};
 use crate::router_input_deletion::seed_router_input;
-use crate::router_input_restart::{configuration_rows, create_body, union_member};
+use crate::router_input_restart::{create_body, minted_configuration_rows, union_member};
 
 /// Every value of the modelled `RouterInputState` enum
 /// (`smithy_query(query="shape",shape="RouterInputState")`): CREATING | STANDBY | STARTING |
@@ -261,7 +261,10 @@ async fn get_reports_the_router_input_its_arn_addresses() {
 
     let mut rows: Vec<Row> = Vec::new();
     for (index, (kind, member_name, json_name, configuration, input_type)) in
-        configuration_rows().into_iter().enumerate()
+        minted_configuration_rows(&emulator, "get-kinds")
+            .await
+            .into_iter()
+            .enumerate()
     {
         let tier = TIERS[index % TIERS.len()];
         let maximum_bitrate = mc::router_input_tier_bitrate_ceiling(tier)
@@ -433,7 +436,8 @@ async fn the_reader_reports_the_state_the_store_holds() {
 #[tokio::test]
 async fn reading_a_router_input_changes_nothing_a_later_caller_sees() {
     let emulator = Emulator::new();
-    let (_, _, _, configuration, _) = configuration_rows()
+    let (_, _, _, configuration, _) = minted_configuration_rows(&emulator, "read-twice")
+        .await
         .into_iter()
         .next()
         .expect("the configuration table has rows");

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateLoginProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateLoginProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateLoginProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +174,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateLoginProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateLoginProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateLoginProfile"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateLoginProfileErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // A mutation: the operation "changes the password for the specified IAM
+        // user", so the lock is held for write across the existence checks and the
+        // update of the held profile.
+        let mut store = state.lock();
+
+        // The access key id the request was signed with: the acting principal every
+        // audit record below is attributed to. `UserName` is REQUIRED here (unlike
+        // `CreateLoginProfile` and `GetLoginProfile`, which also serve a nameless
+        // form), so no identity is ever resolved from it.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+        let user_key = crate::state::name_key(&input.user_name);
+
+        // A login profile exists only as the password of a user the account holds, so
+        // an update naming an absent user is not found and changes nothing — the same
+        // refusal `CreateLoginProfile` and `GetLoginProfile` answer with.
+        if !store.users.contains_key(&user_key) {
+            ::tracing::info!(
+                audit = true,
+                operation = "UpdateLoginProfile",
+                outcome = "refused_no_such_user",
+                caller_akid = %caller_akid,
+                user_key = %user_key,
+                "no login profile was updated"
+            );
+            return Err(UpdateLoginProfileErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The user with name {} cannot be found.",
+                        input.user_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // This operation CHANGES a password, so there has to be one to change: a user
+        // with no login profile ("a login profile is created when you create a
+        // password for the user", `GetLoginProfile`) is not found, because creating
+        // the first password is `CreateLoginProfile`'s job, not this operation's.
+        let Some(held) = store.login_profiles.get_mut(&user_key) else {
+            ::tracing::info!(
+                audit = true,
+                operation = "UpdateLoginProfile",
+                outcome = "refused_no_login_profile",
+                caller_akid = %caller_akid,
+                user_key = %user_key,
+                "no login profile was updated"
+            );
+            return Err(UpdateLoginProfileErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "Login Profile for user {} cannot be found.",
+                        input.user_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // Both value members are OPTIONAL and carry no modelled default
+        // (`PasswordResetRequired` targets the BOXED `booleanObjectType`:
+        // `smithy_query(query="operation", operation="UpdateLoginProfile")`), so an
+        // absent member means "unspecified", not "false". The update therefore applies
+        // the members the request supplies and leaves every member it omits at the
+        // value the account already holds.
+        let password_changed = input.password.is_some();
+        if let Some(password) = input.password {
+            // The new password is accepted and then DROPPED here, the one place the
+            // value is consumed, exactly as `CreateLoginProfile` consumes the first
+            // one: no shape reports a password back (`LoginProfile` carries only the
+            // user name, the create date and the reset flag), the model marks the
+            // member sensitive, and this emulator serves no console sign-in, so
+            // keeping it would be holding a secret nothing may ever hand out. It is
+            // never stored, logged or echoed.
+            //
+            // `PasswordPolicyViolationException` is DECLINED for the reason it cannot
+            // arise: it refuses a password that "did not meet the requirements imposed
+            // by the account password policy", and no account password policy can exist
+            // while `UpdateAccountPasswordPolicy` is unimplemented; `passwordType`'s
+            // own length and alphabet constraints are enforced before this handler
+            // runs. `LimitExceededException` is declined too: an update creates no
+            // entity, so it reaches no quota. So is
+            // `EntityTemporarilyUnmodifiableException`, which reports "a user name that
+            // was deleted and then recreated": every delete and create in this
+            // emulator takes effect at once, so no entity is ever temporarily
+            // unmodifiable.
+            drop(password);
+        }
+        if let Some(reset_required) = input.password_reset_required {
+            held.password_reset_required = reset_required;
+        }
+        // `CreateDate` is deliberately NOT moved: "the CreateDate reflects the initial
+        // password creation date" (`GetLoginProfile`), so it belongs to the create and
+        // every later read reports the instant that create minted.
+        let reset_required = held.password_reset_required;
+
+        ::tracing::info!(
+            audit = true,
+            operation = "UpdateLoginProfile",
+            outcome = "updated",
+            caller_akid = %caller_akid,
+            user_key = %user_key,
+            // WHETHER a new password was set — never the password itself, which no log
+            // may carry.
+            password_changed = password_changed,
+            password_reset_required = reset_required,
+            "login profile updated"
+        );
+
+        // The output shape is `Unit`: the operation reports nothing, and the updated
+        // profile is read back through `GetLoginProfile`.
+        Ok(UpdateLoginProfileOutput)
     }
 }
