@@ -178,7 +178,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let stored = record.to_wire();
+        // Projected as of the clock: a publish, disable or preview build the service
+        // already owes this portal is reported as settled, which is a change the CLOCK
+        // made due rather than one this read makes — the stored record is untouched.
+        let stored = record.to_wire(::std::time::SystemTime::now());
         Ok(GetPortalOutput {
             authorization: Some(stored.authorization),
             endpoint_configuration: Some(stored.endpoint_configuration),
