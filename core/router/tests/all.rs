@@ -90,6 +90,11 @@ mod elb_classic_and_v2_signing_name_routing;
 // conflicts with every other landing in the same window.
 #[path = "all/elbv2_network_resolution.rs"]
 mod elbv2_network_resolution;
+// Alphabetically between the `elbv2_` and `es_` suites, rather than appended at the end
+// of this file, which is where every new suite lands and therefore where two changes
+// collide.
+#[path = "all/emr_job_flow_role_instance_profile.rs"]
+mod emr_job_flow_role_instance_profile;
 // Declared HERE too, in the sorted list rather than appended at the tail, for the reason
 // the note above gives: the appended region at the end of this file is where every
 // concurrent router suite lands, so a line added there conflicts with every other suite

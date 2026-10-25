@@ -74,3 +74,5 @@ mod regional_partitioning;
 mod manifest_count_range;
 #[path = "all/caller_supplied_arns.rs"]
 mod caller_supplied_arns;
+#[path = "all/channel_reset_multiview.rs"]
+mod channel_reset_multiview;
