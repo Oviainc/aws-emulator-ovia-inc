@@ -254,6 +254,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(bad_request(&message));
         }
 
+        // The same windows `CreateApi` holds a new api's string members to, over the
+        // members THIS request rewrites: a patch cannot put a value outside the shape's
+        // documented length on an api a later reader reports back. Checked BEFORE
+        // anything is written, so a refused patch leaves the api exactly as it was.
+        for (member, value, window) in [
+            ("Name", input.name.as_deref(), crate::state::API_NAME_LEN),
+            (
+                "Description",
+                input.description.as_deref(),
+                crate::state::API_DESCRIPTION_LEN,
+            ),
+            (
+                "Version",
+                input.version.as_deref(),
+                crate::state::API_VERSION_LEN,
+            ),
+        ] {
+            if let Some(value) = value {
+                crate::state::validate_member_length(member, value, window)
+                    .map_err(|message| bad_request(&message))?;
+            }
+        }
+
         // The patch rule (`PATCH /v2/apis/{ApiId}`): a member the request carries
         // replaces the stored one, and a member it omits leaves the stored value exactly
         // as it was. Nothing here is defaulted — a default belongs to the create, and
