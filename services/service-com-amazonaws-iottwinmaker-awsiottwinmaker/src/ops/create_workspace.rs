@@ -193,12 +193,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The Region this request is signed for picks the store the workspace
+        // is created in, and the Region its ARN carries: this service is
+        // regional, so the same id names an independent workspace in each
+        // Region and the id is only taken in the Region that holds it.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateWorkspaceErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the iottwinmaker store is unavailable".to_string()),
             })
         })?;
         let mut state = state.lock();
+        // Nothing is created in a further Region once this store holds
+        // resources for as many as it may: the Region is the caller's own
+        // credential scope, so without a ceiling a caller could repeat a create
+        // under fresh Region names until the process ran out of memory.
+        if state.region_ceiling_reached(&region) {
+            return Err(CreateWorkspaceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(crate::state::region_ceiling_message()),
+                },
+            )
+            .into());
+        }
+        let state = state.region_mut(&region);
 
         if state.workspaces.contains_key(&input.workspace_id) {
             return Err(CreateWorkspaceErrorModeled::ConflictException(
@@ -225,7 +243,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let region = crate::state::request_region(ctx.parts());
         let arn = crate::state::workspace_arn(&region, &input.workspace_id);
         let now = ::std::time::SystemTime::now();
 

@@ -40,7 +40,7 @@ use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
     UPDATE_REASON_PRICING_TIER_UPDATE,
 };
 
-use crate::harness::Emulator;
+use crate::harness::{Emulator, REGION};
 
 /// The largest number of names `PricingBundles` admits (`@length(1..10)`), from
 /// the `PricingBundles` list's own constraint.
@@ -347,9 +347,8 @@ async fn the_update_reason_describes_the_change() {
             // A change accepted but not yet in force can only be put in the
             // store directly: nothing in this emulator defers one.
             let state = emulator.state();
-            state.lock().pending_pricing_plan = Some(PricingPlanRecord::default_plan(
-                SystemTime::now(),
-            ));
+            state.lock().region_mut(REGION).pending_pricing_plan =
+                Some(PricingPlanRecord::default_plan(SystemTime::now()));
         }
 
         let bundles: Vec<String> = row.bundles.iter().map(|b| (*b).to_string()).collect();

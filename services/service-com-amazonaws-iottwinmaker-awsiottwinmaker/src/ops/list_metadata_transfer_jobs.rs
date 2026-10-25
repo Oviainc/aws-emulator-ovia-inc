@@ -175,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Every call is recorded, successful or refused: the real service logs
         // control-plane access, and a page served is a read of tenant state. The
@@ -189,6 +189,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             destination_type = ?input.destination_type,
             "serving a request"
         );
+        // The Region this request is signed for picks the store that answers
+        // it: a job created through another Region's endpoint is not in it.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListMetadataTransferJobsErrorModeled::InternalServerException(
                 InternalServerException {
@@ -197,6 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let mut state = state.lock();
+        let state = state.region_mut(&region);
 
         // The outcome is recorded where the refusal is BUILT, so one record
         // covers every refusal this handler owns and says which one it was.

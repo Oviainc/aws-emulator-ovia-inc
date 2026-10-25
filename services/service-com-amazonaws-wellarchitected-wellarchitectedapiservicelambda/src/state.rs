@@ -26,7 +26,10 @@
 //! `ProfileArn` the create minted, and the association of one with a workload
 //! (`AssociateProfiles`, `DisassociateProfiles`) is held on the workload the association is
 //! OF, pinned at the profile version the workload is reviewed against — the version
-//! `UpgradeProfileVersion` moves to the one that profile is at. The agent profiles
+//! `UpgradeProfileVersion` moves to the one that profile is at. The shares of a profile
+//! (`CreateProfileShare`, `ListProfileShares`) are held like a workload's, keyed by the
+//! `ProfileArn` they share then by the share's own `ShareId`, and each raises the
+//! invitation `ListShareInvitations` reports to the principal it was offered to. The agent profiles
 //! (`CreateAgentProfile`, `GetAgentProfile`, `ListAgentProfiles`) and the optimization
 //! goals recorded against one (`CreateAgentGoal`, `GetAgentGoal`, `UpdateAgentGoal`,
 //! `DeleteAgentGoal`) are backed the same way,
@@ -87,9 +90,10 @@ use crate::ops::types::{
     AgentProfileSummary, AgentRecommendationGenerationSummary, AgentRecommendationSummary,
     AggregationConfiguration, Choice, ChoiceAnswer, ConflictException, ContextContent,
     ContextSummary, GoalSummary, JiraSelectedQuestionConfiguration, LensReview, LensSummary,
-    Milestone, MilestoneSummary, PillarReviewSummary, Profile, ProfileQuestion, ProfileSummary,
-    Progress, ResourceNotFoundException, ReviewTemplate, ReviewTemplateAnswer,
-    ReviewTemplateLensReview, ReviewTemplatePillarReviewSummary, ReviewTemplateSummary, Scope,
+    Milestone, MilestoneSummary, PillarReviewSummary, Profile, ProfileQuestion,
+    ProfileShareSummary, ProfileSummary, Progress, ResourceNotFoundException, ReviewTemplate,
+    ReviewTemplateAnswer, ReviewTemplateLensReview, ReviewTemplatePillarReviewSummary,
+    ReviewTemplateSummary, Scope,
     ShareInvitation, ShareInvitationSummary, Tag, Workload, WorkloadDiscoveryConfig,
     WorkloadJiraConfigurationInput, WorkloadJiraConfigurationOutput, WorkloadShare,
     WorkloadShareSummary, WorkloadSummary, APPLICATION_TYPE_VALUES, CONTEXT_TYPE_VALUES,
@@ -878,6 +882,13 @@ pub const WORKLOAD_SHARE_RESOURCE_TYPE: &str = "WORKLOAD_SHARE";
 /// KIND, so the two are spelled apart for the same reason.
 pub const LENS_SHARE_RESOURCE_TYPE: &str = "LENS_SHARE";
 
+/// `ConflictException$ResourceType` for a share of a PROFILE — the counterpart of
+/// [`WORKLOAD_SHARE_RESOURCE_TYPE`] for the Well-Architected Tool profile. The share is
+/// a resource of its own (its own `ShareId`), while [`PROFILE_RESOURCE_TYPE`] is the
+/// `ShareResourceType` member naming the shared resource KIND, so the two are spelled
+/// apart for the same reason.
+pub const PROFILE_SHARE_RESOURCE_TYPE: &str = "PROFILE_SHARE";
+
 /// `ConflictException$ResourceType` / `ResourceNotFoundException$ResourceType` for a
 /// share invitation. The invitation is a resource of its own — it has its own
 /// `ShareInvitationId`, which `UpdateShareInvitation` resolves it by — so it is named
@@ -956,6 +967,16 @@ pub const MAX_SHARES_PER_WORKLOAD: usize = 1_000;
 /// rather than a value read off a doc page. It bounds the lens-share map's growth — one
 /// share per principal per lens, and every create token is 1:1 with a live share.
 pub const MAX_SHARES_PER_LENS: usize = 1_000;
+
+/// The most shares one Well-Architected Tool profile holds in this emulator.
+///
+/// The same reasoning as [`MAX_SHARES_PER_WORKLOAD`], for the profile:
+/// `CreateProfileShare` models `ServiceQuotaExceededException` (HTTP 402, "The user has
+/// reached their resource quota") for the metered case and the real quota is adjustable
+/// through Service Quotas, so the number is this emulator's own ceiling rather than a
+/// value read off a doc page. It bounds the profile-share map's growth — one share per
+/// principal per profile, and every create token is 1:1 with a live share.
+pub const MAX_SHARES_PER_PROFILE: usize = 1_000;
 
 /// `ResourceNotFoundException$ResourceType` for the review of one lens in one workload
 /// — the resource `ListAnswers` and the other per-lens reads resolve. The modelled
@@ -3749,6 +3770,90 @@ pub struct CreateLensShareToken {
     pub fingerprint: String,
 }
 
+/// One stored share of a Well-Architected Tool PROFILE: the principal the profile was
+/// shared WITH and where the share stands.
+///
+/// The profile counterpart of [`WorkloadShareRecord`], and recorded for the same reasons:
+/// a share is its own resource identified by its `ShareId`, it belongs to the profile it
+/// shares, and `shared_by` is that profile's owning account — the principal that did the
+/// sharing, which `ShareInvitationSummary$SharedBy` reports. A profile share carries NO
+/// permission: `CreateProfileShare` takes none (`smithy_query(query="operation",
+/// operation="CreateProfileShare")` publishes only `ProfileArn`, `SharedWith` and
+/// `ClientRequestToken`), so a profile invitation reports none either.
+///
+/// `share_invitation_id` is the id of the invitation the recipient has to answer. It is
+/// 1:1 with the share and exists from the moment the share is created, but it is a
+/// resource of its OWN, named by its own `ShareInvitationId`, so it is minted and
+/// recorded beside the `ShareId`.
+///
+/// The profile's NAME is not held here: the profile owns it and `UpdateProfile` can
+/// change it, so an invitation reads it off the profile record at projection time rather
+/// than from a copy that could go stale.
+#[derive(Debug, Clone)]
+pub struct ProfileShareRecord {
+    pub share_id: String,
+    pub share_invitation_id: String,
+    /// The `ProfileArn` the share belongs to — the key of [`ProfileRecord`] in the store.
+    pub profile_arn: String,
+    pub shared_by: String,
+    pub shared_with: String,
+    pub status: String,
+    pub status_message: Option<String>,
+}
+
+impl ProfileShareRecord {
+    /// The `ProfileShareSummary` projection `ListProfileShares` pages over.
+    ///
+    /// `ProfileShareSummary` declares exactly `ShareId`, `SharedWith`, `Status` and
+    /// `StatusMessage` (`smithy_query(query="shape", shape="ProfileShareSummary")`) — no
+    /// permission, because a profile share grants none.
+    pub fn to_summary(&self) -> ProfileShareSummary {
+        ProfileShareSummary {
+            share_id: Some(self.share_id.clone()),
+            shared_with: Some(self.shared_with.clone()),
+            status: Some(self.status.clone()),
+            // "Profile share invitation status message"
+            // (`ProfileShareSummary$StatusMessage` doc): a share that is simply waiting on
+            // its invitation has nothing to add to its status.
+            status_message: self.status_message.clone(),
+        }
+    }
+
+    /// The `ShareInvitationSummary` projection `ListShareInvitations` pages over: this
+    /// share seen as the invitation its recipient was offered.
+    ///
+    /// `profile_name` is the name of the profile the share shares, read off the profile
+    /// record by the caller rather than off the share; it is `None` for a profile this
+    /// store no longer holds. Only the members of the shared resource KIND are filled, and
+    /// a profile share grants no permission, so `PermissionType` is left off too.
+    pub fn to_invitation_summary(&self, profile_name: Option<&str>) -> ShareInvitationSummary {
+        ShareInvitationSummary {
+            share_invitation_id: Some(self.share_invitation_id.clone()),
+            shared_by: Some(self.shared_by.clone()),
+            shared_with: Some(self.shared_with.clone()),
+            permission_type: None,
+            share_resource_type: Some(PROFILE_RESOURCE_TYPE.to_string()),
+            workload_name: None,
+            workload_id: None,
+            lens_name: None,
+            lens_arn: None,
+            profile_name: profile_name.map(ToString::to_string),
+            profile_arn: Some(self.profile_arn.clone()),
+            template_name: None,
+            template_arn: None,
+        }
+    }
+}
+
+/// What a `CreateProfileShare` idempotency token resolves to: the share the original
+/// request created, plus that request's parameter fingerprint.
+#[derive(Debug, Clone)]
+pub struct CreateProfileShareToken {
+    pub profile_arn: String,
+    pub share_id: String,
+    pub fingerprint: String,
+}
+
 /// What a `CreateReviewTemplate` idempotency token resolves to: the review template the
 /// original request created, plus that request's parameter fingerprint.
 #[derive(Debug, Clone)]
@@ -3847,9 +3952,11 @@ impl ProfileRecord {
             owner: Some(self.owner.clone()),
             created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
             updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
-            // "The ID assigned to the share invitation": only a profile reached through a
-            // share invitation carries one, and profile shares are still stubs with their
-            // own issues, so a profile this account owns carries none.
+            // "The ID assigned to the share invitation": only a profile reached THROUGH a
+            // share invitation carries one. An invitation is offered to the principal a
+            // profile was shared with, and this emulator attributes every request to the
+            // one account that owns the profiles it holds, so a profile read here is never
+            // reached through one.
             share_invitation_id: None,
             // The tag map the profile carries, empty when it carries none: the
             // `@length(min: 1)` on `TagMap` constrains the tags a REQUEST supplies, not
@@ -4786,6 +4893,14 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// performed. Caller input keys it, so it is a BOUNDED [`TokenLedger`]: write it
     /// through [`TokenLedger::remember`].
     pub upgrade_profile_version_tokens: TokenLedger<UpgradeProfileVersionToken>,
+    /// Every share recorded against a Well-Architected Tool profile, keyed by that
+    /// profile's `ProfileArn` then by `ShareId`. A `BTreeMap` because `ShareId` order is
+    /// the stable order `ListProfileShares` pages over, exactly as
+    /// [`Self::workload_shares`] is ordered.
+    pub profile_shares: HashMap<String, BTreeMap<String, ProfileShareRecord>>,
+    /// `CreateProfileShare`'s `ClientRequestToken` -> what the original request created.
+    /// Caller input keys it, so it is a BOUNDED [`TokenLedger`].
+    pub create_profile_share_tokens: TokenLedger<CreateProfileShareToken>,
     /// Every stored custom lens, keyed by its 32-lowercase-hex lens id — the resource
     /// part of its ARN, which is how a `LensAlias` names it.
     pub lenses: HashMap<String, LensRecord>,
@@ -4924,6 +5039,10 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
                 .lens_shares
                 .values()
                 .any(|shares| shares.contains_key(share_id))
+            || self
+                .profile_shares
+                .values()
+                .any(|shares| shares.contains_key(share_id))
     }
 
     /// A fresh `ShareInvitationId`: 32 lowercase hex characters, as `^[0-9a-f]{32}$`
@@ -4943,6 +5062,11 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
                     .any(|share| share.share_invitation_id == id)
                 || self
                     .lens_shares
+                    .values()
+                    .flat_map(BTreeMap::values)
+                    .any(|share| share.share_invitation_id == id)
+                || self
+                    .profile_shares
                     .values()
                     .flat_map(BTreeMap::values)
                     .any(|share| share.share_invitation_id == id);
@@ -5931,9 +6055,9 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// answered it. `ShareInvitationId` order is the stable order the pages are cut on,
     /// which is why the enumeration sorts here rather than at the caller.
     ///
-    /// Workload and LENS invitations can exist in this emulator: a profile or
-    /// review-template share has no store yet because `CreateProfileShare` and
-    /// `CreateTemplateShare` are still stubs with their own issues.
+    /// Workload, LENS and PROFILE invitations can exist in this emulator: a
+    /// review-template share has no store yet because `CreateTemplateShare` is still a
+    /// stub with its own issue.
     pub fn pending_share_invitations_for(&self, principal: &str) -> Vec<ShareInvitationSummary> {
         let mut invitations: Vec<ShareInvitationSummary> = self
             .workload_shares
@@ -5970,6 +6094,25 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
                         .and_then(|lens| lens.summary_content(now))
                         .map(|content| content.definition.name.as_str());
                     share.to_invitation_summary(lens_name)
+                }),
+        );
+        // A profile share raises an invitation of its own kind, reported through the same
+        // enumeration for the same reason.
+        invitations.extend(
+            self.profile_shares
+                .values()
+                .flat_map(|shares| shares.values())
+                .filter(|share| {
+                    share.shared_with == principal && share.status == DEFAULT_SHARE_STATUS
+                })
+                .map(|share| {
+                    // The profile's NAME is the profile's own, which `UpdateProfile` can
+                    // change, so it is read here rather than copied onto the share.
+                    let profile_name = self
+                        .profiles
+                        .get(&share.profile_arn)
+                        .map(|profile| profile.profile_name.as_str());
+                    share.to_invitation_summary(profile_name)
                 }),
         );
         invitations.sort_by(|left, right| {
@@ -6021,6 +6164,38 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
             .find(|share| share.shared_with == shared_with)
     }
 
+    /// Every share recorded against the profile `profile_arn`, in `ShareId` order — the
+    /// profile counterpart of [`Self::workload_shares_of`].
+    pub fn profile_shares_of(&self, profile_arn: &str) -> Vec<&ProfileShareRecord> {
+        self.profile_shares
+            .get(profile_arn)
+            .map(|shares| shares.values().collect())
+            .unwrap_or_default()
+    }
+
+    /// The share `share_id` of the profile `profile_arn`, if the profile holds it.
+    pub fn profile_share(
+        &self,
+        profile_arn: &str,
+        share_id: &str,
+    ) -> Option<&ProfileShareRecord> {
+        self.profile_shares.get(profile_arn)?.get(share_id)
+    }
+
+    /// The share of the profile `profile_arn` the principal `shared_with` already holds,
+    /// if it holds one: a principal holds at most one share of one profile, so this is
+    /// what a second share request for the same principal collides with.
+    pub fn profile_share_with(
+        &self,
+        profile_arn: &str,
+        shared_with: &str,
+    ) -> Option<&ProfileShareRecord> {
+        self.profile_shares
+            .get(profile_arn)?
+            .values()
+            .find(|share| share.shared_with == shared_with)
+    }
+
     /// Drop one share of a lens and everything keyed to it: the create token that
     /// resolved to it — so the next request carrying that token shares afresh rather than
     /// replaying a share that is gone — and the lens's share map once its last share is
@@ -6029,10 +6204,10 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// `None` when the lens holds no such share, which is what tells a delete that the
     /// share it was asked to remove does not exist.
     ///
-    /// This is the first share removal in this store; a workload share is removed the
-    /// same way — drop the record, forget the create token that resolved to it, prune the
-    /// resource's map once it is empty — so whichever operation needs that next should
-    /// generalise this one over the two share maps rather than write a second copy.
+    /// This is the first share removal in this store; a workload or PROFILE share is
+    /// removed the same way — drop the record, forget the create token that resolved to
+    /// it, prune the resource's map once it is empty — so whichever operation needs that
+    /// next should generalise this one over the share maps rather than write a second copy.
     pub fn remove_lens_share(&mut self, lens_id: &str, share_id: &str) -> Option<LensShareRecord> {
         let shares = self.lens_shares.get_mut(lens_id)?;
         let record = shares.remove(share_id)?;
@@ -7485,6 +7660,22 @@ pub fn lens_share_conflict(existing: &LensShareRecord) -> ConflictException {
         &format!(
             "The lens with ARN {} is already shared with {}.",
             existing.lens_arn, existing.shared_with
+        ),
+    )
+}
+
+/// [`conflict`] for a principal a PROFILE is already shared with — the profile
+/// counterpart of [`workload_share_conflict`], for the same reason: a share is the grant
+/// of access to one profile to one principal, so the principal already holding one is
+/// what a second share request for it collides with. `existing` is the share that is in
+/// the way, which `resource_id` names so the caller can delete it.
+pub fn profile_share_conflict(existing: &ProfileShareRecord) -> ConflictException {
+    conflict(
+        PROFILE_SHARE_RESOURCE_TYPE,
+        existing.share_id.clone(),
+        &format!(
+            "The profile with ARN {} is already shared with {}.",
+            existing.profile_arn, existing.shared_with
         ),
     )
 }

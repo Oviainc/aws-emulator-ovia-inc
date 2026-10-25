@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 
-use crate::emulator::{available_bandwidths, placements, text, Emulator};
+use crate::emulator::{available_bandwidths, placements, remote_account_for, text, Emulator};
 
 /// The states a connection being brought up walks, in order, as
 /// `smithy_query(query="doc",shape="Connection",member="state")` documents them:
@@ -43,8 +43,17 @@ fn position(state: &str) -> Option<usize> {
     PROGRESSION.iter().position(|known| *known == state)
 }
 
-/// Create a connection whose request carries ONLY the members the model marks
-/// required, so a row can differ in whether the optional ones are present.
+/// The gateways the rows below attach to: an attach point IS a Direct Connect gateway
+/// of the account, so the suite creates its own and the rows differ in which one they
+/// use, in each gateway's name and in its `amazonSideAsn`.
+const GATEWAY_ROWS: [(&str, Option<i64>); 2] = [
+    ("ic-progression-a", None),
+    ("ic-progression-b", Some(64_512)),
+];
+
+/// Create a connection whose request carries only the members the model marks
+/// required, plus the identifying information the named Environment itself asks for —
+/// so a row can differ in whether the OPTIONAL ones are present.
 async fn create_minimal(
     emulator: &Emulator,
     environment_id: &str,
@@ -58,6 +67,9 @@ async fn create_minimal(
         "attachPoint".to_string(),
         json!({ "directConnectGateway": attach_point }),
     );
+    if let Some(remote_account) = remote_account_for(&emulator.environment(environment_id).await) {
+        request.insert("remoteAccount".to_string(), remote_account);
+    }
     let created = emulator
         .ic_ok("CreateConnection", Value::Object(request))
         .await;
@@ -117,6 +129,7 @@ async fn walk_until_available(emulator: &Emulator, identifier: &str, case: &str)
 async fn a_created_connection_walks_the_documented_progression_to_available() {
     let emulator = Emulator::new();
     let placements = placements(&emulator).await;
+    let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
 
     // Rows differ in the environment (and so the provider kind, the location and the
     // `ConnectionId` prefix), in the bandwidth, in the attach point, and in whether
@@ -125,7 +138,7 @@ async fn a_created_connection_walks_the_documented_progression_to_available() {
     let mut rows = 0usize;
     let mut rows_that_saw_pending: Vec<String> = Vec::new();
     for (seed, (environment_id, bandwidth)) in placements.iter().enumerate() {
-        let attach_point = format!("aaaaaaaa-bbbb-4ccc-8ddd-{seed:012}");
+        let attach_point = gateways[seed % gateways.len()].clone();
         for shape in ["every optional member", "required members only"] {
             let case = format!("{environment_id} / {bandwidth} / {shape}");
             let connection = if shape == "required members only" {
@@ -187,6 +200,7 @@ async fn a_created_connection_walks_the_documented_progression_to_available() {
 async fn the_progression_completes_with_nobody_polling_and_stops_at_available() {
     let emulator = Emulator::new();
     let placements = placements(&emulator).await;
+    let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
 
     // Created first, read only after the whole progression was due: no call in
     // between could have advanced anything.
@@ -196,7 +210,7 @@ async fn the_progression_completes_with_nobody_polling_and_stops_at_available() 
             .create_connection(
                 environment_id,
                 bandwidth,
-                &format!("bbbbbbbb-cccc-4ddd-8eee-{seed:012}"),
+                &gateways[seed % gateways.len()],
                 "settles with nobody polling",
             )
             .await;
@@ -278,7 +292,7 @@ async fn the_progression_completes_with_nobody_polling_and_stops_at_available() 
 async fn an_available_connection_can_be_updated_and_settles_back_to_available() {
     let emulator = Emulator::new();
     let catalog = emulator.environments().await;
-
+    let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
     // Rows differ in the environment and in the pair of bandwidths the change moves
     // between; only an environment offering two available bandwidths can have one
     // changed.
@@ -296,7 +310,7 @@ async fn an_available_connection_can_be_updated_and_settles_back_to_available() 
             .create_connection(
                 &environment_id,
                 &bandwidths[0],
-                &format!("cccccccc-dddd-4eee-8fff-{seed:012}"),
+                &gateways[seed % gateways.len()],
                 "updated once available",
             )
             .await;
