@@ -268,3 +268,9 @@ mod gateway_capability_configuration;
 #[path = "all/project_lifecycle.rs"]
 mod project_lifecycle;
 
+// Declared last, for the same reason the suites above it are: both stretches
+// higher up are where every concurrent iotsitewise change inserts a declaration
+// of its own. Fold it into the sorted list once the churn settles.
+#[path = "all/describe_application_reports.rs"]
+mod describe_application_reports;
+

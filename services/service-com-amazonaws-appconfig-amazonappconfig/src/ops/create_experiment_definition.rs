@@ -369,6 +369,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // updated when it was created.
             updated_at: now,
             tags: input.tags.unwrap_or_default(),
+            // Nothing has been started from this definition yet, and AppConfig numbers a
+            // definition's runs from 1, so the first start issues run 1.
+            runs: std::collections::BTreeMap::new(),
+            next_run_number: 1,
         };
 
         let Some(application) = store.applications.get_mut(&application_id) else {

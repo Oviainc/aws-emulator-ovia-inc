@@ -10,8 +10,11 @@
 //! session, in join order, the ones that have since left included. A participant
 //! reaches a stage through the stage's DATA plane — it joins over WebRTC with its
 //! participant token, or publishes to the WHIP/RTMP endpoints `CreateStage`
-//! advertises — so `crate::state::join_stage_session` is what records one, and this
-//! operation answers from those records alone.
+//! advertises — so `crate::state::join_stage_session` is what records one (a
+//! replication starting is what records the publisher and its replica,
+//! `crate::state::record_replicated_participant`), and this operation answers from
+//! those records alone. What each one reports about replication is read off the
+//! replications the store holds (`crate::state::session_participant_replications`).
 //!
 //! Three things it does beyond reading them, each stated once in
 //! [`ListParticipants::handle`]: it refuses a request carrying more than one of the
@@ -259,6 +262,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .max(1);
 
         let store = state.lock();
+        // What the participants of this session report about replication, read off the
+        // replications this store holds in ONE walk for the whole session rather than once
+        // per participant of the page.
+        let replications = crate::state::session_participant_replications(
+            &store,
+            &input.stage_arn,
+            &input.session_id,
+        );
         // Join order, so a participant joining or leaving mid-pagination cannot shift
         // a later page onto an already-returned one. A pair this store holds no
         // session for selects nothing: see the module note.
@@ -270,10 +281,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|record| selected_by_filters(&input, record))
             .filter(|record| resume_after.is_none_or(|after| record.sequence > after))
             .collect();
+        // A participant no replication names reports the modelled default, which is what
+        // this store holding no entry for it says.
+        let no_replication = crate::state::ParticipantReplication::default();
         let participants: Vec<ParticipantSummary> = matching
             .iter()
             .take(page_size)
-            .map(|record| record.to_summary())
+            .map(|record| {
+                record.to_summary(
+                    replications
+                        .get(&record.participant_id)
+                        .unwrap_or(&no_replication),
+                )
+            })
             .collect();
         // A token only when a participant is left over, and it names the position this
         // page ended at: the last page carries none.

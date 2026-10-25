@@ -84,12 +84,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-sts-awssecuritytokenser
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `GetAccessKeyInfoError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.sts#GetAccessKeyInfo")]
+// here — hence the `GetAccessKeyInfoError` alias below.
+// `GetAccessKeyInfo` lists no errors at all, so `ExpiredTokenException` — a shape this
+// SERVICE models, with its own 400 status and awsQuery code — is widened in: a request
+// that presents an expired session credential is refused with the service's own
+// expired-token error, the same way every other operation here refuses one.
+#[smithy_macros::operation_error(
+    "com.amazonaws.sts#GetAccessKeyInfo",
+    extra_errors = ["ExpiredTokenException"]
+)]
 #[derive(Debug)]
 pub enum GetAccessKeyInfoErrorModeled {
+    ExpiredTokenException(ExpiredTokenException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -143,7 +149,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        use crate::state::{caller_may_call, long_term_identity};
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // This service has no store on the engine it was mounted on, so it cannot
             // serve anything. The router builds the one engine that does, so this is
@@ -153,15 +160,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+        let long_term = {
+            let iam = crate::state::iam_state(&*self.engine);
+            match iam.as_ref() {
+                Some(iam) => long_term_identity(Some(&iam.lock()), &caller_akid),
+                None => long_term_identity(None, &caller_akid),
+            }
+        };
+
         // A pure read: the account of the session this key was minted for. An expired
         // session still belongs to the account it was minted in, so expiry does not
-        // change the answer.
-        let recorded = state
-            .lock()
+        // change the answer — but the CALLER's own credential still has to be one that
+        // may make this call, so it is resolved first and an expired one is refused
+        // rather than answered, exactly as every other operation here refuses one.
+        let mut registry = state.lock();
+        let caller = crate::state::resolve_request_caller(
+            &mut registry,
+            &caller_akid,
+            ::std::time::SystemTime::now(),
+            ctx.credential_store(),
+            long_term,
+        )
+        .map_err(|expired| {
+            GetAccessKeyInfoErrorModeled::ExpiredTokenException(ExpiredTokenException {
+                message: Some(expired.message()),
+            })
+        })?;
+        // Which STS operations a temporary credential may call is documented per kind;
+        // see `caller_may_call`.
+        if !caller_may_call(caller.kind, Self::NAME) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                crate::state::session_credentials_message(Self::NAME),
+            ));
+        }
+
+        let recorded = registry
             .session(&input.access_key_id)
             .map(|session| session.identity.account.clone());
-        let account =
-            recorded.unwrap_or_else(|| ::engine::emulator_account_id().to_string());
+        let account = recorded.unwrap_or_else(|| ::engine::emulator_account_id().to_string());
 
         Ok(GetAccessKeyInfoOutput {
             account: Some(account),

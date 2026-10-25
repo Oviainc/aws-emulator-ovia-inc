@@ -23,6 +23,8 @@ mod error_classification;
 mod error_envelope;
 #[path = "all/health_check_listing.rs"]
 mod health_check_listing;
+#[path = "all/health_check_updates.rs"]
+mod health_check_updates;
 #[path = "all/health_checks.rs"]
 mod health_checks;
 #[path = "all/hosted_zone_config.rs"]

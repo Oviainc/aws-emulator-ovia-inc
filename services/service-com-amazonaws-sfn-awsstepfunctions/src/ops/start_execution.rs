@@ -368,6 +368,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state_machine_arn: machine_arn.clone(),
             state_machine_name: machine_name.clone(),
             role_arn: role_arn.clone(),
+            // This is the attempt a START began, so the execution has been redriven
+            // no times: the count the record is admitted with below.
+            redrive_count: 0,
         };
         // The walk is CPU work a caller's definition sizes, so it runs on a blocking
         // thread rather than on an async worker: an interpretation that reaches its
@@ -420,6 +423,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             redrive_tokens: Vec::new(),
             history: planned.opening,
             pending: planned.pending,
+            // No attempt has stopped at a step of this execution yet.
+            redrive_step: None,
             // Measured and counted by `insert_execution`.
             retained_bytes: 0,
         };

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBackup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBackup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBackup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: catalogues ONE on-demand backup of a stored table — "a time marker of
+//! the request is cataloged, and the backup is created asynchronously" (the doc below) —
+//! minting its `BackupArn`, recording the source table as it stands at that instant, and
+//! reporting the `BackupDetails` of the record it wrote. The backup is `CREATING` until
+//! the clock makes it `AVAILABLE`, which is what `ListBackups`, `DescribeBackup` and
+//! `DeleteBackup` then read.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +174,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBackup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBackupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBackup"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        // "You can also provide the Amazon Resource Name (ARN) of the table in this
+        // parameter" (`CreateBackup$TableName`), so either form names the table.
+        let name = crate::state::resolve_table_name(&input.table_name)
+            .map_err(|error| lift(&input.table_name, error))?;
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+        let table = store
+            .table(&region, &name)
+            .map_err(|error| lift(&name, error))?;
+        // "A target table with the specified name is either being created or deleted"
+        // (`TableInUseException`): there is no settled table to catalogue yet, or no
+        // longer one. A table being UPDATED is a table, and is backed up.
+        if matches!(
+            table.status(now),
+            crate::state::TableStatus::Creating | crate::state::TableStatus::Deleting
+        ) {
+            return Err(CreateBackupErrorModeled::TableInUseException(
+                TableInUseException {
+                    message: Some(format!("Table is being created or deleted: {name}")),
+                },
+            )
+            .into());
+        }
+        // Everything this backup reports is read off the table HERE, at the instant of
+        // the request, so the record stands on its own once the table moves on.
+        let backup = crate::state::Backup::taken_from(table, &input.backup_name, now);
+
+        // The catalogue is budgeted like every other growth site in this store.
+        if store.backup_count_in(&region) >= crate::state::MAX_BACKUPS_PER_REGION {
+            return Err(CreateBackupErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(
+                        "Backup limit exceeded for this account and Region".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let details = backup.details(backup.status(now));
+        let backup_arn = details.backup_arn.clone();
+        let backup_status = details.backup_status.clone();
+        store.insert_backup(backup);
+        // The audit record for a state-changing call: who asked, what was catalogued and
+        // that it succeeded. Never a credential — only the access key id the caller
+        // presented.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            table_name = %name,
+            backup_arn = %backup_arn,
+            backup_status = %backup_status,
+            "backup created"
+        );
+        Ok(CreateBackupOutput {
+            backup_details: Some(details),
+        })
+    }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> CreateBackupError {
+    CreateBackupErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel.
+///
+/// A table this operation cannot find is reported as `TableNotFoundException` — "A source
+/// table with the name TableName does not currently exist within the subscriber's account
+/// or the subscriber is operating in the wrong Amazon Web Services Region" — which is the
+/// miss this operation models, rather than the control plane's
+/// `ResourceNotFoundException`, which it does not. The message is built from the request:
+/// the table it asked for.
+fn lift(table_name: &str, error: crate::state::RequestError) -> CreateBackupError {
+    match error {
+        crate::state::RequestError::NotFound(_) => {
+            CreateBackupErrorModeled::TableNotFoundException(TableNotFoundException {
+                message: Some(format!("Table not found: {table_name}")),
+            })
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
     }
 }

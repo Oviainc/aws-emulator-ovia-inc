@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Assigns tags to the CloudWatch resource `ResourceARN` names. Implemented here, and the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The tags are written onto the ONE tag set that resource already carries in
+//! [`crate::state`] — the set its writer created it with and `ListTagsForResource` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +157,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // The tags are written onto the resource the ARN names; nothing else about it
+        // changes, and `ctx` carries nothing this operation needs.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch resource store is unavailable".into()),
+            })
+        })?;
+
+        // `ResourceARN`'s 1..1024 length and every tag's key and value length are modelled
+        // constraints the boundary validator has already refused, so reaching here leaves
+        // only the ARN's FORM open.
+        let resource = taggable_resource(&input.resource_arn)?;
+        // `Tags` carries no modelled length, so the request's own tag count is refused HERE,
+        // before anything is read, cloned or merged: a resource may carry at most
+        // `MAX_TAGS_PER_RESOURCE` tags, so a longer list could never be stored anyway, and
+        // refusing it first keeps the work this call does bounded by that cap rather than by
+        // the length of the request. `PutInsightRule` and `PutMetricStream` refuse their own
+        // `Tags` the same way.
+        validate_tag_count(&input.tags)?;
+
+        let mut store = state.lock();
+        let held = store
+            .resource_tags_mut(&resource)
+            .ok_or_else(|| unknown_resource(&input.resource_arn, &resource))?;
+
+        // Merged into a copy first, so a request that would take the resource past the tags
+        // it may carry is refused having changed nothing. Both lists are at most
+        // `MAX_TAGS_PER_RESOURCE` long by the refusal above, so the merge is bounded whatever
+        // the request asked for.
+        let mut merged = held.clone();
+        crate::state::merge_tags(&mut merged, &input.tags);
+        if let Some(message) = crate::state::tag_count_error("CloudWatch resource", Some(&merged)) {
+            return Err(invalid_parameter_value(message));
+        }
+        *held = merged;
+
+        Ok(TagResourceOutput {})
     }
+}
+
+/// Refuse the request with this operation's modelled `InvalidParameterValueException`
+/// (HTTP 400): "The value of an input parameter is bad or out-of-range."
+fn invalid_parameter_value(message: String) -> TagResourceError {
+    TagResourceErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The resource `arn` names, refused as a bad parameter value when it is not the ARN of a
+/// resource this service tags. The rule lives in `crate::state`, so this operation,
+/// `ListTagsForResource` and `UntagResource` resolve an ARN by one rule.
+fn taggable_resource(arn: &str) -> Result<crate::state::TaggableResource<'_>, TagResourceError> {
+    crate::state::taggable_resource(arn).map_err(invalid_parameter_value)
+}
+
+/// Refuse a request naming more tags than one resource may carry: "You can associate as many
+/// as 50 tags with a CloudWatch resource." (`TagResource`) — the bound and its sentence live
+/// in `crate::state`, so every operation that accepts tags refuses an over-tagged resource by
+/// one rule.
+fn validate_tag_count(tags: &[Tag]) -> Result<(), TagResourceError> {
+    match crate::state::tag_count_error("CloudWatch resource", Some(tags)) {
+        None => Ok(()),
+        Some(message) => Err(invalid_parameter_value(message)),
+    }
+}
+
+/// Report an ARN this store holds no resource for through this operation's modelled
+/// `ResourceNotFoundException` (HTTP 404): "The named resource does not exist."
+fn unknown_resource(arn: &str, resource: &crate::state::TaggableResource<'_>) -> TagResourceError {
+    TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        resource_type: Some(resource.kind.resource_type().to_string()),
+        resource_id: Some(arn.to_string()),
+        message: Some(crate::state::unknown_resource_message(arn)),
+    })
+    .into()
 }

@@ -27,3 +27,5 @@ mod state_roundtrip;
 mod support;
 #[path = "all/unresolved_resource_arns.rs"]
 mod unresolved_resource_arns;
+#[path = "all/unused_personalization_input.rs"]
+mod unused_personalization_input;

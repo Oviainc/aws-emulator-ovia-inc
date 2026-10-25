@@ -95,6 +95,9 @@ mod lens_review_notes;
 #[path = "all/lens_review_rollup.rs"]
 mod lens_review_rollup;
 
+#[path = "all/lens_share_deletion.rs"]
+mod lens_share_deletion;
+
 #[path = "all/lens_shares.rs"]
 mod lens_shares;
 

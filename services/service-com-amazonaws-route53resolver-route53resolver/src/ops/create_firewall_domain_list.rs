@@ -184,6 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        let now = ::std::time::Instant::now();
         let mut store = state.lock();
 
         // `CreatorRequestId` is "a unique string that identifies the request and
@@ -196,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             if let Some(record) = store.firewall_domain_lists.get(existing_id) {
                 return Ok(CreateFirewallDomainListOutput {
-                    firewall_domain_list: Some(record.to_domain_list()),
+                    firewall_domain_list: Some(record.to_domain_list(now)),
                 });
             }
         }
@@ -249,9 +250,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.clone().unwrap_or_default(),
             creation_time: timestamp.clone(),
             modification_time: timestamp,
+            // A list created empty has no change in flight, so the clock owes
+            // it no transition: the status it reports is already the settled
+            // one.
+            settled_at: None,
         };
 
-        let domain_list = record.to_domain_list();
+        let domain_list = record.to_domain_list(now);
         store
             .firewall_domain_list_creator_request_ids
             .insert(input.creator_request_id.clone(), id.clone());
