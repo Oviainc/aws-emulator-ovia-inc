@@ -12,18 +12,21 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::str::FromStr;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bigdecimal::BigDecimal;
 
 use crate::ops::types::{
-    AttributeDefinition, AttributeValue, AttributeValueUpdate, BillingModeSummary, Capacity,
+    AttributeDefinition, AttributeValue, AttributeValueUpdate, BackupDescription, BackupDetails,
+    BackupSummary, BillingModeSummary, Capacity,
     ConsumedCapacity, ContinuousBackupsDescription, ExpectedAttributeValue,
-    GlobalSecondaryIndexDescription,
+    GlobalSecondaryIndexDescription, GlobalSecondaryIndexInfo,
     GlobalSecondaryIndexWarmThroughputDescription,
     ItemCollectionMetrics, KeySchemaElement, LocalSecondaryIndexDescription,
+    LocalSecondaryIndexInfo,
     PointInTimeRecoveryDescription, Projection,
-    ProvisionedThroughput, ProvisionedThroughputDescription, StreamSpecification, Tag,
+    ProvisionedThroughput, ProvisionedThroughputDescription, SourceTableDetails,
+    SourceTableFeatureDetails, StreamSpecification, Tag,
     TableClassSummary, TableDescription, TableThroughputModeSummary,
     TableWarmThroughputDescription, WarmThroughput,
 };
@@ -1791,6 +1794,364 @@ impl PointInTimeRecovery {
     }
 }
 
+// =============================================================================
+// ON-DEMAND BACKUPS
+//
+// A backup is a resource of its own: `CreateBackup` catalogues one from a table,
+// `ListBackups` reports the ones a region holds, and `DescribeBackup`/`DeleteBackup`
+// address one by the `BackupArn` minted for it. Everything the four of them report is
+// read from the records below.
+// =============================================================================
+
+/// The `BackupStatus` a backup is in while it is still being taken: "the backup is
+/// created asynchronously" (the `CreateBackup` doc), so a backup is `CREATING` for a
+/// span before it is ready.
+pub const BACKUP_STATUS_CREATING: &str = "CREATING";
+
+/// The `BackupStatus` a backup is in once that span has elapsed and it can be restored
+/// from.
+pub const BACKUP_STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// The `BackupStatus` reported for the backup a `DeleteBackup` has just removed — the
+/// third and last value the model's `BackupStatus` enum declares
+/// ([`crate::ops::types::BACKUP_STATUS_VALUES`]).
+pub const BACKUP_STATUS_DELETED: &str = "DELETED";
+
+/// The `BackupType` of a backup a CALLER asked for: "USER - On-demand backup created by
+/// you" (`ListBackups$BackupType`). Every backup this API catalogues is one.
+pub const BACKUP_TYPE_USER: &str = "USER";
+
+/// The `BackupType` of a backup the service took by itself: "SYSTEM - On-demand backup
+/// automatically created by DynamoDB" (`ListBackups$BackupType`). Nothing here takes a
+/// backup on its own, so no stored backup carries it — it is named only by the filter
+/// rule below.
+pub const BACKUP_TYPE_SYSTEM: &str = "SYSTEM";
+
+/// The `BackupTypeFilter` a list that names none is answered for: "USER - On-demand
+/// backup created by you. (The default setting if no other backup types are specified.)"
+/// (`ListBackups$BackupType`).
+pub const DEFAULT_BACKUP_TYPE_FILTER: &str = "USER";
+
+/// The `BackupTypeFilter` that spans several types at once: "ALL - All types of
+/// on-demand backups (USER and SYSTEM)" (`ListBackups$BackupType`).
+pub const BACKUP_TYPE_FILTER_ALL: &str = "ALL";
+
+/// The most backups this emulator will hold IN ONE REGION.
+///
+/// AWS states no ceiling — "There is no limit to the number of on-demand backups that
+/// can be taken" (the `CreateBackup` doc) — so this one is this emulator's own, and it
+/// is the per-region table quota over again ([`MAX_TABLES`]): a backup is catalogued
+/// from a table, and this keeps the catalogue of one region bounded by the number of
+/// tables that region may hold. Reaching it answers the modelled
+/// `LimitExceededException` rather than growing without end.
+///
+/// It bounds the whole catalogue too: a backup is only ever catalogued from a table of
+/// its own region, and the table store holds at most [`MAX_REGIONS`] regions, so the
+/// records here can never outnumber `MAX_REGIONS * MAX_BACKUPS_PER_REGION`.
+pub const MAX_BACKUPS_PER_REGION: usize = MAX_TABLES;
+
+/// Whether a stored `BackupType` is one a request's `BackupTypeFilter` selects.
+///
+/// One rule for every filter value the model declares: `ALL` spans the on-demand types
+/// this API catalogues, and any other value selects exactly the type it names. A backup
+/// "made with Amazon Web Services Backup" is listed by that service's own API rather
+/// than this one (the `ListBackups` doc), so none is ever stored here to select.
+pub fn backup_type_selected(filter: &str, stored: &str) -> bool {
+    match filter {
+        BACKUP_TYPE_FILTER_ALL => stored == BACKUP_TYPE_USER || stored == BACKUP_TYPE_SYSTEM,
+        named => named == stored,
+    }
+}
+
+/// Whether `instant` falls inside the time range a request named: at or after the lower
+/// bound and strictly before the upper one — "In the request, start time is inclusive,
+/// but end time is exclusive" (the `ListBackups` doc). A bound the request omits bounds
+/// nothing.
+///
+/// Both sides are compared at [`at_timestamp_precision`], the precision a reported
+/// timestamp carries, so a bound a client formed from an instant this service reported
+/// selects exactly what it names rather than landing a fraction either side of it.
+pub fn within_time_range(
+    instant: SystemTime,
+    lower: Option<&::aws_smithy_types::DateTime>,
+    upper: Option<&::aws_smithy_types::DateTime>,
+) -> bool {
+    let instant = epoch_millis(instant);
+    lower.is_none_or(|bound| instant >= wire_millis(bound))
+        && upper.is_none_or(|bound| instant < wire_millis(bound))
+}
+
+/// How precise an instant this service reports and compares is: whole milliseconds, the
+/// precision an AWS timestamp carries on the wire — and the one DynamoDB's own backup
+/// identifier is built from, since a `BackupArn`'s last segment is the epoch millisecond
+/// of the request.
+///
+/// This returns `instant` at that precision, which is what a record stores: the instant
+/// it reports is then exactly the instant a client can send back.
+pub fn at_timestamp_precision(instant: SystemTime) -> SystemTime {
+    match instant.duration_since(UNIX_EPOCH) {
+        Ok(since) => {
+            UNIX_EPOCH
+                + Duration::from_millis(u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
+        }
+        // An instant before the epoch is not one this store mints; it is left as it is
+        // rather than moved.
+        Err(_) => instant,
+    }
+}
+
+/// One stored instant as the figure a comparison orders by: whole milliseconds since the
+/// epoch, negative before it.
+fn epoch_millis(instant: SystemTime) -> i128 {
+    match instant.duration_since(UNIX_EPOCH) {
+        Ok(since) => i128::try_from(since.as_millis()).unwrap_or(i128::MAX),
+        Err(before) => i128::try_from(before.duration().as_millis())
+            .map_or(i128::MIN, |millis| -millis),
+    }
+}
+
+/// The same figure for a timestamp a request carried.
+fn wire_millis(timestamp: &::aws_smithy_types::DateTime) -> i128 {
+    i128::from(timestamp.secs()) * 1_000 + i128::from(timestamp.subsec_nanos() / 1_000_000)
+}
+
+/// A new backup's `BackupArn`:
+/// `arn:aws:dynamodb:<region>:<account>:table/<table>/backup/<millis>-<id>`, built
+/// through the same core ARN helper every other identifier here is minted with
+/// ([`table_arn`]).
+///
+/// The last segment is the instant the backup was requested, in zero-padded epoch
+/// milliseconds, followed by a unique suffix drawn from the `uuid` crate's v4 generator
+/// (OS randomness): the instant alone does not identify a backup, because two calls can
+/// land in the same millisecond. Minted ONCE, at create, and stored on the backup, so
+/// every later read reports the same ARN — and because the fixed-width instant sits
+/// inside it, ascending ARN order IS ascending (table, request instant) order, which is
+/// what the `ExclusiveStartBackupArn` cursor pages through.
+pub fn new_backup_arn(region: &str, table: &str, requested_at: SystemTime) -> String {
+    let millis = requested_at
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    let unique = ::uuid::Uuid::new_v4().simple().to_string();
+    ::engine::emulator_arn(
+        "dynamodb",
+        region,
+        &format!(
+            "table/{table}/backup/{millis:014}-{}",
+            unique.get(..8).unwrap_or(unique.as_str())
+        ),
+    )
+}
+
+/// One stored on-demand backup: what the request asked for, when it was catalogued, and
+/// the snapshot of the source table taken at that instant.
+///
+/// A backup is a RESOURCE OF ITS OWN rather than part of a table: it is addressed by its
+/// own ARN, it outlives the table it was taken from, and every member a backup operation
+/// reports is read from here.
+#[derive(Debug, Clone)]
+pub struct Backup {
+    /// The `BackupArn` minted for this backup at create ([`new_backup_arn`]), which is
+    /// also the key the store holds it under.
+    pub arn: String,
+    /// The `BackupName` the request named.
+    pub name: String,
+    /// The region this backup lives in — the one its source table lives in, which is the
+    /// scope every backup operation resolves inside.
+    pub region: String,
+    pub table_name: String,
+    pub table_id: String,
+    pub table_arn: String,
+    /// `USER` for every backup catalogued through `CreateBackup` ([`BACKUP_TYPE_USER`]).
+    pub backup_type: String,
+    /// The bytes the source table held at the instant of the request, which is what this
+    /// backup holds: "the entire table data is backed up" (the `CreateBackup` doc).
+    pub size_bytes: i64,
+    /// When the backup was requested: "a time marker of the request is cataloged" (the
+    /// `CreateBackup` doc), which is the `BackupCreationDateTime` every read reports and
+    /// the instant `ListBackups`'s time range is measured against ("these boundaries are
+    /// for the time at which the original backup was requested" — the `ListBackups` doc).
+    pub created_at: SystemTime,
+    /// When the clock owes this backup its `CREATING` -> `AVAILABLE` transition, one
+    /// [`STATUS_TRANSITION`] after the request: the backup "is created asynchronously"
+    /// and becomes "available for restore" afterwards (the `CreateBackup` doc). Derived
+    /// from the stored instant on every read, so nothing sleeps and no read writes.
+    pub available_at: SystemTime,
+    /// When this backup expires by itself, for a kind that does: "Time at which the
+    /// automatic on-demand backup created by DynamoDB will expire" — a `SYSTEM` backup's
+    /// own member (`BackupDetails$BackupExpiryDateTime`). A backup a caller asked for
+    /// does not expire, so this is `None` for every backup this API catalogues.
+    pub expires_at: Option<SystemTime>,
+    /// The source table as it stood when the backup was requested.
+    pub source: SourceTableSnapshot,
+}
+
+/// The source table as a backup records it: the configuration and figures
+/// `SourceTableDetails` and `SourceTableFeatureDetails` report for the backup, frozen at
+/// the instant the backup was requested rather than read off the table later — the table
+/// may have moved on, or be gone.
+#[derive(Debug, Clone)]
+pub struct SourceTableSnapshot {
+    pub key_schema: Vec<KeySchemaElement>,
+    pub table_creation_date_time: SystemTime,
+    pub billing_mode: String,
+    /// The capacity the table was provisioned for, as a description reports it: zeroes
+    /// for an on-demand table ([`reported_capacity`]).
+    pub provisioned_throughput: ProvisionedThroughput,
+    pub item_count: i64,
+    pub table_size_bytes: i64,
+    pub global_secondary_indexes: Vec<GlobalSecondaryIndexInfo>,
+    pub local_secondary_indexes: Vec<LocalSecondaryIndexInfo>,
+    /// The table's stream configuration, for a table that had a stream.
+    pub stream_specification: Option<StreamSpecification>,
+}
+
+impl Backup {
+    /// The backup a `CreateBackup` at `now` catalogues from `table`.
+    pub fn taken_from(table: &Table, backup_name: &str, now: SystemTime) -> Self {
+        // The time marker this backup is catalogued under, at the precision it is
+        // reported in, so the instant in its ARN, the instant it reports and the instant
+        // a client can send back as a range bound are all the same one.
+        let created_at = at_timestamp_precision(now);
+        Self {
+            arn: new_backup_arn(&table.region, &table.name, created_at),
+            name: backup_name.to_string(),
+            region: table.region.clone(),
+            table_name: table.name.clone(),
+            table_id: table.id.clone(),
+            table_arn: table.arn.clone(),
+            backup_type: BACKUP_TYPE_USER.to_string(),
+            size_bytes: table.stored_bytes,
+            created_at,
+            available_at: now + STATUS_TRANSITION,
+            expires_at: None,
+            source: table.backup_snapshot(),
+        }
+    }
+
+    /// The status at `now`, derived from the stored instants.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now < self.available_at {
+            BACKUP_STATUS_CREATING
+        } else {
+            BACKUP_STATUS_AVAILABLE
+        }
+    }
+
+    /// Whether the clock still owes this backup its `CREATING` -> `AVAILABLE`
+    /// transition, which is what a conflicting backup operation on the table is.
+    pub fn still_creating(&self, now: SystemTime) -> bool {
+        now < self.available_at
+    }
+
+    /// Project this backup into the `BackupDetails` every backup operation reports,
+    /// in the status the CALLING operation reports it in.
+    pub fn details(&self, status: &str) -> BackupDetails {
+        BackupDetails {
+            backup_arn: self.arn.clone(),
+            backup_name: self.name.clone(),
+            backup_size_bytes: Some(self.size_bytes),
+            backup_status: status.to_string(),
+            backup_type: self.backup_type.clone(),
+            backup_creation_date_time: ::aws_smithy_types::DateTime::from(self.created_at),
+            backup_expiry_date_time: self.expires_at.map(::aws_smithy_types::DateTime::from),
+        }
+    }
+
+    /// Project this backup into the `BackupSummary` a list reports, as it stands at
+    /// `now`.
+    pub fn summary(&self, now: SystemTime) -> BackupSummary {
+        BackupSummary {
+            table_name: Some(self.table_name.clone()),
+            table_id: Some(self.table_id.clone()),
+            table_arn: Some(self.table_arn.clone()),
+            backup_arn: Some(self.arn.clone()),
+            backup_name: Some(self.name.clone()),
+            backup_creation_date_time: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            backup_expiry_date_time: self.expires_at.map(::aws_smithy_types::DateTime::from),
+            backup_status: Some(self.status(now).to_string()),
+            backup_type: Some(self.backup_type.clone()),
+            backup_size_bytes: Some(self.size_bytes),
+        }
+    }
+
+    /// Project this backup into the `BackupDescription` the two single-backup operations
+    /// report: the backup itself, plus the source table as this backup recorded it.
+    pub fn describe(&self, status: &str) -> BackupDescription {
+        BackupDescription {
+            backup_details: Some(self.details(status)),
+            source_table_details: Some(SourceTableDetails {
+                table_name: self.table_name.clone(),
+                table_id: self.table_id.clone(),
+                table_arn: Some(self.table_arn.clone()),
+                table_size_bytes: Some(self.source.table_size_bytes),
+                key_schema: self.source.key_schema.clone(),
+                table_creation_date_time: ::aws_smithy_types::DateTime::from(
+                    self.source.table_creation_date_time,
+                ),
+                provisioned_throughput: self.source.provisioned_throughput.clone(),
+                on_demand_throughput: None,
+                item_count: Some(self.source.item_count),
+                billing_mode: Some(self.source.billing_mode.clone()),
+            }),
+            source_table_feature_details: Some(SourceTableFeatureDetails {
+                // A table that had no secondary index of a kind reports no list for it,
+                // exactly as its own description does.
+                local_secondary_indexes: (!self.source.local_secondary_indexes.is_empty())
+                    .then(|| self.source.local_secondary_indexes.clone()),
+                global_secondary_indexes: (!self.source.global_secondary_indexes.is_empty())
+                    .then(|| self.source.global_secondary_indexes.clone()),
+                stream_description: self.source.stream_specification.clone(),
+                ..SourceTableFeatureDetails::default()
+            }),
+        }
+    }
+}
+
+/// The `BackupNotFoundException` message a backup operation answers an ARN it holds no
+/// backup for with: built from the request — the ARN the caller addressed — and nothing
+/// about what the catalogue does hold.
+pub fn backup_not_found(backup_arn: &str) -> RequestError {
+    RequestError::NotFound(format!("Backup not found: {backup_arn}"))
+}
+
+/// Hold an ARN-addressed BACKUP operation's `BackupArn` to the form such an ARN takes in
+/// the scope the request itself was made in.
+///
+/// The same two-part rule [`resolve_resource_arn`] states for a table ARN, over the
+/// deeper form a backup carries
+/// (`arn:<partition>:dynamodb:<region>:<account>:table/<table>/backup/<id>`): the value
+/// must be an ARN of this service naming a backup, and it must address the partition,
+/// account and REGION this request reached — which is exactly the prefix [`table_arn`]
+/// mints for a table of this region. Anything else names no backup whose existence could
+/// be looked up, so it is an INPUT failure ([`RequestError::Validation`]) rather than a
+/// missing resource, and only a well-formed, in-scope ARN reaches the catalogue.
+pub fn check_backup_arn(backup_arn: &str, request_region: &str) -> Result<(), RequestError> {
+    let invalid = || {
+        RequestError::Validation(format!(
+            "Invalid BackupArn: Invalid BackupArn provided as input {backup_arn}"
+        ))
+    };
+    // `arn`, partition, service, region, account, resource — the resource field is the
+    // last one and carries `/`, so the split stops at six.
+    let fields: Vec<&str> = backup_arn.splitn(6, ':').collect();
+    let resource = match fields.as_slice() {
+        ["arn", _partition, "dynamodb", _region, _account, resource] => *resource,
+        _ => return Err(invalid()),
+    };
+    let (table, backup) = resource
+        .strip_prefix("table/")
+        .and_then(|path| path.split_once("/backup/"))
+        .ok_or_else(invalid)?;
+    if backup.is_empty() || backup.contains('/') {
+        return Err(invalid());
+    }
+    let table = resolve_table_name(table).map_err(|_| invalid())?;
+    if backup_arn != format!("{}/backup/{backup}", table_arn(request_region, &table)) {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 /// One stored table: its configuration, its lifecycle instants, and its items.
 #[derive(Debug)]
 pub struct Table {
@@ -2595,6 +2956,51 @@ impl Table {
             ..TableDescription::default()
         }
     }
+
+    /// Snapshot this table as a backup taken from it records its source
+    /// ([`SourceTableSnapshot`]).
+    ///
+    /// The figures are counted HERE, at the instant the backup is requested, rather than
+    /// taken from the table's periodically metered counters: a backup catalogues the data
+    /// committed up to its own time marker (the `CreateBackup` doc), so what it reports
+    /// is what the table held then — and the table itself may be changed or gone by the
+    /// time the backup is read.
+    pub fn backup_snapshot(&self) -> SourceTableSnapshot {
+        SourceTableSnapshot {
+            key_schema: self.key_schema.clone(),
+            table_creation_date_time: self.creation_date_time,
+            billing_mode: self.billing_mode.clone(),
+            provisioned_throughput: reported_capacity(self.provisioned_throughput.as_ref()),
+            item_count: i64::try_from(self.items.len()).unwrap_or(i64::MAX),
+            table_size_bytes: self.stored_bytes,
+            global_secondary_indexes: self
+                .global_secondary_indexes
+                .iter()
+                .map(|index| GlobalSecondaryIndexInfo {
+                    index_name: Some(index.name.clone()),
+                    key_schema: Some(index.key_schema.clone()),
+                    projection: Some(index.projection.clone()),
+                    provisioned_throughput: index.provisioned_throughput.clone(),
+                    on_demand_throughput: None,
+                })
+                .collect(),
+            local_secondary_indexes: self
+                .local_secondary_indexes
+                .iter()
+                .map(|index| LocalSecondaryIndexInfo {
+                    index_name: Some(index.name.clone()),
+                    key_schema: Some(index.key_schema.clone()),
+                    projection: Some(index.projection.clone()),
+                })
+                .collect(),
+            // Reported for a table that has a stream, disabled or not, exactly as the
+            // table's own description reports it.
+            stream_specification: self.stream.as_ref().map(|stream| StreamSpecification {
+                stream_enabled: stream.enabled,
+                stream_view_type: stream.enabled.then(|| stream.view_type.clone()),
+            }),
+        }
+    }
 }
 
 /// Per-service state for com-amazonaws-dynamodb-dynamodb-20120810. A handler reaches it through [`service_state`].
@@ -2618,6 +3024,19 @@ pub struct ComAmazonawsDynamodbDynamodb20120810State {
     /// [`Self::apply_due_transitions`], because "after 10 minutes, any request with
     /// the same client token is treated as a new request".
     pub transactions: HashMap<(String, String), CompletedTransaction>,
+    /// Every on-demand backup this emulator holds, keyed by its own `BackupArn`.
+    ///
+    /// ONE map rather than one per region, because a `BackupArn` already carries the
+    /// region the backup lives in and is the whole selector `DescribeBackup` and
+    /// `DeleteBackup` address it by; each record remembers its region, which is what
+    /// scopes a list to the region its request reached. Ordered by that ARN, so the
+    /// `ExclusiveStartBackupArn` cursor a list pages through is a comparison over the
+    /// keys rather than a sort per request ([`new_backup_arn`]).
+    ///
+    /// Backups are NOT held on the table they were taken from: a backup outlives it
+    /// (nothing in `DeleteTable` removes a table's on-demand backups), and this is the
+    /// only record of one.
+    pub backups: BTreeMap<String, Backup>,
 }
 
 impl ComAmazonawsDynamodbDynamodb20120810State {
@@ -2803,6 +3222,44 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
             Ok(table) if table.status(now).serves_items() => Ok(table),
             _ => Err(item_resource_not_found()),
         }
+    }
+
+    /// Catalogue a new backup under the ARN minted for it.
+    pub fn insert_backup(&mut self, backup: Backup) {
+        self.backups.insert(backup.arn.clone(), backup);
+    }
+
+    /// How many backups that region already holds — what [`MAX_BACKUPS_PER_REGION`] is
+    /// measured against.
+    pub fn backup_count_in(&self, region: &str) -> usize {
+        self.backups_in(region).count()
+    }
+
+    /// Every backup of one region, in ascending `BackupArn` order, which is the scope a
+    /// list reports and the order it pages through.
+    pub fn backups_in<'s>(&'s self, region: &'s str) -> impl Iterator<Item = &'s Backup> + 's {
+        self.backups
+            .values()
+            .filter(move |backup| backup.region == region)
+    }
+
+    /// The backup that `BackupArn` names, inside the region the request reached.
+    ///
+    /// A backup of ANOTHER region is not addressable from this endpoint, so it is the
+    /// same miss as one that was never taken ([`backup_not_found`]).
+    pub fn backup(&self, region: &str, backup_arn: &str) -> Result<&Backup, RequestError> {
+        self.backups
+            .get(backup_arn)
+            .filter(|backup| backup.region == region)
+            .ok_or_else(|| backup_not_found(backup_arn))
+    }
+
+    /// Remove that backup from the catalogue, returning the record removed.
+    pub fn remove_backup(&mut self, region: &str, backup_arn: &str) -> Result<Backup, RequestError> {
+        self.backup(region, backup_arn)?;
+        self.backups
+            .remove(backup_arn)
+            .ok_or_else(|| backup_not_found(backup_arn))
     }
 
     /// The bytes every table together holds — the store-wide figure admission

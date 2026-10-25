@@ -298,11 +298,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An access grant names a group in the server's DIRECTORY, so a server whose
         // identity provider is not a directory has no group to associate: the call is
         // refused through the ONE rule every access operation shares with the
-        // implemented `DeleteAccess`, so the same invalid condition cannot answer two
-        // different messages depending on which operation the caller used.
+        // implemented `DescribeAccess` and `DeleteAccess`, which words the refusal from
+        // this operation's own action and the stored server's type alone.
         if identity_provider_type != st::IDENTITY_PROVIDER_AWS_DIRECTORY_SERVICE {
             return Err(CreateAccessErrorModeled::InvalidRequestException(
-                st::accesses_require_directory_provider(&input.server_id, &identity_provider_type),
+                st::accesses_require_directory_provider(
+                    st::ACCESS_ACTION_CREATE,
+                    &identity_provider_type,
+                ),
             )
             .into());
         }

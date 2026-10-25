@@ -195,7 +195,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
 
         let now = ::std::time::SystemTime::now();
         // One lookup resolves the stream, refuses it if it is not accepting data, and
@@ -229,13 +228,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // bucket means. This put delivers only what an EARLIER buffer was already owed
         // (nothing this record is in can be due yet) and starts the task that waits for
         // the clock, so the delivery happens without any further Firehose call.
+        // An HTTP endpoint destination is delivered to over the in-process transport of
+        // the emulator this handler runs within, so a delivery reaches only what this
+        // emulator itself serves.
+        let transport = ctx.callback().http_connector();
         crate::state::delivery::deliver_due(
             &*self.engine,
             now,
             crate::state::delivery::Extractions::LeaveToThePump,
+            &transport,
         )
         .await;
-        crate::state::delivery::drive_delivery_clock(&self.engine);
+        crate::state::delivery::drive_delivery_clock(&self.engine, transport);
 
         Ok(PutRecordOutput {
             record_id,

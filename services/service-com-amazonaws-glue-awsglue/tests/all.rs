@@ -39,6 +39,8 @@ mod get_table_entity_not_found;
 mod job_listing;
 #[path = "all/job_runs.rs"]
 mod job_runs;
+#[path = "all/job_updates.rs"]
+mod job_updates;
 #[path = "all/jobs.rs"]
 mod jobs;
 #[path = "all/schema_registry.rs"]

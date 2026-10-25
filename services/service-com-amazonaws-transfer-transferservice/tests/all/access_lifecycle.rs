@@ -184,38 +184,34 @@ async fn create_access_is_served_only_on_a_directory_backed_server() {
             .to_string();
         // The refusal is the ONE rule every access operation shares
         // (`state::accesses_require_directory_provider`, which the implemented
-        // `DeleteAccess` applies too): it names the member, the type an access
-        // requires, and the type THIS server is configured with — so each row's
-        // wording is produced from that server's own configuration.
-        for fragment in [
-            "IdentityProviderType",
-            "AWS_DIRECTORY_SERVICE",
-            idp_type,
-            server_id.as_str(),
-        ] {
+        // `DescribeAccess` and `DeleteAccess` apply too): a text fixed for this
+        // operation and for the type THIS server is configured with, carrying nothing
+        // the caller sent. The per-operation wording itself is pinned, across the
+        // operations and the whole type set, in `refusal_message_rules.rs`.
+        assert_eq!(
+            message,
+            format!("Cannot create access on server with IdP type: {idp_type}"),
+            "case {case:?}: expected the fixed directory-provider refusal, got {message:?}"
+        );
+        for sent in [server_id.as_str(), GROUP_SID] {
             assert!(
-                message.contains(fragment),
-                "case {case:?}: expected the refusal to name {fragment:?}, got {message:?}"
+                !message.contains(sent),
+                "case {case:?}: expected no request data in the refusal, got {message:?} \
+                 carrying {sent:?}"
             );
         }
-        assert!(
-            !message.contains(GROUP_SID),
-            "case {case:?}: the ExternalId was never looked up, so it must not appear in \
-             the refusal; got {message:?}"
-        );
 
-        // The refusal persisted nothing: the access is not readable afterwards.
-        let read_back = emulator
-            .call(
-                "DescribeAccess",
-                json!({"ServerId": server_id, "ExternalId": GROUP_SID}),
-            )
-            .await;
-        assert_eq!(
-            read_back.error_code(),
-            "ResourceNotFoundException",
-            "case {case:?}: a refused create must persist nothing, got {}",
-            read_back.body
+        // The refusal persisted nothing: the store holds no grant for the pair the
+        // request named. (A read-back cannot report that here — `DescribeAccess` is
+        // refused by the same gate on this server.)
+        assert!(
+            !emulator
+                .store()
+                .lock()
+                .accesses
+                .contains_key(&(server_id.clone(), GROUP_SID.to_string())),
+            "case {case:?}: a refused create must persist nothing, the store holds a grant \
+             for {GROUP_SID}"
         );
     }
 }

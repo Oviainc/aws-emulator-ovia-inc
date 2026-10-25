@@ -723,6 +723,25 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
         }
     }
 
+    /// The tags held on the device or task a tagging operation's `resourceArn`
+    /// resolved to, to CHANGE: the mutable counterpart of [`Self::tags_of`], so a
+    /// tag write lands on exactly the record a tag read reports.
+    ///
+    /// This is the one place the kind/id → stored-tags resolution lives for the
+    /// write paths: `TagResource` and `UntagResource` both go through it, so the
+    /// two cannot resolve a `resourceArn` differently from each other or from the
+    /// read path. `None` means this account holds no such record, which is the
+    /// tagging APIs' not-found class ([`TAGGING_NOT_FOUND_MESSAGE`]).
+    pub fn tags_of_mut(&mut self, resource: &TaggedResource) -> Option<&mut BTreeMap<String, String>> {
+        match resource.kind {
+            TaggedResourceKind::Device => self
+                .devices
+                .get_mut(&resource.id)
+                .map(|device| &mut device.tags),
+            TaggedResourceKind::Task => self.tasks.get_mut(&resource.id).map(|task| &mut task.tags),
+        }
+    }
+
     /// Materialise every state change the clock already owes.
     ///
     /// An execution the span has elapsed on moves `QUEUED` -> `IN_PROGRESS` ->

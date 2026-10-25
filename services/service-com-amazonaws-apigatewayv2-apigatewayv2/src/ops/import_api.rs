@@ -14,8 +14,9 @@
 //!
 //! The definition reader ([`parse_definition`] and the shapes it answers with) is `pub`
 //! because `ReimportApi` takes the SAME `Body` and `Basepath` members and so has to read
-//! a definition exactly as this operation does; it is still scaffolded, and reaches this
-//! reader as `super::import_api::parse_definition` when it is written.
+//! a definition exactly as this operation does: it reaches this reader as
+//! `super::import_api::parse_definition`, so the same body imports and reimports
+//! identically.
 //!
 //! The `Body` is read in its JSON spelling, through `serde_json`. API Gateway also accepts
 //! the YAML spelling of a definition; reading that needs a YAML parser this crate does not
@@ -229,30 +230,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             ));
         }
-        if definition.routes_exceed_quota {
-            return Err(too_many_requests(
-                "Route",
-                format!(
-                    "The API definition declares more routes than the maximum number of \
-                     routes for an API ({}).",
-                    crate::state::MAX_ROUTES_PER_API
-                ),
-            ));
-        }
-        let integrations = definition
-            .routes
-            .iter()
-            .filter(|route| route.integration.is_some())
-            .count();
-        if integrations > crate::state::MAX_INTEGRATIONS_PER_API {
-            return Err(too_many_requests(
-                "Integration",
-                format!(
-                    "The API definition declares {integrations} integrations; the maximum \
-                     number of integrations for an API is {}.",
-                    crate::state::MAX_INTEGRATIONS_PER_API
-                ),
-            ));
+        // The per-api quotas a definition has to fit inside are the ONE check
+        // `ReimportApi` shares ([`definition_quota_exceeded`]), so the two operations
+        // cannot refuse different definitions.
+        if let Some((limit_type, message)) = definition_quota_exceeded(&definition) {
+            return Err(too_many_requests(limit_type, message));
         }
 
         let api_id = store.mint_api_id();
@@ -300,36 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and this inserts. Taking the entry back gives the STORED record, so the routes
         // and integrations below are written into the api a later GetApi reports.
         let stored = store.apis.entry(api_id).or_insert(record);
-        for imported in definition.routes {
-            // The integration the operation declared, minted FIRST: the route's `Target`
-            // is `integrations/{IntegrationId}`, so the integration has to exist before
-            // the route that points at it.
-            let target = imported.integration.map(|integration| {
-                let integration_id = stored.mint_integration_id();
-                stored.integrations.insert(
-                    integration_id.clone(),
-                    integration.into_record(integration_id.clone()),
-                );
-                format!(
-                    "{}{integration_id}",
-                    crate::state::INTEGRATION_TARGET_PREFIX
-                )
-            });
-            let route_id = stored.mint_route_id();
-            stored.routes.insert(
-                route_id.clone(),
-                crate::state::Route {
-                    route_id,
-                    route_key: imported.route_key,
-                    target,
-                    authorization_type: crate::state::DEFAULT_AUTHORIZATION_TYPE.to_string(),
-                    // The caller's own definition asked for this route, so API Gateway
-                    // does not manage it (`Route$ApiGatewayManaged`).
-                    api_gateway_managed: false,
-                    ..Default::default()
-                },
-            );
-        }
+        write_definition_routes(stored, definition.routes);
 
         let stored = stored.to_wire();
         Ok(ImportApiOutput {
@@ -675,6 +628,80 @@ pub fn base_path_mode(basepath: Option<&str>) -> Result<BasePathMode, String> {
         Some(other) => Err(format!(
             "Invalid value for Basepath: '{other}'. Valid values are: ignore, prepend, split."
         )),
+    }
+}
+
+/// The per-api quota a definition would take an api past, as the `LimitType` and the
+/// message of the operation's `TooManyRequestsException`, or `None` for one that fits.
+///
+/// `ImportApi` and `ReimportApi` both write the WHOLE definition in one call, so each one
+/// either fits or is refused with nothing written, and both ask this — the one owner of the
+/// thresholds and of their wording, so the two cannot drift apart.
+pub fn definition_quota_exceeded(definition: &ImportedApi) -> Option<(&'static str, String)> {
+    if definition.routes_exceed_quota {
+        return Some((
+            "Route",
+            format!(
+                "The API definition declares more routes than the maximum number of routes \
+                 for an API ({}).",
+                crate::state::MAX_ROUTES_PER_API
+            ),
+        ));
+    }
+    let integrations = definition
+        .routes
+        .iter()
+        .filter(|route| route.integration.is_some())
+        .count();
+    if integrations > crate::state::MAX_INTEGRATIONS_PER_API {
+        return Some((
+            "Integration",
+            format!(
+                "The API definition declares {integrations} integrations; the maximum number \
+                 of integrations for an API is {}.",
+                crate::state::MAX_INTEGRATIONS_PER_API
+            ),
+        ));
+    }
+    None
+}
+
+/// Write the routes `routes` describe, and the integration each one declared, into `api`.
+///
+/// The ONE materialisation of a read definition, asked by `ImportApi` for the api it mints
+/// and by `ReimportApi` for the api it PUTS over, so an imported and a reimported document
+/// of the same bytes leave the same records. The api's id seeds drive the ids, so a
+/// reimport never reuses an id the api handed out before.
+pub fn write_definition_routes(api: &mut crate::state::Api, routes: Vec<ImportedRoute>) {
+    for imported in routes {
+        // The integration the operation declared, minted FIRST: the route's `Target` is
+        // `integrations/{IntegrationId}`, so the integration has to exist before the route
+        // that points at it.
+        let target = imported.integration.map(|integration| {
+            let integration_id = api.mint_integration_id();
+            api.integrations.insert(
+                integration_id.clone(),
+                integration.into_record(integration_id.clone()),
+            );
+            format!(
+                "{}{integration_id}",
+                crate::state::INTEGRATION_TARGET_PREFIX
+            )
+        });
+        let route_id = api.mint_route_id();
+        api.routes.insert(
+            route_id.clone(),
+            crate::state::Route {
+                route_id,
+                route_key: imported.route_key,
+                target,
+                authorization_type: crate::state::DEFAULT_AUTHORIZATION_TYPE.to_string(),
+                // The caller's own definition asked for this route, so API Gateway does not
+                // manage it (`Route$ApiGatewayManaged`).
+                api_gateway_managed: false,
+                ..Default::default()
+            },
+        );
     }
 }
 
