@@ -341,20 +341,34 @@ pub(crate) fn assert_profile_projection(
     }
 }
 
+/// The published `@length` bounds of `GoalSummary$title` and `GoalSummary$description`,
+/// both `SensitiveString` — `@length(1, 1000)` and `@length(1, 4000)` respectively
+/// (`smithy_query(query="shape", shape="GoalSummary")`). The table below sits on both
+/// ends of each, so a goal is exercised at the published extremes and not only in the
+/// middle.
+pub(crate) const TITLE_MAX: usize = 1000;
+/// See [`TITLE_MAX`].
+pub(crate) const DESCRIPTION_MAX: usize = 4000;
+
 /// The rows every goal test spans: the pillar sets a goal may name (one, several, and
 /// the whole published catalog, which is the modelled `@length(1, 5)` maximum), with and
-/// without the optional `description`, and titles of different form and size (the
-/// modelled `SensitiveString` `@length(1, 1000)` lower and upper bounds among them).
-fn goal_rows() -> Vec<(&'static str, Value)> {
+/// without the optional `description`, and titles and descriptions of different form and
+/// size (both published `@length` bounds of each among them). No two rows share a title,
+/// so an answer served from the wrong record is caught.
+///
+/// `pub(crate)` because the listing suite and the single-goal read suite beside this one
+/// span the same class of goal, and the table a goal rule is asserted over is spelled
+/// ONCE here rather than copied per suite.
+pub(crate) fn goal_rows() -> Vec<(&'static str, Value)> {
     vec![
         (
             "one-pillar-no-description",
-            json!({ "pillars": ["SECURITY"], "title": "Harden the perimeter" }),
+            json!({ "pillars": [PILLARS[1]], "title": "Harden the perimeter" }),
         ),
         (
             "two-pillars-with-description",
             json!({
-                "pillars": ["COST_OPTIMIZATION", "PERFORMANCE"],
+                "pillars": [PILLARS[0], PILLARS[3]],
                 "title": "Right-size the fleet",
                 "description": "Trade idle capacity for latency headroom",
             }),
@@ -368,20 +382,23 @@ fn goal_rows() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
-            "pillar-the-issue-did-not-cite",
+            "pillars-the-issue-did-not-cite",
             json!({
-                "pillars": ["OPERATIONAL_EXCELLENCE", "RESILIENCE"],
+                "pillars": [PILLARS[4], PILLARS[2]],
                 "title": "Rehearse the failover runbook",
-                "description": "Operational excellence and resilience together",
             }),
         ),
         (
-            "shortest-title",
-            json!({ "pillars": ["RESILIENCE"], "title": "x" }),
+            "shortest-title-and-description",
+            json!({ "pillars": [PILLARS[2]], "title": "x", "description": "d" }),
         ),
         (
-            "longest-title",
-            json!({ "pillars": ["PERFORMANCE"], "title": "t".repeat(1000) }),
+            "longest-title-and-description",
+            json!({
+                "pillars": [PILLARS[3]],
+                "title": "t".repeat(TITLE_MAX),
+                "description": "d".repeat(DESCRIPTION_MAX),
+            }),
         ),
     ]
 }

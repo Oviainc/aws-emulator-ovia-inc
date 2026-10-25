@@ -61,6 +61,18 @@ fn satellite_arn(uuid: &str) -> String {
 /// `ReserveContact`, answering the `contactId` of a contact at version
 /// [`state::FIRST_VERSION_ID`].
 async fn reserve_contact(router: &MultiServiceRouter, profile_arn: &str) -> String {
+    reserve_contact_in_slot(router, profile_arn, 0).await
+}
+
+/// `ReserveContact` for the pass a day per `slot` after [`CONTACT_START`], so two
+/// reservations of this suite hold windows of their own: an antenna serves one pass at a
+/// time, so a second reservation of the SAME window at one ground station is refused.
+async fn reserve_contact_in_slot(
+    router: &MultiServiceRouter,
+    profile_arn: &str,
+    slot: i64,
+) -> String {
+    let shift = slot * 86_400;
     let reserved = send(
         router,
         "POST",
@@ -68,8 +80,8 @@ async fn reserve_contact(router: &MultiServiceRouter, profile_arn: &str) -> Stri
         Some(json!({
             "missionProfileArn": profile_arn,
             "groundStation": "Ohio-1",
-            "startTime": CONTACT_START,
-            "endTime": CONTACT_END,
+            "startTime": CONTACT_START + shift,
+            "endTime": CONTACT_END + shift,
             "satelliteArn": satellite_arn("11111111-1111-4111-8111-111111111111"),
         })),
     )
@@ -339,7 +351,7 @@ async fn a_token_this_listing_did_not_issue_for_this_contact_is_refused() {
     let (router, _engine) = harness_with_engine();
     let profile_arn = create_mission_profile(&router, "version tokens", 180, None, None).await;
     let first_contact = reserve_contact(&router, &profile_arn).await;
-    let second_contact = reserve_contact(&router, &profile_arn).await;
+    let second_contact = reserve_contact_in_slot(&router, &profile_arn, 1).await;
     for body in update_bodies() {
         append_version(&router, &first_contact, body.clone()).await;
         append_version(&router, &second_contact, body).await;

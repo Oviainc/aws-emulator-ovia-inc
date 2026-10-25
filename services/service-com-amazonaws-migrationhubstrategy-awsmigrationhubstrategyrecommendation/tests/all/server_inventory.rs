@@ -35,7 +35,7 @@ use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommenda
 use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommendation::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::import_and_assess::{at, call, Answer};
+use crate::import_and_assess::{at, call, Answer, TEST_REGION};
 
 /// Every value `ServerCriteria` admits, from
 /// `smithy_query(query="shape",shape="ServerCriteria")`. Spelled out here so the table
@@ -199,8 +199,9 @@ pub(crate) fn emulator_with(servers: Vec<ServerRecord>) -> MultiServiceRouter {
         let state = engine
             .state::<ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState>();
         let mut store = state.lock();
+        let portfolio = store.region_entry(TEST_REGION);
         for record in servers {
-            store.servers.insert(record.id.clone(), record);
+            portfolio.servers.insert(record.id.clone(), record);
         }
     }
     let mut router = MultiServiceRouter::new();
