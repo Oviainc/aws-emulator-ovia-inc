@@ -43,21 +43,24 @@ use crate::router_outputs::minted_network_interface;
 /// (`smithy_query(query="operation",operation="TagGlobalResource")`). Each one has a
 /// different implemented reader, which is the only thing the kind decides here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GlobalKind {
+pub(crate) enum GlobalKind {
     Input,
     Output,
     NetworkInterface,
 }
 
 /// Every kind, so a rule is asserted over the whole class the operation covers.
-const EVERY_KIND: [GlobalKind; 3] = [
+pub(crate) const EVERY_KIND: [GlobalKind; 3] = [
     GlobalKind::Input,
     GlobalKind::Output,
     GlobalKind::NetworkInterface,
 ];
 
 /// `POST /tags/global/{ResourceArn}` with the pairs in `tags`.
-async fn tag_global(emulator: &Emulator, resource_arn: &str, tags: Value) -> Reply {
+///
+/// `pub(crate)` because the global tag READING suite drives the same write, to assert that
+/// the report answers what the write merged.
+pub(crate) async fn tag_global(emulator: &Emulator, resource_arn: &str, tags: Value) -> Reply {
     emulator
         .send(
             "POST",
@@ -79,14 +82,19 @@ async fn tag_regional(emulator: &Emulator, resource_arn: &str, tags: Value) -> R
         .await
 }
 
-/// Create one global resource of `kind`, carrying `tags`, and return its minted ARN.
-async fn create_subject(
+/// Create one global resource of `kind`, carrying the `tags` member when `tags` names one
+/// and no such member at all when it is `None`, and return its minted ARN.
+///
+/// `pub(crate)` because the GLOBAL tag READING suite creates the same three subjects: one
+/// definition of each create in this test binary, so a rule asserted about a kind is
+/// asserted about the same request both suites send.
+pub(crate) async fn create_subject(
     emulator: &Emulator,
     kind: GlobalKind,
     name: &str,
-    tags: Value,
+    tags: Option<Value>,
 ) -> String {
-    let (uri, body, pointer) = match kind {
+    let (uri, mut body, pointer) = match kind {
         GlobalKind::Input => (
             "/v1/routerInput",
             json!({
@@ -105,7 +113,6 @@ async fn create_subject(
                 "maximumBitrate": 20_000_000i64,
                 "routingScope": "REGIONAL",
                 "tier": "INPUT_20",
-                "tags": tags,
             }),
             "routerInput",
         ),
@@ -130,7 +137,6 @@ async fn create_subject(
                 "maximumBitrate": 20_000_000i64,
                 "routingScope": "REGIONAL",
                 "tier": "OUTPUT_20",
-                "tags": tags,
             }),
             "routerOutput",
         ),
@@ -139,11 +145,13 @@ async fn create_subject(
             json!({
                 "name": name,
                 "configuration": public_configuration(1),
-                "tags": tags,
             }),
             "routerNetworkInterface",
         ),
     };
+    if let Some(tags) = tags {
+        body["tags"] = tags;
+    }
     let (status, code, created) = emulator.send("POST", uri, Some(body)).await;
     assert_eq!(
         (status, code.as_deref()),
@@ -226,7 +234,7 @@ async fn subjects(emulator: &Emulator) -> Vec<(GlobalKind, String, BTreeMap<Stri
             ("team".to_string(), format!("video-{index}")),
         ]);
         let tags = tag_map(&initial.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>());
-        let arn = create_subject(emulator, kind, &format!("tagged-{index}"), tags).await;
+        let arn = create_subject(emulator, kind, &format!("tagged-{index}"), Some(tags)).await;
         created.push((kind, arn, initial));
     }
     created
@@ -398,7 +406,7 @@ async fn tagging_a_global_arn_that_addresses_nothing_is_not_found() {
         &emulator,
         GlobalKind::Input,
         "not-regional",
-        json!({}),
+        Some(json!({})),
     )
     .await;
     let (status, code, body) = tag_regional(&emulator, &router_input, json!({ "k": "v" })).await;
@@ -438,7 +446,7 @@ async fn tagging_a_global_arn_that_addresses_nothing_is_not_found() {
 #[tokio::test]
 async fn tagging_a_router_input_the_clock_removed_is_not_found() {
     let emulator = Emulator::new();
-    let arn = create_subject(&emulator, GlobalKind::Input, "doomed", json!({})).await;
+    let arn = create_subject(&emulator, GlobalKind::Input, "doomed", Some(json!({}))).await;
 
     let (status, code, body) = emulator
         .send("DELETE", &format!("/v1/routerInput/{arn}"), None)
@@ -488,7 +496,7 @@ async fn tag_pairs_outside_the_documented_bounds_are_refused() {
     let emulator = Emulator::new();
 
     for kind in EVERY_KIND {
-        let arn = create_subject(&emulator, kind, "bounded", json!({})).await;
+        let arn = create_subject(&emulator, kind, "bounded", Some(json!({}))).await;
         let rows = vec![
             BoundCase {
                 case: "a key at the documented maximum length",
@@ -585,7 +593,7 @@ async fn a_global_resource_keeps_at_most_the_bounded_number_of_tags() {
         &emulator,
         GlobalKind::Output,
         "full-of-tags",
-        json!({}),
+        Some(json!({})),
     )
     .await;
 
@@ -659,7 +667,8 @@ async fn a_tag_write_moves_updated_at_only_when_it_changes_the_tags() {
 
     let mut created = Vec::new();
     for (index, kind) in EVERY_KIND.into_iter().enumerate() {
-        let arn = create_subject(&emulator, kind, &format!("stamped-{index}"), json!({})).await;
+        let arn =
+            create_subject(&emulator, kind, &format!("stamped-{index}"), Some(json!({}))).await;
         let case = format!("{kind:?} / created");
         let resource = read_back(&emulator, &case, kind, &arn).await;
         let created_at = timestamp(&case, "createdAt", &resource);
