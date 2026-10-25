@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetWebACLForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetWebACLForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetWebACLForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -130,6 +121,14 @@ impl From<GetWebACLForResourceErrorModeled> for GetWebACLForResourceError {
     }
 }
 
+/// The `ParameterExceptionField` a `ResourceArn` this operation cannot use is reported
+/// under, from the model's generated `PARAMETER_EXCEPTION_FIELD_VALUES`.
+const FIELD_RESOURCE_ARN: &str = "RESOURCE_ARN";
+
+/// The `ParameterExceptionReason` for a member whose value the service cannot use, from
+/// the model's generated `PARAMETER_EXCEPTION_REASON_VALUES`.
+const REASON_ILLEGAL_ARGUMENT: &str = "ILLEGAL_ARGUMENT";
+
 /// The `GetWebACLForResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -166,18 +165,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetWebACLForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetWebACLForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetWebACLForResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetWebACLForResourceErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
+                message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
+            })
+        })?;
+
+        // The same ARN rule `AssociateWebACL` accepts an association under, so an ARN
+        // that call refuses as malformed or unassociable is refused here too rather than
+        // reported as protected by nothing.
+        if crate::state::associable_resource_type(&input.resource_arn).is_none() {
+            return Err(
+                GetWebACLForResourceErrorModeled::WAFInvalidParameterException(
+                    WAFInvalidParameterException {
+                        field: Some(FIELD_RESOURCE_ARN.to_string()),
+                        parameter: Some(input.resource_arn.clone()),
+                        reason: Some(REASON_ILLEGAL_ARGUMENT.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A read: it writes nothing, so what a later caller sees is unchanged.
+        let state = state.lock();
+
+        // "If there is no associated resource, a null WebACLSummary is returned" — the
+        // output member's own documentation, so a resource this service holds no
+        // association for is a SUCCESS carrying no summary, not a refusal.
+        Ok(GetWebACLForResourceOutput {
+            // Projected from the stored web ACL record, never from the request.
+            web_acl_summary: state
+                .web_acl_for_resource(&input.resource_arn)
+                .map(crate::state::WebACLEntry::summary),
+        })
     }
 }
