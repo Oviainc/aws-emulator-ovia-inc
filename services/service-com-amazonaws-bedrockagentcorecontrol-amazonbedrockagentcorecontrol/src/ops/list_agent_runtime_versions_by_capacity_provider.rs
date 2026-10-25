@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAgentRuntimeVersionsByCapacityProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAgentRuntimeVersionsByCapacityProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAgentRuntimeVersionsByCapacityProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the agent-runtime VERSIONS associated with one capacity provider, read from
+//! [`crate::state`]: a version is associated with the provider when the configuration it
+//! was created or updated with names that provider's ARN. Paginated on the same opaque
+//! cursor the other listings of this service use.
+//!
+//! The operation models `AccessDeniedException` (403) and NO not-found error, and the
+//! recorded service answers 403 for a `capacityProviderId` that names nothing: a request
+//! naming a capacity provider this account does not hold is DENIED rather than answered
+//! with an empty list. Because that decision is an authorization one, it is taken before
+//! the request's input constraints are validated — see
+//! `crate::service::EmulatedService::override_operation`, which hoists exactly this check
+//! ahead of the framework's constraint walk; the rule itself lives here.
+//!
+//! What "this account holds" means today, and the one deviation it carries, are stated on
+//! [`crate::state::ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState::holds_capacity_provider`]:
+//! a provider is known by the association a stored runtime version carries, because
+//! `CreateCapacityProvider` is still scaffolded, so a provider that exists with no
+//! associated version is denied here where the real service answers an empty page.
+//!
+//! The denial's MESSAGE is the service's own, stated once in
+//! [`crate::state::CAPACITY_PROVIDER_DENIAL`] and shared with that seam, and it echoes
+//! none of the caller's values.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +174,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAgentRuntimeVersionsByCapacityProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAgentRuntimeVersionsByCapacityProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAgentRuntimeVersionsByCapacityProvider"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAgentRuntimeVersionsByCapacityProviderErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the agent runtime store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+
+        // A capacity provider this account does not hold is an authorization
+        // refusal, not an empty page: this operation models `AccessDeniedException`
+        // and no not-found error. `override_operation` takes the same decision for
+        // a request the framework's constraint walk would refuse first; this is
+        // where the rule is stated, and it also covers a provider whose last
+        // association went away between the two.
+        if !store.holds_capacity_provider(&input.capacity_provider_id) {
+            return Err(
+                ListAgentRuntimeVersionsByCapacityProviderErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(crate::state::CAPACITY_PROVIDER_DENIAL.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The token is opaque on the wire: it carries the cursor the previous page
+        // ended on, hex-encoded, and the next page starts strictly after it.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListAgentRuntimeVersionsByCapacityProviderErrorModeled::ValidationException(
+                    crate::state::field_validation_failed(
+                        "nextToken",
+                        "must be a nextToken returned by a previous \
+                         ListAgentRuntimeVersionsByCapacityProvider call",
+                    ),
+                )
+            })?),
+        };
+
+        // `maxResults` has the modeled range 1..100; absent, a page holds that
+        // same documented maximum. The size is read through the ONE page-size
+        // rule every listing of this service shares (`state::page_size`), which
+        // also clamps into the modelled range, so two listings cannot page by
+        // different rules.
+        let page_size = crate::state::page_size(input.max_results, MAX_PAGE_SIZE);
+
+        let rows =
+            store.runtime_versions_for_capacity_provider(&input.capacity_provider_id, now);
+        // The cursors sort as the rows do, so the page resumes strictly after the
+        // cursor the token carries — whether or not that row is still there.
+        let start = match resume_after.as_deref() {
+            None => 0,
+            Some(cursor) => rows.partition_point(|(key, _)| key.as_str() <= cursor),
+        };
+        let page: Vec<AgentRuntimeVersionSummary> = rows[start..]
+            .iter()
+            .take(page_size)
+            .map(|(_, summary)| summary.clone())
+            .collect();
+        // At least one row is left over, so hand back a token that resumes
+        // exactly where this page ended.
+        let next_token = (start + page.len() < rows.len())
+            .then(|| crate::state::encode_page_token(&rows[start + page.len() - 1].0));
+
+        Ok(ListAgentRuntimeVersionsByCapacityProviderOutput {
+            agent_runtimes: page,
+            next_token,
+        })
     }
 }
+
+/// The modeled upper bound of `maxResults` (range 1..100), used as the page size
+/// when the caller names none.
+const MAX_PAGE_SIZE: i32 = 100;

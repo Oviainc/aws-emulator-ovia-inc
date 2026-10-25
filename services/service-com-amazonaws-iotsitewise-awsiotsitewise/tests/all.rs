@@ -228,6 +228,8 @@ mod gateway_lifecycle;
 mod hierarchies_etags_and_refusals;
 #[path = "all/list_asset_models.rs"]
 mod list_asset_models;
+#[path = "all/list_pipelines.rs"]
+mod list_pipelines;
 #[path = "all/logging_options.rs"]
 mod logging_options;
 #[path = "all/portal_lifecycle.rs"]

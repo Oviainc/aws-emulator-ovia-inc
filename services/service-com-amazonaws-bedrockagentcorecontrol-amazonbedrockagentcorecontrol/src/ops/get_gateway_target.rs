@@ -194,22 +194,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.expire_deleted_gateways(now);
 
         let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
-            GetGatewayTargetErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "no gateway with identifier {} exists in this account",
-                    input.gateway_identifier
-                )),
-            })
+            GetGatewayTargetErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::ACTION_RETRIEVE,
+                    crate::state::RESOURCE_GATEWAY,
+                ),
+            )
         })?;
         // A target id naming no target OF THIS GATEWAY is the same modelled 404 as
         // an unknown gateway: the target is addressed only through its gateway.
         let target = gateway.targets.get(&input.target_id).ok_or_else(|| {
-            GetGatewayTargetErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "gateway {} has no target with id {}",
-                    input.gateway_identifier, input.target_id
-                )),
-            })
+            GetGatewayTargetErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::ACTION_RETRIEVE,
+                    crate::state::RESOURCE_GATEWAY_TARGET,
+                ),
+            )
         })?;
 
         Ok(target.get_output(&gateway.gateway_arn, now))

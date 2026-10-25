@@ -495,6 +495,10 @@ async fn targets_are_created_on_a_gateway_and_read_back() {
     let (_, gateway) = create_gateway(&router, &gateway_body("targets", "AWS_IAM", false)).await;
     let gateway_id = text(&gateway, "gatewayId");
     let gateway_arn = text(&gateway, "gatewayArn");
+    // A gateway takes no target until the clock-owed `CREATING` -> `READY` transition
+    // has come due, so the suite waits it out before creating one. The refusal before
+    // that is `control_plane_preconditions.rs`'s.
+    tokio::time::sleep(PAST_SETTLE).await;
 
     // (case, body) — one row per target shape, so the rows differ along the configuration
     // union the request carries. Source: `TargetConfiguration` and

@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetSecurityGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetSecurityGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetSecurityGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the security groups of the load balancer `LoadBalancerArn` names with the
+//! ones the request lists — "The specified security groups override the previously
+//! associated security groups" — and answers the groups it now carries, which every later
+//! read of that load balancer reports.
+//!
+//! Two rules decide whether the groups can be set, each one a sentence of this
+//! operation's own documentation: "You can't associate a security group with a Gateway
+//! Load Balancer", and "You can't perform this operation on a Network Load Balancer
+//! unless you specified a security group for the load balancer when you created it". A
+//! request one of them refuses, or one naming groups EC2 reports in another VPC than the
+//! load balancer's, is the modelled `InvalidConfigurationRequestException`; an ARN this
+//! store holds no load balancer for is the modelled `LoadBalancerNotFoundException`.
+//!
+//! A third rule is about the request rather than the groups:
+//! `EnforceSecurityGroupInboundRulesOnPrivateLinkTraffic` is available only on a Network
+//! Load Balancer that has a security group ("Applies only if the load balancer has an
+//! associated security group"), so a request carrying that member for any other load
+//! balancer — including an ARN that resolves to none — is refused for THAT reason rather
+//! than for the one it would earn without the member.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +167,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetSecurityGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetSecurityGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetSecurityGroups"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("SetSecurityGroups")
+        })?;
+        let region = crate::state::request_region(ctx);
+
+        // What the load balancer is today, read under the lock and then released: the
+        // security groups are resolved against EC2 next, and nothing is held across that
+        // call. `None` when this store holds no such load balancer, which the
+        // PrivateLink rule below is decided on before the not-found refusal.
+        let carried = {
+            let guard = state.lock();
+            guard
+                .load_balancers
+                .get(&input.load_balancer_arn)
+                .map(|load_balancer| {
+                    (
+                        load_balancer.family(),
+                        load_balancer.vpc_id.clone(),
+                        load_balancer.security_groups.clone(),
+                    )
+                })
+        };
+
+        // `EnforceSecurityGroupInboundRulesOnPrivateLinkTraffic` is about PrivateLink
+        // traffic to a Network Load Balancer and "applies only if the load balancer has an
+        // associated security group", so the member is available on exactly those load
+        // balancers. A request carrying it for anything else is refused for THAT reason —
+        // including when the ARN resolves to no load balancer at all, which is no Network
+        // Load Balancer with a security group either.
+        if input
+            .enforce_security_group_inbound_rules_on_private_link_traffic
+            .is_some()
+            && !carried.as_ref().is_some_and(|(family, _, groups)| {
+                *family == crate::state::LoadBalancerFamily::Network && !groups.is_empty()
+            })
+        {
+            return Err(invalid_configuration(
+                PRIVATE_LINK_SETTING_UNAVAILABLE.to_string(),
+            ));
+        }
+
+        let Some((family, vpc_id, carried_groups)) = carried else {
+            return Err(not_found(&input.load_balancer_arn));
+        };
+
+        // "You can't associate a security group with a Gateway Load Balancer."
+        if family == crate::state::LoadBalancerFamily::Gateway {
+            return Err(invalid_configuration(
+                "Security groups cannot be associated with a gateway load balancer".to_string(),
+            ));
+        }
+        // "You can't perform this operation on a Network Load Balancer unless you
+        // specified a security group for the load balancer when you created it."
+        if family == crate::state::LoadBalancerFamily::Network && carried_groups.is_empty() {
+            return Err(invalid_configuration(
+                "Security groups cannot be set on a network load balancer that was created \
+                 without one"
+                    .to_string(),
+            ));
+        }
+
+        // A security group governs traffic to the load balancer's network interfaces,
+        // which live in its own VPC: a group EC2 reports in another VPC can never be
+        // applied to them.
+        if let Some(vpc_id) = vpc_id.as_deref() {
+            if crate::state::network::has_foreign_security_group(
+                ctx,
+                &region,
+                vpc_id,
+                &input.security_groups,
+            )
+            .await
+            {
+                return Err(invalid_configuration(
+                    "One or more security groups are invalid".to_string(),
+                ));
+            }
+        }
+
+        let mut guard = state.lock();
+        // Looked up again because the lock was released for the EC2 read: the load
+        // balancer may have been deleted while it ran.
+        let Some(load_balancer) = guard.load_balancers.get_mut(&input.load_balancer_arn) else {
+            return Err(not_found(&input.load_balancer_arn));
+        };
+        load_balancer.security_groups = input.security_groups.clone();
+        if let Some(enforce) = input
+            .enforce_security_group_inbound_rules_on_private_link_traffic
+            .clone()
+        {
+            load_balancer.enforce_security_group_inbound_rules_on_private_link_traffic =
+                Some(enforce);
+        }
+
+        Ok(SetSecurityGroupsOutput {
+            // Read back off the record rather than echoed from the request, so the answer
+            // is what a later `DescribeLoadBalancers` reports.
+            security_group_ids: Some(load_balancer.security_groups.clone()),
+            enforce_security_group_inbound_rules_on_private_link_traffic: load_balancer
+                .enforce_security_group_inbound_rules_on_private_link_traffic(),
+        })
     }
+}
+
+/// The refusal a request carrying
+/// `EnforceSecurityGroupInboundRulesOnPrivateLinkTraffic` earns when the load balancer it
+/// names is not one the setting is available on, in the words Elastic Load Balancing
+/// words it.
+///
+/// A fixed sentence, because what the caller has to fix is WHICH load balancer the call
+/// is made on rather than anything about one value.
+const PRIVATE_LINK_SETTING_UNAVAILABLE: &str = "This security group setting for PrivateLink \
+     traffic is only available for Network Load Balancers with security groups";
+
+/// The modelled refusal for an ARN this store holds no load balancer for, with the
+/// message every operation addressing one load balancer answers
+/// (`crate::state::load_balancer_not_found_message`).
+fn not_found(arn: &str) -> SetSecurityGroupsError {
+    SetSecurityGroupsErrorModeled::LoadBalancerNotFoundException(LoadBalancerNotFoundException {
+        message: Some(crate::state::load_balancer_not_found_message(arn)),
+    })
+    .into()
+}
+
+/// The modelled "the requested configuration is not valid" refusal, for a request this
+/// operation's documented rules cannot apply. The message states the rule, because what
+/// the caller has to fix is which load balancer the call is made on or which members it
+/// carries rather than one value.
+fn invalid_configuration(detail: String) -> SetSecurityGroupsError {
+    SetSecurityGroupsErrorModeled::InvalidConfigurationRequestException(
+        InvalidConfigurationRequestException {
+            message: Some(detail),
+        },
+    )
+    .into()
 }

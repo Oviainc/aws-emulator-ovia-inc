@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutDataProtectionPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutDataProtectionPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutDataProtectionPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +67,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -166,20 +158,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutDataProtectionPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutDataProtectionPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutDataProtectionPolicy"))
+        // Argument validation, BEFORE the store is consulted: a `ResourceArn` that is
+        // not an ARN at all is bad input, not a topic that does not exist. Only the
+        // SHAPE is judged here — the same rule `GetDataProtectionPolicy` holds its own
+        // `ResourceArn` to, because this member is modelled as a `topicARN` too. An
+        // ARN-shaped value that names no topic of this account is left to the lookup
+        // below, which is this operation's modelled miss.
+        if let Some(message) = state::arn_refusal("ResourceArn", &input.resource_arn) {
+            return Err(
+                PutDataProtectionPolicyErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The document's one documented bound, held through the shared rule every write
+        // of a topic's data protection policy uses, so this write and the one
+        // `CreateTopic` carries cannot disagree about which documents fit. The model
+        // declares no constraint on the member, so the boundary validator does not judge
+        // it and the handler has to.
+        if let Some(message) = state::data_protection_policy_refusal(&input.data_protection_policy)
+        {
+            return Err(
+                PutDataProtectionPolicyErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(PutDataProtectionPolicyErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the SNS store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = store.lock();
+
+        // The policy is held BY the topic, so an ARN this account holds no topic under
+        // has nothing to write it to — the same 404 every other call that looks a topic
+        // up answers, and the store is left untouched on that path.
+        let Some(topic) = store.topics.get_mut(&input.resource_arn) else {
+            return Err(PutDataProtectionPolicyErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(state::TOPIC_DOES_NOT_EXIST.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "Adds or updates an inline policy document that is stored in the specified
+        // Amazon SNS topic": the document the request carries REPLACES whatever the topic
+        // held, byte for byte, so a later read reports the LAST write — including the
+        // empty document, which is one a caller chose rather than an absent one.
+        topic.data_protection_policy = Some(input.data_protection_policy);
+
+        // The modelled output is `Unit`: the acknowledgement is the 200 itself.
+        Ok(PutDataProtectionPolicyOutput)
     }
 }

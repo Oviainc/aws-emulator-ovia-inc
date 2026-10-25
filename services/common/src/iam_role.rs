@@ -35,6 +35,11 @@
 ///   assume;
 /// * its resource is not a `role/…`, or the role name is empty.
 ///
+/// An EMPTY account field reads as THIS account: several members' modelled patterns make
+/// that field optional (`RoleArn` of bedrock-agentcore-control is
+/// `^arn:aws(-[^:]+)?:iam::([0-9]{12})?:role/.+$`), and a value that names no account names
+/// no OTHER account either, so the role it names is one IAM can be asked about.
+///
 /// A malformed role ARN is usually refused by the modelled `@pattern` on the member before
 /// a handler runs; this reading is what says whether a WELL-FORMED one is this account's.
 #[must_use]
@@ -65,7 +70,7 @@ fn entity_name<'a>(value: &'a str, entity_type: &str) -> Option<&'a str> {
     if !arn.region.is_empty() {
         return None;
     }
-    if arn.account != ::emulator_server::emulator_account_id() {
+    if !arn.account.is_empty() && arn.account != ::emulator_server::emulator_account_id() {
         return None;
     }
     let name = arn
@@ -75,6 +80,56 @@ fn entity_name<'a>(value: &'a str, entity_type: &str) -> Option<&'a str> {
         .rsplit('/')
         .next()?;
     (!name.is_empty()).then_some(name)
+}
+
+/// Whether IAM ANSWERED that `role_arn` is a role `service_principal` cannot assume: it
+/// holds no such role of this account, or the trust policy the role carries does not admit
+/// that principal.
+///
+/// This is the whole question a service asks before it stores a resource that RUNS AS a
+/// caller-supplied role, stated once here so no service copies the three parts of it: which
+/// role of this account the ARN names ([`role_name`]), the in-process `GetRole`
+/// ([`crate::iam_client`]), and the trust-policy reading
+/// ([`crate::iam_trust_policy::admits_service_principal`]).
+///
+/// `false` — do not refuse — for everything that is NOT such an answer, because a refusal
+/// has to be grounded in what IAM said: a value that names no role of this account (another
+/// account's IAM is not this emulator's to ask), an answer this emulator could not read, and
+/// any failure other than IAM reporting that the role is absent, including an emulator with
+/// no IAM mounted at all. A caller that wants to SEE those cases asks this before it writes
+/// and reports what it wrote; this reading stays silent so the one question has one answer.
+pub async fn role_is_unassumable(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+    service_principal: &str,
+) -> bool {
+    let Some(role_name) = role_name(role_arn) else {
+        return false;
+    };
+    let answer = crate::iam_client::iam_client(ctx, region)
+        .get_role()
+        .role_name(role_name)
+        .send()
+        .await;
+    match answer {
+        // IAM reported the role: it is assumable only if the trust policy it carries
+        // admits the principal. A role with no readable grant is refused — that IS what
+        // IAM answered about it.
+        Ok(output) => match output.role() {
+            Some(role) => !role.assume_role_policy_document().is_some_and(|document| {
+                crate::iam_trust_policy::admits_service_principal(document, service_principal)
+                    .unwrap_or(false)
+            }),
+            // A 200 carrying no `role` member is this emulator failing to READ an answer,
+            // not IAM reporting a bad role, so it grounds no refusal.
+            None => false,
+        },
+        // IAM says this account holds no such role: the refusal is grounded.
+        Err(error) => error
+            .as_service_error()
+            .is_some_and(::aws_sdk_iam::operation::get_role::GetRoleError::is_no_such_entity_exception),
+    }
 }
 
 #[cfg(test)]
@@ -112,6 +167,13 @@ mod tests {
                 "a role name holding the characters IAM admits in one",
                 format!("arn:aws:iam::{account}:role/a_b-1+2=3,4.5@6"),
                 Some("a_b-1+2=3,4.5@6"),
+            ),
+            (
+                // The account field is optional in several modelled role-ARN patterns, and
+                // an ARN with it empty names no other account.
+                "a role ARN carrying no account",
+                "arn:aws:iam:::role/delivery".to_string(),
+                Some("delivery"),
             ),
             (
                 "another account",
