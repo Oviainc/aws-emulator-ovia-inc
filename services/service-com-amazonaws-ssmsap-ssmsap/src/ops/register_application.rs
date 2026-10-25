@@ -274,8 +274,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             id: input.application_id.clone(),
             app_type: input.application_type,
             arn: arn.clone(),
-            // Nothing registers an AppRegistry application here; see the field's docs.
-            app_registry_arn: None,
+            // Registering an application records it in AWS Service Catalog
+            // AppRegistry, so the registration assigns the AppRegistry application
+            // that records it: its id is the service's to mint, not the request's to
+            // carry, and its ARN is what `Application$AppRegistryArn` reports and what
+            // `GetApplication` resolves this application by.
+            app_registry_arn: crate::state::app_registry_arn(
+                &region,
+                &crate::state::new_app_registry_application_id(),
+            ),
             status: crate::state::APPLICATION_STATUS_REGISTERING.to_string(),
             discovery_status: crate::state::DISCOVERY_STATUS_REGISTERING.to_string(),
             // `StatusMessage` explains a failed status; a registration under way has
