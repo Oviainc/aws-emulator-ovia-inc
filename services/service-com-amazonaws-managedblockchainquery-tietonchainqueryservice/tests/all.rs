@@ -31,6 +31,8 @@ mod error_contract;
 mod error_response_shape;
 #[path = "all/finality_default.rs"]
 mod finality_default;
+#[path = "all/native_token_denomination.rs"]
+mod native_token_denomination;
 #[path = "all/response_fidelity.rs"]
 mod response_fidelity;
 #[path = "all/state_roundtrip.rs"]

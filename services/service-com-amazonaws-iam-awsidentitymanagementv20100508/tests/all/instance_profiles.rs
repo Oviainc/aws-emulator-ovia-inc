@@ -22,8 +22,9 @@
 //! a service-linked role cannot be bound into an instance profile.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use crate::role_lifecycle::{borrowed, optional, param, reported_tags};
+use crate::role_lifecycle::{borrowed, optional, param, reported_tags, router_on};
 use crate::user_lifecycle::{account_id, call, element, elements, error_code, router};
 
 /// A trust policy with a single statement, so `CreateRole` accepts the fixture roles the
@@ -317,22 +318,34 @@ async fn the_read_resolves_a_name_under_any_casing() {
 // ---------------------------------------------------------------------------
 
 /// A name the account holds no profile for is `NoSuchEntity` (HTTP 404), whatever shape
-/// the name takes — never an empty success.
+/// the name takes — never an empty success. A name an IAM ROLE exists under is still no
+/// instance profile.
 #[tokio::test]
 async fn reading_what_was_never_created_is_no_such_entity() {
     let router = router();
     let seed = vec![param("InstanceProfileName", "held-profile")];
     let (status, body) = call(&router, "CreateInstanceProfile", &borrowed(&seed)).await;
     assert_eq!(status, 200, "the fixture profile must be created, got {body}");
+    let (status, body) = call(
+        &router,
+        "CreateRole",
+        &[
+            ("RoleName", "role-without-profile"),
+            ("AssumeRolePolicyDocument", TRUST_POLICY),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200, "the fixture role must be created, got {body}");
 
     // Rows: a name nothing holds, a near-miss of the held one, a name in the alphabet's
-    // punctuation, and a long name.
+    // punctuation, a long name, and a name an IAM role — but no profile — exists under.
     let long_name = "p".repeat(128);
     let cases = [
         "never-created",
         "held-profile-2",
         "held@profile",
         long_name.as_str(),
+        "role-without-profile",
     ];
     for name in cases {
         let params = vec![param("InstanceProfileName", name)];
@@ -581,5 +594,96 @@ async fn a_reserved_tag_key_is_refused_and_creates_nothing() {
             "case {name:?}: a refused create must persist nothing, got {status} with body \
              {body}"
         );
+    }
+}
+
+/// An account holds a bounded number of instance profiles: at the quota a create is
+/// refused with the modelled `LimitExceededException` (HTTP 409), and one short of it
+/// still succeeds. The store is seeded directly, so the bound is exercised without a
+/// thousand wire calls.
+#[tokio::test]
+async fn the_account_instance_profile_quota_refuses_one_profile_too_many() {
+    use service_com_amazonaws_iam_awsidentitymanagementv20100508::{
+        state::MAX_INSTANCE_PROFILES_PER_ACCOUNT,
+        ComAmazonawsIamAwsidentitymanagementv20100508State,
+    };
+
+    for (case, seeded, expected_status) in [
+        (
+            "one short of the quota",
+            MAX_INSTANCE_PROFILES_PER_ACCOUNT - 1,
+            200,
+        ),
+        ("at the quota", MAX_INSTANCE_PROFILES_PER_ACCOUNT, 409),
+        (
+            "past the quota",
+            MAX_INSTANCE_PROFILES_PER_ACCOUNT + 1,
+            409,
+        ),
+    ] {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        {
+            let state = engine.state::<ComAmazonawsIamAwsidentitymanagementv20100508State>();
+            let mut store = state.lock();
+            for index in 0..seeded {
+                let name = format!("seeded-{index}");
+                store
+                    .instance_profiles
+                    .insert(name.to_ascii_lowercase(), seeded_profile(&name));
+            }
+        }
+        let router = router_on(engine);
+
+        let (status, body) = call(
+            &router,
+            "CreateInstanceProfile",
+            &[("InstanceProfileName", "one-more-profile")],
+        )
+        .await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: with {seeded} profiles held, expected HTTP {expected_status}, \
+             got {status}: {body}"
+        );
+        if expected_status == 200 {
+            assert_well_formed_id(case, &element(&body, "InstanceProfileId"));
+        } else {
+            assert_eq!(
+                error_code(&body),
+                "LimitExceeded",
+                "case {case:?}: expected the modelled awsQuery code, got {body}"
+            );
+            let (status, got) = call(
+                &router,
+                "GetInstanceProfile",
+                &[("InstanceProfileName", "one-more-profile")],
+            )
+            .await;
+            assert_eq!(
+                status, 404,
+                "case {case:?}: the refused create must persist nothing, got {status}: {got}"
+            );
+        }
+    }
+}
+
+/// One already-held instance profile, as the store holds it: the modelled profile every
+/// reader reports, with no role bound to it. Filled the way `CreateInstanceProfile`
+/// fills it, so a seeded profile is indistinguishable from a created one.
+fn seeded_profile(
+    name: &str,
+) -> service_com_amazonaws_iam_awsidentitymanagementv20100508::state::InstanceProfileRecord {
+    use service_com_amazonaws_iam_awsidentitymanagementv20100508::state;
+    state::InstanceProfileRecord {
+        profile: service_com_amazonaws_iam_awsidentitymanagementv20100508::ops::types::InstanceProfile {
+            path: "/".to_string(),
+            instance_profile_name: name.to_string(),
+            instance_profile_id: format!("AIPASEEDED{name}").replace('-', "_"),
+            arn: expected_arn("/", name),
+            create_date: state::now(),
+            roles: Vec::new(),
+            tags: None,
+        },
+        role_keys: Vec::new(),
     }
 }

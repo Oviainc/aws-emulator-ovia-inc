@@ -142,10 +142,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
         // "You can delete a target group if it is not referenced by any actions": a
-        // listener that forwards to it still needs it, so the delete is refused before
-        // anything is removed.
+        // listener that forwards to it — through its default actions or through one of
+        // its rules — still needs it, so the delete is refused before anything is
+        // removed.
         let referenced_by = guard.listeners_in_order().iter().find_map(|listener| {
-            crate::state::action_target_group_arns(&listener.default_actions)
+            listener
+                .forwarded_target_group_arns()
                 .contains(&input.target_group_arn)
                 .then(|| listener.arn.clone())
         });

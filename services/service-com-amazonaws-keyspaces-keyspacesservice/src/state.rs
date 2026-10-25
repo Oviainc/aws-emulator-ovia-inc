@@ -24,9 +24,32 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AutoScalingPolicy, AutoScalingSettings, AutoScalingSpecification, CapacitySpecification,
-    ClientSideTimestamps, Comment, EncryptionSpecification, FieldDefinition, PointInTimeRecovery,
-    ReplicaSpecification, ResourceNotFoundException, SchemaDefinition, Tag,
+    CdcSpecification, CdcSpecificationSummary, ClientSideTimestamps, Comment,
+    EncryptionSpecification, FieldDefinition, PointInTimeRecovery, ReplicaSpecification,
+    ResourceNotFoundException, SchemaDefinition, Tag,
     TargetTrackingScalingPolicyConfiguration, TimeToLive, WarmThroughputSpecification,
+};
+
+/// The CDC stream store, which the KeyspacesStreams service crate owns.
+///
+/// A table's change data capture stream is created by THIS control plane (`CreateTable`
+/// and `UpdateTable`, from their `cdcSpecification`) and reported by that data plane
+/// (`ListStreams`, `GetStream`, `GetShardIterator`, `GetRecords`), so there is ONE copy
+/// of a stream and both sides read and write it: [`cdc_stream_state`] is that store's
+/// handle in the shared engine, reached exactly the way [`service_state`] reaches this
+/// service's own.
+///
+/// A handler that needs both locks takes THIS SERVICE'S state first and the stream store
+/// second — one order everywhere, so two handlers can never wait on each other.
+pub use ::service_com_amazonaws_keyspacesstreams_keyspacesstreams::state::{
+    service_state as cdc_stream_state,
+    ComAmazonawsKeyspacesstreamsKeyspacesstreamsState as CdcStreamStore,
+    StreamEntry as CdcStreamEntry, MAX_STREAMS_PER_TABLE,
+    STATUS_TRANSITION_DELAY as CDC_STATUS_TRANSITION_DELAY,
+    STREAM_STATUS_DISABLED as CDC_STATUS_DISABLED,
+    STREAM_STATUS_DISABLING as CDC_STATUS_DISABLING,
+    STREAM_STATUS_ENABLED as CDC_STATUS_ENABLED,
+    STREAM_STATUS_ENABLING as CDC_STATUS_ENABLING,
 };
 
 /// The `cassandra` ARN namespace / SigV4 signing name of Amazon Keyspaces
@@ -131,6 +154,17 @@ pub const DEFAULT_ENCRYPTION_TYPE: &str = "AWS_OWNED_KMS_KEY";
 
 /// The encryption type that requires `kmsKeyIdentifier` as input.
 pub const CUSTOMER_MANAGED_ENCRYPTION_TYPE: &str = "CUSTOMER_MANAGED_KMS_KEY";
+
+/// The view type a table's CDC stream publishes when the `cdcSpecification` names none:
+/// "`NEW_AND_OLD_IMAGES` - both versions of the row, before and after the change. This
+/// is the default." (`CdcSpecification$viewType`).
+pub const DEFAULT_CDC_VIEW_TYPE: &str = "NEW_AND_OLD_IMAGES";
+
+/// `CdcPropagateTags` = `TABLE`: the value that makes a table's CDC stream inherit the
+/// table's tags (`CdcSpecification$propagateTags`, "Specifies that the stream inherits
+/// the tags from the table"). The enum's other value, `NONE`, inherits nothing, which
+/// is also what an absent member asks for.
+pub const CDC_PROPAGATE_TAGS_TABLE: &str = "TABLE";
 
 /// Point-in-time recovery is off unless `CreateTable` asks for it.
 pub const DEFAULT_POINT_IN_TIME_RECOVERY_STATUS: &str = "DISABLED";
@@ -509,8 +543,8 @@ pub fn new_tag_set(supplied: Option<&[Tag]>) -> Result<TagSet, TagRejection> {
     Ok(tags)
 }
 
-/// Which resource an Amazon Keyspaces ARN names: the two resource forms this service
-/// mints ([`keyspace_arn`], [`table_arn`]).
+/// Which resource an Amazon Keyspaces ARN names: the resource forms this service mints
+/// ([`keyspace_arn`], [`table_arn`]) and the CDC stream form it enables for a table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceRef {
     /// `arn:<partition>:cassandra:<region>:<account>:/keyspace/<name>/`.
@@ -525,6 +559,18 @@ pub enum ResourceRef {
         /// The table the ARN names.
         table_name: String,
     },
+    /// `arn:…:/keyspace/<ks>/table/<tbl>/stream/<label>`: the CDC stream of one table,
+    /// which is a taggable Amazon Keyspaces resource of its own
+    /// (`CdcSpecification$tags`, "the tags … you want to apply to the stream").
+    Stream {
+        /// The owning keyspace.
+        keyspace_name: String,
+        /// The table whose changes the stream captures.
+        table_name: String,
+        /// The stream's label, which is what distinguishes one of a table's streams
+        /// from another.
+        stream_label: String,
+    },
 }
 
 /// The resource an Amazon Keyspaces ARN names, or `None` when it names none this service
@@ -532,8 +578,10 @@ pub enum ResourceRef {
 ///
 /// The ARN's shape is modelled only as `^arn:(aws[a-zA-Z0-9-]*):cassandra:.+` (`ARN`), so
 /// everything after the service segment is parsed here. A keyspace and a table name
-/// cannot contain `/` (both are modelled `^[a-zA-Z0-9][a-zA-Z0-9_]{0,47}$`), which is
-/// what makes the two forms unambiguous: only the keyspace form ends in `/`.
+/// cannot contain `/` (both are modelled `^[a-zA-Z0-9][a-zA-Z0-9_]{0,47}$`), and neither
+/// can a stream label (a timestamp), which is what makes the three forms unambiguous:
+/// only the keyspace form ends in `/`, and only a stream's resource path carries
+/// `/stream/`.
 pub fn parse_resource_arn(arn: &str) -> Option<ResourceRef> {
     let mut segments = arn.splitn(6, ':');
     let scheme = segments.next()?;
@@ -553,22 +601,32 @@ pub fn parse_resource_arn(arn: &str) -> Option<ResourceRef> {
             },
         ),
         None => {
-            let (keyspace_name, table_name) = rest.split_once("/table/")?;
-            (!keyspace_name.is_empty()
-                && !keyspace_name.contains('/')
-                && !table_name.is_empty()
-                && !table_name.contains('/'))
-            .then(|| ResourceRef::Table {
-                keyspace_name: keyspace_name.to_string(),
-                table_name: table_name.to_string(),
-            })
+            let (keyspace_name, below) = rest.split_once("/table/")?;
+            if keyspace_name.is_empty() || keyspace_name.contains('/') {
+                return None;
+            }
+            match below.split_once("/stream/") {
+                Some((table_name, stream_label)) => (!table_name.is_empty()
+                    && !table_name.contains('/')
+                    && !stream_label.is_empty()
+                    && !stream_label.contains('/'))
+                .then(|| ResourceRef::Stream {
+                    keyspace_name: keyspace_name.to_string(),
+                    table_name: table_name.to_string(),
+                    stream_label: stream_label.to_string(),
+                }),
+                None => (!below.is_empty() && !below.contains('/')).then(|| ResourceRef::Table {
+                    keyspace_name: keyspace_name.to_string(),
+                    table_name: below.to_string(),
+                }),
+            }
         }
     }
 }
 
 /// The keyspace a resource ARN belongs to: the keyspace itself for a keyspace ARN, the
-/// owning keyspace for a table ARN, and `None` for an ARN that names no Amazon Keyspaces
-/// resource.
+/// owning keyspace for a table or CDC stream ARN, and `None` for an ARN that names no
+/// Amazon Keyspaces resource.
 ///
 /// What a caller may do to a resource is decided by its keyspace — a
 /// [service-managed][SERVICE_MANAGED_KEYSPACES] one takes no change at all — so the
@@ -576,8 +634,9 @@ pub fn parse_resource_arn(arn: &str) -> Option<ResourceRef> {
 /// than each re-parsing the ARN.
 pub fn arn_keyspace_name(resource_arn: &str) -> Option<String> {
     match parse_resource_arn(resource_arn)? {
-        ResourceRef::Keyspace { keyspace_name } => Some(keyspace_name),
-        ResourceRef::Table { keyspace_name, .. } => Some(keyspace_name),
+        ResourceRef::Keyspace { keyspace_name }
+        | ResourceRef::Table { keyspace_name, .. }
+        | ResourceRef::Stream { keyspace_name, .. } => Some(keyspace_name),
     }
 }
 
@@ -750,6 +809,19 @@ pub struct Table {
     /// This table's tags: what `CreateTable` attached, plus what `TagResource` added and
     /// `UntagResource` removed since.
     pub tags: TagSet,
+    /// The tags of each CDC stream this table has had, keyed by the stream's ARN: what
+    /// the `cdcSpecification` that enabled the stream applied to it
+    /// ([`new_stream_tag_set`]), plus what `TagResource` added and `UntagResource`
+    /// removed since.
+    ///
+    /// A stream is a resource of its own, addressed by its own ARN, so its tags cannot
+    /// live in `tags` above — and they live HERE rather than beside the stream in the
+    /// CDC stream store so that every tagging operation reaches them through the one
+    /// lookup it already uses ([`ComAmazonawsKeyspacesKeyspacesserviceState::resource_tags`]).
+    /// Bounded with the table, and by [`MAX_STREAMS_PER_TABLE`] entries per table, the
+    /// same cap the stream store applies: a stream ARN ends in the stream's label, a
+    /// timestamp, so dropping the first key drops the oldest stream's tags.
+    pub cdc_stream_tags: BTreeMap<String, TagSet>,
     /// The superseded revisions of the settings a point-in-time restore reproduces "based
     /// on the selected timestamp" — the schema and the TTL settings — newest last. Empty
     /// for a table whose schema and TTL settings have never changed since it was created,
@@ -1350,6 +1422,9 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
                             replica_specifications: BTreeMap::new(),
                             warm_throughput_specification: None,
                             tags: TagSet::new(),
+                            // Only a `cdcSpecification` creates a stream, and no call
+                            // ever carried one for a table the service owns.
+                            cdc_stream_tags: BTreeMap::new(),
                             superseded: Vec::new(),
                             restored_from: None,
                             earliest_known_settings: None,
@@ -1504,6 +1579,19 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
                 let table = self.keyspaces.get(&keyspace_name)?.tables.get(&table_name)?;
                 (table.resource_arn == resource_arn).then_some(&table.tags)
             }
+            // A stream answers for the tags its own ARN was registered with, so a label
+            // that names none of the table's streams reaches nothing here.
+            ResourceRef::Stream {
+                keyspace_name,
+                table_name,
+                ..
+            } => self
+                .keyspaces
+                .get(&keyspace_name)?
+                .tables
+                .get(&table_name)?
+                .cdc_stream_tags
+                .get(resource_arn),
         }
     }
 
@@ -1541,7 +1629,40 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
                     .get_mut(&table_name)?;
                 (table.resource_arn == resource_arn).then_some(&mut table.tags)
             }
+            ResourceRef::Stream {
+                keyspace_name,
+                table_name,
+                ..
+            } => self
+                .keyspaces
+                .get_mut(&keyspace_name)?
+                .tables
+                .get_mut(&table_name)?
+                .cdc_stream_tags
+                .get_mut(resource_arn),
         }
+    }
+}
+
+impl Table {
+    /// Register the tag set of a CDC stream the control plane has just enabled for this
+    /// table, under the stream's own ARN, and forget the tag set of every stream
+    /// `held_stream_arns` no longer names.
+    ///
+    /// A tag set belongs to a stream, and the CDC stream store caps how many streams one
+    /// table keeps ([`MAX_STREAMS_PER_TABLE`]) — so the pruning here is driven by the
+    /// ARNs that store still holds, not by a second cap of its own. That is what keeps
+    /// the two from drifting: `ListTagsForResource` can never answer for a stream
+    /// `GetStream` no longer knows.
+    pub fn register_stream_tags(
+        &mut self,
+        stream_arn: &str,
+        tags: TagSet,
+        held_stream_arns: &[String],
+    ) {
+        self.cdc_stream_tags.insert(stream_arn.to_string(), tags);
+        self.cdc_stream_tags
+            .retain(|arn, _| held_stream_arns.iter().any(|held| held == arn));
     }
 }
 
@@ -1724,6 +1845,76 @@ pub fn resolve_encryption(
         ));
     }
     Ok(encryption)
+}
+
+/// What a `cdcSpecification` asks the service to do with the table's CDC stream.
+#[derive(Debug, Clone)]
+pub struct ResolvedCdc {
+    /// Whether the table is to have a stream capturing its changes.
+    pub enabled: bool,
+    /// The `ViewType` that stream publishes, defaulted when the specification omits it.
+    /// It decides which images a record carries, which is fixed when the stream is
+    /// created ("After you create the stream, you can't make changes to this
+    /// selection"), so it says nothing about a table whose CDC is being turned off.
+    pub view_type: String,
+    /// "The tags (key-value pairs) that you want to apply to the stream"
+    /// (`CdcSpecification$tags`), exactly as supplied.
+    pub tags: Vec<Tag>,
+    /// Whether the stream also inherits the TABLE's tags
+    /// (`CdcSpecification$propagateTags` = [`CDC_PROPAGATE_TAGS_TABLE`]).
+    pub propagate_table_tags: bool,
+}
+
+/// What a `cdcSpecification` asks for, or `None` when the request carries none.
+///
+/// `CdcStatus` and `ViewType` are modelled enums, so the boundary validator has already
+/// refused a value outside either. What the model cannot state is which statuses ask for
+/// a capturing stream — `ENABLED`, and `ENABLING`, which is the status a stream already
+/// being brought up reports — and that the view type has a documented default.
+pub fn resolve_cdc(supplied: Option<&CdcSpecification>) -> Option<ResolvedCdc> {
+    let specification = supplied?;
+    Some(ResolvedCdc {
+        enabled: matches!(
+            specification.status.as_str(),
+            CDC_STATUS_ENABLED | CDC_STATUS_ENABLING
+        ),
+        view_type: specification
+            .view_type
+            .clone()
+            .unwrap_or_else(|| DEFAULT_CDC_VIEW_TYPE.to_string()),
+        tags: specification.tags.clone().unwrap_or_default(),
+        propagate_table_tags: specification.propagate_tags.as_deref()
+            == Some(CDC_PROPAGATE_TAGS_TABLE),
+    })
+}
+
+/// The tag set a table's CDC stream is created with: the tags the specification applies
+/// to the stream, onto the table's own tags when it asks to inherit them.
+///
+/// The per-resource tag rules are the ones every other tag set here follows
+/// ([`merge_tags`]): no reserved key, one tag per key, at most
+/// [`MAX_TAGS_PER_RESOURCE`] on the resource — the stream being a resource of its own,
+/// addressed by its own ARN.
+pub fn new_stream_tag_set(cdc: &ResolvedCdc, table_tags: &TagSet) -> Result<TagSet, TagRejection> {
+    let mut tags = match cdc.propagate_table_tags {
+        true => table_tags.clone(),
+        false => TagSet::new(),
+    };
+    merge_tags(&mut tags, &cdc.tags)?;
+    Ok(tags)
+}
+
+/// The `cdcSpecification` a report of a table carries, from the stream the CDC stream
+/// store holds for it: its status and the view type it publishes.
+///
+/// Derived on read, never stored twice: a table's CDC status IS its stream's
+/// `StreamStatus` (the two enums carry the same four values), so the control plane keeps
+/// no copy that could disagree with what KeyspacesStreams reports.
+pub fn cdc_specification_summary(stream: &CdcStreamEntry) -> CdcSpecificationSummary {
+    CdcSpecificationSummary {
+        status: stream.stream_status.clone(),
+        view_type: Some(stream.stream_view_type.clone()),
+    }
 }
 
 /// Check that the schema's roles and columns agree: every key and static column

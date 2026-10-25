@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpgradeReviewTemplateLensReview
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpgradeReviewTemplateLensReview`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpgradeReviewTemplateLensReview::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Upgrades ONE lens review of ONE review template: the review is against the lens
+//! VERSION the lens was applied to the template at, and this moves it to the lens's
+//! LATEST published version — which is what makes the review `CURRENT` again
+//! (`ReviewTemplateLensReview$LensStatus`) and clears the template's own
+//! `LENS_NOT_CURRENT` update status. A review already against that version has nothing to
+//! move, so the upgrade changes nothing and still answers its empty success; a lens this
+//! emulator holds no content for has no version to move a review to.
+//!
+//! A lens review exists exactly while the lens is applied to the template, so a lens the
+//! template does not apply resolves to the same modelled 404 as a template ARN nothing is
+//! stored under.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +187,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpgradeReviewTemplateLensReview` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpgradeReviewTemplateLensReviewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpgradeReviewTemplateLensReview"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpgradeReviewTemplateLensReviewErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Well-Architected Tool review template store is unavailable"
+                        .to_string(),
+                },
+            )
+        })?;
+
+        let now = std::time::SystemTime::now();
+        // `ClientRequestToken` is the `@idempotencyToken` whose rule is "if you retry a
+        // request with the same client request token and the same parameters after the
+        // original request has completed successfully, the result of the original request
+        // is returned" (its own doc). The parameters besides the token are the two labels
+        // this request names, with the lens taken as the review it names rather than as
+        // the spelling it was named by — a lens review is one review however the request
+        // spells its lens (`crate::state::lens_alias`), so a retry that names it the other
+        // way is the same request.
+        let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
+            "LensAlias": crate::state::lens_alias(&input.lens_alias),
+            "TemplateArn": &input.template_arn,
+        }));
+
+        let mut store = state.lock();
+
+        // Read BEFORE anything is resolved or written: the original request already
+        // completed, and re-running it would move the review again if another version has
+        // been published since — which is not the original request's result.
+        if let Some(client_request_token) = input.client_request_token.as_deref() {
+            match store
+                .upgrade_review_template_lens_review_tokens
+                .get(client_request_token)
+            {
+                Some(spent) if spent.fingerprint == fingerprint => {
+                    return Ok(UpgradeReviewTemplateLensReviewOutput)
+                }
+                Some(spent) => {
+                    let resource_id = spent.resource_id.clone();
+                    return Err(
+                        UpgradeReviewTemplateLensReviewErrorModeled::ConflictException(
+                            crate::state::idempotency_token_conflict(
+                                crate::state::REVIEW_TEMPLATE_RESOURCE_TYPE,
+                                resource_id,
+                                client_request_token,
+                            ),
+                        )
+                        .into(),
+                    );
+                }
+                None => {}
+            }
+        }
+
+        // The version this upgrade moves the review to: the lens's latest published
+        // version, read off the lens catalog before the template is taken for writing. A
+        // lens this emulator holds no content for has none, and a review of it is against
+        // no version either, so there is nothing to move.
+        let latest = store
+            .latest_lens_version(&input.lens_alias)
+            .map(str::to_string);
+
+        let template = store
+            .review_templates
+            .get_mut(&input.template_arn)
+            .ok_or_else(|| {
+                UpgradeReviewTemplateLensReviewErrorModeled::ResourceNotFoundException(
+                    crate::state::review_template_not_found(&input.template_arn),
+                )
+            })?;
+
+        // A lens review of a template exists only while that lens is applied to it, so a
+        // lens the template does not carry has no review to upgrade.
+        if !template.applies_lens(&input.lens_alias) {
+            return Err(
+                UpgradeReviewTemplateLensReviewErrorModeled::ResourceNotFoundException(
+                    crate::state::review_template_lens_review_not_found(
+                        &template.template_arn,
+                        &input.lens_alias,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // The version the review REPORTS: the one it pins, or the lens's latest where it
+        // pins none — the same reading `crate::state::ReviewedLens` is resolved for, so
+        // the upgrade moves the review exactly when a read of it would answer a version
+        // other than the lens's latest. A review already against that version is already
+        // upgraded, and a lens with no published version here has none to move a review
+        // to: either way there is nothing to write, so nothing records an update that
+        // moved no review, and nothing clears a pin the lens's catalog cannot answer for.
+        // Compared BEFORE the review is taken for writing, so an upgrade with nothing to
+        // move materialises no record either and leaves every instant the review reports
+        // where it was.
+        let reported = template
+            .lens_review_version(&input.lens_alias)
+            .or(latest.as_deref());
+        if latest.is_some() && reported != latest.as_deref() {
+            let review = template.lens_review_record_mut(&input.lens_alias, now);
+            review.lens_version = latest;
+            // The upgrade is a write to the lens review, and through its version to the
+            // template's own update status, so both report this instant as the one they
+            // were last updated at — exactly as recording an answer against the template
+            // does.
+            review.updated_at = now;
+            template.updated_at = now;
+        }
+
+        // Recorded only now the upgrade has COMPLETED SUCCESSFULLY: a refused request has
+        // no result to replay, so the token it carried is still free. A request that
+        // carries no token asks for no replay — the Amazon Web Services SDKs generate one,
+        // and a caller that sends none gets none invented for it.
+        if let Some(client_request_token) = input.client_request_token {
+            store.upgrade_review_template_lens_review_tokens.remember(
+                client_request_token,
+                crate::state::CompletedUpgradeToken {
+                    resource_id: input.template_arn,
+                    fingerprint,
+                },
+            );
+        }
+
+        Ok(UpgradeReviewTemplateLensReviewOutput)
     }
 }

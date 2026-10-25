@@ -5172,6 +5172,44 @@ pub fn image_does_not_exist(image_arn: &str) -> String {
     format!("Image with ARN {image_arn} does not exist")
 }
 
+/// The message a `ResourceNotFound` carries for an image version the request identifies
+/// by its number but no store holds: that version's own ARN inside the sentence this
+/// service refuses a missing resource with, the way [`image_does_not_exist`] carries the
+/// image's.
+///
+/// Stated once so every refusal that reports a MISSING IMAGE VERSION words it the same
+/// way: the `DescribeImageVersion` reader and the `DeleteImageVersion` that resolves the
+/// same `Version`.
+pub fn image_version_does_not_exist(version_arn: &str) -> String {
+    format!("ImageVersion with ARN {version_arn} does not exist")
+}
+
+/// The message a `ResourceNotFound` carries when the image IS stored and the request's
+/// selection determines no version ARN — an alias attached to none of its versions, or a
+/// request for the latest version of an image that holds none: what could not be resolved
+/// beside the image's ARN.
+///
+/// Stated once so `DescribeImageVersion`, whose alias and latest-version selections this
+/// serves, and the `DeleteImageVersion` that resolves the same alias word it the same way.
+pub fn image_version_not_resolved(image_arn: &str, selector: &str) -> String {
+    format!("Could not find {selector} of image \"{image_arn}\".")
+}
+
+/// The ARN a version of `image_name` numbered `version` carries in `region`.
+///
+/// The modelled `ImageVersionArn` pattern spells the image name in lowercase
+/// (`image-version/[a-z0-9]([-.]?[a-z0-9])*/[0-9]+`) where the image ARN's keeps the
+/// name's own case, so the name is lowercased for this ARN only. Stated once so the
+/// create that mints a version and the readers and the delete that name one in a refusal
+/// build the same ARN.
+pub fn image_version_arn(region: &str, image_name: &str, version: i32) -> String {
+    resource_arn(
+        region,
+        "image-version",
+        &format!("{}/{version}", image_name.to_lowercase()),
+    )
+}
+
 /// A custom SageMaker AI image created by `CreateImage`, as `DescribeImage` replays it
 /// and `CreateImageVersion` reads it.
 ///
@@ -5328,17 +5366,31 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// the app naming an image nothing holds.
     pub fn app_running_on_image(&self, image_name: &str) -> Option<&str> {
         let image_arn = self.images.get(image_name).map(|image| image.arn.as_str())?;
+        self.apps
+            .values()
+            .find_map(|app| {
+                let spec = app.resource_spec.as_ref()?;
+                (spec.sage_maker_image_arn.as_deref() == Some(image_arn))
+                    .then_some(app.arn.as_str())
+            })
+            .or_else(|| {
+                self.versions_of(image_name)
+                    .find_map(|version| self.app_running_on_image_version(&version.arn))
+            })
+    }
+
+    /// The ARN of a Studio app launched on the image VERSION whose ARN is `version_arn`,
+    /// or `None` when no stored app names it.
+    ///
+    /// An app keeps the spec it launched with (`CreateApp` stores it verbatim), so an app
+    /// in the store is one still running on that version: releasing the version would
+    /// leave the app naming a version nothing holds. This is what `DeleteImageVersion`
+    /// refuses on, and the version half of what [`Self::app_running_on_image`] answers.
+    pub fn app_running_on_image_version(&self, version_arn: &str) -> Option<&str> {
         self.apps.values().find_map(|app| {
             let spec = app.resource_spec.as_ref()?;
-            let names_image = spec.sage_maker_image_arn.as_deref() == Some(image_arn);
-            let names_version = spec
-                .sage_maker_image_version_arn
-                .as_deref()
-                .is_some_and(|version_arn| {
-                    self.versions_of(image_name)
-                        .any(|version| version.arn == version_arn)
-                });
-            (names_image || names_version).then_some(app.arn.as_str())
+            (spec.sage_maker_image_version_arn.as_deref() == Some(version_arn))
+                .then_some(app.arn.as_str())
         })
     }
 }

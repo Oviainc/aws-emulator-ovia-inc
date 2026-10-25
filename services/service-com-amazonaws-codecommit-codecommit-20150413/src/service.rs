@@ -71,7 +71,11 @@ const GIT_HOST_LABEL: &str = "git-codecommit";
 /// `pub(crate)` because a modeled handler whose CPU-bound work also runs under the
 /// store lock uses the same construct for the same reason: a merge evaluation
 /// (`crate::ops::get_merge_options`) compares two tree snapshots and may merge
-/// file content, holding the guard it reads them through for that whole span.
+/// file content, and a merge that WRITES its result
+/// (`crate::ops::create_unreferenced_merge_commit`, through `crate::state::merge`)
+/// walks history and runs a diff3 over whole blobs — each holding the guard it
+/// reads them through for that whole span, so each takes this function plus its
+/// own wall-clock deadline.
 pub(crate) fn off_the_async_worker<T>(work: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
         Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
@@ -185,6 +189,17 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
             "InvalidFileModeException",
             "The specified file mode permission is not valid.",
         ),
+        // `fileMode` is also a member of the nested `SetFileModeEntry` and
+        // `ReplaceContentEntry` of a merge's `conflictResolution`, where it is the
+        // path's LEAF rather than its top-level member.
+        (_, _) if leaf == "fileMode" && missing => (
+            "FileModeRequiredException",
+            "A file mode is required to update mode permissions for a file.",
+        ),
+        (_, ViolationKind::EnumValue(_)) if leaf == "fileMode" => (
+            "InvalidFileModeException",
+            "The specified file mode permission is not valid.",
+        ),
         ("parentCommitId", _) if missing => (
             "ParentCommitIdRequiredException",
             "A parent commit ID is required.",
@@ -256,6 +271,16 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
             "InvalidSortByException",
             "The specified sort by value is not valid.",
         ),
+        // The merge members. Each error is the one the merge operations model for
+        // that member, with that shape's own documented sentence.
+        ("mergeOption", _) if missing => (
+            "MergeOptionRequiredException",
+            "A merge option or stategy is required, and none was provided.",
+        ),
+        ("mergeOption", _) => (
+            "InvalidMergeOptionException",
+            "The specified merge option is not valid for this operation. Not all merge strategies are supported for all operations.",
+        ),
         ("conflictDetailLevel", ViolationKind::EnumValue(_)) => (
             "InvalidConflictDetailLevelException",
             "The specified conflict detail level is not valid.",
@@ -263,6 +288,16 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
         ("conflictResolutionStrategy", ViolationKind::EnumValue(_)) => (
             "InvalidConflictResolutionStrategyException",
             "The specified conflict resolution strategy is not valid.",
+        ),
+        // `replacementType` is a member of the nested `ReplaceContentEntry`, so it
+        // is the path's LEAF rather than its top-level member.
+        (_, _) if leaf == "replacementType" && missing => (
+            "ReplacementTypeRequiredException",
+            "A replacement type is required.",
+        ),
+        (_, ViolationKind::EnumValue(_)) if leaf == "replacementType" => (
+            "InvalidReplacementTypeException",
+            "Automerge was specified for resolving the conflict, but the specified replacement type is not valid.",
         ),
         ("order", ViolationKind::EnumValue(_)) => (
             "InvalidOrderException",
@@ -494,22 +529,56 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             req.body().bytes(),
         ) {
             (Some(state), Some(body)) => {
-                let content_encoding = req.headers().get("content-encoding");
-                // OFF THE ASYNC WORKER. Reading a pack (inflate, delta
-                // resolution) and projecting a push are CPU-bound, and they hold
-                // this service's store lock for their whole span, so they must not
-                // occupy a runtime worker: `block_in_place` hands the current task
-                // its own thread and lets the runtime keep serving every other
-                // request while this one runs. This hook is synchronous — the
-                // vendored router calls it from `dispatch` — so there is no
-                // `spawn_blocking(..).await` to use instead; `block_in_place` is
-                // the construct for exactly that case. It exists only on a
-                // multi-thread runtime, which is the one the emulator boots, so a
-                // current-thread runtime (a `#[tokio::test]`, say) runs the work
-                // inline, where there is no other worker to protect.
-                off_the_async_worker(|| {
-                    git_http::serve(&mut state.lock(), &request, content_encoding, body)
-                })
+                // BOUNDED BEFORE ANYTHING IS READ. The body is caller-supplied and
+                // the work below is inflate and delta resolution over it, so the raw
+                // body is refused above the size this transport could accept at all
+                // ([`git_http::MAX_REQUEST_BODY_BYTES`]) before it is decoded, before
+                // the store guard is taken and before a single byte is expanded.
+                if body.len() > git_http::MAX_REQUEST_BODY_BYTES {
+                    git_http::Response::text(
+                        413,
+                        &format!(
+                            "the request body is larger than the {} bytes this emulator accepts",
+                            git_http::MAX_REQUEST_BODY_BYTES
+                        ),
+                    )
+                } else {
+                    let content_encoding = req.headers().get("content-encoding");
+                    // OFF THE ASYNC WORKER, and OUTSIDE the store guard. Undoing the
+                    // body's `Content-Encoding` is caller-driven CPU over
+                    // caller-supplied bytes, bounded by its own inflated-size
+                    // ceiling, and it needs no store at all — so it runs before the
+                    // lock is taken and holds nothing while it runs.
+                    match off_the_async_worker(|| {
+                        git_http::decode_body(content_encoding, body)
+                    }) {
+                        // OFF THE ASYNC WORKER. Reading a pack (inflate, delta
+                        // resolution) and projecting a push are CPU-bound, and they
+                        // hold this service's store lock for their whole span, so
+                        // they must not occupy a runtime worker: `block_in_place`
+                        // hands the current task its own thread and lets the runtime
+                        // keep serving every other request while this one runs. This
+                        // hook is synchronous — the vendored router calls it from
+                        // `dispatch` — so there is no `spawn_blocking(..).await` to
+                        // use instead; `block_in_place` is the construct for exactly
+                        // that case. It exists only on a multi-thread runtime, which
+                        // is the one the emulator boots, so a current-thread runtime
+                        // (a `#[tokio::test]`, say) runs the work inline, where there
+                        // is no other worker to protect.
+                        //
+                        // Each phase under the guard carries its own wall-clock
+                        // deadline and its own quantity bounds — the pack reader's
+                        // (`git_pack::MAX_PACK_SECONDS`, `MAX_PACK_BYTES`,
+                        // `MAX_PACK_OBJECTS`, `MAX_PACK_INFLATED_BYTES`) and the
+                        // push projection's (`crate::state::MAX_PROJECTION_SECONDS`
+                        // and its budget) — so the span the lock is held for is
+                        // bounded whatever the body carries.
+                        Ok(decoded) => off_the_async_worker(|| {
+                            git_http::serve(&mut state.lock(), &request, &decoded)
+                        }),
+                        Err(message) => git_http::Response::text(400, &message),
+                    }
+                }
             }
             (None, _) => git_http::Response {
                 status: 500,

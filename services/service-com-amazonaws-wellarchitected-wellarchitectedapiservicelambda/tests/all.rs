@@ -120,6 +120,9 @@ mod review_template_lens_review;
 #[path = "all/review_template_lens_review_reads.rs"]
 mod review_template_lens_review_reads;
 
+#[path = "all/review_template_lens_review_upgrade.rs"]
+mod review_template_lens_review_upgrade;
+
 #[path = "all/review_template_listing.rs"]
 mod review_template_listing;
 
@@ -158,6 +161,9 @@ mod workload_profile_association;
 
 #[path = "all/workload_profile_disassociation.rs"]
 mod workload_profile_disassociation;
+
+#[path = "all/workload_profile_upgrade.rs"]
+mod workload_profile_upgrade;
 
 #[path = "all/workload_region_invariant.rs"]
 mod workload_region_invariant;

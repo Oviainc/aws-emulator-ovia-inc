@@ -16,11 +16,13 @@
 //! starts, `VerifyPhoneNumber` completes and `GetContactInformation` reports as
 //! `VerificationStatus` ([`PhoneNumberVerification`]).
 //!
-//! Account Management operations all take an OPTIONAL `AccountId`: absent, the
+//! Most Account Management operations take an OPTIONAL `AccountId`: absent, the
 //! call lands on "the Amazon Web Services account of the identity used to call
 //! the operation" — which for this emulator is
-//! [`::emulator_server::emulator_account_id`]. So a standalone call and a
-//! management-account call that names that same id land on ONE record.
+//! [`::emulator_server::emulator_account_id`]. Present, it names a MEMBER
+//! account of the caller's organization, which the caller's own account is not:
+//! that is [`target_account_id`], the one resolution every operation taking an
+//! account id goes through.
 //!
 //! The GovCloud slice hangs off that record too:
 //! [`Account::gov_cloud_account`] holds the GovCloud account linked to the
@@ -1097,11 +1099,23 @@ pub fn default_account_id() -> &'static str {
     ::engine::emulator_account_id()
 }
 
-/// The account id a request operates on: the one it names, else the caller's own.
-pub fn resolve_account_id(requested: Option<&str>) -> String {
-    requested
-        .map(str::to_string)
-        .unwrap_or_else(|| default_account_id().to_string())
+/// The account id a request with an OPTIONAL account-id member operates on: the
+/// member is absent, so the call is the standalone one on the caller's own
+/// account ([`default_account_id`]), or it names a member account of the
+/// caller's organization.
+///
+/// `Err` when the member names the caller's OWN account: every account-id member
+/// of this service documents that "the management account can't specify its own
+/// `AccountId`; it must call the operation in standalone context by not
+/// including the `AccountId` parameter", so that request is refused
+/// ([`cannot_target_own_account`]) rather than answered as the standalone call
+/// it is not.
+pub fn target_account_id(requested: Option<&str>) -> Result<String, AccessDeniedException> {
+    match requested {
+        None => Ok(default_account_id().to_string()),
+        Some(named) if named == default_account_id() => Err(cannot_target_own_account()),
+        Some(named) => Ok(named.to_string()),
+    }
 }
 
 /// The `AccessDeniedException` payload for an account the caller may not read.
@@ -1229,17 +1243,18 @@ pub fn primary_email_already_in_use() -> ConflictException {
     }
 }
 
-/// The `AccessDeniedException` payload for a primary email update operation
-/// (`StartPrimaryEmailUpdate`, `AcceptPrimaryEmailUpdate`) whose `AccountId` is
-/// the caller's own account.
+/// The `AccessDeniedException` payload for a request whose account-id member
+/// names the caller's own account.
 ///
-/// The model's own `AccountId` documentation states the rule: the operation "can
-/// only be called from the management account or the delegated administrator
-/// account of an organization for a member account", and "the management account
-/// can't specify its own `AccountId`". The message names no account id, so it is
-/// the same sentence whichever account the caller is, and it names neither the
-/// operation nor whether that operation reads or writes — the rule is the same
-/// for a read of a member account (`GetPrimaryEmail`) as for a write of one.
+/// The model's own documentation of every account-id member states the rule: the
+/// member names "a member account in the same organization", and "the management
+/// account can't specify its own `AccountId`; it must call the operation in
+/// standalone context by not including the `AccountId` parameter". The message
+/// names no account id, so it is the same sentence whichever account the caller
+/// is, and it names neither the operation nor whether that operation reads or
+/// writes — the rule is the same for a read of a member account as for a write
+/// of one, and the same for a member that is required as for one that is
+/// optional ([`target_account_id`]).
 pub fn cannot_target_own_account() -> AccessDeniedException {
     AccessDeniedException {
         message: "The operation failed because the management account can't specify its own \

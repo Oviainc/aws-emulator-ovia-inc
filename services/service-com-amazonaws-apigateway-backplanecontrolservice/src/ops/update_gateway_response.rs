@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateGatewayResponse
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateGatewayResponse`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateGatewayResponse::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies every entry of `patchOperations` to the gateway response the request's
+//! `(restApiId, responseType)` names, in request order, and reports the updated record —
+//! so a later `GetGatewayResponse` of that type reports exactly what the patch set.
+//!
+//! An API has a gateway response for EVERY modelled `GatewayResponseType` from the moment
+//! it is created (the one API Gateway generates, until a developer customizes it), so a
+//! response type this API holds no customization for is patched from that generated
+//! record ([`crate::state::default_gateway_response`]) rather than refused — which is how
+//! the published guidance customizes `DEFAULT_4XX`. What the patch produces is a
+//! customization, so it is stored and reported with `defaultResponse: false`, exactly as
+//! `PutGatewayResponse` stores one.
 //!
 //! ## Shape of an operation
 //!
@@ -97,6 +100,135 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    patch_string_map, Patch, PatchFailure, PatchOpKind, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
+};
+
+/// The `path` values `UpdateGatewayResponse` accepts: one per updateable member of the
+/// `GatewayResponse` shape. `responseType` is the response's identity — it is the URI
+/// label that addresses this very record — so it is reported but not patchable, the way
+/// `UpdateMethodResponse` treats a method response's `statusCode`; `defaultResponse` is
+/// the service's own report of whether the response is generated or customized, not a
+/// member a caller sets.
+const SUPPORTED_PATHS: &[&str] = &[
+    "/responseParameters/<parameter-name>",
+    "/responseTemplates/<content-type>",
+    "/statusCode",
+];
+
+/// Apply one patch to a COPY of the gateway response `response_type` reports.
+///
+/// `statusCode` is single-valued and the other two members are MAPS, so a path addressing
+/// one of them names ONE entry (`/responseTemplates/application~1json`), and the edit is
+/// the service's shared map-patch semantics ([`patch_string_map`]): `add` and `replace`
+/// set the entry, `remove` drops it, and `move`/`copy`/`test` name nothing on such a
+/// member.
+fn apply_patch(
+    entry: &mut GetGatewayResponseOutput,
+    patch: &Patch,
+    response_type: &str,
+) -> Result<(), PatchFailure> {
+    match patch.member() {
+        // "The HTTP status code for this GatewayResponse"
+        // (`GatewayResponse$statusCode`), typed `StatusCode` and so constrained to
+        // `^[1-5]\d\d$` — a constraint a patch `value` reaches the handler unvalidated
+        // against, since it is a bare string on the wire.
+        "statusCode" => {
+            patch.require_single_valued()?;
+            match patch.op {
+                PatchOpKind::Add | PatchOpKind::Replace => {
+                    let value = patch.require_value()?;
+                    if !crate::state::is_status_code(value) {
+                        return Err(PatchFailure::BadRequest(format!(
+                            "{} must satisfy the pattern ^[1-5]\\d\\d$, got {value:?}",
+                            patch.path
+                        )));
+                    }
+                    entry.status_code = Some(value.to_string());
+                }
+                // A gateway response carries the status code of its response type
+                // wherever that type has one, which is the rule `PutGatewayResponse`
+                // resolves an absent `statusCode` by: dropping the customized code
+                // restores the generated one, and for the two types that have none
+                // (`DEFAULT_4XX`, `DEFAULT_5XX`) leaves the member unset.
+                PatchOpKind::Remove => {
+                    entry.status_code =
+                        crate::state::default_gateway_status_code(response_type).map(str::to_string);
+                }
+                _ => return Err(patch.unsupported_op()),
+            }
+            Ok(())
+        }
+        // "Response parameters (paths, query strings and headers) of the GatewayResponse
+        // as a string-to-string map of key-value pairs"
+        // (`GatewayResponse$responseParameters`). The key is a mapping expression the
+        // model types as a bare `String` with no pattern, so it is stored as given — the
+        // rule `PutGatewayResponse` stores one by.
+        "responseParameters" => {
+            let name = crate::state::bounded_map_key(patch, 1)?;
+            let mut parameters = crate::state::ordered_map(entry.response_parameters.take());
+            patch_string_map(
+                &mut parameters,
+                patch,
+                name,
+                MAX_COLLECTION_ENTRIES,
+                MAX_STRING_CHARS,
+            )?;
+            entry.response_parameters = crate::state::stored_map(parameters);
+            Ok(())
+        }
+        // "Response templates of the GatewayResponse as a string-to-string map of
+        // key-value pairs" (`GatewayResponse$responseTemplates`), keyed by the content
+        // type the template renders; a `/` in that content type is escaped `~1` the way a
+        // JSON Pointer requires.
+        "responseTemplates" => {
+            let content_type = crate::state::bounded_map_key(patch, 1)?;
+            let mut templates = crate::state::ordered_map(entry.response_templates.take());
+            patch_string_map(
+                &mut templates,
+                patch,
+                content_type,
+                MAX_COLLECTION_ENTRIES,
+                MAX_STRING_CHARS,
+            )?;
+            entry.response_templates = crate::state::stored_map(templates);
+            Ok(())
+        }
+        _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
+    }
+}
+
+/// The modelled failure for a patch this operation cannot apply.
+fn patch_failure(failure: PatchFailure) -> UpdateGatewayResponseError {
+    match failure {
+        PatchFailure::BadRequest(message) => {
+            UpdateGatewayResponseErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::NotFound(message) => {
+            UpdateGatewayResponseErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::Conflict(message) => {
+            UpdateGatewayResponseErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
+}
+
+/// Refuse a request naming a record that does not exist, with the message this service
+/// shares for that identifier.
+fn not_found(message: &str) -> UpdateGatewayResponseError {
+    UpdateGatewayResponseErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -170,18 +302,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateGatewayResponse` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateGatewayResponseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The list is read BEFORE the store lock is taken, so a malformed patch never
+        // reaches the records at all.
+        let patches =
+            crate::state::parse_patches(input.patch_operations.as_ref()).map_err(patch_failure)?;
+
+        let mut store = state.lock();
+        let api = store
+            .rest_apis
+            .get_mut(&input.rest_api_id)
+            .ok_or_else(|| not_found(&crate::state::no_such_rest_api(&input.rest_api_id)))?;
+
+        // The record the API reports for this type today: its customization, or the
+        // response API Gateway generates for the type while there is none. The response
+        // type itself is a path label the model constrains to the `GatewayResponseType`
+        // enum, so the boundary validator has already refused anything outside it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateGatewayResponse"))
+        // Patched on a COPY: a list whose later op is refused leaves the stored response
+        // untouched, rather than keeping the ops before it.
+        let mut updated = api
+            .gateway_responses
+            .get(&input.response_type)
+            .cloned()
+            .unwrap_or_else(|| crate::state::default_gateway_response(&input.response_type));
+
+        for patch in &patches {
+            apply_patch(&mut updated, patch, &input.response_type).map_err(patch_failure)?;
+        }
+
+        // A request that asks for no edit changes nothing — so an uncustomized type is
+        // still reported as the generated response afterwards — while an applied patch
+        // makes the record a developer's customization, which is what `defaultResponse`
+        // reports.
+        if !patches.is_empty() {
+            updated.default_response = false;
+            api.gateway_responses
+                .insert(input.response_type.clone(), updated.clone());
+        }
+
+        // The stored record IS the model's `GatewayResponse`, so the update reports it
+        // exactly as `GetGatewayResponse` will read it back.
+        Ok(UpdateGatewayResponseOutput {
+            response_type: updated.response_type,
+            status_code: updated.status_code,
+            response_parameters: updated.response_parameters,
+            response_templates: updated.response_templates,
+            default_response: updated.default_response,
+        })
     }
 }

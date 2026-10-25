@@ -24,6 +24,10 @@ use service_com_amazonaws_managedblockchainquery_tietonchainqueryservice::state:
     ComAmazonawsManagedblockchainqueryTietonchainqueryserviceState as Ledgers, HoldingKey,
     StoredHolding, StoredTransaction,
 };
+
+use crate::native_token_denomination::{
+    amount_decimals, amount_units, holding_decimals, native_event_token,
+};
 use service_com_amazonaws_managedblockchainquery_tietonchainqueryservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -343,8 +347,13 @@ pub(crate) fn event_holding(event: &Value) -> Option<(Option<String>, Option<Str
     }
 }
 
-/// `GetTokenBalance` for one holding, as of `at` (or now when absent), as an integer —
-/// or `None` when the ledger knows no balance for it at that instant (a 404).
+/// `GetTokenBalance` for one holding, as of `at` (or now when absent), in the token's
+/// SMALLEST unit — or `None` when the ledger knows no balance for it at that instant (a
+/// 404).
+///
+/// A balance is quoted in the token's own unit (`native_token_denomination.rs` pins that
+/// rule), so the reported text is converted back to smallest units here: that is the
+/// quantity the ledger holds and the one an arithmetic row can be checked against.
 pub(crate) async fn balance_or_none(
     emulator: &Emulator,
     network: &str,
@@ -360,13 +369,16 @@ pub(crate) async fn balance_or_none(
     }
     let (status, reply) = emulator.post("/get-token-balance", &body).await;
     match status {
-        200 => Some(
-            reply["balance"]
+        200 => {
+            let text = reply["balance"]
                 .as_str()
-                .unwrap_or_else(|| panic!("case {body}: balance is required, got {reply:?}"))
-                .parse()
-                .unwrap_or_else(|error| panic!("case {body}: balance is not an integer: {error}")),
-        ),
+                .unwrap_or_else(|| panic!("case {body}: balance is required, got {reply:?}"));
+            Some(
+                amount_units(text, holding_decimals(key)).unwrap_or_else(|| {
+                    panic!("case {body}: balance {text:?} is not an amount of the token")
+                }),
+            )
+        }
         404 => None,
         other => panic!("case {body}: expected 200 or 404, got {other} with {reply:?}"),
     }
@@ -962,29 +974,39 @@ async fn list_transaction_events_returns_the_stored_events_in_emission_order() {
                     Some(stored.transaction_hash.as_str()),
                     "case {case} event {position}: expected the transaction's hash, got {event:?}"
                 );
-                assert_eq!(
-                    event["value"].as_str().map(str::to_string),
-                    expected.value.map(|value| value.to_string()),
-                    "case {case} event {position}: expected value {:?}, got {event:?}",
-                    expected.value
-                );
-                assert_eq!(
-                    event["contractAddress"].as_str(),
-                    expected.contract_address.as_deref(),
-                    "case {case} event {position}: expected contractAddress {:?}, got {event:?}",
-                    expected.contract_address
-                );
+                // `tokenId` is the token the event MOVES, which for a native transfer is
+                // the network's own currency and not something the stored event carries;
+                // `native_token_denomination.rs` owns that rule.
+                let token_id = native_event_token(&expected.event_type)
+                    .or(expected.token_id.as_deref());
                 assert_eq!(
                     event["tokenId"].as_str(),
-                    expected.token_id.as_deref(),
-                    "case {case} event {position}: expected tokenId {:?}, got {event:?}",
-                    expected.token_id
+                    token_id,
+                    "case {case} event {position}: expected the token the event moves \
+                     ({token_id:?}), got {event:?}"
+                );
+                // The amount, in the unit that token is quoted in — the same suite's rule.
+                let decimals =
+                    amount_decimals(expected.contract_address.as_deref(), token_id);
+                assert_eq!(
+                    event["value"]
+                        .as_str()
+                        .and_then(|text| amount_units(text, decimals)),
+                    expected.value,
+                    "case {case} event {position}: expected value {:?}, got {event:?}",
+                    expected.value
                 );
                 assert_eq!(
                     event["from"].as_str(),
                     expected.from.as_deref(),
                     "case {case} event {position}: expected from {:?}, got {event:?}",
                     expected.from
+                );
+                assert_eq!(
+                    event["contractAddress"].as_str(),
+                    expected.contract_address.as_deref(),
+                    "case {case} event {position}: expected contractAddress {:?}, got {event:?}",
+                    expected.contract_address
                 );
                 assert_eq!(
                     event["to"].as_str(),
@@ -1050,9 +1072,10 @@ async fn a_balance_moved_exactly_as_much_as_the_events_that_touched_it() {
                 let Some((contract, token_id)) = event_holding(&event) else {
                     continue;
                 };
+                let decimals = amount_decimals(contract.as_deref(), token_id.as_deref());
                 let Some(value) = event["value"]
                     .as_str()
-                    .and_then(|value| value.parse::<i128>().ok())
+                    .and_then(|text| amount_units(text, decimals))
                 else {
                     continue;
                 };
@@ -1132,9 +1155,13 @@ async fn get_token_balance_and_list_token_balances_agree_on_every_holding() {
                 "case {case}: one holding matches that filter, got {balances:?}"
             );
             assert_eq!(
-                balances[0]["balance"].as_str(),
-                Some(stored.to_string().as_str()),
-                "case {case}: ListTokenBalances must agree with GetTokenBalance ({stored})"
+                balances[0]["balance"]
+                    .as_str()
+                    .and_then(|text| amount_units(text, holding_decimals(key))),
+                Some(stored),
+                "case {case}: ListTokenBalances must agree with GetTokenBalance ({stored}), \
+                 got {:?}",
+                balances[0]
             );
             assert!(
                 balances[0]["atBlockchainInstant"]["time"].is_number(),
@@ -1183,8 +1210,10 @@ async fn get_token_balance_reports_the_instant_it_was_asked_for_and_the_last_upd
                     )
                     .await;
                 assert_eq!(
-                    reply["balance"].as_str(),
-                    Some(expected.balance.to_string().as_str()),
+                    reply["balance"]
+                        .as_str()
+                        .and_then(|text| amount_units(text, holding_decimals(key))),
+                    Some(expected.balance),
                     "case {case}: expected the balance in force ({}), got {reply:?}",
                     expected.balance
                 );

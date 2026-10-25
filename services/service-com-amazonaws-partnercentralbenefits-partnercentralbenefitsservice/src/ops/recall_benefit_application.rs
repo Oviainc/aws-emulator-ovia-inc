@@ -214,10 +214,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        application.status = crate::state::STATUS_PENDING_SUBMISSION.to_string();
         // `Reason` is required on this operation, so a recalled application always
-        // reports why it was recalled.
-        application.status_reason = Some(input.reason);
+        // reports why it was recalled — and that reason replaces whatever explained the
+        // status the recall takes it out of.
+        application.set_status(
+            crate::state::STATUS_PENDING_SUBMISSION,
+            Some(input.reason),
+        );
         application.revise(now);
         // Recorded AFTER the revision, which clears the previous recall's token: this
         // recall's idempotency window opens here and closes at the next change to the

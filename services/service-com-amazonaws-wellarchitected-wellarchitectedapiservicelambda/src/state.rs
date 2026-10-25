@@ -13,7 +13,10 @@
 //! reviews (`ListLensReviewImprovements`) and the answers of a review template's lens
 //! reviews (`ListReviewTemplateAnswers`, `GetReviewTemplateAnswer`,
 //! `UpdateReviewTemplateAnswer`) are backed entirely by the maps below, so a
-//! create is visible to the next request on the same engine. The custom lenses
+//! create is visible to the next request on the same engine. A template's lens review is
+//! held against the lens VERSION it was applied at, which
+//! `UpgradeReviewTemplateLensReview` moves to the lens's latest
+//! ([`ReviewTemplateLensReviewRecord::lens_version`]). The custom lenses
 //! `ImportLens`
 //! imports, the versions `CreateLensVersion` publishes from them, the content
 //! `ExportLens` reads back and the versions `GetLensVersionDifference` compares are backed
@@ -22,7 +25,8 @@
 //! Tool profiles (`CreateProfile`, `GetProfile`) are backed the same way, each keyed by the
 //! `ProfileArn` the create minted, and the association of one with a workload
 //! (`AssociateProfiles`, `DisassociateProfiles`) is held on the workload the association is
-//! OF. The agent profiles
+//! OF, pinned at the profile version the workload is reviewed against — the version
+//! `UpgradeProfileVersion` moves to the one that profile is at. The agent profiles
 //! (`CreateAgentProfile`, `GetAgentProfile`, `ListAgentProfiles`) and the optimization
 //! goals recorded against one (`CreateAgentGoal`, `GetAgentGoal`, `DeleteAgentGoal`) are
 //! backed the same way,
@@ -222,11 +226,16 @@ pub const FRAMEWORK_LENS_VERSION: &str = "2023-10-03";
 /// `LensStatus$CURRENT`: the lens review is against the lens's latest version
 /// (`smithy_query(query="shape", shape="LensStatus")` publishes `CURRENT`,
 /// `NOT_CURRENT`, `DEPRECATED`, `DELETED` and `UNSHARED`). Each AWS-official lens in the
-/// catalog carries exactly one version (its [`OfficialLens::version`]), and the operations
-/// that could move a review off it — `CreateLensVersion`, `DeleteLens`, `CreateLensShare`
-/// and `UpgradeLensReview` — are still stubs, each with its own issue, so a review of a
-/// lens this emulator holds content for is on that lens's current version.
+/// catalog carries exactly one version (its [`OfficialLens::version`]), so a review of one
+/// is on that lens's current version; a custom lens's versions are what
+/// `CreateLensVersion` publishes, and a review stays on the version it was applied at
+/// until it is upgraded.
 pub const LENS_STATUS_CURRENT: &str = "CURRENT";
+
+/// `LensStatus$NOT_CURRENT`: the lens review is against a version of the lens a later one
+/// has superseded — what a review reports between the publish that supersedes its version
+/// and the upgrade that moves it to the latest one.
+pub const LENS_STATUS_NOT_CURRENT: &str = "NOT_CURRENT";
 
 /// One question of the AWS-official framework lens, as this emulator's lens content:
 /// the pillar it belongs to, the id it is named by on the wire, its title and the best
@@ -1100,11 +1109,15 @@ pub const MAX_PROFILE_ARNS_PER_REQUEST: usize = 10;
 /// applied to it is at its current version. The enum publishes exactly `CURRENT` and
 /// `LENS_NOT_CURRENT` (`smithy_query(query="shape",
 /// shape="ReviewTemplateUpdateStatus")`), and a template whose lenses have not been
-/// superseded is current. A stored template records the lens aliases applied to it and
-/// no lens VERSION ([`ReviewTemplateRecord::lenses`]), so there is no pinned version for
-/// a later `CreateLensVersion` to supersede: pinning one is `UpdateReviewTemplate` /
-/// `UpgradeReviewTemplateLensReview`'s work, each a stub with its own issue.
+/// superseded is current.
 pub const REVIEW_TEMPLATE_UPDATE_STATUS_CURRENT: &str = "CURRENT";
+
+/// `ReviewTemplateUpdateStatus$LENS_NOT_CURRENT`: what a review template reports once a
+/// lens applied to it has a version later than the one its lens review is against
+/// ([`ReviewTemplateLensReviewRecord::lens_version`]) — the template's own view of the
+/// `LensStatus` that review reports ([`LENS_STATUS_NOT_CURRENT`]), which
+/// `UpgradeReviewTemplateLensReview` is what clears.
+pub const REVIEW_TEMPLATE_UPDATE_STATUS_LENS_NOT_CURRENT: &str = "LENS_NOT_CURRENT";
 
 /// The `Question` bucket a question with no answer counts under —
 /// `smithy_query(query="shape", shape="Question")` publishes exactly `UNANSWERED` and
@@ -1583,6 +1596,25 @@ pub fn delete_replay(
     }
 }
 
+/// What a COMPLETED upgrade's `ClientRequestToken` resolves to: the resource the original
+/// request upgraded, plus a fingerprint of that request's parameters so a token spent on a
+/// DIFFERENT request can be told apart from a genuine retry.
+///
+/// Held for the same reason [`CompletedDeleteToken`] is: an upgrade's result is its empty
+/// success, so there is nothing to project and only the record that this exact request has
+/// already executed once. Replaying it from the record rather than re-running it is what
+/// keeps a retry from moving a lens review onto a version published since the original
+/// request answered.
+#[derive(Debug, Clone)]
+pub struct CompletedUpgradeToken {
+    /// The identifier the original request named — the ARN of the resource whose lens
+    /// review it upgraded — so a token spent on another request can report what it
+    /// already resolved to.
+    pub resource_id: String,
+    /// [`parameter_fingerprint`] of the original request's parameters.
+    pub fingerprint: String,
+}
+
 /// The most tags one resource carries: `TagMap` is `@length(min: 1, max: 50)` wherever a
 /// request supplies one (`smithy_query(query="operation", operation="ImportLens")`), so
 /// 50 is the most a stored resource can hold too.
@@ -1687,8 +1719,8 @@ pub struct WorkloadRecord {
     ///
     /// `AssociateProfiles` (and a `CreateWorkload` that names a profile) is what adds an
     /// entry here, through [`Self::associate_profile`]; `DisassociateProfiles` is what
-    /// removes one. The list is held at [`MAX_PROFILES_PER_WORKLOAD`] by the operations
-    /// that add to it.
+    /// removes one, and `UpgradeProfileVersion` what moves the version one is pinned at.
+    /// The list is held at [`MAX_PROFILES_PER_WORKLOAD`] by the operations that add to it.
     pub profiles: Vec<WorkloadProfileRecord>,
 }
 
@@ -2029,21 +2061,25 @@ impl MilestoneRecord {
     }
 }
 
-/// The notes one lens review of a review template carries: "the notes that will be
-/// associated with the workload when the template is applied"
-/// (`UpdateReviewTemplateLensReviewInput$LensNotes` / `$PillarNotes` docs).
+/// One lens review of a review template, as the store holds it.
 ///
 /// A lens review of a template is not a resource of its own — it exists exactly while
-/// the lens is applied to the template ([`ReviewTemplateRecord::applies_lens`]) — so
-/// what this record holds is only what a caller has WRITTEN to it: the review's own
-/// notes, the notes of each pillar of that lens, and when either was last written
-/// (`ReviewTemplateLensReview$UpdatedAt`, "the date and time when the review template
-/// lens review was last updated"). Everything else a lens review reports — the lens's
-/// name, version and status, its pillars and its question roll-up — is DERIVED from the
-/// lens content and the template's stored answers by
-/// [`ReviewTemplateRecord::to_lens_review`].
+/// the lens is applied to the template ([`ReviewTemplateRecord::applies_lens`]) — so what
+/// this record holds is the review's own state and nothing the lens or the template's
+/// answers already say: the notes a caller has written ("the notes that will be
+/// associated with the workload when the template is applied",
+/// `UpdateReviewTemplateLensReviewInput$LensNotes` / `$PillarNotes` docs), when the review
+/// was last written (`ReviewTemplateLensReview$UpdatedAt`, "the date and time when the
+/// review template lens review was last updated") and the VERSION of the lens the review
+/// is against — pinned when the lens was applied, exactly as a workload's profile
+/// association pins the profile version it is reviewed against
+/// ([`WorkloadProfileRecord::profile_version`]).
+///
+/// Everything else a lens review reports — the lens's name and currency, its pillars and
+/// its question roll-up — is DERIVED from the lens catalog and the template's stored
+/// answers by [`ReviewTemplateRecord::to_lens_review`].
 #[derive(Debug, Clone)]
-pub struct ReviewTemplateLensNotes {
+pub struct ReviewTemplateLensReviewRecord {
     /// `ReviewTemplateLensReview$Notes`, absent until a caller writes it.
     pub notes: Option<String>,
     /// `ReviewTemplatePillarReviewSummary$Notes` per `PillarId`, holding only the
@@ -2051,6 +2087,42 @@ pub struct ReviewTemplateLensNotes {
     pub pillar_notes: BTreeMap<String, String>,
     /// `ReviewTemplateLensReview$UpdatedAt`.
     pub updated_at: SystemTime,
+    /// The `LensVersion` this review is against: the version the lens's content was
+    /// published as when the lens was applied ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::applied_lens_version`]),
+    /// which `UpgradeReviewTemplateLensReview` moves to the lens's latest version.
+    /// `None` for a lens this emulator holds no content for, which has no version to be
+    /// at.
+    pub lens_version: Option<String>,
+}
+
+/// What the lens catalog says about the lens ONE lens review is a review of, as that
+/// review reports it: the ARN the lens is reported by, the `LensVersion` the review is
+/// against, the lens's name as of that version and the currency of that version.
+///
+/// It is resolved from the catalog in ONE step
+/// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::reviewed_lens`])
+/// and owns every value it carries, so a handler can resolve it BEFORE it takes the
+/// resource carrying the review for writing and still project the review afterwards —
+/// the same reason [`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::lens_arn_of`]
+/// is called before the write.
+///
+/// Every member but the ARN is absent for a lens this emulator holds no content for: such
+/// a lens has no version here to be at, and inventing one would mean reporting a review
+/// against a version nothing published.
+#[derive(Debug, Clone)]
+pub struct ReviewedLens {
+    /// `ReviewTemplateLensReview$LensArn` / `LensReview$LensArn`.
+    pub lens_arn: String,
+    /// `ReviewTemplateLensReview$LensVersion` / `LensReview$LensVersion` — the version
+    /// the review is against, which is the lens's latest for a review that pins none.
+    pub lens_version: Option<String>,
+    /// `ReviewTemplateLensReview$LensName` / `LensReview$LensName`, as the content of
+    /// that version names the lens.
+    pub lens_name: Option<String>,
+    /// `ReviewTemplateLensReview$LensStatus` / `LensReview$LensStatus`:
+    /// [`LENS_STATUS_CURRENT`] while the review is against the lens's latest version and
+    /// [`LENS_STATUS_NOT_CURRENT`] once a later one has been published.
+    pub lens_status: Option<String>,
 }
 
 /// One stored review template: "A review template" (`ReviewTemplate` shape doc).
@@ -2075,10 +2147,11 @@ pub struct ReviewTemplateRecord {
     /// ([`WorkloadRecord::answers`]) — a review template is reviewed against the same
     /// lens question set, so the two cannot disagree about what an answer records.
     pub answers: BTreeMap<String, BTreeMap<String, AnswerRecord>>,
-    /// The notes recorded against this template's lens reviews, by lens ALIAS (as
-    /// [`lens_alias`] resolves it, so one entry however the request named the lens).
-    /// A lens whose review nothing has been written to carries no entry.
-    pub lens_reviews: BTreeMap<String, ReviewTemplateLensNotes>,
+    /// This template's lens reviews, by lens ALIAS (as [`lens_alias`] resolves it, so one
+    /// entry however the request named the lens). An entry exists for every lens applied
+    /// to the template, because the review exists as soon as the lens is applied
+    /// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::applied_lens_reviews`]).
+    pub lens_reviews: BTreeMap<String, ReviewTemplateLensReviewRecord>,
 }
 
 impl ReviewTemplateRecord {
@@ -2181,29 +2254,36 @@ impl ReviewTemplateRecord {
         counts
     }
 
-    /// The notes written to ONE of this template's lens reviews, if any have been.
+    /// ONE of this template's lens reviews as the store holds it, if the store holds one.
     ///
-    /// `lens` is a lens as a request names it, so the same notes are found by either
+    /// `lens` is a lens as a request names it, so the same review is found by either
     /// spelling ([`lens_alias`]).
-    pub fn lens_review_notes(&self, lens: &str) -> Option<&ReviewTemplateLensNotes> {
+    pub fn lens_review_record(&self, lens: &str) -> Option<&ReviewTemplateLensReviewRecord> {
         self.lens_reviews.get(lens_alias(lens))
     }
 
-    /// [`Self::lens_review_notes`] for a caller about to WRITE them, created empty at
-    /// `now` on the first write: the lens review itself exists as soon as the lens is
-    /// applied, and this record is only how the store remembers what was written to it.
-    pub fn lens_review_notes_mut(
+    /// [`Self::lens_review_record`] for a caller about to WRITE to it, created empty at
+    /// `now` if the store holds none: the lens review itself exists as soon as the lens is
+    /// applied, and this record is only how the store remembers that review's own state.
+    pub fn lens_review_record_mut(
         &mut self,
         lens: &str,
         now: SystemTime,
-    ) -> &mut ReviewTemplateLensNotes {
+    ) -> &mut ReviewTemplateLensReviewRecord {
         self.lens_reviews
             .entry(lens_alias(lens).to_string())
-            .or_insert_with(|| ReviewTemplateLensNotes {
+            .or_insert_with(|| ReviewTemplateLensReviewRecord {
                 notes: None,
                 pillar_notes: BTreeMap::new(),
                 updated_at: now,
+                lens_version: None,
             })
+    }
+
+    /// The `LensVersion` ONE lens review of this template is against, as it was pinned
+    /// when the lens was applied or last moved by an upgrade.
+    pub fn lens_review_version(&self, lens: &str) -> Option<&str> {
+        self.lens_review_record(lens)?.lens_version.as_deref()
     }
 
     /// The pillars ONE lens review of this template reports a summary for, each with the
@@ -2223,7 +2303,7 @@ impl ReviewTemplateRecord {
             .iter()
             .map(|(pillar_id, pillar_name, _)| ((*pillar_id).to_string(), Some(*pillar_name)))
             .collect();
-        if let Some(written) = self.lens_review_notes(lens) {
+        if let Some(written) = self.lens_review_record(lens) {
             // `pillar_notes` is a `BTreeMap`, so the extra pillars come out in
             // `PillarId` order.
             pillars.extend(
@@ -2246,23 +2326,22 @@ impl ReviewTemplateRecord {
     ///
     /// `lens` is the lens AS THE REQUEST NAMED IT — `LensAlias` is "either the lens
     /// alias … or the lens ARN" (`LensAlias` doc) and this shape models no member to
-    /// resolve one spelling into the other — and `lens_arn` is the ARN that lens is
-    /// reported by ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::lens_arn_of`]).
+    /// resolve one spelling into the other — and `reviewed` is what the lens catalog says
+    /// about the lens this review is against, resolved for the version the review is at
+    /// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::reviewed_lens`]).
     ///
-    /// Everything but the notes is DERIVED on every read: the lens's own name, version
-    /// and status from the lens content this emulator holds ([`lens_metadata`], absent
-    /// for a lens it holds none for), one pillar summary per pillar of the lens
+    /// Everything but the review's own state is DERIVED on every read: the lens's name,
+    /// version and currency from `reviewed`, one pillar summary per pillar of the lens
     /// ([`Self::lens_review_pillars`]) and the answered/unanswered roll-ups from the
     /// template's stored answers.
-    pub fn to_lens_review(&self, lens: &str, lens_arn: String) -> ReviewTemplateLensReview {
-        let metadata = lens_metadata(lens);
-        let written = self.lens_review_notes(lens);
+    pub fn to_lens_review(&self, lens: &str, reviewed: &ReviewedLens) -> ReviewTemplateLensReview {
+        let written = self.lens_review_record(lens);
         ReviewTemplateLensReview {
             lens_alias: Some(lens.to_string()),
-            lens_arn: Some(lens_arn),
-            lens_version: metadata.map(|metadata| metadata.version.to_string()),
-            lens_name: metadata.map(|metadata| metadata.name.to_string()),
-            lens_status: metadata.map(|metadata| metadata.status.to_string()),
+            lens_arn: Some(reviewed.lens_arn.clone()),
+            lens_version: reviewed.lens_version.clone(),
+            lens_name: reviewed.lens_name.clone(),
+            lens_status: reviewed.lens_status.clone(),
             pillar_review_summaries: Some(
                 self.lens_review_pillars(lens)
                     .into_iter()
@@ -2280,8 +2359,8 @@ impl ReviewTemplateRecord {
                     .collect(),
             ),
             // "The date and time when the review template lens review was last updated":
-            // the notes record carries that instant, and a lens review nothing has been
-            // written to was last changed when the template carrying it was.
+            // the review's own record carries that instant, and one the store holds no
+            // record for was last changed when the template carrying it was.
             updated_at: Some(::aws_smithy_types::DateTime::from(
                 written.map_or(self.updated_at, |written| written.updated_at),
             )),
@@ -2306,7 +2385,11 @@ impl ReviewTemplateRecord {
     /// `ReviewTemplateSummary` models no `Notes`, `Tags`, `QuestionCounts` or
     /// `ShareInvitationId` member (`smithy_query(query="shape",
     /// shape="ReviewTemplateSummary")`), so a summary carries only what it declares.
-    pub fn to_summary(&self) -> ReviewTemplateSummary {
+    ///
+    /// `update_status` is this template's `ReviewTemplateUpdateStatus`, which depends on
+    /// the lens catalog rather than on the record
+    /// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::review_template_update_status`]).
+    pub fn to_summary(&self, update_status: &str) -> ReviewTemplateSummary {
         ReviewTemplateSummary {
             description: Some(self.description.clone()),
             lenses: Some(self.lenses.clone()),
@@ -2314,12 +2397,14 @@ impl ReviewTemplateRecord {
             updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
             template_arn: Some(self.template_arn.clone()),
             template_name: Some(self.template_name.clone()),
-            update_status: Some(REVIEW_TEMPLATE_UPDATE_STATUS_CURRENT.to_string()),
+            update_status: Some(update_status.to_string()),
         }
     }
 
-    /// The `ReviewTemplate` shape `GetReviewTemplate` returns.
-    pub fn to_review_template(&self) -> ReviewTemplate {
+    /// The `ReviewTemplate` shape `GetReviewTemplate` returns. `update_status` is as
+    /// [`Self::to_summary`] takes it, so a summary and a `GetReviewTemplate` of the same
+    /// template cannot disagree about it.
+    pub fn to_review_template(&self, update_status: &str) -> ReviewTemplate {
         ReviewTemplate {
             description: Some(self.description.clone()),
             lenses: Some(self.lenses.clone()),
@@ -2337,7 +2422,7 @@ impl ReviewTemplateRecord {
             // `@length(min: 1)` on `TagMap` constrains the tags a REQUEST supplies, not
             // what a projection of the stored template reports.
             tags: Some(self.tags.clone().into_iter().collect()),
-            update_status: Some(REVIEW_TEMPLATE_UPDATE_STATUS_CURRENT.to_string()),
+            update_status: Some(update_status.to_string()),
             // "The ID assigned to the template share invitation": only a template reached
             // through a share invitation carries one, and template shares are still a
             // stub.
@@ -3558,6 +3643,23 @@ pub struct CreateProfileToken {
     pub fingerprint: String,
 }
 
+/// What an `UpgradeProfileVersion` idempotency token resolves to: the profile whose
+/// association the original request upgraded, plus that request's parameter fingerprint.
+///
+/// The operation answers an EMPTY body, so a replay has no value to return — what the
+/// token is for here is keeping the replay from acting a second time, which matters
+/// because the upgrade can also record a milestone and a second recording of the same
+/// milestone name would collide ([`milestone_name_conflict`]). The profile ARN is kept so
+/// a token reused with different parameters can name the resource it already upgraded, and
+/// the workload id so the token goes with the workload whose association it upgraded
+/// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::remove_workload`]).
+#[derive(Debug, Clone)]
+pub struct UpgradeProfileVersionToken {
+    pub workload_id: String,
+    pub profile_arn: String,
+    pub fingerprint: String,
+}
+
 /// `ConflictException$ResourceType` / `ResourceNotFoundException$ResourceType` for an
 /// AGENT profile — the resource `CreateAgentProfile` mints and every
 /// `/api/v1/agent-profiles/{profileArn}` route resolves.
@@ -4147,6 +4249,11 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// completed, held exactly as [`Self::delete_workload_tokens`] is and for the same
     /// reason: the deleted template cannot serve the replay, so the completed delete does.
     pub delete_review_template_tokens: TokenLedger<CompletedDeleteToken>,
+    /// `UpgradeReviewTemplateLensReview`'s `ClientRequestToken` -> the upgrade the
+    /// original request completed, held exactly as [`Self::delete_review_template_tokens`]
+    /// is and for the same reason: an upgrade answers an empty success, so the completed
+    /// upgrade is what a retry is served from ([`CompletedUpgradeToken`]).
+    pub upgrade_review_template_lens_review_tokens: TokenLedger<CompletedUpgradeToken>,
     /// Every stored Well-Architected Tool profile, keyed by its `ProfileArn` — the only
     /// identifier the modelled profile operations take for one (`GetProfile`,
     /// `UpdateProfile`, `DeleteProfile` and every `/profiles/{ProfileArn}` route bind it
@@ -4155,6 +4262,10 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// `CreateProfile`'s `ClientRequestToken` -> what the original request created.
     /// Caller input keys it, so it is a BOUNDED [`TokenLedger`].
     pub create_profile_tokens: TokenLedger<CreateProfileToken>,
+    /// `UpgradeProfileVersion`'s `ClientRequestToken` -> the upgrade the original request
+    /// performed. Caller input keys it, so it is a BOUNDED [`TokenLedger`]: write it
+    /// through [`TokenLedger::remember`].
+    pub upgrade_profile_version_tokens: TokenLedger<UpgradeProfileVersionToken>,
     /// Every stored custom lens, keyed by its 32-lowercase-hex lens id — the resource
     /// part of its ARN, which is how a `LensAlias` names it.
     pub lenses: HashMap<String, LensRecord>,
@@ -4606,6 +4717,149 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
             .map_or_else(|| lens.to_string(), |record| record.lens_arn.clone())
     }
 
+    /// The `LensVersion` of the LATEST version of the lens a `LensAlias` names — the
+    /// version a review of that lens is CURRENT against, and the one an upgrade of such a
+    /// review moves it to.
+    ///
+    /// An AWS-official lens is published by AWS, so the version of it this emulator ships
+    /// content for is its latest ([`lens_metadata`]); a custom lens's latest version is
+    /// the one `CreateLensVersion` published most recently
+    /// ([`LensRecord::latest_version`]), whatever its draft now holds. `None` for a lens
+    /// this emulator holds no content for and for a custom lens no version has been
+    /// published from.
+    pub fn latest_lens_version(&self, lens: &str) -> Option<&str> {
+        if is_aws_official_lens(lens) {
+            return lens_metadata(lens).map(|metadata| metadata.version);
+        }
+        self.lens_by_alias(lens)?
+            .latest_version()
+            .map(|(version, _)| version)
+    }
+
+    /// The `LensName` the lens a `LensAlias` names carries as of `version`: the name the
+    /// content of that version gives the lens.
+    ///
+    /// A custom lens is named BY ITS CONTENT ("name" of the lens document), so a version
+    /// published from other content can name it differently and the name is read off the
+    /// version a review is against; a version this store does not hold falls back to the
+    /// lens's latest, which is also what a review pinning no version is against. An
+    /// AWS-official lens's name is the catalog's, which its one shipped version is the
+    /// content of.
+    pub fn lens_name_at(&self, lens: &str, version: Option<&str>) -> Option<&str> {
+        if is_aws_official_lens(lens) {
+            return lens_metadata(lens).map(|metadata| metadata.name);
+        }
+        let record = self.lens_by_alias(lens)?;
+        let published = version
+            .and_then(|version| record.versions.get(version))
+            .or_else(|| record.latest_version().map(|(_, published)| published))?;
+        Some(published.content.definition.name.as_str())
+    }
+
+    /// The `LensVersion` a review of `lens` created at `now` is against: the version the
+    /// lens's content is published AS at that instant.
+    ///
+    /// A lens review is a review against ONE version of the lens, so applying a lens pins
+    /// the version its content is published as right then
+    /// ([`LensRecord::published_version`]) — the same way associating a profile with a
+    /// workload pins the profile version it is reviewed against
+    /// ([`WorkloadProfileRecord::profile_version`]). `None` for a lens this emulator holds
+    /// no content for, and for a custom lens whose content is a DRAFT — which no operation
+    /// applies, since a custom lens "cannot be applied to workloads … until it's published
+    /// with CreateLensVersion" (`ImportLens` doc) is what
+    /// [`Self::unapplicable_lenses_refusal`] enforces.
+    pub fn applied_lens_version(&self, lens: &str, now: SystemTime) -> Option<String> {
+        if is_aws_official_lens(lens) {
+            return lens_metadata(lens).map(|metadata| metadata.version.to_string());
+        }
+        self.lens_by_alias(lens)?
+            .published_version(now)
+            .map(|(version, _)| version.to_string())
+    }
+
+    /// The lens reviews a review template applying `lenses` carries the moment it is
+    /// created: one per applied lens, keyed by lens ALIAS, each against the version of
+    /// that lens's content as of `now` ([`Self::applied_lens_version`]) and with nothing
+    /// written to it yet.
+    ///
+    /// A lens review exists as soon as the lens is applied
+    /// ([`ReviewTemplateRecord::applies_lens`]), which is why the records are created with
+    /// the template rather than on the first write to one.
+    pub fn applied_lens_reviews(
+        &self,
+        lenses: &[String],
+        now: SystemTime,
+    ) -> BTreeMap<String, ReviewTemplateLensReviewRecord> {
+        lenses
+            .iter()
+            .map(|lens| {
+                (
+                    lens_alias(lens).to_string(),
+                    ReviewTemplateLensReviewRecord {
+                        notes: None,
+                        pillar_notes: BTreeMap::new(),
+                        updated_at: now,
+                        lens_version: self.applied_lens_version(lens, now),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// What the lens catalog says about the lens ONE lens review of the stored review
+    /// template `template_arn` is a review of, for the version that review is against
+    /// ([`ReviewTemplateRecord::lens_review_version`]).
+    ///
+    /// `lens` is the lens as the request named it, which is the spelling its `LensArn` is
+    /// resolved from. A `template_arn` this store holds no template under has no review to
+    /// report — the caller answers that lookup miss itself — and what comes back then
+    /// describes the lens as a review pinning no version would be against, its latest.
+    pub fn reviewed_lens(&self, template_arn: &str, lens: &str, region: &str) -> ReviewedLens {
+        let pinned = self
+            .review_templates
+            .get(template_arn)
+            .and_then(|template| template.lens_review_version(lens));
+        let latest = self.latest_lens_version(lens);
+        // The version the review is AGAINST: the one it pins, or the lens's latest for a
+        // review that pins none.
+        let version = pinned.or(latest);
+        ReviewedLens {
+            lens_arn: self.lens_arn_of(lens, region),
+            lens_name: self.lens_name_at(lens, version).map(str::to_string),
+            lens_status: version.zip(latest).map(|(version, latest)| {
+                if version == latest {
+                    LENS_STATUS_CURRENT.to_string()
+                } else {
+                    LENS_STATUS_NOT_CURRENT.to_string()
+                }
+            }),
+            lens_version: version.map(str::to_string),
+        }
+    }
+
+    /// `ReviewTemplate$UpdateStatus` / `ReviewTemplateSummary$UpdateStatus` of one stored
+    /// template: [`REVIEW_TEMPLATE_UPDATE_STATUS_LENS_NOT_CURRENT`] while ANY lens review
+    /// of it is against a version its lens has superseded, else
+    /// [`REVIEW_TEMPLATE_UPDATE_STATUS_CURRENT`].
+    ///
+    /// Derived on every read from the template's pinned versions and the lens catalog, so
+    /// it moves when either does — the template's own view of the `LensStatus` each of its
+    /// lens reviews reports.
+    pub fn review_template_update_status(&self, template: &ReviewTemplateRecord) -> &'static str {
+        let superseded = template.lenses.iter().any(|lens| {
+            let pinned = template.lens_review_version(lens);
+            matches!(
+                (pinned, self.latest_lens_version(lens)),
+                (Some(pinned), Some(latest)) if pinned != latest
+            )
+        });
+        if superseded {
+            REVIEW_TEMPLATE_UPDATE_STATUS_LENS_NOT_CURRENT
+        } else {
+            REVIEW_TEMPLATE_UPDATE_STATUS_CURRENT
+        }
+    }
+
     /// [`Self::lens_by_alias`] for a caller that is about to write to the lens.
     pub fn lens_by_alias_mut(&mut self, alias: &str) -> Option<&mut LensRecord> {
         let id = lens_alias(alias).to_string();
@@ -4760,6 +5014,10 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         self.workload_shares.remove(workload_id);
         self.create_workload_share_tokens
             .retain(|token| token.workload_id != workload_id);
+        // An upgrade token resolves to the upgrade of an association OF this workload, so
+        // it goes with the associations the record above carried.
+        self.upgrade_profile_version_tokens
+            .retain(|token| token.workload_id != workload_id);
         Some(record)
     }
 
@@ -4776,6 +5034,10 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         let record = self.review_templates.remove(template_arn)?;
         self.create_review_template_tokens
             .retain(|token| token.template_arn != template_arn);
+        // An upgrade token resolves to a lens review OF this template, so it cannot
+        // outlive it either: the next request carrying one acts afresh.
+        self.upgrade_review_template_lens_review_tokens
+            .retain(|token| token.resource_id != template_arn);
         Some(record)
     }
 

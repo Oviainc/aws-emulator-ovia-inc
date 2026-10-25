@@ -179,7 +179,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(message));
         }
 
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let store = crate::state::store_at(&state, now);
         let stored = store
             .budgets
             .get(&(input.account_id.clone(), input.budget_name.clone()))
@@ -192,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })?;
 
-        let mut budget = crate::state::project_budget(stored, ::std::time::SystemTime::now());
+        let mut budget = crate::state::project_budget(stored, now);
         // "Specifies whether the response includes the filter expression associated with
         // the budget" — so it is left out until the caller asks for it.
         if !input.show_filter_expression.unwrap_or(false) {

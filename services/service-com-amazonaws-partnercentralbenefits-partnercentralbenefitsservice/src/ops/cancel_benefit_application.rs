@@ -218,10 +218,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        application.status = crate::state::STATUS_CANCELED.to_string();
         // `Reason` is optional, so an application cancelled without one carries no
-        // `StatusReason` rather than an invented sentence.
-        application.status_reason = input.reason;
+        // `StatusReason` rather than an invented sentence; either way the transition
+        // replaces whatever explained the status the application is leaving.
+        application.set_status(crate::state::STATUS_CANCELED, input.reason);
         application.revise(now);
 
         // The write this call made, kept so a retry carrying the same `ClientToken`

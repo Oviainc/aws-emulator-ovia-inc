@@ -238,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // written, so a refused call leaves the resource exactly as it was.
         if let Some(violation) = crate::state::tag_violation(&input.tags, existing) {
             return Err(TagResourceErrorModeled::ValidationException(ValidationException {
-                message: format!("1 validation error detected: {violation}"),
+                message: crate::state::tag_validation_message(&violation),
             })
             .into());
         }

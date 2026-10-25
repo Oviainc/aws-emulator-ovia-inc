@@ -6,6 +6,9 @@ license.workspace = true
 publish = false
 
 [dependencies]
+# `iam_client`: the in-process IAM client a service resolving a caller-supplied IAM
+# entity asks, built once here instead of per service.
+aws-sdk-iam = { version = "1", default-features = false }
 # `resolve_route_key` / `ROOT_PATH_SEGMENT`: the framework's own routing-key rule,
 # which this crate narrows rather than replaces.
 emulator-server = { workspace = true }

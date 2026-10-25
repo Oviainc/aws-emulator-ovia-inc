@@ -23,6 +23,8 @@ mod contact_information;
 mod enum_input_validation;
 #[path = "all/gov_cloud_account_information.rs"]
 mod gov_cloud_account_information;
+#[path = "all/own_account_target_refusal.rs"]
+mod own_account_target_refusal;
 #[path = "all/pattern_validation_messages.rs"]
 mod pattern_validation_messages;
 #[path = "all/phone_number_verification.rs"]

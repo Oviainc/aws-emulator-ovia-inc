@@ -862,6 +862,20 @@ impl Channel {
         self.modified_at = at;
         self.recompute_etag();
     }
+
+    /// Whether this channel composites video from the source channels in its multiview
+    /// configuration instead of receiving ingest of its own, which is what the model's
+    /// `InputType` doc says a [`INPUT_TYPE_MULTIVIEW`] channel does ("The channel receives
+    /// no ingest of its own. Instead, it composites video from the source channels in its
+    /// MultiviewConfiguration").
+    ///
+    /// Decided from the stored `InputType`, which is materialised at create time and
+    /// immutable, so it is the one answer every operation that has nothing to act on such
+    /// a channel branches on — rather than each handler inferring it from a different
+    /// member.
+    pub fn is_multiview(&self) -> bool {
+        self.input_type == INPUT_TYPE_MULTIVIEW
+    }
 }
 
 /// A persisted origin endpoint: the output side, holding the manifests whose URLs

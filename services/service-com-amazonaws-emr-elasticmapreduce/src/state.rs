@@ -26,9 +26,10 @@ use crate::ops::types::{
     Configuration, EbsBlockDevice, Ec2InstanceAttributes, HadoopStepConfig, InstanceFleetConfig,
     InstanceGroup, InstanceGroupConfig, InstanceGroupStateChangeReason, InstanceGroupStatus,
     InstanceGroupTimeline, JobFlowInstancesConfig, KerberosAttributes, ManagedScalingPolicy,
-    MonitoringConfiguration, NotebookExecution, OSRelease, PlacementGroupConfig, PortRange,
-    Session, SessionMappingDetail, SimplifiedApplication, Step, StepConfig, StepStatus, StepSummary,
-    StepTimeline, Studio, SupportedInstanceType, Tag,
+    MonitoringConfiguration, NotebookExecution, NotebookExecutionSummary,
+    NotebookS3LocationForOutput, OSRelease, OutputNotebookS3LocationForOutput, PlacementGroupConfig,
+    PortRange, Session, SessionMappingDetail, SimplifiedApplication, StartNotebookExecutionInput,
+    Step, StepConfig, StepStatus, StepSummary, StepTimeline, Studio, SupportedInstanceType, Tag,
 };
 
 /// `com.amazonaws.emr#ClusterState`, as the wire carries it.
@@ -119,6 +120,9 @@ pub mod cancel_steps_request_status {
 
 /// `com.amazonaws.emr#NotebookExecutionStatus`, for the statuses this emulator sets.
 pub mod notebook_execution_status {
+    /// "`START_PENDING` indicates that the cluster has received the execution request
+    /// but execution has not begun."
+    pub const START_PENDING: &str = "START_PENDING";
     /// "`STOP_PENDING` indicates that the cluster has received a
     /// `StopNotebookExecution` request and the stop is pending."
     pub const STOP_PENDING: &str = "STOP_PENDING";
@@ -241,6 +245,14 @@ pub const MAX_STUDIOS: usize = 100;
 /// mapping is keyed by comes from the request, so without a bound one studio could
 /// accumulate mappings without end.
 pub const MAX_SESSION_MAPPINGS_PER_STUDIO: usize = 500;
+
+/// How many notebook executions this emulator holds at once.
+///
+/// CHOSEN, not documented, for the same reason [`MAX_STUDIOS`] is: every
+/// `StartNotebookExecution` records one more execution for the life of the process, so
+/// without a bound a client loop grows the map without end. A start past it is refused
+/// with the operation's modelled `InvalidRequestException`, the way a quota is.
+pub const MAX_NOTEBOOK_EXECUTIONS: usize = 1_000;
 
 /// How many instance fleets one cluster holds at once.
 ///
@@ -376,12 +388,14 @@ pub struct ComAmazonawsEmrElasticmapreduceState {
     /// which is the identity `GetStudioSessionMapping` addresses one by. Bounded per
     /// studio by [`MAX_SESSION_MAPPINGS_PER_STUDIO`].
     pub studio_session_mappings: BTreeMap<String, SessionMappingDetail>,
-    /// The persisted notebook executions, keyed by execution id.
+    /// The persisted notebook executions, keyed by execution id — minted from a
+    /// monotonic sequence like every other id here, so the map's key order IS the order
+    /// `StartNotebookExecution` recorded them in.
     ///
-    /// `StartNotebookExecution` is what inserts one; it is still a scaffold stub (its
-    /// own issue), so until it lands this map is what tells `DescribeNotebookExecution`
-    /// and `StopNotebookExecution` that an execution id names nothing.
-    pub notebook_executions: BTreeMap<String, NotebookExecution>,
+    /// `StartNotebookExecution` is what inserts one; `DescribeNotebookExecution`,
+    /// `ListNotebookExecutions` and `StopNotebookExecution` all resolve these records.
+    pub notebook_executions: BTreeMap<String, NotebookExecutionRecord>,
+    pub next_notebook_execution_seq: u64,
     /// The ONE block public access configuration of this account and Region, which
     /// always exists: `PutBlockPublicAccessConfiguration` REPLACES it and
     /// `GetBlockPublicAccessConfiguration` reports it.
@@ -411,6 +425,7 @@ impl Default for ComAmazonawsEmrElasticmapreduceState {
             next_studio_seq: 0,
             studio_session_mappings: BTreeMap::new(),
             notebook_executions: BTreeMap::new(),
+            next_notebook_execution_seq: 0,
             block_public_access: BlockPublicAccessRecord::account_default(SystemTime::now()),
             security_configurations: BTreeMap::new(),
         }
@@ -446,6 +461,31 @@ impl ComAmazonawsEmrElasticmapreduceState {
     pub fn mint_studio_id(&mut self) -> String {
         self.next_studio_seq += 1;
         format!("es-{}", base36_id(self.next_studio_seq))
+    }
+
+    /// A fresh notebook execution id: `ex-` followed by uppercase alphanumerics.
+    pub fn mint_notebook_execution_id(&mut self) -> String {
+        self.next_notebook_execution_seq += 1;
+        format!("ex-{}", base36_id(self.next_notebook_execution_seq))
+    }
+
+    /// The notebook execution `id`, with the status the clock already made due applied.
+    pub fn notebook_execution_mut(
+        &mut self,
+        id: &str,
+        now: SystemTime,
+    ) -> Option<&mut NotebookExecutionRecord> {
+        let record = self.notebook_executions.get_mut(id)?;
+        record.advance_to(now);
+        Some(record)
+    }
+
+    /// Apply the clock to every notebook execution. Called by the listing, which
+    /// filters on status.
+    pub fn advance_all_notebook_executions(&mut self, now: SystemTime) {
+        for record in self.notebook_executions.values_mut() {
+            record.advance_to(now);
+        }
     }
 
     /// How many session mappings the studio `studio_id` holds — the count
@@ -560,6 +600,260 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
+/// What AWS answers when a cluster launch names an EC2 instance profile that does
+/// not resolve: `Invalid InstanceProfile: <name>.`, built from the request.
+pub fn invalid_instance_profile_message(job_flow_role: &str) -> String {
+    format!("Invalid InstanceProfile: {job_flow_role}.")
+}
+
+/// The instance profile NAME a `JobFlowRole` value denotes, or `None` when the
+/// value denotes no instance profile of this account at all.
+///
+/// `RunJobFlow$JobFlowRole` is "also called instance profile and Amazon EC2 role",
+/// and an instance profile is named either by its friendly name or by its ARN, so an
+/// ARN is read through the tree's shared IAM-ARN reading
+/// ([`service_common::iam_role::instance_profile_name`]): a value that is ARN-shaped
+/// but names another vendor, another IAM entity type, another account or a Region an
+/// IAM ARN does not carry resolves to nothing rather than to an unrelated name. The
+/// empty value, which `@length(0..10280)` admits, names nothing either.
+fn instance_profile_name(job_flow_role: &str) -> Option<&str> {
+    if !job_flow_role.starts_with("arn:") {
+        return (!job_flow_role.is_empty()).then_some(job_flow_role);
+    }
+    ::service_common::iam_role::instance_profile_name(job_flow_role)
+}
+
+/// Amazon EMR resolves a cluster's `JobFlowRole` to a real EC2 instance profile
+/// when the cluster is LAUNCHED, and refuses the launch — writing no cluster —
+/// when that profile does not exist in this account.
+///
+/// `Some(message)` is that refusal, worded as AWS words it
+/// ([`invalid_instance_profile_message`]). `None` means the launch may proceed.
+///
+/// IAM is reached the way any emulated service reaches another: through the ONE
+/// in-process IAM client every service that resolves a caller-supplied IAM entity
+/// shares ([`service_common::iam_client::iam_client`]), so this crate names no other
+/// service crate. `None` therefore also covers the case where this emulator has no
+/// IAM to ask (a router with only this service mounted, say): nothing is then known
+/// about the profile, and a refusal has to be grounded in what IAM answered, never
+/// assumed.
+pub async fn instance_profile_violation(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    job_flow_role: &str,
+) -> Option<String> {
+    let Some(name) = instance_profile_name(job_flow_role) else {
+        return Some(invalid_instance_profile_message(job_flow_role));
+    };
+    let answer = ::service_common::iam_client::iam_client(ctx, region)
+        .get_instance_profile()
+        .instance_profile_name(name)
+        .send()
+        .await;
+    match answer {
+        Ok(_) => None,
+        // IAM says this account holds no such instance profile: the refusal is
+        // grounded in what IAM answered.
+        Err(error) if instance_profile_is_absent(&error) => {
+            Some(invalid_instance_profile_message(job_flow_role))
+        }
+        // Any other answer is this emulator failing to ask, not IAM reporting an
+        // unresolvable profile, so it refuses nothing — and it is worth a warning,
+        // because a deployment with no IAM to ask is one where this gate does not
+        // run.
+        Err(error) => {
+            ::tracing::warn!(
+                %job_flow_role,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the job flow role could not be resolved against IAM"
+            );
+            None
+        }
+    }
+}
+
+/// The ARN of a notebook execution:
+/// `arn:aws:elasticmapreduce:<region>:<account>:notebook-execution/<id>`.
+pub fn notebook_execution_arn(region: &str, execution_id: &str) -> String {
+    ::engine::emulator_arn(
+        "elasticmapreduce",
+        region,
+        &format!("notebook-execution/{execution_id}"),
+    )
+}
+
+/// `ListNotebookExecutions` page size: "Returns a maximum of 50 notebook executions and
+/// a marker to track the paging of a longer notebook execution list across multiple
+/// `ListNotebookExecutions` calls." (`ListNotebookExecutions` doc, Smithy model.)
+pub const LIST_NOTEBOOK_EXECUTIONS_PAGE_SIZE: usize = 50;
+
+/// How far back `ListNotebookExecutions` looks when the request names no `From`: "The
+/// beginning of time range filter for listing notebook executions. The default is the
+/// timestamp of 30 days ago." (`ListNotebookExecutionsInput$From` doc, Smithy model.)
+pub const NOTEBOOK_EXECUTION_DEFAULT_FROM: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// `NotebookExecution$LastStateChangeReason` for an execution this service recorded and
+/// then never ran.
+///
+/// This emulator is a control plane: it records a notebook execution faithfully — its
+/// engine, its notebook location, its parameters — but it runs no notebook, so an
+/// execution can never reach `FINISHED`. Once the request has been received the clock
+/// owes it the modelled failure status, with a reason that says exactly that, rather
+/// than a success for work nothing ran.
+pub const NOTEBOOK_NOT_EXECUTED_REASON: &str =
+    "This emulator records notebook executions but runs no notebook, so the execution \
+     ended without running.";
+
+/// `NotebookExecution$LastStateChangeReason` for an execution a caller stopped.
+pub const NOTEBOOK_STOPPED_REASON: &str = "Stopped by a StopNotebookExecution request";
+
+/// The status a notebook execution's clock owes it, and when that comes due.
+#[derive(Debug, Clone)]
+pub struct PendingNotebookExecutionStatus {
+    /// The instant the status below was owed, stored rather than slept for.
+    pub due: SystemTime,
+    pub status: String,
+    pub reason: String,
+}
+
+/// A persisted notebook execution: the wire `NotebookExecution` that
+/// `DescribeNotebookExecution` reports, plus the status the clock still owes it.
+///
+/// `ListNotebookExecutions` reports a PROJECTION of this record
+/// ([`NotebookExecutionRecord::to_summary`]); no handler builds that summary from its
+/// own input.
+#[derive(Debug, Clone)]
+pub struct NotebookExecutionRecord {
+    pub execution: NotebookExecution,
+    pub pending_status: Option<PendingNotebookExecutionStatus>,
+}
+
+impl NotebookExecutionRecord {
+    /// The execution `StartNotebookExecution` records for `input`, under the id and ARN
+    /// EMR minted for it.
+    pub fn from_request(
+        id: String,
+        arn: String,
+        input: StartNotebookExecutionInput,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            execution: NotebookExecution {
+                notebook_execution_id: Some(id),
+                editor_id: input.editor_id,
+                execution_engine: Some(input.execution_engine),
+                notebook_execution_name: input.notebook_execution_name,
+                notebook_params: input.notebook_params,
+                // "START_PENDING indicates that the cluster has received the execution
+                // request but execution has not begun." (`NotebookExecution$Status`
+                // doc.) That is exactly where a just-recorded execution stands.
+                status: Some(notebook_execution_status::START_PENDING.to_string()),
+                start_time: Some(timestamp(now)),
+                end_time: None,
+                arn: Some(arn),
+                // No notebook ran, so there is no output file in Amazon S3 to point at.
+                output_notebook_uri: None,
+                last_state_change_reason: None,
+                notebook_instance_security_group_id: input.notebook_instance_security_group_id,
+                tags: input.tags,
+                notebook_s3_location: input.notebook_s3_location.map(|location| {
+                    NotebookS3LocationForOutput {
+                        bucket: location.bucket,
+                        key: location.key,
+                    }
+                }),
+                output_notebook_s3_location: input.output_notebook_s3_location.map(|location| {
+                    OutputNotebookS3LocationForOutput {
+                        bucket: location.bucket,
+                        key: location.key,
+                    }
+                }),
+                output_notebook_format: input.output_notebook_format,
+                environment_variables: input.environment_variables,
+            },
+            pending_status: Some(PendingNotebookExecutionStatus {
+                due: now + TRANSITION_SPAN,
+                status: notebook_execution_status::FAILED.to_string(),
+                reason: NOTEBOOK_NOT_EXECUTED_REASON.to_string(),
+            }),
+        }
+    }
+
+    /// Materialise the status the clock already made due, and nothing else.
+    pub fn advance_to(&mut self, now: SystemTime) {
+        let due = self
+            .pending_status
+            .as_ref()
+            .is_some_and(|pending| now >= pending.due);
+        if !due {
+            return;
+        }
+        let Some(pending) = self.pending_status.take() else {
+            return;
+        };
+        self.execution.status = Some(pending.status.clone());
+        self.execution.last_state_change_reason = Some(pending.reason);
+        // A status the execution never leaves is where it ended, and the instant it
+        // ended is the one the transition was owed at — not the instant somebody looked.
+        if notebook_execution_status::TERMINAL.contains(&pending.status.as_str()) {
+            self.execution.end_time = Some(timestamp(pending.due));
+        }
+    }
+
+    /// Begin stopping this execution on the caller's request, answering whether there
+    /// was anything to stop.
+    ///
+    /// "STOP_PENDING indicates that the cluster has received a `StopNotebookExecution`
+    /// request and the stop is pending" (`NotebookExecution$Status` doc), so the stop is
+    /// asynchronous: the execution goes `STOP_PENDING` now and the clock owes it
+    /// `STOPPED`. An execution already stopping was accepted once, so repeating the
+    /// request does not push that due instant out.
+    pub fn begin_stop(&mut self, now: SystemTime) -> bool {
+        let status = self.execution.status.as_deref().unwrap_or_default();
+        if notebook_execution_status::TERMINAL.contains(&status) {
+            return false;
+        }
+        if status == notebook_execution_status::STOP_PENDING {
+            return true;
+        }
+        self.execution.status = Some(notebook_execution_status::STOP_PENDING.to_string());
+        self.execution.last_state_change_reason = Some(NOTEBOOK_STOPPED_REASON.to_string());
+        self.pending_status = Some(PendingNotebookExecutionStatus {
+            due: now + TRANSITION_SPAN,
+            status: notebook_execution_status::STOPPED.to_string(),
+            reason: NOTEBOOK_STOPPED_REASON.to_string(),
+        });
+        true
+    }
+
+    /// The wire `NotebookExecutionSummary` for this record.
+    pub fn to_summary(&self) -> NotebookExecutionSummary {
+        NotebookExecutionSummary {
+            notebook_execution_id: self.execution.notebook_execution_id.clone(),
+            editor_id: self.execution.editor_id.clone(),
+            notebook_execution_name: self.execution.notebook_execution_name.clone(),
+            status: self.execution.status.clone(),
+            start_time: self.execution.start_time,
+            end_time: self.execution.end_time,
+            notebook_s3_location: self.execution.notebook_s3_location.clone(),
+            execution_engine_id: self
+                .execution
+                .execution_engine
+                .as_ref()
+                .map(|engine| engine.id.clone()),
+        }
+    }
+
+    /// The id of the execution engine this execution names, which
+    /// `ListNotebookExecutions$ExecutionEngineId` filters on.
+    pub fn execution_engine_id(&self) -> Option<&str> {
+        self.execution
+            .execution_engine
+            .as_ref()
+            .map(|engine| engine.id.as_str())
+    }
+}
+
 /// The account's block public access configuration, with the metadata EMR keeps beside
 /// it: "Properties that describe the Amazon Web Services principal that created the
 /// `BlockPublicAccessConfiguration` using the `PutBlockPublicAccessConfiguration` action
@@ -623,6 +917,19 @@ impl BlockPublicAccessRecord {
             created_by_arn: self.created_by_arn.clone(),
         }
     }
+}
+
+/// Whether an IAM `GetInstanceProfile` failure is IAM reporting that the profile
+/// does not exist (`NoSuchEntity`), as opposed to the call not reaching IAM.
+fn instance_profile_is_absent(
+    error: &::aws_sdk_iam::error::SdkError<
+        ::aws_sdk_iam::operation::get_instance_profile::GetInstanceProfileError,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> bool {
+    error.as_service_error().is_some_and(
+        ::aws_sdk_iam::operation::get_instance_profile::GetInstanceProfileError::is_no_such_entity_exception,
+    )
 }
 
 /// The IAM principal this request was signed by: what a configuration it writes records
