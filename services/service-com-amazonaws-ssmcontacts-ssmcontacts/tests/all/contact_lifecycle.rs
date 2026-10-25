@@ -49,10 +49,12 @@ impl Emulator {
     }
 
     /// The emulator with NOTHING written into its store: the account exactly as a client
-    /// reaching a freshly started emulator finds it.
+    /// reaching a freshly started emulator finds it, which includes holding no Incident
+    /// Manager replication set.
     ///
-    /// `tests/all/default_onboarding.rs` asserts what that account can do, so it must be
-    /// handed no fixture at all; every other suite goes through [`Emulator::new`].
+    /// `tests/all/default_onboarding.rs` asserts what that account's store holds and
+    /// `tests/all/cold_account_gate.rs` what it answers, so both must be handed no fixture
+    /// at all; every other suite goes through [`Emulator::new`].
     pub(crate) fn fresh() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
