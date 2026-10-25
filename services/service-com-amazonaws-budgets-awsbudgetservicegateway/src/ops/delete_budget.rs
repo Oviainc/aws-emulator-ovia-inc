@@ -172,7 +172,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let key = (input.account_id.clone(), input.budget_name.clone());
-        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = crate::state::store_at(&state, now);
         // Removing the stored budget removes its notifications, subscribers and tags
         // with it: they are held inside it, exactly as AWS deletes "the budget and all
         // the associated notifications and subscribers" together.

@@ -8,10 +8,11 @@
 //!
 //! Every listener has a DEFAULT rule, minted with the listener: the rule that carries
 //! the listener's default actions, matches on no condition and reports the priority
-//! `default`. It is what this read answers for a listener, and the rule store it walks is
-//! the listener record itself, so a rule reported here is the one `CreateListener`
-//! persisted. (`CreateRule`, which adds the non-default rules, is still a scaffold stub
-//! with its own issue; the rules it stores join the walk below.)
+//! `default`. Beside it a listener carries the rules `CreateRule` added, and the rule
+//! store this read walks is the listener record itself, so a rule reported here is the
+//! rule a create persisted. The rules are walked in EVALUATION order — lowest priority
+//! value first, the default rule last, because it is what runs when no other rule's
+//! conditions are met.
 //!
 //! A reporting operation: it reads the store and writes nothing to it. An ARN this store
 //! holds no listener for is the modelled `ListenerNotFoundException`, and a `RuleArns`

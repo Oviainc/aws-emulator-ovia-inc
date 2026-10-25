@@ -14,7 +14,8 @@
 //! with an id, an ARN and tags. A global network also owns its
 //! CORE network — the Cloud WAN managed network
 //! whose segments and edges are a function of the core network policy document it holds.
-//! A core network in turn owns its ATTACHMENTS: each joins one resource to the edge
+//! A core network edge can PEER with a resource of another service (a transit gateway),
+//! and a core network in turn owns its ATTACHMENTS: each joins one resource to the edge
 //! locations that policy configures — one of them for every kind but a Direct Connect
 //! gateway attachment, which spans several — and a Connect attachment is carried over
 //! another attachment (its transport) rather than over a resource of its own, and a
@@ -133,6 +134,12 @@ pub const CUSTOMER_GATEWAY_ASSOCIATION_KIND: &str = "customer-gateway-associatio
 /// (`smithy_query shape=CoreNetworkId`), which the 17 hex digits of
 /// [`ComAmazonawsNetworkmanagerNetworkmanagerState::next_id`] satisfy.
 pub const CORE_NETWORK_KIND: &str = "core-network";
+/// See [`GLOBAL_NETWORK_KIND`]. The model constrains this one's id itself too:
+/// `PeeringId` carries `pattern ^peering-([0-9a-f]{8,17})$` (`smithy_query
+/// shape=PeeringId`), which the 17 hex digits of
+/// [`ComAmazonawsNetworkmanagerNetworkmanagerState::next_id`] satisfy. It is also the
+/// `peering` entry of [`NETWORK_RESOURCE_TYPES`].
+pub const PEERING_KIND: &str = "peering";
 /// The resource kind a refusal names when the resource addressed is ONE policy of a core
 /// network rather than the core network itself. A policy version is not a resource this
 /// service mints an id or an ARN for — the model identifies it by its owning
@@ -162,12 +169,6 @@ pub const PREFIX_LIST_ASSOCIATION_KIND: &str = "prefix-list-association";
 /// `RouteAnalysisId` (`smithy_query shape=RouteAnalysis`) — so this name serves the id
 /// prefix (`route-analysis-<hex>`) and the `ResourceType` a not-found refusal reports.
 pub const ROUTE_ANALYSIS_KIND: &str = "route-analysis";
-/// See [`GLOBAL_NETWORK_KIND`]. A PEERING joins a core network to a resource of another
-/// service — a transit gateway, the one `PeeringType` the model carries (`smithy_query
-/// shape=PeeringType`) — so one name serves the id prefix (`peering-<hex>`, which the
-/// model's own `^peering-([0-9a-f]{8,17})$` on `PeeringId` constrains), the ARN resource
-/// type (`peering/<id>`) and the `peering` entry of [`NETWORK_RESOURCE_TYPES`].
-pub const PEERING_KIND: &str = "peering";
 
 /// The one value `PeeringType` enumerates (`smithy_query shape=PeeringType`, mirrored in
 /// `ops::types::PEERING_TYPE_VALUES`): "The type of peering. This will be
@@ -293,7 +294,7 @@ pub const FIELD_GLOBAL_NETWORK_ID: &str = "globalNetworkId";
 /// See [`FIELD_GLOBAL_NETWORK_ID`].
 pub const FIELD_SITE_ID: &str = "siteId";
 /// See [`FIELD_GLOBAL_NETWORK_ID`]: the same lowerCamelCase spelling of the request
-/// member, for the references and values an attachment create carries.
+/// member, for the references and values an attachment or peering create carries.
 pub const FIELD_CORE_NETWORK_ID: &str = "coreNetworkId";
 /// See [`FIELD_CORE_NETWORK_ID`].
 pub const FIELD_TRANSPORT_ATTACHMENT_ID: &str = "transportAttachmentId";
@@ -1636,10 +1637,10 @@ pub fn check_edge_location_list(
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for location in requested {
         if !topology.is_some_and(|topology| topology.has_edge_location(location)) {
-            return Err(field_rejection(
+            return Err(no_such_edge(
                 FIELD_EDGE_LOCATIONS,
-                VALIDATION_REASON_OTHER,
-                format!("core network {core_network_id} configures no edge location in {location}"),
+                core_network_id,
+                location,
             ));
         }
         if !seen.insert(location.as_str()) {
@@ -1924,7 +1925,7 @@ pub struct AttachmentRecord {
 
 /// What one attachment kind adds to the shared [`AttachmentRecord`] envelope: the members
 /// its own wrapper shape carries beside `Attachment` (`smithy_query
-/// shape=VpcAttachment,ConnectAttachment,SiteToSiteVpnAttachment,DirectConnectGatewayAttachment`),
+/// shape=VpcAttachment,ConnectAttachment,SiteToSiteVpnAttachment,TransitGatewayRouteTableAttachment,DirectConnectGatewayAttachment`),
 /// plus the one envelope member only a single kind fills
 /// ([`Self::DirectConnectGateway`]).
 #[derive(Debug, Clone)]
@@ -2076,6 +2077,10 @@ impl AttachmentRecord {
     }
 
     /// The modelled `Attachment` envelope of this record, as of `now`.
+    ///
+    /// `EdgeLocations` is absent because "this is returned only for Direct Connect gateway
+    /// attachments. All other attachment types retrun EdgeLocation" (`smithy_query
+    /// query="doc" shape="Attachment" member="EdgeLocations"`).
     pub fn to_attachment(&self, now: SystemTime) -> Attachment {
         self.to_attachment_at(self.state_at(now), self.updated_at(now))
     }
@@ -2932,6 +2937,13 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     pub connections: BTreeMap<String, ConnectionRecord>,
     /// Core networks by `CoreNetworkId`, each carrying its owning `GlobalNetworkId`.
     pub core_networks: BTreeMap<String, CoreNetworkRecord>,
+    /// Peerings by `PeeringId`, each carrying the `CoreNetworkId` it joins to a resource
+    /// of another service ([`PeeringRecord`]). A `BTreeMap`, so the store has one stable
+    /// order like every other map here.
+    ///
+    /// Bounded by [`MAX_PEERINGS_PER_CORE_NETWORK`] per core network, so repeated creates
+    /// cannot grow it without end.
+    pub peerings: BTreeMap<String, PeeringRecord>,
     /// Attachments by `AttachmentId`, of every kind, each carrying the `CoreNetworkId` it
     /// belongs to. A `BTreeMap`, so listing order is stable and a pagination token can
     /// name a key offset into it.
@@ -2941,13 +2953,6 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// network-resource inventory and the core-network delete refusal all count
     /// attachments without caring which kind each is.
     pub attachments: BTreeMap<String, AttachmentRecord>,
-    /// Peerings by `PeeringId`, each carrying the `CoreNetworkId` it joins to a resource
-    /// of another service ([`PeeringRecord`]). A `BTreeMap`, so the store has one stable
-    /// order like every other map here.
-    ///
-    /// Bounded by [`MAX_PEERINGS_PER_CORE_NETWORK`] per core network, so repeated creates
-    /// cannot grow it without end.
-    pub peerings: BTreeMap<String, PeeringRecord>,
     /// Prefix list associations by [`prefix_list_association_key`], each tying one stored
     /// core network to one managed prefix list of Amazon VPC. A `BTreeMap`, so listing
     /// order is stable and a pagination token can name a key offset into it.
@@ -3283,8 +3288,8 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             DEVICE_KIND => self.device_count_of(global_network_id),
             CONNECTION_KIND => self.connection_count_of(global_network_id),
             CORE_NETWORK_KIND => self.core_network_count_of(global_network_id),
-            ATTACHMENT_KIND => self.attachment_count_of_global_network(global_network_id),
             PEERING_KIND => self.peering_count_of_global_network(global_network_id),
+            ATTACHMENT_KIND => self.attachment_count_of_global_network(global_network_id),
             CONNECT_PEER_KIND => self.connect_peer_count_of_global_network(global_network_id),
             _ => 0,
         };
@@ -3992,8 +3997,13 @@ fn parse_foreign_arn<'a>(
     })
 }
 
-/// The ARN namespace of the managed prefix list a core network's prefix-list association
-/// names: an Amazon VPC (EC2) resource, not one of this service.
+/// The ARN namespace of the resources of ANOTHER service this service's Cloud WAN
+/// operations take as INPUT: a transit gateway, one of its route tables and a managed
+/// prefix list are all Amazon VPC (EC2) resources, so their ARNs read
+/// `arn:<partition>:ec2:<region>:<account>:<type>/<id>` — the form the members' own
+/// documentation gives as an example ("arn:aws:ec2:us-west-2:123456789012:transit-gateway-route-table/tgw-rtb-9876543210123456",
+/// `smithy_query query="doc" shape="CreateTransitGatewayRouteTableAttachmentRequest"
+/// member="TransitGatewayRouteTableArn"`). This service mints nothing for them.
 const EC2_NAMESPACE: &str = "ec2";
 /// The ARN resource type of a managed prefix list, and the prefix of its id — the `pl-` of
 /// `prefix-list/pl-0123456789abcdef1`.
@@ -4475,6 +4485,27 @@ pub fn tag_problem_rejection(problem: TagProblem) -> ValidationException {
 pub fn too_many_tags_message(resulting: usize) -> String {
     format!(
         "a resource may carry at most {MAX_TAGS_PER_RESOURCE} tags, but the request would leave {resulting}"
+    )
+}
+
+/// The modelled `ValidationException` (HTTP 400) a create answers when the core network it
+/// must hang off configures no edge in the Region the resource it names lives in.
+///
+/// A peering and an attachment both sit at a core network EDGE, and a core network's edges
+/// are the ones its policy document configures
+/// ([`PolicyTopology::has_edge_location`]), so a request naming a Region that document
+/// does not configure is refused rather than attached to an edge that does not exist. The
+/// `Reason` is [`VALIDATION_REASON_OTHER`]: the member satisfies every modelled
+/// constraint, it is the stored policy that configures no such edge.
+pub fn no_such_edge(
+    member: &str,
+    core_network_id: &str,
+    edge_location: &str,
+) -> ValidationException {
+    field_rejection(
+        member,
+        VALIDATION_REASON_OTHER,
+        format!("core network {core_network_id} configures no edge location in {edge_location}"),
     )
 }
 
@@ -5654,8 +5685,8 @@ pub fn same_vpc_options(left: Option<&VpcOptions>, right: Option<&VpcOptions>) -
 }
 
 /// The Region segment of an EC2 resource ARN
-/// (`arn:<partition>:ec2:<region>:<account>:<type>/<id>`), or `None` when it carries no
-/// non-empty one.
+/// (`arn:<partition>:ec2:<region>:<account>:<type>/<id>`), or `None` when it names no
+/// Region an endpoint could carry.
 ///
 /// A VPC attachment's edge location is not a request member: it is the Region the VPC is
 /// in, which only the VPC's ARN names; the same holds for a site-to-site VPN attachment

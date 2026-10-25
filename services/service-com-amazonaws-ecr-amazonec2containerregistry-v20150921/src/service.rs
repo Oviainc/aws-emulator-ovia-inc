@@ -80,8 +80,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 ///   expression '[a-z0-9]+…''`), or prose for an ARN-valued member (`… at
 ///   'signingProfileArn' … 'The signing profile ARN '<value>' must be well formed''`).
 ///   That is every parameter the request CARRIES — a top-level member, or an element of
-///   one of its collections, which is a value of that same parameter — plus an ARN
-///   wherever the request carries it, because ECR checks an ARN's form itself.
+///   one of its collections, which is one VALUE of that same parameter and is named by it
+///   in the singular — plus an ARN wherever the request carries it, because ECR checks an
+///   ARN's form itself.
 /// * a value the MODEL-DRIVEN walk caught inside a NESTED structure keeps that walk's own
 ///   rendering: the dotted path it descended, collection steps included, and the
 ///   `@pattern` exactly as the model declares it, anchors and all — `… at
@@ -99,16 +100,20 @@ fn clause(violation: &Violation) -> String {
     // states the kind of ARN and the value that is not one — so this branch is taken
     // before the position of the member is even looked at.
     if let ViolationKind::Pattern(pattern) = &violation.kind {
-        if let Some(prose) = arn_constraint(member, pattern, violation.value.as_deref()) {
-            return stated(member, &prose);
+        if let Some(prose) = arn_constraint(&member, pattern, violation.value.as_deref()) {
+            return stated(&member, &prose);
         }
     }
     let by_ecr = carried_parameter(&violation.path);
     let Some(requirement) = requirement(&violation.kind, by_ecr) else {
         return violation.message();
     };
-    let parameter = if by_ecr { member } else { &violation.path };
-    stated(parameter, &requirement)
+    let parameter = if by_ecr {
+        member
+    } else {
+        ::std::borrow::Cow::Borrowed(violation.path.as_str())
+    };
+    stated(&parameter, &requirement)
 }
 
 /// The clause itself, the one place its template is written.
@@ -167,12 +172,49 @@ fn carried_parameter(path: &str) -> bool {
 /// (`signingProfileArn`, not `signingConfiguration.rules.1.member.signingProfileArn`).
 ///
 /// The steps from a collection into an element are dropped off the end first
-/// ([`named_member`]), which leaves the COLLECTION named when the refused value is itself
-/// an element (`repositoryNames` rather than `repositoryNames.2.member`), and what remains
-/// is the last named member.
-fn member_at_fault(path: &str) -> &str {
+/// ([`named_member`]), and what remains is the last named member. A refused value that was
+/// an ELEMENT is one value of the collection's parameter rather than the collection
+/// itself, and ECR names the value's own parameter: the collection is named by the plural
+/// of it, so the value is named by [`one_value_of`] that name (`repositoryNames.2.member`
+/// -> `repositoryName`).
+fn member_at_fault(path: &str) -> ::std::borrow::Cow<'_, str> {
     let remaining = named_member(path);
-    remaining.rsplit('.').next().unwrap_or(remaining)
+    let member = remaining.rsplit('.').next().unwrap_or(remaining);
+    if remaining.len() == path.len() {
+        return ::std::borrow::Cow::Borrowed(member);
+    }
+    one_value_of(member)
+}
+
+/// The parameter ONE VALUE of the collection parameter `collection` belongs to: a
+/// collection of a parameter's values is named by the PLURAL of that parameter, so a value
+/// of it is named by the singular — `repositoryNames` -> `repositoryName`, `imageIds` ->
+/// `imageId`, `ecrRepositoryPrefixes` -> `ecrRepositoryPrefix`.
+///
+/// The plural is undone the way English forms it, which is what a member name in this model
+/// is written in: a name ending in a sibilant takes `-es` (`prefix` -> `prefixes`), a name
+/// ending in a consonant and `y` has it replaced by `-ies` (`policy` -> `policies`), and
+/// every other name takes a plain `-s`. A name that is not a plural has nothing to drop and
+/// keeps its own spelling.
+fn one_value_of(collection: &str) -> ::std::borrow::Cow<'_, str> {
+    /// The endings an `-es` plural follows: `s`, `x` and `z`, plus the digraphs `ch` and
+    /// `sh`, are the ones that take the syllable rather than a bare `s`.
+    const SIBILANT_ENDINGS: [&str; 5] = ["s", "x", "z", "ch", "sh"];
+
+    if let Some(stem) = collection.strip_suffix("ies").filter(|s| !s.is_empty()) {
+        return ::std::borrow::Cow::Owned(format!("{stem}y"));
+    }
+    if let Some(stem) = collection.strip_suffix("es").filter(|s| !s.is_empty()) {
+        if SIBILANT_ENDINGS.iter().any(|ending| stem.ends_with(ending)) {
+            return ::std::borrow::Cow::Borrowed(stem);
+        }
+    }
+    collection
+        .strip_suffix('s')
+        .filter(|value| !value.is_empty())
+        .map_or(::std::borrow::Cow::Borrowed(collection), |value| {
+            ::std::borrow::Cow::Borrowed(value)
+        })
 }
 
 /// `path` with the steps from a collection into an element dropped off the end, so what

@@ -84,14 +84,14 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    CallAnalyticsJob, CallAnalyticsJobSettings, CallAnalyticsJobSummary, CategoryProperties,
-    ChannelDefinition, ContentRedaction, EncryptionConfiguration, InputDataConfig,
-    JobExecutionSettings, LanguageIdSettings, LanguageModel, Media,
+    AbsoluteTimeRange, CallAnalyticsJob, CallAnalyticsJobSettings, CallAnalyticsJobSummary,
+    CategoryProperties, ChannelDefinition, ContentRedaction, EncryptionConfiguration,
+    InputDataConfig, JobExecutionSettings, LanguageIdSettings, LanguageModel, Media,
     MedicalScribeChannelDefinition, MedicalScribeJob, MedicalScribeJobSummary,
     MedicalScribeOutput,
     MedicalScribeSettings, MedicalTranscript, MedicalTranscriptionJob,
-    MedicalTranscriptionJobSummary, MedicalTranscriptionSetting, ModelSettings, Rule, Settings,
-    SubtitlesOutput, Tag,
+    MedicalTranscriptionJobSummary, MedicalTranscriptionSetting, ModelSettings, RelativeTimeRange,
+    Rule, Settings, SubtitlesOutput, Tag,
     ToxicityDetectionSettings, Transcript, TranscriptionJob, TranscriptionJobSummary,
     VocabularyFilterInfo, VocabularyInfo, MEDICAL_SCRIBE_LANGUAGE_CODE_VALUES,
 };
@@ -720,14 +720,37 @@ pub fn co_required_setting_error(
     qualifier: &str,
     qualifier_set: bool,
 ) -> Option<String> {
-    match (enabled, qualifier_set) {
+    co_required_pair_error("Settings", toggle, enabled, qualifier, qualifier_set)
+}
+
+/// How this service refuses a member pair that is co-required in BOTH directions when
+/// a request carries one side of it and not the other, or `None` when the pair holds
+/// together (both sides, or neither).
+///
+/// A pair whose two members are each documented as requiring the other has ONE refusal
+/// whichever side is missing: the member the caller DID send, and the companion it
+/// needs, both spelled from `parent` as the caller spells them
+/// (`Settings.ShowSpeakerLabels`, `Rules[0].SentimentFilter.RelativeTimeRange.StartPercentage`).
+/// Single-homed here because every such pair of this service — the settings toggles and
+/// the values that qualify them ([`co_required_setting_error`]), and the bounded
+/// segment of a time range ([`time_range_co_requirement_error`]) — is refused the same
+/// way, and because Smithy's constraint traits cannot express a conditional
+/// co-requirement, so no boundary validation can refuse one.
+pub fn co_required_pair_error(
+    parent: &str,
+    left: &str,
+    left_present: bool,
+    right: &str,
+    right_present: bool,
+) -> Option<String> {
+    match (left_present, right_present) {
         (true, false) => Some(missing_companion_message(
-            &format!("Settings.{toggle}"),
-            &format!("Settings.{qualifier}"),
+            &format!("{parent}.{left}"),
+            &format!("{parent}.{right}"),
         )),
         (false, true) => Some(missing_companion_message(
-            &format!("Settings.{qualifier}"),
-            &format!("Settings.{toggle}"),
+            &format!("{parent}.{right}"),
+            &format!("{parent}.{left}"),
         )),
         _ => None,
     }
@@ -772,6 +795,89 @@ pub fn missing_companion_error(
     companion_present: bool,
 ) -> Option<String> {
     (present && !companion_present).then(|| missing_companion_message(member, companion))
+}
+
+/// The refusal for a half-specified time range under `parent`, or `None` when both the
+/// time ranges it carries are whole.
+///
+/// Each of the two time-range shapes bounds a custom segment with a PAIR of members
+/// that are co-required in both directions — "If you include `StartTime` in your
+/// request, you must also include `EndTime`" and the converse, with the shape doc
+/// repeating "You must use `StartTime` and `EndTime` as a set; that is, if you include
+/// one, you must include both", and the same two sentences for `StartPercentage` /
+/// `EndPercentage` (`smithy_query(query="shape",
+/// shape="AbsoluteTimeRange,RelativeTimeRange")`). The open-ended members `First` and
+/// `Last` carry no such sentence ("You can use `First` and `Last` independently of each
+/// other"), so either alone is a whole range. Single-homed here because every filter
+/// that can carry a time range carries the same two shapes, so no operation ends up
+/// checking a different pair. A filter carrying BOTH shapes half-specified is refused
+/// over the ABSOLUTE one, so which member a refusal names is the same on every run.
+pub fn time_range_co_requirement_error(
+    parent: &str,
+    absolute: Option<&AbsoluteTimeRange>,
+    relative: Option<&RelativeTimeRange>,
+) -> Option<String> {
+    absolute
+        .and_then(|range| {
+            co_required_pair_error(
+                &format!("{parent}.AbsoluteTimeRange"),
+                "StartTime",
+                range.start_time.is_some(),
+                "EndTime",
+                range.end_time.is_some(),
+            )
+        })
+        .or_else(|| {
+            relative.and_then(|range| {
+                co_required_pair_error(
+                    &format!("{parent}.RelativeTimeRange"),
+                    "StartPercentage",
+                    range.start_percentage.is_some(),
+                    "EndPercentage",
+                    range.end_percentage.is_some(),
+                )
+            })
+        })
+}
+
+/// The refusal for the first rule of `rules` that carries a half-specified time range,
+/// or `None` when every time range of every rule holds together.
+///
+/// The `Rule` union's four members are the filters a category's rules are built from,
+/// and each one can bound its search to a time range in milliseconds or in percentage
+/// (`smithy_query(query="shape",
+/// shape="Rule,NonTalkTimeFilter,InterruptionFilter,TranscriptFilter,SentimentFilter")`),
+/// so the co-requirement [`time_range_co_requirement_error`] decides is read on every
+/// member of the union rather than on the filters one request happened to use. The
+/// rules are walked in the order the request lists them, so which rule a refusal names
+/// is the same on every run; the name is the member PATH the caller sent, carrying no
+/// other request value.
+pub fn rule_time_range_error(rules: &[Rule]) -> Option<String> {
+    rules.iter().enumerate().find_map(|(index, rule)| {
+        let (filter, absolute, relative) = match rule {
+            Rule::NonTalkTimeFilter(filter) => (
+                "NonTalkTimeFilter",
+                filter.absolute_time_range.as_ref(),
+                filter.relative_time_range.as_ref(),
+            ),
+            Rule::InterruptionFilter(filter) => (
+                "InterruptionFilter",
+                filter.absolute_time_range.as_ref(),
+                filter.relative_time_range.as_ref(),
+            ),
+            Rule::TranscriptFilter(filter) => (
+                "TranscriptFilter",
+                filter.absolute_time_range.as_ref(),
+                filter.relative_time_range.as_ref(),
+            ),
+            Rule::SentimentFilter(filter) => (
+                "SentimentFilter",
+                filter.absolute_time_range.as_ref(),
+                filter.relative_time_range.as_ref(),
+            ),
+        };
+        time_range_co_requirement_error(&format!("Rules[{index}].{filter}"), absolute, relative)
+    })
 }
 
 /// The references a request's settings name, as

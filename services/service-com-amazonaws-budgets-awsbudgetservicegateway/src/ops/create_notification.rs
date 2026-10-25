@@ -198,7 +198,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = crate::state::store_at(&state, now);
         // "You must create the budget before you create the associated notification":
         // a notification is held inside the budget that owns it, so a budget this
         // account does not hold is the resource this call cannot locate.

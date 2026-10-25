@@ -8,8 +8,10 @@
 //! nothing, so the link a caller reads is the one the store already held.
 //!
 //! The standard account is the one `StandardAccountId` names, else the caller's
-//! own (`crate::state::resolve_account_id`), which is the standalone call the
-//! model documents. A standard account this emulator holds no record of is the
+//! own (`crate::state::target_account_id`), which is the standalone call the
+//! model documents — and the member it documents names a MEMBER account, so
+//! naming the caller's own account there is refused rather than served as that
+//! standalone call. A standard account this emulator holds no record of is the
 //! same authorization refusal every other reader of this service answers
 //! (`AccessDeniedException`); a record that carries no link has no GovCloud
 //! account to report, which is the modelled `ResourceNotFoundException`.
@@ -181,8 +183,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // The account this call acts on. An absent `StandardAccountId` is the
+        // standalone call on the caller's own account; a PRESENT one names a
+        // member account of the caller's organization, which the caller's own
+        // account is not — so naming it is the modelled authorization refusal.
         let standard_account_id =
-            crate::state::resolve_account_id(input.standard_account_id.as_deref());
+            match crate::state::target_account_id(input.standard_account_id.as_deref()) {
+                Ok(account_id) => account_id,
+                Err(denied) => {
+                    return Err(
+                        GetGovCloudAccountInformationErrorModeled::AccessDeniedException(denied)
+                            .into(),
+                    )
+                }
+            };
         // A REPORTING operation: the store is read, never written, so no record
         // and no link is created here and a later caller sees exactly what this
         // one saw.
