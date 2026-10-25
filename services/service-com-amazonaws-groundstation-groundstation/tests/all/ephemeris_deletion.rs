@@ -180,13 +180,18 @@ fn put_in_status(engine: &engine::InMemoryEngine, contact_id: &str, status: &str
 }
 
 /// Reserve a contact flown against `satellite_arn`, and answer its id.
+///
+/// `slot` moves the window a day per row, so each reservation of a table holds a window of
+/// its own: an antenna serves one pass at a time, so a second reservation of the SAME
+/// window at one ground station is refused.
 async fn reserve_against(
     router: &MultiServiceRouter,
     case: &str,
     profile_arn: &str,
     satellite_arn: &str,
+    slot: usize,
 ) -> String {
-    let start = 1_800_000_000_i64;
+    let start = 1_800_000_000_i64 + i64::try_from(slot).expect("a row index fits in i64") * 86_400;
     let reserved = send(
         router,
         "POST",
@@ -482,7 +487,7 @@ async fn an_ephemeris_in_force_is_held_by_every_non_terminal_contact_of_its_sate
 
     // ONE wait for the whole table, after every row is stored.
     let mut rows: Vec<(&str, String, String)> = Vec::new();
-    for (status, satellite_id) in CONTACT_STATUSES.iter().zip(&satellites) {
+    for (slot, (status, satellite_id)) in CONTACT_STATUSES.iter().zip(&satellites).enumerate() {
         let ephemeris_id = create_ok(
             &router,
             status,
@@ -496,7 +501,7 @@ async fn an_ephemeris_in_force_is_held_by_every_non_terminal_contact_of_its_sate
         )
         .await;
         let satellite = satellite_arn(&engine, satellite_id);
-        let contact_id = reserve_against(&router, status, &profile_arn, &satellite).await;
+        let contact_id = reserve_against(&router, status, &profile_arn, &satellite, slot).await;
         rows.push((status, ephemeris_id, contact_id));
     }
     wait_out_validation();
@@ -589,7 +594,7 @@ async fn a_contact_holds_only_the_ephemeris_in_force_for_its_own_satellite() {
     );
     let flown = satellite_arn(&engine, &satellites[0]);
     let profile_arn = create_mission_profile(&router, "ephemeris boundary", 60, None, None).await;
-    let contact_id = reserve_against(&router, "boundary", &profile_arn, &flown).await;
+    let contact_id = reserve_against(&router, "boundary", &profile_arn, &flown, 0).await;
 
     let rows = vec![
         NotHeld {

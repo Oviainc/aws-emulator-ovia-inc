@@ -4,9 +4,11 @@
 //! IMPLEMENTED: overwrites the stored feed's name, outputs and access role, so a
 //! later GetFeed/ListFeeds reports the new values. PUT overwrite semantics: the
 //! payload replaces the existing one, so an omitted `accessRoleArn` clears the role.
-//! The overwrite is complete when the call answers (HTTP 200), so the response
-//! reports the feed's settled status — `AVAILABLE` with no resource associated,
-//! `ACTIVE` while one holds it — rather than a transient one. The replacement list
+//! Reconfiguring the feed's payload is work the service carries out after the call, so
+//! the feed reports the modelled transient `UPDATING` for the span of it and the clock
+//! then settles it back into the status the reconfiguration suspended — `AVAILABLE`
+//! with no resource associated, `ACTIVE` while one holds it, `ARCHIVED` once its
+//! resource has been released. The replacement list
 //! still has to describe a feed the service would hold: output names are unique within
 //! a feed (`ConflictException`, HTTP 409) and `fromAssociation` is service-owned, so a
 //! request that disagrees with the stored provenance is refused (`ValidationException`,
@@ -330,14 +332,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         feed.name = input.name;
         feed.outputs = outputs;
         feed.access_role_arn = input.access_role_arn;
-        // The feed's LIFECYCLE status is not what an update moves: UpdateFeed answers
-        // HTTP 200, not 202, so the overwrite is complete when the call answers and the
-        // feed reports the status it HOLDS — AVAILABLE with no resource associated,
-        // ACTIVE while one holds it. An update never parks the feed in a transient
-        // status the caller would have to wait out, and it neither cancels nor
-        // accelerates a transition the clock already owes (a feed whose deletion has
-        // been accepted is still DELETING, and is refused above). AssociateFeed, also a
-        // 200, already works this way.
+        // Reconfiguring a live media feed's payload is work the service then carries
+        // out, so the feed is IN FLIGHT for the span of it and reports the modelled
+        // `UPDATING` — the value that exists for exactly this span — until the clock
+        // settles it back into the status the reconfiguration suspended: `AVAILABLE`
+        // with no resource associated, `ACTIVE` while one holds it, `ARCHIVED` once its
+        // resource has been released. The status is suspended, not replaced, which is
+        // why the feed remembers where it goes back to.
+        //
+        // The span is non-zero, so a client polling GetFeed straight after the PUT does
+        // observe `UPDATING` and can wait for the feed to leave it; nothing sleeps for
+        // it, since the due instant is stored on the feed and materialised by the next
+        // call's settle pass. A feed whose deletion has already been accepted never
+        // reaches here (it is refused above), so this neither cancels nor accelerates a
+        // transition the clock already owes.
+        let due = feed.begin_reconfiguration(now);
 
         let output = UpdateFeedOutput {
             arn: feed.arn.clone(),
@@ -350,6 +359,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             association: feed.association.clone(),
             tags: Some(feed.tag_map()),
         };
+        state.note_due(due);
         Ok(output)
     }
 }
