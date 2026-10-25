@@ -273,14 +273,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The version ARN's modelled pattern spells the image name in lowercase
-        // (`image-version/[a-z0-9]([-.]?[a-z0-9])*/[0-9]+`) where the image ARN's keeps
-        // the name's own case, so the name is lowercased for this ARN only.
-        let arn = crate::state::resource_arn(
-            &region,
-            "image-version",
-            &format!("{}/{next_version}", input.image_name.to_lowercase()),
-        );
+        // See [`crate::state::image_version_arn`] for how a version's ARN spells the
+        // image name.
+        let arn = crate::state::image_version_arn(&region, &input.image_name, next_version);
 
         store.image_versions.insert(
             (input.image_name.clone(), next_version),

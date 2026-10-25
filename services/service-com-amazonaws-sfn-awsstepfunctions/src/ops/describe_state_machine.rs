@@ -257,7 +257,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let not_found = || {
             DescribeStateMachineErrorModeled::StateMachineDoesNotExist(StateMachineDoesNotExist {
                 message: Some(crate::state::resource_error_message(
-                    crate::state::STATE_MACHINE_DOES_NOT_EXIST,
+                    // The condition names the resource the ARN REFERRED to: a
+                    // version-qualified ARN that resolves to nothing is a version
+                    // that does not exist, not a state machine that does not exist.
+                    crate::state::absent_state_machine_condition(&parsed),
                     &input.state_machine_arn,
                 )),
             })

@@ -7,6 +7,11 @@
 //! `createdAt`/`updatedAt` taken at the moment of the call) in this service's state, and
 //! returns the ARN it stored the record under.
 //!
+//! The supplied tags are resolved by tag key before they are stored
+//! ([`crate::state::merge_resource_tags`]), so a request naming one key twice stores
+//! that key once, holding its last value — the state applying those entries through
+//! `TagResource` would leave.
+//!
 //! A dashboard's name identifies it within the account, so a create naming a dashboard the
 //! account already holds is refused with the modelled `ValidationException` (HTTP 400) and
 //! stores nothing.
@@ -246,8 +251,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             updated_at: now,
             // Persisted at create time, as the tag list every tagging operation
-            // reads and writes.
-            resource_tags: input.resource_tags.unwrap_or_default(),
+            // reads and writes — resolved by tag key through the resolution every
+            // tagging path shares (`crate::state::merge_resource_tags`), so a request
+            // that names one key twice stores that key once, holding its last value,
+            // exactly as applying those entries through `TagResource` would.
+            resource_tags: crate::state::merge_resource_tags(
+                Vec::new(),
+                input.resource_tags.unwrap_or_default(),
+            ),
             // A new dashboard carries no resource-based policy: `CreateDashboard`
             // models no member that attaches one, so `GetResourcePolicy` reads back
             // the empty document until something writes a policy here.

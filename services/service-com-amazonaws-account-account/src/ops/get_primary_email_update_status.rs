@@ -169,7 +169,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        let account_id = crate::state::resolve_account_id(input.account_id.as_deref());
+        // The account this call acts on. An absent `AccountId` is the standalone
+        // call on the caller's own account; a PRESENT one names a member account
+        // of the caller's organization, which the caller's own account is not —
+        // so naming it is the modelled authorization refusal.
+        let account_id = match crate::state::target_account_id(input.account_id.as_deref()) {
+            Ok(account_id) => account_id,
+            Err(denied) => {
+                return Err(
+                    GetPrimaryEmailUpdateStatusErrorModeled::AccessDeniedException(denied).into(),
+                )
+            }
+        };
         // A REPORTING operation (`@readonly`): the store is read, never written, so
         // no record is created here and a later caller sees exactly what this one
         // saw. A completion the CLOCK already owes an accepted update is still

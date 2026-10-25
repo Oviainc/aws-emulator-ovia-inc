@@ -21,6 +21,8 @@ mod error_paths;
 mod execution_role_pass_role;
 #[path = "all/interval_validation.rs"]
 mod interval_validation;
+#[path = "all/invalid_request_parameter_lists.rs"]
+mod invalid_request_parameter_lists;
 #[path = "all/lifecycle_policy_crud.rs"]
 mod lifecycle_policy_crud;
 #[path = "all/policy_configuration_validation.rs"]

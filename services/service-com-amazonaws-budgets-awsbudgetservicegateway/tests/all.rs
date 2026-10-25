@@ -31,6 +31,8 @@ mod budget_action_subscriber_limits;
 mod budget_actions_for_budget;
 #[path = "all/budget_creation_limits.rs"]
 mod budget_creation_limits;
+#[path = "all/budget_end_date_expiry.rs"]
+mod budget_end_date_expiry;
 #[path = "all/budget_lifecycle.rs"]
 mod budget_lifecycle;
 #[path = "all/budget_read_projection.rs"]

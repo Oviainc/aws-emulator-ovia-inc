@@ -15,6 +15,8 @@
 mod add_custom_attributes;
 #[path = "all/admin_group_listing.rs"]
 mod admin_group_listing;
+#[path = "all/admin_remove_user_from_group.rs"]
+mod admin_remove_user_from_group;
 #[path = "all/admin_respond_to_auth_challenge.rs"]
 mod admin_respond_to_auth_challenge;
 #[path = "all/admin_user_pool_lifecycle.rs"]
