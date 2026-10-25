@@ -19,8 +19,9 @@ use crate::ops::types::{
     LifecyclePolicySummary, PolicyDetails, ResourceNotFoundException, RetainRule, Schedule, Tag,
 };
 
-/// The region a policy ARN is built for when the request carries no SigV4
-/// credential scope to read one from.
+/// The region a request belongs to — the policies it reaches, and the region a
+/// policy ARN it mints names — when it carries no SigV4 credential scope to read
+/// one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// The `arnNamespace` / sigv4 signing name this service's ARNs carry
@@ -697,14 +698,29 @@ fn tag_filter(tag: &Tag) -> String {
     format!("{}={}", tag.key, tag.value)
 }
 
+/// The lifecycle policies of ONE region, keyed by policy id. A `BTreeMap` gives
+/// `GetLifecyclePolicies` a stable total order, and ids sort in the order they
+/// were minted.
+pub type RegionalPolicies = BTreeMap<String, LifecyclePolicyRecord>;
+
 /// Per-service state for com-amazonaws-dlm-dlm-20180112. A handler reaches it through [`service_state`].
+///
+/// Policies are keyed by REGION and then by id, because a lifecycle policy
+/// belongs to the region its request was signed for: Amazon Data Lifecycle
+/// Manager is a regional control plane (per-region endpoints, and a `PolicyArn`
+/// that names the region the policy lives in), so a policy created in one region
+/// is the only scope in which its id resolves. The account is not part of the key
+/// because this emulator serves exactly one account — the canonical account
+/// [`::engine::emulator_arn`] mints every ARN for — so every request's policies
+/// already belong to it.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsDlmDlm20180112State {
-    /// Every lifecycle policy, keyed by its id — the single source of truth. A
-    /// `BTreeMap` gives `GetLifecyclePolicies` a stable total order, and ids sort
-    /// in the order they were minted.
-    pub policies: BTreeMap<String, LifecyclePolicyRecord>,
-    /// The counter policy ids are minted from.
+    /// Every lifecycle policy, keyed by the region it was created in and then by
+    /// its id — the single source of truth.
+    pub regions: BTreeMap<String, RegionalPolicies>,
+    /// The counter policy ids are minted from. It spans every region, so no two
+    /// policies this store holds ever share an id — the per-region uniqueness a
+    /// policy id has in Amazon Data Lifecycle Manager, and no weaker.
     pub next_policy_suffix: u64,
 }
 
@@ -718,25 +734,79 @@ impl ComAmazonawsDlmDlm20180112State {
         loop {
             self.next_policy_suffix = self.next_policy_suffix.wrapping_add(1);
             let id = format!("policy-{:016x}", self.next_policy_suffix);
-            if !self.policies.contains_key(&id) {
+            if !self.regions.values().any(|region| region.contains_key(&id)) {
                 return id;
             }
         }
     }
 
-    /// The id of the policy whose stored `PolicyArn` is `arn`.
+    /// The policies of one region — the only scope a policy id resolves in.
+    pub fn policies_in(&self, region: &str) -> Option<&RegionalPolicies> {
+        self.regions.get(region)
+    }
+
+    /// The policy that id names in that region, whatever its state.
+    pub fn policy(&self, region: &str, policy_id: &str) -> Option<&LifecyclePolicyRecord> {
+        self.policies_in(region)
+            .and_then(|policies| policies.get(policy_id))
+    }
+
+    /// The same, mutably, for the operations that change a policy.
+    pub fn policy_mut(
+        &mut self,
+        region: &str,
+        policy_id: &str,
+    ) -> Option<&mut LifecyclePolicyRecord> {
+        self.regions
+            .get_mut(region)
+            .and_then(|policies| policies.get_mut(policy_id))
+    }
+
+    /// Store a newly minted policy in the region it was created in.
+    pub fn insert_policy(&mut self, region: &str, record: LifecyclePolicyRecord) {
+        self.regions
+            .entry(region.to_string())
+            .or_default()
+            .insert(record.policy_id.clone(), record);
+    }
+
+    /// Remove the policy that id names in that region, answering it when there
+    /// was one. A region left holding no policies keeps no bucket.
+    pub fn remove_policy(
+        &mut self,
+        region: &str,
+        policy_id: &str,
+    ) -> Option<LifecyclePolicyRecord> {
+        let policies = self.regions.get_mut(region)?;
+        let removed = policies.remove(policy_id);
+        if policies.is_empty() {
+            self.regions.remove(region);
+        }
+        removed
+    }
+
+    /// How many policies this store holds across every region — what the store's
+    /// own bound ([`POLICY_QUOTA`]) is measured against.
+    pub fn policy_count(&self) -> usize {
+        self.regions.values().map(RegionalPolicies::len).sum()
+    }
+
+    /// The id of the policy in that region whose stored `PolicyArn` is `arn`.
     ///
     /// The tag operations address a policy by ARN; no index is kept for it,
-    /// because the ARN is derived from the id and the store is small.
-    pub fn policy_id_for_arn(&self, arn: &str) -> Option<String> {
-        self.policies
+    /// because the ARN is derived from the id and the store is small. A stored
+    /// ARN names the region its policy lives in, so an ARN naming another region
+    /// resolves to no policy here.
+    pub fn policy_id_for_arn(&self, region: &str, arn: &str) -> Option<String> {
+        self.policies_in(region)?
             .values()
             .find(|policy| policy.policy_arn == arn)
             .map(|policy| policy.policy_id.clone())
     }
 }
 
-/// The region this request was signed for — what a policy ARN names.
+/// The region this request was signed for: the region whose policies it reaches,
+/// and what a policy ARN minted for it names.
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
