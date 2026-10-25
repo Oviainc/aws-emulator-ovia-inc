@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PublishFunction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PublishFunction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PublishFunction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +73,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::IfMatch;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -152,20 +145,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PublishFunction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PublishFunctionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PublishFunction"))
+        // The engine is reachable from `&self` (constructor-injected); this operation
+        // needs nothing from the request metadata the context carries.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // The stage a publish READS and copies from is the one a function is created in, so
+        // the version token the precondition is checked against is that stage's: `IfMatch`
+        // is "The current version (ETag value) of the function that you are publishing,
+        // which you can get using DescribeFunction", and a describe that names no stage
+        // reads the stage a function is created in.
+        let published_from = crate::state::DEFAULT_FUNCTION_STAGE;
+
+        // "The name of the function that you are publishing": a name no function holds is
+        // "the function does not exist", and is answered before the precondition, which can
+        // only be checked against a stored version.
+        let Some(current_etag) = store
+            .function(&input.name)
+            .map(|function| function.development.etag.clone())
+        else {
+            return Err(PublishFunctionErrorModeled::NoSuchFunctionExists(
+                crate::state::no_such_function_exists(&input.name, published_from),
+            )
+            .into());
+        };
+
+        // The precondition is checked against the STORED version, so a publish only copies
+        // the stage its caller actually read: a token that is not a version token at all is
+        // "missing or not valid", and a well-formed token that is not the current one is a
+        // failed precondition. Both are decided BEFORE anything is written, so a refused
+        // publish promotes nothing and leaves the stored function exactly as it was.
+        match crate::state::check_if_match(&current_etag, Some(input.if_match.as_str())) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => {
+                return Err(PublishFunctionErrorModeled::InvalidIfMatchVersion(
+                    crate::state::invalid_if_match_version(),
+                )
+                .into());
+            }
+            IfMatch::Stale => {
+                return Err(PublishFunctionErrorModeled::PreconditionFailed(
+                    crate::state::precondition_failed(),
+                )
+                .into());
+            }
+        }
+
+        // The copy itself, and the projection of the stage it wrote. The record this answers
+        // from is the one the store now holds, so a later describe or get of the `LIVE` stage
+        // reports the same configuration, code, status, stage and timestamps.
+        let Some(summary) = store.publish_function(&input.name, now) else {
+            return Err(PublishFunctionErrorModeled::NoSuchFunctionExists(
+                crate::state::no_such_function_exists(&input.name, published_from),
+            )
+            .into());
+        };
+
+        Ok(PublishFunctionOutput {
+            // "Contains configuration information and metadata about a CloudFront function"
+            // — the projection of the stage this call just wrote, which is the `LIVE` one.
+            function_summary: Some(summary),
+        })
     }
 }

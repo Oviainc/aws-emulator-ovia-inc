@@ -39,6 +39,11 @@ pub const CONNECTION_STATUS_PENDING: &str = "PENDING";
 /// VPC_CONFIG_FAILED_INITIALIZATION", `smithy_query(query="shape", shape="Host")`).
 /// `HostStatus` is modeled as a free-form string (`len 1..64`) rather than an enum, so
 /// these are the values the doc names rather than a closed set the wire enforces.
+///
+/// A host created through the API is `PENDING`: the model's `CreateHost` doc says "A host
+/// created through the CLI or the SDK is in `PENDING` status by default. You can make its
+/// status `AVAILABLE` by setting up the host in the console", and setting the host up is a
+/// console action rather than anything the clock owes.
 pub const HOST_STATUS_PENDING: &str = "PENDING";
 /// The status description a host carries while it is `PENDING`.
 ///
@@ -238,10 +243,10 @@ impl StoredRepositoryLink {
 /// One record per `HostArn`, holding every member of the modeled `Host` shape the API
 /// can observe, so an operation that reports or deletes a host works off this one row
 /// rather than recomputing one. `CreateHost` writes the row, `GetHost` and `ListHosts`
-/// render it through [`StoredHost::to_host`], and `DeleteHost` reads
-/// [`StoredHost::status`] (the delete is refused while the host's VPC configuration is in
-/// flight) before removing the whole record. `UpdateHost` updates this same row (still a
-/// scaffold with its own open issue).
+/// render it through [`StoredHost::to_host`], `UpdateHost` replaces the configurations a
+/// request supplies on it, and `DeleteHost` reads [`StoredHost::status`] (the delete is
+/// refused while the host's VPC configuration is in flight) before removing the whole
+/// record.
 #[derive(Debug, Clone)]
 pub struct StoredHost {
     /// `Name` as supplied at create.
@@ -372,9 +377,11 @@ pub struct ComAmazonawsCodestarconnectionsCodestarConnections20191201State {
     /// `GetRepositoryLink`, `UpdateRepositoryLink` and `DeleteRepositoryLink` address a
     /// link by.
     pub repository_links: BTreeMap<String, StoredRepositoryLink>,
-    /// Every host in this emulator, keyed by its ARN. A connection may name one
-    /// through `StoredConnection::host_arn`, which is the association `DeleteHost`
-    /// refuses to break.
+    /// Every host in this emulator, keyed by its ARN. `CreateHost` inserts here and
+    /// `GetHost` / `UpdateHost` / `DeleteHost` resolve the ARN against this one map, so
+    /// there is a single copy of each host. A connection may name one through
+    /// `StoredConnection::host_arn`, which is the association `DeleteHost` refuses to
+    /// break.
     pub hosts: BTreeMap<String, StoredHost>,
     /// Every sync blocker in this emulator, keyed by its `Id` — the id
     /// `UpdateSyncBlocker` addresses a blocker by, alongside the resource and sync type
@@ -386,7 +393,8 @@ pub struct ComAmazonawsCodestarconnectionsCodestarConnections20191201State {
     /// `SyncBlockerDoesNotExistException`.
     pub sync_blockers: BTreeMap<String, StoredSyncBlocker>,
     /// Tags by resource ARN, shared by `TagResource` / `UntagResource` /
-    /// `ListTagsForResource` and populated from `CreateConnection.Tags`.
+    /// `ListTagsForResource` and populated from `CreateConnection.Tags` /
+    /// `CreateHost.Tags`.
     pub tags: BTreeMap<String, BTreeMap<String, String>>,
     /// The next creation-order sequence number to hand out.
     pub next_sequence: u64,
@@ -730,10 +738,10 @@ pub fn host_arn(region: &str, host_id: &str) -> String {
 
 /// How this service reports a `HostArn` that resolves to no host it holds.
 ///
-/// Shared by every operation that resolves one (`DeleteHost`, `GetHost`, and the
-/// `CreateConnection` / `ListConnections` host cross-references), so an absent host reads
-/// the same whichever call found it absent. The message is built from the REQUEST — it
-/// names the ARN that was supplied — which is the part of it that is a contract.
+/// Shared by every operation that resolves one (`GetHost`, `UpdateHost`, `DeleteHost`, and
+/// the `CreateConnection` / `ListConnections` host cross-references), so an absent host
+/// reads the same whichever call found it absent. The message is built from the REQUEST —
+/// it names the ARN that was supplied — which is the part of it that is a contract.
 pub fn host_not_found_message(host_arn: &str) -> String {
     format!("No host exists with the ARN: {host_arn}")
 }
@@ -778,9 +786,11 @@ pub fn absent_resource_message(resource_arn: &str) -> String {
 /// with: HTTP 400, the awsJson1_0 client-error status, not the `@httpError 404` the
 /// `ResourceNotFoundException` shape declares (the recorded
 /// `codestar-connections-connection-error-paths#task#2` and `#task#3` expectations —
-/// status 400 with `__type` `ResourceNotFoundException`). `GetHost` and the
-/// repository-link operations answer an absent resource the same way, from their own
-/// fixtures. The handler passes this to `crate::scaffolded::Scaffolded::modeled_with_status`.
+/// status 400 with `__type` `ResourceNotFoundException`). The host operations (`GetHost`,
+/// `UpdateHost`, `DeleteHost` — `codestar-connections-host-error-paths#task#1`, `#task#2`
+/// and `#task#3`) and the repository-link operations answer an absent resource the same
+/// way, from their own fixtures. The handler passes this to
+/// `crate::scaffolded::Scaffolded::modeled_with_status`.
 pub const RESOURCE_NOT_FOUND_STATUS: u16 = 400;
 
 /// How this service reports a sync blocker the request's (`Id`, `ResourceName`,

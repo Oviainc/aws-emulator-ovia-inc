@@ -205,6 +205,97 @@ pub fn grant_sns_delivery(queue_arn: &str) -> String {
     .to_string()
 }
 
+/// A queue called `name`: its url and its ARN, with no policy of its own.
+///
+/// The SNS-action suites all need one — a notification is asserted where a client sees it, on
+/// the queue subscribed to the alarm's topic — so the setup lives here once.
+pub async fn given_queue(emulator: &Emulator, name: &str) -> (String, String) {
+    let created = rpc(
+        emulator,
+        "sqs",
+        "AmazonSQS",
+        "CreateQueue",
+        &::serde_json::json!({"QueueName": name}),
+    )
+    .await;
+    let url = created["QueueUrl"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreateQueue {name}: no QueueUrl in {created}"))
+        .to_string();
+    let attributes = rpc(
+        emulator,
+        "sqs",
+        "AmazonSQS",
+        "GetQueueAttributes",
+        &::serde_json::json!({"QueueUrl": url, "AttributeNames": ["QueueArn"]}),
+    )
+    .await;
+    let arn = attributes["Attributes"]["QueueArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("GetQueueAttributes {name}: no QueueArn in {attributes}"))
+        .to_string();
+    (url, arn)
+}
+
+/// Grant the SNS service principal the send on the queue at `url`, which is what a
+/// subscribed queue needs to receive anything ([`grant_sns_delivery`]).
+pub async fn grant_sns_delivery_on(emulator: &Emulator, url: &str, queue_arn: &str) {
+    rpc(
+        emulator,
+        "sqs",
+        "AmazonSQS",
+        "SetQueueAttributes",
+        &::serde_json::json!({
+            "QueueUrl": url,
+            "Attributes": {"Policy": grant_sns_delivery(queue_arn)},
+        }),
+    )
+    .await;
+}
+
+/// Subscribe the queue `queue_arn` to the topic `topic_arn`.
+pub async fn subscribe_queue(emulator: &Emulator, topic_arn: &str, queue_arn: &str) {
+    sns(
+        emulator,
+        "Subscribe",
+        &[
+            ("TopicArn", topic_arn),
+            ("Protocol", "sqs"),
+            ("Endpoint", queue_arn),
+        ],
+    )
+    .await;
+}
+
+/// Force one alarm into `state`, which is what fires the actions configured for it.
+pub async fn set_alarm_state(emulator: &Emulator, name: &str, state: &str) {
+    rpc(
+        emulator,
+        "monitoring",
+        TARGET_PREFIX,
+        "SetAlarmState",
+        &::serde_json::json!({
+            "AlarmName": name,
+            "StateValue": state,
+            "StateReason": "driven by the test",
+        }),
+    )
+    .await;
+}
+
+/// Every message waiting on the queue at `url`, as `ReceiveMessage` reports them.
+pub async fn received_messages(emulator: &Emulator, url: &str) -> Vec<Value> {
+    let received = rpc(
+        emulator,
+        "sqs",
+        "AmazonSQS",
+        "ReceiveMessage",
+        &::serde_json::json!({"QueueUrl": url, "MaxNumberOfMessages": 10}),
+    )
+    .await;
+    received["Messages"].as_array().cloned().unwrap_or_default()
+}
+
 /// The Region the suite's requests are signed for unless they say otherwise.
 pub const DEFAULT_REGION: &str = "us-east-1";
 

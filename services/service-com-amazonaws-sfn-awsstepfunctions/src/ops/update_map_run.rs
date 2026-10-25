@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMapRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMapRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: a MUTATING operation. It writes the configuration a caller names onto
+//! the ONE in-progress Map Run record its ARN resolves to, and leaves the settings the
+//! request does not name where they are.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMapRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! It changes the SETTINGS and nothing else: the items the Map Run iterated are not
+//! re-run, so what they produced — and the outcome the execution around it reached
+//! through the same `Map` state — stands, and the two never come to disagree.
+//!
+//! A request this operation cannot serve is refused with one of the operation's own
+//! modelled errors; it never answers 501.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +145,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMapRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMapRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMapRun"))
+        // `mapRunArn` (1..2000), `maxConcurrency` (0..), `toleratedFailureCount`
+        // (0..) and `toleratedFailurePercentage` (0..100) are modelled, so the
+        // centralized walk has already refused anything outside them.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The ARN is validated BEFORE the lookup: a malformed ARN, an ARN of another
+        // service and an ARN of another region are defects in the REQUEST, which
+        // `InvalidArn` reports, not a Map Run that is absent here.
+        let endpoint_region = crate::state::request_region(ctx.parts());
+        if let Err(message) = crate::state::read_map_run_arn(&input.map_run_arn, &endpoint_region) {
+            return Err(UpdateMapRunErrorModeled::InvalidArn(InvalidArn {
+                message: Some(message),
+            })
+            .into());
+        }
+
+        let mut store = state.lock();
+        // Settle first, so a Map Run the clock had already finished is refused as the
+        // completed Map Run it is rather than updated as a running one.
+        store.settle(crate::state::now());
+
+        match store.update_map_run(
+            &input.map_run_arn,
+            input.max_concurrency,
+            input.tolerated_failure_count,
+            input.tolerated_failure_percentage,
+        ) {
+            // The change IS the whole of what this operation reports: the model gives
+            // it no output members, so `DescribeMapRun` is what answers from the
+            // record this wrote.
+            Ok(()) => Ok(UpdateMapRunOutput {}),
+            Err(crate::state::MapRunUpdateRejection::NotFound) => {
+                Err(UpdateMapRunErrorModeled::ResourceNotFound(ResourceNotFound {
+                    message: Some(crate::state::resource_not_found_message(&input.map_run_arn)),
+                    resource_name: Some(input.map_run_arn.clone()),
+                })
+                .into())
+            }
+            // A Map Run that has finished has no in-progress configuration to change,
+            // which this operation's own `ValidationException` reports, carrying the
+            // reason the model declares for exactly that.
+            Err(crate::state::MapRunUpdateRejection::Completed) => Err(
+                UpdateMapRunErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::COMPLETED_MAP_RUN_MESSAGE.to_string()),
+                    reason: Some(crate::state::VALIDATION_REASON_COMPLETED_MAP_RUN.to_string()),
+                })
+                .into(),
+            ),
+        }
     }
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutPermissionPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutPermissionPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutPermissionPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches an IAM policy to the rule group its `ResourceArn` names, so the rule
+//! group can be shared with other accounts. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +163,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutPermissionPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutPermissionPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutPermissionPolicy"))
+        // A mutation: it attaches the policy `GetPermissionPolicy` reports. `ctx`
+        // carries only request metadata — the rule group is addressed by the
+        // `ResourceArn` the request names, so nothing here depends on the endpoint.
+        let _ = ctx;
+
+        // "The policy specifications must conform to the following …": a document
+        // outside those restrictions is refused whatever resource it was addressed
+        // to, and before anything is stored, so a rejected policy leaves the rule
+        // group carrying whatever it carried before.
+        if !crate::state::permission_policy_is_valid(&input.policy) {
+            crate::state::audit(
+                "PutPermissionPolicy",
+                "",
+                "",
+                "",
+                "WAFInvalidPermissionPolicyException",
+            );
+            return Err(
+                PutPermissionPolicyErrorModeled::WAFInvalidPermissionPolicyException(
+                    crate::state::invalid_permission_policy_exception(),
+                )
+                .into(),
+            );
+        }
+
+        // An ARN that is not even shaped like one of this service's resource ARNs is
+        // the malformed-ARN parameter failure, as every operation here that takes an
+        // ARN reports it.
+        if !crate::state::is_wafv2_resource_arn(&input.resource_arn) {
+            return Err(PutPermissionPolicyErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_arn_exception(&input.resource_arn),
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutPermissionPolicyErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // "The ARN in the request must be a valid WAF RuleGroup ARN and the rule
+        // group must exist in the same Region": a well-formed ARN that resolves to no
+        // rule group of this account — one of another resource kind, one naming a
+        // rule group that was never created, or one carrying another Region —
+        // references a resource that doesn't exist.
+        let Some(entry) = state.rule_group_by_arn_mut(&input.resource_arn) else {
+            crate::state::audit(
+                "PutPermissionPolicy",
+                "",
+                "",
+                "",
+                "WAFNonexistentItemException",
+            );
+            return Err(PutPermissionPolicyErrorModeled::WAFNonexistentItemException(
+                crate::state::nonexistent_item_exception(),
+            )
+            .into());
+        };
+        // "You can attach only one policy with each PutPermissionPolicy request": the
+        // rule group carries exactly one, so attaching REPLACES whatever was
+        // attached. The caller's own text is stored unchanged — a policy is an opaque
+        // document beyond the restrictions checked above, so nothing here
+        // re-serializes it.
+        entry.permission_policy = Some(input.policy.clone());
+        // Read out of the entry before the audit record, so that record holds no
+        // borrow of the store.
+        let scope = entry.scope.clone();
+        let name = entry.rule_group.name.clone();
+        let id = entry.rule_group.id.clone();
+        crate::state::audit("PutPermissionPolicy", &scope, &name, &id, "policy attached");
+
+        Ok(PutPermissionPolicyOutput {})
     }
 }

@@ -37,6 +37,10 @@ mod acme_surface_wire_values;
 mod certificate_detail_projection;
 #[path = "all/certificate_domain_validations.rs"]
 mod certificate_domain_validations;
+#[path = "all/certificate_idempotency_expiry.rs"]
+mod certificate_idempotency_expiry;
+#[path = "all/certificate_import.rs"]
+mod certificate_import;
 #[path = "all/certificate_lifecycle.rs"]
 mod certificate_lifecycle;
 #[path = "all/certificate_list_filters.rs"]
