@@ -238,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // of it reports the empty `stageArn` and no publisher.
         for arn in &publishing_with {
             if let Some(configuration) = store.ingest_configurations.get_mut(arn) {
-                configuration.stage_arn = crate::state::NO_ASSOCIATED_STAGE_ARN.to_string();
+                configuration.clear_stage_association();
             }
         }
 
