@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateWorkspace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateWorkspace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Updates a stored workspace in place: the members the request names replace
+//! what the workspace held, the ones it leaves out keep their stored values, and
+//! the call answers the instant of the change — which `GetWorkspace` then
+//! reports as the workspace's `updateDateTime`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateWorkspace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `workspaceId` is modelled `Id` (not the `IdOrArn` form `GetWorkspace`
+//! accepts), so the label is the workspace's id and nothing else. A workspace
+//! this Region's store does not hold is a `ResourceNotFoundException`, in the
+//! construction the UPDATE path uses
+//! ([`crate::state::workspace_does_not_exist_message`]) rather than the one a
+//! look-up path reports. The update is SYNCHRONOUS: the next read sees it.
+//!
+//! Authorization is not emulated, so the modelled `AccessDeniedException` is
+//! never returned, and nothing here can exceed a quota the create did not.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +157,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateWorkspace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateWorkspaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateWorkspace"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and this one mutates tenant state.
+        ::tracing::info!(
+            operation = "UpdateWorkspace",
+            workspace_id = %input.workspace_id,
+            "serving a request"
+        );
+        // The Region this request is signed for picks the store it acts on: a
+        // workspace created through another Region's endpoint is not in it, so
+        // this call cannot update it.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateWorkspaceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+        let state = state.region_mut(&region);
+
+        let Some(workspace) = state.workspaces.get_mut(&input.workspace_id) else {
+            return Err(UpdateWorkspaceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::workspace_does_not_exist_message(
+                        &input.workspace_id,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // A patch: a member the request names replaces the stored value, one it
+        // leaves out keeps it. Nothing below can fail, so the record is written
+        // in place rather than on a copy.
+        if let Some(description) = input.description {
+            workspace.description = description;
+        }
+        if let Some(role) = input.role {
+            workspace.role = Some(role);
+        }
+        if let Some(s3_location) = input.s3_location {
+            workspace.s3_location = Some(s3_location);
+        }
+        // The workspace changed at this call's instant, which is what the output
+        // reports and what the next read reports as its `updateDateTime`: both
+        // come from the stored record, so they cannot disagree.
+        workspace.update_date_time = ::std::time::SystemTime::now();
+
+        Ok(UpdateWorkspaceOutput {
+            update_date_time: crate::state::timestamp(workspace.update_date_time),
+        })
     }
 }

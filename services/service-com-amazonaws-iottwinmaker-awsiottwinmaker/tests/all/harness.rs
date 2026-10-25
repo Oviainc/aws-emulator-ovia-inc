@@ -60,6 +60,66 @@ impl Emulator {
         Self { router, engine }
     }
 
+    /// One emulator carrying BOTH this service and IAM over the SAME engine.
+    ///
+    /// A caller-supplied role lives in the IAM store, so a suite about a rule
+    /// this service decides against an IAM record — a `syncRole`'s trust policy
+    /// — needs IAM mounted beside this service and seeds it through
+    /// [`Emulator::create_iam_role`]. Every other suite uses [`Emulator::new`],
+    /// which mounts this service alone and leaves the IAM store empty.
+    pub(crate) fn with_iam() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(
+            service_com_amazonaws_iottwinmaker_awsiottwinmaker::EmulatedService::new(engine.clone()),
+        );
+        router.register_service(
+            service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+                engine.clone(),
+            ),
+        );
+        Self { router, engine }
+    }
+
+    /// Create an IAM role carrying `document` as its trust policy, and answer
+    /// the ARN IAM minted for it.
+    ///
+    /// Driven over IAM's OWN awsQuery wire through the same router, so the role
+    /// this crate's rules are decided against is a record a real `CreateRole`
+    /// call wrote; the ARN is read off the response rather than constructed, so
+    /// it is the ARN IAM actually holds. Only meaningful on an emulator built by
+    /// [`Emulator::with_iam`].
+    pub(crate) async fn create_iam_role(&self, name: &str, document: &str) -> String {
+        let body = format!(
+            "Action=CreateRole&Version=2010-05-08&RoleName={}&AssumeRolePolicyDocument={}",
+            encode_query(name),
+            encode_query(document)
+        );
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("https://iam.amazonaws.com/")
+            .header("host", "iam.amazonaws.com")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(bytes::Bytes::from(body))
+            .expect("build the request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let xml = String::from_utf8(response.into_body().to_vec()).expect("a UTF-8 response body");
+        assert_eq!(
+            status, 200,
+            "CreateRole {name:?} expected 200, got {status} {xml}"
+        );
+        let opened = xml
+            .find("<Arn>")
+            .unwrap_or_else(|| panic!("CreateRole {name:?} returned no <Arn>: {xml}"))
+            + "<Arn>".len();
+        let closed = xml[opened..]
+            .find("</Arn>")
+            .unwrap_or_else(|| panic!("CreateRole {name:?} left <Arn> unclosed: {xml}"));
+        xml[opened..opened + closed].to_string()
+    }
+
     /// This service's store in the shared engine — the very store the mounted
     /// handlers read and write, reached the way a handler reaches it.
     pub(crate) fn state(
@@ -150,6 +210,21 @@ impl Emulator {
 
     pub(crate) async fn get_workspace(&self, id_or_arn: &str) -> Resp {
         self.call("GET", &format!("/workspaces/{id_or_arn}"), None).await
+    }
+
+    /// `UpdateWorkspace`: PUT on the workspace's own path, with the id as the
+    /// only `@httpLabel` and the members the patch names in the body.
+    pub(crate) async fn update_workspace(&self, workspace_id: &str, body: Value) -> Resp {
+        self.call("PUT", &format!("/workspaces/{workspace_id}"), Some(body))
+            .await
+    }
+
+    /// `CreateWorkspace` carrying the members the request names, for a suite
+    /// that cares what a workspace was created WITH; [`Emulator::create_workspace`]
+    /// is this with an empty body.
+    pub(crate) async fn create_workspace_with(&self, workspace_id: &str, body: Value) -> Resp {
+        self.call("POST", &format!("/workspaces/{workspace_id}"), Some(body))
+            .await
     }
 
     pub(crate) async fn create_entity(&self, workspace_id: &str, body: Value) -> Resp {
