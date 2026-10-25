@@ -21,6 +21,8 @@ mod localized_text;
 mod organization_recommendation_accounts;
 #[path = "all/organization_recommendation_lifecycle.rs"]
 mod organization_recommendation_lifecycle;
+#[path = "all/organization_recommendation_read.rs"]
+mod organization_recommendation_read;
 #[path = "all/organization_recommendations.rs"]
 mod organization_recommendations;
 #[path = "all/recommendation_loop.rs"]
