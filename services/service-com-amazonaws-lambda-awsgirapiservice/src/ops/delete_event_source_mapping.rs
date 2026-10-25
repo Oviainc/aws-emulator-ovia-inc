@@ -252,7 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteEventSourceMappingErrorModeled::ServiceException(
@@ -265,9 +265,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        // A mapping is addressed by its own `UUID` and reports the ARNs it was created
-        // with, so no request metadata takes part in this delete.
-        let _ = ctx;
         let mut store = state.lock();
         // The store is first brought up to whatever the clock already made due, so a
         // mapping whose own removal was already owed is gone before this call looks for
@@ -279,6 +276,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 DeleteEventSourceMappingErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         r#type: None,
+                        // A mapping is addressed by its own identifier, which the request
+                        // already carries, so the refusal is the fixed sentence rather
+                        // than the resource named back.
                         message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                     },
                 )

@@ -11,6 +11,12 @@
 //! decides whether a `ManagedRuleGroupStatement` names a group that exists and what
 //! running it costs. A pair the catalogue does not list names nothing that exists.
 //!
+//! What a vendor OFFERS is what this lists: a version the vendor has retired
+//! ([`crate::state::ManagedRuleGroupDescriptor::expired_versions`]) is pruned from
+//! the list, while `DescribeManagedRuleGroup` still knows it and reports it as
+//! expired — which is what sends a version-pinning caller here to find a version it
+//! can roll forward to.
+//!
 //! Nothing here writes: the response is a reading of published data, so two
 //! identical calls answer identically and a call changes nothing a later caller
 //! sees.

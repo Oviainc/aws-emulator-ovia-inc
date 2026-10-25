@@ -2,19 +2,26 @@
 
 //! Engine state for the com-amazonaws-athena-amazonathena service.
 //!
-//! Athena's workgroup registry lives here. `CreateWorkGroup` writes a
+//! Athena's workgroup and data-catalog registries live here. `CreateWorkGroup` writes a
 //! [`WorkGroupRecord`] into [`ComAmazonawsAthenaAmazonathenaState::work_groups`] and
 //! `GetWorkGroup` answers out of that same record, so every value a read reports is
 //! one some earlier write persisted rather than one derived from the reading request.
+//! `CreateDataCatalog` and `GetDataCatalog` stand in the same relation through
+//! [`DataCatalogRecord`] and [`ComAmazonawsAthenaAmazonathenaState::data_catalogs`].
 //!
 //! A workgroup has no lifecycle the clock owes: Athena answers `CreateWorkGroup` with
 //! the workgroup already usable, so the record is stored in its terminal state and a
-//! read never has to materialise a pending transition.
+//! read never has to materialise a pending transition. A data catalog has one only when
+//! its creation is asynchronous (see [`DataCatalogRecord::status_at`]), and even then the
+//! due instant is stored once and every read derives the status from it rather than
+//! writing.
 
-use std::collections::{BTreeMap, HashSet};
-use std::time::SystemTime;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{EngineVersion, Tag, WorkGroup, WorkGroupConfiguration};
+use crate::ops::types::{
+    DataCatalog, EngineVersion, Tag, WorkGroup, WorkGroupConfiguration, CONNECTION_TYPE_VALUES,
+};
 
 /// The `WorkGroupState` a freshly created workgroup is in. One of
 /// `WORK_GROUP_STATE_VALUES` in [`crate::ops::types`] (the model's `WorkGroupState`
@@ -200,12 +207,321 @@ pub fn open_configuration_bytes(configuration: &WorkGroupConfiguration) -> usize
     bytes
 }
 
+/// The `DataCatalogType` a federated catalog carries — the one type whose creation the
+/// `DataCatalog$Status` documentation calls asynchronous. One of
+/// `DATA_CATALOG_TYPE_VALUES` in [`crate::ops::types`].
+pub const DATA_CATALOG_TYPE_FEDERATED: &str = "FEDERATED";
+/// The `DataCatalogType` of an Glue Data Catalog; see [`DATA_CATALOG_TYPE_FEDERATED`].
+pub const DATA_CATALOG_TYPE_GLUE: &str = "GLUE";
+/// The `DataCatalogType` of an external Apache Hive metastore; see
+/// [`DATA_CATALOG_TYPE_FEDERATED`].
+pub const DATA_CATALOG_TYPE_HIVE: &str = "HIVE";
+/// The `DataCatalogType` of a Lambda-backed catalog; see
+/// [`DATA_CATALOG_TYPE_FEDERATED`].
+pub const DATA_CATALOG_TYPE_LAMBDA: &str = "LAMBDA";
+
+/// The `DataCatalogStatus` of a catalog whose creation is still running.
+///
+/// `DataCatalog$Status` documents "`CREATE_IN_PROGRESS`: Federated data catalog creation
+/// in progress." One of `DATA_CATALOG_STATUS_VALUES` in [`crate::ops::types`].
+pub const DATA_CATALOG_STATUS_CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
+/// The `DataCatalogStatus` of a created catalog: `DataCatalog$Status` documents
+/// "`CREATE_COMPLETE`: Data catalog creation complete."
+pub const DATA_CATALOG_STATUS_CREATE_COMPLETE: &str = "CREATE_COMPLETE";
+
+/// How long a federated catalog stays [`DATA_CATALOG_STATUS_CREATE_IN_PROGRESS`] before
+/// it is [`DATA_CATALOG_STATUS_CREATE_COMPLETE`].
+///
+/// `DataCatalog$Status` documents that the `FEDERATED` type "is created asynchronously",
+/// so the catalog is handed back in a non-terminal status and the completion is a
+/// transition the CLOCK owes. AWS publishes no duration for it (it builds a stack, a
+/// Lambda function and a connection), so this span is the emulator's own choice: short
+/// enough that a caller is not kept waiting, long enough that a caller reading straight
+/// back still observes the in-progress status.
+pub const FEDERATED_DATA_CATALOG_CREATION: Duration = Duration::from_millis(500);
+
+/// How many characters a data catalog name may use.
+///
+/// `CreateDataCatalogInput$Name` documents: "The catalog name must be unique for the
+/// Amazon Web Services account and can use a maximum of 127 alphanumeric, underscore, at
+/// sign, or hyphen characters. The remainder of the length constraint of 256 is reserved
+/// for use by Athena." The model bounds `CatalogNameString` at 256, so this tighter
+/// documented bound is enforced here.
+pub const MAX_DATA_CATALOG_NAME_CHARS: usize = 127;
+
+/// How many characters a FEDERATED data catalog name may use.
+///
+/// `CreateDataCatalogInput$Name` documents: "since we use it to create other resources
+/// that allow less characters and we prepend a prefix to it, the actual catalog name
+/// limit for `FEDERATED` catalog is 64 - 23 = 41 characters."
+pub const MAX_FEDERATED_DATA_CATALOG_NAME_CHARS: usize = 41;
+
+/// The characters a data catalog name may use beside the alphanumeric ones, from the
+/// `CreateDataCatalogInput$Name` documentation quoted on
+/// [`MAX_DATA_CATALOG_NAME_CHARS`]: underscore, at sign and hyphen.
+pub const DATA_CATALOG_NAME_PUNCTUATION: [char; 3] = ['_', '@', '-'];
+
+/// How many data catalogs one account holds in this emulator.
+///
+/// This is the EMULATOR's own bound and has no counterpart in the model: it is chosen
+/// far above any plausible set of registered catalogs and exists only so that the
+/// registry cannot grow without limit. A write past it is refused with the operation's
+/// own `InvalidRequestException`.
+pub const MAX_DATA_CATALOGS: usize = 1000;
+
+/// The largest `Parameters` map a stored data catalog may hold, in bytes of keys and
+/// values (see [`parameters_bytes`]).
+///
+/// Another bound with no AWS counterpart: the model bounds one `ParametersMap` value at
+/// 51200 bytes and one key at 255, but not how many entries the map holds, so this is
+/// what keeps [`MAX_DATA_CATALOGS`] times the size of one record a bounded product. It
+/// is well above the handful of entries a catalog of any type documents, including a
+/// federated catalog's escaped-JSON connection properties.
+pub const MAX_DATA_CATALOG_PARAMETERS_BYTES: usize = 128 * 1024;
+
+/// The `Parameters` key a HIVE or LAMBDA catalog names its metadata function with.
+///
+/// Every key below is from the `DataCatalog$Parameters` documentation, which gives the
+/// syntax per catalog type.
+pub const PARAMETER_METADATA_FUNCTION: &str = "metadata-function";
+/// The `Parameters` key a LAMBDA catalog names its record function with.
+pub const PARAMETER_RECORD_FUNCTION: &str = "record-function";
+/// The `Parameters` key a LAMBDA catalog names its composite function with.
+pub const PARAMETER_FUNCTION: &str = "function";
+/// The `Parameters` key a GLUE catalog names its catalog id with.
+pub const PARAMETER_CATALOG_ID: &str = "catalog-id";
+/// The `Parameters` key a FEDERATED catalog reuses an existing Glue connection with.
+pub const PARAMETER_CONNECTION_ARN: &str = "connection-arn";
+/// The `Parameters` key a FEDERATED catalog states a new connection's type with.
+pub const PARAMETER_CONNECTION_TYPE: &str = "connection-type";
+
+/// One data catalog, as this service persists it.
+///
+/// The status is NOT stored: it follows from [`create_complete_at`](Self::create_complete_at),
+/// so a read derives it from the clock instead of a reader having to move it.
+#[derive(Debug, Clone)]
+pub struct DataCatalogRecord {
+    /// The catalog name, which is also its key in the registry.
+    pub name: String,
+    /// A `DataCatalogType` value: one of [`DATA_CATALOG_TYPE_FEDERATED`],
+    /// [`DATA_CATALOG_TYPE_GLUE`], [`DATA_CATALOG_TYPE_HIVE`] or
+    /// [`DATA_CATALOG_TYPE_LAMBDA`].
+    pub catalog_type: String,
+    /// The description the create call carried, if any.
+    pub description: Option<String>,
+    /// The `Parameters` the create call carried. A `BTreeMap` so the stored map has one
+    /// stable order whatever order the request listed it in.
+    pub parameters: BTreeMap<String, String>,
+    /// The `ConnectionType` of a federated catalog that states one, read once from
+    /// [`PARAMETER_CONNECTION_TYPE`] at create time.
+    pub connection_type: Option<String>,
+    /// When this catalog's creation is complete. For a synchronously created type this
+    /// is the instant of the create call itself; for a federated one it is
+    /// [`FEDERATED_DATA_CATALOG_CREATION`] after it.
+    pub create_complete_at: SystemTime,
+    /// The tags the create call carried; keys are unique within this list.
+    pub tags: Vec<Tag>,
+}
+
+impl DataCatalogRecord {
+    /// The `DataCatalogStatus` this catalog is in at `now`.
+    ///
+    /// `DataCatalog$Status` documents the `LAMBDA`, `GLUE` and `HIVE` types as created
+    /// synchronously and the `FEDERATED` type as created asynchronously, so a catalog is
+    /// [`DATA_CATALOG_STATUS_CREATE_IN_PROGRESS`] until its completion is due and
+    /// [`DATA_CATALOG_STATUS_CREATE_COMPLETE`] from then on. Derived, never written: two
+    /// reads at the same instant report the same status.
+    pub fn status_at(&self, now: SystemTime) -> &'static str {
+        if now < self.create_complete_at {
+            DATA_CATALOG_STATUS_CREATE_IN_PROGRESS
+        } else {
+            DATA_CATALOG_STATUS_CREATE_COMPLETE
+        }
+    }
+
+    /// The record as the modelled `DataCatalog` shape a read answers with, as of `now`.
+    pub fn to_data_catalog(&self, now: SystemTime) -> DataCatalog {
+        DataCatalog {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            r#type: self.catalog_type.clone(),
+            parameters: if self.parameters.is_empty() {
+                None
+            } else {
+                Some(
+                    self.parameters
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                )
+            },
+            status: Some(self.status_at(now).to_string()),
+            connection_type: self.connection_type.clone(),
+            // `DataCatalog$Error` is the "text of the error that occurred during data
+            // catalog creation or deletion"; nothing here fails, so there is none.
+            error: None,
+        }
+    }
+}
+
+/// When a catalog of `catalog_type` created at `now` is complete.
+///
+/// `DataCatalog$Status` documents the `LAMBDA`, `GLUE` and `HIVE` types as created
+/// synchronously — complete as the create call returns — and the `FEDERATED` type as
+/// created asynchronously, which is due [`FEDERATED_DATA_CATALOG_CREATION`] later. The
+/// addition is checked, so a clock far enough in the future to overflow yields a catalog
+/// that is already complete rather than a panic.
+pub fn create_complete_at(catalog_type: &str, now: SystemTime) -> SystemTime {
+    if catalog_type == DATA_CATALOG_TYPE_FEDERATED {
+        now.checked_add(FEDERATED_DATA_CATALOG_CREATION).unwrap_or(now)
+    } else {
+        now
+    }
+}
+
+/// Why `name` is not a usable data catalog name for `catalog_type`, if it is not.
+///
+/// Enforces the two documented bounds quoted on [`MAX_DATA_CATALOG_NAME_CHARS`] and
+/// [`MAX_FEDERATED_DATA_CATALOG_NAME_CHARS`] plus the documented character set, none of
+/// which the model's `CatalogNameString` carries.
+pub fn data_catalog_name_error(name: &str, catalog_type: &str) -> Option<String> {
+    let limit = if catalog_type == DATA_CATALOG_TYPE_FEDERATED {
+        MAX_FEDERATED_DATA_CATALOG_NAME_CHARS
+    } else {
+        MAX_DATA_CATALOG_NAME_CHARS
+    };
+    let length = name.chars().count();
+    if length > limit {
+        return Some(format!(
+            "Name is {length} characters long, more than the {limit} characters a \
+             {catalog_type} data catalog name can use."
+        ));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|ch| !ch.is_ascii_alphanumeric() && !DATA_CATALOG_NAME_PUNCTUATION.contains(ch))
+    {
+        return Some(format!(
+            "Name contains the character '{bad}'; a data catalog name can use \
+             alphanumeric, underscore, at sign, or hyphen characters."
+        ));
+    }
+    None
+}
+
+/// Why `parameters` does not describe a catalog of `catalog_type`, if it does not.
+///
+/// `DataCatalog$Parameters` is "a mapping whose values depend on the catalog type" and
+/// states, per type, which keys are required and which sets are mutually exclusive; a
+/// map that satisfies none of those sets names no catalog Athena could register. A type
+/// the documentation states no requirement for constrains nothing here.
+pub fn data_catalog_parameters_error(
+    catalog_type: &str,
+    parameters: &HashMap<String, String>,
+) -> Option<String> {
+    let has = |key: &str| parameters.contains_key(key);
+    match catalog_type {
+        // "For the HIVE data catalog type ... The metadata-function parameter is
+        // required."
+        DATA_CATALOG_TYPE_HIVE if !has(PARAMETER_METADATA_FUNCTION) => Some(format!(
+            "Parameters for a {DATA_CATALOG_TYPE_HIVE} data catalog must contain \
+             {PARAMETER_METADATA_FUNCTION}."
+        )),
+        // "For the LAMBDA data catalog type, use one of the following sets of required
+        // parameters, but not both": metadata-function with record-function, or
+        // function on its own.
+        DATA_CATALOG_TYPE_LAMBDA => {
+            let composite = has(PARAMETER_FUNCTION);
+            let split = has(PARAMETER_METADATA_FUNCTION) && has(PARAMETER_RECORD_FUNCTION);
+            let partial_split = has(PARAMETER_METADATA_FUNCTION) || has(PARAMETER_RECORD_FUNCTION);
+            if composite && partial_split {
+                Some(format!(
+                    "Parameters for a {DATA_CATALOG_TYPE_LAMBDA} data catalog must contain \
+                     either {PARAMETER_FUNCTION} or {PARAMETER_METADATA_FUNCTION} with \
+                     {PARAMETER_RECORD_FUNCTION}, but not both."
+                ))
+            } else if composite || split {
+                None
+            } else {
+                Some(format!(
+                    "Parameters for a {DATA_CATALOG_TYPE_LAMBDA} data catalog must contain \
+                     either {PARAMETER_FUNCTION} or both {PARAMETER_METADATA_FUNCTION} and \
+                     {PARAMETER_RECORD_FUNCTION}."
+                ))
+            }
+        }
+        // "The GLUE type takes a catalog ID parameter and is required."
+        DATA_CATALOG_TYPE_GLUE if !has(PARAMETER_CATALOG_ID) => Some(format!(
+            "Parameters for a {DATA_CATALOG_TYPE_GLUE} data catalog must contain \
+             {PARAMETER_CATALOG_ID}."
+        )),
+        // "The FEDERATED data catalog type uses one of the following parameters, but not
+        // both": connection-arn, or connection-type (with connection-properties).
+        DATA_CATALOG_TYPE_FEDERATED => {
+            match (has(PARAMETER_CONNECTION_ARN), has(PARAMETER_CONNECTION_TYPE)) {
+                (true, true) => Some(format!(
+                    "Parameters for a {DATA_CATALOG_TYPE_FEDERATED} data catalog must contain \
+                     either {PARAMETER_CONNECTION_ARN} or {PARAMETER_CONNECTION_TYPE}, but \
+                     not both."
+                )),
+                (false, false) => Some(format!(
+                    "Parameters for a {DATA_CATALOG_TYPE_FEDERATED} data catalog must contain \
+                     either {PARAMETER_CONNECTION_ARN} or {PARAMETER_CONNECTION_TYPE}."
+                )),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The `ConnectionType` a federated catalog's `Parameters` state, and whether it is one
+/// the model's `ConnectionType` enum holds.
+///
+/// `DataCatalog$ConnectionType` is that enum and `DataCatalog$Parameters` writes the
+/// parameter as `connection-type:MYSQL|REDSHIFT|....`, so a value outside the enum is
+/// one no read could report. `Ok(None)` means the parameter is absent, which is what a
+/// catalog reusing an existing connection, or one of any other type, looks like.
+pub fn federated_connection_type(
+    catalog_type: &str,
+    parameters: &HashMap<String, String>,
+) -> Result<Option<String>, String> {
+    if catalog_type != DATA_CATALOG_TYPE_FEDERATED {
+        return Ok(None);
+    }
+    match parameters.get(PARAMETER_CONNECTION_TYPE) {
+        None => Ok(None),
+        Some(value) if CONNECTION_TYPE_VALUES.contains(&value.as_str()) => Ok(Some(value.clone())),
+        Some(value) => Err(format!(
+            "Parameters names the connection type '{value}', which is not a supported \
+             connection type. Supported connection types are {}.",
+            CONNECTION_TYPE_VALUES.join(", ")
+        )),
+    }
+}
+
+/// The bytes of keys and values held in a `ParametersMap`, checked against
+/// [`MAX_DATA_CATALOG_PARAMETERS_BYTES`] before the map is stored.
+///
+/// Linear in the size of the map it measures, and it allocates nothing.
+pub fn parameters_bytes(parameters: &HashMap<String, String>) -> usize {
+    parameters
+        .iter()
+        .fold(0usize, |bytes, (key, value)| {
+            bytes.saturating_add(key.len()).saturating_add(value.len())
+        })
+}
+
 /// Per-service state for com-amazonaws-athena-amazonathena. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAthenaAmazonathenaState {
     /// Every workgroup this account holds, keyed by its name. A `BTreeMap` so a
     /// listing walks the registry in one stable order.
     pub work_groups: BTreeMap<String, WorkGroupRecord>,
+    /// Every data catalog this account holds, keyed by its name — the key the
+    /// `CreateDataCatalogInput$Name` documentation calls unique per account. A
+    /// `BTreeMap` for the same reason as [`Self::work_groups`].
+    pub data_catalogs: BTreeMap<String, DataCatalogRecord>,
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

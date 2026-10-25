@@ -118,7 +118,9 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 /// the service creates stores with.
 pub const DEFAULT_CEDAR_VERSION: &str = "CEDAR_4";
 
-/// The message EVERY `ResourceNotFoundException` this service raises carries.
+/// The message a CONTROL-PLANE `ResourceNotFoundException` of this service
+/// carries — the one every call that reads, creates, changes or deletes a
+/// resource answers with.
 ///
 /// A CONSTANT, embedding no request or generated value: the model gives the
 /// exception its own `resourceId` ("the unique ID of the resource referenced in
@@ -129,12 +131,47 @@ pub const DEFAULT_CEDAR_VERSION: &str = "CEDAR_4";
 /// steps task#2 and teardown#11) and `ListTagsForResource` — which is what
 /// establishes it as one fixed sentence rather than per-operation prose.
 ///
-/// Every not-found path of this service fills it through the single builder
-/// [`crate::ops::resource_not_found`]. `IsAuthorized`'s recording expects an
-/// id-BEARING message, but no rule in the model or the corpus produces that
-/// text, so under the message rule it is an example rather than a requirement
-/// and that path answers this constant too.
+/// Every control-plane not-found path fills it through the single builder
+/// [`crate::ops::resource_not_found`]. The AUTHORIZATION calls are the other
+/// half of this API and word their own refusal, which
+/// [`resource_not_found_naming`] states.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found";
+
+/// The message an AUTHORIZATION call's `ResourceNotFoundException` carries: the
+/// KIND of resource that was not found, and the id the request named it by.
+///
+/// Deciding an authorization request is the other half of this API, served by its
+/// own front end, and its not-found names the resource rather than summarising it:
+/// the corpus records `IsAuthorized` against a store that does not exist
+/// answering a message built from the request, naming the resource kind and the
+/// `policyStoreId` that was sent, where the control-plane 404s it records all
+/// answer [`RESOURCE_NOT_FOUND_MESSAGE`]. So the rule is the TEMPLATE, filled
+/// from the request: the kind, the id, and nothing this call generated.
+///
+/// `resource_type` is one of the modelled `ResourceType` values and is rendered
+/// as the words it names ([`resource_kind_words`]); `resource_id` is the id of
+/// the resource the request referenced, which is the caller's own value echoed
+/// back.
+pub fn resource_not_found_naming(resource_type: &str, resource_id: &str) -> String {
+    format!(
+        "{} with id '{resource_id}' not found",
+        resource_kind_words(resource_type)
+    )
+}
+
+/// A `ResourceType` value as the words it names, for a sentence that reports it:
+/// `POLICY_STORE` is a policy store. The enum's own spelling is
+/// SCREAMING_SNAKE_CASE, so the words are its value lowercased with the
+/// underscores as spaces, and the first letter raised because it opens the
+/// sentence.
+fn resource_kind_words(resource_type: &str) -> String {
+    let words = resource_type.to_ascii_lowercase().replace('_', " ");
+    let mut characters = words.chars();
+    match characters.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + characters.as_str(),
+        None => words,
+    }
+}
 
 /// The message EVERY `ConflictException` this service raises carries.
 ///
@@ -335,12 +372,13 @@ pub struct PolicyStore {
     pub schema: Option<StoredSchema>,
 }
 
-/// The one Cedar schema a policy store holds: the text exactly as `PutSchema`
-/// received it, plus the namespaces read out of it and its own timestamps.
+/// The one Cedar schema a policy store holds: the schema document as the service
+/// reports it ([`canonical_schema_json`]), plus the namespaces read out of it and
+/// its own timestamps.
 #[derive(Debug, Clone)]
 pub struct StoredSchema {
-    /// The Cedar schema JSON, byte-identical to what `PutSchema` was given, so
-    /// `GetSchema` reports the caller's own text back.
+    /// The Cedar schema JSON, in the form a read reports it:
+    /// [`canonical_schema_json`] of the text `PutSchema` was given.
     pub cedar_json: String,
     /// The namespaces the schema declares, in the order the parse reported them.
     pub namespaces: Vec<String>,
@@ -358,6 +396,31 @@ pub struct StoredSchema {
 /// documents "To delete the schema, run PutSchema with `{}` for this parameter" —
 /// so "no schema" and "the empty schema" are one state of one document.
 pub const EMPTY_SCHEMA_JSON: &str = "{}";
+
+/// The Cedar schema document a read reports for the text `PutSchema` was given:
+/// the same JSON document with the insignificant whitespace between its tokens
+/// removed.
+///
+/// The service does not echo the caller's own spelling of the document. Replaying
+/// the recorded `PutSchema` -> `GetSchema` pair while this service stored the
+/// submitted text verbatim diverges on `schema`, and reporting the document
+/// minified is what agrees with the recording — so the text the recorded request
+/// carried was not the spelling the service answered with. Nothing else about the
+/// document moves: its members keep the order they were given in, and every token
+/// — a string's escapes and inner spaces, a number's spelling — is reported as it
+/// arrived, so a caller that diffs or hashes a round-trip sees a difference only
+/// when the document itself differs.
+///
+/// The scan this delegates to is TOTAL, so text that is not a JSON document comes
+/// back with the whitespace outside its quotes dropped rather than refused here:
+/// [`cedar::parse_schema`] is what refuses a document, and it runs first.
+///
+/// The scan itself belongs to no one service — a document reported back keeps its
+/// bytes wherever it is reported — so it lives in `service_common::json_document`
+/// and is named here for the member it is the rendering of.
+pub fn canonical_schema_json(definition: &str) -> String {
+    service_common::json_document::minified(definition)
+}
 
 /// One identity source in a store: the provider it points at, the Cedar entity
 /// type its principals carry, and when it was created and last changed.
@@ -1017,6 +1080,14 @@ impl ReferencedResource {
     /// `resourceType` members model.
     pub fn not_found(self) -> crate::ops::types::ResourceNotFoundException {
         crate::ops::resource_not_found(&self.resource_id, &self.resource_type)
+    }
+
+    /// The same modelled `ResourceNotFoundException`, worded as an AUTHORIZATION
+    /// call words it: the message NAMES this reference's resource kind and id
+    /// ([`resource_not_found_naming`]), and `resourceId`/`resourceType` are the
+    /// same members the control-plane form reports.
+    pub fn not_found_naming_the_resource(self) -> crate::ops::types::ResourceNotFoundException {
+        crate::ops::resource_not_found_naming_the_resource(&self.resource_id, &self.resource_type)
     }
 }
 
