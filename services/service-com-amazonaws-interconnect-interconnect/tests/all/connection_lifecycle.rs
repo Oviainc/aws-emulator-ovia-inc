@@ -36,6 +36,7 @@ const GATEWAY_ROWS: [(&str, Option<i64>); 2] = [
     ("ic-lifecycle-table-b", Some(64_512)),
 ];
 
+
 // ---------------------------------------------------------------------------
 // Shape checks, written from the model's own constraints
 // ---------------------------------------------------------------------------

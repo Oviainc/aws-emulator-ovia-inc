@@ -15,6 +15,8 @@
 mod control_plane_error_semantics;
 #[path = "all/data_transformation_job.rs"]
 mod data_transformation_job;
+#[path = "all/data_transformation_job_listing.rs"]
+mod data_transformation_job_listing;
 #[path = "all/data_transformation_profile.rs"]
 mod data_transformation_profile;
 #[path = "all/datastore_encryption_and_preload.rs"]

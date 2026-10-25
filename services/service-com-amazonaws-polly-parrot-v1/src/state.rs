@@ -18,6 +18,10 @@
 //!   synthesis tasks `StartSpeechSynthesisTask` creates and
 //!   `GetSpeechSynthesisTask` and `ListSpeechSynthesisTasks` report. Keyed by
 //!   `TaskId` in a `BTreeMap`, so the list read is ordered and paginable the same way.
+//!   A task is kept for the documented [`TASK_RETENTION`] window and no longer, so
+//!   every task read reaches the store through
+//!   [`ComAmazonawsPollyParrotV1State::retained_synthesis_tasks`], which materialises
+//!   what the clock already owes it.
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -184,6 +188,28 @@ pub struct PendingTaskStatus {
 /// wait on it.
 pub const TASK_COMPLETION_DELAY: Duration = Duration::from_millis(500);
 
+/// How long a synthesis task is kept after it was started.
+///
+/// NOT a span the emulator chooses: the model documents it on
+/// `StartSpeechSynthesisTask` — "The SpeechSynthesisTask object is available for 72
+/// hours after starting the asynchronous synthesis task" — so the stored task is gone
+/// once that long has passed since its `CreationTime`, and the read operations then
+/// answer as they do for a `TaskId` that names no task.
+pub const TASK_RETENTION: Duration = Duration::from_secs(72 * 60 * 60);
+
+/// Whether `task` is still within its retention window at `now`.
+///
+/// The window is measured from the task's own `CreationTime` — "available for 72 hours
+/// AFTER starting" — so the task is reportable strictly before `creation_time +
+/// TASK_RETENTION` and gone from that instant on. A creation time so far in the future
+/// that the sum is not representable is treated as retained: a task cannot expire
+/// before it was created.
+pub fn task_is_retained(task: &StoredSynthesisTask, now: SystemTime) -> bool {
+    task.creation_time
+        .checked_add(TASK_RETENTION)
+        .is_none_or(|expires_at| now < expires_at)
+}
+
 /// Materialise the status transition the clock has ALREADY made due on `task`.
 ///
 /// A read calls this before reporting a task: it changes nothing a caller could not
@@ -293,6 +319,31 @@ impl ComAmazonawsPollyParrotV1State {
     /// nothing — when that Region holds none under that name.
     pub fn remove_lexicon(&mut self, region: &str, name: &str) -> Option<StoredLexicon> {
         self.lexicons.remove(&LexiconKey::new(region, name))
+    }
+
+    /// Materialise everything the CLOCK already owes the task store at `now`, and
+    /// answer the tasks that are left.
+    ///
+    /// Two clock-driven changes, in the order the clock makes them: a task past its
+    /// [`TASK_RETENTION`] window is dropped, because it is no longer a task the service
+    /// holds, and every task still held settles the status transition that fell due
+    /// ([`settle_task_status`]). Both were owed at `now` whether or not anybody called,
+    /// so a read may make them; neither depends on which read arrives first.
+    ///
+    /// Every task read goes through here, so no two of them can disagree about which
+    /// tasks exist or what status they are in. What it hands back is SHARED: the two
+    /// clock-driven writes above are the only ones a report makes, and a caller that
+    /// reads through here cannot make another.
+    pub fn retained_synthesis_tasks(
+        &mut self,
+        now: SystemTime,
+    ) -> &BTreeMap<String, StoredSynthesisTask> {
+        self.synthesis_tasks
+            .retain(|_, task| task_is_retained(task, now));
+        for task in self.synthesis_tasks.values_mut() {
+            settle_task_status(task, now);
+        }
+        &self.synthesis_tasks
     }
 }
 
@@ -647,17 +698,17 @@ mod tests {
         }
     }
 
-    /// A pending status is materialised exactly when the clock has made it due, and
-    /// never before — polling early must not complete a task.
-    #[test]
-    fn a_task_status_moves_only_when_the_clock_makes_it_due() {
-        let now = SystemTime::now();
-        let task = |due: SystemTime| StoredSynthesisTask {
-            task_id: "task".to_string(),
+    /// One stored task, as a start call would have recorded it: `task_id` identifies the
+    /// case and `created` is its `CreationTime`, and a test overrides the members its
+    /// own case is about. ONE definition for this module, so a new stored member is
+    /// added here and nowhere else.
+    fn stored_task(task_id: &str, created: SystemTime) -> StoredSynthesisTask {
+        StoredSynthesisTask {
+            task_id: task_id.to_string(),
             engine: "standard".to_string(),
             output_format: "mp3".to_string(),
-            output_uri: "s3://bucket/task.mp3".to_string(),
-            creation_time: now,
+            output_uri: format!("s3://bucket/{task_id}.mp3"),
+            creation_time: created,
             request_characters: 5,
             sns_topic_arn: None,
             lexicon_names: Vec::new(),
@@ -668,11 +719,23 @@ mod tests {
             language_code: None,
             task_status: "inProgress".to_string(),
             task_status_reason: None,
-            pending_status: Some(PendingTaskStatus {
+            pending_status: None,
+        }
+    }
+
+    /// A pending status is materialised exactly when the clock has made it due, and
+    /// never before — polling early must not complete a task.
+    #[test]
+    fn a_task_status_moves_only_when_the_clock_makes_it_due() {
+        let now = SystemTime::now();
+        let task = |due: SystemTime| {
+            let mut task = stored_task("task", now);
+            task.pending_status = Some(PendingTaskStatus {
                 due_at: due,
                 status: "completed".to_string(),
                 reason: None,
-            }),
+            });
+            task
         };
 
         for (case, due, expected) in [
@@ -697,6 +760,88 @@ mod tests {
             (settled.task_status.as_str(), settled.pending_status.is_some()),
             ("completed", false),
             "a settled task must stay settled"
+        );
+    }
+
+    /// A task is held for the documented retention window, measured from its own
+    /// creation time, and is gone from the store once that window has elapsed — while a
+    /// task still inside it keeps the status transition the clock owes it.
+    #[test]
+    fn the_task_store_holds_a_task_for_its_retention_window() {
+        let now = SystemTime::now();
+        let mut state = ComAmazonawsPollyParrotV1State::default();
+
+        // Ages spanning the class: inside the window, on the published bound, and past
+        // it — and one creation time in the future, which cannot have expired.
+        let cases: [(&str, SystemTime, bool); 7] = [
+            ("just created", now, true),
+            ("an hour old", now - Duration::from_secs(3_600), true),
+            (
+                "a second inside the window",
+                now - (TASK_RETENTION - Duration::from_secs(1)),
+                true,
+            ),
+            ("exactly the window old", now - TASK_RETENTION, false),
+            (
+                "a millisecond past the window",
+                now - (TASK_RETENTION + Duration::from_millis(1)),
+                false,
+            ),
+            (
+                "many windows old",
+                now - (TASK_RETENTION * 10),
+                false,
+            ),
+            ("created in the future", now + Duration::from_secs(60), true),
+        ];
+        for (case, created, _) in cases {
+            let mut task = stored_task(case, created);
+            // A due transition on every task, so a retained one must still settle it —
+            // except where the task was created in the future and is owed nothing yet.
+            if created <= now {
+                task.pending_status = Some(PendingTaskStatus {
+                    due_at: now - TASK_COMPLETION_DELAY,
+                    status: "completed".to_string(),
+                    reason: None,
+                });
+            }
+            state.synthesis_tasks.insert(task.task_id.clone(), task);
+        }
+
+        let held = state.retained_synthesis_tasks(now);
+        for (case, _, retained) in cases {
+            let actual = held.contains_key(case);
+            assert_eq!(
+                actual, retained,
+                "case {case:?}: held is {actual}, expected {retained}"
+            );
+            if retained {
+                let task = &held[case];
+                let expected_status = if task.creation_time > now {
+                    "inProgress"
+                } else {
+                    "completed"
+                };
+                assert_eq!(
+                    task.task_status, expected_status,
+                    "case {case:?}: a retained task must still settle what it was owed"
+                );
+            }
+        }
+
+        // Nothing is owed a second time: the same reading drops nothing further.
+        let count = held.len();
+        assert_eq!(
+            state.retained_synthesis_tasks(now).len(),
+            count,
+            "a second reading at the same instant must hold the same tasks"
+        );
+        // And the clock going on past every window empties the store.
+        assert!(
+            state
+                .retained_synthesis_tasks(now + TASK_RETENTION * 2)
+                .is_empty(),
+            "every task must be gone once its window has elapsed"
         );
     }
 

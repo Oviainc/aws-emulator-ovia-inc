@@ -19,6 +19,8 @@ mod domain_account_cap_and_lookup_semantics;
 mod domain_response_projection;
 #[path = "all/domain_subscription_lifecycle.rs"]
 mod domain_subscription_lifecycle;
+#[path = "all/domain_web_app_identity.rs"]
+mod domain_web_app_identity;
 #[path = "all/error_detail_member.rs"]
 mod error_detail_member;
 #[path = "all/list_tags_for_resource.rs"]

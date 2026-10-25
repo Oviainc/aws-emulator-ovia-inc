@@ -31,6 +31,8 @@ mod data_protection_policy;
 mod deletion_protection;
 #[path = "all/deliveries.rs"]
 mod deliveries;
+#[path = "all/delivery_creation.rs"]
+mod delivery_creation;
 #[path = "all/delivery_destination_policies.rs"]
 mod delivery_destination_policies;
 #[path = "all/delivery_destination_policy_reads.rs"]
@@ -43,6 +45,8 @@ mod delivery_sources;
 mod destination_policies;
 #[path = "all/destinations.rs"]
 mod destinations;
+#[path = "all/export_tasks.rs"]
+mod export_tasks;
 #[path = "all/field_indexes.rs"]
 mod field_indexes;
 #[path = "all/fixed_text_refusals.rs"]
@@ -59,6 +63,8 @@ mod index_policy_puts;
 mod index_policy_removal;
 #[path = "all/ingestion_window.rs"]
 mod ingestion_window;
+#[path = "all/insights_queries.rs"]
+mod insights_queries;
 #[path = "all/integrations.rs"]
 mod integrations;
 #[path = "all/log_anomaly_detectors.rs"]
@@ -81,6 +87,8 @@ mod log_stream_removal;
 mod lookup_tables;
 #[path = "all/metric_filters.rs"]
 mod metric_filters;
+#[path = "all/query_compilation.rs"]
+mod query_compilation;
 #[path = "all/query_definitions.rs"]
 mod query_definitions;
 #[path = "all/refusal_error_codes.rs"]
@@ -91,12 +99,16 @@ mod refusal_messages;
 mod refusal_wording;
 #[path = "all/resource_policies.rs"]
 mod resource_policies;
+#[path = "all/resource_policy_revision_ids.rs"]
+mod resource_policy_revision_ids;
 #[path = "all/resource_tag_removal.rs"]
 mod resource_tag_removal;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/retention_policy.rs"]
 mod retention_policy;
+#[path = "all/scratch_queries.rs"]
+mod scratch_queries;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/storage_tier_policy.rs"]

@@ -197,6 +197,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(authorization) = input.authorization.as_ref() {
             crate::state::check_authorization_arns(authorization)?;
         }
+        // The log-subscription block names the CloudWatch Logs log group this group's
+        // egress access logs are written INTO, so the name is read against what
+        // CloudWatch Logs can hold before anything is stored — exactly as `ConfigureLogs`
+        // reads the same block.
+        crate::state::check_egress_access_logs(input.egress_access_logs.as_ref())?;
         // Scoped to the Region this request was served in: the same `Id` in another
         // Region is another group, so it is not a duplicate of this one.
         if state.has_packaging_group(&region, &input.id) {

@@ -19,6 +19,8 @@ mod agentcore_stack_outputs;
 mod appconfig_resource_types;
 #[path = "all/callback_signature.rs"]
 mod callback_signature;
+#[path = "all/change_set_hooks.rs"]
+mod change_set_hooks;
 #[path = "all/change_set_lifecycle.rs"]
 mod change_set_lifecycle;
 #[path = "all/change_set_preview.rs"]

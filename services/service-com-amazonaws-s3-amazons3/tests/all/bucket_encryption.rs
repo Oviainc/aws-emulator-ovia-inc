@@ -100,6 +100,26 @@ impl Rule {
             Some(types.iter().map(|kind| kind.to_string()).collect());
         self
     }
+
+    /// This rule as `GetBucketEncryption` REPORTS it.
+    ///
+    /// `BucketKeyEnabled` is a switch with a documented off state ("General purpose
+    /// buckets - By default, S3 Bucket Key is not enabled",
+    /// `ServerSideEncryptionRule$BucketKeyEnabled`), so a rule stored without it is
+    /// reported with it OFF rather than with the member dropped. Every round-trip
+    /// assertion compares against this form, so what is pinned is the configuration a
+    /// reader sees rather than the bytes a writer sent.
+    pub(crate) fn as_reported(&self) -> Self {
+        Self {
+            bucket_key_enabled: Some(self.bucket_key_enabled.unwrap_or(false)),
+            ..self.clone()
+        }
+    }
+}
+
+/// Every rule of `rules` as `GetBucketEncryption` reports it ([`Rule::as_reported`]).
+pub(crate) fn as_reported(rules: &[Rule]) -> Vec<Rule> {
+    rules.iter().map(Rule::as_reported).collect()
 }
 
 /// The `ServerSideEncryptionConfiguration` payload for `rules`, spelled the way a client's
@@ -343,7 +363,7 @@ async fn putting_an_encryption_configuration_stores_it_and_reads_back_through_ge
         );
         assert_eq!(
             reported_rules(&read),
-            rules,
+            as_reported(&rules),
             "case {case:?}: expected the stored configuration back unchanged, got {:?}",
             reported_rules(&read)
         );
@@ -359,7 +379,7 @@ async fn putting_an_encryption_configuration_stores_it_and_reads_back_through_ge
         let reread = get_encryption(&router, &bucket).await;
         assert_eq!(
             reported_rules(&reread),
-            rules,
+            as_reported(&rules),
             "case {case:?}: a repeated put must not change what is stored, got {:?}",
             reported_rules(&reread)
         );
@@ -448,7 +468,7 @@ async fn a_bucket_no_put_has_configured_reports_the_sse_s3_default() {
         let read = get_encryption(&router, bucket).await;
         assert_eq!(
             reported_rules(&read),
-            configured,
+            as_reported(&configured),
             "case {case:?}: the configured bucket must report what it was given, got {:?}",
             reported_rules(&read)
         );
@@ -550,7 +570,7 @@ async fn a_refused_encryption_payload_changes_nothing() {
         let read = get_encryption(&router, bucket).await;
         assert_eq!(
             reported_rules(&read),
-            stored,
+            as_reported(&stored),
             "case {case:?}: a refused put must leave the stored configuration untouched, \
              got {:?}",
             reported_rules(&read)
@@ -595,7 +615,7 @@ async fn a_refused_encryption_payload_changes_nothing() {
         let read = get_encryption(&router, bucket).await;
         assert_eq!(
             reported_rules(&read),
-            stored,
+            as_reported(&stored),
             "case {case:?}: a refused put must leave the stored configuration untouched, \
              got {:?}",
             reported_rules(&read)
@@ -664,7 +684,7 @@ async fn encryption_on_a_bucket_this_emulator_does_not_hold_is_no_such_bucket() 
     let read = get_encryption(&router, "held-encryption-bucket").await;
     assert_eq!(
         reported_rules(&read),
-        configured,
+        as_reported(&configured),
         "the held bucket must report the configuration it was given, got {:?}",
         reported_rules(&read)
     );
@@ -762,7 +782,7 @@ async fn an_expected_bucket_owner_that_is_not_the_account_is_access_denied() {
     .await;
     assert_eq!(
         reported_rules(&read),
-        owned,
+        as_reported(&owned),
         "the owning account must read the configuration back, got {:?}",
         reported_rules(&read)
     );

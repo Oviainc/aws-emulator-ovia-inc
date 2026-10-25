@@ -17,6 +17,8 @@ mod error_reason_fault_classes;
 mod error_response_bodies;
 #[path = "all/list_rules_page_order.rs"]
 mod list_rules_page_order;
+#[path = "all/lockable_rule_invariant.rs"]
+mod lockable_rule_invariant;
 #[path = "all/resource_tag_pair_quota.rs"]
 mod resource_tag_pair_quota;
 #[path = "all/resource_tags.rs"]

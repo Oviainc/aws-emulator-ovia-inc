@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDataTransformationJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDataTransformationJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDataTransformationJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the persisted data transformation jobs of this account, from
+//! [`crate::state`], narrowed by the `JobName` / `JobStatus` /
+//! `SubmittedBefore` / `SubmittedAfter` filter members and paged by
+//! `MaxResults`/`NextToken`.
+//!
+//! The records come from
+//! [`crate::state::ComAmazonawsHealthlakeHealthlakeState::transformation_jobs`],
+//! the ONE map `StartDataTransformationJob` mints into and
+//! `DescribeDataTransformationJob` reads back, reported through the modelled
+//! `TransformationJobSummary` — the subset of the properties shape that one
+//! declares — so a job is reported identically by every operation that can see
+//! it. A transformation job belongs to no data store, so this listing is scoped
+//! to the account and nothing here can be not-found: a filter that selects
+//! nothing is an empty page.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +166,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDataTransformationJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDataTransformationJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDataTransformationJobs"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server(
+                "the HealthLake data transformation job registry is unavailable",
+            ));
+        };
+
+        let mut store = state.lock();
+        // The job records must have caught up with the clock before any of them
+        // is read: a job whose transition is already due would otherwise be
+        // listed — and filtered on — under the status it has left.
+        store.settle_transformation_jobs();
+
+        let mut matched: Vec<&crate::state::TransformationJob> = store
+            .transformation_jobs
+            .values()
+            .filter(|job| matches_request(job, &input))
+            .collect();
+        // A stable total order is what makes paging resumable: oldest
+        // submission first, identifier breaking a tie between two jobs
+        // submitted in one tick. The model documents no order, so this is the
+        // one every other listing in this crate pages in.
+        matched.sort_by(|a, b| {
+            crate::state::epoch_nanos(&a.submitted_at)
+                .cmp(&crate::state::epoch_nanos(&b.submitted_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        // `NextToken` is the identifier of the first entry the next page
+        // returns, so resuming is a lookup in this same order. A token that
+        // names no entry of this listing resumes nothing, which is a bad
+        // request rather than an empty page.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => matched
+                .iter()
+                .position(|job| job.id == token)
+                .ok_or_else(|| {
+                    validation("NextToken does not resume a ListDataTransformationJobs page")
+                })?,
+        };
+        // `MaxResults` is modelled 1..100, and the model documents that a
+        // request naming none returns "up to 100 results", so an absent value
+        // pages at that maximum. The boundary validator has already refused a
+        // value outside the range — `tests/all/data_transformation_job_listing.rs`
+        // pins 0 and 101 at a 400 `ValidationException` — so the conversion
+        // below is a defensive floor rather than a silent re-reading of the
+        // request: it can only ever see a value in range.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(0)
+            .clamp(1, usize::try_from(MAX_PAGE_SIZE).unwrap_or(usize::MAX));
+
+        let page: Vec<TransformationJobSummary> = matched[start..]
+            .iter()
+            .take(page_size)
+            .map(|job| job.summary())
+            .collect();
+        // A token is emitted ONLY when entries remain after this page.
+        let next_token = matched.get(start + page.len()).map(|job| job.id.clone());
+
+        Ok(ListDataTransformationJobsOutput {
+            items: page,
+            next_token,
+        })
     }
+}
+
+/// The largest page `MaxResults` allows (modelled range 1..100), which is also
+/// the page size a request that names none gets — "If you don't specify a
+/// value, the service returns up to 100 results."
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// This operation's 400 refusal, as the modelled `ValidationException` it
+/// declares.
+fn validation(message: &str) -> ListDataTransformationJobsError {
+    ListDataTransformationJobsErrorModeled::ValidationException(ValidationException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// This operation's 500, for a store the handler could not reach at all.
+fn internal_server(message: &str) -> ListDataTransformationJobsError {
+    ListDataTransformationJobsErrorModeled::InternalServerException(InternalServerException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// Whether `job` satisfies every filter member the request set.
+///
+/// Each member narrows the listing on its own and all of them together:
+/// `JobName` and `JobStatus` match exactly (the model: "filters the results to
+/// include only jobs with the specified name" / "with the specified status"),
+/// and `SubmittedAfter` / `SubmittedBefore` are INCLUSIVE cutoffs on
+/// `SubmitTime` ("submitted at or after this timestamp" / "at or before this
+/// timestamp") — the same reading `ListFHIRExportJobs` gives its own pair, so
+/// two of this service's listings cannot disagree about whether a boundary
+/// instant is in the window.
+fn matches_request(
+    job: &crate::state::TransformationJob,
+    input: &ListDataTransformationJobsInput,
+) -> bool {
+    if let Some(name) = input.job_name.as_deref() {
+        if job.name.as_deref() != Some(name) {
+            return false;
+        }
+    }
+    // The boundary validator has already refused any value outside the modelled
+    // `TransformationJobStatus` value set, and a record can only hold a
+    // modelled one, so this is a comparison rather than a second validation.
+    if let Some(status) = input.job_status.as_deref() {
+        if job.status.as_wire() != status {
+            return false;
+        }
+    }
+    let submitted = crate::state::epoch_nanos(&job.submitted_at);
+    if let Some(before) = input.submitted_before.as_ref() {
+        if submitted > crate::state::epoch_nanos(before) {
+            return false;
+        }
+    }
+    if let Some(after) = input.submitted_after.as_ref() {
+        if submitted < crate::state::epoch_nanos(after) {
+            return false;
+        }
+    }
+    true
 }

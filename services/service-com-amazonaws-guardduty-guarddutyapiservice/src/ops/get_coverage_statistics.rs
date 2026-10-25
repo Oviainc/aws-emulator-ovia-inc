@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCoverageStatistics
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCoverageStatistics`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCoverageStatistics::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: aggregates the Runtime Monitoring coverage of the compute resources the
+//! account holds in the detector's Region — the same resources `ListCoverage` reports
+//! one by one — into the counts the request asks for. This is a pure report: it never
+//! writes.
+//!
+//! The coverage facts themselves — which resources the detector covers, what each one's
+//! coverage is, and the criteria a request narrows them by — live in
+//! [`crate::state::coverage`], shared with the operation that lists them, so the count
+//! and the list cannot disagree about one resource. This file turns them into this
+//! operation's own `CoverageStatistics` answer: one map per `CoverageStatisticsType`
+//! the request names, and no map it did not name.
+//!
+//! An unknown detector id is refused with `BadRequestException`, and so is a
+//! `statisticsType` or criterion key this service's model does not carry — silently
+//! ignoring one would count resources the caller asked to exclude.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +153,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCoverageStatistics` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCoverageStatisticsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCoverageStatistics"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetCoverageStatisticsErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+
+        // Decided from the REQUEST alone, before the store or any inventory is looked
+        // at, so a detector covering nothing refuses an unaggregatable statistics type
+        // or an unevaluable criterion exactly as one covering resources does.
+        let requested = requested_statistics(&input.statistics_type)?;
+        let criteria = crate::state::coverage::requested_criteria(input.filter_criteria.as_ref())
+            .map_err(refusal)?;
+
+        // What the detector's Runtime Monitoring configuration says is covered. A pure
+        // report: nothing writes to the store, and the guard is released before the
+        // inventory below is asked for, because another service answers those calls.
+        let scope = {
+            let store = state.lock();
+            let Some(detector) = store.detector_in(&region, &input.detector_id) else {
+                // Classified from the REQUEST: a value that cannot be a detector id is
+                // a parameter failure, a well-formed one this account does not hold an
+                // ownership failure.
+                return Err(bad_request(crate::state::detector_id_rejection(
+                    &input.detector_id,
+                )));
+            };
+            crate::state::coverage::CoverageScope::of(detector)
+        };
+
+        let account_id = crate::state::administrator_account_id();
+        let mut rows = crate::state::coverage::covered_resources(
+            ctx,
+            &region,
+            &input.detector_id,
+            &account_id,
+            &scope,
+        )
+        .await;
+        crate::state::coverage::retain_matching(&mut rows, &criteria);
+
+        Ok(GetCoverageStatisticsOutput {
+            coverage_statistics: Some(CoverageStatistics {
+                // One map per statistics type the request named, and NONE it did not:
+                // both members are optional, so a statistic nobody asked for is absent
+                // rather than reported as zero.
+                count_by_resource_type: requested
+                    .contains(&COUNT_BY_RESOURCE_TYPE)
+                    .then(|| {
+                        counted(
+                            rows.iter()
+                                .map(crate::state::coverage::CoverageRow::resource_type),
+                        )
+                    }),
+                count_by_coverage_status: requested
+                    .contains(&COUNT_BY_COVERAGE_STATUS)
+                    .then(|| {
+                        counted(
+                            rows.iter()
+                                .map(crate::state::coverage::CoverageRow::coverage_status),
+                        )
+                    }),
+            }),
+        })
     }
+}
+
+/// The `CoverageStatisticsType` members (`smithy_query(shape="CoverageStatisticsType")`),
+/// each naming the coverage attribute the counts are aggregated by.
+const COUNT_BY_RESOURCE_TYPE: &str = "COUNT_BY_RESOURCE_TYPE";
+/// See [`COUNT_BY_RESOURCE_TYPE`].
+const COUNT_BY_COVERAGE_STATUS: &str = "COUNT_BY_COVERAGE_STATUS";
+
+/// The input member a refusal names, spelled as the wire spells it
+/// (`smithy_query(operation="GetCoverageStatistics")`).
+const STATISTICS_TYPE_MEMBER: &str = "statisticsType";
+
+// Named, not taken by position out of the generated value list: this assertion fails
+// the BUILD if the model stops carrying a value this file switches on, where an index
+// would instead have silently matched some other member.
+const _: () = {
+    let kinds = [COUNT_BY_RESOURCE_TYPE, COUNT_BY_COVERAGE_STATUS];
+    let mut index = 0;
+    while index < kinds.len() {
+        assert!(crate::state::enum_carries(
+            crate::ops::types::shared_types::COVERAGE_STATISTICS_TYPE_VALUES,
+            kinds[index]
+        ));
+        index += 1;
+    }
+};
+
+/// The statistics the request asks for.
+///
+/// A `statisticsType` the model does not carry is REFUSED rather than ignored: a client
+/// that asked for a statistic and got no map back would read the absence as "no
+/// resources" instead of "that is not a statistic". A request that names none asks for
+/// no statistic at all, which is the empty answer rather than a canned map.
+fn requested_statistics(requested: &[String]) -> Result<Vec<&str>, GetCoverageStatisticsError> {
+    let mut kinds = Vec::new();
+    for kind in requested {
+        if !crate::state::enum_carries(
+            crate::ops::types::shared_types::COVERAGE_STATISTICS_TYPE_VALUES,
+            kind,
+        ) {
+            return Err(bad_request(crate::state::invalid_parameter_message(
+                STATISTICS_TYPE_MEMBER,
+            )));
+        }
+        kinds.push(kind.as_str());
+    }
+    Ok(kinds)
+}
+
+/// How many covered resources fall into each group, keyed by the group.
+///
+/// A group no covered resource falls into is NOT an entry: the map counts the resources
+/// the account holds, so a key with no resource behind it would claim this service
+/// observed something it did not. An account whose covered resources are all filtered
+/// out therefore gets the empty map — present, because the statistic was asked for.
+fn counted<'rows>(
+    groups: impl Iterator<Item = &'rows str>,
+) -> ::std::collections::HashMap<String, i64> {
+    let mut counts: ::std::collections::HashMap<String, i64> =
+        ::std::collections::HashMap::new();
+    for group in groups {
+        let count = counts.entry(group.to_string()).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+    counts
+}
+
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` and its `type` member.
+fn bad_request(message: impl Into<String>) -> GetCoverageStatisticsError {
+    crate::scaffolded::Scaffolded::invalid_input(message)
+}
+
+/// Refuse a criterion this service cannot evaluate, naming the member it arrived under.
+fn refusal(rejection: crate::state::coverage::Rejection) -> GetCoverageStatisticsError {
+    bad_request(rejection.message())
 }

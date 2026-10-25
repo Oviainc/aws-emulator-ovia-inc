@@ -71,6 +71,8 @@ mod key_value_store_update;
 mod managed_cache_policy_catalog;
 #[path = "all/managed_certificate_details.rs"]
 mod managed_certificate_details;
+#[path = "all/managed_certificate_domain_ownership.rs"]
+mod managed_certificate_domain_ownership;
 #[path = "all/monitoring_subscription.rs"]
 mod monitoring_subscription;
 #[path = "all/origin_access_control_delete.rs"]

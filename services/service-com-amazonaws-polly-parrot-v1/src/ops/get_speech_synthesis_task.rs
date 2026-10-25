@@ -4,16 +4,19 @@
 //!
 //! Reports one speech synthesis task out of the task store, by its `TaskId`.
 //!
-//! This is a REPORTING operation: it creates nothing and consumes nothing. The one
-//! write it may make is materialising the status transition the CLOCK has already
-//! made due on the task it reads ([`crate::state::settle_task_status`]) — a change
-//! that was owed at that instant whether or not anybody polled.
+//! This is a REPORTING operation: it creates nothing and consumes nothing. The only
+//! writes it may make are the ones the CLOCK has already made due on the task store
+//! ([`crate::state::ComAmazonawsPollyParrotV1State::retained_synthesis_tasks`]):
+//! settling a status transition that fell due, and dropping a task whose documented
+//! retention window has run out — changes that were owed at that instant whether or
+//! not anybody polled.
 //!
 //! The model declares two distinct refusals for the `TaskId`, and they mean different
 //! things: a value that is not an identifier this service could have minted (the
 //! model's pattern is far wider than the minted form — see
 //! [`crate::state::is_task_id`]) is `InvalidTaskIdException` (HTTP 400), while an
-//! identifier of the minted form that names no stored task is
+//! identifier of the minted form that names no task the service holds — never started,
+//! or started longer ago than [`crate::state::TASK_RETENTION`] — is
 //! `SynthesisTaskNotFoundException` (HTTP 400). A `TaskId` that does not satisfy the
 //! model's pattern at all never reaches this handler, because the framework refuses it
 //! at the boundary.
@@ -168,18 +171,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
+        // ONE clock reading for the whole call, so the task store this read sees and
+        // the status it reports are of the same instant.
+        let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
-        let stored = guard.synthesis_tasks.get_mut(&input.task_id).ok_or_else(|| {
-            // The `TaskId` is one this service could have minted and names no task,
-            // which is this error rather than `InvalidTaskIdException`.
-            GetSpeechSynthesisTaskErrorModeled::SynthesisTaskNotFoundException(
-                crate::service::errors::synthesis_task_not_found(),
-            )
-        })?;
-        // The task's status as of NOW: a transition the clock owed it is reported the
-        // first time a read arrives after it fell due, not when some other call
-        // happens to run.
-        crate::state::settle_task_status(stored, ::std::time::SystemTime::now());
+        // The task store as of NOW: a task whose retention window has run out is no
+        // longer held, and a status transition the clock owed a task it still holds is
+        // materialised. Both were owed at `now` whether or not anybody polled.
+        let stored = guard
+            .retained_synthesis_tasks(now)
+            .get(&input.task_id)
+            .ok_or_else(|| {
+                // The `TaskId` is one this service could have minted and names no task
+                // the service holds, which is this error rather than
+                // `InvalidTaskIdException`.
+                GetSpeechSynthesisTaskErrorModeled::SynthesisTaskNotFoundException(
+                    crate::service::errors::synthesis_task_not_found(),
+                )
+            })?;
 
         Ok(GetSpeechSynthesisTaskOutput {
             synthesis_task: Some(crate::state::synthesis_task(stored)),

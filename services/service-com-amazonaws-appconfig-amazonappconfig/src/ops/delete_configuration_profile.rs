@@ -179,12 +179,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // `DeletionProtectionCheck` asks for deletion protection to be bypassed, applied
-        // or left to the account setting. Protection refuses a delete only when the
-        // profile served a configuration inside the protected interval; the call that
-        // would record that (`GetLatestConfiguration`) belongs to the `appconfigdata`
-        // service, so this service observes no such activity and has nothing to refuse
-        // on, whichever value the caller sent — the same reading `DeleteEnvironment`
-        // applies to its own copy of this header.
+        // or left to the account setting, so it selects only WHETHER the protection check
+        // runs. What that check looks at is configuration-read activity for this profile
+        // inside the account's protection period, and it skips a profile created in the
+        // past hour unless the caller asked for `APPLY` (the model's
+        // `DeletionProtectionSettings` documentation). Neither read that records such
+        // activity leaves a mark on this service's state: `GetLatestConfiguration` belongs
+        // to the `appconfigdata` service, and this service's own deprecated
+        // `GetConfiguration` is still a scaffold. So the check has nothing to protect for
+        // any profile here and refuses nothing, whichever value the caller sent — the same
+        // reading `DeleteEnvironment` applies to its own copy of this header. Once a
+        // configuration read is recorded against a profile, the refusal belongs here.
         let _requested_check = input.deletion_protection_check;
 
         // A configuration profile only exists under an application, so the parent is

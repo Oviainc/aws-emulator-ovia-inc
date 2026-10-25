@@ -11,6 +11,9 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/agent_context_create_limits.rs"]
+mod agent_context_create_limits;
+
 #[path = "all/agent_contexts.rs"]
 mod agent_contexts;
 
@@ -232,3 +235,7 @@ mod agent_profile_updates;
 // position for an agent suite is the one gap of this list every new agent suite lands in.
 #[path = "all/agent_recommendations.rs"]
 mod agent_recommendations;
+
+// Declared last for the same reason as the declarations above.
+#[path = "all/agent_recommendation_paging.rs"]
+mod agent_recommendation_paging;

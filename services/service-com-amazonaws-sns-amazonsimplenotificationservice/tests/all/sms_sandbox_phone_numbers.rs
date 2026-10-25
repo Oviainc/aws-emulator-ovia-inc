@@ -21,30 +21,16 @@ use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_sns_amazonsimplenotificationservice::ops::types::S_M_S_SANDBOX_PHONE_NUMBER_VERIFICATION_STATUS_VALUES;
 use service_com_amazonaws_sns_amazonsimplenotificationservice::state::{
-    SandboxPhoneNumberRecord, MAX_RECORDS_PER_STORE, PAGE_SIZE, RESOURCE_DOES_NOT_EXIST,
-    SANDBOX_NUMBER_PENDING,
+    SandboxPhoneNumberRecord, INVALID_NEXT_TOKEN_REFUSAL, MAX_RECORDS_PER_STORE, PAGE_SIZE,
+    RESOURCE_DOES_NOT_EXIST, SANDBOX_NUMBER_PENDING,
 };
 
-use super::topics_subscriptions_publish::{xml_unescape, Answer, Sns};
+use super::topics_subscriptions_publish::{text_of, Answer, Sns};
 
 /// The page `MaxResults` bounds: `smithy_query(query="shape", shape="MaxItems")`
 /// reports `range {min: 1, max: 100}` for the member's target shape.
 const MIN_MAX_RESULTS: i64 = 1;
 const MAX_MAX_RESULTS: i64 = 100;
-
-/// The text of the first `<tag>…</tag>` element inside `block`, or `""` when the
-/// element is absent or empty.
-fn text_of(block: &str, tag: &str) -> String {
-    let open = format!("<{tag}>");
-    let Some(start) = block.find(&open) else {
-        return String::new();
-    };
-    let rest = &block[start + open.len()..];
-    match rest.find(&format!("</{tag}>")) {
-        Some(end) => xml_unescape(&rest[..end]),
-        None => String::new(),
-    }
-}
 
 /// The body of the response's `<PhoneNumbers>` element, or `None` when the response
 /// carries no such member at all — the member is modelled `required`, so an answered
@@ -428,6 +414,14 @@ async fn a_next_token_the_listing_did_not_mint_is_refused() {
             answer.code(),
             "InvalidParameter",
             "case {case:?}: expected the InvalidParameter code, got {}",
+            answer.body
+        );
+        // The sentence is per error class, not per listing: every paginated SNS list
+        // refuses a token it did not mint with the same one.
+        assert_eq!(
+            answer.element("Message").as_deref(),
+            Some(INVALID_NEXT_TOKEN_REFUSAL),
+            "case {case:?}: expected the member's refusal sentence, got {}",
             answer.body
         );
     }

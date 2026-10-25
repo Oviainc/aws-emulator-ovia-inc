@@ -4370,25 +4370,77 @@ pub fn summarise_rule_compliance<'a>(
     rules: impl Iterator<Item = &'a ConfigRuleEntry>,
     at: SystemTime,
 ) -> ComplianceSummary {
+    summarise_compliance(
+        rules.map(ConfigRuleEntry::compliance),
+        COMPLIANCE_SUMMARY_RULE_CAP,
+        at,
+    )
+}
+
+/// The compliance roll-up of `verdicts` — one `ComplianceType` per item summarised:
+/// how many of them are compliant and how many are noncompliant, each counted up to
+/// `cap`, as of `at`.
+///
+/// The cap is a parameter for the same reason [`capped_count`]'s is: Config counts the
+/// RULES a summary covers up to [`COMPLIANCE_SUMMARY_RULE_CAP`] and the RESOURCES one
+/// covers up to [`COMPLIANCE_RESOURCE_CAP`], while the summarising rule itself — which
+/// verdicts count towards which member, and when the count is capped — is the same
+/// one, written here once.
+pub fn summarise_compliance<'a>(
+    verdicts: impl Iterator<Item = &'a str>,
+    cap: i32,
+    at: SystemTime,
+) -> ComplianceSummary {
     let mut compliant = 0i64;
     let mut non_compliant = 0i64;
-    for rule in rules {
-        match rule.compliance() {
+    for verdict in verdicts {
+        match verdict {
             COMPLIANCE_TYPE_COMPLIANT => compliant += 1,
             COMPLIANCE_TYPE_NON_COMPLIANT => non_compliant += 1,
-            // A rule no evaluation result places either way contributes to neither
+            // Something no evaluation result places either way contributes to neither
             // count.
             _ => {}
         }
     }
     ComplianceSummary {
-        compliant_resource_count: Some(capped_count(compliant, COMPLIANCE_SUMMARY_RULE_CAP)),
-        non_compliant_resource_count: Some(capped_count(
-            non_compliant,
-            COMPLIANCE_SUMMARY_RULE_CAP,
-        )),
+        compliant_resource_count: Some(capped_count(compliant, cap)),
+        non_compliant_resource_count: Some(capped_count(non_compliant, cap)),
         compliance_summary_timestamp: Some(timestamp(at)),
     }
+}
+
+/// The `ComplianceType` every RESOURCE the account's `rules` have evaluated rolls up
+/// to, keyed by the `(resourceType, resourceId)` pair that identifies a resource in
+/// Config — so one resource several rules evaluated appears ONCE, whichever rules
+/// placed it.
+///
+/// A resource falls in the scope of every rule that evaluates its type, so its own
+/// compliance is the roll-up of the verdicts all of those rules recorded for it, under
+/// the same precedence a single rule's roll-up follows
+/// ([`resource_evaluation::roll_up_compliance`]): noncompliant if any rule placed it
+/// so, compliant if at least one did and none placed it noncompliant, and
+/// `INSUFFICIENT_DATA` where no verdict places it either way.
+pub fn resource_compliance<'a>(
+    rules: impl Iterator<Item = &'a ConfigRuleEntry>,
+) -> BTreeMap<(String, String), &'static str> {
+    let mut recorded: BTreeMap<(String, String), Vec<&str>> = BTreeMap::new();
+    for rule in rules {
+        for result in rule.evaluation_results.values() {
+            recorded
+                .entry((result.resource_type.clone(), result.resource_id.clone()))
+                .or_default()
+                .push(result.compliance_type.as_str());
+        }
+    }
+    recorded
+        .into_iter()
+        .map(|(resource, verdicts)| {
+            (
+                resource,
+                resource_evaluation::roll_up_compliance(verdicts.into_iter()),
+            )
+        })
+        .collect()
 }
 
 /// `count` contributors reported as a `ComplianceContributorCount` against `cap`: the

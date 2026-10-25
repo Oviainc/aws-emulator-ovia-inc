@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/alarm_action_dispatch.rs"]
 mod alarm_action_dispatch;
+#[path = "all/alarm_actions_switch.rs"]
+mod alarm_actions_switch;
 #[path = "all/alarm_configuration.rs"]
 mod alarm_configuration;
 #[path = "all/alarm_evaluation.rs"]

@@ -219,31 +219,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let resource = record.versioned_arn(&version);
-        // The resource the request named resolved, so what is missing is the POLICY: the
-        // refusal is the fixed sentence that names no resource, leaving the
-        // resource-identifying form to a request that resolves to nothing.
+        // The resource the request named resolved, so what a removal finds missing is the
+        // POLICY itself, and that is what it reports: a READ of the policy answers for the
+        // resource it was asked about, a removal answers for the policy it was asked to
+        // change.
         let Some(policy) = record.policies.get_mut(&version) else {
             return Err(RemovePermissionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     r#type: None,
-                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                    message: Some(crate::state::NO_POLICY_MESSAGE.to_string()),
                 },
             )
             .into());
         };
 
         // "Update the policy only if the revision ID matches the ID that's specified."
-        // The id to match is the policy's own, which is the one `GetPolicy` reports.
+        // The id to match is the policy's own, which is the one `GetPolicy` reports, and
+        // the refusal is the one fixed sentence naming that reader.
         if let Some(expected) = input.revision_id.as_deref() {
             if policy.revision_id != expected {
                 return Err(RemovePermissionErrorModeled::PreconditionFailedException(
                     PreconditionFailedException {
                         r#type: None,
-                        message: Some(format!(
-                            "The RevisionId ({expected}) provided does not match the latest \
-                             RevisionId for the resource {resource}. Call GetPolicy to retrieve \
-                             the latest RevisionId for your resource."
-                        )),
+                        message: Some(
+                            crate::state::POLICY_REVISION_PRECONDITION_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into());

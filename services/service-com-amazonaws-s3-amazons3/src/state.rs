@@ -370,6 +370,41 @@ pub const MAX_TAG_KEY_CHARS: usize = 128;
 /// string, so nothing refuses an over-long value before this check.
 pub const MAX_TAG_VALUE_CHARS: usize = 256;
 
+/// The punctuation a tag key or value may carry, beside Unicode letters, digits and
+/// whitespace.
+///
+/// The published tag restrictions the two tagging operations point at ("Tag restrictions",
+/// Amazon S3 User Guide, and the same list in the AWS *Tagging Resources* guide): "the
+/// allowed characters are letters, whitespace, and numbers representable in UTF-8, plus
+/// the following special characters: + - = . _ : / @". A code point outside that set — an
+/// emoji, a currency sign, a bracket — is refused rather than stored, which is what
+/// [`tag_text_is_allowed`] decides.
+pub const TAG_PUNCTUATION: [char; 8] = ['+', '-', '=', '.', '_', ':', '/', '@'];
+
+/// Whether every character of `text` is one a tag key or value may carry.
+///
+/// ONE character class for both halves of a tag and for both tag sets S3 holds, from the
+/// published restrictions quoted on [`TAG_PUNCTUATION`]: Unicode letters, Unicode digits,
+/// whitespace, and that punctuation. "Letters" is the Unicode property, not ASCII, so a
+/// tag written in any script is storable; a SYMBOL (an emoji is one) is not a letter and
+/// is refused. Stated once, by the function that finds the offending character.
+pub fn tag_text_is_allowed(text: &str) -> bool {
+    first_disallowed_tag_char(text).is_none()
+}
+
+/// The first character of `text` that a tag key or value may NOT carry, or `None` when
+/// every one of them is allowed.
+///
+/// The one place the class is spelled; [`tag_text_is_allowed`] is this answering "none".
+pub fn first_disallowed_tag_char(text: &str) -> Option<char> {
+    text.chars().find(|character| {
+        !(character.is_alphabetic()
+            || character.is_numeric()
+            || character.is_whitespace()
+            || TAG_PUNCTUATION.contains(character))
+    })
+}
+
 /// One tag on a resource this emulator holds — a bucket's tag set or an object's: the
 /// key/value pair `Tag` carries on the wire.
 ///
@@ -442,6 +477,14 @@ pub enum TagSetRejectionCause {
     ValueTooLong { key: String, chars: usize },
     /// Two tags in one set name the same key, so the set is not a key/value mapping.
     DuplicateKey { key: String },
+    /// A key or a value carries a character outside the published class every tag set
+    /// shares ([`tag_text_is_allowed`]).
+    DisallowedCharacter {
+        /// Which half of the tag carries it ("Tag.Key", "Tag.Value").
+        field: &'static str,
+        /// The character the published class does not allow.
+        character: char,
+    },
 }
 
 /// Why a tag set cannot be stored on a resource: the restriction it breaks, and the
@@ -483,9 +526,48 @@ impl std::fmt::Display for TagSetRejection {
                 "Tagging.TagSet names the key {key:?} twice; a {resource} tag set holds \
                  one value per key"
             ),
+            TagSetRejectionCause::DisallowedCharacter { field, character } => write!(
+                f,
+                "Tagging.TagSet has a {field} carrying {character:?}, which is not one of \
+                 the letters, numbers, whitespace and {TAG_PUNCTUATION:?} a tag may hold"
+            ),
         }
     }
 }
+
+impl TagSetRejection {
+    /// The wire error code S3 answers this rejection with.
+    ///
+    /// Two codes, one per class of restriction, both HTTP 400: a tag set carrying more
+    /// tags than its resource may hold is refused `BadRequest` — the set is too big,
+    /// whatever is in it — while a restriction one INDIVIDUAL tag breaks (its key, its
+    /// value, or the set naming that key twice) is refused `InvalidTag`, "the tag provided
+    /// was not a valid tag. This error can occur if the tag did not pass input validation"
+    /// (`PutBucketTagging`'s own list of special errors). Neither code is a shape in this
+    /// model, so a caller renders it through the unmodelled channel.
+    pub fn code(&self) -> &'static str {
+        match self.cause {
+            TagSetRejectionCause::TooManyTags { .. } => BAD_REQUEST_CODE,
+            TagSetRejectionCause::EmptyKey
+            | TagSetRejectionCause::KeyTooLong { .. }
+            | TagSetRejectionCause::ValueTooLong { .. }
+            | TagSetRejectionCause::DuplicateKey { .. }
+            | TagSetRejectionCause::DisallowedCharacter { .. } => INVALID_TAG_CODE,
+        }
+    }
+}
+
+/// The code S3 answers a tag set whose SIZE is past what the resource may hold:
+/// "BadRequest", HTTP 400 (Amazon S3 "Error responses", list of error codes).
+pub const BAD_REQUEST_CODE: &str = "BadRequest";
+
+/// The code S3 answers a tag that does not pass input validation: "InvalidTag - The tag
+/// provided was not a valid tag. This error can occur if the tag did not pass input
+/// validation" (`PutBucketTagging`'s own list of special errors), HTTP 400.
+pub const INVALID_TAG_CODE: &str = "InvalidTag";
+
+/// The HTTP status both tag-set codes are rendered with: 400, from that same list.
+pub const TAG_REJECTION_STATUS: u16 = 400;
 
 /// Whether `tags` may be stored as the tag set of a resource with these `limits`,
 /// reporting the first restriction it breaks.
@@ -512,11 +594,23 @@ pub fn validate_tag_set(
         if key_chars > MAX_TAG_KEY_CHARS {
             return refuse(TagSetRejectionCause::KeyTooLong { chars: key_chars });
         }
+        if let Some(character) = first_disallowed_tag_char(&tag.key) {
+            return refuse(TagSetRejectionCause::DisallowedCharacter {
+                field: "Tag.Key",
+                character,
+            });
+        }
         let value_chars = tag.value.chars().count();
         if value_chars > MAX_TAG_VALUE_CHARS {
             return refuse(TagSetRejectionCause::ValueTooLong {
                 key: tag.key.clone(),
                 chars: value_chars,
+            });
+        }
+        if let Some(character) = first_disallowed_tag_char(&tag.value) {
+            return refuse(TagSetRejectionCause::DisallowedCharacter {
+                field: "Tag.Value",
+                character,
             });
         }
         if !seen.insert(tag.key.as_str()) {
@@ -761,7 +855,8 @@ pub fn default_acl_grants() -> Vec<AclGrant> {
 /// * `private` — owner `FULL_CONTROL`, nobody else;
 /// * `public-read` — owner `FULL_CONTROL`, `AllUsers` `READ`;
 /// * `public-read-write` — owner `FULL_CONTROL`, `AllUsers` `READ` and `WRITE`;
-/// * `authenticated-read` — owner `FULL_CONTROL`, `AuthenticatedUsers` `READ`.
+/// * `authenticated-read` — owner `FULL_CONTROL`, `AuthenticatedUsers` `READ`;
+/// * `log-delivery-write` — owner `FULL_CONTROL`, `LogDelivery` `WRITE` and `READ_ACP`.
 pub fn canned_acl_grants(canned: &str) -> Option<Vec<AclGrant>> {
     let owner = AclGrant::to_canonical_user(canonical_user_id(), PERMISSION_FULL_CONTROL);
     let grants = match canned {
@@ -778,6 +873,14 @@ pub fn canned_acl_grants(canned: &str) -> Option<Vec<AclGrant>> {
         "authenticated-read" => vec![
             owner,
             AclGrant::to_group(AUTHENTICATED_USERS_GROUP_URI, PERMISSION_READ),
+        ],
+        // The fifth bucket row of that same table: "log-delivery-write — the LogDelivery
+        // group gets WRITE and READ_ACP permissions on the bucket", which is the ACL S3
+        // server access logging requires on a target bucket.
+        "log-delivery-write" => vec![
+            owner,
+            AclGrant::to_group(LOG_DELIVERY_GROUP_URI, PERMISSION_WRITE),
+            AclGrant::to_group(LOG_DELIVERY_GROUP_URI, PERMISSION_READ_ACP),
         ],
         _ => return None,
     };
@@ -1037,6 +1140,49 @@ pub const METHOD_NOT_ALLOWED_STATUS: u16 = 405;
 /// longer affect permissions" (`PutBucketAcl`'s documentation), so a request to set one is
 /// refused with [`ACL_NOT_SUPPORTED_CODE`] while a request to read one still answers.
 pub const BUCKET_OWNER_ENFORCED: &str = "BucketOwnerEnforced";
+
+/// The `ObjectOwnership` value a bucket is left in once its ownership controls are
+/// REMOVED: ACLs affect permissions again, and "the uploading account will own the object
+/// if the object is uploaded with the bucket-owner-full-control canned ACL"
+/// (`smithy_query(query="shape",shape="ObjectOwnership")`). A bucket with no
+/// `OwnershipControls` is one whose ACLs are enabled — the state
+/// `GetBucketOwnershipControls` describes as "the bucket was created before the
+/// BucketOwnerEnforced setting was introduced" or "you've manually deleted the bucket
+/// ownership control value".
+pub const OBJECT_WRITER: &str = "ObjectWriter";
+
+/// The `ObjectOwnership` a general purpose bucket is CREATED with when the request names
+/// none: "By default, `ObjectOwnership` is set to `BucketOwnerEnforced` and ACLs are
+/// disabled" (`smithy_query(query="shape",shape="ObjectOwnership")`), so a bucket nothing
+/// has configured refuses an ACL write with [`ACL_NOT_SUPPORTED_CODE`].
+pub const DEFAULT_OBJECT_OWNERSHIP: &str = BUCKET_OWNER_ENFORCED;
+
+/// The code S3 answers a request that would leave a bucket with BOTH an ACL that grants
+/// more than the owner's `FULL_CONTROL` and the `BucketOwnerEnforced` Object Ownership
+/// setting that disables ACLs: "InvalidBucketAclWithObjectOwnership - Bucket cannot have
+/// ACLs set with ObjectOwnership's BucketOwnerEnforced setting", HTTP 400 (Amazon S3
+/// "Error responses", list of error codes).
+pub const INVALID_BUCKET_ACL_WITH_OBJECT_OWNERSHIP_CODE: &str =
+    "InvalidBucketAclWithObjectOwnership";
+/// See [`INVALID_BUCKET_ACL_WITH_OBJECT_OWNERSHIP_CODE`] — the text of that same entry.
+pub const INVALID_BUCKET_ACL_WITH_OBJECT_OWNERSHIP_MESSAGE: &str =
+    "Bucket cannot have ACLs set with ObjectOwnership's BucketOwnerEnforced setting";
+
+/// Whether `grants` gives any access to a PREDEFINED GROUP that stands for people outside
+/// the bucket owner's account — `AllUsers` (anyone) or `AuthenticatedUsers` (any AWS
+/// account).
+///
+/// "The Meaning of Public" (Amazon S3 User Guide, Block Public Access): an ACL is public
+/// when it grants access to `AllUsers` or `AuthenticatedUsers`. A grant to the
+/// `LogDelivery` group is to an S3 service principal, not to the public, and a grant to a
+/// canonical user or an email address names one account.
+pub fn acl_grants_public_access(grants: &[AclGrant]) -> bool {
+    grants.iter().any(|grant| {
+        grant.grantee.uri.as_deref().is_some_and(|uri| {
+            uri == ALL_USERS_GROUP_URI || uri == AUTHENTICATED_USERS_GROUP_URI
+        })
+    })
+}
 
 /// The versioning state a bucket carries once `PutBucketVersioning` has set one.
 ///
@@ -3340,6 +3486,22 @@ pub struct Bucket {
     ///
     /// Private, like `tags`, so the pair of accessors below is the only way in or out.
     ownership_controls: Option<Vec<String>>,
+    /// The bucket's EFFECTIVE `ObjectOwnership` setting, or `None` while nothing has
+    /// changed it from the one a bucket is created with.
+    ///
+    /// Distinct from [`Self::ownership_controls`], which is the `OwnershipControls`
+    /// SUBRESOURCE a reader reports: the two part company in exactly the case
+    /// `GetBucketOwnershipControls` describes, a bucket with no controls associated with it
+    /// at all. A freshly created bucket has none (so the read is not-found) and yet is
+    /// `BucketOwnerEnforced` — "by default, `ObjectOwnership` is set to
+    /// `BucketOwnerEnforced` and ACLs are disabled" — while a bucket whose controls were
+    /// DELETED has none and its ACLs affect permissions again. `None` here is the former:
+    /// [`DEFAULT_OBJECT_OWNERSHIP`], derived rather than stored so a create writes no copy
+    /// of the default.
+    ///
+    /// Private, like `ownership_controls`, so the accessor pair below is the only way in or
+    /// out.
+    object_ownership: Option<String>,
     /// The access control list `PutBucketAcl` last set on the bucket — one entry per
     /// `Grant` of the `AccessControlPolicy` it applied, in the order that ACL names them
     /// — or `None` while no ACL has ever been set on it.
@@ -3706,6 +3868,11 @@ impl Bucket {
     /// carries the complete `OwnershipControls` container as its payload, so what the
     /// request names becomes the bucket's controls in full.
     pub fn set_ownership_controls(&mut self, rules: Vec<String>) {
+        // The rules the container names are what the bucket's effective setting becomes:
+        // the LAST one wins, the way a later rule in one document overrides an earlier one.
+        if let Some(last) = rules.last() {
+            self.object_ownership = Some(last.clone());
+        }
         self.ownership_controls = Some(rules);
     }
 
@@ -3716,12 +3883,35 @@ impl Bucket {
     /// `GetBucketOwnershipControls` reports no ownership controls again
     /// ([`OWNERSHIP_CONTROLS_NOT_FOUND_CODE`]). Scoped to this one bucket's controls:
     /// nothing else on the record is touched.
+    ///
+    /// A bucket with no `OwnershipControls` is one whose ACLs are ENABLED, so the
+    /// effective setting becomes [`OBJECT_WRITER`] rather than the
+    /// [`DEFAULT_OBJECT_OWNERSHIP`] a create derives: that default belongs to the create,
+    /// and withdrawing the controls is the documented way back to ACLs that affect
+    /// permissions.
     pub fn clear_ownership_controls(&mut self) {
         self.ownership_controls = None;
+        self.object_ownership = Some(OBJECT_WRITER.to_string());
     }
 
-    /// Whether ACLs are DISABLED on the bucket, i.e. its ownership controls name
-    /// [`BUCKET_OWNER_ENFORCED`].
+    /// The bucket's effective `ObjectOwnership` setting: what nothing has changed it from
+    /// is [`DEFAULT_OBJECT_OWNERSHIP`].
+    pub fn object_ownership(&self) -> &str {
+        self.object_ownership
+            .as_deref()
+            .unwrap_or(DEFAULT_OBJECT_OWNERSHIP)
+    }
+
+    /// Set the bucket's effective `ObjectOwnership` setting — what `CreateBucket`'s
+    /// `x-amz-object-ownership` header names, and what the last rule of a
+    /// `PutBucketOwnershipControls` payload applies.
+    pub fn set_object_ownership(&mut self, ownership: &str) {
+        self.object_ownership = Some(ownership.to_string());
+    }
+
+    /// Whether ACLs are DISABLED on the bucket, i.e. its effective `ObjectOwnership`
+    /// setting is [`BUCKET_OWNER_ENFORCED`] — which is what a bucket is CREATED with
+    /// unless the create or a later `PutBucketOwnershipControls` names another value.
     ///
     /// "If your bucket uses the bucket owner enforced setting for S3 Object Ownership,
     /// ACLs are disabled and no longer affect permissions" (`PutBucketAcl`'s own
@@ -3729,9 +3919,7 @@ impl Bucket {
     /// [`ACL_NOT_SUPPORTED_CODE`], while a request to READ one still answers — with the
     /// bucket-owner-full-control ACL, which is [`default_acl_grants`].
     pub fn acls_disabled(&self) -> bool {
-        self.ownership_controls
-            .as_deref()
-            .is_some_and(|rules| rules.iter().any(|rule| rule == BUCKET_OWNER_ENFORCED))
+        self.object_ownership() == BUCKET_OWNER_ENFORCED
     }
 
     /// The grants of the bucket's access control list: the ACL last set on it, or the
@@ -3747,6 +3935,17 @@ impl Bucket {
             Some(grants) if !self.acls_disabled() => grants.to_vec(),
             _ => default_acl_grants(),
         }
+    }
+
+    /// The grants a `PutBucketAcl` (or the create's canned ACL) last set on the bucket,
+    /// or `None` when none ever was — the raw record, NOT what a reader reports.
+    ///
+    /// [`Self::acl_grants`] reports the default for a bucket whose ACLs are disabled,
+    /// because that is what `GetBucketAcl` answers; this is what the bucket actually
+    /// carries, which is what decides whether switching Object Ownership to
+    /// [`BUCKET_OWNER_ENFORCED`] would disable an ACL that still grants something.
+    pub fn stored_acl_grants(&self) -> Option<&[AclGrant]> {
+        self.acl.as_deref()
     }
 
     /// Associate `grants` with the bucket as its whole access control list.
@@ -5890,6 +6089,34 @@ pub const NO_SUCH_VERSION_CODE: &str = "NoSuchVersion";
 /// See [`NO_SUCH_VERSION_CODE`].
 pub const NO_SUCH_VERSION_MESSAGE: &str =
     "The specified version does not exist.";
+
+/// How many characters a minted version id carries ([`mint_version_id`]): 24 digest bytes
+/// Base64 encoded without padding.
+const VERSION_ID_CHARS: usize = 32;
+
+/// Whether `version_id` is SHAPED like a version id this service can have minted.
+///
+/// A `versionId` is one of exactly two things: the literal [`NULL_VERSION_ID`], which
+/// names the version a write made while the bucket had no versioning state, or a token of
+/// the form [`mint_version_id`] produces — [`VERSION_ID_CHARS`] characters of the URL-safe
+/// Base64 alphabet. Anything else cannot name a version of any object in any bucket, so it
+/// is a malformed ARGUMENT rather than an absent version: S3 answers the former
+/// [`INVALID_ARGUMENT_CODE`] with HTTP 400 and reserves [`NO_SUCH_VERSION_CODE`] with HTTP
+/// 404 for a well-formed id that names no stored version. Checked by every operation that
+/// takes a `versionId`, so one id is well-formed or malformed everywhere.
+pub fn version_id_is_well_formed(version_id: &str) -> bool {
+    if version_id == NULL_VERSION_ID {
+        return true;
+    }
+    version_id.chars().count() == VERSION_ID_CHARS
+        && version_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
+}
+
+/// The `<Message>` S3 sends with [`INVALID_ARGUMENT_CODE`] for a `versionId` that is not
+/// shaped like a version id ([`version_id_is_well_formed`]).
+pub const INVALID_VERSION_ID_MESSAGE: &str = "Invalid version id specified";
 /// The code S3 answers a `DeleteBucket` of a bucket that still holds something, with HTTP
 /// 409 Conflict: "All objects (including all object versions and delete markers) in the
 /// bucket must be deleted before the bucket itself can be deleted" (`DeleteBucket`'s own
@@ -5973,6 +6200,56 @@ pub const MALFORMED_XML_CODE: &str = "MalformedXML";
 pub const MALFORMED_XML_MESSAGE: &str =
     "The XML you provided was not well-formed or did not validate against our published \
      schema";
+
+/// The first character of `document` that the XML 1.0 character set does not allow, or
+/// `None` when every one of them is a `Char`.
+///
+/// XML 1.0 defines the characters a document may contain as
+/// `#x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]` (W3C XML 1.0,
+/// §2.2 "Characters"), so a C0 control other than tab, line feed and carriage return — and
+/// the two non-characters `#xFFFE`/`#xFFFF` — cannot appear in one at all. A request
+/// document carrying one is not well-formed XML whatever it otherwise says, which is
+/// [`MALFORMED_XML_CODE`]. Surrogates are unrepresentable in a Rust `str`, so there is
+/// nothing to check for them.
+pub fn first_forbidden_xml_char(document: &str) -> Option<char> {
+    document.chars().find(|character| {
+        matches!(character, '\u{0}'..='\u{8}' | '\u{b}' | '\u{c}' | '\u{e}'..='\u{1f}')
+            || matches!(character, '\u{fffe}' | '\u{ffff}')
+    })
+}
+
+/// The `Content-Type` an object is stored with when the write that created it named none.
+///
+/// S3 never infers a type from the key: an object put with no `Content-Type` is stored and
+/// reported as `binary/octet-stream` (the default `Content-Type` the Amazon S3 User Guide
+/// documents for an upload that specifies none), so a later `GetObject` or `HeadObject`
+/// reports exactly that rather than a type the caller never sent.
+pub const DEFAULT_CONTENT_TYPE: &str = "binary/octet-stream";
+
+/// The code S3 answers a `CreateBucket` whose location constraint cannot be served by the
+/// endpoint the request was sent to: "IllegalLocationConstraintException - The specified
+/// location-constraint is not valid", HTTP 400 (Amazon S3 "Error responses", list of error
+/// codes).
+pub const ILLEGAL_LOCATION_CONSTRAINT_CODE: &str = "IllegalLocationConstraintException";
+/// See [`ILLEGAL_LOCATION_CONSTRAINT_CODE`] — the wording S3 uses for a create that names
+/// NO constraint on an endpoint that is not the one the unspecified constraint means.
+pub const UNSPECIFIED_LOCATION_CONSTRAINT_MESSAGE: &str =
+    "The unspecified location constraint is incompatible for the region specific endpoint \
+     this request was sent to.";
+
+/// The Region the request was signed for: the third field of its SigV4 credential scope,
+/// which is the endpoint a client addressed this emulator as.
+///
+/// The parsing lives in `emulator_server::sigv4_credential_scope`, the one place this
+/// whole emulator reads a credential scope, so no service re-splits the header. A request
+/// carrying no parseable scope is read as the Region the unspecified location constraint
+/// means ([`DEFAULT_BUCKET_REGION`]), which is the endpoint a client that named none
+/// reached.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| DEFAULT_BUCKET_REGION.to_string())
+}
 
 /// The ABAC status a general purpose bucket carries until a `PutBucketAbac` sets one.
 ///

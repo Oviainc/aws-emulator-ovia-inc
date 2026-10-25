@@ -349,6 +349,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // code this model carries no shape for, so it goes out through the unmodelled
         // channel rather than as a success that deleted nothing.
         if let Some(version_id) = input.version_id.as_deref() {
+            // A `versionId` that is not SHAPED like one cannot name a version of anything,
+            // so it is a malformed argument rather than an absent version:
+            // `InvalidArgument` with HTTP 400, which leaves `NoSuchVersion` for a
+            // well-formed id the bucket holds no version for.
+            if !crate::state::version_id_is_well_formed(version_id) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    crate::state::INVALID_VERSION_ID_MESSAGE,
+                ));
+            }
             // "Indicates whether the specified object version that was permanently deleted
             // was (true) or was not (false) a delete marker before deletion"
             // (`DeleteObjectOutput$DeleteMarker`) — read off the stored version BEFORE it

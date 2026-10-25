@@ -259,14 +259,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // current tags exactly as they were, and against the OBJECT's own published
         // limits — "Amazon S3 limits the maximum number of tags to 10 tags per object"
         // (this operation's own documentation), with the key and value character bounds
-        // every tag set shares. AWS refuses these with `InvalidTag`, a code this
-        // service's model does not declare as a shape and so cannot render, so the
-        // refusal goes out through the framework's 400 `ValidationException` channel —
-        // the same channel `PutBucketTagging` uses for a bucket's tag set.
+        // every tag set shares. The wire code is the rejection's own
+        // ([`crate::state::TagSetRejection::code`]): a set carrying more tags than the
+        // object may hold is `BadRequest`, and a tag that does not pass input validation
+        // is `InvalidTag`. Neither is a shape in this model, so both go out through the
+        // unmodelled channel carrying the code a client branches on.
         if let Err(rejection) =
             crate::state::validate_tag_set(&tags, crate::state::OBJECT_TAG_SET_LIMITS)
         {
-            return Err(crate::scaffolded::Scaffolded::validation(
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                rejection.code(),
+                crate::state::TAG_REJECTION_STATUS,
                 rejection.to_string(),
             ));
         }

@@ -1113,6 +1113,63 @@ pub fn check_authorization_arns(
     ])
 }
 
+// ---------------------------------------------------------------------------
+// What the log-subscription member has to NAME
+//
+// `EgressAccessLogs$LogGroupName` ("Customize the log group name.") is an instruction to
+// WRITE a packaging group's egress access logs INTO that CloudWatch Logs log group, so the
+// value has to be a name CloudWatch Logs can actually hold: the empty string, a name past
+// CloudWatch's ceiling and a name carrying a character outside its set each name no group
+// this service could ever write to. Such a request is refused with
+// `UnprocessableEntityException` (422, keyed by the member) before anything is stored,
+// instead of being kept and reported by every later read as a live log subscription that
+// collects nothing.
+//
+// The model targets the member at the bare `__string` and publishes no `@length` or
+// `@pattern` (`smithy_query(query="shape",shape="EgressAccessLogs")` reports the single
+// `LogGroupName` member, `jsonName: logGroupName`), so the framework's constraint walk
+// cannot refuse any of it. What CloudWatch Logs can hold is the SHARED reading
+// ([`::service_common::cloudwatch_logs`]), so this service and every other that binds a
+// log group name judge a name against one rule; what lives here is which of this model's
+// members name a log group, and the envelope the refusal travels in.
+// ---------------------------------------------------------------------------
+
+/// What CloudWatch Logs can hold, read from the SHARED rule rather than copied here: the
+/// two published bounds, the predicate over a whole name, and the one sentence a refusal
+/// states. Re-exported rather than wrapped, so this service's own suites read the bounds
+/// off `state` while the rule itself has exactly one definition.
+pub use ::service_common::cloudwatch_logs::{
+    is_log_group_name, log_group_name_requirement, MAX_LOG_GROUP_NAME_CHARS,
+    MIN_LOG_GROUP_NAME_CHARS,
+};
+
+/// The wire path of the egress access-log group member, which its refusal is keyed by
+/// (`EgressAccessLogs` arrives as `@jsonName("egressAccessLogs")` and carries
+/// `LogGroupName` as `@jsonName("logGroupName")`).
+pub const EGRESS_LOG_GROUP_MEMBER: &str = "egressAccessLogs.logGroupName";
+
+/// Refuse a log-subscription block that names a log group CloudWatch Logs could not hold.
+///
+/// Every operation that ACCEPTS the block judges it the same way — `CreatePackagingGroup`
+/// and `ConfigureLogs` are the two this model binds it on — and the judgement happens
+/// before anything is written, so a refused request leaves the addressed group's
+/// subscription exactly as it was. A block that carries no `LogGroupName` names no group
+/// and so violates nothing: it leaves the group unsubscribed.
+pub fn check_egress_access_logs(
+    logs: Option<&EgressAccessLogs>,
+) -> Result<(), crate::scaffolded::UnprocessableEntity> {
+    let Some(name) = logs.and_then(|logs| logs.log_group_name.as_deref()) else {
+        return Ok(());
+    };
+    if is_log_group_name(name) {
+        return Ok(());
+    }
+    Err(crate::scaffolded::UnprocessableEntity::member(
+        EGRESS_LOG_GROUP_MEMBER,
+        log_group_name_requirement(),
+    ))
+}
+
 /// Read the `SpekeKeyProvider$RoleArn` of whichever package block a
 /// `CreatePackagingConfiguration` request carries an `Encryption` block in.
 ///

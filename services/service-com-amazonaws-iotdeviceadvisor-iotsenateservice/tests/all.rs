@@ -23,6 +23,9 @@ mod device_identity_validation;
 #[path = "all/endpoint.rs"]
 mod endpoint;
 
+#[path = "all/parallel_runs.rs"]
+mod parallel_runs;
+
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 

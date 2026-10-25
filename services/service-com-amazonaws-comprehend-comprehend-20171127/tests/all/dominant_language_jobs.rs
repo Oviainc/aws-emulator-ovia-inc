@@ -35,7 +35,9 @@ use service_com_amazonaws_comprehend_comprehend_20171127::state::{
     JOB_ALREADY_TERMINAL_MESSAGE, JOB_NOT_FOUND_MESSAGE, TERMINAL_JOB_STATUSES,
 };
 
-use crate::comprehend_client::{error_code, error_message, Comprehend, ACCOUNT_ID, REGION};
+use crate::comprehend_client::{
+    create_bucket_payload, error_code, error_message, Comprehend, ACCOUNT_ID, REGION,
+};
 use crate::sync_inference::DOCUMENTS;
 
 /// The bucket every suite writes its input documents to.
@@ -185,7 +187,9 @@ impl RunCase {
 
 /// Create `BUCKET`, so the job's reads and writes have somewhere to go.
 async fn create_bucket(comprehend: &Comprehend) {
-    let (status, body) = comprehend.s3("PUT", &format!("/{BUCKET}"), b"").await;
+    let (status, body) = comprehend
+        .s3("PUT", &format!("/{BUCKET}"), create_bucket_payload().as_bytes())
+        .await;
     assert_eq!(
         status,
         200,
