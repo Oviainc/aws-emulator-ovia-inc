@@ -25,6 +25,8 @@ mod entity_reads;
 mod entity_type_projections;
 #[path = "all/request_validation.rs"]
 mod request_validation;
+#[path = "all/reserved_tag_keys.rs"]
+mod reserved_tag_keys;
 #[path = "all/resource_policy_and_tagging.rs"]
 mod resource_policy_and_tagging;
 #[path = "all/resource_policy_lifecycle.rs"]
