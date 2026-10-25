@@ -29,6 +29,8 @@ mod identity_sources;
 mod inactive_team_version_deletion;
 #[path = "all/management_account_gate_order.rs"]
 mod management_account_gate_order;
+#[path = "all/pending_team_update.rs"]
+mod pending_team_update;
 #[path = "all/policy_catalog.rs"]
 mod policy_catalog;
 #[path = "all/policy_version_detail.rs"]

@@ -203,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // statuses), so a stopped job settles to STOPPED and never to the status its scan
         // would have reached.
         job.owe_only(
-            now + crate::state::TRANSITION_DELAY,
+            crate::state::due_at(now, crate::state::TRANSITION_DELAY),
             crate::state::STOPPED,
             None,
         );

@@ -47,6 +47,8 @@ mod organization_insight_listing;
 mod organization_overview;
 #[path = "all/organization_resource_collection_health.rs"]
 mod organization_resource_collection_health;
+#[path = "all/recommendations.rs"]
+mod recommendations;
 #[path = "all/resource_collection_health.rs"]
 mod resource_collection_health;
 #[path = "all/state_roundtrip.rs"]

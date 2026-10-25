@@ -195,19 +195,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
-        // `policyName` and `policyDocument` are documented "This parameter is
-        // required", but the model does not mark them required, so the boundary
-        // validator lets a request without them through to here.
-        let Some(policy_name) = input
-            .policy_name
-            .as_deref()
-            .filter(|name| !name.trim().is_empty())
-        else {
-            return Err(invalid("policyName is required"));
-        };
+        // `policyDocument` is documented "This parameter is required", but the model
+        // does not mark it required, so the boundary validator lets a request without it
+        // through to here. Every scope needs the document: it IS the policy.
         let Some(policy_document) = input.policy_document.as_deref() else {
             return Err(invalid("policyDocument is required"));
         };
+        // The name is the whole identity of an account-scoped policy, so that scope
+        // requires it (below); a policy scoped to a `resourceArn` is identified by the
+        // resource it attaches to, so a name there is optional and only reported back.
+        // A blank name identifies nothing, so it counts as a name the request omitted.
+        let policy_name = input
+            .policy_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty());
         // "This is formatted as a JSON string": a document that is not a JSON object is
         // not a policy document.
         if !::serde_json::from_str::<::serde_json::Value>(policy_document)
@@ -288,7 +289,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // so the next update must present this one.
                 let revision_id = crate::state::mint_revision_id(store.take_policy_revision());
                 let record = crate::state::ResourcePolicyRecord {
-                    policy_name: policy_name.to_string(),
+                    policy_name: policy_name.map(str::to_string),
                     policy_document: policy_document.to_string(),
                     last_updated_time_ms: now,
                     // The ARN as the log group reports it, so a request naming the
@@ -304,6 +305,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // Account-scoped: keyed by `policyName`, and the account holds at most ten.
             None => {
+                // With no resource to attach to, the name is the only identity the
+                // policy has — it is the key this scope is stored and found under.
+                let Some(policy_name) = policy_name else {
+                    return Err(invalid("policyName is required"));
+                };
                 // The revision guard serializes updates of ONE resource's policy;
                 // without a resource there is nothing for it to guard.
                 if input.expected_revision_id.is_some() {
@@ -328,7 +334,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into());
                 }
                 let record = crate::state::ResourcePolicyRecord {
-                    policy_name: policy_name.to_string(),
+                    policy_name: Some(policy_name.to_string()),
                     policy_document: policy_document.to_string(),
                     last_updated_time_ms: now,
                     resource_arn: None,
@@ -346,7 +352,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // policies that carry a revision.
             revision_id: record.revision_id.clone(),
             resource_policy: Some(ResourcePolicy {
-                policy_name: Some(record.policy_name.clone()),
+                // Echoed only when the request named the policy: this operation reports
+                // what it stored and mints no name of its own.
+                policy_name: record.policy_name.clone(),
                 policy_document: Some(record.policy_document.clone()),
                 last_updated_time: Some(record.last_updated_time_ms),
                 policy_scope: Some(record.policy_scope().to_string()),
