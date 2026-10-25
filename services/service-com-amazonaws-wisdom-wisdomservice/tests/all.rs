@@ -27,3 +27,5 @@ mod session_recommendations;
 mod shared_signing_name_routing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_resource.rs"]
+mod tag_resource;
