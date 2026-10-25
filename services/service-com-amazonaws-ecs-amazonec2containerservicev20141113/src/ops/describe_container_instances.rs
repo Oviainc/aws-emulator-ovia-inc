@@ -213,7 +213,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             match guard.resolve_container_instance(&region, &cluster_name, reference) {
                 Some(instance) => container_instances.push(instance.view(fields)),
-                None => failures.push(crate::state::missing_failure(&arn)),
+                // A `containerInstances` entry that resolves to no registered instance
+                // is reported under the identifier the request sent, NOT under the
+                // cluster-qualified ARN a registered instance of that id would carry.
+                None => failures.push(crate::state::unresolved_failure(
+                    &region,
+                    crate::state::CONTAINER_INSTANCE_RESOURCE_TYPE,
+                    reference,
+                )),
             }
         }
 

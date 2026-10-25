@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use crate::medical_vocabularies::is_absent;
 use crate::transcription_jobs::{dispatch, Reply, Transcribe};
 
 /// Long enough for the `PENDING -> READY` transition of a vocabulary created during
@@ -156,11 +157,14 @@ async fn a_created_vocabulary_is_pending_then_ready_and_reads_back() {
             "case {case:?}: reading a vocabulary must not finish its processing, got {:?}",
             read.body
         );
-        let download_uri = read.member(case, "DownloadUri");
+        // The reported location is that of the BUILT vocabulary, and this one is
+        // still being processed, so there is nothing to download yet
+        // (`crate::vocabulary_download_uri_state` spans the rule).
         assert!(
-            download_uri.starts_with("https://") && download_uri.ends_with(&name),
-            "case {case:?}: DownloadUri must name this vocabulary's own location, got \
-             {download_uri:?}"
+            is_absent(&read, "DownloadUri"),
+            "case {case:?}: a vocabulary still being processed has nothing built to \
+             download, got {:?}",
+            read.body
         );
         if let Some(role) = request.get("DataAccessRoleArn").and_then(Value::as_str) {
             assert_eq!(
@@ -186,6 +190,12 @@ async fn a_created_vocabulary_is_pending_then_ready_and_reads_back() {
             "case {case:?}: the vocabulary must be READY once its processing fell due, \
              got {:?}",
             read.body
+        );
+        let download_uri = read.member(case, "DownloadUri");
+        assert!(
+            download_uri.starts_with("https://") && download_uri.ends_with(&name),
+            "case {case:?}: a built vocabulary's DownloadUri must name its own \
+             location, got {download_uri:?}"
         );
     }
 }

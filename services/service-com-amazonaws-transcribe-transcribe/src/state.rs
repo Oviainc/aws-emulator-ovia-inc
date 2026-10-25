@@ -70,7 +70,12 @@
 //! exactly the same (see [`MedicalVocabularyRecord`]). Either way this emulator reads
 //! no object store and makes no outbound request, so it has nothing to build a
 //! vocabulary's terms from and never reports a vocabulary built from a file as
-//! `READY`. A vocabulary FILTER whose words would have come from such a file is
+//! `READY`. The `DownloadUri` is where the BUILT vocabulary is stored, so only a
+//! vocabulary whose build has FINISHED reports one: it is absent while the service is
+//! still processing the terms (`PENDING`) and absent after a build that failed, in
+//! both families alike ([`VocabularyRecord::download_uri`],
+//! [`MedicalVocabularyRecord::download_uri`]). A vocabulary FILTER whose words would
+//! have come from such a file is
 //! RECORDED the same way ([`VocabularyFilterRecord`]), and that is all there is to
 //! report for it: the filter family models no processing state and no operation of it
 //! reports a filter's words, so the only thing a filter nothing read a file for does
@@ -1778,14 +1783,21 @@ impl VocabularyRecord {
         }
     }
 
-    /// Where this vocabulary's own file is reported to live, for one this service
-    /// built from the terms the request listed — and `None` for one whose terms would
-    /// have come from a file, which nothing read: a vocabulary no terms were loaded
-    /// for has no file to download, exactly as in the medical family
+    /// Where this vocabulary's own file is reported to live, for one this service has
+    /// FINISHED building — and `None` for every other record.
+    ///
+    /// The reported location is that of the BUILT vocabulary, so it exists only once
+    /// the build that produces it has completed successfully: [`VOCABULARY_STATE_READY`]
+    /// is the state the model gives that outcome, and while a build is still
+    /// [`VOCABULARY_STATE_PENDING`] — or after it ended
+    /// [`VOCABULARY_STATE_FAILED`] — there is nothing built to download and the member
+    /// is absent. That one condition also covers where the terms were to come from:
+    /// a vocabulary whose terms would have had to be READ from a file never reaches
+    /// `READY` ([`Self::advance_clock`]), because nothing loaded them. The medical
+    /// family gates the same member on the same state
     /// ([`MedicalVocabularyRecord::download_uri`]). See [`vocabulary_download_uri`].
     pub fn download_uri(&self) -> Option<String> {
-        self.file_uri
-            .is_none()
+        (self.state == VOCABULARY_STATE_READY)
             .then(|| vocabulary_download_uri(RESOURCE_TYPE_VOCABULARY, &self.name, &self.region))
     }
 }

@@ -195,6 +195,9 @@ mod ipam_byoasn_associations;
 mod interruptible_capacity_reservation_allocations;
 #[path = "all/ipam_lifecycle.rs"]
 mod ipam_lifecycle;
+// Deleting the association between an IPAM and a Regional Internet Registry.
+#[path = "all/ipam_internet_registry_associations.rs"]
+mod ipam_internet_registry_associations;
 #[path = "all/ipam_policies.rs"]
 mod ipam_policies;
 #[path = "all/ipam_pools.rs"]
