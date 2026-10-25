@@ -21,6 +21,8 @@ mod activity_heartbeats;
 mod activity_lifecycle;
 #[path = "all/activity_tasks.rs"]
 mod activity_tasks;
+#[path = "all/alias_order_and_redrive_context.rs"]
+mod alias_order_and_redrive_context;
 #[path = "all/arn_validation.rs"]
 mod arn_validation;
 #[path = "all/client_error_wrappers.rs"]

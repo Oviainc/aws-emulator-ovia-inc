@@ -33,6 +33,13 @@
 //!
 //! An `entityId` that is already taken in the workspace is a `ConflictException`.
 //!
+//! A create that would store more components, composite components, properties
+//! or property groups on one entity than this emulator's declared ceilings
+//! allow is refused with the modelled `ServiceQuotaExceededException` and
+//! nothing is stored (`crate::state::entity_contents_over_ceiling`, the
+//! ceiling rule `UpdateEntity` applies to the record it patches), beside the
+//! per-workspace entity ceiling below.
+//!
 //! Two deliberate gaps: a `componentTypeId` the workspace does not hold at all
 //! is still stored without being refused (the real service refuses an unknown
 //! one, but a real workspace carries more built-in component types than this
@@ -361,6 +368,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let resolved = crate::state::resolve_composite_component_path(
                 &component_records,
                 &workspace.component_types,
+                "compositeComponents",
                 &component_path,
             )
             .map_err(|message| {
@@ -417,8 +425,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // no provisioning window to emulate — recorded traffic reads a
             // just-created entity back as ACTIVE.
             state: crate::state::STATE_ACTIVE.to_string(),
+            // No transition is owed: the state above is terminal, so the
+            // instant one would fall due is this call's own. An UPDATE is what
+            // opens a window (`crate::state::Entity::begin_update`).
+            settles_at: now,
         };
         let created_state = entity.state.clone();
+
+        // The emulator's declared ceilings on ONE entity's contents
+        // (`crate::state::entity_contents_over_ceiling`), applied to the record
+        // this create is about to store, so the components and properties a
+        // single call carries are bounded exactly as `UpdateEntity`'s are.
+        if let Some(message) = crate::state::entity_contents_over_ceiling(&entity) {
+            return Err(CreateEntityErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         // Store the entity BEFORE indexing its ARN, so the index can never name
         // an entity that was not stored: the workspace is re-borrowed mutably
@@ -527,13 +552,9 @@ fn property_group_records(
 /// Why a component naming `component_type_id` cannot be created — `None` when
 /// it can.
 ///
-/// The component type is resolved in the WORKSPACE's own registry, which holds
-/// both the component types a caller created and the built-ins the workspace
-/// was provisioned with, and the refusal is the one an ABSTRACT type earns
-/// ([`crate::state::component_type_is_abstract`] decides which types those
-/// are). An id the workspace does not hold is left alone — see this module's
-/// deliberate gaps — and a component that names no component type instantiates
-/// nothing and so has nothing to resolve.
+/// The rule itself is [`crate::state::abstract_component_type_violation`],
+/// which every writer of an entity's components shares; this lifts the message
+/// it produces into the refusal THIS operation answers with.
 ///
 /// Shared by the top-level components and the composite ones, so one rule is
 /// applied once to every component a create writes.
@@ -541,13 +562,9 @@ fn abstract_component_type_refusal(
     workspace: &crate::state::Workspace,
     component_type_id: Option<&str>,
 ) -> Option<CreateEntityErrorModeled> {
-    let component_type_id = component_type_id?;
-    let component_type = workspace.component_types.get(component_type_id)?;
-    component_type.is_abstract.then(|| {
+    crate::state::abstract_component_type_violation(workspace, component_type_id).map(|message| {
         CreateEntityErrorModeled::ValidationException(ValidationException {
-            message: Some(crate::state::abstract_component_type_message(
-                component_type_id,
-            )),
+            message: Some(message),
         })
     })
 }

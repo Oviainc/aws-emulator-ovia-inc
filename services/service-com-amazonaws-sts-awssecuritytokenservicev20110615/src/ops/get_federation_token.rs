@@ -253,8 +253,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            duplicate_tag_key, packed_policy_size, policy_document_error, sts_arn, Identity,
-            NewSession, SessionKind, VENDED_SESSION_DEFAULT_DURATION_SECONDS,
+            caller_may_call, duplicate_tag_key, long_term_identity, packed_policy_size,
+            policy_document_error, resolve_request_caller, sts_arn, Identity, NewSession,
+            SessionKind, MAX_MANAGED_SESSION_POLICIES, VENDED_SESSION_DEFAULT_DURATION_SECONDS,
         };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -279,15 +280,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if let Some(duplicate) = duplicate_tag_key(input.tags.as_deref()) {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Tags carries the session tag key '{duplicate}' more than once"
+        if duplicate_tag_key(input.tags.as_deref()).is_some() {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                "Duplicate tag keys found. Please note that Tag keys are case insensitive.",
+            ));
+        }
+
+        // The model's own constraints on a session tag's key and value, which sit on
+        // members nested inside `tagListType` and so are checked here; see
+        // `invalid_session_tag`.
+        if let Some(violated) = crate::state::invalid_session_tag(input.tags.as_deref()) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(violated));
+        }
+
+        let named_policy_arns = crate::state::policy_arns(input.policy_arns.as_deref());
+        if named_policy_arns.len() > MAX_MANAGED_SESSION_POLICIES {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "1 validation error detected: Value '[{}]' at 'policyArns' failed to satisfy \
+                 constraint: Member must have length less than or equal to \
+                 {MAX_MANAGED_SESSION_POLICIES}",
+                named_policy_arns.join(", ")
             )));
         }
 
         let packed_policy = packed_policy_size(
             input.policy.as_deref(),
-            &crate::state::policy_arns(input.policy_arns.as_deref()),
+            &named_policy_arns,
             input.tags.as_deref().unwrap_or(&[]),
         );
         if let Some(percent) = packed_policy.filter(|percent| *percent > 100) {
@@ -303,13 +321,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+        // The identity a long-term key speaks for comes from the IAM store, read before
+        // the session lock is taken so the two are never held at once.
+        let long_term = {
+            let iam = crate::state::iam_state(&*self.engine);
+            match iam.as_ref() {
+                Some(iam) => long_term_identity(Some(&iam.lock()), &access_key_id),
+                None => long_term_identity(None, &access_key_id),
+            }
+        };
         let mut registry = state.lock();
-        let caller = crate::state::resolve_caller(&mut registry, &access_key_id, now, store)
+        let caller = resolve_request_caller(&mut registry, &access_key_id, now, store, long_term)
             .map_err(|expired| {
                 GetFederationTokenErrorModeled::ExpiredTokenException(ExpiredTokenException {
                     message: Some(expired.message()),
                 })
             })?;
+
+        // This operation must be called "using the long-term security credentials of an
+        // IAM user" (this operation's documentation), so a temporary credential of any
+        // class is refused; see `caller_may_call`.
+        if !caller_may_call(caller.kind, Self::NAME) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                crate::state::session_credentials_message(Self::NAME),
+            ));
+        }
+        let caller = caller.identity;
 
         // The federated user lives in the calling identity's account, and is named by
         // the request: `<account>:<Name>` and `arn:aws:sts::<account>:federated-user/<Name>`.
