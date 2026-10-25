@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMultipartUploads
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMultipartUploads`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMultipartUploads::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this is the read-back for the multipart uploads ONE BUCKET has in
+//! progress — it reports the uploads `CreateMultipartUpload` recorded in this service's
+//! state ([`crate::state::MultipartUpload`]), in key order and, within one key, in
+//! upload-id order, filtered by `prefix`, rolled up by `delimiter` and paged by
+//! `max-uploads` from the position `key-marker`/`upload-id-marker` names, and refuses a
+//! bucket this emulator does not hold with `NoSuchBucket`.
 //!
 //! ## Shape of an operation
 //!
@@ -203,14 +200,22 @@ use super::types::*;
 // `ListMultipartUploadsError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `ListMultipartUploadsError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#ListMultipartUploads")]
+// The operation's MODELED errors, widened by `NoSuchBucket`.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="ListMultipartUploads")` reports `errors: []`),
+// but `Bucket` is an @httpLabel, so a request can name a bucket that does not exist and
+// AWS answers the service-wide `NoSuchBucket` ("The specified bucket does not exist",
+// `httpError 404`). `extra_errors` widens the set with that shape, which the SERVICE
+// models, so this handler answers the same 404 every other bucket-scoped listing does
+// rather than reporting an empty page for a bucket nothing created.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#ListMultipartUploads",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum ListMultipartUploadsErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -264,18 +269,312 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMultipartUploads` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMultipartUploadsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMultipartUploads"))
+        // A listing needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+
+        // `RequestPayer` confirms a Requester Pays charge nothing here makes, so a request
+        // asking for it keeps the 501 rather than being answered as if it had been
+        // honoured — exactly as `ListParts` and `ListObjectVersions` refuse the same
+        // member. `encoding-type` IS served (below): it decides how the key-name elements
+        // of this response are written rather than which uploads it reports.
+        if input.request_payer.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListMultipartUploads with x-amz-request-payer",
+            ));
+        }
+
+        // "The account ID of the expected bucket owner. If the account ID that you provide
+        // does not match the actual owner of the bucket, the request fails with the HTTP
+        // status code 403 Forbidden (access denied)"
+        // (`ListMultipartUploadsRequest$ExpectedBucketOwner`), judged the way every other
+        // bucket-scoped operation here judges it: this emulator serves one account, so that
+        // account owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                403,
+                "Access Denied",
+            ));
+        }
+
+        // `encoding-type` names the ONE value the model's `EncodingType` enum declares
+        // (`url`), and the boundary refuses anything else before this handler runs; this
+        // guard is what keeps a listing from answering 200 with its keys written verbatim
+        // while echoing back an encoding it did not apply.
+        if input
+            .encoding_type
+            .as_deref()
+            .is_some_and(|requested| requested != crate::state::ENCODING_TYPE_URL)
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_ARGUMENT_CODE,
+                crate::state::INVALID_ARGUMENT_STATUS,
+                "Invalid Encoding Method specified in Request",
+            ));
+        }
+
+        // "Sets the maximum number of multipart uploads, from 1 to 1,000, to return in the
+        // response body" (`ListMultipartUploadsRequest$MaxUploads`), bounded by what one
+        // page may carry: "The ListMultipartUploads operation returns a maximum of 1,000
+        // multipart uploads in the response. The limit of 1,000 multipart uploads is also
+        // the default value" (this operation's own documentation). A negative value is not
+        // a count at all, which is `InvalidArgument` (400) — the code every other listing
+        // here answers an out-of-range page size with.
+        let max_uploads = match input.max_uploads {
+            Some(requested) if requested < 0 => {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    format!(
+                        "Argument max-uploads must be an integer between 0 and 2147483647: \
+                         {requested}"
+                    ),
+                ))
+            }
+            Some(requested) => requested.min(MAX_UPLOADS_PER_PAGE),
+            None => MAX_UPLOADS_PER_PAGE,
+        };
+        let page_limit = usize::try_from(max_uploads).unwrap_or(0);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INTERNAL_ERROR_CODE,
+                crate::state::INTERNAL_ERROR_STATUS,
+                "the shared S3 store is unreachable from this engine",
+            )
+        })?;
+        // Read-only: the guard is taken, the uploads in progress are copied out, and
+        // nothing is written — a later caller sees exactly what this one saw.
+        let store = state.lock();
+        let bucket = store
+            .bucket(&input.bucket)
+            .ok_or(ListMultipartUploadsErrorModeled::NoSuchBucket(
+                NoSuchBucket {},
+            ))?;
+
+        let prefix = input.prefix.clone().unwrap_or_default();
+        let delimiter = input.delimiter.clone().unwrap_or_default();
+
+        // The bucket keys its uploads by upload id, but a listing is paged by KEY first:
+        // the `key-marker` / `upload-id-marker` pair resumes at "the multipart upload after
+        // which listing should begin", keys lexicographically and then upload ids
+        // lexicographically within one key — so the entries are ordered by that pair before
+        // the page is cut.
+        let mut in_progress: Vec<(&str, &str, &crate::state::MultipartUpload)> = bucket
+            .multipart_uploads()
+            .iter()
+            .map(|(upload_id, upload)| (upload.key.as_str(), upload_id.as_str(), upload))
+            .collect();
+        in_progress.sort_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
+
+        let mut uploads: Vec<MultipartUpload> = Vec::new();
+        let mut common_prefixes: Vec<String> = Vec::new();
+        // The last entry this page reported, as `(key, upload id)` — `None` for a rolled-up
+        // common prefix, which is no upload and so has no id of its own — and whether
+        // anything was left unreported.
+        let mut last_entry: Option<(String, Option<String>)> = None;
+        let mut truncated = false;
+
+        // `max-uploads=0` asks for no entries at all, which is an empty page and NOT a
+        // truncated one — reporting it as truncated would hand a paginating client markers
+        // that make no progress — so the walk below is skipped entirely.
+        if page_limit > 0 {
+            for (key, upload_id, upload) in in_progress {
+                // "Lists in-progress uploads only for those keys that begin with the
+                // specified prefix" (`ListMultipartUploadsRequest$Prefix`).
+                if !key.starts_with(&prefix) {
+                    continue;
+                }
+                // "If upload-id-marker is not specified, only the keys lexicographically
+                // greater than the specified key-marker will be included in the list"
+                // (`ListMultipartUploadsRequest$KeyMarker`) — so a key BELOW the marker,
+                // and the marker's own key when no upload-id-marker narrows it, belong to
+                // an earlier page. "If key-marker is not specified, the upload-id-marker
+                // parameter is ignored", which is why only this arm consults it.
+                match input.key_marker.as_deref() {
+                    Some(marker) if key < marker => continue,
+                    Some(marker) if key == marker && input.upload_id_marker.is_none() => {
+                        continue
+                    }
+                    _ => {}
+                }
+
+                // "If you specify a delimiter in the request, then the result returns each
+                // distinct key prefix containing the delimiter in a CommonPrefixes element"
+                // (`ListMultipartUploadsOutput$CommonPrefixes`): a key whose remainder
+                // after the prefix contains the delimiter is reported as the prefix up to
+                // and including that delimiter, and every upload of such a key rolls into
+                // it rather than being reported on its own.
+                let rolled_up = if delimiter.is_empty() {
+                    None
+                } else {
+                    key[prefix.len()..]
+                        .find(delimiter.as_str())
+                        .map(|at| key[..prefix.len() + at + delimiter.len()].to_string())
+                };
+                if let Some(rolled_up) = rolled_up {
+                    // "The keys that are grouped under CommonPrefixes result element are
+                    // not returned elsewhere in the response": an upload under a prefix
+                    // already on this page consumes no further slot.
+                    if common_prefixes.last() == Some(&rolled_up) {
+                        continue;
+                    }
+                    // "CommonPrefixes is filtered out from results if it is not
+                    // lexicographically greater than the key-marker"
+                    // (`ListMultipartUploadsRequest$Delimiter`) — which is what keeps the
+                    // page after one that ended on a rolled-up prefix from reporting that
+                    // prefix, and the uploads under it, a second time.
+                    if input
+                        .key_marker
+                        .as_deref()
+                        .is_some_and(|marker| rolled_up.as_str() <= marker)
+                    {
+                        continue;
+                    }
+                    if uploads.len() + common_prefixes.len() >= page_limit {
+                        truncated = true;
+                        break;
+                    }
+                    last_entry = Some((rolled_up.clone(), None));
+                    common_prefixes.push(rolled_up);
+                    continue;
+                }
+
+                // "Any multipart uploads for a key equal to the key-marker might also be
+                // included, provided those multipart uploads have upload IDs
+                // lexicographically greater than the specified upload-id-marker"
+                // (`ListMultipartUploadsRequest$UploadIdMarker`) — within the marker's own
+                // key, the ids at or below the id marker are the previous page's.
+                if let (Some(marker), Some(id_marker)) = (
+                    input.key_marker.as_deref(),
+                    input.upload_id_marker.as_deref(),
+                ) {
+                    if key == marker && upload_id <= id_marker {
+                        continue;
+                    }
+                }
+
+                // One slot per entry, shared by Uploads and CommonPrefixes, because
+                // `max-uploads` bounds "the number of uploads in a response" and a
+                // rolled-up prefix stands for the uploads it hides. Out of slots means
+                // there is more to report: this page is truncated, and the markers below
+                // name the last entry it DID report, which is where the next one resumes
+                // from.
+                if uploads.len() + common_prefixes.len() >= page_limit {
+                    truncated = true;
+                    break;
+                }
+                last_entry = Some((key.to_string(), Some(upload_id.to_string())));
+                uploads.push(MultipartUpload {
+                    // The id the store minted for the upload and the key it was initiated
+                    // for: "Upload ID that identifies the multipart upload" and "Key of the
+                    // object for which the multipart upload was initiated".
+                    upload_id: Some(upload_id.to_string()),
+                    key: Some(key.to_string()),
+                    // "Date and time at which the multipart upload was initiated"
+                    // (`MultipartUpload$Initiated`) — the instant the initiation recorded,
+                    // which does not move while the upload is in progress.
+                    initiated: Some(::aws_smithy_types::DateTime::from(upload.initiated_at)),
+                    // "The class of storage used to store the object" and the checksum
+                    // configuration the upload was initiated with, read off the RECORDED
+                    // upload so a reader reports what the initiation settled rather than a
+                    // default.
+                    storage_class: Some(upload.storage_class.clone()),
+                    checksum_algorithm: upload.checksum_algorithm.clone(),
+                    checksum_type: upload.checksum_type.clone(),
+                    // "Specifies the owner of the object that is part of the multipart
+                    // upload" and "Identifies who initiated the multipart upload": this
+                    // emulator serves one account, so both are that account's canonical
+                    // user id — the id every S3 reader here reports an owner by, and the
+                    // same pair `ListParts` reports for one upload.
+                    owner: Some(Owner {
+                        id: Some(crate::state::canonical_user_id()),
+                        display_name: None,
+                    }),
+                    initiator: Some(Initiator {
+                        id: Some(crate::state::canonical_user_id()),
+                        display_name: None,
+                    }),
+                });
+            }
+        }
+
+        // "If there are more than 1,000 multipart uploads that satisfy your
+        // ListMultipartUploads request, the response returns an IsTruncated element with
+        // the value of true, a NextKeyMarker element, and a NextUploadIdMarker element. To
+        // list the remaining multipart uploads … Set the value of key-marker to the
+        // NextKeyMarker value from the previous response. Similarly, set the value of
+        // upload-id-marker to the NextUploadIdMarker value" — so the markers name the LAST
+        // entry this page reported, which is the position the next request resumes after.
+        // That pair is what makes paging lossless: every upload is reported exactly once,
+        // whatever the page size.
+        let (next_key_marker, next_upload_id_marker) = match (truncated, last_entry) {
+            (true, Some((key, upload_id))) => (Some(key), upload_id),
+            _ => (None, None),
+        };
+
+        // The key-name elements of this listing, encoded when the request asked for an
+        // encoding type: "returns encoded key name values in the following response
+        // elements: Delimiter, KeyMarker, Prefix, NextKeyMarker, Key"
+        // (`ListMultipartUploadsOutput$EncodingType`), and a rolled-up `CommonPrefixes`
+        // entry is a key name too. An upload ID is NOT a key name, so it is reported as
+        // minted.
+        let encode = |value: String| match input.encoding_type.as_deref() {
+            Some(crate::state::ENCODING_TYPE_URL) => crate::state::url_encoded_key(&value),
+            _ => value,
+        };
+
+        Ok(ListMultipartUploadsOutput {
+            // The address the uploads were recorded under (no access point is held here, so
+            // there is no ARN or alias to report instead).
+            bucket: Some(input.bucket.clone()),
+            prefix: input.prefix.clone().map(&encode),
+            delimiter: input.delimiter.clone().map(&encode),
+            // "Maximum number of multipart uploads that could have been included in the
+            // response" — the effective bound this page was computed under, not the raw
+            // request value.
+            max_uploads: Some(max_uploads),
+            // "The key at or after which the listing began" and its upload-id companion:
+            // the markers the request carried are echoed back.
+            key_marker: input.key_marker.clone().map(&encode),
+            upload_id_marker: input.upload_id_marker.clone(),
+            // Truncated exactly when an entry was left for the next page; the markers name
+            // the last entry reported here, which the next request resumes after.
+            is_truncated: Some(truncated),
+            next_key_marker: next_key_marker.map(&encode),
+            next_upload_id_marker,
+            uploads: (!uploads.is_empty()).then(|| {
+                uploads
+                    .into_iter()
+                    .map(|mut upload| {
+                        upload.key = upload.key.map(&encode);
+                        upload
+                    })
+                    .collect()
+            }),
+            common_prefixes: (!common_prefixes.is_empty()).then(|| {
+                common_prefixes
+                    .into_iter()
+                    .map(|prefix| CommonPrefix {
+                        prefix: Some(encode(prefix)),
+                    })
+                    .collect()
+            }),
+            // `EncodingType` is "included in the response" exactly when the request asked
+            // for one, which is when the elements above are encoded; `RequestCharged`
+            // reports a Requester Pays charge this emulator does not model.
+            encoding_type: input.encoding_type.clone(),
+            request_charged: None,
+        })
     }
 }
+
+/// The most uploads one page may carry: "The ListMultipartUploads operation returns a
+/// maximum of 1,000 multipart uploads in the response. The limit of 1,000 multipart
+/// uploads is also the default value" (`ListMultipartUploads`'s own documentation). A
+/// larger `max-uploads` is answered with this many.
+const MAX_UPLOADS_PER_PAGE: i32 = 1000;
