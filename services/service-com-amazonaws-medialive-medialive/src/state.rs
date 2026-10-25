@@ -152,7 +152,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AnywhereSettings, CdiInputSpecification, Channel, ChannelSummary,
+    AnywhereSettings, CdiInputSpecification, Channel, ChannelEgressEndpoint, ChannelSummary,
     DescribeAnywhereSettings, DescribeFollowerChannelSettings, DescribeInferenceSettings,
     DescribeLinkedChannelSettings, DescribeNetworkSummary, DescribePrimaryChannelSettings,
     EncoderSettings, EventBridgeRuleTemplateGroupSummary,
@@ -160,7 +160,8 @@ use crate::ops::types::{
     InputDestinationRoute, InputDeviceSettings, InputSecurityGroup, InputSource,
     InputSourceRequest, InputSpecification, InputVpcRequest, InputWhitelistRule,
     InputWhitelistRuleCidr, IpPool,
-    LinkedChannelSettings, MaintenanceStatus, MediaConnectFlow, MediaConnectFlowRequest,
+    LinkedChannelSettings, MaintenanceCreateSettings, MaintenanceStatus, MediaConnectFlow,
+    MediaConnectFlowRequest,
     MediaResource, MediaResourceNeighbor, MonitorDeployment, MulticastSettings,
     MulticastSettingsCreateRequest, MulticastSource, OutputDestination, PipelineDetail,
     Route,
@@ -647,14 +648,15 @@ fn push_ingest_protocol(input_type: Option<&str>) -> Option<PushIngestProtocol> 
         .map(|(_, protocol)| *protocol)
 }
 
-/// Base of the pool a push input's ingest addresses come from: `198.18.0.0`,
-/// the first address of `198.18.0.0/15`, the RFC 2544 benchmarking range.
-/// Non-routable, so an emulated push endpoint never hands a caller an address
-/// that belongs to somebody.
-const INGEST_IP_POOL_BASE: u32 = u32::from_be_bytes([198, 18, 0, 0]);
+/// Base of the pool this service's emulated public addresses come from — a push
+/// input's ingest address and a channel pipeline's egress address alike:
+/// `198.18.0.0`, the first address of `198.18.0.0/15`, the RFC 2544
+/// benchmarking range. Non-routable, so an emulated endpoint never hands a
+/// caller an address that belongs to somebody.
+const IP_POOL_BASE: u32 = u32::from_be_bytes([198, 18, 0, 0]);
 
 /// `198.18.0.0/15` holds 2^17 addresses; allocation wraps inside it.
-const INGEST_IP_POOL_LEN: u32 = 1 << 17;
+const IP_POOL_LEN: u32 = 1 << 17;
 
 /// How long a resource stays in a transient state before the clock makes the next
 /// one due: a channel's `CREATING`, `STARTING`, `STOPPING`, `RECOVERING` and
@@ -906,9 +908,11 @@ struct Transition {
 /// One created channel, as `CreateChannel` stored it plus its lifecycle state.
 ///
 /// The members mirror the model's `Channel` shape. Members the real service
-/// computes from infrastructure it owns (a pipeline's egress IP, a VPC network
-/// interface id, an engine-version expiry) are NOT invented here: they stay
-/// absent, because this emulator has no such infrastructure to report.
+/// computes from infrastructure it owns (a VPC network interface id, an
+/// engine-version expiry) are NOT invented here: they stay absent, because this
+/// emulator has no such infrastructure to report. The two members the service
+/// SELECTS for every channel — its maintenance window and the public address
+/// each pipeline egresses from — are stored, because a channel always has them.
 #[derive(Debug, Clone)]
 pub struct ChannelRecord {
     pub id: String,
@@ -931,6 +935,15 @@ pub struct ChannelRecord {
     pub inference_settings: Option<InferenceSettings>,
     pub vpc: Option<VpcOutputSettings>,
     pub channel_engine_version: Option<String>,
+    /// The public address each of this channel's pipelines egresses from, in
+    /// pipeline order — `ChannelEgressEndpoint$SourceIp`, "Public IP of where a
+    /// channel's output comes from".
+    ///
+    /// PRIVATE: the only way in is
+    /// [`ComAmazonawsMedialiveMedialiveState::allocate_channel_egress_addresses`],
+    /// which owns the pool and never reassigns a pipeline's address, and the
+    /// only way out is [`ChannelRecord::egress_endpoints`].
+    egress_ips: Vec<String>,
     /// The MediaConnect Router handoff settings a request supplied but the
     /// `Channel` response shape reports no member for — stored rather than
     /// dropped, exactly as [`InputRecord::special_router_settings`] is for an
@@ -1076,6 +1089,29 @@ impl ChannelRecord {
             .map(|pipeline| PipelineDetail {
                 pipeline_id: Some(pipeline.to_string()),
                 ..PipelineDetail::default()
+            })
+            .collect()
+    }
+
+    /// The endpoints this channel's outgoing connections initiate from —
+    /// `EgressEndpoints`, "The endpoints where outgoing connections initiate
+    /// from", one `ChannelEgressEndpoint` per pipeline carrying the public
+    /// address allocated to that pipeline.
+    ///
+    /// One entry per pipeline the channel's class gives it
+    /// ([`Self::pipeline_count`]), in pipeline order, so a `STANDARD` channel
+    /// reports two and a `SINGLE_PIPELINE` channel one — in every state,
+    /// because the address a channel egresses from is provisioned with the
+    /// channel and not with a run. A class change that drops a pipeline stops
+    /// reporting its address but keeps it recorded, so changing back puts the
+    /// same address back on the same pipeline.
+    pub fn egress_endpoints(&self) -> Vec<ChannelEgressEndpoint> {
+        let pipelines = usize::try_from(self.pipeline_count()).unwrap_or(0);
+        self.egress_ips
+            .iter()
+            .take(pipelines)
+            .map(|source_ip| ChannelEgressEndpoint {
+                source_ip: Some(source_ip.clone()),
             })
             .collect()
     }
@@ -1723,10 +1759,11 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     pub next_input_id: u64,
     /// `CreateInput`'s `RequestId` (`@idempotencyToken`) -> the input it created.
     input_tokens: IdempotencyTokens,
-    /// Next offset into the ingest-address pool, so no two push destinations
-    /// report the same endpoint address. PRIVATE: the only way in is
-    /// [`Self::allocate_input_ingest_addresses`], which owns the pool.
-    next_ingest_ip: u32,
+    /// Next offset into the emulated public address pool, so no two endpoints
+    /// this service reports — a push input's ingest address, a channel
+    /// pipeline's egress address — are the same. PRIVATE: the only way in is
+    /// [`Self::allocate_pool_address`], which owns the pool.
+    next_pool_ip: u32,
     /// Every cloudwatch alarm template group that exists, keyed by its minted
     /// `Id`. A `BTreeMap` so a later `ListCloudWatchAlarmTemplateGroups` walks it
     /// in id order on every call.
@@ -2552,11 +2589,10 @@ impl ComAmazonawsMedialiveMedialiveState {
             cdi_input_specification: channel.cdi_input_specification.clone(),
             channel_class: Some(channel.channel_class.clone()),
             destinations: Some(channel.destinations.clone()),
-            // ABSENT, not empty: `EgressEndpoints` reports the public IP each
-            // pipeline's output comes from, which the real service allocates and
-            // this emulator does not. An empty list would claim the channel
-            // egresses from nowhere; absent says it is not reported.
-            egress_endpoints: None,
+            // One endpoint per pipeline, each carrying the public address that
+            // pipeline egresses from — allocated with the channel, so it is
+            // read out of the store like every other member here.
+            egress_endpoints: Some(channel.egress_endpoints()),
             encoder_settings: channel.encoder_settings.clone(),
             id: Some(channel.id.clone()),
             input_attachments: Some(channel.input_attachments.clone()),
@@ -2593,8 +2629,8 @@ impl ComAmazonawsMedialiveMedialiveState {
             cdi_input_specification: channel.cdi_input_specification.clone(),
             channel_class: Some(channel.channel_class.clone()),
             destinations: Some(channel.destinations.clone()),
-            // ABSENT for the same reason as in `channel_description`.
-            egress_endpoints: None,
+            // The same endpoints as in `channel_description`.
+            egress_endpoints: Some(channel.egress_endpoints()),
             id: Some(channel.id.clone()),
             input_attachments: Some(channel.input_attachments.clone()),
             input_specification: channel.input_specification.clone(),
@@ -2668,24 +2704,52 @@ impl ComAmazonawsMedialiveMedialiveState {
         let allocated = input.ingest_ips.len();
         let wanted = input.destinations.len();
         let fresh: Vec<String> = (allocated..wanted)
-            .map(|_| self.allocate_ingest_address())
+            .map(|_| self.allocate_pool_address())
             .collect();
         if let Some(input) = self.inputs.get_mut(id) {
             input.ingest_ips.extend(fresh);
         }
     }
 
-    /// The next address out of the ingest pool.
+    /// Allocate the public egress address of every pipeline of the channel `id`
+    /// that does not hold one yet, so the channel reports the address its
+    /// outputs originate from — `ChannelEgressEndpoint$SourceIp` ("Public IP of
+    /// where a channel's output comes from"), one endpoint per pipeline.
     ///
-    /// The counter wraps at [`INGEST_IP_POOL_LEN`], so an address could in
+    /// Call this from the operations that WRITE a channel's pipelines
+    /// (`CreateChannel`, `UpdateChannelClass`): allocating an address is a
+    /// write, so no reporting operation does it.
+    ///
+    /// Top-up only, out of the same pool the ingest addresses come from, so an
+    /// address already allocated for a pipeline stays with that pipeline: a
+    /// class change that adds a pipeline spends one more address and leaves the
+    /// first pipeline egressing from the address it already reported.
+    pub fn allocate_channel_egress_addresses(&mut self, id: &str) {
+        let Some(channel) = self.channels.get(id) else {
+            return;
+        };
+        let allocated = channel.egress_ips.len();
+        let wanted = usize::try_from(channel.pipeline_count()).unwrap_or(0);
+        let fresh: Vec<String> = (allocated..wanted)
+            .map(|_| self.allocate_pool_address())
+            .collect();
+        if let Some(channel) = self.channels.get_mut(id) {
+            channel.egress_ips.extend(fresh);
+        }
+    }
+
+    /// The next address out of the emulated public address pool.
+    ///
+    /// The counter wraps at [`IP_POOL_LEN`], so an address could in
     /// principle be reissued - but only after 2^17 allocations, and the store
     /// holds at most [`MAX_INPUTS`] inputs, each with a caller-bounded
-    /// destination list, so the wrap is the pool's last-resort bound rather than
-    /// a path a client can reach.
-    fn allocate_ingest_address(&mut self) -> String {
-        let offset = self.next_ingest_ip % INGEST_IP_POOL_LEN;
-        self.next_ingest_ip = self.next_ingest_ip.wrapping_add(1);
-        ::std::net::Ipv4Addr::from(INGEST_IP_POOL_BASE + offset).to_string()
+    /// destination list, and at most [`MAX_CHANNELS`] channels, each with at
+    /// most two pipelines, so the wrap is the pool's last-resort bound rather
+    /// than a path a client can reach.
+    fn allocate_pool_address(&mut self) -> String {
+        let offset = self.next_pool_ip % IP_POOL_LEN;
+        self.next_pool_ip = self.next_pool_ip.wrapping_add(1);
+        ::std::net::Ipv4Addr::from(IP_POOL_BASE + offset).to_string()
     }
 
     /// Record `token` as having created `input_id`, under the same bounded,
@@ -4689,17 +4753,87 @@ fn described_engine_version(version: &str) -> crate::ops::types::ChannelEngineVe
     }
 }
 
+/// The days `MaintenanceDay` gives the service to choose a channel's
+/// maintenance window from, in the model's own order
+/// (`smithy_query(query="shape", shape="MaintenanceDay")`: MONDAY | TUESDAY |
+/// WEDNESDAY | THURSDAY | FRIDAY | SATURDAY | SUNDAY).
+const MAINTENANCE_DAYS: [&str; 7] = [
+    "MONDAY",
+    "TUESDAY",
+    "WEDNESDAY",
+    "THURSDAY",
+    "FRIDAY",
+    "SATURDAY",
+    "SUNDAY",
+];
+
+/// The hours a maintenance start time can name, which is what makes the start
+/// time a whole hour of the day ("Choose the hour that maintenance will
+/// start").
+const MAINTENANCE_HOURS: usize = 24;
+
+/// The maintenance window the service selects for a channel.
+///
+/// EVERY channel has one selected: the response member is a *status* whose day
+/// is "The currently selected maintenance day" and whose time is "The currently
+/// selected maintenance start time", while the create setting that would choose
+/// them is optional — so the selection is made here, when the channel is
+/// created, rather than left absent until some caller writes one.
+///
+/// Derived from the channel's own minted id, so the window is stable for the
+/// channel's whole lifetime (nothing about the request or the clock enters it)
+/// and the windows of an account's channels are spread over the week and over
+/// the hours of the day instead of all falling together. The start time is a
+/// whole hour, the only form the member accepts.
+///
+/// `MaintenanceDeadline` ("Maintenance is required by the displayed date and
+/// time") and `MaintenanceScheduledDate` ("The currently scheduled maintenance
+/// date and time") are assigned by the real service's maintenance scheduler,
+/// which this emulator does not run, so they stay absent: no maintenance has
+/// been scheduled for or required of this channel.
+fn assigned_maintenance_window(id: &str) -> MaintenanceStatus {
+    let seed = usize::try_from(id.parse::<u64>().unwrap_or_default()).unwrap_or_default();
+    let hour = seed % MAINTENANCE_HOURS;
+    MaintenanceStatus {
+        maintenance_day: Some(MAINTENANCE_DAYS[seed % MAINTENANCE_DAYS.len()].to_string()),
+        maintenance_deadline: None,
+        maintenance_scheduled_date: None,
+        maintenance_start_time: Some(format!("{hour:02}:00")),
+    }
+}
+
+/// Apply the day and start time a `CreateChannel` request chose to the window
+/// the service assigned the channel.
+///
+/// Member by member, because each of the two is optional and documented on its
+/// own ("Choose one day of the week for maintenance", "Choose the hour that
+/// maintenance will start"): a request that names one leaves the other at the
+/// service's selection, so the channel carries a complete window either way.
+pub fn choose_maintenance_window(
+    stored: &mut Option<MaintenanceStatus>,
+    chosen: MaintenanceCreateSettings,
+) {
+    let stored = stored.get_or_insert_with(MaintenanceStatus::default);
+    if chosen.maintenance_day.is_some() {
+        stored.maintenance_day = chosen.maintenance_day;
+    }
+    if chosen.maintenance_start_time.is_some() {
+        stored.maintenance_start_time = chosen.maintenance_start_time;
+    }
+}
+
 /// Build a new channel record from a `CreateChannel` request's values.
 ///
-/// Every member is the value the request supplied; the lifecycle members are the
-/// only computed ones. The channel starts in `CREATING` and owes `IDLE`, which is
-/// what the real service does.
+/// Every member is the value the request supplied; the lifecycle members and the
+/// service-selected maintenance window are the only computed ones. The channel
+/// starts in `CREATING` and owes `IDLE`, which is what the real service does.
 pub fn new_channel(
     id: String,
     arn: String,
     channel_class: String,
     now: SystemTime,
 ) -> ChannelRecord {
+    let maintenance = assigned_maintenance_window(&id);
     let mut channel = ChannelRecord {
         id,
         arn,
@@ -4712,7 +4846,7 @@ pub fn new_channel(
         input_attachments: Vec::new(),
         input_specification: None,
         log_level: None,
-        maintenance: None,
+        maintenance: Some(maintenance),
         role_arn: None,
         tags: HashMap::new(),
         channel_security_groups: Vec::new(),
@@ -4721,6 +4855,7 @@ pub fn new_channel(
         inference_settings: None,
         vpc: None,
         channel_engine_version: None,
+        egress_ips: Vec::new(),
         special_router_settings: None,
         restarting_pipelines: Vec::new(),
         schedule: ChannelSchedule::default(),

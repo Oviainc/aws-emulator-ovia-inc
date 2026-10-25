@@ -278,14 +278,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         channel.input_attachments = input.input_attachments.unwrap_or_default();
         channel.input_specification = input.input_specification;
         channel.log_level = input.log_level;
-        channel.maintenance = input.maintenance.map(|maintenance| MaintenanceStatus {
-            maintenance_day: maintenance.maintenance_day,
-            maintenance_start_time: maintenance.maintenance_start_time,
-            // The deadline and the scheduled date are assigned by the real
-            // service's maintenance scheduler, which this emulator does not run.
-            maintenance_deadline: None,
-            maintenance_scheduled_date: None,
-        });
+        // The window the service selected for this channel is already on the
+        // record; a request that chose a day or an hour moves it.
+        if let Some(maintenance) = input.maintenance {
+            crate::state::choose_maintenance_window(&mut channel.maintenance, maintenance);
+        }
         channel.role_arn = input.role_arn;
         channel.tags = input.tags.unwrap_or_default();
         channel.channel_security_groups = input.channel_security_groups.unwrap_or_default();
@@ -297,6 +294,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.channel_engine_version.and_then(|version| version.version);
 
         state.channels.insert(id.clone(), channel);
+        // The channel's pipelines now exist, so each gets the public address its
+        // outputs originate from — a write, done here rather than by any later
+        // read of the channel.
+        state.allocate_channel_egress_addresses(&id);
         if let Some(token) = input.request_id {
             // Bounded, evicting write: a caller-chosen token can neither
             // accumulate past the cap nor outlive the channel it created.
