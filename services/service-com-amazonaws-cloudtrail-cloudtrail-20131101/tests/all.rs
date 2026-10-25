@@ -145,3 +145,5 @@ mod resource_policy_isolation;
 mod lake_query_listing;
 #[path = "all/event_data_store_listing.rs"]
 mod event_data_store_listing;
+#[path = "all/resource_policy_delete.rs"]
+mod resource_policy_delete;
