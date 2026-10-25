@@ -140,6 +140,23 @@ pub async fn list_page(
     (services, next)
 }
 
+/// `count` catalog service identifiers, spread across the catalog rather than
+/// taken from its head, so a suite's rows are not all near-neighbours in its
+/// order. The ONE place a suite draws settable identifiers from: they are what
+/// `UpdateAccountCustomizations` admits as `visibleServices`.
+pub async fn catalog_services(router: &MultiServiceRouter, count: usize) -> Vec<String> {
+    let catalog = whole_catalog(router).await;
+    assert!(
+        catalog.len() >= count,
+        "the catalog must hold at least {count} entries to draw rows from, got {}",
+        catalog.len()
+    );
+    let stride = catalog.len() / count;
+    (0..count)
+        .map(|n| catalog[(n * stride).min(catalog.len() - 1)].clone())
+        .collect()
+}
+
 /// The whole catalog, as the single page an unsized request returns.
 pub async fn whole_catalog(router: &MultiServiceRouter) -> Vec<String> {
     let (services, next) = list_page(router, None, None).await;
@@ -153,7 +170,8 @@ pub async fn whole_catalog(router: &MultiServiceRouter) -> Vec<String> {
 /// A service identifier legal under the model's `Service` member pattern
 /// `^[a-z0-9]+(-[a-z0-9]+)*$` (`smithy_query(query="shape", shape="ServiceList")`)
 /// and NOT a member of the catalog `ListServices` pages over, whose entries are
-/// all real service identifiers.
+/// all console service identifiers. A suite that uses it asserts its absence
+/// from the catalog before relying on that.
 pub fn generated_service_id(n: usize) -> String {
     format!("svc-{n}")
 }
