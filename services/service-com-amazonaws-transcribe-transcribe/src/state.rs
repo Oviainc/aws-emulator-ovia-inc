@@ -28,6 +28,13 @@
 //! three tagging operations reach every family's tag set through one lookup
 //! ([`ComAmazonawsTranscribeTranscribeState::tags_mut`]).
 //!
+//! EVERY family is REGION-SCOPED ([`RegionalStore`]): Amazon Transcribe is a regional
+//! service, so a record belongs to the one Region whose endpoint created it and every
+//! lookup, listing, uniqueness check and quota count is made in the Region the calling
+//! request was signed for ([`request_region`]). That Region is caller-supplied and
+//! unauthenticated, so a family's store is bounded by its per-Region ceiling TOGETHER
+//! WITH [`MAX_REGIONS`], the cap on how many Regions hold records of it at all.
+//!
 //! WHAT THIS EMULATES, AND WHAT IT DOES NOT: the job RECORD — its name, its
 //! settings, its status, its timestamps and the location its output would be
 //! written to. No audio is transcribed and no object is ever written at the
@@ -213,20 +220,22 @@ impl JobLifecycle for MedicalScribeJobRecord {
     }
 }
 
-/// How many of `jobs` the service is still working on at `now`: the records whose
-/// status is not terminal ([`is_terminal_job_status`]), counted after every
+/// How many of `region`'s `jobs` the service is still working on at `now`: the records
+/// whose status is not terminal ([`is_terminal_job_status`]), counted after every
 /// clock-owed transition has been materialised, so a job the clock already finished
 /// is not counted as running.
 ///
 /// This — not how many records the account holds — is what a job family's ceiling
 /// bounds (see [`MAX_CONCURRENT_TRANSCRIPTION_JOBS`]), so a finished job releases its
-/// slot while staying listable.
+/// slot while staying listable. The ceiling is published per account per REGION, so
+/// only the jobs of the Region the start was signed for are counted.
 pub fn jobs_in_flight<R: JobLifecycle>(
-    jobs: &mut BTreeMap<String, R>,
+    jobs: &mut RegionalStore<R>,
+    region: &str,
     now: SystemTime,
 ) -> usize {
     let mut in_flight = 0;
-    for record in jobs.values_mut() {
+    for record in jobs.values_in_mut(region) {
         record.materialise_due_transitions(now);
         if !is_terminal_job_status(record.job_status()) {
             in_flight += 1;
@@ -235,38 +244,45 @@ pub fn jobs_in_flight<R: JobLifecycle>(
     in_flight
 }
 
-/// The most job records of one family this emulator KEEPS.
+/// The most job records of one family this emulator KEEPS for one Region.
 ///
 /// Not a quota and not a refusal: a start is never refused for it. It is the bound on
 /// this process's memory, since the quota above counts only the jobs in flight and so
-/// cannot cap how many records a caller that keeps starting jobs accumulates. A
+/// cannot cap how many records a caller that keeps starting jobs accumulates; together
+/// with [`MAX_REGIONS`], which caps how many Regions hold job records at all, it bounds
+/// a family's whole store. A
 /// CHOSEN figure, several times the concurrency quota so recent history stays
 /// readable and listable; the real service keeps a job record far longer than any
 /// emulator run.
 pub const MAX_RETAINED_JOB_RECORDS: usize = 500;
 
-/// Keep a family's store at [`MAX_RETAINED_JOB_RECORDS`] records by dropping the
-/// OLDEST ones the service has already finished with, as a start that adds a record
-/// does.
+/// Keep a family's store for `region` at [`MAX_RETAINED_JOB_RECORDS`] records by
+/// dropping the OLDEST ones the service has already finished with, as a start that adds
+/// a record does.
+///
+/// Only `region`'s records are counted and only `region`'s records are dropped: the
+/// store is Region-scoped, so one Region's traffic can never evict a job another Region
+/// holds.
 ///
 /// Only a terminal record is ever dropped, so no job in flight and no job a caller
 /// could still be polling to completion disappears; a record is dropped exactly as a
 /// delete of that job would drop it. With the concurrency quota capping how many jobs
-/// can be in flight at once, the two together bound a family's store at
+/// can be in flight at once, the two together bound a family's store for one Region at
 /// [`MAX_RETAINED_JOB_RECORDS`] plus that quota.
-pub fn evict_oldest_finished_jobs<R: JobLifecycle>(jobs: &mut BTreeMap<String, R>) {
-    if jobs.len() <= MAX_RETAINED_JOB_RECORDS {
+pub fn evict_oldest_finished_jobs<R: JobLifecycle>(jobs: &mut RegionalStore<R>, region: &str) {
+    let held = jobs.len_in(region);
+    if held <= MAX_RETAINED_JOB_RECORDS {
         return;
     }
-    let excess = jobs.len() - MAX_RETAINED_JOB_RECORDS;
+    let excess = held - MAX_RETAINED_JOB_RECORDS;
     let mut finished: Vec<(u64, String)> = jobs
-        .iter()
+        .iter_in(region)
         .filter(|(_, record)| is_terminal_job_status(record.job_status()))
-        .map(|(name, record)| (record.sequence(), name.clone()))
+        .map(|(name, record)| (record.sequence(), name.to_string()))
         .collect();
     finished.sort_unstable();
     for (_, name) in finished.into_iter().take(excess) {
-        jobs.remove(&name);
+        jobs.remove(region, &name);
     }
 }
 
@@ -368,7 +384,7 @@ pub const DEFAULT_LIST_MAX_RESULTS: i32 = 5;
 /// refuses more than this before a handler runs.
 pub const MAX_LIST_MAX_RESULTS: usize = 100;
 
-/// The most transcription jobs this emulator runs AT ONCE for an account.
+/// The most transcription jobs this emulator runs AT ONCE for an account in one Region.
 ///
 /// The quota Amazon Transcribe publishes for this family is a CONCURRENCY one — 100
 /// concurrent batch transcription jobs per account per Region — and the
@@ -445,15 +461,58 @@ pub const VOCABULARY_TRANSITION_DELAY: Duration = Duration::from_millis(500);
 /// any other language is refused.
 pub const MEDICAL_LANGUAGE_CODE: &str = "en-US";
 
-/// The most custom vocabularies this emulator holds for an account.
+/// How many distinct Regions one resource family keeps records for.
+///
+/// A per-Region quota alone would not bound a store: the Region keying it is the
+/// request's own SigV4 credential-scope Region, which this emulator does not
+/// authenticate, so without this cap a caller could open a fresh per-Region bucket —
+/// each with its own quota — on every request. With it a family holds at most
+/// `MAX_REGIONS` buckets, and so at most `MAX_REGIONS` times its own per-Region
+/// ceiling ([`MAX_VOCABULARIES`], [`MAX_LANGUAGE_MODELS`],
+/// [`MAX_CALL_ANALYTICS_CATEGORIES`], [`MAX_RETAINED_JOB_RECORDS`] plus that family's
+/// concurrency quota) in total. AWS operates on the order of 36 commercial Regions, so
+/// this figure is this emulator's own and comfortably above the real surface; a create
+/// or start past it answers the same modelled `LimitExceededException` AWS answers when
+/// a create would exceed an allowance ([`region_capacity_message`]).
+pub const MAX_REGIONS: usize = 64;
+
+/// The refusal a create or start carries when its Region would be an
+/// `MAX_REGIONS + 1`-th one for `family`: the Region is not one this emulator holds
+/// records of that family for, and it has no room for another.
+///
+/// One spelling for every family, as [`concurrency_limit_message`] is: the condition is
+/// the same in each, and it is the emulator's own bound rather than a published quota,
+/// so the text says so instead of naming an AWS allowance.
+pub fn region_capacity_message(family: &str, region: &str) -> String {
+    format!(
+        "This emulator holds {family} for at most {MAX_REGIONS} Regions, and {region} \
+         is not one of them. Delete the {family} of a Region you no longer need and try \
+         your request again."
+    )
+}
+
+/// The most custom vocabularies this emulator holds for an account IN ONE REGION.
 ///
 /// Amazon Transcribe publishes a default quota of 100 custom vocabularies per account
 /// per Region, and the same figure for custom medical vocabularies and for custom
-/// vocabulary filters. Applying the published figure to each family keeps the store
-/// bounded: a caller that never deletes cannot grow it without end, and
+/// vocabulary filters. Applying the published figure to each family, per Region, keeps
+/// the store bounded TOGETHER WITH [`MAX_REGIONS`], which caps how many Regions hold
+/// records at all: a caller that never deletes cannot grow it without end, and
 /// `DeleteVocabulary` / `DeleteMedicalVocabulary` / `DeleteVocabularyFilter` is what
 /// makes room again.
 pub const MAX_VOCABULARIES: usize = 100;
+
+/// The family [`region_capacity_message`] names in a custom vocabulary's Region
+/// refusal.
+pub const FAMILY_VOCABULARIES: &str = "custom vocabularies";
+/// See [`FAMILY_VOCABULARIES`].
+pub const FAMILY_MEDICAL_VOCABULARIES: &str = "custom medical vocabularies";
+/// See [`FAMILY_VOCABULARIES`].
+pub const FAMILY_VOCABULARY_FILTERS: &str = "custom vocabulary filters";
+/// See [`FAMILY_VOCABULARIES`].
+pub const FAMILY_LANGUAGE_MODELS: &str = "custom language models";
+/// See [`FAMILY_VOCABULARIES`].
+pub const FAMILY_CALL_ANALYTICS_CATEGORIES: &str = "Call Analytics categories";
 
 /// The number of custom vocabularies `ListVocabularies` / `ListMedicalVocabularies` /
 /// `ListVocabularyFilters` return when the request names no `MaxResults`: "If you do
@@ -487,14 +546,14 @@ pub const INPUT_TYPE_REAL_TIME: &str = "REAL_TIME";
 /// value rather than each one re-defaulting.
 pub const DEFAULT_INPUT_TYPE: &str = INPUT_TYPE_POST_CALL;
 
-/// The most Call Analytics categories this emulator holds for an account.
+/// The most Call Analytics categories this emulator holds for an account IN ONE REGION.
 ///
 /// A CHOSEN ceiling, not a published one: AWS gives no per-account figure for Call
 /// Analytics categories in the model, and the only count the model bounds is the
 /// RULES of one category (`RuleList` is `length {min 1, max 20}`, which the boundary
 /// validator already enforces). Applying the same figure the other families use keeps
-/// the store bounded — a caller that never deletes cannot grow it without end, and
-/// `DeleteCallAnalyticsCategory` is what makes room again.
+/// the store bounded together with [`MAX_REGIONS`] — a caller that never deletes cannot
+/// grow it without end, and `DeleteCallAnalyticsCategory` is what makes room again.
 pub const MAX_CALL_ANALYTICS_CATEGORIES: usize = 100;
 
 /// `ModelStatus` values, from the model's enum
@@ -531,12 +590,12 @@ pub fn is_terminal_model_status(status: &str) -> bool {
 /// terminates quickly. The due instant is stored on the record; nothing sleeps for it.
 pub const MODEL_TRANSITION_DELAY: Duration = Duration::from_millis(500);
 
-/// The most custom language models this emulator holds for an account.
+/// The most custom language models this emulator holds for an account IN ONE REGION.
 ///
 /// A CHOSEN ceiling, not a published one: the model carries no per-account figure for
 /// custom language models. Applying the same figure the other families use keeps the
-/// store bounded — a caller that never deletes cannot grow it without end, and
-/// `DeleteLanguageModel` is what makes room again.
+/// store bounded together with [`MAX_REGIONS`] — a caller that never deletes cannot grow
+/// it without end, and `DeleteLanguageModel` is what makes room again.
 pub const MAX_LANGUAGE_MODELS: usize = 100;
 
 /// The ARN resource type of a transcription job, as the `TranscribeArn` pattern's
@@ -966,47 +1025,171 @@ pub fn extend_language_id_references<'a>(
 /// repeated tagging calls, so a merge past it is refused rather than stored.
 pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 
+/// One resource family's store, Region by Region.
+///
+/// Amazon Transcribe is a REGIONAL service: a request reaches the endpoint of exactly
+/// one Region, and the resources that endpoint serves are the ones created through it.
+/// So the key of a record is the Region it was created in TOGETHER with its name, and
+/// every lookup, listing, uniqueness check and quota count is scoped to the Region the
+/// calling request was signed for ([`request_region`]) — two Regions hold two
+/// independent sets of resources that may use the same names, and neither can read,
+/// mutate, delete or crowd out the other's.
+///
+/// One generic store rather than a region dimension bolted onto each of the nine
+/// families: they differ in what a record IS, not in how a Region scopes it.
+#[derive(Debug)]
+pub struct RegionalStore<R> {
+    /// Keyed `(region, name)`, so the records of one Region are a contiguous range and
+    /// a name is unique only within its Region.
+    records: BTreeMap<(String, String), R>,
+}
+
+impl<R> Default for RegionalStore<R> {
+    fn default() -> Self {
+        Self {
+            records: BTreeMap::new(),
+        }
+    }
+}
+
+impl<R> RegionalStore<R> {
+    /// The record `region` holds under `name`, or `None` when that Region holds none —
+    /// whatever any other Region holds under the same name.
+    pub fn get(&self, region: &str, name: &str) -> Option<&R> {
+        self.records.get(&(region.to_string(), name.to_string()))
+    }
+
+    /// [`Self::get`] for a caller that mutates the record it finds.
+    pub fn get_mut(&mut self, region: &str, name: &str) -> Option<&mut R> {
+        self.records
+            .get_mut(&(region.to_string(), name.to_string()))
+    }
+
+    /// Whether `region` holds a record under `name` — the uniqueness check a create of
+    /// any family makes, which is why the same name may be created once per Region.
+    pub fn contains(&self, region: &str, name: &str) -> bool {
+        self.get(region, name).is_some()
+    }
+
+    /// Store `record` as `region`'s record under `name`, answering the record it
+    /// replaced, if any.
+    pub fn insert(&mut self, region: &str, name: &str, record: R) -> Option<R> {
+        self.records
+            .insert((region.to_string(), name.to_string()), record)
+    }
+
+    /// Drop `region`'s record under `name`, answering it when there was one.
+    pub fn remove(&mut self, region: &str, name: &str) -> Option<R> {
+        self.records.remove(&(region.to_string(), name.to_string()))
+    }
+
+    /// How many records `region` holds — what a per-account-per-Region ceiling counts.
+    pub fn len_in(&self, region: &str) -> usize {
+        self.iter_in(region).count()
+    }
+
+    /// `region`'s records with the name each is stored under, in name order.
+    pub fn iter_in(&self, region: &str) -> impl Iterator<Item = (&str, &R)> {
+        let owned = region.to_string();
+        self.records
+            .range((owned.clone(), String::new())..)
+            .take_while(move |((stored, _), _)| *stored == owned)
+            .map(|((_, name), record)| (name.as_str(), record))
+    }
+
+    /// `region`'s records, in name order.
+    pub fn values_in(&self, region: &str) -> impl Iterator<Item = &R> {
+        self.iter_in(region).map(|(_, record)| record)
+    }
+
+    /// `region`'s records for mutation, in name order — how a listing materialises
+    /// every clock-owed transition of the Region it is reporting on.
+    pub fn values_in_mut(&mut self, region: &str) -> impl Iterator<Item = &mut R> {
+        let owned = region.to_string();
+        self.records
+            .range_mut((owned.clone(), String::new())..)
+            .take_while(move |((stored, _), _)| *stored == owned)
+            .map(|(_, record)| record)
+    }
+
+    /// Whether this store holds any record for `region`.
+    ///
+    /// A Region that held records and no longer does answers `false`, so a deleted
+    /// Region stops counting against [`MAX_REGIONS`] — which is what keeps that cap a
+    /// bound on what is actually stored rather than on what was ever asked for.
+    pub fn holds_region(&self, region: &str) -> bool {
+        self.values_in(region).next().is_some()
+    }
+
+    /// How many Regions this store holds records for, which [`MAX_REGIONS`] bounds.
+    ///
+    /// The keys are ordered by Region first, so one walk counts the distinct ones.
+    pub fn regions_held(&self) -> usize {
+        let mut held = 0;
+        let mut previous: Option<&str> = None;
+        for (region, _) in self.records.keys() {
+            if previous != Some(region.as_str()) {
+                held += 1;
+                previous = Some(region.as_str());
+            }
+        }
+        held
+    }
+
+    /// Whether a record for `region` cannot be stored because this store already holds
+    /// records for [`MAX_REGIONS`] OTHER Regions.
+    ///
+    /// The per-Region quotas bound one Region's records; this bounds how many Regions
+    /// have records at all. Both are needed, because the Region a record is keyed by is
+    /// the request's own SigV4 credential-scope Region, which this emulator does not
+    /// authenticate: without this cap a caller could open a fresh per-Region bucket,
+    /// each with its own quota, on every request.
+    pub fn region_bucket_exhausted(&self, region: &str) -> bool {
+        !self.holds_region(region) && self.regions_held() >= MAX_REGIONS
+    }
+}
+
 /// Per-service state for com-amazonaws-transcribe-transcribe. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsTranscribeTranscribeState {
-    /// Every transcription job this account has started, keyed by its name (which
-    /// `StartTranscriptionJob` requires to be unique).
-    pub transcription_jobs: BTreeMap<String, TranscriptionJobRecord>,
-    /// Every MEDICAL transcription job this account has started, keyed by its name
-    /// (which `StartMedicalTranscriptionJob` requires to be unique within an account).
-    /// A family of its own: a medical transcription job and a transcription job may
-    /// share a name.
-    pub medical_transcription_jobs: BTreeMap<String, MedicalTranscriptionJobRecord>,
-    /// Every custom vocabulary this account holds, keyed by its name (which
+    /// Every transcription job this account has started, keyed by the Region it was
+    /// started in and its name (which `StartTranscriptionJob` requires to be unique).
+    pub transcription_jobs: RegionalStore<TranscriptionJobRecord>,
+    /// Every MEDICAL transcription job this account has started, keyed by Region and
+    /// name (which `StartMedicalTranscriptionJob` requires to be unique within an
+    /// account). A family of its own: a medical transcription job and a transcription
+    /// job may share a name.
+    pub medical_transcription_jobs: RegionalStore<MedicalTranscriptionJobRecord>,
+    /// Every custom vocabulary this account holds, keyed by Region and name (which
     /// `CreateVocabulary` requires to be unique within an account).
-    pub vocabularies: BTreeMap<String, VocabularyRecord>,
-    /// Every custom MEDICAL vocabulary this account holds, keyed by its name (which
-    /// `CreateMedicalVocabulary` requires to be unique within an account). A family
-    /// of its own: a medical vocabulary and a custom vocabulary may share a name.
-    pub medical_vocabularies: BTreeMap<String, MedicalVocabularyRecord>,
-    /// Every custom vocabulary filter this account holds, keyed by its name (which
-    /// `CreateVocabularyFilter` requires to be unique within an account).
-    pub vocabulary_filters: BTreeMap<String, VocabularyFilterRecord>,
-    /// Every Call Analytics category this account holds, keyed by its name ("Category
-    /// names are case sensitive and must be unique within an Amazon Web Services
-    /// account" — model doc for `CategoryProperties$CategoryName`).
-    pub call_analytics_categories: BTreeMap<String, CallAnalyticsCategoryRecord>,
-    /// Every custom language model this account holds, keyed by its name (which
+    pub vocabularies: RegionalStore<VocabularyRecord>,
+    /// Every custom MEDICAL vocabulary this account holds, keyed by Region and name
+    /// (which `CreateMedicalVocabulary` requires to be unique within an account). A
+    /// family of its own: a medical vocabulary and a custom vocabulary may share a name.
+    pub medical_vocabularies: RegionalStore<MedicalVocabularyRecord>,
+    /// Every custom vocabulary filter this account holds, keyed by Region and name
+    /// (which `CreateVocabularyFilter` requires to be unique within an account).
+    pub vocabulary_filters: RegionalStore<VocabularyFilterRecord>,
+    /// Every Call Analytics category this account holds, keyed by Region and name
+    /// ("Category names are case sensitive and must be unique within an Amazon Web
+    /// Services account" — model doc for `CategoryProperties$CategoryName`).
+    pub call_analytics_categories: RegionalStore<CallAnalyticsCategoryRecord>,
+    /// Every custom language model this account holds, keyed by Region and name (which
     /// `CreateLanguageModel` requires to be unique within an account: "If you try to
     /// create a new custom language model with the same name as an existing custom
     /// language model, you get a `ConflictException` error").
-    pub language_models: BTreeMap<String, LanguageModelRecord>,
-    /// Every Medical Scribe job this account has started, keyed by its name (which
-    /// `StartMedicalScribeJob` requires to be "unique within an Amazon Web Services
-    /// account").
+    pub language_models: RegionalStore<LanguageModelRecord>,
+    /// Every Medical Scribe job this account has started, keyed by Region and name
+    /// (which `StartMedicalScribeJob` requires to be "unique within an Amazon Web
+    /// Services account").
     ///
     /// A job of this family carries the tags its start request asked for, reports them
     /// through its own operations, and is reachable from [`Self::tags`] /
     /// [`Self::tags_mut`] under [`RESOURCE_TYPE_MEDICAL_SCRIBE_JOB`], like every other
     /// family this state holds records of.
-    pub medical_scribe_jobs: BTreeMap<String, MedicalScribeJobRecord>,
-    /// Every Call Analytics job this account has started, keyed by its name ("Job
-    /// names are case sensitive and must be unique within an Amazon Web Services
+    pub medical_scribe_jobs: RegionalStore<MedicalScribeJobRecord>,
+    /// Every Call Analytics job this account has started, keyed by Region and name
+    /// ("Job names are case sensitive and must be unique within an Amazon Web Services
     /// account" — model doc for `CallAnalyticsJob$CallAnalyticsJobName`).
     ///
     /// A family of its own: a Call Analytics job and a transcription job may share a
@@ -1014,7 +1197,7 @@ pub struct ComAmazonawsTranscribeTranscribeState {
     /// [`Self::tags_mut`] because this emulator has no recorded spelling for the ARN
     /// `<type>` segment of a Call Analytics job. The tags its start request asked for
     /// are carried on the record and reported by that family's own operations.
-    pub call_analytics_jobs: BTreeMap<String, CallAnalyticsJobRecord>,
+    pub call_analytics_jobs: RegionalStore<CallAnalyticsJobRecord>,
     /// Source of [`TranscriptionJobRecord::sequence`]: a monotonic counter, so
     /// creation order is total even when two jobs start in the same clock tick.
     next_sequence: u64,
@@ -1027,30 +1210,39 @@ impl ComAmazonawsTranscribeTranscribeState {
         self.next_sequence
     }
 
-    /// Materialise every clock-owed status transition, then the stored jobs newest
-    /// first — the order `ListTranscriptionJobs` documents ("Jobs are ordered by
-    /// creation date, with the newest job first").
-    pub fn jobs_newest_first(&mut self, now: SystemTime) -> Vec<&TranscriptionJobRecord> {
-        for record in self.transcription_jobs.values_mut() {
+    /// Materialise every clock-owed status transition of the jobs `region` holds, then
+    /// those jobs newest first — the order `ListTranscriptionJobs` documents ("Jobs are
+    /// ordered by creation date, with the newest job first").
+    ///
+    /// Only `region`'s jobs: a listing is served by one Region's endpoint and reports
+    /// what that Region holds.
+    pub fn jobs_newest_first(
+        &mut self,
+        region: &str,
+        now: SystemTime,
+    ) -> Vec<&TranscriptionJobRecord> {
+        for record in self.transcription_jobs.values_in_mut(region) {
             record.advance_clock(now);
         }
-        let mut records: Vec<&TranscriptionJobRecord> = self.transcription_jobs.values().collect();
+        let mut records: Vec<&TranscriptionJobRecord> =
+            self.transcription_jobs.values_in(region).collect();
         records.sort_by_key(|record| std::cmp::Reverse(record.sequence));
         records
     }
 
     /// The MEDICAL transcription job named `name`, with every clock-owed transition of
-    /// it already materialised, or `None` when this account has started no such job.
+    /// it already materialised, or `None` when that Region has started no such job.
     ///
     /// The single lookup for this family, so every operation that reads or deletes a
     /// medical transcription job sees the same status: the one the clock already owed
     /// it.
     pub fn medical_transcription_job_mut(
         &mut self,
+        region: &str,
         name: &str,
         now: SystemTime,
     ) -> Option<&mut MedicalTranscriptionJobRecord> {
-        let record = self.medical_transcription_jobs.get_mut(name)?;
+        let record = self.medical_transcription_jobs.get_mut(region, name)?;
         record.advance_clock(now);
         Some(record)
     }
@@ -1060,28 +1252,30 @@ impl ComAmazonawsTranscribeTranscribeState {
     /// ("Jobs are ordered by creation date, with the newest job first").
     pub fn medical_transcription_jobs_newest_first(
         &mut self,
+        region: &str,
         now: SystemTime,
     ) -> Vec<&MedicalTranscriptionJobRecord> {
-        for record in self.medical_transcription_jobs.values_mut() {
+        for record in self.medical_transcription_jobs.values_in_mut(region) {
             record.advance_clock(now);
         }
         let mut records: Vec<&MedicalTranscriptionJobRecord> =
-            self.medical_transcription_jobs.values().collect();
+            self.medical_transcription_jobs.values_in(region).collect();
         records.sort_by_key(|record| std::cmp::Reverse(record.sequence));
         records
     }
 
     /// The Medical Scribe job named `name`, with every clock-owed transition of it
-    /// already materialised, or `None` when this account has started no such job.
+    /// already materialised, or `None` when that Region has started no such job.
     ///
     /// The single lookup for this family, so every operation that reads or deletes a
     /// Medical Scribe job sees the same status: the one the clock already owed it.
     pub fn medical_scribe_job_mut(
         &mut self,
+        region: &str,
         name: &str,
         now: SystemTime,
     ) -> Option<&mut MedicalScribeJobRecord> {
-        let record = self.medical_scribe_jobs.get_mut(name)?;
+        let record = self.medical_scribe_jobs.get_mut(region, name)?;
         record.advance_clock(now);
         Some(record)
     }
@@ -1091,27 +1285,30 @@ impl ComAmazonawsTranscribeTranscribeState {
     /// ordered by creation date, with the newest job first").
     pub fn medical_scribe_jobs_newest_first(
         &mut self,
+        region: &str,
         now: SystemTime,
     ) -> Vec<&MedicalScribeJobRecord> {
-        for record in self.medical_scribe_jobs.values_mut() {
+        for record in self.medical_scribe_jobs.values_in_mut(region) {
             record.advance_clock(now);
         }
-        let mut records: Vec<&MedicalScribeJobRecord> = self.medical_scribe_jobs.values().collect();
+        let mut records: Vec<&MedicalScribeJobRecord> =
+            self.medical_scribe_jobs.values_in(region).collect();
         records.sort_by_key(|record| std::cmp::Reverse(record.sequence));
         records
     }
 
     /// The Call Analytics job named `name`, with every clock-owed transition of it
-    /// already materialised, or `None` when this account has started no such job.
+    /// already materialised, or `None` when that Region has started no such job.
     ///
     /// The single lookup for this family, so every operation that reads a Call
     /// Analytics job sees the same status: the one the clock already owed it.
     pub fn call_analytics_job_mut(
         &mut self,
+        region: &str,
         name: &str,
         now: SystemTime,
     ) -> Option<&mut CallAnalyticsJobRecord> {
-        let record = self.call_analytics_jobs.get_mut(name)?;
+        let record = self.call_analytics_jobs.get_mut(region, name)?;
         record.advance_clock(now);
         Some(record)
     }
@@ -1121,24 +1318,27 @@ impl ComAmazonawsTranscribeTranscribeState {
     /// ordered by creation date, with the newest job first").
     pub fn call_analytics_jobs_newest_first(
         &mut self,
+        region: &str,
         now: SystemTime,
     ) -> Vec<&CallAnalyticsJobRecord> {
-        for record in self.call_analytics_jobs.values_mut() {
+        for record in self.call_analytics_jobs.values_in_mut(region) {
             record.advance_clock(now);
         }
-        let mut records: Vec<&CallAnalyticsJobRecord> = self.call_analytics_jobs.values().collect();
+        let mut records: Vec<&CallAnalyticsJobRecord> =
+            self.call_analytics_jobs.values_in(region).collect();
         records.sort_by_key(|record| std::cmp::Reverse(record.sequence));
         records
     }
 
     /// The custom vocabulary named `name`, with every clock-owed transition of it
-    /// already materialised, or `None` when this account holds no such vocabulary.
+    /// already materialised, or `None` when that Region holds no such vocabulary.
     pub fn vocabulary_mut(
         &mut self,
+        region: &str,
         name: &str,
         now: SystemTime,
     ) -> Option<&mut VocabularyRecord> {
-        let record = self.vocabularies.get_mut(name)?;
+        let record = self.vocabularies.get_mut(region, name)?;
         record.advance_clock(now);
         Some(record)
     }
@@ -1149,24 +1349,29 @@ impl ComAmazonawsTranscribeTranscribeState {
     /// Newest first for the same reason the job listing is: a listing that put the
     /// oldest first would page a caller through history before reaching what it just
     /// created.
-    pub fn vocabularies_newest_first(&mut self, now: SystemTime) -> Vec<&VocabularyRecord> {
-        for record in self.vocabularies.values_mut() {
+    pub fn vocabularies_newest_first(
+        &mut self,
+        region: &str,
+        now: SystemTime,
+    ) -> Vec<&VocabularyRecord> {
+        for record in self.vocabularies.values_in_mut(region) {
             record.advance_clock(now);
         }
-        let mut records: Vec<&VocabularyRecord> = self.vocabularies.values().collect();
+        let mut records: Vec<&VocabularyRecord> = self.vocabularies.values_in(region).collect();
         records.sort_by_key(|record| std::cmp::Reverse(record.sequence));
         records
     }
 
     /// The custom MEDICAL vocabulary named `name`, with every clock-owed transition
-    /// of it already materialised, or `None` when this account holds no such medical
+    /// of it already materialised, or `None` when that Region holds no such medical
     /// vocabulary.
     pub fn medical_vocabulary_mut(
         &mut self,
+        region: &str,
         name: &str,
         now: SystemTime,
     ) -> Option<&mut MedicalVocabularyRecord> {
-        let record = self.medical_vocabularies.get_mut(name)?;
+        let record = self.medical_vocabularies.get_mut(region, name)?;
         record.advance_clock(now);
         Some(record)
     }
@@ -1177,34 +1382,36 @@ impl ComAmazonawsTranscribeTranscribeState {
     /// vocabulary first").
     pub fn medical_vocabularies_newest_first(
         &mut self,
+        region: &str,
         now: SystemTime,
     ) -> Vec<&MedicalVocabularyRecord> {
-        for record in self.medical_vocabularies.values_mut() {
+        for record in self.medical_vocabularies.values_in_mut(region) {
             record.advance_clock(now);
         }
         let mut records: Vec<&MedicalVocabularyRecord> =
-            self.medical_vocabularies.values().collect();
+            self.medical_vocabularies.values_in(region).collect();
         records.sort_by_key(|record| std::cmp::Reverse(record.sequence));
         records
     }
 
     /// The stored custom vocabulary filters, newest first. A filter has no
     /// `VocabularyState` in the model, so none of them has a clock-owed transition.
-    pub fn vocabulary_filters_newest_first(&self) -> Vec<&VocabularyFilterRecord> {
+    pub fn vocabulary_filters_newest_first(&self, region: &str) -> Vec<&VocabularyFilterRecord> {
         let mut records: Vec<&VocabularyFilterRecord> =
-            self.vocabulary_filters.values().collect();
+            self.vocabulary_filters.values_in(region).collect();
         records.sort_by_key(|record| std::cmp::Reverse(record.sequence));
         records
     }
 
     /// The custom language model named `name`, with every clock-owed transition of it
-    /// already materialised, or `None` when this account holds no such model.
+    /// already materialised, or `None` when that Region holds no such model.
     pub fn language_model_mut(
         &mut self,
+        region: &str,
         name: &str,
         now: SystemTime,
     ) -> Option<&mut LanguageModelRecord> {
-        let record = self.language_models.get_mut(name)?;
+        let record = self.language_models.get_mut(region, name)?;
         record.advance_clock(now);
         Some(record)
     }
@@ -1214,44 +1421,48 @@ impl ComAmazonawsTranscribeTranscribeState {
     /// ("Language models are ordered by creation date, with the newest model first").
     pub fn language_models_newest_first(
         &mut self,
+        region: &str,
         now: SystemTime,
     ) -> Vec<&LanguageModelRecord> {
-        for record in self.language_models.values_mut() {
+        for record in self.language_models.values_in_mut(region) {
             record.advance_clock(now);
         }
-        let mut records: Vec<&LanguageModelRecord> = self.language_models.values().collect();
+        let mut records: Vec<&LanguageModelRecord> =
+            self.language_models.values_in(region).collect();
         records.sort_by_key(|record| std::cmp::Reverse(record.sequence));
         records
     }
 
-    /// Whether this account holds a resource of `family` named `name`.
+    /// Whether `region` holds a resource of `family` named `name`.
     ///
-    /// Reads the same per-family lookup [`Self::tags`] does, so "this account holds
+    /// Reads the same per-family lookup [`Self::tags`] does, so "this Region holds
     /// it" cannot mean one thing to a tagging call and another to a job start. Borrows
     /// the name rather than building a [`ResourceRef`], so a start checking several
     /// references allocates nothing.
-    pub fn holds(&self, family: ResourceFamily, name: &str) -> bool {
-        self.tags_of(family, name).is_some()
+    pub fn holds(&self, family: ResourceFamily, region: &str, name: &str) -> bool {
+        self.tags_of(family, region, name).is_some()
     }
 
-    /// The refusal for the first resource `references` names that this account does
-    /// not hold, or `None` when every named one is held.
+    /// The refusal for the first resource `references` names that the Region this
+    /// request is served in does not hold, or `None` when every named one is held.
     ///
     /// A job's settings may NAME a custom vocabulary, custom vocabulary filter or
-    /// custom language model, and a name no create of that family ever recorded names
-    /// nothing this emulator could apply — so a start that carries one is refused with
-    /// the family's own not-found text ([`not_found_message`]) rather than stored on a
-    /// job that would report the dangling name back. Each reference is the family the
-    /// member's target resource belongs to and the name the request put there, or
-    /// `None` where the request left the member out; the families are distinct stores,
-    /// so a resource of one family never stands in for another's.
+    /// custom language model, and a name no create of that family ever recorded IN THIS
+    /// REGION names nothing this emulator could apply — so a start that carries one is
+    /// refused with the family's own not-found text ([`not_found_message`]) rather than
+    /// stored on a job that would report the dangling name back. Each reference is the
+    /// family the member's target resource belongs to and the name the request put
+    /// there, or `None` where the request left the member out; the families are distinct
+    /// stores, so a resource of one family never stands in for another's, and so is each
+    /// Region, so a resource of another Region never stands in either.
     pub fn unheld_reference_error(
         &self,
+        region: &str,
         references: &[(ResourceFamily, Option<&str>)],
     ) -> Option<String> {
         references.iter().find_map(|(family, name)| {
             let name = (*name)?;
-            (!self.holds(*family, name)).then(|| not_found_message(family.kind()))
+            (!self.holds(*family, region, name)).then(|| not_found_message(family.kind()))
         })
     }
 
@@ -1267,47 +1478,53 @@ impl ComAmazonawsTranscribeTranscribeState {
             return None;
         }
         let family = ResourceFamily::from_resource_type(&resource.resource_type)?;
-        self.tags_of(family, &resource.name)
+        self.tags_of(family, region, &resource.name)
     }
 
-    /// The tag set of the resource `family` names `name`, or `None` when this account
-    /// holds no such resource.
+    /// The tag set of the resource `family` names `name` in `region`, or `None` when
+    /// that Region holds no such resource.
     ///
-    /// The lookup [`Self::tags`] and [`Self::holds`] both read, by family and borrowed
-    /// name: one place decides which family's store answers for which resource.
-    pub fn tags_of(&self, family: ResourceFamily, name: &str) -> Option<&Vec<Tag>> {
+    /// The lookup [`Self::tags`] and [`Self::holds`] both read, by family, Region and
+    /// borrowed name: one place decides which family's store answers for which resource.
+    pub fn tags_of(&self, family: ResourceFamily, region: &str, name: &str) -> Option<&Vec<Tag>> {
         match family {
-            ResourceFamily::TranscriptionJob => {
-                self.transcription_jobs.get(name).map(|record| &record.tags)
-            }
+            ResourceFamily::TranscriptionJob => self
+                .transcription_jobs
+                .get(region, name)
+                .map(|record| &record.tags),
             ResourceFamily::MedicalTranscriptionJob => self
                 .medical_transcription_jobs
-                .get(name)
+                .get(region, name)
                 .map(|record| &record.tags),
-            ResourceFamily::Vocabulary => self.vocabularies.get(name).map(|record| &record.tags),
+            ResourceFamily::Vocabulary => self
+                .vocabularies
+                .get(region, name)
+                .map(|record| &record.tags),
             ResourceFamily::MedicalVocabulary => self
                 .medical_vocabularies
-                .get(name)
+                .get(region, name)
                 .map(|record| &record.tags),
             ResourceFamily::VocabularyFilter => self
                 .vocabulary_filters
-                .get(name)
+                .get(region, name)
                 .map(|record| &record.tags),
-            ResourceFamily::LanguageModel => {
-                self.language_models.get(name).map(|record| &record.tags)
-            }
+            ResourceFamily::LanguageModel => self
+                .language_models
+                .get(region, name)
+                .map(|record| &record.tags),
             ResourceFamily::CallAnalyticsCategory => self
                 .call_analytics_categories
-                .get(name)
+                .get(region, name)
                 .map(|record| &record.tags),
-            ResourceFamily::MedicalScribeJob => {
-                self.medical_scribe_jobs.get(name).map(|record| &record.tags)
-            }
+            ResourceFamily::MedicalScribeJob => self
+                .medical_scribe_jobs
+                .get(region, name)
+                .map(|record| &record.tags),
         }
     }
 
     /// The tag set of the resource `resource` names, for reading and writing, or
-    /// `None` when this account holds no such resource.
+    /// `None` when that Region holds no such resource.
     ///
     /// One lookup for the two tagging operations that WRITE, so `TagResource` and
     /// `UntagResource` cannot disagree about which ARN names which stored record. It
@@ -1327,35 +1544,35 @@ impl ComAmazonawsTranscribeTranscribeState {
         match ResourceFamily::from_resource_type(&resource.resource_type)? {
             ResourceFamily::TranscriptionJob => self
                 .transcription_jobs
-                .get_mut(&resource.name)
+                .get_mut(region, &resource.name)
                 .map(|record| &mut record.tags),
             ResourceFamily::MedicalTranscriptionJob => self
                 .medical_transcription_jobs
-                .get_mut(&resource.name)
+                .get_mut(region, &resource.name)
                 .map(|record| &mut record.tags),
             ResourceFamily::Vocabulary => self
                 .vocabularies
-                .get_mut(&resource.name)
+                .get_mut(region, &resource.name)
                 .map(|record| &mut record.tags),
             ResourceFamily::MedicalVocabulary => self
                 .medical_vocabularies
-                .get_mut(&resource.name)
+                .get_mut(region, &resource.name)
                 .map(|record| &mut record.tags),
             ResourceFamily::VocabularyFilter => self
                 .vocabulary_filters
-                .get_mut(&resource.name)
+                .get_mut(region, &resource.name)
                 .map(|record| &mut record.tags),
             ResourceFamily::LanguageModel => self
                 .language_models
-                .get_mut(&resource.name)
+                .get_mut(region, &resource.name)
                 .map(|record| &mut record.tags),
             ResourceFamily::CallAnalyticsCategory => self
                 .call_analytics_categories
-                .get_mut(&resource.name)
+                .get_mut(region, &resource.name)
                 .map(|record| &mut record.tags),
             ResourceFamily::MedicalScribeJob => self
                 .medical_scribe_jobs
-                .get_mut(&resource.name)
+                .get_mut(region, &resource.name)
                 .map(|record| &mut record.tags),
         }
     }
@@ -1378,7 +1595,7 @@ pub struct ResourceRef {
     pub account: String,
     /// The ARN's resource type, e.g. [`RESOURCE_TYPE_VOCABULARY`].
     pub resource_type: String,
-    /// The resource's name, which is also its key in the store that holds it.
+    /// The resource's name, which together with the Region keys the store that holds it.
     pub name: String,
 }
 
@@ -1455,7 +1672,8 @@ pub fn resource_arn(resource_type: &str, name: &str, region: &str) -> String {
 /// [`Self::advance_clock`]).
 #[derive(Debug, Clone)]
 pub struct VocabularyRecord {
-    /// `VocabularyName`, also this record's key in the store.
+    /// `VocabularyName`, the second half of this record's key in the store (the Region
+    /// it was created in is the first).
     pub name: String,
     /// Creation order, newest = largest. Also the cursor `ListVocabularies` pages
     /// with.
@@ -1567,7 +1785,7 @@ impl VocabularyRecord {
 /// ends the same way ([`VocabularyRecord::advance_clock`]).
 #[derive(Debug, Clone)]
 pub struct MedicalVocabularyRecord {
-    /// `VocabularyName`, also this record's key in the store.
+    /// `VocabularyName`, with the Region, this record's key in the store.
     pub name: String,
     /// Creation order, newest = largest. Also the cursor
     /// `ListMedicalVocabularies` pages with.
@@ -1700,7 +1918,7 @@ pub fn file_not_read_failure_reason(kind: &str, file_uri: &str) -> String {
 /// is the custom MEDICAL vocabulary's case again ([`MedicalVocabularyRecord`]).
 #[derive(Debug, Clone)]
 pub struct LanguageModelRecord {
-    /// `ModelName`, also this record's key in the store.
+    /// `ModelName`, with the Region, this record's key in the store.
     pub name: String,
     /// Creation order, newest = largest. Also the cursor a listing of this family
     /// would page with.
@@ -1839,7 +2057,7 @@ pub fn language_model_failure_reason(s3_uri: &str) -> String {
 /// this emulator reads no object store and makes no outbound request.
 #[derive(Debug, Clone)]
 pub struct VocabularyFilterRecord {
-    /// `VocabularyFilterName`, also this record's key in the store.
+    /// `VocabularyFilterName`, with the Region, this record's key in the store.
     pub name: String,
     /// Creation order, newest = largest. Also the cursor `ListVocabularyFilters`
     /// pages with.
@@ -1896,7 +2114,7 @@ impl VocabularyFilterRecord {
 /// Call Analytics job would be matched against, never a match.
 #[derive(Debug, Clone)]
 pub struct CallAnalyticsCategoryRecord {
-    /// `CategoryName`, also this record's key in the store.
+    /// `CategoryName`, with the Region, this record's key in the store.
     pub name: String,
     /// The rules that define the category, as the request listed them. `RuleList` is
     /// modelled `length {min 1, max 20}`, so the boundary validator has already
@@ -2268,7 +2486,7 @@ pub fn vocabulary_download_uri(resource_type: &str, name: &str, region: &str) ->
 /// lifecycle facts the service itself owns (status, timestamps, transcript location).
 #[derive(Debug, Clone)]
 pub struct TranscriptionJobRecord {
-    /// `TranscriptionJobName`, also this record's key in the store.
+    /// `TranscriptionJobName`, with the Region, this record's key in the store.
     pub name: String,
     /// Creation order, newest = largest. Also the cursor `ListTranscriptionJobs`
     /// pages with.
@@ -2447,7 +2665,7 @@ impl TranscriptionJobRecord {
 /// `COMPLETED`.
 #[derive(Debug, Clone)]
 pub struct MedicalTranscriptionJobRecord {
-    /// `MedicalTranscriptionJobName`, also this record's key in the store.
+    /// `MedicalTranscriptionJobName`, with the Region, this record's key in the store.
     pub name: String,
     /// Creation order, newest = largest. Also the cursor a listing of this family
     /// would page with.
@@ -2587,7 +2805,7 @@ impl MedicalTranscriptionJobRecord {
 /// clock-owed transition, `IN_PROGRESS` -> `COMPLETED`.
 #[derive(Debug, Clone)]
 pub struct MedicalScribeJobRecord {
-    /// `MedicalScribeJobName`, also this record's key in the store.
+    /// `MedicalScribeJobName`, with the Region, this record's key in the store.
     pub name: String,
     /// Creation order, newest = largest. Also the cursor a listing of this family
     /// would page with.
@@ -2886,7 +3104,7 @@ pub fn identified_language(language_options: Option<&[String]>) -> String {
 /// location nothing writes to or serves.
 #[derive(Debug, Clone)]
 pub struct CallAnalyticsJobRecord {
-    /// `CallAnalyticsJobName`, also this record's key in the store.
+    /// `CallAnalyticsJobName`, with the Region, this record's key in the store.
     pub name: String,
     /// Creation order, newest = largest. Also the cursor `ListCallAnalyticsJobs`
     /// pages with.

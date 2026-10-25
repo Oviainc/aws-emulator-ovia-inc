@@ -167,7 +167,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteMedicalScribeJobErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -180,12 +179,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The Region this request is served in: only the jobs started through this
+        // Region's endpoint are this call's to delete.
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // The clock-owed transition is materialised FIRST (inside the lookup), so a
         // job whose completion was already due is deleted rather than refused for a
         // status it had left.
-        let Some(record) = store.medical_scribe_job_mut(&input.medical_scribe_job_name, now) else {
+        let Some(record) =
+            store.medical_scribe_job_mut(&region, &input.medical_scribe_job_name, now)
+        else {
             return Err(DeleteMedicalScribeJobErrorModeled::BadRequestException(
                 BadRequestException {
                     message: Some(crate::state::not_found_message(crate::state::KIND_JOB)),
@@ -214,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         store
             .medical_scribe_jobs
-            .remove(&input.medical_scribe_job_name);
+            .remove(&region, &input.medical_scribe_job_name);
         ::tracing::info!(
             operation = "DeleteMedicalScribeJob",
             job = %input.medical_scribe_job_name,

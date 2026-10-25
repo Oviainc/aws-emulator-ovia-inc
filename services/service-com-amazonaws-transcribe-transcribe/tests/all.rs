@@ -55,6 +55,8 @@ mod medical_transcription_jobs;
 mod medical_vocabularies;
 #[path = "all/medical_vocabulary_constraints.rs"]
 mod medical_vocabulary_constraints;
+#[path = "all/regional_resource_scoping.rs"]
+mod regional_resource_scoping;
 #[path = "all/rpc_success_status.rs"]
 mod rpc_success_status;
 #[path = "all/service_claim.rs"]

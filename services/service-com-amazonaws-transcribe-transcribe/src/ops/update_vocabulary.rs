@@ -252,8 +252,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        let Some(record) = store.vocabularies.get_mut(&input.vocabulary_name) else {
-            // A resource that does not exist is a `BadRequestException` on this
+        let Some(record) = store
+            .vocabularies
+            .get_mut(&region, &input.vocabulary_name)
+        else {
+            // A resource this Region does not hold is a `BadRequestException` on this
             // service's wire, not the modelled `NotFoundException`: the shape's own
             // documentation covers "the entity you're trying to delete doesn't exist",
             // and that is the shape its recorded not-found responses carry.
@@ -273,7 +276,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.failure_reason = None;
         record.transition_due = Some(now + crate::state::VOCABULARY_TRANSITION_DELAY);
         record.last_modified_time = now;
-        record.region = region;
+        // The Region a resource lives in is fixed when it is created: it is part of
+        // what identifies the record (the store is keyed by it), so an update reaches
+        // only its own Region's resource and never migrates one.
         record.data_access_role_arn = input.data_access_role_arn;
         record.encryption_configuration = input.encryption_configuration;
 
